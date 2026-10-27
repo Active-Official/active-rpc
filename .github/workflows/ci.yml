@@ -25,6 +25,9 @@ jobs:
       - name: Tests (no default features)
         run: cargo test --locked --no-default-features
       - name: Documentation
+        env:
+          # A broken intra-doc link is a documentation defect, not a warning.
+          RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps --all-features
 
   msrv:
