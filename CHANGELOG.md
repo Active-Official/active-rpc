@@ -1,5 +1,15 @@
 # Changelog — Active RPC
 
+## 1.1.8 — 2026-10-27
+
+No API or wire-format change in this crate.
+
+- **Depends on `active-infinity` 2.0.0**, which removes the public plaintext
+  secret accessors (`secret_texts`, `secret_bytes`, `secret_literals`). RPC never
+  called them; the floor moves so consumers of the stack resolve the fixed core.
+- Everything else is unchanged: capability, promise, lane, channel, transport and
+  tool behavior, the MSRV (1.88) and the feature set.
+
 ## 1.1.7 — 2026-10-27
 
 No API or wire-format change.
