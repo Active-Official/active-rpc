@@ -45,7 +45,7 @@ git push --follow-tags
 ## Verifying a tag (anyone)
 
 ```bash
-git -c gpg.ssh.allowedSignersFile=release-signing.allowed_signers tag -v v1.1.3
+git -c gpg.ssh.allowedSignersFile=release-signing.allowed_signers tag -v v1.1.4
 ```
 
 A good tag prints:
@@ -53,13 +53,13 @@ A good tag prints:
 ```
 object <commit>
 type commit
-tag v1.1.3
+tag v1.1.4
 tagger ...
 Good "git" signature for im.david.demarco@gmail.com with ED25519 key SHA256:msxYmwYS/hzVOmO8hm9sjOfOOlK1u6TohPU8BgT7n3Y
 ```
 
 To verify against a GitHub-hosted key instead, import the public key above into
-a `allowed_signers` file of your own; the tag carries the signature and needs no
+an `allowed_signers` file of your own; the tag carries the signature and needs no
 network access.
 
 ## Rotation

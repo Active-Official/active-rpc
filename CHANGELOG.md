@@ -13,7 +13,9 @@
 - **CI tests the committed dependency graph.** Every job runs with `--locked`,
   the MSRV job builds every feature and every target, the fuzz job runs on
   pushes as well as pull requests, and the package job verifies the tarball.
-  `cargo deny check` passes with no advisory ignores.
+  `cargo deny check` passes with one documented ignore: RUSTSEC-2024-0449
+  (`unsafe-libyaml`, pulled in by `active-core`'s `serde_yaml` and outside every
+  parsing path this crate exposes).
 
 ## 1.1.3 — 2026-10-27
 

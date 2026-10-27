@@ -12,11 +12,11 @@
 The crate depends on the published `active-infinity` so a fresh clone builds on its
 own. To iterate on both repositories together, add a local patch (not committed):
 
-``toml
+```toml
 # Cargo.toml (local only, or in an uncommitted .cargo/config.toml)
 [patch.crates-io]
 active-infinity = { path = "../Active-Infinity" }
-``n
+```
 Remove it before packaging: cargo package builds against the registry version,
 which is what consumers get.
 

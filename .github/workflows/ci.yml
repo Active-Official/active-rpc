@@ -36,6 +36,8 @@ jobs:
       # `proptest` 1.12 both require it; see docs/adr/0007-msrv.md.
       - name: MSRV check (every feature, every target)
         run: cargo check --locked --all-targets --all-features
+      - name: MSRV check (no default features)
+        run: cargo check --locked --no-default-features
 
   package:
     runs-on: ubuntu-latest
@@ -49,6 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # A rolling nightly is deliberate: libFuzzer fixes and sanitizer support
+      # land there first. The crate graph is pinned by the committed
+      # fuzz/Cargo.lock, which cargo-fuzz uses as-is.
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install clang (libFuzzer runtime)
         run: sudo apt-get update && sudo apt-get install -y clang

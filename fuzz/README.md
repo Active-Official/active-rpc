@@ -17,7 +17,7 @@ with `STATUS_DLL_NOT_FOUND`; that is an environment limitation, not a target
 defect. Use a Linux container:
 
 ```bash
-docker run --rm -v "$PWD:/work" -w /work rust:1.85-bookworm bash -c \
+docker run --rm -v "$PWD:/work" -w /work rust:1.88-bookworm bash -c \
   "apt-get update -qq && apt-get install -y -qq clang && \
    rustup toolchain install nightly --profile minimal && \
    cargo +nightly install cargo-fuzz --locked && \
