@@ -11,3 +11,7 @@
 
 /.scratch/
 
+
+# Release artifacts (attached to tags, not committed)
+*.cdx.json
+
