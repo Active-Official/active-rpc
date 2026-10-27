@@ -1,5 +1,16 @@
 # Changelog — Active RPC
 
+## 1.1.9 — 2026-10-27
+
+No API or wire-format change in this crate.
+
+- **Tracks `active-infinity` 2.0.1** and the committed lockfile resolves it. The
+  previous floor (`2.0.0`) is yanked because it still exposed
+  `Validated::secret`; this release makes a fresh clone and a locked build both
+  resolve the fixed core.
+- Everything else is unchanged: capability, promise, lane, channel, transport and
+  tool behavior, MSRV 1.88, and the feature set.
+
 ## 1.1.8 — 2026-10-27
 
 No API or wire-format change in this crate.
