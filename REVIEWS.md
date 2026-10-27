@@ -89,3 +89,20 @@ Verification of round 5, plus a whole-repository pass. Six findings, all fixed:
 No capability-forgery, secret-leak or budget-bypass path was found in `src/`;
 the reviewer ran `cargo fmt --check`, `cargo deny check`, `cargo test --locked`
 and confirmed the workflow parses.
+
+## Round 7 — 2026-10-27 (1.1.6)
+
+Final verification of round 6. The reviewer confirmed every prior fix, the doc
+gate, the MSRV, the ADR, the CI checks and the fuzz assertion, and found no
+security or correctness issue in `src/`. Five documentation defects, all fixed:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| Signing example pinned `v1.1.4` while the doc implied it tracks the current release | low | fixed: `v1.1.5`, with a note to substitute the tag being verified |
+| `CHECKLIST.md` still said `1.1.2` and "tags are annotated" | low | fixed: `1.1.5`, SSH-signed |
+| `Channel::close` claimed receives fail; queued messages stay receivable | low | fixed doc; behavior unchanged |
+| Duplicate doc line on `Channel::len` | low | fixed |
+| `McpSession::calls` did not say the handshake is excluded | low | fixed |
+
+Verified in the same round: `fmt`, `clippy -D warnings`, `deny`, `test --locked`
+and `doc` all pass; no `unsafe` and no `TODO` in `src/`.

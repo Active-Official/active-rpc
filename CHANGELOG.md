@@ -1,5 +1,19 @@
 # Changelog — Active RPC
 
+## 1.1.6 — 2026-10-27
+
+Documentation-only release: no API, wire-format or behavior change.
+
+- **Documentation corrected against behavior.** `Channel::close` said sends and
+  receives fail, but queued messages stay receivable; the doc now says so.
+  `McpSession::calls` now states that the handshake is not counted, and a
+  duplicated line on `Channel::len` is gone.
+- **Release docs track the current release.** The signing example and its
+  expected output name `v1.1.5`, with a note to substitute the tag being
+  verified.
+- **`CHECKLIST.md` no longer claims annotated tags** (they are SSH-signed) and
+  names the published line `1.1.5`.
+
 ## 1.1.5 — 2026-10-27
 
 Documentation-only release: no API, wire-format or behavior change.

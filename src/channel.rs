@@ -150,7 +150,6 @@ impl Channel {
     }
 
     /// Number of queued messages.
-    /// Messages waiting in the queue.
     pub fn len(&self) -> usize {
         self.queue.len()
     }
@@ -160,7 +159,8 @@ impl Channel {
         self.queue.is_empty()
     }
 
-    /// Close the channel: further sends and receives fail.
+    /// Close the channel: further sends fail; messages already queued remain
+    /// receivable.
     pub fn close(&mut self) {
         self.closed = true;
     }

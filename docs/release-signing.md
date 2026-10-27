@@ -38,22 +38,23 @@ dependency, works on every platform, and is the format GitHub displays as
 git config gpg.format ssh
 git config user.signingkey "$HOME/.ssh/active-release-signing.pub"
 git config tag.gpgsign true
-git tag -s -m "active-rpc 1.1.4" v1.1.4
+git tag -s -m "active-rpc 1.1.5" v1.1.5
 git push --follow-tags
 ```
 
 ## Verifying a tag (anyone)
 
 ```bash
-git -c gpg.ssh.allowedSignersFile=release-signing.allowed_signers tag -v v1.1.4
+git -c gpg.ssh.allowedSignersFile=release-signing.allowed_signers tag -v v1.1.5
 ```
 
-A good tag prints:
+The example below is from the current release; replace the tag with the one you
+are verifying. A good tag prints:
 
 ```
 object <commit>
 type commit
-tag v1.1.4
+tag v1.1.5
 tagger ...
 Good "git" signature for im.david.demarco@gmail.com with ED25519 key SHA256:msxYmwYS/hzVOmO8hm9sjOfOOlK1u6TohPU8BgT7n3Y
 ```

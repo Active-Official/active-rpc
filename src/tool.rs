@@ -227,7 +227,8 @@ pub struct McpSession<T: McpTransport> {
     transport: T,
     tools: Vec<McpToolDef>,
     next_id: u64,
-    /// Calls issued through this session.
+    /// Tool invocations issued through this session (the handshake is not
+    /// counted).
     pub calls: u64,
 }
 
