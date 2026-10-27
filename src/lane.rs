@@ -78,7 +78,10 @@ impl Lane {
     }
 
     /// Whether the lane may issue another call under its budget.
+    ///
+    /// Pending calls count: queueing a thousand calls before `run()` must not
+    /// let a lane outspend its grant.
     pub fn has_capacity(&self) -> bool {
-        !self.closed && self.completed < self.budget.max_calls
+        !self.closed && self.completed.saturating_add(self.pending as u64) < self.budget.max_calls
     }
 }

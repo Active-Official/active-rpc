@@ -11,9 +11,10 @@ come from the design, not from memory protection.
 ## Decision
 
 1. **Identity is derived, not chosen.** A capability id is
-   `Blake3(kernel secret ‖ serial ‖ parent id)[..16]`. The kernel secret is
-   random per agent (or fixed for deterministic replays) and never leaves the
-   kernel. A peer can guess, but a guess is only useful if it is in the
+   `Blake3(kernel secret ‖ serial ‖ parent id)[..16]`. The kernel secret comes
+   from the operating system's CSPRNG (`Agent::new`, via `getrandom`; a
+   clock-derived seed would be guessable) or is fixed for deterministic replays
+   (`Agent::with_secret`), and never leaves the kernel. A peer can guess, but a guess is only useful if it is in the
    receiver's registry — and the receiver only mints through `mint`/`attenuate`.
 2. **The registry is the authority.** `Agent::import` reconstructs a handle from
    a wire id without granting anything: every call looks the id up, and an

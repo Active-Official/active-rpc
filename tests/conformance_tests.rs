@@ -124,7 +124,8 @@ fn capability_table_golden_shape() {
     assert_eq!(cap.path_scope.as_deref(), Some("app"));
 
     // The standalone table codec agrees with the envelope.
-    let table = active_rpc::wire::encode_capability_table(std::slice::from_ref(&descriptor)).unwrap();
+    let table =
+        active_rpc::wire::encode_capability_table(std::slice::from_ref(&descriptor)).unwrap();
     let decoded_table = active_rpc::wire::decode_capability_table(&table).unwrap();
     assert_eq!(decoded_table, vec![descriptor]);
 }

@@ -77,6 +77,25 @@ impl Value {
         }
     }
 
+    /// Bytes this value occupies on the wire (upper bound; used for budgets).
+    pub fn wire_size(&self) -> u64 {
+        match self {
+            Value::Null => 1,
+            Value::Bool(_) => 2,
+            Value::Int(_) | Value::Float(_) => 9,
+            Value::Text(text) | Value::Path(text) => 5 + text.len() as u64,
+            Value::Secret => 1,
+            Value::Module(bytes) => 5 + bytes.len() as u64,
+            Value::List(items) => 5 + items.iter().map(Value::wire_size).sum::<u64>(),
+            Value::Map(entries) => {
+                5 + entries
+                    .iter()
+                    .map(|(key, value)| 5 + key.len() as u64 + value.wire_size())
+                    .sum::<u64>()
+            }
+        }
+    }
+
     /// True when this value or any descendant is a secret marker.
     pub fn is_tainted(&self) -> bool {
         match self {
@@ -115,6 +134,15 @@ impl Arg {
         match self {
             Arg::Promise(id) => Some(*id),
             _ => None,
+        }
+    }
+
+    /// Bytes this argument occupies on the wire (used for budget accounting).
+    pub fn wire_size(&self) -> u64 {
+        match self {
+            Arg::Value(value) => value.wire_size(),
+            Arg::Promise(_) => 8,
+            Arg::Cap(_) => 16,
         }
     }
 }

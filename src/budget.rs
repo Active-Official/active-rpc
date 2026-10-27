@@ -70,6 +70,8 @@ impl Budget {
             ("max_wall_ms", self.max_wall_ms),
             ("max_nodes", self.max_nodes),
             ("max_depth", self.max_depth),
+            ("max_array_len", self.max_array_len),
+            ("max_value_size", self.max_value_size),
         ] {
             if value == 0 {
                 return Err(Error::InvalidArgument(match name {
@@ -77,7 +79,9 @@ impl Budget {
                     "max_bytes" => "max_bytes must be non-zero",
                     "max_wall_ms" => "max_wall_ms must be non-zero",
                     "max_nodes" => "max_nodes must be non-zero",
-                    _ => "max_depth must be non-zero",
+                    "max_depth" => "max_depth must be non-zero",
+                    "max_array_len" => "max_array_len must be non-zero",
+                    _ => "max_value_size must be non-zero",
                 }));
             }
         }

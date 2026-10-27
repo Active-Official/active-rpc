@@ -161,9 +161,7 @@ impl Provider for ModuleProvider {
             "subgraph" => {
                 let (_path, node) = self.resolve(&module, call)?;
                 let sub = restrict(&module, node)?;
-                let bytes =
-                    encode(&sub).map_err(|error| Error::Payload(error.code().to_string()))?;
-                Response::Module(bytes)
+                Response::Module(redacted_module_bytes(&sub)?)
             }
             "patch" => {
                 let (_path, node) = self.resolve(&module, call)?;
@@ -191,8 +189,7 @@ impl Provider for ModuleProvider {
                     parent: None,
                     entries: Vec::new(),
                 }));
-                let bytes =
-                    encode(&patched).map_err(|error| Error::Payload(error.code().to_string()))?;
+                let bytes = redacted_module_bytes(&patched)?;
                 // A patch advances the object in place: every holder of a
                 // capability for it observes the new version, which is what
                 // "patch returns the new module capability" means without a
@@ -248,6 +245,7 @@ impl Provider for ModuleProvider {
                 Response::Value(Value::Map(map))
             }
             "annotations" => {
+                let tainted_ids = tainted_nodes(&module);
                 let mut out = Vec::new();
                 for annotation in module.annotations() {
                     let (kind, text) = match &annotation.kind {
@@ -255,7 +253,12 @@ impl Provider for ModuleProvider {
                         AnnotationKind::Constraint { source, .. } => ("constraint", source.clone()),
                         AnnotationKind::AiImmutable(flag) => ("ai_immutable", flag.to_string()),
                     };
-                    let text = if call.redact && text.contains("***") {
+                    // A redacting capability hides anything attached to the
+                    // secret cone; a non-redacting one still only sees text that
+                    // canonicalization already redacted.
+                    let hidden = (call.redact && tainted_ids.contains(&annotation.node))
+                        || text.contains(security::SECRET_MARKER);
+                    let text = if hidden {
                         Value::Secret
                     } else {
                         Value::Text(text)
@@ -378,6 +381,67 @@ fn tainted_labels(module: &InfinityModule) -> BTreeSet<String> {
     // label differs from the id-derived one.
     labels.extend(secret_tainted_paths(module));
     labels
+}
+
+/// Encode a module for an RPC payload with every secret replaced by the marker.
+///
+/// The RPC wire has no tag that carries secret bytes (`docs/spec/wire.md` §2.2),
+/// so a module returned by `subgraph` or `patch` is a redacted projection: the
+/// structure survives, the material does not. A caller that needs the raw module
+/// moves it through a transport payload, not through a capability result.
+fn redacted_module_bytes(module: &InfinityModule) -> Result<Vec<u8>> {
+    let mut redacted = module.clone();
+    for index in 0..redacted.node_count() {
+        let id = NodeId(index as u32);
+        let is_secret = redacted
+            .get(id)
+            .map(|node| node.is_secret())
+            .unwrap_or(false);
+        if is_secret {
+            *redacted.node_mut(id)? = Inode::Str(security::SECRET_MARKER.to_string());
+        }
+    }
+    let bytes = encode(&redacted).map_err(|error| Error::Payload(error.code().to_string()))?;
+    security::check_module_payload(&bytes)?;
+    Ok(bytes)
+}
+
+/// Node ids that are secrets or contain one, transitively.
+fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
+    let mut tainted = BTreeSet::new();
+    let mut stack: Vec<NodeId> = Vec::new();
+    for (index, node) in module.nodes().iter().enumerate() {
+        if node.is_secret() {
+            let id = NodeId(index as u32);
+            tainted.insert(id);
+            stack.push(id);
+        }
+    }
+    while let Some(id) = stack.pop() {
+        if let Some(node) = module.get(id) {
+            for child in node.children() {
+                if tainted.insert(child) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    // Containment: ancestors of a secret are tainted too.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (index, node) in module.nodes().iter().enumerate() {
+            let id = NodeId(index as u32);
+            if tainted.contains(&id) {
+                continue;
+            }
+            if node.children().iter().any(|child| tainted.contains(child)) {
+                tainted.insert(id);
+                changed = true;
+            }
+        }
+    }
+    tainted
 }
 
 /// Extract the subgraph rooted at `node` as a standalone module.

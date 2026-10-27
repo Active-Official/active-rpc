@@ -172,9 +172,12 @@ impl CapAttrs {
             (None, Some(_)) => false,
         };
         let tool_ok = match (&self.tool_policy, &parent.tool_policy) {
-            (None, _) => true,
+            // A parent without a policy leaves the tool surface open; adding one
+            // on the child narrows it, which `attenuate` also accepts.
+            (_, None) => true,
+            // Dropping the parent's policy widens authority.
+            (None, Some(_)) => false,
             (Some(policy), Some(parent)) => policy.is_attenuation_of(parent),
-            (Some(_), None) => false,
         };
         methods_ok && budget_ok && read_only_ok && redact_ok && path_ok && tool_ok
     }
@@ -315,13 +318,26 @@ impl CapHandle {
     pub fn id(&self) -> CapId {
         self.id
     }
+
+    /// Surrender this handle without releasing its reference.
+    ///
+    /// Used when a reference moves (channel transfer): the receiver becomes
+    /// responsible for the reference the sender held.
+    pub fn into_id(mut self) -> CapId {
+        self.owning = false;
+        self.id
+    }
 }
 
 impl Clone for CapHandle {
-    /// Cloning retains the capability: the kernel increments the reference
-    /// count, and both handles must drop before the provider is notified.
+    /// Cloning an *owning* handle retains the capability: the kernel increments
+    /// the reference count and both handles must drop before the provider is
+    /// notified. Cloning a borrowed handle stays borrowed — it never retained a
+    /// reference, so it must not create one.
     fn clone(&self) -> Self {
-        self.control.retain(self.id);
+        if self.owning {
+            self.control.retain(self.id);
+        }
         Self {
             control: Rc::clone(&self.control),
             id: self.id,

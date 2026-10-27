@@ -1,0 +1,42 @@
+# Changelog — Active RPC
+
+## 1.1.0 — 2026-10-27
+
+Security and correctness fixes from the independent review. The wire format
+(`ARP1` v1) is unchanged.
+
+- **Revocation at dispatch.** A capability revoked after a call was queued is
+  rejected when the batch runs; the provider never sees it.
+- **Cancel and destroy really drop work.** A queued job is removed on
+  `cancel`/`destroy_lane`, and its promise is rejected; an in-flight job cannot
+  be stopped and its result is discarded.
+- **Lane budget counts queued calls.** Queueing many calls no longer bypasses a
+  lane's call budget.
+- **Byte budget is charged.** Arguments and payloads are measured, charged
+  against the capability meter and intersected with the lane budget; a call over
+  the ceiling fails with `rpc/budget-exceeded` before dispatch.
+- **Every budget ceiling must be non-zero**, including array length and value
+  size; the wire refuses a descriptor that disables one.
+- **Bounded value decoding.** Nesting is capped at 64 levels and every length is
+  checked against remaining bytes; deeply nested or oversized values are
+  `rpc/wire` instead of a stack overflow or a huge allocation.
+- **Redacted module results.** `subgraph` and `patch` return a module with every
+  secret replaced by `***SECRET***`; the wire has no tag for secret bytes.
+- **CSPRNG capability ids.** `Agent::new` seeds the id secret from the OS random
+  source instead of the clock.
+- **No borrow across provider code.** The kernel releases its borrow before
+  invoking a provider, so a provider that holds an `Agent` and calls back works.
+- **Tool-policy predicate fixed.** `CapAttrs::is_attenuation_of` now agrees with
+  `attenuate` (adding a policy narrows, dropping one widens).
+- **Capability sharing clarified.** Channel messages share (borrow) capability
+  ids without inflating reference counts; cloning a borrowed handle no longer
+  leaks a reference.
+- **Atomic shared-memory consumption.** `SharedSegment::pop_frame` decodes and
+  advances under one lock.
+
+## 1.0.0 — 2026-10-27
+
+First release: capability kernel with attenuation and lifetime notification,
+promise pipelining with batching, lanes, channels, tool handles (MCP, HTTP,
+sandboxed process), domain operations over Active Infinity, and five transports
+(in-process, TCP, shared memory, QUIC, Connect/gRPC bridge).

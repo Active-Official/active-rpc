@@ -525,40 +525,54 @@ fn read_arg(bytes: &[u8], cursor: &mut usize) -> Result<Arg> {
     }
 }
 
+/// Deepest value nesting an envelope may carry.
+pub const MAX_VALUE_DEPTH: usize = 64;
+
 fn read_value(bytes: &[u8], cursor: &mut usize) -> Result<Value> {
+    read_value_at(bytes, cursor, 0, bytes.len())
+}
+
+fn read_value_at(bytes: &[u8], cursor: &mut usize, depth: usize, budget: usize) -> Result<Value> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(Error::Wire("value nesting exceeds the ceiling"));
+    }
     let tag = read_u8(bytes, cursor)?;
     let value = match tag {
         0 => Value::Null,
         1 => Value::Bool(read_u8(bytes, cursor)? != 0),
         2 => Value::Int(read_u64(bytes, cursor)? as i64),
         3 => Value::Float(f64::from_bits(read_u64(bytes, cursor)?)),
-        4 => Value::Text(read_str(bytes, cursor, u32::MAX)?),
+        4 => Value::Text(read_str(bytes, cursor, budget as u32)?),
         5 => {
             let count = read_u32(bytes, cursor)?;
-            if count > (1 << 20) {
+            // A list cannot hold more elements than there are bytes left.
+            if count as usize > budget {
                 return Err(Error::Wire("list too long"));
             }
             let mut items = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                items.push(read_value(bytes, cursor)?);
+                items.push(read_value_at(bytes, cursor, depth + 1, budget)?);
             }
             Value::List(items)
         }
         6 => {
             let count = read_u32(bytes, cursor)?;
-            if count > (1 << 20) {
+            if count as usize > budget {
                 return Err(Error::Wire("map too large"));
             }
             let mut entries = std::collections::BTreeMap::new();
             for _ in 0..count {
-                let key = read_str(bytes, cursor, u32::MAX)?;
-                entries.insert(key, read_value(bytes, cursor)?);
+                let key = read_str(bytes, cursor, budget as u32)?;
+                entries.insert(key, read_value_at(bytes, cursor, depth + 1, budget)?);
             }
             Value::Map(entries)
         }
         7 => Value::Secret,
         8 => {
             let len = read_u32(bytes, cursor)?;
+            if len as usize > budget {
+                return Err(Error::Wire("module payload exceeds the ceiling"));
+            }
             let end = cursor
                 .checked_add(len as usize)
                 .ok_or(Error::Wire("length overflow"))?;
@@ -569,7 +583,7 @@ fn read_value(bytes: &[u8], cursor: &mut usize) -> Result<Value> {
             *cursor = end;
             Value::Module(module)
         }
-        9 => Value::Path(read_str(bytes, cursor, u32::MAX)?),
+        9 => Value::Path(read_str(bytes, cursor, budget as u32)?),
         _ => return Err(Error::Wire("unknown value tag")),
     };
     Ok(value)

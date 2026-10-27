@@ -90,8 +90,13 @@ A capability argument transfers authority explicitly.
 | 8 | `Module` | `u32` length + Infinity image bytes |
 | 9 | `Path` | `u32` length + UTF-8 dotted path |
 
-`Secret` is the *only* representation of secret material on the wire. There is
-no tag that carries secret bytes, so no encoder in this crate can leak one.
+`Secret` is the *only* representation of secret material on the wire. There is no
+tag that carries secret bytes, so no encoder in this crate can leak one.
+
+Value nesting is capped at 64 levels and every length is checked against the
+remaining bytes before allocation (`rpc/wire`). A `Module` value is a **redacted**
+projection: secret nodes are replaced by the marker before encoding, because the
+wire has no tag that could carry the material.
 
 ---
 
@@ -113,6 +118,10 @@ A descriptor whose budget disables a ceiling (any `0`) is refused with
 
 The table is a *description*, never proof. A receiver must look the id up in its
 own registry; an id it did not mint is refused with `rpc/unknown-capability`.
+
+Every budget ceiling must be non-zero: a descriptor that disables a ceiling is
+refused. Budgets are charged per call (arguments plus payload) and intersected
+with the lane's budget before dispatch.
 
 ---
 
@@ -189,5 +198,7 @@ guesses or forwards a partially decoded envelope.
 1. Every length and count fit inside the buffer; nothing allocates on a claim.
 2. The body ends exactly at the end of the capability table.
 3. Every capability descriptor has a valid budget and a non-empty id.
-4. No argument carries secret bytes: `Secret` is a marker.
+4. No argument carries secret bytes: `Secret` is a marker, and module payloads
+   are redacted projections.
 5. The envelope can be re-encoded to the same bytes.
+6. Value nesting stays within 64 levels.

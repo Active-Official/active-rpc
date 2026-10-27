@@ -1,0 +1,20 @@
+[advisories]
+# `unsafe-libyaml` (via active-core → serde_yaml) is unmaintained upstream; it is
+# not in this crate's parsing path. See the Infinity ADR-0008.
+ignore = ["RUSTSEC-2024-0449"]
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CC0-1.0"]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+deny = [
+    { name = "md5" },
+    { name = "sha1" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

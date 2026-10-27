@@ -244,22 +244,13 @@ impl Default for Agent {
 
 impl Agent {
     /// Create an agent kernel with an unpredictable capability secret.
+    ///
+    /// The secret comes from the operating system's CSPRNG. A clock-derived
+    /// seed would make capability ids guessable to a peer that can estimate the
+    /// start time, which defeats unforgeability.
     pub fn new() -> Self {
         let mut seed = [0u8; 32];
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let counter = NEXT_AGENT.with(|value| {
-            let mut value = value.borrow_mut();
-            *value += 1;
-            *value
-        });
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"active-rpc/agent");
-        hasher.update(&nanos.to_le_bytes());
-        hasher.update(&counter.to_le_bytes());
-        seed.copy_from_slice(&hasher.finalize().as_bytes()[..32]);
+        getrandom::fill(&mut seed).expect("the operating system CSPRNG must be available");
         Self::with_secret(seed)
     }
 
@@ -415,13 +406,29 @@ impl Agent {
     }
 
     /// Destroy a lane and drop its queued work.
+    ///
+    /// Queued jobs are removed from the dispatch queue and their promises are
+    /// rejected, so a destroyed lane cannot keep spending budget or produce side
+    /// effects after the fact.
     pub fn destroy_lane(&self, lane: LaneId) -> Result<()> {
         let mut kernel = self.cell.borrow_mut();
-        let record = kernel
-            .lanes
-            .get_mut(&lane)
-            .ok_or(Error::UnknownLane(lane.0))?;
-        record.destroy();
+        {
+            let record = kernel
+                .lanes
+                .get_mut(&lane)
+                .ok_or(Error::UnknownLane(lane.0))?;
+            record.destroy();
+        }
+        let doomed: Vec<u64> = kernel
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.lane == lane && job.state == JobState::Queued)
+            .map(|(id, _)| *id)
+            .collect();
+        kernel.queue.retain(|id| !doomed.contains(id));
+        for job_id in doomed {
+            kernel.fail_job(job_id, Error::UnknownLane(lane.0));
+        }
         kernel.events.push(Event::LaneDestroyed(lane));
         Ok(())
     }
@@ -600,12 +607,16 @@ impl Agent {
                 return Err(Error::ToolPolicy("argument too large"));
             }
         }
+        let call_bytes: u64 = args.iter().map(|arg| arg.wire_size()).sum();
+        let effective = record.attrs.budget.intersect(&lane_budget);
+        if call_bytes > effective.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
+        }
         let meter = kernel
             .meters
             .get_mut(&cap_id)
             .ok_or(Error::InvalidArgument("capability has no meter"))?;
-        meter.charge(0)?;
-        let effective = record.attrs.budget.intersect(&lane_budget);
+        meter.charge(call_bytes)?;
 
         let promise_id = PromiseId(kernel.next_promise);
         kernel.next_promise += 1;
@@ -657,7 +668,6 @@ impl Agent {
             cap: cap_id,
         });
         // Budgets are enforced again at dispatch with the effective grant.
-        let _ = effective;
         Ok(PromiseHandle {
             agent: self.clone(),
             id: promise_id,
@@ -674,13 +684,13 @@ impl Agent {
                 }
                 match kernel.next_batch() {
                     Ok(batch) => batch,
-                    Err(_) => {
-                        // Unorderable jobs (a pipelined cycle): fail them all.
-                        let jobs: Vec<u64> = kernel.queue.drain(..).collect();
-                        for job_id in jobs {
-                            kernel.fail_job(job_id, "rpc/pipelined-cycle");
+                    Err(stuck) => {
+                        // Only the jobs that cannot be ordered are failed; work
+                        // for other providers stays queued.
+                        for job_id in stuck {
+                            kernel.fail_job(job_id, Error::PipelinedCycle);
                         }
-                        return kernel.round_trips;
+                        continue;
                     }
                 }
             };
@@ -726,13 +736,37 @@ impl Agent {
     }
 
     /// Cancel a promise.
+    ///
+    /// A job that has not been dispatched yet is removed from the queue, so a
+    /// cancellation really prevents the provider call (and its side effects). A
+    /// job already in flight cannot be stopped; its result is discarded.
     pub fn cancel(&self, promise: &PromiseHandle) -> Result<()> {
         let mut kernel = self.cell.borrow_mut();
-        let record = kernel
-            .promises
-            .get_mut(&promise.id)
-            .ok_or(Error::UnknownPromise(promise.id.0))?;
-        record.cancel()
+        {
+            let record = kernel
+                .promises
+                .get_mut(&promise.id)
+                .ok_or(Error::UnknownPromise(promise.id.0))?;
+            record.cancel()?;
+        }
+        let queued: Option<u64> = kernel
+            .jobs
+            .iter()
+            .find(|(_, job)| job.promise == promise.id && job.state == JobState::Queued)
+            .map(|(id, _)| *id);
+        if let Some(job_id) = queued {
+            kernel.queue.retain(|id| *id != job_id);
+            let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
+            if let Some(job) = kernel.jobs.get_mut(&job_id) {
+                job.state = JobState::Done;
+            }
+            if let Some(lane) = lane {
+                if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
+                    lane_record.complete();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Drain drop notifications recorded by one provider.
@@ -783,68 +817,103 @@ impl Agent {
     }
 
     fn dispatch(&self, batch: Vec<u64>) {
-        let mut kernel = self.cell.borrow_mut();
-        kernel.round_trips += 1;
-        kernel.now_ms = kernel.now_ms.saturating_add(kernel.latency_ms);
-        let Some(first) = batch.first().and_then(|id| kernel.jobs.get(id)) else {
-            return;
-        };
-        let provider_id = kernel
-            .caps
-            .get(&first.cap)
-            .map(|record| record.provider)
-            .unwrap_or(ProviderId(u64::MAX));
-        let lanes: BTreeSet<u64> = batch
-            .iter()
-            .filter_map(|id| kernel.jobs.get(id).map(|job| job.lane.0))
-            .collect();
-        kernel.events.push(Event::BatchDispatched {
-            provider: provider_id,
-            jobs: batch.len(),
-            lanes,
-        });
-        // Take the provider out so the borrow of the kernel ends before
-        // invoking user code.
-        let Some(mut provider) = kernel.providers.remove(&provider_id) else {
-            for job_id in batch {
-                kernel.fail_job(job_id, "rpc/provider");
-            }
-            return;
-        };
-        let mut results: Vec<(u64, Result<Value>, LaneId, PromiseId)> = Vec::new();
-        for job_id in &batch {
-            let Some(job) = kernel.jobs.get(job_id).cloned() else {
-                continue;
+        // No kernel borrow is held while a provider runs: a provider may hold an
+        // `Agent` and call back into the kernel, and a re-entrant borrow would
+        // panic (or, with `try_borrow_mut`, silently drop a refcount update).
+        // Each phase takes a short borrow and returns owned data.
+        let (provider_id, provider) = {
+            let mut kernel = self.cell.borrow_mut();
+            kernel.round_trips += 1;
+            kernel.now_ms = kernel.now_ms.saturating_add(kernel.latency_ms);
+            let Some(first) = batch.first().and_then(|id| kernel.jobs.get(id)) else {
+                return;
             };
-            if job.state == JobState::Done {
-                continue;
+            let provider_id = kernel
+                .caps
+                .get(&first.cap)
+                .map(|record| record.provider)
+                .unwrap_or(ProviderId(u64::MAX));
+            let lanes: BTreeSet<u64> = batch
+                .iter()
+                .filter_map(|id| kernel.jobs.get(id).map(|job| job.lane.0))
+                .collect();
+            kernel.events.push(Event::BatchDispatched {
+                provider: provider_id,
+                jobs: batch.len(),
+                lanes,
+            });
+            let provider = kernel.providers.remove(&provider_id);
+            (provider_id, provider)
+        };
+        let Some(mut provider) = provider else {
+            let mut kernel = self.cell.borrow_mut();
+            for job_id in batch {
+                kernel.fail_job(
+                    job_id,
+                    Error::Provider {
+                        code: "rpc/provider".to_string(),
+                    },
+                );
             }
-            // Resolve promise arguments from the settled promise graph (a
-            // dependency produced earlier in this batch is already settled).
-            let mut args = Vec::with_capacity(job.call.args.len());
-            let mut failure = None;
-            for arg in &job.call.args {
-                match arg {
-                    Arg::Promise(id) => match kernel.promises.get(id) {
-                        Some(record) if record.state.is_settled() => match record.value() {
-                            Ok(value) => args.push(Arg::Value(value)),
-                            Err(error) => {
-                                failure = Some(error);
+            return;
+        };
+
+        for job_id in &batch {
+            // Phase 1: decide, under a read borrow.
+            let prepared = {
+                let kernel = self.cell.borrow();
+                let Some(job) = kernel.jobs.get(job_id).cloned() else {
+                    continue;
+                };
+                if job.state == JobState::Done {
+                    continue;
+                }
+                let mut args = Vec::with_capacity(job.call.args.len());
+                let mut failure = None;
+                for arg in &job.call.args {
+                    match arg {
+                        Arg::Promise(id) => match kernel.promises.get(id) {
+                            Some(record) if record.state.is_settled() => match record.value() {
+                                Ok(value) => args.push(Arg::Value(value)),
+                                Err(error) => {
+                                    failure = Some(error);
+                                    break;
+                                }
+                            },
+                            Some(_) => {
+                                failure = Some(Error::UnresolvablePromise(id.0));
+                                break;
+                            }
+                            None => {
+                                failure = Some(Error::UnknownPromise(id.0));
                                 break;
                             }
                         },
-                        Some(_) => {
-                            failure = Some(Error::UnresolvablePromise(id.0));
-                            break;
-                        }
-                        None => {
-                            failure = Some(Error::UnknownPromise(id.0));
-                            break;
-                        }
-                    },
-                    other => args.push(other.clone()),
+                        other => args.push(other.clone()),
+                    }
                 }
-            }
+                // Authority is re-checked at dispatch: a capability revoked
+                // after the call was queued must not reach the provider.
+                let record = kernel.caps.get(&job.cap).cloned();
+                let failure = match &record {
+                    None => Some(Error::UnknownCapability(0)),
+                    Some(record) if record.revoked => {
+                        Some(Error::Revoked(u128::from_be_bytes(pad128(record.id))))
+                    }
+                    Some(_) => failure,
+                };
+                Some((
+                    job,
+                    args,
+                    failure,
+                    record.map(|record| record.object).unwrap_or(0),
+                ))
+            };
+            let Some((job, args, failure, object)) = prepared else {
+                continue;
+            };
+
+            // Phase 2: run provider code with no borrow held.
             let outcome = match failure {
                 Some(error) => Err(error),
                 None => {
@@ -852,15 +921,12 @@ impl Agent {
                         args,
                         ..job.call.clone()
                     };
-                    let object = kernel
-                        .caps
-                        .get(&job.cap)
-                        .map(|record| record.object)
-                        .unwrap_or(0);
                     provider.invoke(object, &call).map(Response::into_value)
                 }
             };
-            // Settle the promise now so later jobs in this batch can use it.
+
+            // Phase 3: settle under a write borrow.
+            let mut kernel = self.cell.borrow_mut();
             match &outcome {
                 Ok(value) => {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
@@ -878,31 +944,29 @@ impl Agent {
                     });
                 }
             }
-            results.push((*job_id, outcome, job.lane, job.promise));
-        }
-        kernel.providers.insert(provider_id, provider);
-        for (job_id, outcome, lane, _promise) in results {
-            if let Some(job) = kernel.jobs.get_mut(&job_id) {
-                job.state = JobState::Done;
+            if let Some(record) = kernel.jobs.get_mut(job_id) {
+                record.state = JobState::Done;
             }
-            if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
+            if let Some(lane_record) = kernel.lanes.get_mut(&job.lane) {
                 lane_record.complete();
             }
-            kernel
-                .events
-                .push(Event::JobCompleted { job: job_id, lane });
-            if outcome.is_err() {
-                // Keep the job record so callers can inspect it; the promise
-                // carries the failure code.
-            }
+            kernel.events.push(Event::JobCompleted {
+                job: *job_id,
+                lane: job.lane,
+            });
         }
+
+        self.cell
+            .borrow_mut()
+            .providers
+            .insert(provider_id, provider);
     }
 }
 
 impl Kernel {
     /// Build the next dispatch batch: all queued jobs for the head job's
     /// provider, ordered so promise producers precede consumers.
-    fn next_batch(&mut self) -> Result<Vec<u64>> {
+    fn next_batch(&mut self) -> std::result::Result<Vec<u64>, Vec<u64>> {
         let Some(head) = self.queue.front().copied() else {
             return Ok(Vec::new());
         };
@@ -910,11 +974,11 @@ impl Kernel {
             self.queue.pop_front();
             return Ok(Vec::new());
         };
-        let provider = self
-            .caps
-            .get(&head_job.cap)
-            .map(|record| record.provider)
-            .ok_or(Error::InvalidArgument("job capability disappeared"))?;
+        let Some(provider) = self.caps.get(&head_job.cap).map(|record| record.provider) else {
+            // The capability vanished; fail this job and let the caller retry.
+            self.queue.pop_front();
+            return Err(vec![head]);
+        };
         let mut candidates: Vec<u64> = self
             .queue
             .iter()
@@ -959,37 +1023,33 @@ impl Kernel {
             }
         }
         if !pending.is_empty() {
-            return Err(Error::PipelinedCycle);
+            // Unorderable: the remaining jobs form (or depend on) a cycle.
+            for id in &pending {
+                self.queue.retain(|queued| queued != id);
+            }
+            return Err(pending);
         }
         candidates.clear();
         self.queue.retain(|id| !ordered.contains(id));
         Ok(ordered)
     }
 
-    fn fail_job(&mut self, job_id: u64, code: &str) {
+    fn fail_job(&mut self, job_id: u64, error: Error) {
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.state = JobState::Done;
             let promise = job.promise;
             let lane = job.lane;
+            let code = error.code().to_string();
             if let Some(record) = self.promises.get_mut(&promise) {
-                let _ = record.reject(Error::Provider {
-                    code: code.to_string(),
-                });
+                let _ = record.reject(error);
             }
             if let Some(lane_record) = self.lanes.get_mut(&lane) {
                 lane_record.complete();
             }
-            self.events.push(Event::PromiseRejected {
-                promise,
-                code: code.to_string(),
-            });
+            self.events.push(Event::PromiseRejected { promise, code });
             self.events.push(Event::JobCompleted { job: job_id, lane });
         }
     }
-}
-
-thread_local! {
-    static NEXT_AGENT: RefCell<u64> = const { RefCell::new(0) };
 }
 
 fn pad128(id: CapId) -> [u8; 16] {

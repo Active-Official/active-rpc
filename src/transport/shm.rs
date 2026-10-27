@@ -114,17 +114,33 @@ impl SharedSegment {
         Ok(Some(frame))
     }
 
-    /// Borrow the oldest frame in place (zero copy).
+    /// Borrow the oldest frame in place (zero copy) without releasing it.
     ///
     /// The closure runs under the segment lock, so the bytes cannot move while
-    /// it looks at them. The consumer must call [`SharedSegment::advance`] to
-    /// release the frame.
+    /// it looks at them. For a single consumer this is safe; a consumer that
+    /// decodes and consumes should use [`SharedSegment::pop_frame`], which
+    /// advances under the same lock so two consumers cannot double-advance.
     pub fn with_frame<R>(&self, inspect: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
         let state = self.state.lock().expect("segment lock");
         let Some((start, len)) = frame_bounds(&state)? else {
             return Ok(None);
         };
         Ok(Some(inspect(&state.data[start..start + len])))
+    }
+
+    /// Inspect and consume the oldest frame atomically (zero copy).
+    pub fn pop_frame<R>(&self, inspect: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
+        let mut state = self.state.lock().expect("segment lock");
+        let Some((start, len)) = frame_bounds(&state)? else {
+            return Ok(None);
+        };
+        let result = inspect(&state.data[start..start + len]);
+        state.tail += len as u64 + 4;
+        if state.tail >= state.head {
+            state.tail = 0;
+            state.head = 0;
+        }
+        Ok(Some(result))
     }
 
     /// Release the oldest frame.
@@ -198,17 +214,9 @@ impl SharedMemoryTransport {
     /// Decode the next frame in place, without copying it out of the segment.
     pub fn recv_zero_copy(&mut self) -> Result<Option<Envelope>> {
         let limits = self.limits;
-        let decoded = self.segment.with_frame(|frame| {
-            let envelope = Envelope::decode_with(frame, limits);
-            (envelope, frame.len())
-        })?;
-        match decoded {
-            None => Ok(None),
-            Some((envelope, len)) => {
-                self.segment.advance(len);
-                Ok(Some(envelope?))
-            }
-        }
+        self.segment
+            .pop_frame(|frame| Envelope::decode_with(frame, limits))?
+            .transpose()
     }
 }
 

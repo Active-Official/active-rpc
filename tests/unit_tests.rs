@@ -398,7 +398,12 @@ fn channels_carry_messages_and_transfer_capabilities() {
     agent.subscribe(lane, channel).unwrap();
 
     let sequence = agent
-        .send(lane, channel, Value::text("hello"), std::slice::from_ref(&cap))
+        .send(
+            lane,
+            channel,
+            Value::text("hello"),
+            std::slice::from_ref(&cap),
+        )
         .unwrap();
     assert_eq!(sequence, 0);
     let message = agent.recv(channel).unwrap().expect("message");
@@ -406,8 +411,14 @@ fn channels_carry_messages_and_transfer_capabilities() {
     assert_eq!(message.caps, vec![cap.id()]);
     assert!(agent.recv(channel).unwrap().is_none());
 
-    // The transferred capability is still usable.
+    // Channel capability sharing is a borrow within one agent: the sender keeps
+    // its handle and the ids travel with the message.
     assert!(agent.call(lane, &cap, "stats", vec![]).is_ok());
+    assert_eq!(
+        message.caps,
+        vec![cap.id()],
+        "the message names the shared capability"
+    );
     assert!(agent
         .events()
         .iter()

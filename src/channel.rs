@@ -1,10 +1,15 @@
 //! Channels: named streams of messages and capability transfers.
 //!
-//! A channel is a typed, named stream between lanes (or between an agent and a
-//! peer). Direction is declared up front; a receive-only channel refuses sends,
-//! and a send-only channel refuses receives. Messages carry values and may carry
-//! capabilities, which the kernel transfers (moves) rather than copies, so a
-//! transferred capability leaves the sender.
+//! A channel is a typed, named stream between lanes of one agent. Direction is
+//! declared up front; a receive-only channel refuses sends, and a send-only
+//! channel refuses receives.
+//!
+//! Capabilities named in a message are **shared (borrowed)**, not copied or
+//! moved: the ids travel, the sender keeps its handles, and the receiver's
+//! authority is whatever its own kernel registry already holds. Across agents
+//! the same ids travel in an envelope's capability table and each receiver looks
+//! them up in its own registry — authority never transfers implicitly, which is
+//! why a channel message cannot inflate a reference count.
 
 use std::collections::{BTreeSet, VecDeque};
 
