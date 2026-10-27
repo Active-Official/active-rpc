@@ -255,6 +255,8 @@
 - R-12.2: `cargo audit` and `cargo deny` pass (one upstream unmaintained
   dependency accepted and documented); a CycloneDX SBOM is produced per release;
   tags are annotated.
-- Published: crates.io `active-rpc` 1.0.0; GitHub `Active-Official/active-rpc`
-  and `RatioArtificiosa/active-rpc` at tag `v1.0.0`.
+- Published: crates.io `active-rpc` 1.1.2 (1.1.0-1.1.2 are the review-driven hardening
+  releases, see `REVIEWS.md` and `CHANGELOG.md`); GitHub
+  `Active-Official/active-rpc` and `RatioArtificiosa/active-rpc` at tag `v1.1.2`
+  with a CycloneDX SBOM attached to the release.
 - Reserved names: `active-infinity-cli` 0.1.0 and `active-rpc-cli` 0.1.0.
