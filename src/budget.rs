@@ -136,6 +136,7 @@ pub struct BudgetMeter {
 }
 
 impl BudgetMeter {
+    /// Start a meter at zero usage against `budget`.
     pub fn new(budget: Budget) -> Self {
         Self {
             budget,
@@ -144,14 +145,17 @@ impl BudgetMeter {
         }
     }
 
+    /// The ceiling this meter enforces.
     pub fn budget(&self) -> &Budget {
         &self.budget
     }
 
+    /// Calls charged so far.
     pub fn calls(&self) -> u64 {
         self.calls
     }
 
+    /// Payload bytes charged so far.
     pub fn bytes(&self) -> u64 {
         self.bytes
     }

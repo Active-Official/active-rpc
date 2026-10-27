@@ -54,6 +54,7 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The wire byte for this kind. Codes are permanent.
     pub const fn code(self) -> u8 {
         match self {
             Kind::Request => 1,
@@ -63,6 +64,7 @@ impl Kind {
         }
     }
 
+    /// Parse a wire byte; an unknown kind is `None`, never a guess.
     pub const fn from_code(code: u8) -> Option<Kind> {
         match code {
             1 => Some(Kind::Request),

@@ -152,6 +152,10 @@ struct Job {
     state: JobState,
 }
 
+/// The deterministic kernel: providers, capabilities, budgets and promises.
+///
+/// It performs no I/O of its own; transports hand it envelopes and take the
+/// results back. Holding the kernel is the only way to reach a provider.
 pub struct Kernel {
     secret: [u8; 32],
     providers: BTreeMap<ProviderId, Box<dyn Provider>>,

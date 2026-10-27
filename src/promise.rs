@@ -38,6 +38,7 @@ pub enum PromiseState {
 }
 
 impl PromiseState {
+    /// Whether the promise has resolved, failed or been cancelled.
     pub fn is_settled(&self) -> bool {
         !matches!(self, PromiseState::Pending)
     }
@@ -46,7 +47,9 @@ impl PromiseState {
 /// Provider-side record of one promise.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromiseRecord {
+    /// Kernel-assigned identifier.
     pub id: PromiseId,
+    /// Current state (pending until the producing call settles).
     pub state: PromiseState,
     /// Calls waiting on this promise (derived, informational).
     pub waiters: u32,
@@ -55,6 +58,7 @@ pub struct PromiseRecord {
 }
 
 impl PromiseRecord {
+    /// Create a pending record for `id`, owned by `lane`.
     pub fn new(id: PromiseId, lane: u64) -> Self {
         Self {
             id,

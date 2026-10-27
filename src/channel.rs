@@ -40,10 +40,12 @@ pub enum Direction {
 }
 
 impl Direction {
+    /// Whether this direction permits sending.
     pub fn can_send(self) -> bool {
         matches!(self, Direction::Send | Direction::Both)
     }
 
+    /// Whether this direction permits receiving.
     pub fn can_receive(self) -> bool {
         matches!(self, Direction::Receive | Direction::Both)
     }
@@ -65,12 +67,16 @@ pub struct Message {
 /// A named channel.
 #[derive(Debug, Clone)]
 pub struct Channel {
+    /// Kernel-assigned identifier.
     pub id: ChannelId,
+    /// The name a peer subscribes by.
     pub name: String,
+    /// Which ways messages may flow.
     pub direction: Direction,
     queue: VecDeque<Message>,
     next_sequence: u64,
     closed: bool,
+    /// Lanes subscribed to this channel.
     pub subscribers: BTreeSet<u64>,
     /// Total messages sent (including those already received).
     pub sent: u64,
@@ -79,6 +85,7 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// Create an open channel with an empty queue.
     pub fn new(id: ChannelId, name: impl Into<String>, direction: Direction) -> Self {
         Self {
             id,
@@ -143,10 +150,12 @@ impl Channel {
     }
 
     /// Number of queued messages.
+    /// Messages waiting in the queue.
     pub fn len(&self) -> usize {
         self.queue.len()
     }
 
+    /// Whether the queue holds no messages.
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -156,6 +165,7 @@ impl Channel {
         self.closed = true;
     }
 
+    /// Whether the channel has been closed.
     pub fn is_closed(&self) -> bool {
         self.closed
     }

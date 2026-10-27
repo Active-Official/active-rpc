@@ -47,7 +47,6 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
-#![allow(missing_docs)] // item-level docs live in the specs; see docs/spec/wire.md
 
 pub mod budget;
 pub mod cap;

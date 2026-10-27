@@ -65,6 +65,7 @@ impl Default for ModuleProvider {
 }
 
 impl ModuleProvider {
+    /// Create an empty provider with no modules installed.
     pub fn new() -> Self {
         Self {
             modules: BTreeMap::new(),

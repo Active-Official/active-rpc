@@ -1,5 +1,21 @@
 # Changelog — Active RPC
 
+## 1.1.5 — 2026-10-27
+
+Documentation-only release: no API, wire-format or behavior change.
+
+- **The documentation gate is real again.** `#![deny(missing_docs)]` was
+  cancelled by an `#![allow(missing_docs)]` left over from earlier scaffolding,
+  so the published docs could regress silently. The allow is gone and the 27
+  public items it was hiding are documented, so `cargo doc` fails the build on an
+  undocumented item.
+- **README states the MSRV** (1.88) and points at ADR-0007.
+- **ADR-0007 records the one advisory ignore** (RUSTSEC-2024-0449, `unsafe-libyaml`
+  via `active-core`'s `serde_yaml`), matching `deny.toml` and the changelog.
+- **The framing fuzz target asserts the decoder's own capability ceiling**
+  (`WireLimits::default().max_caps`) instead of a looser constant, and the
+  release-signing example names the current release tag.
+
 ## 1.1.4 — 2026-10-27
 
 - **An unmaintained dependency is gone.** `rustls-pemfile` was declared for the

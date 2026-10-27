@@ -102,6 +102,12 @@ flakes — and why a transport is a thin adapter (ADR-0002).
 `--no-default-features` builds every transport except QUIC (in-process, TCP,
 shared memory, Connect bridge).
 
+## Minimum supported Rust
+
+MSRV 1.88 (`rust-version` in `Cargo.toml`; ADR-0007 records why the QUIC
+transport's patched `time` sets the floor). `active-infinity` itself supports
+1.85.
+
 ## Testing
 
 ```bash

@@ -38,7 +38,7 @@ dependency, works on every platform, and is the format GitHub displays as
 git config gpg.format ssh
 git config user.signingkey "$HOME/.ssh/active-release-signing.pub"
 git config tag.gpgsign true
-git tag -s -m "active-rpc 1.1.3" v1.1.3
+git tag -s -m "active-rpc 1.1.4" v1.1.4
 git push --follow-tags
 ```
 

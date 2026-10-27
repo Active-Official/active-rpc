@@ -315,6 +315,7 @@ impl CapHandle {
         }
     }
 
+    /// The capability id this handle refers to.
     pub fn id(&self) -> CapId {
         self.id
     }

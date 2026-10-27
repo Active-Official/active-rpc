@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
 
     // 2. Capability tables: independent entry point, same rules.
     if let Ok(caps) = decode_capability_table(data) {
-        assert!(caps.len() <= 1 << 20);
+        assert!(caps.len() <= WireLimits::default().max_caps as usize);
         for cap in &caps {
             assert_ne!(cap.budget.max_calls, 0, "a decoded budget must be finite");
         }

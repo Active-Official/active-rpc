@@ -23,8 +23,11 @@ impl std::fmt::Display for LaneId {
 /// A lane's state.
 #[derive(Debug, Clone)]
 pub struct Lane {
+    /// Kernel-assigned identifier.
     pub id: LaneId,
+    /// The name the caller chose.
     pub name: String,
+    /// The lane's own call and byte ceiling.
     pub budget: Budget,
     /// Calls issued by this lane that have not completed.
     pub pending: u32,
@@ -41,6 +44,7 @@ pub struct Lane {
 }
 
 impl Lane {
+    /// Create an open lane with its own budget.
     pub fn new(id: LaneId, name: impl Into<String>, budget: Budget) -> Self {
         Self {
             id,

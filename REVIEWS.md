@@ -52,3 +52,40 @@ Six new findings, all fixed in 1.1.2:
 ## Round 4 — 2026-10-27
 
 Verification round: **NO NEW FINDINGS**.
+
+## Round 5 — 2026-10-27 (1.1.4)
+
+Review of `v1.1.2..HEAD` (releases 1.1.3 and 1.1.4). No `src/` or `tests/` code
+changed in the range; the review covered dependencies, feature wiring, CI and the
+documents those releases claim. Five findings, all fixed:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| `CHANGELOG.md` claimed `cargo deny check` passes with no advisory ignores, while `deny.toml` carries one | medium | fixed: the text names RUSTSEC-2024-0449 (`unsafe-libyaml` via `active-core`'s `serde_yaml`, outside every parsing path) |
+| `fuzz/README.md` container example pinned `rust:1.85-bookworm`, below the declared 1.88 MSRV | low | fixed: `rust:1.88-bookworm` |
+| `CONTRIBUTING.md` patch example closed a fence with a mangled `` ``n `` | low | fixed |
+| CI: the fuzz job's toolchain and graph were unpinned, and the MSRV job skipped `--no-default-features` | low | fixed: the fuzz graph is the committed `fuzz/Cargo.lock` (documented rolling nightly), and the MSRV job checks both feature sets |
+| `docs/release-signing.md` verify example still named `v1.1.3`, and one sentence read "a `allowed_signers`" | low | fixed: `v1.1.4`, grammar corrected |
+
+Verified in the same round: `rustls-pemfile` removal is safe (no code reference;
+the QUIC transport uses quinn/rustls/rcgen directly), the feature list is complete,
+the MSRV claim holds for the committed lockfile, no public API or wire behavior
+changed (empty `src` diff), and the signing instructions match the keys and
+commands that actually verify.
+
+## Round 6 — 2026-10-27 (1.1.5)
+
+Verification of round 5, plus a whole-repository pass. Six findings, all fixed:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| `#![deny(missing_docs)]` was cancelled by `#![allow(missing_docs)]`, so the documentation gate was off | medium | fixed: the allow is gone and all 27 hidden items are documented; `cargo doc` is part of the gates |
+| ADR-0007 said `cargo deny` must pass with no advisory ignores while `deny.toml` carries one | medium | fixed: the ADR names RUSTSEC-2024-0449 and why it is out of the parsing path |
+| The MSRV job's no-default-features check skipped `--all-targets` | low | fixed |
+| README did not state the 1.88 MSRV | low | fixed (new section, links ADR-0007) |
+| The framing fuzz target asserted `caps.len() <= 1 << 20` while the decoder caps at 256 | low | fixed: the assertion uses `WireLimits::default().max_caps` |
+| The signing example still named `v1.1.3` | low | fixed: `v1.1.4`; the doc now tracks the current release |
+
+No capability-forgery, secret-leak or budget-bypass path was found in `src/`;
+the reviewer ran `cargo fmt --check`, `cargo deny check`, `cargo test --locked`
+and confirmed the workflow parses.
