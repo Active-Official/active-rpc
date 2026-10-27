@@ -1,0 +1,13 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/benches/target
+**/*.rs.bk
+.scratch/coverage
+*.profraw
+*.pdb
+.DS_Store
+
+/.scratch/
+
