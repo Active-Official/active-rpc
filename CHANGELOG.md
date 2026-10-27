@@ -1,5 +1,14 @@
 # Changelog — Active RPC
 
+## 1.1.3 — 2026-10-27
+
+- **A fresh clone builds.** The dependency on `active-infinity` is the published
+  crate (now 1.2.0) instead of a path into a sibling repository, so `git clone`
+  followed by `cargo test` works with no extra checkout. Co-development is
+  documented in `CONTRIBUTING.md` with a `[patch.crates-io]` override.
+- **Fuzzing runs in CI.** The framing target is built and run on every push, not
+  only on a manual dispatch.
+
 ## 1.1.2 — 2026-10-27
 
 - **No preallocation from untrusted counts.** List/map values and the standalone
@@ -11,7 +20,7 @@
   capability; it does not keep it alive, matching the documented borrow
   semantics.
 - **A destroyed lane cannot send.** send refuses a closed lane like call does.
-- **Attenuation validates the budget.** ttenuate/ttenuate_lane refuse a zero
+- **Attenuation validates the budget.** `attenuate`/`attenuate_lane` refuse a zero
   ceiling instead of minting an unbounded grant.
 
 ## 1.1.1 — 2026-10-27

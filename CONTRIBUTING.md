@@ -9,7 +9,7 @@
 
 ## Working against an unreleased Active Infinity
 
-The crate depends on the published ctive-infinity so a fresh clone builds on its
+The crate depends on the published `active-infinity` so a fresh clone builds on its
 own. To iterate on both repositories together, add a local patch (not committed):
 
 ``toml
