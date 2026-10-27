@@ -40,5 +40,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: "Package (no verify, path dependency on active-infinity)"
-        run: cargo package --no-verify --allow-dirty
+      - name: Package
+        run: cargo package
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install clang (libFuzzer runtime)
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed the corpus with a well-formed envelope
+        run: |
+          mkdir -p fuzz/corpus/framing
+          printf '415250310101000001000000000000000400000070696e67000000000000000000000000' | xxd -r -p > fuzz/corpus/framing/ping.arp1
+      - name: Bounded fuzz campaign
+        run: cargo fuzz run framing -- -runs=20000
