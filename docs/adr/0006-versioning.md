@@ -22,6 +22,8 @@ channels and tool adapters.
 3. The envelope version byte changes only for an incompatible layout change.
    Kind, flag, argument, value and error codes are permanent.
 4. MSRV is 1.85, matching Active Infinity and the Active workspace.
+   *(Superseded by [ADR-0007](0007-msrv.md): the QUIC transport's patched
+   `time` requires 1.88.)*
 5. Publishing: `cargo publish --dry-run`, then publish, then push the same tag to
    both organizations' remotes. A published version is never yanked without an
    ADR.

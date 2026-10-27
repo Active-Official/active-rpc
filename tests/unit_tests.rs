@@ -585,3 +585,53 @@ fn events_record_the_dispatch_batches() {
     assert!(matches!(batches[0], Event::BatchDispatched { jobs: 1, .. }));
     let _ = BTreeMap::<u8, u8>::new();
 }
+
+/// Closing a channel stops sends but not the drain: messages already queued stay
+/// receivable, which is what the documented behavior promises.
+#[test]
+fn close_stops_sends_but_queued_messages_remain_receivable() {
+    use active_rpc::{Channel, ChannelId, Direction, LaneId, Value};
+    let mut channel = Channel::new(ChannelId(1), "demo", Direction::Both);
+    channel
+        .send(LaneId(7), Value::Int(1), Vec::new())
+        .expect("open channel accepts a send");
+    channel.close();
+    assert!(channel.is_closed());
+    assert!(
+        channel.send(LaneId(7), Value::Int(2), Vec::new()).is_err(),
+        "a closed channel refuses new sends"
+    );
+    let message = channel
+        .recv()
+        .expect("draining is allowed")
+        .expect("the queued message is still there");
+    assert_eq!(message.payload, Value::Int(1));
+    assert!(channel.recv().expect("drained").is_none());
+}
+
+/// The MCP handshake is not a tool invocation, and discovery still works on a
+/// transport that answers both handshake methods.
+#[test]
+fn mcp_handshake_is_not_counted_as_a_tool_call() {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+    use std::collections::BTreeMap;
+
+    let mut responses = BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo back"}]}}"#
+            .to_string(),
+    );
+    let session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
+    assert_eq!(session.tools().len(), 1);
+    assert_eq!(
+        session.calls, 0,
+        "only tool invocations count, not the handshake"
+    );
+    assert!(session.policy().allowed.contains("echo"));
+}

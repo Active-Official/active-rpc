@@ -229,7 +229,9 @@
   → PROPOSAL §15.
 
 - [x] **R-13.3** Runnable examples for agents.  
-  → examples/.
+  → `examples/loopback.rs` (`cargo run --example loopback`): a capability, a
+  lane, two domain calls, a drop notification and a method the capability does
+  not grant.
 
 - [x] **R-13.4** Dual-publish preparation.  
   → MASTER-CHECKLIST Phase 6.

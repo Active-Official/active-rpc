@@ -1,5 +1,19 @@
 # Changelog — Active RPC
 
+## 1.1.7 — 2026-10-27
+
+No API or wire-format change.
+
+- **A runnable example.** `examples/loopback.rs` (`cargo run --example loopback`)
+  mints a capability, opens a lane, calls `stats` and `why`, shows the provider's
+  drop notification, and demonstrates a method the capability does not grant
+  being refused. The checklist entry for runnable examples now points at it.
+- **Documented behavior is pinned by tests.** `Channel::close` (sends stop, queued
+  messages stay receivable) and `McpSession::calls` (the handshake is not a tool
+  call) each have a test.
+- **ADR-0006 points at ADR-0007** for the MSRV change instead of leaving the old
+  number unqualified.
+
 ## 1.1.6 — 2026-10-27
 
 Documentation-only release: no API, wire-format or behavior change.

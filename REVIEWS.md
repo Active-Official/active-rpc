@@ -106,3 +106,18 @@ security or correctness issue in `src/`. Five documentation defects, all fixed:
 
 Verified in the same round: `fmt`, `clippy -D warnings`, `deny`, `test --locked`
 and `doc` all pass; no `unsafe` and no `TODO` in `src/`.
+
+## Round 8 — 2026-10-27 (1.1.7)
+
+Verification of round 7 found four low items; all fixed in 1.1.7:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| ADR-0006 stated MSRV 1.85 with no pointer to its successor | low | fixed: points at ADR-0007 |
+| The new `Channel::close` doc had no test | low | fixed: `close_stops_sends_but_queued_messages_remain_receivable` |
+| `McpSession::calls` semantics had no test | low | fixed: `mcp_handshake_is_not_counted_as_a_tool_call` |
+| `examples/` was empty while the checklist claimed runnable examples | low | fixed: `examples/loopback.rs`, checklist repointed |
+
+## Round 9 — 2026-10-27 (1.1.7)
+
+Verification round: **NO NEW FINDINGS**.
