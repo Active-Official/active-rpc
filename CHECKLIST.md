@@ -14,7 +14,7 @@
 - [x] **R-0.1** Initialize crate `active-rpc` with scaffold folder layout.  
   → PROPOSAL §1; MASTER-CHECKLIST M-0.1.
 
-- [x] **R-0.2** `Cargo.toml` (name `active-rpc`, dual license, both repository URLs, MSRV 1.85).  
+- [x] **R-0.2** `Cargo.toml` (name `active-rpc`, dual license, both repository URLs, MSRV 1.88).  
   → MASTER-PROPOSAL §6.
 
 - [x] **R-0.3** LICENSE files, README, CONTRIBUTING, CODE_OF_CONDUCT, SECURITY, AGENTS.md.  

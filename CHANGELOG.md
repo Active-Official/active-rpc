@@ -1,5 +1,20 @@
 # Changelog — Active RPC
 
+## 1.1.4 — 2026-10-27
+
+- **An unmaintained dependency is gone.** `rustls-pemfile` was declared for the
+  QUIC feature but never used; it is removed, which clears advisory
+  RUSTSEC-2025-0134.
+- **MSRV is 1.88.** The patched `time` (RUSTSEC-2026-0009, stack exhaustion while
+  parsing RFC 2822 dates) and `proptest` 1.12 both require rustc 1.88; keeping
+  1.85 would mean pinning the vulnerable release. `rust-version` and the CI MSRV
+  job now say 1.88, and ADR-0007 records the reasoning. Active Infinity keeps its
+  1.85 floor.
+- **CI tests the committed dependency graph.** Every job runs with `--locked`,
+  the MSRV job builds every feature and every target, the fuzz job runs on
+  pushes as well as pull requests, and the package job verifies the tarball.
+  `cargo deny check` passes with no advisory ignores.
+
 ## 1.1.3 — 2026-10-27
 
 - **A fresh clone builds.** The dependency on `active-infinity` is the published

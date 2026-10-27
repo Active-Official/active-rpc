@@ -17,31 +17,33 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy (all targets)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
       - name: Tests (no default features)
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
       - name: Documentation
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps --all-features
 
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - name: MSRV check
-        run: cargo check
+      - uses: dtolnay/rust-toolchain@1.88.0
+      # 1.88 is the floor because the patched `time` (RUSTSEC-2026-0009) and
+      # `proptest` 1.12 both require it; see docs/adr/0007-msrv.md.
+      - name: MSRV check (every feature, every target)
+        run: cargo check --locked --all-targets --all-features
 
   package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Package
-        run: cargo package
+      - name: Package (the tarball must build on its own)
+        run: cargo package --locked
 
   fuzz:
     runs-on: ubuntu-latest

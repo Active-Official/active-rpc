@@ -8,3 +8,4 @@
 | [0004](0004-capability-ids.md) | Capability identity, attenuation and lifetime |
 | [0005](0005-promises.md) | Promises, batching and what "pipelined" measures |
 | [0006](0006-versioning.md) | Versioning and publishing |
+| [0007](0007-msrv.md) | Minimum supported Rust version 1.88 |
