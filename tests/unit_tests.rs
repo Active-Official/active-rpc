@@ -552,7 +552,8 @@ fn tool_policy_is_enforced_on_tool_calls() {
     let provider_id = agent.register(Box::new(Echo));
     let lane = agent.create_lane("main", Budget::default()).unwrap();
     let mut policy = ToolPolicy::allow(&["echo"]);
-    policy.max_arg_bytes = 3;
+    // Wire size of Arg::text("ok") is 7 bytes (tag + length + text).
+    policy.max_arg_bytes = 8;
     let cap = agent
         .mint(
             provider_id,

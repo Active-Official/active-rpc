@@ -375,6 +375,20 @@ fn threat_argument_bombs_in_memory_budget() {
             .code(),
         "rpc/tool-policy"
     );
+    // Nested shapes count too: a list of texts cannot smuggle bytes past the
+    // policy by hiding them one level down.
+    assert_eq!(
+        agent
+            .call(
+                lane,
+                &cap,
+                "echo",
+                vec![Arg::Value(Value::list(vec![Value::text("0123456789")]))]
+            )
+            .unwrap_err()
+            .code(),
+        "rpc/tool-policy"
+    );
 }
 
 // ---------------------------------------------------------------------------

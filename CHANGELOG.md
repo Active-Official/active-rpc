@@ -1,5 +1,11 @@
 # Changelog — Active RPC
 
+## 1.1.1 — 2026-10-27
+
+- **Tool payload ceiling counts every argument shape.** max_arg_bytes is compared
+  against the recursive wire size of the arguments, so a nested list or map can no
+  longer hide bytes one level down while the call budget sees them.
+
 ## 1.1.0 — 2026-10-27
 
 Security and correctness fixes from the independent review. The wire format

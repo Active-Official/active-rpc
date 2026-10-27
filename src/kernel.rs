@@ -595,14 +595,9 @@ impl Agent {
             if !policy.allowed.contains(method) {
                 return Err(Error::ToolPolicy("tool not allowed"));
             }
-            let bytes: u64 = args
-                .iter()
-                .map(|arg| match arg {
-                    Arg::Value(Value::Text(text)) => text.len() as u64,
-                    Arg::Value(Value::Module(bytes)) => bytes.len() as u64,
-                    _ => 0,
-                })
-                .sum();
+            // Count every argument shape, recursively: a nested list or map
+            // must not slip past the tool's payload ceiling.
+            let bytes: u64 = args.iter().map(Arg::wire_size).sum();
             if bytes > policy.max_arg_bytes {
                 return Err(Error::ToolPolicy("argument too large"));
             }
