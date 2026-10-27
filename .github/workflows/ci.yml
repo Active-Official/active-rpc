@@ -40,5 +40,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Package (no verify: path dependency on active-infinity)
+      - name: "Package (no verify, path dependency on active-infinity)"
         run: cargo package --no-verify --allow-dirty
