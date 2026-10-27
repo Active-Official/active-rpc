@@ -616,3 +616,73 @@ fn review_provider_may_call_back_into_the_agent() {
     assert_eq!(promise.value().unwrap(), Value::text("pong"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn review_capability_table_count_is_capped_before_allocating() {
+    // Four bytes claiming a million descriptors must not allocate a million
+    // entries.
+    let mut bytes = (1_000_000u32).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&[0u8; 32]);
+    let error = active_rpc::wire::decode_capability_table(&bytes).unwrap_err();
+    assert_eq!(error.code(), "rpc/capability-table");
+}
+
+#[test]
+fn review_channel_shares_capabilities_without_holding_them_alive() {
+    let (agent, provider_id, cap, lane) = setup();
+    let channel = agent
+        .create_channel("share", active_rpc::channel::Direction::Both)
+        .unwrap();
+    agent
+        .send(
+            lane,
+            channel,
+            Value::text("hello"),
+            std::slice::from_ref(&cap),
+        )
+        .unwrap();
+    // Dropping the only handle releases it even though a message names it.
+    drop(cap);
+    let drops = agent.take_drops(provider_id);
+    assert_eq!(drops.len(), 1, "the message must not retain a reference");
+}
+
+#[test]
+fn review_closed_lane_cannot_send() {
+    let (agent, _provider, _cap, lane) = setup();
+    let channel = agent
+        .create_channel("out", active_rpc::channel::Direction::Send)
+        .unwrap();
+    agent.destroy_lane(lane).unwrap();
+    let error = agent
+        .send(lane, channel, Value::text("late"), &[])
+        .unwrap_err();
+    assert_eq!(error.code(), "rpc/unknown-lane");
+}
+
+#[test]
+fn review_attenuation_validates_the_budget() {
+    let (agent, _provider, cap, _lane) = setup();
+    let error = agent
+        .attenuate(
+            &cap,
+            CapAttrs::new(&["stats"]).with_budget(Budget {
+                max_calls: 0,
+                ..Budget::default()
+            }),
+        )
+        .expect_err("a zero ceiling is not a budget");
+    assert_eq!(error.code(), "rpc/invalid-argument");
+
+    let lane = agent.create_lane("lane", Budget::default()).unwrap();
+    let error = agent
+        .attenuate_lane(
+            lane,
+            Budget {
+                max_bytes: 0,
+                ..Budget::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "rpc/invalid-argument");
+}

@@ -140,17 +140,19 @@ impl BridgeServer {
             write_http_response(&mut stream, 404, b"rpc/not-found")?;
             return Ok(0);
         }
-        let content_length = head
-            .iter()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                if name.eq_ignore_ascii_case("content-length") {
-                    value.trim().parse::<usize>().ok()
-                } else {
-                    None
-                }
-            })
-            .ok_or(Error::Wire("missing content-length"))?;
+        let Some(content_length) = head.iter().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        }) else {
+            // A malformed request is a 400 for that connection, not a server
+            // failure: `serve` must keep accepting.
+            write_http_response(&mut stream, 400, b"rpc/wire")?;
+            return Ok(1);
+        };
         if content_length > MAX_BODY {
             write_http_response(&mut stream, 413, b"rpc/wire")?;
             return Ok(0);
@@ -171,9 +173,10 @@ impl BridgeServer {
             return Ok(0);
         }
         let mut body = vec![0u8; content_length];
-        reader
-            .read_exact(&mut body)
-            .map_err(|error| Error::Transport(format!("body: {error}")))?;
+        if let Err(error) = reader.read_exact(&mut body) {
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            return Err(Error::Transport(format!("body: {error}")));
+        }
         let (message, rest) = match grpc_unframe(&body) {
             Ok(parts) => parts,
             Err(error) => {

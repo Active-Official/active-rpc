@@ -515,6 +515,38 @@ fn peer_reports_an_error_envelope_for_unknown_methods() {
 }
 
 #[test]
+fn connect_bridge_survives_a_request_without_content_length() {
+    use std::io::Write;
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let handle = std::thread::spawn(move || {
+        server
+            .serve(2, |envelope| {
+                Envelope::response(envelope.request_id, Value::text("ok"))
+            })
+            .expect("serve")
+    });
+
+    // A request with no content-length is a 400; the server keeps accepting.
+    let mut raw = std::net::TcpStream::connect(&address).expect("connect");
+    raw.write_all(b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: x\r\ncontent-type: application/connect+active-infinity\r\n\r\n")
+        .expect("write");
+    let mut reply = Vec::new();
+    use std::io::Read;
+    raw.read_to_end(&mut reply).expect("read");
+    let text = String::from_utf8_lossy(&reply);
+    assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+
+    let mut client = ConnectClient::connect(&address).expect("client");
+    let response = client
+        .call(&Envelope::request(1, "ping", vec![]))
+        .expect("call after the malformed request");
+    assert_eq!(response.first_value(), Some(&Value::text("ok")));
+    let served = handle.join().expect("join");
+    assert_eq!(served, 2);
+}
+
+#[test]
 fn tcp_transport_rejects_a_malformed_envelope() {
     let (listener, address) = active_rpc::transport::bind_loopback().expect("bind");
     let handle = std::thread::spawn(move || {

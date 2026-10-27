@@ -336,6 +336,7 @@ impl Agent {
         if record.revoked {
             return Err(Error::Revoked(u128::from_be_bytes(pad128(parent_id))));
         }
+        attrs.budget.check()?;
         let attrs = record.attrs.attenuate(attrs)?;
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
@@ -397,6 +398,7 @@ impl Agent {
 
     /// Attenuate a lane's budget.
     pub fn attenuate_lane(&self, lane: LaneId, budget: Budget) -> Result<()> {
+        budget.check()?;
         let mut kernel = self.cell.borrow_mut();
         let record = kernel
             .lanes
@@ -451,7 +453,8 @@ impl Agent {
     /// Subscribe a lane to a channel.
     pub fn subscribe(&self, lane: LaneId, channel: ChannelId) -> Result<()> {
         let mut kernel = self.cell.borrow_mut();
-        if !kernel.lanes.contains_key(&lane) {
+        let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+        if lane_record.closed {
             return Err(Error::UnknownLane(lane.0));
         }
         let record = kernel
@@ -474,7 +477,8 @@ impl Agent {
         caps: &[CapHandle],
     ) -> Result<u64> {
         let mut kernel = self.cell.borrow_mut();
-        if !kernel.lanes.contains_key(&lane) {
+        let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+        if lane_record.closed {
             return Err(Error::UnknownLane(lane.0));
         }
         let mut cap_ids = Vec::with_capacity(caps.len());
@@ -486,9 +490,10 @@ impl Agent {
             if record.revoked {
                 return Err(Error::Revoked(u128::from_be_bytes(pad128(cap.id()))));
             }
-            // A transfer moves the capability: the sender's reference is
-            // consumed by the message, which keeps the capability alive for
-            // the receiver.
+            // A channel shares (borrows) the capability: the id travels with
+            // the message and the sender keeps its handle. No reference is
+            // created, so a channel cannot keep a capability alive after its
+            // holder drops it (see `channel.rs`).
             cap_ids.push(cap.id());
         }
         let record = kernel
@@ -501,9 +506,6 @@ impl Agent {
             sequence: message.sequence,
         });
         for id in cap_ids {
-            if let Some(record) = kernel.caps.get_mut(&id) {
-                record.refs = record.refs.saturating_add(1);
-            }
             kernel.transfers += 1;
             kernel
                 .events

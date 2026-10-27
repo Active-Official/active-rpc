@@ -549,7 +549,9 @@ fn read_value_at(bytes: &[u8], cursor: &mut usize, depth: usize, budget: usize) 
             if count as usize > budget {
                 return Err(Error::Wire("list too long"));
             }
-            let mut items = Vec::with_capacity(count as usize);
+            // Never preallocate from an untrusted count: the loop grows the
+            // vector and stops when the input runs out.
+            let mut items = Vec::with_capacity((count as usize).min(1024));
             for _ in 0..count {
                 items.push(read_value_at(bytes, cursor, depth + 1, budget)?);
             }
@@ -637,10 +639,10 @@ fn read_cap(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<CapDes
 pub fn decode_capability_table(bytes: &[u8]) -> Result<Vec<CapDescriptor>> {
     let mut cursor = 0usize;
     let count = read_u32(bytes, &mut cursor)?;
-    if count > 1 << 20 {
+    if count > WireLimits::default().max_caps {
         return Err(Error::CapabilityTable("too many descriptors"));
     }
-    let mut caps = Vec::with_capacity(count as usize);
+    let mut caps = Vec::with_capacity((count as usize).min(64));
     for _ in 0..count {
         caps.push(read_cap(bytes, &mut cursor, 256)?);
     }

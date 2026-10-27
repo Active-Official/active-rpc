@@ -1,5 +1,19 @@
 # Changelog — Active RPC
 
+## 1.1.2 — 2026-10-27
+
+- **No preallocation from untrusted counts.** List/map values and the standalone
+  capability-table decoder grow from a small bound instead of trusting a 4-byte
+  count; the table decoder is capped by WireLimits::max_caps.
+- **The Connect bridge survives a malformed request.** A missing content length or a
+  short body is a 400 for that connection, not a server failure.
+- **Channel capability sharing no longer retains references.** A message names a
+  capability; it does not keep it alive, matching the documented borrow
+  semantics.
+- **A destroyed lane cannot send.** send refuses a closed lane like call does.
+- **Attenuation validates the budget.** ttenuate/ttenuate_lane refuse a zero
+  ceiling instead of minting an unbounded grant.
+
 ## 1.1.1 — 2026-10-27
 
 - **Tool payload ceiling counts every argument shape.** max_arg_bytes is compared
