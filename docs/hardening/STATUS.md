@@ -39,6 +39,24 @@ agreement is not.
 
 The machine-readable mapping is `docs/hardening/invariant-map.toml`.
 
+Invariants discovered in code comments and tests during the audit (now mapped):
+
+- `lane.rs`: queued calls count against lane capacity (I-8).
+- `cap.rs`: a borrowed channel capability must not create a strong reference
+  (I-7).
+- `tool.rs`: adapters inherit no ambient authority and are attenuation-only
+  (I-11).
+- `kernel.rs`: revocation is re-checked after queueing and before the provider
+  runs; tool payloads are capped (I-6, I-8).
+- `promise.rs`: a promise settles once and never twice (C-1).
+- `wire.rs`: every decode is bounded by `WireLimits`, including the capability
+  table count (I-8, I-10).
+
+Benchmarks: `benches/transport.rs` (115 lines, criterion) measures envelope
+encode/decode, in-process transport, shared-memory transport and a full
+call-and-run cycle. It is a benchmark, not a gate; no checked-in numbers exist
+yet (H4.3, H4.5).
+
 ### H0.2 Fuzz, corpus and coverage
 
 - One fuzz target (`framing`, 52 lines) covers envelope decode, capability table
