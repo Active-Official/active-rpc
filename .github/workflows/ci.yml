@@ -80,9 +80,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: Seed the corpus with a well-formed envelope
+      # The corpus is committed under fuzz/corpus/<target>/. A short campaign
+      # per target on every push and pull request; main and nightly run longer.
+      - name: Bounded fuzz campaign (every target)
         run: |
-          mkdir -p fuzz/corpus/framing
-          printf '415250310101000001000000000000000400000070696e67000000000000000000000000' | xxd -r -p > fuzz/corpus/framing/ping.arp1
-      - name: Bounded fuzz campaign
-        run: cargo fuzz run framing -- -runs=20000
+          for target in \
+            fuzz_arp1_frame \
+            fuzz_capability_lifecycle \
+            fuzz_promise_graph \
+            fuzz_budget_matrix \
+            fuzz_tool_mcp \
+            fuzz_tool_http \
+            fuzz_tool_process \
+            fuzz_channel_cap_transfer \
+            fuzz_transport_framing; do
+            echo "== $target =="
+            cargo fuzz run "$target" -- -runs=2000
+          done

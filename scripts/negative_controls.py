@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Prove that each security-critical check fails when its guard is removed.
 
-A test that passes on a broken build proves nothing. This runner creates a
-throwaway git worktree at HEAD, confirms every mapped check passes there, then
-applies one precise source mutation per control, runs the mapped check, and
-requires a real test failure (not a compile error). The worktree is removed
-afterwards, so the working tree is never touched.
+A test that passes on a broken build proves nothing. This runner copies the
+working tree (including uncommitted changes), confirms every mapped check
+passes there, then applies one precise source mutation per control, runs the
+mapped check, and requires a real test failure (not a compile error). The copy
+is removed afterwards, so the working tree is never touched.
 
 Usage:
     python scripts/negative_controls.py --check
@@ -63,6 +63,16 @@ CONTROLS = [
         "suite": "redteam_tests",
         "test": "review_revocation_after_queueing_prevents_invocation",
         "why": "The dispatch loop no longer re-checks revocation, so a revoked queued call reaches the provider.",
+    },
+    {
+        "id": "I-8-shm",
+        "invariant": "I-8",
+        "file": "src/transport/shm.rs",
+        "find": "            let tail_start = state.tail as usize % state.capacity;\n",
+        "replace": "            let tail_start = state.head as usize % state.capacity;\n",
+        "suite": "unit_tests",
+        "test": "shared_memory_compaction_survives_a_wrapped_ring",
+        "why": "Compaction reads from the head offset instead of the tail, so a wrapped ring panics.",
     },
     {
         "id": "I-8-bytes",
@@ -172,12 +182,17 @@ def main() -> int:
 
     failures: list[str] = []
     try:
-        added = run(
-            ["git", "worktree", "add", "--detach", str(tree), "HEAD"], root, env
+        # Copy the working tree, including uncommitted changes. A control must
+        # test the code under review, not the last commit; a git worktree would
+        # silently run the old tree and turn a new test into a vacuous pass.
+        shutil.copytree(
+            root,
+            tree,
+            ignore=shutil.ignore_patterns(
+                ".git", "target", "fuzz", ".scratch", "__pycache__"
+            ),
+            symlinks=True,
         )
-        if added.returncode != 0:
-            print(added.stdout + added.stderr, file=sys.stderr)
-            return 2
 
         print("== baseline: the unmutated checks must pass ==")
         for control in selected:
@@ -268,9 +283,8 @@ def main() -> int:
         return 0
     finally:
         if args.keep:
-            print(f"worktree kept at {tree}")
+            print(f"tree kept at {tree}")
         else:
-            run(["git", "worktree", "remove", "--force", str(tree)], root, env)
             shutil.rmtree(base, ignore_errors=True)
 
 

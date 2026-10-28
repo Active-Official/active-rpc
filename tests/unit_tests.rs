@@ -589,6 +589,40 @@ fn events_record_the_dispatch_batches() {
 /// Closing a channel stops sends but not the drain: messages already queued stay
 /// receivable, which is what the documented behavior promises.
 #[test]
+fn shared_memory_compaction_survives_a_wrapped_ring() {
+    use active_rpc::transport::shm::SharedSegment;
+
+    let segment = SharedSegment::new(1024);
+    let frame = vec![0x5a; 500];
+    segment.write(&frame).expect("first frame");
+    segment.write(&frame).expect("second frame");
+    // Consume the first frame: tail moves to 504 while head stays at 1008.
+    assert_eq!(segment.read().expect("read").expect("frame"), frame);
+    // The third write must compact the unread bytes from the *tail*. The old
+    // code copied from the head offset and panicked at 1008..1512.
+    segment.write(&frame).expect("compacting write");
+    assert_eq!(segment.read().expect("read").expect("frame"), frame);
+    assert_eq!(segment.read().expect("read").expect("frame"), frame);
+    assert!(segment.read().expect("read").is_none());
+}
+
+#[test]
+fn shared_memory_write_is_total_after_a_desynchronised_advance() {
+    use active_rpc::transport::shm::SharedSegment;
+
+    let segment = SharedSegment::new(1024);
+    let frame = vec![7u8; 100];
+    segment.write(&frame).expect("frame");
+    // A consumer that advances without a frame is misuse, but a safe public
+    // API must return an error rather than panic or corrupt the ring.
+    segment.advance(0);
+    let _ = segment.write(&frame);
+    let _ = segment.read();
+    let _ = segment.with_frame(|bytes| bytes.len());
+    let _ = segment.pop_frame(|bytes| bytes.len());
+}
+
+#[test]
 fn close_stops_sends_but_queued_messages_remain_receivable() {
     use active_rpc::{Channel, ChannelId, Direction, LaneId, Value};
     let mut channel = Channel::new(ChannelId(1), "demo", Direction::Both);

@@ -22,11 +22,11 @@ the bottom is generated from `docs/hardening/invariant-map.toml` by
 
 ### H0.1 Test inventory
 
-76 test functions across 6 integration-test binaries plus one doctest:
+78 test functions across 6 integration-test binaries plus one doctest:
 
 | Suite | Tests | What it proves |
 |---|---|---|
-| `tests/unit_tests.rs` | 22 | capability ids, attenuation, lane budgets, path scope, drop notification, revocation, promises, channels, wire round-trip, tool policy, events |
+| `tests/unit_tests.rs` | 24 | capability ids, attenuation, lane budgets, path scope, drop notification, revocation, promises, channels, wire round-trip, tool policy, events, shared-memory compaction |
 | `tests/integration_tests.rs` | 15 | domain operations, in-process/shm/Connect/QUIC/TCP transports, cross-process peer, redaction, budgeted evaluation |
 | `tests/concurrency_tests.rs` | 5 | lane interleaving, budget isolation, channel isolation, concurrent tools, two agents over TCP |
 | `tests/conformance_tests.rs` | 8 | golden envelope, re-encode stability, capability table shape, truncated prefixes, header attacks, error catalog, wire limits |
@@ -59,10 +59,11 @@ yet (H4.3, H4.5).
 
 ### H0.2 Fuzz, corpus and coverage
 
-- One fuzz target (`framing`, 52 lines) covers envelope decode, capability table
-  decode and the gRPC framing helper.
-- No committed corpus. CI writes one 28-byte ping envelope at run time.
-- Conformance cases are inline Rust, not files.
+- Nine targets cover framing, capability lifecycle, promises, budgets, MCP/HTTP/
+  process tools, channels and transport framing.
+- Corpora are committed under `fuzz/corpus/<target>/` (26 seeds).
+- Conformance cases are inline Rust; the framing corpus adds the same shape as
+  files.
 - Coverage (all features, Windows x86_64): 67.53% regions, 68.52% lines,
   58.62% functions. Full table in `docs/hardening/CORPUS.md`.
 - Weakest surfaces: `tool.rs` 17.61% regions / 16.02% lines (MCP, HTTP, process
@@ -119,6 +120,7 @@ removed afterwards; the working tree is never modified.
 | `I-5-attenuation` | I-5 | method-subset check removed | `attenuation_narrows_and_never_widens` |
 | `I-6-dispatch` | I-6 | dispatch revocation re-check removed | `review_revocation_after_queueing_prevents_invocation` |
 | `I-8-bytes` | I-8 | per-call ceiling and meter charge removed | `review_byte_budget_is_charged` |
+| `I-8-shm` | I-8 | compaction reads from the head offset | `shared_memory_compaction_survives_a_wrapped_ring` |
 | `I-10-trailing` | I-10 | trailing-byte check removed | `wire_rejects_malformed_envelopes` |
 | `C-1-settlement` | C-1 | promise accepts a second settlement | `promise_can_be_cancelled_or_resolved_once` |
 
@@ -131,14 +133,14 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
 | `cargo fmt --all -- --check` | pass | local run 2026-10-27 |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | pass | local run 2026-10-27 |
 | `cargo clippy --locked --all-targets --no-default-features -- -D warnings` | pass | local run 2026-10-27 |
-| `cargo test --locked --all-features` | pass (76 tests + doctest) | local run + CI |
-| `cargo test --locked --no-default-features` | pass (75 tests + doctest) | local run + CI |
+| `cargo test --locked --all-features` | pass (78 tests + doctest) | local run + CI |
+| `cargo test --locked --no-default-features` | pass (77 tests + doctest) | local run + CI |
 | `cargo doc` with `RUSTDOCFLAGS=-D warnings` | pass | local run 2026-10-27 |
 | `cargo package --locked` | pass | local run 2026-10-27 |
 | `cargo audit` | pass (1 allowed warning) | local run 2026-10-27 |
 | `cargo deny check` | pass | local run 2026-10-27 |
-| Fuzz smoke (20k runs) | pass | CI run 40559854293 |
-| Negative controls (7) | pass | local run 2026-10-27; CI job `negative-controls` |
+| Fuzz campaigns (9 targets, 10k runs) | pass | Docker run 2026-10-27; CI job `fuzz` runs 2k per target |
+| Negative controls (8) | pass | local run 2026-10-27; CI job `negative-controls` |
 | GitHub Actions on `69acea8` | success | run 40559854293 |
 
 ## Ordered next steps
@@ -182,7 +184,7 @@ Not signed. H0 is complete; H1–H9 remain.
 
 **Repository:** `active-rpc` **version:** `1.1.9` **baseline commit:** `69acea89bd03a9a69ff88cdd6dd8d12560a2d210` **baseline tag:** `hardening-baseline` **measured:** 2026-10-27
 
-Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 23 done, 55 partial, 62 gap, 20 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 81.
+Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 34 done, 55 partial, 51 gap, 20 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 92.
 
 | Invariant | Meaning | Status | Checks | Negative control |
 |---|---|---|---|---|
@@ -193,7 +195,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 23 
 | **I-5** | Attenuation only narrows | `covered` | 7 | implemented |
 | **I-6** | Revocation at dispatch | `covered` | 5 | implemented |
 | **I-7** | Drop notification | `covered` | 2 | - |
-| **I-8** | Hard budgets | `covered` | 9 | implemented |
+| **I-8** | Hard budgets | `covered` | 12 | implemented |
 | **I-9** | Deterministic canonicalization | `covered` | 4 | - |
 | **I-10** | Fail-closed validation | `covered` | 8 | implemented |
 | **I-11** | No ambient authority | `covered` | 4 | - |
@@ -203,7 +205,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 23 
 | Item | Checklist item | Status | Evidence |
 |---|---|---|---|
 | **H0.1** | Inventory all existing tests as an invariant-to-test matrix | `done` | `script:scripts/hardening_status.py` |
-| **H0.2** | Inventory fuzz targets, corpus sizes and coverage snapshots | `done` | `doc:docs/hardening/CORPUS.md`, `fuzz:framing` |
+| **H0.2** | Inventory fuzz targets, corpus sizes and coverage snapshots | `done` | `doc:docs/hardening/CORPUS.md`, `fuzz:fuzz_arp1_frame` |
 | **H0.3** | Inventory ADRs, SECURITY, REVIEWS, security and performance specs | `done` | `doc:docs/hardening/STATUS.md` |
 | **H0.4** | Confirm license, MSRV, advisories, signing and publish status | `done` | `gate:audit`, `gate:deny` |
 | **H0.5** | Tag a hardening baseline | `done` | `gate:baseline-tag` |
@@ -216,22 +218,22 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 23 
 | **H1.6** | fuzz_secret_positions | `n/a` | - |
 | **H1.7** | fuzz_unit_discriminants | `n/a` | - |
 | **H1.8** | fuzz_projection_agreement | `n/a` | - |
-| **H1.9** | fuzz_arp1_frame: envelope and capability table malformations | `partial` | `fuzz:framing` |
-| **H1.10** | fuzz_capability_lifecycle | `gap` | - |
-| **H1.11** | fuzz_promise_graph | `gap` | - |
-| **H1.12** | fuzz_budget_matrix | `gap` | - |
-| **H1.13** | fuzz_tool_mcp | `gap` | - |
-| **H1.14** | fuzz_tool_http | `gap` | - |
-| **H1.15** | fuzz_tool_process | `gap` | - |
-| **H1.16** | fuzz_channel_cap_transfer | `gap` | - |
-| **H1.17** | fuzz_transport_framing | `gap` | - |
-| **H1.18** | Seed corpus = vectors, examples, almost-valid frames; document classes | `gap` | - |
-| **H1.19** | Every fixed bug adds a minimized seed | `gap` | - |
-| **H1.20** | CI fuzz budget on PRs, longer on main/nightly, fail on regression | `partial` | `fuzz:framing` |
+| **H1.9** | fuzz_arp1_frame: envelope and capability table malformations | `partial` | `fuzz:fuzz_arp1_frame` |
+| **H1.10** | fuzz_capability_lifecycle | `done` | `fuzz:fuzz_capability_lifecycle` |
+| **H1.11** | fuzz_promise_graph | `done` | `fuzz:fuzz_promise_graph` |
+| **H1.12** | fuzz_budget_matrix | `done` | `fuzz:fuzz_budget_matrix` |
+| **H1.13** | fuzz_tool_mcp | `done` | `fuzz:fuzz_tool_mcp` |
+| **H1.14** | fuzz_tool_http | `done` | `fuzz:fuzz_tool_http` |
+| **H1.15** | fuzz_tool_process | `done` | `fuzz:fuzz_tool_process` |
+| **H1.16** | fuzz_channel_cap_transfer | `done` | `fuzz:fuzz_channel_cap_transfer` |
+| **H1.17** | fuzz_transport_framing | `done` | `fuzz:fuzz_transport_framing` |
+| **H1.18** | Seed corpus = vectors, examples, almost-valid frames; document classes | `done` | `doc:docs/hardening/CORPUS.md` |
+| **H1.19** | Every fixed bug adds a minimized seed | `done` | `doc:docs/hardening/CORPUS.md` |
+| **H1.20** | CI fuzz budget on PRs, longer on main/nightly, fail on regression | `partial` | `fuzz:fuzz_arp1_frame` |
 | **H1.21** | Optional public sanitized corpus | `gap` | - |
 | **H1.22** | 32-bit target build and test lane | `gap` | - |
 | **H1.23** | Differential canonicalization oracle | `n/a` | - |
-| **H1.24** | fuzz_tool_policy: adversarial policy descriptors and tool calls | `gap` | - |
+| **H1.24** | fuzz_tool_policy: adversarial policy descriptors and tool calls | `done` | `fuzz:fuzz_tool_mcp`, `fuzz:fuzz_tool_http`, `fuzz:fuzz_tool_process` |
 | **H2.0** | Scripted negative controls prove each security-critical check fails on a broken build | `done` | `gate:negative-controls` |
 | **H2.1** | Integer overflow and underflow in length and offset arithmetic | `partial` | `test:tests/conformance_tests.rs::header_field_attacks_are_rejected`, `test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected` |
 | **H2.2** | Overlapping and out-of-bounds sections | `n/a` | - |
@@ -333,7 +335,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 23 
 | **R-4** | Every finding becomes a test, item, ADR or n/a note | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
 | **D1.1** | At least 15 historical parser bugs with identifiers | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
 | **D1.2** | Map each historical bug to the wire decoder | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **D1.3** | Add a test or fuzz oracle per mapped class | `partial` | `fuzz:framing` |
+| **D1.3** | Add a test or fuzz oracle per mapped class | `partial` | `fuzz:fuzz_arp1_frame` |
 | **D1.4** | Differential parsing and second checker | `gap` | - |
 | **D2.1** | At least 10 capability or RPC authz failure patterns | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
 | **D2.2** | Map authz patterns to kernel, cap, channel, tool, transport | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
@@ -344,7 +346,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 23 
 | **D3.3** | Anti-oracle equality in debug and optimized builds | `n/a` | - |
 | **D3.4** | Stable error codes do not branch on secret-dependent data | `gap` | - |
 | **D4.1** | Compare fuzz targets to structure-aware state of the art | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **D4.2** | Semantic oracles, not only crash oracles | `partial` | `fuzz:framing` |
+| **D4.2** | Semantic oracles, not only crash oracles | `partial` | `fuzz:fuzz_arp1_frame` |
 | **D4.3** | Directed seeds for cold paths | `gap` | - |
 | **D4.4** | Corpus growth and minimize-and-commit policy | `partial` | `doc:docs/hardening/CORPUS.md` |
 | **D5.1** | Map classic DoS classes to budget dimensions | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
@@ -379,7 +381,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 23 
 - `test:tests/redteam_tests.rs::review_module_payloads_are_redacted`
 - `test:tests/integration_tests.rs::redaction_hides_the_secret_cone`
 - `test:tests/unit_tests.rs::response_and_error_envelopes_carry_no_payload`
-- `fuzz:framing` — fuzz/fuzz_targets/framing.rs
+- `fuzz:fuzz_arp1_frame` — fuzz/fuzz_targets/fuzz_arp1_frame.rs
 
 Negative control (implemented): Make Kernel::redact_module_payload a no-op and run the redaction tests → expected: threat_secret_material_never_reaches_the_wire must fail with the canary bytes present in the encoded envelope
 
@@ -429,7 +431,7 @@ Negative control (implemented): Remove the revocation re-check from the dispatch
 
 </details>
 
-<details><summary><strong>I-8</strong> (9 checks)</summary>
+<details><summary><strong>I-8</strong> (12 checks)</summary>
 
 - `test:tests/unit_tests.rs::lane_budget_is_independent_and_enforced`
 - `test:tests/redteam_tests.rs::threat_budget_bypass_attempts`
@@ -439,6 +441,9 @@ Negative control (implemented): Remove the revocation re-check from the dispatch
 - `test:tests/redteam_tests.rs::review_wire_rejects_deep_value_nesting`
 - `test:tests/redteam_tests.rs::review_zero_ceilings_are_refused_in_every_budget_field`
 - `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating`
+- `test:tests/unit_tests.rs::shared_memory_compaction_survives_a_wrapped_ring`
+- `test:tests/unit_tests.rs::shared_memory_write_is_total_after_a_desynchronised_advance`
+- `script:scripts/negative_controls.py#I-8-shm`
 - `test:tests/conformance_tests.rs::wire_limits_are_enforced`
 
 Negative control (implemented): Charge one byte instead of the recursive wire size in Kernel::call and run review_byte_budget_is_charged → expected: the byte budget no longer fires, so the test fails when the large nested argument is accepted
@@ -463,7 +468,7 @@ Negative control (implemented): Charge one byte instead of the recursive wire si
 - `test:tests/unit_tests.rs::unknown_method_is_refused`
 - `test:tests/property_tests.rs::arbitrary_bytes_never_panic`
 - `test:tests/redteam_tests.rs::threat_malformed_frames_and_bombs`
-- `fuzz:framing` — fuzz/fuzz_targets/framing.rs
+- `fuzz:fuzz_arp1_frame` — fuzz/fuzz_targets/fuzz_arp1_frame.rs
 
 Negative control (implemented): Skip the trailing-bytes check in Envelope::decode and run the malformed-envelope tests → expected: the trailing-bytes case must be accepted, so wire_rejects_malformed_envelopes fails and names the case
 
@@ -511,7 +516,7 @@ Negative control (implemented): Remove the settled flag check in Promise::settle
 | `deny` | `cargo deny check` |
 | `doc` | `RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps --all-features` |
 | `fmt` | `cargo fmt --all -- --check` |
-| `fuzz` | `cargo +nightly fuzz run framing -- -runs=20000` |
+| `fuzz` | `cargo +nightly fuzz run fuzz_arp1_frame -- -runs=20000` |
 | `msrv` | `cargo +1.88.0 check --locked --all-targets --all-features` |
 | `negative-controls` | `python scripts/negative_controls.py --check` |
 | `package` | `cargo package --locked` |

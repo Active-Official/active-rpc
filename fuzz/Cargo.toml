@@ -12,8 +12,64 @@ libfuzzer-sys = "0.4"
 active-rpc = { path = "..", default-features = false }
 
 [[bin]]
-name = "framing"
-path = "fuzz_targets/framing.rs"
+name = "fuzz_arp1_frame"
+path = "fuzz_targets/fuzz_arp1_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_capability_lifecycle"
+path = "fuzz_targets/fuzz_capability_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_promise_graph"
+path = "fuzz_targets/fuzz_promise_graph.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_budget_matrix"
+path = "fuzz_targets/fuzz_budget_matrix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tool_mcp"
+path = "fuzz_targets/fuzz_tool_mcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tool_http"
+path = "fuzz_targets/fuzz_tool_http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tool_process"
+path = "fuzz_targets/fuzz_tool_process.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_channel_cap_transfer"
+path = "fuzz_targets/fuzz_channel_cap_transfer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_transport_framing"
+path = "fuzz_targets/fuzz_transport_framing.rs"
 test = false
 doc = false
 bench = false

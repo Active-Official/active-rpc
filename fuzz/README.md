@@ -1,44 +1,55 @@
 # Fuzzing
 
-One target exercises the untrusted framing surface:
+Nine targets cover framing, authorization, promises, budgets, tools, channels
+and transports. Every target drives the real kernel or adapter and asserts an
+invariant, not only "did not crash".
 
-- `framing` — envelope decoding (fixed-point re-encode), the standalone
-  capability-table codec and the gRPC/Connect frame splitter.
+| Target | Surface | Invariant |
+|---|---|---|
+| `fuzz_arp1_frame` | envelope and capability-table codecs, gRPC framing | decode is total and a fixed point; strict limits never panic |
+| `fuzz_capability_lifecycle` | mint, attenuate, revoke, clone, drop, call, transplant | attenuation only narrows; revoked and foreign capabilities are refused |
+| `fuzz_promise_graph` | pipelining, cancel, resolve, destroy lane | a promise settles once; a destroyed lane refuses calls |
+| `fuzz_budget_matrix` | calls, bytes, wall, nodes, depth, array, value | zero ceilings are refused; each ceiling binds |
+| `fuzz_tool_mcp` | `McpSession` over `MemoryTransport` | the handshake is not a call; undiscovered tools are refused |
+| `fuzz_tool_http` | `HttpTool` allow-list | path and method escapes are `rpc/tool-policy` |
+| `fuzz_tool_process` | `LocalProcess` argv allow-list | arguments cannot escape; no process is spawned for a refusal |
+| `fuzz_channel_cap_transfer` | channel direction, close, capability transfer | direction is enforced; a transferred id does not retain the capability |
+| `fuzz_transport_framing` | shared-memory ring, gRPC framing | a frame larger than the segment is refused; reads never pass the head |
 
 ## Running
 
+`cargo-fuzz` does not launch on Windows MSVC: libFuzzer reports
+`STATUS_DLL_NOT_FOUND`. The supported lane is the Linux container:
+
 ```bash
-cargo install cargo-fuzz --locked
-cargo +nightly fuzz run framing -- -runs=200000
+python scripts/fuzz_docker.py --build
+python scripts/fuzz_docker.py --all --runs 20000
+python scripts/fuzz_docker.py --target fuzz_promise_graph --runs 100000
 ```
 
-On Windows MSVC the current cargo-fuzz/libFuzzer combination fails to *launch*
-with `STATUS_DLL_NOT_FOUND`; that is an environment limitation, not a target
-defect. Use a Linux container:
+The scripts mount the repository at `/work`, so the corpus grows in place.
+
+On a native Linux host:
 
 ```bash
-docker run --rm -v "$PWD:/work" -w /work rust:1.88-bookworm bash -c \
-  "apt-get update -qq && apt-get install -y -qq clang && \
-   rustup toolchain install nightly --profile minimal && \
-   cargo +nightly install cargo-fuzz --locked && \
-   cargo +nightly fuzz run framing -- -runs=20000"
+cargo +nightly fuzz run fuzz_arp1_frame -- -runs=200000
 ```
 
 ## Corpus
 
-Seed with one well-formed envelope so mutations start from a valid frame:
+Seeds are committed under `fuzz/corpus/<target>/`:
 
-```bash
-mkdir -p fuzz/corpus/framing
-printf '415250310101000001000000000000000400000070696e67000000000000000000000000' \
-  | xxd -r -p > fuzz/corpus/framing/ping.arp1
-```
+- a well-formed ping envelope, a truncated envelope and an envelope with trailing
+  bytes for the framing target;
+- short action streams (`0..63`, an interleaved pattern, all `0xFF`) for the
+  lifecycle, promise, budget, tool and channel targets, so mutations start from
+  a sequence that reaches several branches;
+- a small shared-memory frame and a length-prefixed gRPC frame.
 
-## Invariants asserted by the target
+Every fixed bug adds a minimized seed named after the checklist item. Seeds are
+deterministic and treated as hostile input.
 
-1. `Envelope::decode` is total; a successful decode re-encodes to a fixed point.
-2. Decoded envelopes respect `WireLimits`.
-3. `decode_capability_table` is total and never accepts a zero ceiling.
-4. `grpc_unframe`/`grpc_frame` are self-delimiting and never panic.
+## Budgets
 
-A crash or assertion failure is a release blocker.
+Pull requests run a short campaign per target; `main` and the nightly lane run a
+longer one. A crash, an assertion failure or a panic fails the lane.

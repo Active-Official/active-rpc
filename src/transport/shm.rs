@@ -87,12 +87,32 @@ impl SharedSegment {
         if used + needed > state.capacity {
             return Err(Error::Transport("shared segment is full".to_string()));
         }
+        // A desynchronised consumer can advance past the frame boundary and
+        // leave `tail` mid-frame. The ring is unusable then; reset it instead
+        // of computing an out-of-bounds compaction range.
+        if used > state.capacity {
+            state.head = 0;
+            state.tail = 0;
+            return Err(Error::Transport(
+                "shared segment desynchronised".to_string(),
+            ));
+        }
         let start = state.head as usize % state.capacity;
         if start + needed > state.capacity {
             // Compact instead of fragmenting the frame: move the unread bytes
-            // to the front of the ring.
+            // from the *tail* to the front. The unread region can wrap, so copy
+            // it in at most two pieces. Using the head offset here would read
+            // past the end when the ring is nearly full.
             let unread = used;
-            state.data.copy_within(start..start + unread, 0);
+            let tail_start = state.tail as usize % state.capacity;
+            let capacity = state.capacity;
+            if tail_start + unread <= capacity {
+                state.data.copy_within(tail_start..tail_start + unread, 0);
+            } else {
+                let first = capacity - tail_start;
+                state.data.copy_within(tail_start..capacity, 0);
+                state.data.copy_within(0..unread - first, first);
+            }
             state.head = unread as u64;
             state.tail = 0;
         }

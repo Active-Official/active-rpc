@@ -1,18 +1,17 @@
 #![no_main]
 
-//! Framing and capability-table fuzz target.
+//! ARP1 envelope and capability-table framing.
 //!
-//! Invariants under test:
+//! Invariants under test (I-8, I-9, I-10):
 //!
-//! 1. `Envelope::decode` never panics, hangs or over-allocates on arbitrary
-//!    bytes; a successful decode re-encodes to bytes that decode again
-//!    identically (the envelope is a fixed point).
+//! 1. `Envelope::decode` is total; a successful decode re-encodes to a fixed
+//!    point, and strict limits never panic.
 //! 2. The standalone capability-table codec agrees with the envelope codec and
-//!    never panics.
-//! 3. A decoded envelope never exceeds the configured limits.
-//! 4. The gRPC/Connect framing helper never panics and is self-delimiting.
+//!    never accepts a zero call ceiling.
+//! 3. A decoded envelope never exceeds the configured counts.
+//! 4. The gRPC/Connect framing helper is self-delimiting.
 //!
-//! Run with `cargo +nightly fuzz run framing -- -runs=200000`.
+//! Run with `cargo +nightly fuzz run fuzz_arp1_frame -- -runs=200000`.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -30,8 +29,14 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Strict limits must also never panic.
+    // Strict and two arbitrary limit profiles must also never panic.
     let _ = Envelope::decode_with(data, WireLimits::strict());
+    let tiny = WireLimits {
+        max_args: 1,
+        max_caps: 1,
+        ..WireLimits::default()
+    };
+    let _ = Envelope::decode_with(data, tiny);
 
     // 2. Capability tables: independent entry point, same rules.
     if let Ok(caps) = decode_capability_table(data) {

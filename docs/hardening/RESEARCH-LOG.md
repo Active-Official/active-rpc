@@ -131,3 +131,28 @@ event payloads currently record values; H7.2 must prove they contain no secrets.
 - **H6.10** Exhaustive small-state capability lifecycle model.
 
 Status: open. Each item is a gap or partial row until its oracle lands.
+
+## 2026-10-27 — D1/D6 shared-memory ring compaction panic (found by fuzz_transport_framing)
+
+Source: H1.17 fuzz target; a wrapped ring with a partially consumed frame.
+Attack class: SharedSegment::write compacted unread bytes starting at the
+head offset rather than the tail. When the head was near the end of the segment
+and a frame did not fit contiguously, the copy range ran past the buffer and
+panicked. A consumer that calls dvance with the wrong length can also leave
+	ail mid-frame; the next write then computes a nonsense range.
+Mapped invariants: I-8 (hard capacity), I-10 (fail closed).
+Fix: compact from 	ail % capacity, copy the unread region in at most two
+pieces when it wraps, and reset with Error::Transport when the ring is
+desynchronised instead of computing an out-of-bounds range.
+Tests: shared_memory_compaction_survives_a_wrapped_ring,
+shared_memory_write_is_total_after_a_desynchronised_advance.
+Control: I-8-shm (compaction from the head offset must fail the test).
+Status: fixed.
+
+## 2026-10-27 — fuzz harness lesson (transport)
+
+SharedSegment::new clamps tiny requests to 1024 bytes. The target compared the
+payload against the requested size instead of segment.capacity(), so a valid
+write was asserted to fail. The target now uses the constructed capacity.
+Status: harness fix.
+

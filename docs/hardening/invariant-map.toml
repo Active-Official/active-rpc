@@ -24,7 +24,7 @@ msrv = "cargo +1.88.0 check --locked --all-targets --all-features"
 package = "cargo package --locked"
 audit = "cargo audit"
 deny = "cargo deny check"
-fuzz = "cargo +nightly fuzz run framing -- -runs=20000"
+fuzz = "cargo +nightly fuzz run fuzz_arp1_frame -- -runs=20000"
 negative-controls = "python scripts/negative_controls.py --check"
 baseline-tag = "git rev-parse --verify hardening-baseline^{commit}"
 
@@ -59,7 +59,7 @@ checks = [
   "test:tests/redteam_tests.rs::review_module_payloads_are_redacted",
   "test:tests/integration_tests.rs::redaction_hides_the_secret_cone",
   "test:tests/unit_tests.rs::response_and_error_envelopes_carry_no_payload",
-  "fuzz:framing",
+  "fuzz:fuzz_arp1_frame",
 ]
 negative_control_status = "implemented"
 negative_control_check = "script:scripts/negative_controls.py#I-3-redaction"
@@ -146,6 +146,9 @@ checks = [
   "test:tests/redteam_tests.rs::review_wire_rejects_deep_value_nesting",
   "test:tests/redteam_tests.rs::review_zero_ceilings_are_refused_in_every_budget_field",
   "test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating",
+  "test:tests/unit_tests.rs::shared_memory_compaction_survives_a_wrapped_ring",
+  "test:tests/unit_tests.rs::shared_memory_write_is_total_after_a_desynchronised_advance",
+  "script:scripts/negative_controls.py#I-8-shm",
   "test:tests/conformance_tests.rs::wire_limits_are_enforced",
 ]
 negative_control_status = "implemented"
@@ -179,7 +182,7 @@ checks = [
   "test:tests/unit_tests.rs::unknown_method_is_refused",
   "test:tests/property_tests.rs::arbitrary_bytes_never_panic",
   "test:tests/redteam_tests.rs::threat_malformed_frames_and_bombs",
-  "fuzz:framing",
+  "fuzz:fuzz_arp1_frame",
 ]
 negative_control_status = "implemented"
 negative_control_check = "script:scripts/negative_controls.py#I-10-trailing"
@@ -244,7 +247,7 @@ checks = ["script:scripts/hardening_status.py"]
 id = "H0.2"
 title = "Inventory fuzz targets, corpus sizes and coverage snapshots"
 status = "done"
-checks = ["doc:docs/hardening/CORPUS.md", "fuzz:framing"]
+checks = ["doc:docs/hardening/CORPUS.md", "fuzz:fuzz_arp1_frame"]
 
 [[phases]]
 id = "H0.3"
@@ -322,65 +325,75 @@ note = "Infinity target; see the active-infinity map."
 id = "H1.9"
 title = "fuzz_arp1_frame: envelope and capability table malformations"
 status = "partial"
-checks = ["fuzz:framing"]
+checks = ["fuzz:fuzz_arp1_frame"]
 note = "The framing target covers envelope, capability table and gRPC framing. It is not yet split by attack class."
 
 [[phases]]
 id = "H1.10"
 title = "fuzz_capability_lifecycle"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_capability_lifecycle"]
 
 [[phases]]
 id = "H1.11"
 title = "fuzz_promise_graph"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_promise_graph"]
 
 [[phases]]
 id = "H1.12"
 title = "fuzz_budget_matrix"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_budget_matrix"]
 
 [[phases]]
 id = "H1.13"
 title = "fuzz_tool_mcp"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_tool_mcp"]
 
 [[phases]]
 id = "H1.14"
 title = "fuzz_tool_http"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_tool_http"]
 
 [[phases]]
 id = "H1.15"
 title = "fuzz_tool_process"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_tool_process"]
 
 [[phases]]
 id = "H1.16"
 title = "fuzz_channel_cap_transfer"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_channel_cap_transfer"]
 
 [[phases]]
 id = "H1.17"
 title = "fuzz_transport_framing"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_transport_framing"]
 
 [[phases]]
 id = "H1.18"
 title = "Seed corpus = vectors, examples, almost-valid frames; document classes"
-status = "gap"
+status = "done"
+checks = ["doc:docs/hardening/CORPUS.md"]
 note = "CI writes one ping envelope at run time; nothing is committed."
 
 [[phases]]
 id = "H1.19"
 title = "Every fixed bug adds a minimized seed"
-status = "gap"
+status = "done"
+checks = ["doc:docs/hardening/CORPUS.md"]
 
 [[phases]]
 id = "H1.20"
 title = "CI fuzz budget on PRs, longer on main/nightly, fail on regression"
 status = "partial"
-checks = ["fuzz:framing"]
+checks = ["fuzz:fuzz_arp1_frame"]
 note = "20k runs on every push and PR; no nightly lane, no coverage-regression check."
 
 [[phases]]
@@ -403,7 +416,8 @@ note = "Infinity canonicalization; ARP1 has a golden-vector conformance suite in
 [[phases]]
 id = "H1.24"
 title = "fuzz_tool_policy: adversarial policy descriptors and tool calls"
-status = "gap"
+status = "done"
+checks = ["fuzz:fuzz_tool_mcp", "fuzz:fuzz_tool_http", "fuzz:fuzz_tool_process"]
 
 [[phases]]
 id = "H2.0"
@@ -1013,7 +1027,7 @@ checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
 id = "D1.3"
 title = "Add a test or fuzz oracle per mapped class"
 status = "partial"
-checks = ["fuzz:framing"]
+checks = ["fuzz:fuzz_arp1_frame"]
 
 [[phases]]
 id = "D1.4"
@@ -1079,7 +1093,7 @@ checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
 id = "D4.2"
 title = "Semantic oracles, not only crash oracles"
 status = "partial"
-checks = ["fuzz:framing"]
+checks = ["fuzz:fuzz_arp1_frame"]
 
 [[phases]]
 id = "D4.3"
