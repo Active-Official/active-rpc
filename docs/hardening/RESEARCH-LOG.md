@@ -156,3 +156,19 @@ payload against the requested size instead of segment.capacity(), so a valid
 write was asserted to fail. The target now uses the constructed capacity.
 Status: harness fix.
 
+## 2026-10-27 — H2.18/H7.2 raw capability authority in default telemetry
+
+Source: code audit of `CapId`, `CapHandle` and `Event`.
+Attack class: `Debug for CapId` printed the full 128-bit id. Events carry
+`CapId` values, so any operator who logs `agent.events()` (or an assertion
+failure that formats a handle) writes live authority into the log. Possession
+is authority, so a log reader could replay the capability while the kernel
+lives.
+Fix: `CapId::correlation_id` is a domain-separated Blake3 prefix used by
+`Debug` and `CapHandle::fmt`; `hex()` remains for a deliberate transfer (the
+peer CLI prints it so a caller can use it) and is documented as authority.
+Tests: `capability_debug_does_not_print_raw_bits`; battery case H2.18 now scans
+event output for raw id bits.
+Control: I-4-debug.
+Status: fixed.
+

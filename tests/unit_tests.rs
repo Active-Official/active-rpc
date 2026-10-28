@@ -109,6 +109,33 @@ fn capability_ids_are_unforgeable() {
 }
 
 #[test]
+fn capability_debug_does_not_print_raw_bits() {
+    // Possession of a capability id is authority. Default telemetry (Debug,
+    // events) must carry a correlation id, never the raw 128 bits.
+    let (agent, provider_id, _cap) = agent_with_module();
+    let cap = agent
+        .mint(provider_id, 0, CapAttrs::new(&["stats"]))
+        .expect("mint");
+    let raw = cap.id().hex();
+    let debug = format!("{:?}", cap.id());
+    assert!(debug.starts_with("CapId("));
+    assert!(
+        !debug.contains(&raw),
+        "CapId Debug printed the raw authority: {debug}"
+    );
+    let handle = format!("{cap:?}");
+    assert!(
+        !handle.contains(&raw),
+        "CapHandle Debug printed the raw authority: {handle}"
+    );
+    let events = format!("{:?}", agent.events());
+    assert!(
+        !events.contains(&raw),
+        "events printed the raw authority: {events}"
+    );
+}
+
+#[test]
 fn unknown_method_is_refused() {
     let (agent, _provider, cap) = agent_with_module();
     let lane = agent.create_lane("main", Budget::default()).unwrap();

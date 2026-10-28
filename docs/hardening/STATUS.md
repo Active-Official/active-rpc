@@ -22,15 +22,16 @@ the bottom is generated from `docs/hardening/invariant-map.toml` by
 
 ### H0.1 Test inventory
 
-78 test functions across 6 integration-test binaries plus one doctest:
+80 test functions across 7 integration-test binaries plus one doctest:
 
 | Suite | Tests | What it proves |
 |---|---|---|
-| `tests/unit_tests.rs` | 24 | capability ids, attenuation, lane budgets, path scope, drop notification, revocation, promises, channels, wire round-trip, tool policy, events, shared-memory compaction |
+| `tests/unit_tests.rs` | 25 | capability ids, attenuation, lane budgets, path scope, drop notification, revocation, promises, channels, wire round-trip, tool policy, events, shared-memory compaction, telemetry correlation ids |
 | `tests/integration_tests.rs` | 15 | domain operations, in-process/shm/Connect/QUIC/TCP transports, cross-process peer, redaction, budgeted evaluation |
 | `tests/concurrency_tests.rs` | 5 | lane interleaving, budget isolation, channel isolation, concurrent tools, two agents over TCP |
 | `tests/conformance_tests.rs` | 8 | golden envelope, re-encode stability, capability table shape, truncated prefixes, header attacks, error catalog, wire limits |
 | `tests/redteam_tests.rs` | 23 | forgery/transplant, confused deputy, escalation, secret leakage, budget bypass, promise abuse, malformed frames, revocation edges, plus thirteen review regressions |
+| `tests/redteam_battery.rs` | 1 (18 cases) | table-driven H2 cases, each naming its checklist id and invariant |
 | `tests/property_tests.rs` | 3 | envelope round-trip, arbitrary bytes never panic, attenuation monotonicity |
 
 There is **no** `doc_gate.rs` in this crate; the Infinity crate has one. CI does
@@ -117,6 +118,7 @@ removed afterwards; the working tree is never modified.
 |---|---|---|---|
 | `I-3-redaction` | I-3 | module payload redaction disabled | `review_module_payloads_are_redacted` |
 | `I-4-secret` | I-4 | fixed all-zero agent secret | `review_agent_secrets_are_random` |
+| `I-4-debug` | I-4 | CapId Debug prints the raw id | `capability_debug_does_not_print_raw_bits` |
 | `I-5-attenuation` | I-5 | method-subset check removed | `attenuation_narrows_and_never_widens` |
 | `I-6-dispatch` | I-6 | dispatch revocation re-check removed | `review_revocation_after_queueing_prevents_invocation` |
 | `I-8-bytes` | I-8 | per-call ceiling and meter charge removed | `review_byte_budget_is_charged` |
@@ -140,7 +142,7 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
 | `cargo audit` | pass (1 allowed warning) | local run 2026-10-27 |
 | `cargo deny check` | pass | local run 2026-10-27 |
 | Fuzz campaigns (9 targets, 10k runs) | pass | Docker run 2026-10-27; CI job `fuzz` runs 2k per target |
-| Negative controls (8) | pass | local run 2026-10-27; CI job `negative-controls` |
+| Negative controls (9) | pass | local run 2026-10-27; CI job `negative-controls` |
 | GitHub Actions on `69acea8` | success | run 40559854293 |
 
 ## Ordered next steps
@@ -148,10 +150,9 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
 1. **H1** Split `framing` into the nine required RPC targets, commit a seed
    corpus in `tests/vectors/`, and add the research-derived targets (capability
    lifecycle, promise graph, budget matrix, tool policy, transport framing).
-2. **H2** Build the table-driven red-team battery, including the
-   cross-kernel transplant, path canonicalization, event-redaction and tool
-   timeout cases. The scripted negative controls are in place; the remaining
-   work is breadth and the research-derived cases.
+2. **H2** The table-driven battery is in place (18 cases). Remaining: the
+   cross-worker, overlapping-grant, stale-ownership and tool-timeout cases,
+   plus a global lane/channel ceiling.
 3. **H6** Raise the `active-infinity` minimum to the security release, add the
    reproducible-build note, and exercise the yank dry run.
 4. **H7** Prove events and metrics redact payloads and hash capability ids.
@@ -184,14 +185,14 @@ Not signed. H0 is complete; H1–H9 remain.
 
 **Repository:** `active-rpc` **version:** `1.1.9` **baseline commit:** `69acea89bd03a9a69ff88cdd6dd8d12560a2d210` **baseline tag:** `hardening-baseline` **measured:** 2026-10-27
 
-Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 34 done, 55 partial, 51 gap, 20 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 92.
+Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 49 done, 48 partial, 43 gap, 20 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 95.
 
 | Invariant | Meaning | Status | Checks | Negative control |
 |---|---|---|---|---|
 | **I-1** | Structural secret taint | `covered` | 3 | - |
 | **I-2** | Anti-oracle equality | `n/a` | 0 | - |
 | **I-3** | Secret non-leakage | `covered` | 5 | implemented |
-| **I-4** | Capability unforgeability | `covered` | 4 | implemented |
+| **I-4** | Capability unforgeability | `covered` | 6 | implemented |
 | **I-5** | Attenuation only narrows | `covered` | 7 | implemented |
 | **I-6** | Revocation at dispatch | `covered` | 5 | implemented |
 | **I-7** | Drop notification | `covered` | 2 | - |
@@ -242,33 +243,33 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 34 
 | **H2.5** | Huge sparse claims with tiny actual buffers | `partial` | `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating`, `test:tests/redteam_tests.rs::threat_malformed_frames_and_bombs` |
 | **H2.6** | Invalid UTF-8 and encoding confusion | `partial` | `test:tests/unit_tests.rs::wire_rejects_malformed_envelopes` |
 | **H2.7** | Streaming slowloris and oversize total declarations | `gap` | - |
-| **H2.8** | Forge capability IDs (random, bit-flip, replay, cross-agent) | `done` | `test:tests/unit_tests.rs::capability_ids_are_unforgeable`, `test:tests/redteam_tests.rs::threat_forgery_and_transplant`, `test:tests/redteam_tests.rs::review_agent_secrets_are_random` |
-| **H2.9** | Attenuate then widen (methods, budget, path, tool policy) | `done` | `test:tests/unit_tests.rs::attenuation_narrows_and_never_widens`, `test:tests/property_tests.rs::attenuation_is_monotone`, `test:tests/redteam_tests.rs::threat_escalation_through_metadata` |
-| **H2.10** | Use after revoke or drop; borrowed channel lifetime | `partial` | `test:tests/redteam_tests.rs::threat_revocation_and_lifetime_edges`, `test:tests/unit_tests.rs::dropping_the_last_handle_notifies_the_provider` |
-| **H2.11** | Confused deputy provider | `partial` | `test:tests/redteam_tests.rs::threat_confused_deputy` |
-| **H2.12** | Tool adapter confused deputy | `partial` | `test:tests/redteam_tests.rs::review_tool_policy_predicate_matches_the_enforcer`, `test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls` |
+| **H2.8** | Forge capability IDs (random, bit-flip, replay, cross-agent) | `done` | `test:tests/unit_tests.rs::capability_ids_are_unforgeable`, `test:tests/redteam_tests.rs::threat_forgery_and_transplant`, `test:tests/redteam_tests.rs::review_agent_secrets_are_random`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.9** | Attenuate then widen (methods, budget, path, tool policy) | `done` | `test:tests/unit_tests.rs::attenuation_narrows_and_never_widens`, `test:tests/property_tests.rs::attenuation_is_monotone`, `test:tests/redteam_tests.rs::threat_escalation_through_metadata`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.10** | Use after revoke or drop; borrowed channel lifetime | `done` | `test:tests/redteam_tests.rs::threat_revocation_and_lifetime_edges`, `test:tests/unit_tests.rs::dropping_the_last_handle_notifies_the_provider`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.11** | Confused deputy provider | `done` | `test:tests/redteam_tests.rs::threat_confused_deputy`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.12** | Tool adapter confused deputy | `done` | `test:tests/redteam_tests.rs::review_tool_policy_predicate_matches_the_enforcer`, `test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.13** | Revocation racing with dispatch | `done` | `test:tests/redteam_tests.rs::review_revocation_after_queueing_prevents_invocation`, `test:tests/redteam_tests.rs::review_cancelled_and_destroyed_work_never_runs` |
 | **H2.14** | Secrets in every legal position; scan all export paths | `partial` | `test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire`, `test:tests/redteam_tests.rs::review_module_payloads_are_redacted` |
 | **H2.15** | Force secrets into error messages | `partial` | `test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire` |
 | **H2.16** | Equality and ordering oracle attempts | `n/a` | - |
 | **H2.17** | Smuggle secrets via extensions, annotations, provenance, projections | `partial` | `test:tests/redteam_tests.rs::review_module_payloads_are_redacted` |
-| **H2.18** | Logging and metrics carry no secrets or raw capability bits | `partial` | `test:tests/unit_tests.rs::events_record_the_dispatch_batches` |
-| **H2.19** | Queue storms under a low call budget | `partial` | `test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls` |
-| **H2.20** | Nested value byte bombs under a low byte budget | `partial` | `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget` |
+| **H2.18** | Logging and metrics carry no secrets or raw capability bits | `done` | `test:tests/unit_tests.rs::events_record_the_dispatch_batches`, `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.19** | Queue storms under a low call budget | `done` | `test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.20** | Nested value byte bombs under a low byte budget | `done` | `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.21** | Many lanes, channels and promises to finite limits | `gap` | - |
 | **H2.22** | Enormous tool payloads and tools that never return | `gap` | - |
 | **H2.23** | Zero or near-zero ceilings refused where policy needs finite limits | `done` | `test:tests/redteam_tests.rs::review_zero_ceilings_are_refused_in_every_budget_field` |
 | **H2.24** | Single-bit mutation fails validation or changes the hash | `n/a` | - |
 | **H2.25** | Large-corpus hash collision search | `n/a` | - |
-| **H2.26** | Pipelined vs sequential preserves the authorization side-effect set | `gap` | - |
+| **H2.26** | Pipelined vs sequential preserves the authorization side-effect set | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.27** | Projection hash and redaction agreement | `n/a` | - |
 | **H2.28** | Overlapping write capabilities detected or prevented | `gap` | - |
-| **H2.29** | Audit-only capability cannot write | `done` | `test:tests/unit_tests.rs::read_only_capability_refuses_mutation` |
+| **H2.29** | Audit-only capability cannot write | `done` | `test:tests/unit_tests.rs::read_only_capability_refuses_mutation`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.30** | Stale capability after ownership change refused | `gap` | - |
 | **H2.31** | Another worker's secret-bearing subgraph denied or fully redacted | `gap` | - |
-| **H2.32** | Public errors do not enable secret or capability oracles | `partial` | `test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented` |
+| **H2.32** | Public errors do not enable secret or capability oracles | `done` | `test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.33** | No debug unlock or test ambient authority in release builds | `gap` | - |
-| **H2.34** | Fuzz corpus treated as permanently hostile input | `gap` | - |
+| **H2.34** | Fuzz corpus treated as permanently hostile input | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.35** | Docs and examples do not teach insecure patterns without warnings | `partial` | `doc:SECURITY.md`, `doc:README.md` |
 | **H2.36** | Allocation ceiling for untrusted counts | `partial` | `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating` |
 | **H2.37** | Length arithmetic checked on 32-bit and 64-bit widths | `gap` | - |
@@ -276,11 +277,11 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 34 
 | **H2.39** | Extension skip and duplicate-tag arithmetic | `n/a` | - |
 | **H2.40** | Abort-free lane under panic=abort | `gap` | - |
 | **H2.41** | Linear-time validation | `gap` | - |
-| **H2.42** | Cross-kernel and cross-connection capability transplant or replay | `gap` | - |
-| **H2.43** | Event and log redaction oracle (no secret bytes, hashed capability ids) | `gap` | - |
+| **H2.42** | Cross-kernel and cross-connection capability transplant or replay | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.43** | Event and log redaction oracle (no secret bytes, hashed capability ids) | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.44** | Tool timeout and payload ceiling | `gap` | - |
-| **H2.45** | Shared-memory frame TOCTOU under concurrent mutation | `gap` | - |
-| **H2.46** | URL and path allow-list canonicalization bypass | `gap` | - |
+| **H2.45** | Shared-memory frame TOCTOU under concurrent mutation | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.46** | URL and path allow-list canonicalization bypass | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.47** | Promise settlement count under concurrent cancel and resolve | `partial` | `test:tests/unit_tests.rs::promise_can_be_cancelled_or_resolved_once` |
 | **H3.1** | Freeze a review scope document | `gap` | - |
 | **H3.2** | Independent review with recorded findings | `partial` | `doc:REVIEWS.md` |
@@ -315,9 +316,9 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 34 
 | **H6.9** | Public statement of tested vs fuzzed vs reviewed vs proven | `partial` | `doc:SECURITY.md` |
 | **H6.10** | Exhaustive small-state capability lifecycle model | `gap` | - |
 | **H7.1** | Structured events for call, settle, revoke, budget, refusal | `partial` | `test:tests/unit_tests.rs::events_record_the_dispatch_batches` |
-| **H7.2** | Default logs carry no secrets or raw capability bits | `gap` | - |
+| **H7.2** | Default logs carry no secrets or raw capability bits | `done` | `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H7.3** | Metrics without sensitive payloads | `gap` | - |
-| **H7.4** | Tests that force sensitive data into events fail CI | `gap` | - |
+| **H7.4** | Tests that force sensitive data into events fail CI | `done` | `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H8.1** | Written wire and format compatibility policy | `partial` | `doc:docs/spec/wire.md` |
 | **H8.2** | Old Infinity images still validate | `n/a` | - |
 | **H8.3** | Unknown flags and fields behavior specified and tested | `partial` | `test:tests/conformance_tests.rs::header_field_attacks_are_rejected`, `test:tests/conformance_tests.rs::every_encoding_is_stable_under_re_encoding` |
@@ -387,11 +388,13 @@ Negative control (implemented): Make Kernel::redact_module_payload a no-op and r
 
 </details>
 
-<details><summary><strong>I-4</strong> (4 checks)</summary>
+<details><summary><strong>I-4</strong> (6 checks)</summary>
 
 - `test:tests/unit_tests.rs::capability_ids_are_unforgeable`
 - `test:tests/redteam_tests.rs::threat_forgery_and_transplant`
 - `test:tests/redteam_tests.rs::review_agent_secrets_are_random`
+- `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`
+- `script:scripts/negative_controls.py#I-4-debug`
 - `test:tests/unit_tests.rs::unknown_method_is_refused`
 
 Negative control (implemented): Replace the OS CSPRNG in Agent::new with a fixed seed and mint two agents → expected: review_agent_secrets_are_random must fail because both agents produce the same capability ids

@@ -45,6 +45,16 @@ CONTROLS = [
         "why": "Every agent gets the same all-zero secret, so minted capability ids collide.",
     },
     {
+        "id": "I-4-debug",
+        "invariant": "I-4",
+        "file": "src/cap.rs",
+        "find": '        write!(f, "CapId({})", self.correlation_id())\n',
+        "replace": '        write!(f, "CapId({})", self.hex())\n',
+        "suite": "unit_tests",
+        "test": "capability_debug_does_not_print_raw_bits",
+        "why": "CapId Debug prints the raw 128-bit authority, so any logged event leaks it.",
+    },
+    {
         "id": "I-5-attenuation",
         "invariant": "I-5",
         "file": "src/cap.rs",

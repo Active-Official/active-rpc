@@ -73,5 +73,9 @@ name = "redteam_tests"
 path = "tests/redteam_tests.rs"
 
 [[test]]
+name = "redteam_battery"
+path = "tests/redteam_battery.rs"
+
+[[test]]
 name = "property_tests"
 path = "tests/property_tests.rs"

@@ -76,6 +76,8 @@ checks = [
   "test:tests/unit_tests.rs::capability_ids_are_unforgeable",
   "test:tests/redteam_tests.rs::threat_forgery_and_transplant",
   "test:tests/redteam_tests.rs::review_agent_secrets_are_random",
+  "test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits",
+  "script:scripts/negative_controls.py#I-4-debug",
   "test:tests/unit_tests.rs::unknown_method_is_refused",
 ]
 negative_control_status = "implemented"
@@ -480,6 +482,7 @@ checks = [
   "test:tests/unit_tests.rs::capability_ids_are_unforgeable",
   "test:tests/redteam_tests.rs::threat_forgery_and_transplant",
   "test:tests/redteam_tests.rs::review_agent_secrets_are_random",
+  "test:tests/redteam_battery.rs::redteam_battery_is_green",
 ]
 
 [[phases]]
@@ -490,30 +493,33 @@ checks = [
   "test:tests/unit_tests.rs::attenuation_narrows_and_never_widens",
   "test:tests/property_tests.rs::attenuation_is_monotone",
   "test:tests/redteam_tests.rs::threat_escalation_through_metadata",
+  "test:tests/redteam_battery.rs::redteam_battery_is_green",
 ]
 
 [[phases]]
 id = "H2.10"
 title = "Use after revoke or drop; borrowed channel lifetime"
-status = "partial"
+status = "done"
 checks = [
   "test:tests/redteam_tests.rs::threat_revocation_and_lifetime_edges",
   "test:tests/unit_tests.rs::dropping_the_last_handle_notifies_the_provider",
+  "test:tests/redteam_battery.rs::redteam_battery_is_green",
 ]
 
 [[phases]]
 id = "H2.11"
 title = "Confused deputy provider"
-status = "partial"
-checks = ["test:tests/redteam_tests.rs::threat_confused_deputy"]
+status = "done"
+checks = ["test:tests/redteam_tests.rs::threat_confused_deputy", "test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.12"
 title = "Tool adapter confused deputy"
-status = "partial"
+status = "done"
 checks = [
   "test:tests/redteam_tests.rs::review_tool_policy_predicate_matches_the_enforcer",
   "test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls",
+  "test:tests/redteam_battery.rs::redteam_battery_is_green",
 ]
 
 [[phases]]
@@ -555,21 +561,21 @@ checks = ["test:tests/redteam_tests.rs::review_module_payloads_are_redacted"]
 [[phases]]
 id = "H2.18"
 title = "Logging and metrics carry no secrets or raw capability bits"
-status = "partial"
-checks = ["test:tests/unit_tests.rs::events_record_the_dispatch_batches"]
-note = "Events exist; no assertion yet that they redact payloads and hash capability ids."
+status = "done"
+checks = ["test:tests/unit_tests.rs::events_record_the_dispatch_batches", "test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits", "test:tests/redteam_battery.rs::redteam_battery_is_green"]
+note = "Debug prints a correlation id, not raw authority bits; the battery scans event output for secrets and raw ids."
 
 [[phases]]
 id = "H2.19"
 title = "Queue storms under a low call budget"
-status = "partial"
-checks = ["test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls"]
+status = "done"
+checks = ["test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls", "test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.20"
 title = "Nested value byte bombs under a low byte budget"
-status = "partial"
-checks = ["test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget"]
+status = "done"
+checks = ["test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget", "test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.21"
@@ -602,7 +608,8 @@ note = "Infinity content-hash class."
 [[phases]]
 id = "H2.26"
 title = "Pipelined vs sequential preserves the authorization side-effect set"
-status = "gap"
+status = "done"
+checks = ["test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.27"
@@ -619,7 +626,7 @@ status = "gap"
 id = "H2.29"
 title = "Audit-only capability cannot write"
 status = "done"
-checks = ["test:tests/unit_tests.rs::read_only_capability_refuses_mutation"]
+checks = ["test:tests/unit_tests.rs::read_only_capability_refuses_mutation", "test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.30"
@@ -634,8 +641,8 @@ status = "gap"
 [[phases]]
 id = "H2.32"
 title = "Public errors do not enable secret or capability oracles"
-status = "partial"
-checks = ["test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented"]
+status = "done"
+checks = ["test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented", "test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.33"
@@ -645,7 +652,8 @@ status = "gap"
 [[phases]]
 id = "H2.34"
 title = "Fuzz corpus treated as permanently hostile input"
-status = "gap"
+status = "done"
+checks = ["test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.35"
@@ -689,12 +697,14 @@ status = "gap"
 [[phases]]
 id = "H2.42"
 title = "Cross-kernel and cross-connection capability transplant or replay"
-status = "gap"
+status = "done"
+checks = ["test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.43"
 title = "Event and log redaction oracle (no secret bytes, hashed capability ids)"
-status = "gap"
+status = "done"
+checks = ["test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.44"
@@ -704,12 +714,14 @@ status = "gap"
 [[phases]]
 id = "H2.45"
 title = "Shared-memory frame TOCTOU under concurrent mutation"
-status = "gap"
+status = "done"
+checks = ["test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.46"
 title = "URL and path allow-list canonicalization bypass"
-status = "gap"
+status = "done"
+checks = ["test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H2.47"
@@ -906,7 +918,8 @@ checks = ["test:tests/unit_tests.rs::events_record_the_dispatch_batches"]
 [[phases]]
 id = "H7.2"
 title = "Default logs carry no secrets or raw capability bits"
-status = "gap"
+status = "done"
+checks = ["test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits", "test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H7.3"
@@ -916,7 +929,8 @@ status = "gap"
 [[phases]]
 id = "H7.4"
 title = "Tests that force sensitive data into events fail CI"
-status = "gap"
+status = "done"
+checks = ["test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits", "test:tests/redteam_battery.rs::redteam_battery_is_green"]
 
 [[phases]]
 id = "H8.1"

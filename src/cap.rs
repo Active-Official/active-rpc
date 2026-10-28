@@ -39,9 +39,30 @@ impl CapId {
     }
 
     /// Hex form for logs and errors.
+    ///
+    /// This is the raw capability id and **is** authority: possession of it is
+    /// enough to call the object while the kernel lives. Prefer
+    /// [`CapId::correlation_id`] in telemetry; `hex` is for an explicit,
+    /// deliberate transfer (the peer CLI prints it so a caller can use it).
     pub fn hex(self) -> String {
         let mut out = String::with_capacity(32);
         for byte in self.0 {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+
+    /// A non-reversible correlation id for logs and events.
+    ///
+    /// Logs can correlate two events that mention the same capability without
+    /// carrying the authority itself.
+    pub fn correlation_id(self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"active-rpc/capid-correlation");
+        hasher.update(&self.0);
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(16);
+        for byte in &digest.as_bytes()[..8] {
             out.push_str(&format!("{byte:02x}"));
         }
         out
@@ -50,7 +71,9 @@ impl CapId {
 
 impl fmt::Debug for CapId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CapId({})", self.hex())
+        // Default telemetry must not carry raw authority bits. Use `hex` only
+        // for a deliberate transfer.
+        write!(f, "CapId({})", self.correlation_id())
     }
 }
 
@@ -357,8 +380,6 @@ impl Drop for CapHandle {
 
 impl fmt::Debug for CapHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CapHandle")
-            .field("id", &self.id.hex())
-            .finish()
+        f.debug_struct("CapHandle").field("id", &self.id).finish()
     }
 }
