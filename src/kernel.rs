@@ -1133,10 +1133,13 @@ impl Agent {
 
             // Phase 3: settle under a write borrow.
             let mut kernel = self.cell.borrow_mut();
+            let mut settled_now = false;
             match &outcome {
                 Ok(value) => {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
-                        if record.resolve(value.clone()).is_err() {
+                        if record.resolve(value.clone()).is_ok() {
+                            settled_now = true;
+                        } else {
                             kernel.metrics.promises_double_settled =
                                 kernel.metrics.promises_double_settled.saturating_add(1);
                         }
@@ -1147,7 +1150,9 @@ impl Agent {
                 }
                 Err(error) => {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
-                        if record.reject(error.clone()).is_err() {
+                        if record.reject(error.clone()).is_ok() {
+                            settled_now = true;
+                        } else {
                             kernel.metrics.promises_double_settled =
                                 kernel.metrics.promises_double_settled.saturating_add(1);
                         }
@@ -1160,7 +1165,9 @@ impl Agent {
                         kernel.metrics.promises_rejected.saturating_add(1);
                 }
             }
-            kernel.record_settled(job.promise);
+            if settled_now {
+                kernel.record_settled(job.promise);
+            }
             // A completed job no longer needs its Call or arguments. Removing it
             // here is what makes the jobs ceiling a transient bound rather than
             // a lifetime quota.
@@ -1294,8 +1301,11 @@ impl Kernel {
             let promise = job.promise;
             let lane = job.lane;
             let code = error.code().to_string();
+            let mut settled_now = false;
             if let Some(record) = self.promises.get_mut(&promise) {
-                if record.reject(error).is_err() {
+                if record.reject(error).is_ok() {
+                    settled_now = true;
+                } else {
                     self.metrics.promises_double_settled =
                         self.metrics.promises_double_settled.saturating_add(1);
                 }
@@ -1305,7 +1315,9 @@ impl Kernel {
             }
             self.push_event(Event::PromiseRejected { promise, code });
             self.metrics.promises_rejected = self.metrics.promises_rejected.saturating_add(1);
-            self.record_settled(promise);
+            if settled_now {
+                self.record_settled(promise);
+            }
             self.jobs.remove(&job_id);
             self.push_event(Event::JobCompleted { job: job_id, lane });
         }
