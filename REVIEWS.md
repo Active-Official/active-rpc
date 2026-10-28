@@ -180,3 +180,9 @@ registry and `CapToken` paths.
 Mutation evidence: renaming `impl.items` exits 1 with "inherent impl has no `items` array"; renaming `hex` exits 1 with "found 0".
 
 Verification: full suite, API gate, clippy, docs, 32-bit lane and the red-team battery pass.
+
+## Round 14 - 2026-10-27 (convergence of the gate hardening)
+
+**NO NEW FINDINGS.** The reviewer confirmed the `impl.items` drift finding, the
+inherent-method counting, the single-`hex` allowlist check and the reclamation
+interactions.
