@@ -1206,11 +1206,29 @@ fn a_large_pipelined_batch_keeps_every_handle_readable() {
     for _ in 0..2_000 {
         handles.push(agent.call(lane, &cap, "stats", vec![]).expect("call"));
     }
+    let total = handles.len();
+    let mut readable = 0usize;
+    let mut failed = 0usize;
+    let mut first_failure: Option<(usize, String)> = None;
     for (index, promise) in handles.iter().enumerate() {
-        promise
-            .value()
-            .unwrap_or_else(|error| panic!("handle {index}: {}", error.code()));
+        match promise.value() {
+            Ok(_) => readable += 1,
+            Err(error) => {
+                failed += 1;
+                if first_failure.is_none() {
+                    first_failure = Some((index, error.code().to_string()));
+                }
+            }
+        }
     }
+    println!(
+        "batch handles: total={total} readable={readable} failed={failed} first={first_failure:?}"
+    );
+    assert_eq!(
+        failed, 0,
+        "a live handle lost its result: {failed} of {total} failed, first={first_failure:?}"
+    );
+    assert_eq!(readable, total);
     assert_eq!(agent.job_count(), 0);
     // Dropping the handles makes the records evictable on the next drain; the
     // kernel must not have needed that to serve the reads above.
