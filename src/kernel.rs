@@ -798,6 +798,7 @@ impl Agent {
         kernel
             .promises
             .insert(promise_id, PromiseRecord::new(promise_id, lane.0));
+
         let job_id = kernel.next_job;
         kernel.next_job += 1;
         let deps: Vec<PromiseId> = args.iter().filter_map(|arg| arg.promise()).collect();
@@ -846,6 +847,13 @@ impl Agent {
         // Budgets are charged here, before the call is queued. Dispatch
         // re-checks existence and revocation; providers receive the effective
         // budget in `Call` and tool adapters must enforce their wall ceiling.
+        //
+        // The handle below is the only owner of this promise now; set the
+        // reference immediately before constructing it, so an earlier error
+        // leaves an unreferenced (and therefore trimmable) record.
+        if let Some(record) = kernel.promises.get_mut(&promise_id) {
+            record.handles = 1;
+        }
         Ok(PromiseHandle {
             agent: self.clone(),
             id: promise_id,
