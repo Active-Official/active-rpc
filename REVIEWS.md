@@ -168,3 +168,15 @@ Focused convergence review of the three fixes and the surrounding lifecycle,
 registry and `CapToken` paths.
 
 **NO NEW FINDINGS.**
+
+## Round 13 - 2026-10-27 (API gate and reclamation)
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| `api_surface.py` treated a renamed `impl.items` key as an empty list, so the gate stayed green while blind to every inherent method (including `CapId::hex`) | high | fixed: a missing or non-list `items` array is a schema-drift finding; inherent methods now count toward the `<10` tripwire |
+| The allowlist could rot silently if `CapId::hex` disappeared | medium | fixed: the gate requires exactly one documented `hex` accessor; mutation test exits 1 with `found 0` |
+| Double settlement could add a duplicate retention entry | low | fixed: a promise is recorded for retention only when it newly settles |
+
+Mutation evidence: renaming `impl.items` exits 1 with "inherent impl has no `items` array"; renaming `hex` exits 1 with "found 0".
+
+Verification: full suite, API gate, clippy, docs, 32-bit lane and the red-team battery pass.
