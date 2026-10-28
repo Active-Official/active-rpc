@@ -30,14 +30,15 @@ and a doctest:
 | Suite | Tests | What it proves |
 |---|---|---|
 | `tests/unit_tests.rs` | 41 | capability mint/attenuation/revocation, drops, promises, lanes, channels, wire codec, tool policy, MCP handshake, bounded lifecycle model, observability metrics, process timeout |
-| `tests/integration_tests.rs` | 8 | real Infinity payloads, TCP peer pipelining, shared-memory transport, domain provider, tools |
-| `tests/property_tests.rs` | 5 | envelope round-trip, attenuation monotonicity, value redaction |
-| `tests/conformance_tests.rs` | 5 | error-code catalog, golden capability table, header attacks, stable encodings |
+| `tests/integration_tests.rs` | 15 | real Infinity payloads, TCP peer pipelining, shared-memory transport, domain provider, tools |
+| `tests/property_tests.rs` | 3 | envelope round-trip, attenuation monotonicity, value redaction |
+| `tests/conformance_tests.rs` | 8 | error-code catalog, golden capability table, header attacks, stable encodings |
 | `tests/concurrency_tests.rs` | 5 | lanes, channels, concurrent batches, revocation races |
 | `tests/redteam_tests.rs` | 23 | forgery/transplant, confused deputy, escalation, secret wire, budgets, promises, malformed frames, revocation edges, argument bombs, review regressions |
 | `tests/redteam_battery.rs` | 1 (19 cases) | table-driven H2 cases, each naming its checklist id and invariant |
-| `tests/perf_budget.rs` | 4 | linear envelope decode, call throughput, shared-memory frames, RSS/FD/thread stability |
-| `tests/doc_gate.rs` | 11 | error codes, wire spec, invariants, README, hardening docs, review record, performance matrix, release process, migration/compatibility, SECURITY evidence levels, status sign-off |
+| `tests/perf_budget.rs` | 3 | linear envelope decode, call throughput, shared-memory frames, RSS/FD/thread stability |
+| `tests/doc_gate.rs` | 11 |
+| `tests/api_surface.rs` | 3 | semantic tripwire: no raw secret accessor, one documented `CapId::hex`, correlation-id Display and errors | error codes, wire spec, invariants, README, hardening docs, review record, performance matrix, release process, migration/compatibility, SECURITY evidence levels, status sign-off |
 
 The machine-readable invariant-to-test mapping is
 `docs/hardening/invariant-map.toml`. Every row resolves to a `#[test]`, a fuzz
