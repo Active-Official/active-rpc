@@ -17,7 +17,7 @@ the bottom is generated from `docs/hardening/invariant-map.toml` by
 | Released tag | `v1.1.9` |
 | MSRV | 1.88 |
 | Wire format | ARP1 |
-| Final commit | `c8040b1` |
+| Hardening commit | `15853d2` |
 | Measured | 2026-10-27 |
 
 ## H0 findings
