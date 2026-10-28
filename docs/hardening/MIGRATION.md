@@ -4,6 +4,26 @@ Active Infinity keeps the shape of a configuration document and changes the
 representation: a canonical binary image, a content hash, structural secrets and
 units. This guide maps the common cases.
 
+## Migrating to `active-rpc` 2.0
+
+The `ARP1` wire format does not change. One Rust API change is breaking:
+
+- `Error::UnknownCapability` and `Error::Revoked` carry `CapToken` instead of
+  `u128`. The raw bits stay internal; formatting prints a correlation id.
+  Replace a `u128` match with `error.code()` (`rpc/unknown-capability`,
+  `rpc/revoked`) or match `CapToken`.
+- `Display for CapId` prints the correlation id. `CapId::hex()` remains the
+  explicit raw-authority accessor for a deliberate transfer.
+
+New conveniences are additive: `Metrics` and `Agent::metrics`, the refusal
+events, `destroy_channel`, `promise_count`/`job_count`, `decode_capability_table_with`,
+`LocalProcess::with_timeout`, and the `MAX_*` ceilings.
+
+Promises are retained while a `PromiseHandle` is alive. Dropping the handle makes
+the settled record eligible for trimming after the next drain; a handle never
+loses a result it can still read.
+
+
 ## Values
 
 | JSON / YAML | Active Infinity |

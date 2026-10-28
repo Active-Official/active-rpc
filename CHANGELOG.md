@@ -1,4 +1,62 @@
-# Changelog — Active RPC
+# Changelog - Active RPC
+
+## 2.0.0 - 2026-10-28
+
+Hardening release with one breaking error-type change. The `ARP1` wire format is
+unchanged.
+
+### Breaking
+
+- `Error::UnknownCapability` and `Error::Revoked` now carry `CapToken` instead of
+  `u128`. `CapToken` keeps the raw bits internally and formats a correlation id;
+  the previous variants printed the raw authority into `Display` and `Debug`.
+  Migration: match `error.code()` (`rpc/unknown-capability`, `rpc/revoked`) or
+  compare a `CapToken`; do not expect a `u128` field.
+- `Display for CapId` now prints the correlation id. `CapId::hex()` remains the
+  documented raw-authority accessor for a deliberate transfer.
+- The dependency floor is `active-infinity = "2.1.0"`, the hardened core
+  release; the lockfile and clean-clone gates use it.
+
+### Security
+
+- **Handle-pinned promise retention.** Settled promise records are trimmed to
+  1,024 records / 64 MiB only when no live `PromiseHandle` references them. A
+  pipelined batch of any size can be drained and then read; the older
+  order-window trim lost results above 1,024.
+- **Completed jobs are reclaimed immediately**, and promise/job ceilings are
+  checked before budget is charged. `MAX_PROMISES` is transient backpressure,
+  not a lifetime quota.
+- **Capability and lane/channel registries are finite and reclaimable**;
+  `destroy_channel` and lane destruction release their slots.
+- **`LocalProcess` honours the capability wall budget** and kills a child at the
+  deadline; the channel queue is bounded.
+- **API-surface gate**: rustdoc-JSON check for raw secret accessors and exactly
+  one documented `CapId::hex`, wired into CI.
+
+### Added
+
+- `Metrics`, `Event::CallRefused`, `Event::BudgetExhausted`, `Event::ToolRefused`.
+- `Agent::metrics`, `promise_count`, `job_count`, `destroy_channel`.
+- `MAX_LANES`, `MAX_CHANNELS`, `MAX_PROMISES`, `MAX_EVENTS`,
+  `MAX_SETTLED_PROMISES`, `MAX_SETTLED_BYTES`.
+- `decode_capability_table_with`.
+- `LocalProcess::with_timeout`.
+- `examples/tool_policy.rs`, `examples/two_agents.rs`.
+
+### Fixed
+
+- Shared-memory wrapped-ring compaction copied through a temporary buffer; a
+  desynchronised ring is reported before the capacity decision.
+- Dispatch uses the job's real capability id in errors; a destroyed lane leaves
+  settled results readable.
+- Double settlement is counted in `Metrics::promises_double_settled`.
+- The CI 32-bit lane and the Linux churn test are stable.
+
+### Verification
+
+- 115 tests, red-team battery (19 cases), nine negative controls, Docker fuzz
+  (9 targets), i686 lane, performance budgets, API gate and clean-clone gates.
+
 
 ## 1.1.9 — 2026-10-27
 
@@ -151,3 +209,4 @@ First release: capability kernel with attenuation and lifetime notification,
 promise pipelining with batching, lanes, channels, tool handles (MCP, HTTP,
 sandboxed process), domain operations over Active Infinity, and five transports
 (in-process, TCP, shared memory, QUIC, Connect/gRPC bridge).
+
