@@ -47,19 +47,19 @@ pub const MAX_CHANNELS: usize = 4_096;
 /// [`MAX_SETTLED_BYTES`], and completed jobs are removed immediately.
 pub const MAX_PROMISES: usize = 100_000;
 
-/// Settled promise records retained per kernel after a drain.
+/// Target number of settled promise records retained after a drain.
 ///
-/// A handle may read its value after the promise settled; the most recent
-/// records are kept so that ordinary await patterns work. Older settled records
-/// are evicted and their handles return `rpc/unknown-promise`. Pending records
-/// are never evicted.
+/// Retention is handle-pinned: a record with a live [`PromiseHandle`] is never
+/// evicted, so a caller that holds handles for a large batch can read every
+/// result. Only records with no live handle are candidates; pending records are
+/// never evicted.
 pub const MAX_SETTLED_PROMISES: usize = 1_024;
 
-/// Bytes of settled values retained per kernel after a drain.
+/// Target bytes of settled values retained per kernel after a drain.
 ///
-/// Values can be large; this bounds the payload memory a completed call chain
-/// pins. The newest record is always kept even when it alone exceeds the
-/// budget, so the call that just settled remains readable.
+/// Values can be large; this bounds the payload memory an *unreferenced*
+/// completed call chain pins. Handle-pinned records are exempt because the
+/// caller can still read them.
 pub const MAX_SETTLED_BYTES: usize = 64 << 20;
 
 /// Ceiling on the retained event log.
@@ -959,6 +959,24 @@ impl Agent {
         Ok(())
     }
 
+    /// Reference a promise record from a handle.
+    fn retain_promise(&self, id: PromiseId) {
+        if let Ok(mut kernel) = self.cell.try_borrow_mut() {
+            if let Some(record) = kernel.promises.get_mut(&id) {
+                record.handles = record.handles.saturating_add(1);
+            }
+        }
+    }
+
+    /// Drop a handle's reference to a promise record.
+    fn release_promise(&self, id: PromiseId) {
+        if let Ok(mut kernel) = self.cell.try_borrow_mut() {
+            if let Some(record) = kernel.promises.get_mut(&id) {
+                record.handles = record.handles.saturating_sub(1);
+            }
+        }
+    }
+
     /// Drain drop notifications recorded by one provider.
     pub fn take_drops(&self, provider: ProviderId) -> Vec<(u64, CapId)> {
         self.cell
@@ -1212,12 +1230,29 @@ impl Kernel {
     /// Trim settled promises after the queue drains.
     ///
     /// Only called with no queued job, so no dependency can still need an
-    /// evicted record. The newest settled record always survives.
+    /// evicted record. A record with a live handle is pinned and never evicted;
+    /// if every record is pinned the limits are a target, not a reason to drop
+    /// a result the caller can still read.
     fn trim_settled(&mut self) {
         while (self.settled.len() > MAX_SETTLED_PROMISES || self.settled_bytes > MAX_SETTLED_BYTES)
             && self.settled.len() > 1
         {
-            let Some((id, size)) = self.settled.pop_front() else {
+            let mut victim = None;
+            for (index, (id, _)) in self.settled.iter().enumerate() {
+                let pinned = self
+                    .promises
+                    .get(id)
+                    .map(|record| record.handles > 0)
+                    .unwrap_or(false);
+                if !pinned {
+                    victim = Some(index);
+                    break;
+                }
+            }
+            let Some(index) = victim else {
+                break;
+            };
+            let Some((id, size)) = self.settled.remove(index) else {
                 break;
             };
             self.settled_bytes = self.settled_bytes.saturating_sub(size);
@@ -1333,10 +1368,25 @@ fn cap_token(id: CapId) -> crate::cap::CapToken {
 }
 
 /// A handle to a pending or settled result.
-#[derive(Clone)]
 pub struct PromiseHandle {
     agent: Agent,
     id: PromiseId,
+}
+
+impl Clone for PromiseHandle {
+    fn clone(&self) -> Self {
+        self.agent.retain_promise(self.id);
+        Self {
+            agent: self.agent.clone(),
+            id: self.id,
+        }
+    }
+}
+
+impl Drop for PromiseHandle {
+    fn drop(&mut self) {
+        self.agent.release_promise(self.id);
+    }
 }
 
 impl PromiseHandle {

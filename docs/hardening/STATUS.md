@@ -24,12 +24,12 @@ the bottom is generated from `docs/hardening/invariant-map.toml` by
 
 ### H0.1 Test inventory
 
-114 test functions across the integration binaries plus the library unit tests
+115 test functions across the integration binaries plus the library unit tests
 and a doctest:
 
 | Suite | Tests | What it proves |
 |---|---|---|
-| `tests/unit_tests.rs` | 41 | capability mint/attenuation/revocation, drops, promises, lanes, channels, wire codec, tool policy, MCP handshake, bounded lifecycle model, observability metrics, process timeout |
+| `tests/unit_tests.rs` | 42 | capability mint/attenuation/revocation, drops, promises, lanes, channels, wire codec, tool policy, MCP handshake, bounded lifecycle model, observability metrics, process timeout |
 | `tests/integration_tests.rs` | 15 | real Infinity payloads, TCP peer pipelining, shared-memory transport, domain provider, tools |
 | `tests/property_tests.rs` | 3 | envelope round-trip, attenuation monotonicity, value redaction |
 | `tests/conformance_tests.rs` | 8 | error-code catalog, golden capability table, header attacks, stable encodings |
@@ -146,7 +146,7 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
 | `cargo fmt --all -- --check` | pass | local run 2026-10-27 |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | pass | local run 2026-10-27 |
 | `cargo clippy --no-default-features -- -D warnings` | pass | local run 2026-10-27 |
-| `cargo test --locked --all-features` | pass (114 tests) | local run + CI |
+| `cargo test --locked --all-features` | pass (115 tests) | local run + CI |
 | `cargo test --locked --no-default-features` | pass | local run + CI |
 | `cargo doc` with `RUSTDOCFLAGS=-D warnings` | pass | local run 2026-10-27 |
 | `cargo package --locked` | pass | local run 2026-10-27 |
@@ -184,15 +184,17 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
   with a scrubbed environment and a wall-clock ceiling, but the program itself
   is trusted code.
 - **`unsafe-libyaml` advisory.** Accepted, unreachable from the parsing path.
-- **Settled promises are retained in a bounded window.** After each drain the
-  kernel keeps the newest `MAX_SETTLED_PROMISES = 1_024` settled records and at
-  most `MAX_SETTLED_BYTES = 64 MiB` of response payloads (the newest record is
-  always kept). A handle whose record was evicted returns `rpc/unknown-promise`;
-  callers that need a long-lived result must copy it out. Pending promises are
-  never evicted, and `MAX_PROMISES` is transient backpressure, not a lifetime
-  quota: completed job records are removed immediately and settled records are
-  trimmed on every drain. A caller that never drains can fill the pending
-  window; draining restores capacity.
+- **Settled promise retention is handle-pinned.** A record referenced by a live
+  `PromiseHandle` is never evicted, so a caller can queue a batch of any size,
+  drain it, and still read every handle. Records with no live handle are trimmed
+  after each drain toward `MAX_SETTLED_PROMISES = 1_024` and
+  `MAX_SETTLED_BYTES = 64 MiB`; the limits are targets for unreferenced records,
+  not a licence to drop a readable result. Dropping the handle makes the record
+  eligible on the next drain. Pending promises are never evicted, and
+  `MAX_PROMISES` is transient backpressure, not a lifetime quota: completed job
+  records are removed immediately and settled records are trimmed on every
+  drain. A caller that never drains can fill the pending window; draining
+  restores capacity.
 - **Retained response values are a residual cost.** The 64 MiB window bounds
   pinned payload memory; one value larger than the window is still retained
   because it is the result the caller just awaited.
@@ -232,7 +234,7 @@ Sign-off: 2026-10-27, Grok (AI coding and security agent)
 
 **Repository:** `active-rpc` **version:** `1.1.9` **baseline commit:** `69acea89bd03a9a69ff88cdd6dd8d12560a2d210` **baseline tag:** `hardening-baseline` **measured:** 2026-10-27
 
-Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136 done, 0 partial, 0 gap, 24 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 141.
+Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136 done, 0 partial, 0 gap, 24 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 142.
 
 | Invariant | Meaning | Status | Checks | Negative control |
 |---|---|---|---|---|
@@ -303,7 +305,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136
 | **H2.18** | Logging and metrics carry no secrets or raw capability bits | `done` | `test:tests/unit_tests.rs::events_record_the_dispatch_batches`, `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::capability_display_and_errors_do_not_print_raw_bits` |
 | **H2.19** | Queue storms under a low call budget | `done` | `test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.20** | Nested value byte bombs under a low byte budget | `done` | `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.21** | Many lanes, channels and promises to finite limits | `done` | `test:tests/unit_tests.rs::global_registry_ceilings_are_finite`, `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging`, `test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots`, `test:tests/unit_tests.rs::settled_promise_and_job_records_are_reclaimed`, `test:tests/unit_tests.rs::settled_value_bytes_are_bounded_after_a_drain` |
+| **H2.21** | Many lanes, channels and promises to finite limits | `done` | `test:tests/unit_tests.rs::a_large_pipelined_batch_keeps_every_handle_readable`, `test:tests/unit_tests.rs::global_registry_ceilings_are_finite`, `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging`, `test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots`, `test:tests/unit_tests.rs::settled_promise_and_job_records_are_reclaimed`, `test:tests/unit_tests.rs::settled_value_bytes_are_bounded_after_a_drain` |
 | **H2.22** | Enormous tool payloads and tools that never return | `done` | `test:tests/unit_tests.rs::local_process_timeout_kills_a_hung_child`, `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget`, `test:tests/unit_tests.rs::channel_queue_ceiling_bounds_one_sender` |
 | **H2.23** | Zero or near-zero ceilings refused where policy needs finite limits | `done` | `test:tests/redteam_tests.rs::review_zero_ceilings_are_refused_in_every_budget_field` |
 | **H2.24** | Single-bit mutation fails validation or changes the hash | `n/a` | - |

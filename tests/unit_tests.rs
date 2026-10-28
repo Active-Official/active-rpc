@@ -1187,3 +1187,32 @@ fn settled_value_bytes_are_bounded_after_a_drain() {
         "retained bytes exceed the budget plus the newest value"
     );
 }
+
+#[test]
+fn a_large_pipelined_batch_keeps_every_handle_readable() {
+    let (agent, provider_id, _cap) = agent_with_module();
+    let wide = Budget {
+        max_calls: 10_000,
+        ..Budget::default()
+    };
+    let lane = agent.create_lane("batch", wide).expect("lane");
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.budget = wide;
+    let cap = agent.mint(provider_id, 0, attrs).expect("cap");
+
+    // Queue the whole batch before awaiting anything. The first await drains
+    // every job; retention must pin the records because these handles are live.
+    let mut handles = Vec::new();
+    for _ in 0..2_000 {
+        handles.push(agent.call(lane, &cap, "stats", vec![]).expect("call"));
+    }
+    for (index, promise) in handles.iter().enumerate() {
+        promise
+            .value()
+            .unwrap_or_else(|error| panic!("handle {index}: {}", error.code()));
+    }
+    assert_eq!(agent.job_count(), 0);
+    // Dropping the handles makes the records evictable on the next drain; the
+    // kernel must not have needed that to serve the reads above.
+    drop(handles);
+}

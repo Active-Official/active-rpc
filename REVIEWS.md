@@ -186,3 +186,14 @@ Verification: full suite, API gate, clippy, docs, 32-bit lane and the red-team b
 **NO NEW FINDINGS.** The reviewer confirmed the `impl.items` drift finding, the
 inherent-method counting, the single-`hex` allowlist check and the reclamation
 interactions.
+
+## Round 15 - 2026-10-27 (handle-pinned retention)
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| `trim_settled` evicted the oldest settled records without regard for live `PromiseHandle`s. A 2,000-call batch drained by the first await lost 976 results to `rpc/unknown-promise`, including the handle being awaited. | high | fixed: `PromiseRecord` carries a handle refcount; `PromiseHandle::clone`/`Drop` maintain it; trimming only evicts records with `handles == 0`. The limits are targets for unreferenced records, not a reason to drop readable results. |
+| The previous reclamation test awaited each promise inside the loop, so it never had more than one live handle and could not catch the batch bug. | gap | fixed: `a_large_pipelined_batch_keeps_every_handle_readable` queues 2,000 calls, drains once, then reads every handle. With pinning disabled it fails on handle 0 with `rpc/unknown-promise`; with pinning it passes. |
+| Residual-risk text told callers to "copy it out", which a pending pipeline cannot do before the drain. | gap | fixed: STATUS now states the real rule (handle-pinned; unreferenced records are trimmed). |
+
+Verification: 115 tests, clippy both feature sets, doc gate, 32-bit lane and the
+red-team battery pass.

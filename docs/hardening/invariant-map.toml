@@ -554,7 +554,8 @@ checks = ["test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget",
 id = "H2.21"
 title = "Many lanes, channels and promises to finite limits"
 status = "done"
-checks = ["test:tests/unit_tests.rs::global_registry_ceilings_are_finite", "test:tests/redteam_battery.rs::redteam_battery_is_green", "test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging", "test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots", "test:tests/unit_tests.rs::settled_promise_and_job_records_are_reclaimed", "test:tests/unit_tests.rs::settled_value_bytes_are_bounded_after_a_drain"]
+checks = [
+  "test:tests/unit_tests.rs::a_large_pipelined_batch_keeps_every_handle_readable","test:tests/unit_tests.rs::global_registry_ceilings_are_finite", "test:tests/redteam_battery.rs::redteam_battery_is_green", "test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging", "test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots", "test:tests/unit_tests.rs::settled_promise_and_job_records_are_reclaimed", "test:tests/unit_tests.rs::settled_value_bytes_are_bounded_after_a_drain"]
 
 [[phases]]
 id = "H2.22"

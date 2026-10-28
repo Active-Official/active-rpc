@@ -55,6 +55,11 @@ pub struct PromiseRecord {
     pub waiters: u32,
     /// Lane that issued the producing call.
     pub lane: u64,
+    /// Live [`crate::kernel::PromiseHandle`]s referencing this record.
+    ///
+    /// A settled record with a live handle is never evicted by retention
+    /// trimming: the caller can still read it.
+    pub handles: u32,
 }
 
 impl PromiseRecord {
@@ -65,6 +70,8 @@ impl PromiseRecord {
             state: PromiseState::Pending,
             waiters: 0,
             lane,
+            // The handle returned by `Agent::call` owns this reference.
+            handles: 1,
         }
     }
 
