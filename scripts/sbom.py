@@ -2,8 +2,8 @@
 """Generate a CycloneDX 1.5 SBOM from the committed Cargo graph.
 
 Usage:
-    python scripts/sbom.py --output dist/active-infinity-2.0.7.cdx.json
-    python scripts/sbom.py --check dist/active-infinity-2.0.7.cdx.json
+    python scripts/sbom.py --output dist/active-rpc-1.1.9.cdx.json
+    python scripts/sbom.py --check dist/active-rpc-1.1.9.cdx.json
 """
 
 from __future__ import annotations
@@ -131,3 +131,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
