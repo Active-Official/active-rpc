@@ -1,0 +1,10 @@
+<svg width="320" height="72" viewBox="0 0 320 72" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="packet-flow">
+<path id="Vector" d="M8 36H312" stroke="black" stroke-opacity="0.25" stroke-width="2" stroke-dasharray="4 8"/>
+<path id="Vector_2" d="M33 26H23C20.2386 26 18 28.2386 18 31V41C18 43.7614 20.2386 46 23 46H33C35.7614 46 38 43.7614 38 41V31C38 28.2386 35.7614 26 33 26Z" fill="black" fill-opacity="0.25"/>
+<path id="Vector_3" d="M101 26H91C88.2386 26 86 28.2386 86 31V41C86 43.7614 88.2386 46 91 46H101C103.761 46 106 43.7614 106 41V31C106 28.2386 103.761 26 101 26Z" fill="black" fill-opacity="0.55"/>
+<path id="Vector_4" d="M169 26H159C156.239 26 154 28.2386 154 31V41C154 43.7614 156.239 46 159 46H169C171.761 46 174 43.7614 174 41V31C174 28.2386 171.761 26 169 26Z" fill="black"/>
+<path id="Vector_5" d="M237 26H227C224.239 26 222 28.2386 222 31V41C222 43.7614 224.239 46 227 46H237C239.761 46 242 43.7614 242 41V31C242 28.2386 239.761 26 237 26Z" fill="black" fill-opacity="0.55"/>
+<path id="Vector_6" d="M301 26H291C288.239 26 286 28.2386 286 31V41C286 43.7614 288.239 46 291 46H301C303.761 46 306 43.7614 306 41V31C306 28.2386 303.761 26 301 26Z" fill="black" fill-opacity="0.25"/>
+</g>
+</svg>

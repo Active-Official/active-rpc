@@ -161,6 +161,9 @@ jobs:
       - name: Control plane tests
         run: cargo test --locked
         working-directory: control-plane
+      - name: Control plane two-launch smoke
+        run: python3 scripts/launch_check.py
+        working-directory: control-plane
       - name: Control plane lint
         run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: control-plane

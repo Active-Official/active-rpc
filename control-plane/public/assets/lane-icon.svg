@@ -1,0 +1,7 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="lane-icon">
+<path id="Vector" d="M10 18H54M10 32H38M10 46H46" stroke="black" stroke-width="4" stroke-linecap="round"/>
+<path id="Vector_2" d="M46 37C48.7614 37 51 34.7614 51 32C51 29.2386 48.7614 27 46 27C43.2386 27 41 29.2386 41 32C41 34.7614 43.2386 37 46 37Z" fill="black"/>
+<path id="Vector_3" d="M52 51C54.7614 51 57 48.7614 57 46C57 43.2386 54.7614 41 52 41C49.2386 41 47 43.2386 47 46C47 48.7614 49.2386 51 52 51Z" fill="black"/>
+</g>
+</svg>

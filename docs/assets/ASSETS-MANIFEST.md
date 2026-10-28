@@ -10,6 +10,15 @@
 | `control-plane-light.png` | Live dashboard screenshot (light) with Live activity, 20 real gauges, engines and event log | 1320x917 |
 | `control-plane-gauges-dark.png` | Live gauge grid (dark): 20 source-labelled gauges from the running plane | 1320x917 |
 | `control-plane-gauges-light.png` | Live gauge grid (light): 20 source-labelled gauges from the running plane | 1320x917 |
+| `control-plane-benchmark-dark.png` | Benchmark desk and Agent access panels (dark) after a real 40-iteration run | 1320x917 |
+| `control-plane-benchmark-light.png` | Benchmark desk and Agent access panels (light) after a real 40-iteration run | 1320x917 |
+| `control-plane-mcp-dark.png` | Agent access and MCP configuration panel (dark) | 1320x917 |
+| `control-plane-mcp-light.png` | Agent access and MCP configuration panel (light) | 1320x917 |
+| `../../control-plane/public/assets/gauge-frame.svg` | D2 reusable gauge bezel, exported from Figma frame 1:20 | 260x160 |
+| `../../control-plane/public/assets/lane-icon.svg` | D3 lane metaphor icon, exported from Figma frame 1:25 | 64x64 |
+| `../../control-plane/public/assets/channel-icon.svg` | D4 channel metaphor icon, exported from Figma frame 1:29 | 64x64 |
+| `../../control-plane/public/assets/cap-icon.svg` | D5 capability token icon, exported from Figma frame 1:34 | 64x64 |
+| `../../control-plane/public/assets/packet-flow.svg` | D6 packet-flow motif, exported from Figma frame 1:40 | 320x72 |
 | `readme-arch-rpc-dark.png` | README theme asset | 1320x462 |
 | `readme-arch-rpc-dark.svg` | README theme asset | 2400x840 |
 | `readme-arch-rpc-light.png` | README theme asset | 1320x462 |
@@ -25,8 +34,9 @@
 
 All README images are authored at 2400x840 and exported losslessly at 1320x462
 (1.5x GitHub README width) to stay inside the 500 KB budget. Light/dark pairs
-are separate files; the README selects them with GitHub theme fragments and a
-`<picture>`/`prefers-color-scheme` fallback. The palette is the active-lang
+are separate files; the README selects them with `<picture>` and
+`prefers-color-scheme`. GitHub's deprecated `#gh-` fragments are not used;
+that deviation is recorded in the package and goal notes. The palette is the active-lang
 header: #101016 charcoal, #f2571f orange, #a0a7b0 gray, flat surfaces, no
 gradients. The approved mark `active-mark.png` is an exact byte copy of
 active-lang's `docs/assets/active-icon.png`

@@ -1,0 +1,9 @@
+<svg width="260" height="160" viewBox="0 0 260 160" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="gauge-frame">
+<g id="frame">
+<path id="Vector" d="M30 128C30 101.478 40.5357 76.043 59.2893 57.2893C78.043 38.5357 103.478 28 130 28C156.522 28 181.957 38.5357 200.711 57.2893C219.464 76.043 230 101.478 230 128" stroke="black" stroke-opacity="0.18" stroke-width="12" stroke-linecap="round"/>
+<path id="Vector_2" d="M30 128C30 101.478 40.5357 76.043 59.2893 57.2893C78.043 38.5357 103.478 28 130 28C156.522 28 181.957 38.5357 200.711 57.2893C219.464 76.043 230 101.478 230 128" stroke="black" stroke-opacity="0.55" stroke-width="12" stroke-linecap="round" stroke-dasharray="1 13"/>
+<path id="Vector_3" d="M130 133C132.761 133 135 130.761 135 128C135 125.239 132.761 123 130 123C127.239 123 125 125.239 125 128C125 130.761 127.239 133 130 133Z" fill="black"/>
+</g>
+</g>
+</svg>

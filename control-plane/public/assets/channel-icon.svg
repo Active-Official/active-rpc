@@ -1,0 +1,8 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="channel-icon">
+<path id="Vector" d="M12 22H52M12 42H52" stroke="black" stroke-width="4" stroke-linecap="round"/>
+<path id="Vector_2" d="M22 28V36M42 28V36" stroke="black" stroke-width="4" stroke-linecap="round"/>
+<path id="Vector_3" d="M22 35C23.6569 35 25 33.6569 25 32C25 30.3431 23.6569 29 22 29C20.3431 29 19 30.3431 19 32C19 33.6569 20.3431 35 22 35Z" fill="black"/>
+<path id="Vector_4" d="M42 35C43.6569 35 45 33.6569 45 32C45 30.3431 43.6569 29 42 29C40.3431 29 39 30.3431 39 32C39 33.6569 40.3431 35 42 35Z" fill="black"/>
+</g>
+</svg>

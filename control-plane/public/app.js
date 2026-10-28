@@ -460,7 +460,7 @@
 		);
 		$("engine-grid").innerHTML = `
       <div class="engine-col">
-        <span class="section-label">Lanes</span>
+        <span class="section-label"><span class="icon-mask icon-lane" aria-hidden="true"></span>Lanes</span>
         ${engines.lanes
 					.map(
 						(lane) =>
@@ -469,7 +469,7 @@
 					.join("")}
       </div>
       <div class="engine-col">
-        <span class="section-label">Channels</span>
+        <span class="section-label"><span class="icon-mask icon-channel" aria-hidden="true"></span>Channels</span>
         ${engines.channels
 					.map(
 						(channel) =>
