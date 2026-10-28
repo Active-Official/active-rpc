@@ -191,7 +191,8 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
   callers that need a long-lived result must copy it out. Pending promises are
   never evicted, and `MAX_PROMISES` is transient backpressure, not a lifetime
   quota: completed job records are removed immediately and settled records are
-  trimmed on every drain.
+  trimmed on every drain. A caller that never drains can fill the pending
+  window; draining restores capacity.
 - **Retained response values are a residual cost.** The 64 MiB window bounds
   pinned payload memory; one value larger than the window is still retained
   because it is the result the caller just awaited.
