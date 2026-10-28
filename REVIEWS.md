@@ -197,3 +197,10 @@ interactions.
 
 Verification: 115 tests, clippy both feature sets, doc gate, 32-bit lane and the
 red-team battery pass.
+
+## Round 16 - 2026-10-27 (convergence of handle-pinned retention)
+
+**NO NEW FINDINGS.** The reviewer confirmed the refcount, clone/drop balance,
+trim's pinned-record skip, the late handle-reference assignment, and the
+interactions with pipelined dependencies, cancel, failure, destroy and cloning.
+The 2,000-call batch test drives the shipped drain/read path.
