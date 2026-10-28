@@ -110,6 +110,11 @@ silently aged out.
   scenario and never appears in a payload, log or screenshot.
 - Canonical OK rate counts real re-encode equality attempts; zero samples shows
   `0.0%` rather than a fabricated perfect score.
+- Refusals are real observations. The negative ladder steps intentionally
+  trigger revocation, tool policy, path policy and budget ceilings; each attempt
+  records both the generic `CallRefused` and the specific
+  `ToolRefused`/`BudgetExhausted` event. The Refused KPI reports `calls_refused`
+  once, while the gauges expose the tool and budget subsets.
 - Lane counts, channel message counts and promise records are registry reads,
   not estimates.
 

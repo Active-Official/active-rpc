@@ -239,6 +239,7 @@ main { max-width: 1560px; margin: 0 auto; padding: 22px 28px 40px; display: grid
 .brush-band { position: absolute; top: 0; height: 100%; background: color-mix(in srgb, var(--accent) 18%, transparent); border-left: 1px solid var(--accent); border-right: 1px solid var(--accent); pointer-events: none; }
 
 .log-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.log-note { margin: -2px 0 8px; }
 .filter-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip-filter {
   border: 1px solid var(--stroke);

@@ -31,7 +31,7 @@
       <article class="kpi"><span class="kpi-label">Calls queued</span><strong id="kpi-calls">0</strong><small>calls_queued · cumulative counter</small></article>
       <article class="kpi"><span class="kpi-label">Promise records</span><strong id="kpi-promises">0</strong><small>Agent::promise_count()</small></article>
       <article class="kpi"><span class="kpi-label">Provider round-trips</span><strong id="kpi-roundtrips">0</strong><small>Agent::round_trips()</small></article>
-      <article class="kpi"><span class="kpi-label">Refused</span><strong id="kpi-refused">0</strong><small>calls_refused + tool_refusals</small></article>
+      <article class="kpi"><span class="kpi-label">Refused</span><strong id="kpi-refused">0</strong><small>calls_refused · tool/budget are subsets</small></article>
       <article class="kpi"><span class="kpi-label">Budget pressure</span><strong id="kpi-pressure">0.0%</strong><small>calls / granted call budgets</small></article>
       <article class="kpi"><span class="kpi-label">Wire bytes / s</span><strong id="kpi-bytes">0</strong><small>bytes_in + bytes_out delta</small></article>
       <article class="kpi"><span class="kpi-label">Last error code</span><strong id="kpi-error" class="code-value">none</strong><small>latest event with a stable code</small></article>
@@ -112,6 +112,7 @@
           <div class="filter-chips" id="filter-chips" role="group" aria-label="Event filters"></div>
           <input id="event-search" class="search" type="search" placeholder="Filter detail, code, lane, method…" aria-label="Filter events">
         </div>
+        <p class="hint log-note">Refusals are intentional: L1.4 and L2.2–L2.4 exercise revocation, tool and path policy; L4.1–L4.3 exercise budget ceilings.</p>
         <ol id="event-log" class="event-log"></ol>
         <div class="log-actions">
           <button class="mini-button" id="download-jsonl" type="button">Download JSONL</button>

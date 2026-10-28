@@ -315,6 +315,31 @@ fn health_and_scenario_allow_list_are_stable() {
 }
 
 #[test]
+fn every_refusal_facet_is_recorded() {
+    let mut core = PlaneCore::new();
+    core.run_scenario("tool-policy").expect("tool policy");
+    core.run_scenario("budget").expect("budget");
+    core.run_scenario("revoke").expect("revoke");
+    let snapshot = core.snapshot();
+    let events = snapshot.events;
+    // Both the generic call refusal and the specific policy/budget event are
+    // true observations and stay visible.
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "call_refused"
+            && event.code.as_deref() == Some("rpc/tool-policy")));
+    assert!(events.iter().any(|event| event.kind == "tool_refused"));
+    assert!(events.iter().any(|event| event.kind == "call_refused"
+        && event.code.as_deref() == Some("rpc/budget-exceeded")));
+    assert!(events.iter().any(|event| event.kind == "budget"));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "call_refused" && event.code.as_deref() == Some("rpc/revoked")));
+    assert!(snapshot.metrics.tool_refusals >= 1);
+    assert!(snapshot.metrics.budget_exhaustions >= 1);
+}
+
+#[test]
 fn http_and_process_tools_survive_repeated_runs() {
     let mut core = PlaneCore::new();
     for round in 0..10 {

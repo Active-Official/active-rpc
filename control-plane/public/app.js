@@ -363,7 +363,7 @@
 		setText("kpi-calls", fmt(metrics.calls_queued));
 		setText("kpi-promises", fmt(metrics.promise_records));
 		setText("kpi-roundtrips", fmt(metrics.round_trips));
-		setText("kpi-refused", fmt(metrics.calls_refused + metrics.tool_refusals));
+		setText("kpi-refused", fmt(metrics.calls_refused));
 		setText("kpi-pressure", `${fmt(metrics.budget_pressure, 1)}%`);
 		setText(
 			"kpi-bytes",

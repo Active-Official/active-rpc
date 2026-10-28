@@ -1127,12 +1127,13 @@ impl PlaneCore {
             .map(|event| self.event_from_kernel(event))
             .collect();
         for event in events {
-            let duplicate = self
-                .events
-                .iter()
-                .rev()
-                .take(6)
-                .any(|existing| existing.kind == event.kind && existing.detail == event.detail);
+            let duplicate = self.events.iter().rev().take(6).any(|existing| {
+                existing.kind == event.kind
+                    && existing.detail == event.detail
+                    && existing.code == event.code
+                    && existing.capability == event.capability
+                    && existing.lane == event.lane
+            });
             if !duplicate {
                 self.record(event);
             }
