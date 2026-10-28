@@ -18,6 +18,13 @@ use crate::error::{Error, Result};
 use crate::lane::LaneId;
 use crate::value::Value;
 
+/// Maximum messages queued on one channel.
+///
+/// A channel is a mailbox, not an unbounded log. The ceiling is high enough for
+/// a burst and finite so one sender with a valid capability cannot grow kernel
+/// memory without bound.
+pub const MAX_QUEUED_PER_CHANNEL: usize = 4_096;
+
 /// Channel identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChannelId(pub u64);
@@ -117,6 +124,9 @@ impl Channel {
         }
         if !self.direction.can_send() {
             return Err(Error::InvalidArgument("channel is receive-only"));
+        }
+        if self.queue.len() >= MAX_QUEUED_PER_CHANNEL {
+            return Err(Error::BudgetExceeded("channel queue"));
         }
         let message = Message {
             from,

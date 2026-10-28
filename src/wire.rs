@@ -639,14 +639,25 @@ fn read_cap(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<CapDes
 
 /// Decode a capability table on its own (side-channel use).
 pub fn decode_capability_table(bytes: &[u8]) -> Result<Vec<CapDescriptor>> {
+    decode_capability_table_with(bytes, &WireLimits::default())
+}
+
+/// Decode a capability table under caller-supplied limits.
+///
+/// A strict peer can tighten `max_caps` and `max_methods` for a context that
+/// accepts only a few, narrowly-scoped capabilities.
+pub fn decode_capability_table_with(
+    bytes: &[u8],
+    limits: &WireLimits,
+) -> Result<Vec<CapDescriptor>> {
     let mut cursor = 0usize;
     let count = read_u32(bytes, &mut cursor)?;
-    if count > WireLimits::default().max_caps {
+    if count > limits.max_caps {
         return Err(Error::CapabilityTable("too many descriptors"));
     }
     let mut caps = Vec::with_capacity((count as usize).min(64));
     for _ in 0..count {
-        caps.push(read_cap(bytes, &mut cursor, 256)?);
+        caps.push(read_cap(bytes, &mut cursor, limits.max_methods)?);
     }
     if cursor != bytes.len() {
         return Err(Error::CapabilityTable("trailing bytes"));

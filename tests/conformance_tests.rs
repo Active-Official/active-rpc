@@ -184,13 +184,13 @@ fn header_field_attacks_are_rejected() {
 #[test]
 fn every_error_code_is_unique_and_documented() {
     let errors = [
-        Error::UnknownCapability(1),
+        Error::UnknownCapability(active_rpc::CapToken(1)),
         Error::MethodNotGranted { method: "x".into() },
         Error::Escalation("budget"),
         Error::ReadOnly,
         Error::PathNotGranted("a".into()),
         Error::ToolPolicy("x"),
-        Error::Revoked(1),
+        Error::Revoked(active_rpc::CapToken(1)),
         Error::BudgetExceeded("calls"),
         Error::UnknownLane(1),
         Error::UnknownChannel(1),

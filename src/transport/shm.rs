@@ -84,12 +84,9 @@ impl SharedSegment {
                 "frame does not fit the segment".to_string(),
             ));
         }
-        if used + needed > state.capacity {
-            return Err(Error::Transport("shared segment is full".to_string()));
-        }
         // A desynchronised consumer can advance past the frame boundary and
-        // leave `tail` mid-frame. The ring is unusable then; reset it instead
-        // of computing an out-of-bounds compaction range.
+        // leave `tail` mid-frame. Check this before the capacity decision so the
+        // failure names the real cause instead of reporting a full segment.
         if used > state.capacity {
             state.head = 0;
             state.tail = 0;
@@ -97,22 +94,28 @@ impl SharedSegment {
                 "shared segment desynchronised".to_string(),
             ));
         }
+        if used + needed > state.capacity {
+            return Err(Error::Transport("shared segment is full".to_string()));
+        }
         let start = state.head as usize % state.capacity;
         if start + needed > state.capacity {
             // Compact instead of fragmenting the frame: move the unread bytes
-            // from the *tail* to the front. The unread region can wrap, so copy
-            // it in at most two pieces. Using the head offset here would read
-            // past the end when the ring is nearly full.
+            // from the *tail* to the front. The unread region can wrap and the
+            // two source pieces can overlap their destinations, so copy through
+            // a temporary buffer. Compaction is rare (once per ring wrap) and
+            // bounded by the segment size.
             let unread = used;
             let tail_start = state.tail as usize % state.capacity;
             let capacity = state.capacity;
+            let mut compacted = Vec::with_capacity(unread);
             if tail_start + unread <= capacity {
-                state.data.copy_within(tail_start..tail_start + unread, 0);
+                compacted.extend_from_slice(&state.data[tail_start..tail_start + unread]);
             } else {
                 let first = capacity - tail_start;
-                state.data.copy_within(tail_start..capacity, 0);
-                state.data.copy_within(0..unread - first, first);
+                compacted.extend_from_slice(&state.data[tail_start..capacity]);
+                compacted.extend_from_slice(&state.data[0..unread - first]);
             }
+            state.data[..unread].copy_from_slice(&compacted);
             state.head = unread as u64;
             state.tail = 0;
         }

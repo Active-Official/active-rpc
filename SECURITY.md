@@ -45,3 +45,16 @@ capability id at rest (it is a bearer token).
 - Secret material is represented by `Value::Secret`, never by bytes.
 - Every frame is bounded and rejected at the boundary.
 - `#![forbid(unsafe_code)]`.
+
+## What is tested, fuzzed, reviewed, and proven
+
+| Level | What it covers | Where the evidence lives |
+|---|---|---|
+| **Tested** | kernel, capability lifecycle, attenuation, revocation, promises, lanes, channels, tools, transports, the red-team battery, negative controls and performance budgets | `tests/`, `docs/hardening/STATUS.md` |
+| **Fuzzed** | nine structure-aware targets: envelope, capability lifecycle, promise graph, budget matrix, MCP/HTTP/process tools, channel transfers, transport framing | `fuzz/`, committed corpora, nightly 200k-run campaign |
+| **Reviewed** | independent review rounds with triaged findings and regression tests for every fix | `REVIEWS.md`, `docs/hardening/REVIEW-SCOPE.md` |
+| **Proven** | monotone attenuation, revoke-at-dispatch and single settlement are stated as invariants and property/model-tested; they are **not** machine-checked proofs | `docs/spec/security.md` |
+
+Nothing in this crate is formally verified. The claims are bounded by the
+checked-in tests and the documented residual risks; a property that is not in
+that table is not claimed.

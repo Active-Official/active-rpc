@@ -172,3 +172,10 @@ event output for raw id bits.
 Control: I-4-debug.
 Status: fixed.
 
+
+## Standing question
+
+**What would an agent with infinite structured inputs try next?** Every research
+sprint answers this with at least one new test. The current frontier, in order:
+shared-memory frame timing under a separate process, QUIC stream reordering,
+and a grammar-driven capability-table mutator seeded from `docs/spec/wire.md`.

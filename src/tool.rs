@@ -588,6 +588,10 @@ pub struct LocalProcess {
     pub env: BTreeMap<String, String>,
     /// Maximum output bytes.
     pub max_output: usize,
+    /// Maximum wall-clock time one invocation may take before the child is
+    /// killed. Bounded on purpose: a tool that never returns must not hold the
+    /// caller forever (H2.44).
+    pub timeout_ms: u64,
     /// Calls served.
     pub calls: u64,
 }
@@ -600,8 +604,17 @@ impl LocalProcess {
             allow_args: allow_args.iter().map(|arg| arg.to_string()).collect(),
             env: BTreeMap::new(),
             max_output: 1 << 20,
+            timeout_ms: 10_000,
             calls: 0,
         }
+    }
+
+    /// Set the per-invocation wall-clock ceiling.
+    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
+        // Clamp to a sane window: zero would make every call flaky, and an
+        // enormous value would overflow the deadline arithmetic.
+        self.timeout_ms = timeout_ms.clamp(1, 300_000);
+        self
     }
 
     /// Policy for a capability: process execution must be granted explicitly.
@@ -667,24 +680,73 @@ impl Provider for LocalProcess {
         for (key, value) in &self.env {
             command.env(key, value);
         }
-        let output = command.output().map_err(|error| Error::Provider {
+        let mut child = command.spawn().map_err(|error| Error::Provider {
             code: format!("process/spawn:{error}"),
         })?;
-        if output.stdout.len() > self.max_output {
+        // Drain both pipes on their own threads. A child that writes more than
+        // the ceiling stops being drained, blocks on the pipe, and is killed at
+        // the deadline instead of growing our memory.
+        let ceiling = self.max_output as u64 + 1;
+        let stdout = child.stdout.take().map(|stream| {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = stream.take(ceiling).read_to_end(&mut buffer);
+                buffer
+            })
+        });
+        let stderr = child.stderr.take().map(|stream| {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = stream.take(ceiling).read_to_end(&mut buffer);
+                buffer
+            })
+        });
+
+        // The capability's wall budget can be tighter than the adapter default;
+        // the effective ceiling is the smaller of the two.
+        let ceiling_ms = self.timeout_ms.min(call.budget.max_wall_ms);
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(ceiling_ms))
+            .unwrap_or_else(std::time::Instant::now);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(Error::Timeout);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => {
+                    return Err(Error::Provider {
+                        code: format!("process/wait:{error}"),
+                    })
+                }
+            }
+        };
+        let stdout = stdout
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        if stdout.len() > self.max_output || stderr.len() > self.max_output {
             return Err(Error::ToolPolicy("output too large"));
         }
         let mut map = BTreeMap::new();
         map.insert(
             "status".to_string(),
-            Value::Int(output.status.code().unwrap_or(-1) as i64),
+            Value::Int(status.code().unwrap_or(-1) as i64),
         );
         map.insert(
             "stdout".to_string(),
-            Value::Text(String::from_utf8_lossy(&output.stdout).to_string()),
+            Value::Text(String::from_utf8_lossy(&stdout).to_string()),
         );
         map.insert(
             "stderr".to_string(),
-            Value::Text(String::from_utf8_lossy(&output.stderr).to_string()),
+            Value::Text(String::from_utf8_lossy(&stderr).to_string()),
         );
         Ok(Response::Value(Value::Map(map)))
     }

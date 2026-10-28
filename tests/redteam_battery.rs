@@ -82,6 +82,12 @@ const CASES: &[Case] = &[
         check: h2_20_byte_bomb,
     },
     Case {
+        id: "H2.21",
+        invariant: "I-8",
+        threat: "unbounded lane and channel registries",
+        check: h2_21_registries,
+    },
+    Case {
         id: "H2.23",
         invariant: "I-8",
         threat: "zero ceiling accepted",
@@ -104,6 +110,12 @@ const CASES: &[Case] = &[
         invariant: "I-10",
         threat: "errors leak payload or use unstable codes",
         check: h2_32_errors,
+    },
+    Case {
+        id: "H2.33",
+        invariant: "I-11",
+        threat: "security check compiled out in release",
+        check: h2_33_cfg,
     },
     Case {
         id: "H2.34",
@@ -535,6 +547,32 @@ fn h2_20_byte_bomb() -> std::result::Result<(), String> {
     Ok(())
 }
 
+fn h2_21_registries() -> std::result::Result<(), String> {
+    use active_rpc::kernel::{MAX_CHANNELS, MAX_LANES};
+
+    let agent = agent(21);
+    for _ in 0..MAX_LANES {
+        agent
+            .create_lane("lane", Budget::default())
+            .map_err(|e| e.to_string())?;
+    }
+    let error = agent
+        .create_lane("overflow", Budget::default())
+        .expect_err("lane ceiling");
+    expect_code(error, "rpc/budget-exceeded")?;
+
+    for _ in 0..MAX_CHANNELS {
+        agent
+            .create_channel("channel", active_rpc::Direction::Both)
+            .map_err(|e| e.to_string())?;
+    }
+    let error = agent
+        .create_channel("overflow", active_rpc::Direction::Both)
+        .expect_err("channel ceiling");
+    expect_code(error, "rpc/budget-exceeded")?;
+    Ok(())
+}
+
 fn h2_23_zero() -> std::result::Result<(), String> {
     let agent = agent(23);
     let provider = agent.register(Box::new(Counting {
@@ -678,6 +716,39 @@ fn corpus_files(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+fn h2_33_cfg() -> std::result::Result<(), String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![root];
+    let mut files = 0usize;
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                files += 1;
+                let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                let debug_only = text.contains("debug_assert!")
+                    || text.contains("cfg!(debug_assertions)")
+                    || text.contains("cfg(debug_assertions)");
+                if debug_only {
+                    return Err(format!(
+                        "{} contains a debug-only assertion or branch",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    if files == 0 {
+        return Err("no source files found".into());
+    }
+    Ok(())
 }
 
 fn h2_34_corpus() -> std::result::Result<(), String> {

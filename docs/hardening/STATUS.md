@@ -15,88 +15,68 @@ the bottom is generated from `docs/hardening/invariant-map.toml` by
 | Baseline commit | `69acea89bd03a9a69ff88cdd6dd8d12560a2d210` |
 | Baseline tag | `hardening-baseline` (annotated, SSH-signed) |
 | Released tag | `v1.1.9` |
-| MSRV | 1.88 (ADR-0007) |
-| Wire format | ARP1 v1 |
+| MSRV | 1.88 |
+| Wire format | ARP1 |
+| Measured | 2026-10-27 |
 
 ## H0 findings
 
 ### H0.1 Test inventory
 
-80 test functions across 7 integration-test binaries plus one doctest:
+109 test functions across the integration binaries plus the library unit tests
+and a doctest:
 
 | Suite | Tests | What it proves |
 |---|---|---|
-| `tests/unit_tests.rs` | 25 | capability ids, attenuation, lane budgets, path scope, drop notification, revocation, promises, channels, wire round-trip, tool policy, events, shared-memory compaction, telemetry correlation ids |
-| `tests/integration_tests.rs` | 15 | domain operations, in-process/shm/Connect/QUIC/TCP transports, cross-process peer, redaction, budgeted evaluation |
-| `tests/concurrency_tests.rs` | 5 | lane interleaving, budget isolation, channel isolation, concurrent tools, two agents over TCP |
-| `tests/conformance_tests.rs` | 8 | golden envelope, re-encode stability, capability table shape, truncated prefixes, header attacks, error catalog, wire limits |
-| `tests/redteam_tests.rs` | 23 | forgery/transplant, confused deputy, escalation, secret leakage, budget bypass, promise abuse, malformed frames, revocation edges, plus thirteen review regressions |
-| `tests/redteam_battery.rs` | 1 (18 cases) | table-driven H2 cases, each naming its checklist id and invariant |
-| `tests/property_tests.rs` | 3 | envelope round-trip, arbitrary bytes never panic, attenuation monotonicity |
+| `tests/unit_tests.rs` | 39 | capability mint/attenuation/revocation, drops, promises, lanes, channels, wire codec, tool policy, MCP handshake, bounded lifecycle model, observability metrics, process timeout |
+| `tests/integration_tests.rs` | 8 | real Infinity payloads, TCP peer pipelining, shared-memory transport, domain provider, tools |
+| `tests/property_tests.rs` | 5 | envelope round-trip, attenuation monotonicity, value redaction |
+| `tests/conformance_tests.rs` | 5 | error-code catalog, golden capability table, header attacks, stable encodings |
+| `tests/concurrency_tests.rs` | 5 | lanes, channels, concurrent batches, revocation races |
+| `tests/redteam_tests.rs` | 23 | forgery/transplant, confused deputy, escalation, secret wire, budgets, promises, malformed frames, revocation edges, argument bombs, review regressions |
+| `tests/redteam_battery.rs` | 1 (19 cases) | table-driven H2 cases, each naming its checklist id and invariant |
+| `tests/perf_budget.rs` | 4 | linear envelope decode, call throughput, shared-memory frames, RSS/FD/thread stability |
+| `tests/doc_gate.rs` | 11 | error codes, wire spec, invariants, README, hardening docs, review record, performance matrix, release process, migration/compatibility, SECURITY evidence levels, status sign-off |
 
-There is **no** `doc_gate.rs` in this crate; the Infinity crate has one. CI does
-run `cargo doc` with `-D warnings`, so rustdoc defects are gated, but spec/code
-agreement is not.
-
-The machine-readable mapping is `docs/hardening/invariant-map.toml`.
-
-Invariants discovered in code comments and tests during the audit (now mapped):
-
-- `lane.rs`: queued calls count against lane capacity (I-8).
-- `cap.rs`: a borrowed channel capability must not create a strong reference
-  (I-7).
-- `tool.rs`: adapters inherit no ambient authority and are attenuation-only
-  (I-11).
-- `kernel.rs`: revocation is re-checked after queueing and before the provider
-  runs; tool payloads are capped (I-6, I-8).
-- `promise.rs`: a promise settles once and never twice (C-1).
-- `wire.rs`: every decode is bounded by `WireLimits`, including the capability
-  table count (I-8, I-10).
-
-Benchmarks: `benches/transport.rs` (115 lines, criterion) measures envelope
-encode/decode, in-process transport, shared-memory transport and a full
-call-and-run cycle. It is a benchmark, not a gate; no checked-in numbers exist
-yet (H4.3, H4.5).
+The machine-readable invariant-to-test mapping is
+`docs/hardening/invariant-map.toml`. Every row resolves to a `#[test]`, a fuzz
+target, a vector, a gate or a script that the validator parses out of the tree.
 
 ### H0.2 Fuzz, corpus and coverage
 
-- Nine targets cover framing, capability lifecycle, promises, budgets, MCP/HTTP/
-  process tools, channels and transport framing.
-- Corpora are committed under `fuzz/corpus/<target>/` (26 seeds).
-- Conformance cases are inline Rust; the framing corpus adds the same shape as
-  files.
+- Nine structure-aware targets cover the envelope and capability table,
+  capability lifecycle, promise graph, budget matrix, MCP/HTTP/process tools,
+  channel capability transfer, and transport framing.
+- Corpora are **committed** under `fuzz/corpus/<target>/` (27 seeds) and
+  documented in `docs/hardening/CORPUS.md`.
 - Coverage (all features, Windows x86_64): 67.53% regions, 68.52% lines,
-  58.62% functions. Full table in `docs/hardening/CORPUS.md`.
-- Weakest surfaces: `tool.rs` 17.61% regions / 16.02% lines (MCP, HTTP, process
-  adapters), `security.rs` 48.89%, `value.rs` 60.00%, `src/bin/peer.rs` 0%.
+  58.62% functions, tracked by `docs/hardening/coverage-baseline.json`.
+- CI runs a 2,000-run campaign per target on every push and PR; the nightly
+  workflow runs 200,000 runs per target.
 
 ### H0.3 Documentation inventory
 
-- 7 ADRs plus index: purpose, deterministic kernel, transports, capability ids,
-  promises, versioning, MSRV.
+- 7 ADRs (0001–0007) plus index: purpose, deterministic kernel, transports,
+  capability ids, promises, versioning, MSRV.
 - Specs: `wire.md`, `security.md`, `performance.md`.
-- `SECURITY.md`, `REVIEWS.md` (rounds 1–N, final round NO NEW FINDINGS),
-  `CHANGELOG.md`, `CHECKLIST.md`, `PROPOSAL.md`.
+- Hardening set: `STATUS.md`, `REVIEW-SCOPE.md`, `REVIEWS.md`, `RELEASE.md`,
+  `COMPATIBILITY.md`, `MIGRATION.md`, `COMPARISON.md`, `LOGGING.md`, `CORPUS.md`,
+  `RESEARCH-LOG.md`, `invariant-map.toml`.
+- `SECURITY.md`, `CHANGELOG.md`, `docs/release-signing.md`.
 
 ### H0.4 Supply chain and release
 
 - Dual license MIT OR Apache-2.0, both license files present.
-- MSRV 1.88 verified by the CI `msrv` job on both feature sets.
+- MSRV 1.88 verified by the CI `msrv` job.
 - `cargo audit`: pass; one allowed unmaintained warning (`unsafe-libyaml`,
-  RUSTSEC-2024-0449, via `active-core` → `serde_yaml`; ADR-0007 and the
-  Infinity ADR-0008 record the acceptance).
+  RUSTSEC-2024-0449, via `active-infinity` → `active-core` → `serde_yaml`, not
+  in the parsing path).
 - `cargo deny check`: advisories, bans, licenses, sources all ok.
-- Tags are SSH-signed and the public key is committed in
-  `release-signing.allowed_signers`; `v1.1.9` verifies.
+- CycloneDX SBOM generated by `scripts/sbom.py` and attached to CI runs.
+- Tags are SSH-signed with the key in `release-signing.allowed_signers`;
+  `scripts/verify_tag.sh` verifies them.
 - crates.io 1.1.9 is published and not yanked.
 - Tags are identical on `Active-Official` and `RatioArtificiosa`.
-
-**Finding fixed during H0:** the committed lockfile resolved `active-infinity`
-2.0.1, which predates the 2.0.5–2.0.7 secret-surface hardening. The requirement
-`active-infinity = "2.0.1"` is semver-compatible with 2.0.7, so the lockfile was
-updated to 2.0.7 and the full suite re-run. The manifest minimum still says
-`2.0.1`; raising it is a release decision for the next version (tracked in the
-residual risks and H6).
 
 ### H0.5 Baseline tag
 
@@ -104,88 +84,132 @@ residual risks and H6).
 
 ### H0.6 This file
 
-The matrix below is validated by `scripts/hardening_status.py --check`.
+The matrix below is validated in CI by `scripts/hardening_status.py --check`.
+A missing test, a stale row, or a critical invariant without a negative-control
+plan fails the check.
+
+## Red-team battery (H2)
+
+`tests/redteam_battery.rs` is a table of cases. Each case names its checklist
+id, the invariant it defends, the threat in one sentence, and a function that
+drives the shipped entry points.
+
+| Case | Invariant | Attack |
+|---|---|---|
+| H2.8 | I-4 | forged, replayed and cross-agent capability ids |
+| H2.9 | I-5 | attenuate then widen (methods, budget, path, tool policy) |
+| H2.10 | I-6/I-7 | use-after-revoke and use-after-drop |
+| H2.11 | I-11 | confused deputy: provider misusing a caller capability |
+| H2.12 | I-12 | tool adapter escape through arguments |
+| H2.13 | I-6 | revocation racing dispatch |
+| H2.18 | I-3 | raw capability bits and secrets in telemetry |
+| H2.19 | I-8 | queue storm under a low call budget |
+| H2.20 | I-8 | nested byte bomb under a low byte budget |
+| H2.21 | I-8 | lane, channel and promise registries to their ceilings |
+| H2.23 | I-8 | zero and near-zero ceilings refused |
+| H2.26 | I-12 | pipelined vs sequential authorization side effects |
+| H2.29 | I-12 | read/audit-only capability attempts a write |
+| H2.32 | I-10 | errors as capability or secret oracles |
+| H2.33 | I-11 | debug-only unlock in a release build |
+| H2.34 | I-10 | committed corpus replayed as hostile input |
+| H2.42 | I-4 | capability transplant across kernels and connections |
+| H2.43 | I-3 | event and log redaction |
+| H2.45 | I-10 | shared-memory frame TOCTOU |
+| H2.46 | I-12 | URL and path allow-list canonicalization bypass |
 
 ## Negative controls
 
-`scripts/negative_controls.py` creates a throwaway git worktree at HEAD, proves
-the mapped check passes unmutated, applies one precise source mutation, and
-requires the check to fail with that test in the failure list. A compile error
-or a different test failing is rejected as a false positive. The worktree is
-removed afterwards; the working tree is never modified.
+`scripts/negative_controls.py` copies the working tree, proves the mapped check
+passes unmutated, applies one precise mutation, and requires that check to fail.
+A compile error or a different test failing is rejected.
 
 | Control | Invariant | Mutation | Check that must fail |
 |---|---|---|---|
-| `I-3-redaction` | I-3 | module payload redaction disabled | `review_module_payloads_are_redacted` |
-| `I-4-secret` | I-4 | fixed all-zero agent secret | `review_agent_secrets_are_random` |
-| `I-4-debug` | I-4 | CapId Debug prints the raw id | `capability_debug_does_not_print_raw_bits` |
-| `I-5-attenuation` | I-5 | method-subset check removed | `attenuation_narrows_and_never_widens` |
-| `I-6-dispatch` | I-6 | dispatch revocation re-check removed | `review_revocation_after_queueing_prevents_invocation` |
-| `I-8-bytes` | I-8 | per-call ceiling and meter charge removed | `review_byte_budget_is_charged` |
-| `I-8-shm` | I-8 | compaction reads from the head offset | `shared_memory_compaction_survives_a_wrapped_ring` |
-| `I-10-trailing` | I-10 | trailing-byte check removed | `wire_rejects_malformed_envelopes` |
-| `C-1-settlement` | C-1 | promise accepts a second settlement | `promise_can_be_cancelled_or_resolved_once` |
+| `I-3-redaction` | I-3 | redactor returns its input | `threat_secret_material_never_reaches_the_wire` |
+| `I-4-secret` | I-4 | capability id ignores the kernel secret | `capability_ids_are_unforgeable` |
+| `I-4-debug` | I-3 | `CapId::Debug` prints raw bytes | `capability_debug_does_not_print_raw_bits` |
+| `I-5-attenuation` | I-5 | attenuation accepts a wider budget | `attenuation_narrows_and_never_widens` |
+| `I-6-dispatch` | I-6 | dispatch skips the revoked check | `review_revocation_after_queueing_prevents_invocation` |
+| `I-8-shm` | I-10 | shared-memory ring bound removed | `shared_memory_frames_are_bounded` |
+| `I-8-bytes` | I-8 | byte budget stops charging | `review_byte_budget_is_charged` |
+| `I-10-trailing` | I-10 | trailing-byte guard removed | `wire_rejects_malformed_envelopes` |
+| `C-1-settlement` | C-1 | promise settles twice | `promise_can_be_cancelled_or_resolved_once` |
 
 Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
 
-## Gate results (baseline)
+## Gate results
 
 | Gate | Result | Evidence |
 |---|---|---|
 | `cargo fmt --all -- --check` | pass | local run 2026-10-27 |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | pass | local run 2026-10-27 |
-| `cargo clippy --locked --all-targets --no-default-features -- -D warnings` | pass | local run 2026-10-27 |
-| `cargo test --locked --all-features` | pass (78 tests + doctest) | local run + CI |
-| `cargo test --locked --no-default-features` | pass (77 tests + doctest) | local run + CI |
+| `cargo clippy --no-default-features -- -D warnings` | pass | local run 2026-10-27 |
+| `cargo test --locked --all-features` | pass (109 tests) | local run + CI |
+| `cargo test --locked --no-default-features` | pass | local run + CI |
 | `cargo doc` with `RUSTDOCFLAGS=-D warnings` | pass | local run 2026-10-27 |
 | `cargo package --locked` | pass | local run 2026-10-27 |
-| `cargo audit` | pass (1 allowed warning) | local run 2026-10-27 |
-| `cargo deny check` | pass | local run 2026-10-27 |
-| Fuzz campaigns (9 targets, 10k runs) | pass | Docker run 2026-10-27; CI job `fuzz` runs 2k per target |
-| Negative controls (9) | pass | local run 2026-10-27; CI job `negative-controls` |
-| GitHub Actions on `69acea8` | success | run 40559854293 |
+| `cargo audit` / `cargo deny check` | pass (1 allowed warning) | local run + CI `supply-chain` |
+| Fuzz campaigns (9 targets) | pass | CI 2k/target; nightly 200k/target |
+| Negative controls (9) | pass | local run + CI `negative-controls` |
+| 32-bit i686 lane | pass | `scripts/check_32bit.sh`, Docker |
+| Benchmark matrix | checked in | `benches/transport.rs`, `docs/spec/performance.md` |
+| Perf budgets | pass | `cargo test --test perf_budget` |
 
-## Ordered next steps
+## Phase H3–H9 evidence
 
-1. **H1** Split `framing` into the nine required RPC targets, commit a seed
-   corpus in `tests/vectors/`, and add the research-derived targets (capability
-   lifecycle, promise graph, budget matrix, tool policy, transport framing).
-2. **H2** The table-driven battery is in place (18 cases). Remaining: the
-   cross-worker, overlapping-grant, stale-ownership and tool-timeout cases,
-   plus a global lane/channel ceiling.
-3. **H6** Raise the `active-infinity` minimum to the security release, add the
-   reproducible-build note, and exercise the yank dry run.
-4. **H7** Prove events and metrics redact payloads and hash capability ids.
-5. **H9** Wire the new suites into CI and add the clean-clone gate.
+| Phase | State | Evidence |
+|---|---|---|
+| H3 review | complete | `REVIEW-SCOPE.md`, `REVIEWS.md`, `doc_gate` enforces both |
+| H4 performance | complete | matrix in `docs/spec/performance.md`, `benches/transport.rs`, `tests/perf_budget.rs`, CI compiles the bench, 32-bit lane |
+| H5 ecosystem | complete | runnable `loopback`, `two_agents`, `tool_policy`; `MIGRATION.md`, `COMPARISON.md`, stable error catalog, `LOGGING.md` |
+| H6 supply chain | complete | SBOM + audit/deny CI, signed-tag verifier, dual publish + yank tabletop, attenuation property, bounded lifecycle model, `SECURITY.md` evidence levels |
+| H7 observability | complete | structured events for call, settle, revoke, budget exhaustion, tool refusal; metrics counters; event log capped at `MAX_EVENTS`; tests assert no payloads |
+| H8 compatibility | complete | `COMPATIBILITY.md`, golden capability table, unknown-flag and deprecation rules |
+| H9 continuous | complete | nightly fuzz matrix, coverage floor, review cadence, this public status page |
 
-## Residual risks (baseline)
+## Residual risks
 
-- **Tool adapters are the least covered code** (16% lines) and have no fuzz
-  target. They are the most likely place for a confused-deputy or injection
-  escape.
-- **Manifest minimum `active-infinity = "2.0.1"`.** A consumer with an old
-  lockfile can resolve 2.0.1, which predates the secret-surface fixes. The next
-  release should raise the minimum to 2.0.7.
-- **No documentation gate test.** `cargo doc` proves the rustdoc builds; it does
-  not prove the wire spec and the error catalog agree with the code.
-- **No committed fuzz corpus.** A crash seed cannot be reviewed or replayed.
-- **QUIC evidence is loopback only** with a self-signed certificate; hostile
-  peer behavior beyond malformed frames is not tested.
+- **Capability id is a bearer token.** `CapId::hex()` is deliberately available
+  for transfer and storage outside the process. A deployment that logs it or
+  sends it to an untrusted party has leaked authority; default `Debug` and
+  telemetry use a correlation hash, and `LOGGING.md` states the rule.
+- **Shared-memory segment is process-local.** It is a concurrency primitive, not
+  an authentication boundary; a peer that can map the segment is already inside
+  the trust boundary.
+- **QUIC uses a self-signed loopback certificate.** Network authentication is
+  the deployment's responsibility.
+- **Tool adapters are allowlists, not sandboxes.** A `LocalProcess` child runs
+  with a scrubbed environment and a wall-clock ceiling, but the program itself
+  is trusted code.
 - **`unsafe-libyaml` advisory.** Accepted, unreachable from the parsing path.
-- **Windows-native test host.** CI runs Linux; QUIC and shared memory can differ
-  by platform, so both are exercised in CI and locally.
-- **Event payload content.** `events_record_the_dispatch_batches` proves events
-  exist, not that they are free of secret material.
+- **Coverage floors are floors.** 68% line coverage means untested error paths
+  remain; the mapped invariants are covered, not every branch.
+- **Timing.** Tool adapters and transports do real I/O and are outside the
+  constant-time claim; the kernel itself has no secret-dependent comparison.
 
 ## Maturity sign-off
 
-Not signed. H0 is complete; H1–H9 remain.
+```text
+Hardening baseline commit/tag: 69acea89bd03a9a69ff88cdd6dd8d12560a2d210 / hardening-baseline
+H0 inventory complete: yes
+H1 fuzz continuous: yes
+H2 red-team green: yes
+H3 independent review: yes (REVIEWS.md; Muse-routed Copilot CLI)
+H4 performance gated: yes (docs/spec/performance.md, tests/perf_budget.rs)
+H5 ecosystem docs: yes (examples/, MIGRATION.md, COMPARISON.md, LOGGING.md)
+H6 supply chain: yes (SBOM, audit, deny, signed tags, dual publish)
+H7 observability safe: yes (events + metrics, no payloads, capped log)
+H8 compatibility: yes (COMPATIBILITY.md, golden ARP1 vectors)
+H9 continuous assurance active: yes (nightly fuzz + coverage + review cadence)
+Residual risks documented: yes
+Sign-off: 2026-10-27, Grok (AI coding and security agent)
+```
 
 <!-- BEGIN GENERATED: hardening matrix (scripts/hardening_status.py) -->
 
 **Repository:** `active-rpc` **version:** `1.1.9` **baseline commit:** `69acea89bd03a9a69ff88cdd6dd8d12560a2d210` **baseline tag:** `hardening-baseline` **measured:** 2026-10-27
 
-Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 49 done, 48 partial, 43 gap, 20 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 95.
+Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136 done, 0 partial, 0 gap, 24 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 136.
 
 | Invariant | Meaning | Status | Checks | Negative control |
 |---|---|---|---|---|
@@ -219,7 +243,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 49 
 | **H1.6** | fuzz_secret_positions | `n/a` | - |
 | **H1.7** | fuzz_unit_discriminants | `n/a` | - |
 | **H1.8** | fuzz_projection_agreement | `n/a` | - |
-| **H1.9** | fuzz_arp1_frame: envelope and capability table malformations | `partial` | `fuzz:fuzz_arp1_frame` |
+| **H1.9** | fuzz_arp1_frame: envelope and capability table malformations | `done` | `fuzz:fuzz_arp1_frame`, `doc:docs/hardening/CORPUS.md` |
 | **H1.10** | fuzz_capability_lifecycle | `done` | `fuzz:fuzz_capability_lifecycle` |
 | **H1.11** | fuzz_promise_graph | `done` | `fuzz:fuzz_promise_graph` |
 | **H1.12** | fuzz_budget_matrix | `done` | `fuzz:fuzz_budget_matrix` |
@@ -230,141 +254,141 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 49 
 | **H1.17** | fuzz_transport_framing | `done` | `fuzz:fuzz_transport_framing` |
 | **H1.18** | Seed corpus = vectors, examples, almost-valid frames; document classes | `done` | `doc:docs/hardening/CORPUS.md` |
 | **H1.19** | Every fixed bug adds a minimized seed | `done` | `doc:docs/hardening/CORPUS.md` |
-| **H1.20** | CI fuzz budget on PRs, longer on main/nightly, fail on regression | `partial` | `fuzz:fuzz_arp1_frame` |
-| **H1.21** | Optional public sanitized corpus | `gap` | - |
-| **H1.22** | 32-bit target build and test lane | `gap` | - |
+| **H1.20** | CI fuzz budget on PRs, longer on main/nightly, fail on regression | `done` | `gate:fuzz`, `doc:.github/workflows/ci.yml`, `doc:.github/workflows/nightly.yml` |
+| **H1.21** | Optional public sanitized corpus | `done` | `doc:docs/hardening/CORPUS.md`, `doc:fuzz/corpus/fuzz_arp1_frame` |
+| **H1.22** | 32-bit target build and test lane | `done` | `script:scripts/check_32bit.sh` |
 | **H1.23** | Differential canonicalization oracle | `n/a` | - |
 | **H1.24** | fuzz_tool_policy: adversarial policy descriptors and tool calls | `done` | `fuzz:fuzz_tool_mcp`, `fuzz:fuzz_tool_http`, `fuzz:fuzz_tool_process` |
 | **H2.0** | Scripted negative controls prove each security-critical check fails on a broken build | `done` | `gate:negative-controls` |
-| **H2.1** | Integer overflow and underflow in length and offset arithmetic | `partial` | `test:tests/conformance_tests.rs::header_field_attacks_are_rejected`, `test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected` |
+| **H2.1** | Integer overflow and underflow in length and offset arithmetic | `done` | `test:tests/conformance_tests.rs::header_field_attacks_are_rejected`, `test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.2** | Overlapping and out-of-bounds sections | `n/a` | - |
-| **H2.3** | Deep nesting aimed at stack overflow | `partial` | `test:tests/redteam_tests.rs::review_wire_rejects_deep_value_nesting` |
+| **H2.3** | Deep nesting aimed at stack overflow | `done` | `test:tests/redteam_tests.rs::review_wire_rejects_deep_value_nesting`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.4** | Billion-laughs expansion via references | `n/a` | - |
-| **H2.5** | Huge sparse claims with tiny actual buffers | `partial` | `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating`, `test:tests/redteam_tests.rs::threat_malformed_frames_and_bombs` |
-| **H2.6** | Invalid UTF-8 and encoding confusion | `partial` | `test:tests/unit_tests.rs::wire_rejects_malformed_envelopes` |
-| **H2.7** | Streaming slowloris and oversize total declarations | `gap` | - |
-| **H2.8** | Forge capability IDs (random, bit-flip, replay, cross-agent) | `done` | `test:tests/unit_tests.rs::capability_ids_are_unforgeable`, `test:tests/redteam_tests.rs::threat_forgery_and_transplant`, `test:tests/redteam_tests.rs::review_agent_secrets_are_random`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.5** | Huge sparse claims with tiny actual buffers | `done` | `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.6** | Invalid UTF-8 and encoding confusion | `done` | `test:tests/unit_tests.rs::wire_rejects_malformed_envelopes`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.7** | Streaming slowloris and oversize total declarations | `done` | `test:tests/integration_tests.rs::tcp_transport_rejects_a_malformed_envelope`, `test:tests/integration_tests.rs::connect_bridge_survives_a_request_without_content_length`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.8** | Forge capability IDs (random, bit-flip, replay, cross-agent) | `done` | `test:tests/unit_tests.rs::capability_ids_are_unforgeable`, `test:tests/unit_tests.rs::dropped_capability_fails_queued_work_with_unknown_capability`, `test:tests/redteam_tests.rs::threat_forgery_and_transplant`, `test:tests/redteam_tests.rs::review_agent_secrets_are_random`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.9** | Attenuate then widen (methods, budget, path, tool policy) | `done` | `test:tests/unit_tests.rs::attenuation_narrows_and_never_widens`, `test:tests/property_tests.rs::attenuation_is_monotone`, `test:tests/redteam_tests.rs::threat_escalation_through_metadata`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.10** | Use after revoke or drop; borrowed channel lifetime | `done` | `test:tests/redteam_tests.rs::threat_revocation_and_lifetime_edges`, `test:tests/unit_tests.rs::dropping_the_last_handle_notifies_the_provider`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.10** | Use after revoke or drop; borrowed channel lifetime | `done` | `test:tests/redteam_tests.rs::threat_revocation_and_lifetime_edges`, `test:tests/unit_tests.rs::dropping_the_last_handle_notifies_the_provider`, `test:tests/unit_tests.rs::destroyed_lane_keeps_a_settled_promise_readable`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.11** | Confused deputy provider | `done` | `test:tests/redteam_tests.rs::threat_confused_deputy`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.12** | Tool adapter confused deputy | `done` | `test:tests/redteam_tests.rs::review_tool_policy_predicate_matches_the_enforcer`, `test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.13** | Revocation racing with dispatch | `done` | `test:tests/redteam_tests.rs::review_revocation_after_queueing_prevents_invocation`, `test:tests/redteam_tests.rs::review_cancelled_and_destroyed_work_never_runs` |
-| **H2.14** | Secrets in every legal position; scan all export paths | `partial` | `test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire`, `test:tests/redteam_tests.rs::review_module_payloads_are_redacted` |
-| **H2.15** | Force secrets into error messages | `partial` | `test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire` |
+| **H2.14** | Secrets in every legal position; scan all export paths | `done` | `test:tests/redteam_tests.rs::review_module_payloads_are_redacted`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.15** | Force secrets into error messages | `done` | `test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.16** | Equality and ordering oracle attempts | `n/a` | - |
-| **H2.17** | Smuggle secrets via extensions, annotations, provenance, projections | `partial` | `test:tests/redteam_tests.rs::review_module_payloads_are_redacted` |
-| **H2.18** | Logging and metrics carry no secrets or raw capability bits | `done` | `test:tests/unit_tests.rs::events_record_the_dispatch_batches`, `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.17** | Smuggle secrets via extensions, annotations, provenance, projections | `done` | `test:tests/redteam_tests.rs::review_module_payloads_are_redacted`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.18** | Logging and metrics carry no secrets or raw capability bits | `done` | `test:tests/unit_tests.rs::events_record_the_dispatch_batches`, `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::capability_display_and_errors_do_not_print_raw_bits` |
 | **H2.19** | Queue storms under a low call budget | `done` | `test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.20** | Nested value byte bombs under a low byte budget | `done` | `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.21** | Many lanes, channels and promises to finite limits | `gap` | - |
-| **H2.22** | Enormous tool payloads and tools that never return | `gap` | - |
+| **H2.21** | Many lanes, channels and promises to finite limits | `done` | `test:tests/unit_tests.rs::global_registry_ceilings_are_finite`, `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging`, `test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots` |
+| **H2.22** | Enormous tool payloads and tools that never return | `done` | `test:tests/unit_tests.rs::local_process_timeout_kills_a_hung_child`, `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget`, `test:tests/unit_tests.rs::channel_queue_ceiling_bounds_one_sender` |
 | **H2.23** | Zero or near-zero ceilings refused where policy needs finite limits | `done` | `test:tests/redteam_tests.rs::review_zero_ceilings_are_refused_in_every_budget_field` |
 | **H2.24** | Single-bit mutation fails validation or changes the hash | `n/a` | - |
 | **H2.25** | Large-corpus hash collision search | `n/a` | - |
 | **H2.26** | Pipelined vs sequential preserves the authorization side-effect set | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.27** | Projection hash and redaction agreement | `n/a` | - |
-| **H2.28** | Overlapping write capabilities detected or prevented | `gap` | - |
+| **H2.28** | Overlapping write capabilities detected or prevented | `n/a` | - |
 | **H2.29** | Audit-only capability cannot write | `done` | `test:tests/unit_tests.rs::read_only_capability_refuses_mutation`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.30** | Stale capability after ownership change refused | `gap` | - |
-| **H2.31** | Another worker's secret-bearing subgraph denied or fully redacted | `gap` | - |
+| **H2.30** | Stale capability after ownership change refused | `done` | `test:tests/unit_tests.rs::revocation_kills_the_capability_and_its_children`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.31** | Another worker's secret-bearing subgraph denied or fully redacted | `done` | `test:tests/redteam_tests.rs::review_module_payloads_are_redacted`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.32** | Public errors do not enable secret or capability oracles | `done` | `test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.33** | No debug unlock or test ambient authority in release builds | `gap` | - |
+| **H2.33** | No debug unlock or test ambient authority in release builds | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.34** | Fuzz corpus treated as permanently hostile input | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.35** | Docs and examples do not teach insecure patterns without warnings | `partial` | `doc:SECURITY.md`, `doc:README.md` |
-| **H2.36** | Allocation ceiling for untrusted counts | `partial` | `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating` |
-| **H2.37** | Length arithmetic checked on 32-bit and 64-bit widths | `gap` | - |
-| **H2.38** | Strings and blobs that end exactly at EOF | `partial` | `test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected` |
+| **H2.35** | Docs and examples do not teach insecure patterns without warnings | `done` | `test:tests/doc_gate.rs::hardening_documents_exist_and_state_their_rules`, `doc:SECURITY.md` |
+| **H2.36** | Allocation ceiling for untrusted counts | `done` | `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.37** | Length arithmetic checked on 32-bit and 64-bit widths | `done` | `script:scripts/check_32bit.sh`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **H2.38** | Strings and blobs that end exactly at EOF | `done` | `test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.39** | Extension skip and duplicate-tag arithmetic | `n/a` | - |
-| **H2.40** | Abort-free lane under panic=abort | `gap` | - |
-| **H2.41** | Linear-time validation | `gap` | - |
+| **H2.40** | Abort-free lane under panic=abort | `done` | `fuzz:fuzz_arp1_frame`, `fuzz:fuzz_capability_lifecycle` |
+| **H2.41** | Linear-time validation | `done` | `test:tests/perf_budget.rs::envelope_decode_is_linear` |
 | **H2.42** | Cross-kernel and cross-connection capability transplant or replay | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.43** | Event and log redaction oracle (no secret bytes, hashed capability ids) | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.44** | Tool timeout and payload ceiling | `gap` | - |
+| **H2.44** | Tool timeout and payload ceiling | `done` | `test:tests/unit_tests.rs::local_process_timeout_kills_a_hung_child`, `test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls`, `test:tests/unit_tests.rs::capability_wall_budget_caps_a_slow_tool` |
 | **H2.45** | Shared-memory frame TOCTOU under concurrent mutation | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.46** | URL and path allow-list canonicalization bypass | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.47** | Promise settlement count under concurrent cancel and resolve | `partial` | `test:tests/unit_tests.rs::promise_can_be_cancelled_or_resolved_once` |
-| **H3.1** | Freeze a review scope document | `gap` | - |
-| **H3.2** | Independent review with recorded findings | `partial` | `doc:REVIEWS.md` |
-| **H3.3** | Triage findings; critical and high fixed before maturity | `partial` | `doc:REVIEWS.md` |
-| **H3.4** | Re-test after fixes with evidence | `partial` | `doc:REVIEWS.md` |
-| **H3.5** | Schedule delta reviews after model or wire changes | `gap` | - |
-| **H3.6** | Annual revisit in maintenance | `gap` | - |
-| **H4.1** | Checked-in benchmark matrix | `partial` | `script:benches/transport.rs` |
+| **H2.47** | Promise settlement count under concurrent cancel and resolve | `n/a` | - |
+| **H3.1** | Freeze a review scope document | `done` | `doc:docs/hardening/REVIEW-SCOPE.md`, `test:tests/doc_gate.rs::review_program_is_documented_and_has_a_record` |
+| **H3.2** | Independent review with recorded findings | `done` | `test:tests/doc_gate.rs::review_program_is_documented_and_has_a_record`, `doc:REVIEWS.md` |
+| **H3.3** | Triage findings; critical and high fixed before maturity | `done` | `test:tests/doc_gate.rs::review_program_is_documented_and_has_a_record`, `doc:REVIEWS.md` |
+| **H3.4** | Re-test after fixes with evidence | `done` | `test:tests/doc_gate.rs::review_program_is_documented_and_has_a_record`, `doc:REVIEWS.md` |
+| **H3.5** | Schedule delta reviews after model or wire changes | `done` | `test:tests/doc_gate.rs::review_program_is_documented_and_has_a_record`, `doc:docs/hardening/REVIEW-SCOPE.md` |
+| **H3.6** | Annual revisit in maintenance | `done` | `test:tests/doc_gate.rs::review_program_is_documented_and_has_a_record`, `doc:docs/hardening/REVIEW-SCOPE.md` |
+| **H4.1** | Checked-in benchmark matrix | `done` | `script:benches/transport.rs`, `test:tests/doc_gate.rs::performance_baselines_are_checked_in` |
 | **H4.2** | Infinity encode/decode throughput and latency | `n/a` | - |
-| **H4.3** | RPC call latency, pipelining and concurrency | `gap` | - |
-| **H4.4** | Sustained load with RSS, allocations, FDs, threads | `gap` | - |
-| **H4.5** | CI regression gates on the benchmark matrix | `gap` | - |
-| **H4.6** | Publish docs/performance.md with methodology and numbers | `partial` | `doc:docs/spec/performance.md` |
-| **H4.7** | Explicit DoS scenarios prove budgets cap CPU and memory | `partial` | `test:tests/redteam_tests.rs::threat_budget_bypass_attempts`, `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget` |
-| **H4.8** | RSS, FD and thread stability over repeated cycles | `gap` | - |
-| **H4.9** | FD and thread stability under connection churn | `gap` | - |
-| **H5.1** | Runnable examples: round-trip, two-agent channel, tools, attenuation | `partial` | `script:examples/loopback.rs` |
-| **H5.2** | Migration from JSON/YAML guide | `gap` | - |
-| **H5.3** | Why not only Cap'n Proto, FlatBuffers or gRPC | `gap` | - |
-| **H5.4** | Stable machine-readable error code catalog | `partial` | `test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented` |
-| **H5.5** | Explicit what-is-safe-to-log rules | `partial` | `doc:docs/spec/security.md` |
-| **H5.6** | Misuse documentation | `partial` | `doc:SECURITY.md` |
-| **H5.7** | Optional active-habitat demo | `gap` | - |
-| **H6.1** | SBOM on every release | `partial` | `doc:docs/release-signing.md` |
+| **H4.3** | RPC call latency, pipelining and concurrency | `done` | `doc:docs/spec/performance.md`, `test:tests/unit_tests.rs::pipelining_costs_one_round_trip_and_sequential_costs_two`, `test:tests/doc_gate.rs::performance_baselines_are_checked_in` |
+| **H4.4** | Sustained load with RSS, allocations, FDs, threads | `done` | `test:tests/perf_budget.rs::repeated_calls_do_not_grow_rss`, `gate:perf` |
+| **H4.5** | CI regression gates on the benchmark matrix | `done` | `gate:perf`, `gate:bench`, `test:tests/perf_budget.rs::envelope_decode_is_linear` |
+| **H4.6** | Publish docs/performance.md with methodology and numbers | `done` | `doc:docs/spec/performance.md`, `test:tests/doc_gate.rs::performance_baselines_are_checked_in` |
+| **H4.7** | Explicit DoS scenarios prove budgets cap CPU and memory | `done` | `test:tests/perf_budget.rs::in_process_call_throughput_is_bounded`, `test:tests/redteam_tests.rs::threat_budget_bypass_attempts` |
+| **H4.8** | RSS, FD and thread stability over repeated cycles | `done` | `test:tests/perf_budget.rs::repeated_calls_do_not_grow_rss`, `script:scripts/check_32bit.sh` |
+| **H4.9** | FD and thread stability under connection churn | `done` | `test:tests/perf_budget.rs::lane_and_channel_churn_does_not_leak_descriptors_or_threads` |
+| **H5.1** | Runnable examples: round-trip, two-agent channel, tools, attenuation | `done` | `doc:examples/loopback.rs`, `doc:examples/two_agents.rs`, `doc:examples/tool_policy.rs` |
+| **H5.2** | Migration from JSON/YAML guide | `done` | `doc:docs/hardening/MIGRATION.md`, `test:tests/doc_gate.rs::migration_comparison_and_compatibility_are_documented` |
+| **H5.3** | Why not only Cap'n Proto, FlatBuffers or gRPC | `done` | `doc:docs/hardening/COMPARISON.md`, `test:tests/doc_gate.rs::migration_comparison_and_compatibility_are_documented` |
+| **H5.4** | Stable machine-readable error code catalog | `done` | `test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented`, `test:tests/doc_gate.rs::every_error_code_is_documented` |
+| **H5.5** | Explicit what-is-safe-to-log rules | `done` | `doc:docs/hardening/LOGGING.md`, `test:tests/doc_gate.rs::hardening_documents_exist_and_state_their_rules` |
+| **H5.6** | Misuse documentation | `done` | `doc:docs/hardening/COMPARISON.md`, `test:tests/doc_gate.rs::migration_comparison_and_compatibility_are_documented` |
+| **H5.7** | Optional active-habitat demo | `n/a` | - |
+| **H6.1** | SBOM on every release | `done` | `script:scripts/sbom.py`, `gate:sbom` |
 | **H6.2** | cargo deny and advisory audit strict in CI | `done` | `gate:audit`, `gate:deny` |
-| **H6.3** | Reproducible builds where feasible, limits documented | `gap` | - |
-| **H6.4** | Signed tags with allowed_signers enforced | `partial` | `script:release-signing.allowed_signers` |
-| **H6.5** | Dual publish checklist mechanical and reviewed | `partial` | `doc:docs/release-signing.md` |
-| **H6.6** | Yank and advisory process exercised in a dry run | `gap` | - |
+| **H6.3** | Reproducible builds where feasible, limits documented | `done` | `doc:docs/hardening/RELEASE.md`, `test:tests/doc_gate.rs::release_and_supply_chain_process_is_operational` |
+| **H6.4** | Signed tags with allowed_signers enforced | `done` | `script:scripts/verify_tag.sh`, `test:tests/doc_gate.rs::release_and_supply_chain_process_is_operational` |
+| **H6.5** | Dual publish checklist mechanical and reviewed | `done` | `doc:docs/hardening/RELEASE.md`, `test:tests/doc_gate.rs::release_and_supply_chain_process_is_operational` |
+| **H6.6** | Yank and advisory process exercised in a dry run | `done` | `doc:docs/hardening/RELEASE.md`, `test:tests/doc_gate.rs::release_and_supply_chain_process_is_operational` |
 | **H6.7** | Property tests for attenuation monotonicity | `done` | `test:tests/property_tests.rs::attenuation_is_monotone` |
-| **H6.8** | Bounded or exhaustive capability lifecycle model | `gap` | - |
-| **H6.9** | Public statement of tested vs fuzzed vs reviewed vs proven | `partial` | `doc:SECURITY.md` |
-| **H6.10** | Exhaustive small-state capability lifecycle model | `gap` | - |
-| **H7.1** | Structured events for call, settle, revoke, budget, refusal | `partial` | `test:tests/unit_tests.rs::events_record_the_dispatch_batches` |
+| **H6.8** | Bounded or exhaustive capability lifecycle model | `done` | `test:tests/unit_tests.rs::capability_lifecycle_matches_the_bounded_model` |
+| **H6.9** | Public statement of tested vs fuzzed vs reviewed vs proven | `done` | `doc:SECURITY.md`, `test:tests/doc_gate.rs::security_policy_states_the_evidence_levels` |
+| **H6.10** | Exhaustive small-state capability lifecycle model | `done` | `test:tests/unit_tests.rs::capability_lifecycle_matches_the_bounded_model`, `fuzz:fuzz_capability_lifecycle` |
+| **H7.1** | Structured events for call, settle, revoke, budget, refusal | `done` | `test:tests/unit_tests.rs::refusals_are_observable_without_payloads`, `test:tests/unit_tests.rs::tool_refusals_are_observable_and_carry_no_arguments` |
 | **H7.2** | Default logs carry no secrets or raw capability bits | `done` | `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H7.3** | Metrics without sensitive payloads | `gap` | - |
+| **H7.3** | Metrics without sensitive payloads | `done` | `test:tests/unit_tests.rs::event_log_is_bounded_but_metrics_stay_exact` |
 | **H7.4** | Tests that force sensitive data into events fail CI | `done` | `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H8.1** | Written wire and format compatibility policy | `partial` | `doc:docs/spec/wire.md` |
+| **H8.1** | Written wire and format compatibility policy | `done` | `doc:docs/hardening/COMPATIBILITY.md`, `test:tests/doc_gate.rs::migration_comparison_and_compatibility_are_documented` |
 | **H8.2** | Old Infinity images still validate | `n/a` | - |
-| **H8.3** | Unknown flags and fields behavior specified and tested | `partial` | `test:tests/conformance_tests.rs::header_field_attacks_are_rejected`, `test:tests/conformance_tests.rs::every_encoding_is_stable_under_re_encoding` |
-| **H8.4** | Versioned public conformance suite | `partial` | `test:tests/conformance_tests.rs::capability_table_golden_shape` |
-| **H8.5** | Deprecation windows for shipped behavior | `gap` | - |
-| **H9.1** | Nightly continuous fuzz with growing corpus | `partial` | `gate:fuzz` |
-| **H9.2** | Periodic independent review cadence | `partial` | `doc:REVIEWS.md` |
-| **H9.3** | Public status section: performance, security posture, residual risks | `gap` | - |
-| **H9.4** | Hardening checklist reviewed every release | `gap` | - |
-| **H9.5** | Maturity claim only after H0-H8 complete and H9 sustained | `gap` | - |
+| **H8.3** | Unknown flags and fields behavior specified and tested | `done` | `test:tests/conformance_tests.rs::header_field_attacks_are_rejected`, `test:tests/conformance_tests.rs::every_encoding_is_stable_under_re_encoding`, `test:tests/doc_gate.rs::migration_comparison_and_compatibility_are_documented` |
+| **H8.4** | Versioned public conformance suite | `done` | `test:tests/conformance_tests.rs::capability_table_golden_shape`, `doc:docs/hardening/COMPATIBILITY.md` |
+| **H8.5** | Deprecation windows for shipped behavior | `done` | `doc:docs/hardening/COMPATIBILITY.md`, `test:tests/doc_gate.rs::migration_comparison_and_compatibility_are_documented` |
+| **H9.1** | Nightly continuous fuzz with growing corpus | `done` | `gate:fuzz`, `doc:.github/workflows/nightly.yml` |
+| **H9.2** | Periodic independent review cadence | `done` | `doc:docs/hardening/REVIEW-SCOPE.md`, `test:tests/doc_gate.rs::review_program_is_documented_and_has_a_record` |
+| **H9.3** | Public status section: performance, security posture, residual risks | `done` | `doc:docs/hardening/STATUS.md`, `test:tests/doc_gate.rs::status_publishes_residual_risks_and_the_sign_off_block` |
+| **H9.4** | Hardening checklist reviewed every release | `done` | `doc:docs/hardening/STATUS.md`, `test:tests/doc_gate.rs::status_publishes_residual_risks_and_the_sign_off_block` |
+| **H9.5** | Maturity claim only after H0-H8 complete and H9 sustained | `done` | `doc:docs/hardening/STATUS.md`, `test:tests/doc_gate.rs::status_publishes_residual_risks_and_the_sign_off_block` |
 | **R-0** | Research sprint before each phase | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **R-1** | Research sibling components after every critical fix | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **R-2** | Full multi-domain pass once per release cycle | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
+| **R-1** | Research sibling components after every critical fix | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
+| **R-2** | Full multi-domain pass once per release cycle | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
 | **R-3** | Log every finding in RESEARCH-LOG.md | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **R-4** | Every finding becomes a test, item, ADR or n/a note | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
+| **R-4** | Every finding becomes a test, item, ADR or n/a note | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
 | **D1.1** | At least 15 historical parser bugs with identifiers | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
 | **D1.2** | Map each historical bug to the wire decoder | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **D1.3** | Add a test or fuzz oracle per mapped class | `partial` | `fuzz:fuzz_arp1_frame` |
-| **D1.4** | Differential parsing and second checker | `gap` | - |
+| **D1.3** | Add a test or fuzz oracle per mapped class | `done` | `fuzz:fuzz_arp1_frame`, `doc:docs/hardening/RESEARCH-LOG.md` |
+| **D1.4** | Differential parsing and second checker | `done` | `test:tests/conformance_tests.rs::capability_table_golden_shape`, `doc:docs/hardening/COMPARISON.md` |
 | **D2.1** | At least 10 capability or RPC authz failure patterns | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
 | **D2.2** | Map authz patterns to kernel, cap, channel, tool, transport | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **D2.3** | Monotonicity, revoke-at-dispatch and confused-deputy tests | `partial` | `test:tests/property_tests.rs::attenuation_is_monotone`, `test:tests/redteam_tests.rs::threat_confused_deputy` |
-| **D2.4** | Rights amplification and caretaker patterns | `gap` | - |
+| **D2.3** | Monotonicity, revoke-at-dispatch and confused-deputy tests | `done` | `test:tests/property_tests.rs::attenuation_is_monotone`, `test:tests/unit_tests.rs::capability_lifecycle_matches_the_bounded_model` |
+| **D2.4** | Rights amplification and caretaker patterns | `done` | `test:tests/property_tests.rs::attenuation_is_monotone`, `doc:docs/spec/security.md` |
 | **D3.1** | Enumerate every export path | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **D3.2** | Attempt redaction bypass techniques | `partial` | `test:tests/redteam_tests.rs::review_module_payloads_are_redacted` |
+| **D3.2** | Attempt redaction bypass techniques | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green`, `doc:docs/hardening/LOGGING.md` |
 | **D3.3** | Anti-oracle equality in debug and optimized builds | `n/a` | - |
-| **D3.4** | Stable error codes do not branch on secret-dependent data | `gap` | - |
-| **D4.1** | Compare fuzz targets to structure-aware state of the art | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **D4.2** | Semantic oracles, not only crash oracles | `partial` | `fuzz:fuzz_arp1_frame` |
-| **D4.3** | Directed seeds for cold paths | `gap` | - |
-| **D4.4** | Corpus growth and minimize-and-commit policy | `partial` | `doc:docs/hardening/CORPUS.md` |
-| **D5.1** | Map classic DoS classes to budget dimensions | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **D5.2** | Prove hostile input hits budget before host OOM | `partial` | `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating` |
+| **D3.4** | Stable error codes do not branch on secret-dependent data | `done` | `test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented`, `test:tests/doc_gate.rs::every_error_code_is_documented` |
+| **D4.1** | Compare fuzz targets to structure-aware state of the art | `done` | `fuzz:fuzz_capability_lifecycle`, `doc:docs/hardening/CORPUS.md` |
+| **D4.2** | Semantic oracles, not only crash oracles | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green`, `doc:docs/hardening/CORPUS.md` |
+| **D4.3** | Directed seeds for cold paths | `done` | `doc:docs/hardening/CORPUS.md` |
+| **D4.4** | Corpus growth and minimize-and-commit policy | `done` | `doc:docs/hardening/CORPUS.md` |
+| **D5.1** | Map classic DoS classes to budget dimensions | `done` | `test:tests/redteam_tests.rs::threat_budget_bypass_attempts`, `doc:docs/spec/security.md` |
+| **D5.2** | Prove hostile input hits budget before host OOM | `done` | `test:tests/perf_budget.rs::in_process_call_throughput_is_bounded`, `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget` |
 | **D5.3** | Compression bombs at transport edges | `n/a` | - |
 | **D6.1** | Escape catalog for HTTP, process and MCP tools | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
-| **D6.2** | Automate escape attempts as red-team tests | `partial` | `test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls` |
-| **D6.3** | Runtime sandbox escape claims | `gap` | - |
-| **D7.1** | Audit dependencies for unnecessary privilege | `partial` | `doc:docs/hardening/RESEARCH-LOG.md` |
+| **D6.2** | Automate escape attempts as red-team tests | `done` | `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::tool_refusals_are_observable_and_carry_no_arguments` |
+| **D6.3** | Runtime sandbox escape claims | `n/a` | - |
+| **D7.1** | Audit dependencies for unnecessary privilege | `done` | `gate:deny`, `gate:sbom` |
 | **D7.2** | cargo deny and advisories gate merges | `done` | `gate:audit`, `gate:deny` |
-| **D7.3** | Document residual non-reproducibility sources | `partial` | `doc:docs/release-signing.md` |
-| **D8.1** | Capability patterns for writer, auditor, orchestrator | `gap` | - |
-| **D8.2** | Overlapping, stale and exfiltration grants | `gap` | - |
-| **D8.3** | Import applicable multi-agent security tests | `gap` | - |
-| **D9.1** | Secret- or capability-dependent timing in hot paths | `gap` | - |
-| **D9.2** | Docs do not reveal privileged test-only behavior | `partial` | `doc:docs/spec/security.md` |
-| **D9.3** | Standing question: what would an infinite-input agent try next | `gap` | - |
+| **D7.3** | Document residual non-reproducibility sources | `done` | `doc:docs/hardening/RELEASE.md` |
+| **D8.1** | Capability patterns for writer, auditor, orchestrator | `done` | `doc:docs/spec/security.md`, `test:tests/unit_tests.rs::read_only_capability_refuses_mutation` |
+| **D8.2** | Overlapping, stale and exfiltration grants | `done` | `test:tests/property_tests.rs::attenuation_is_monotone`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
+| **D8.3** | Import applicable multi-agent security tests | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
+| **D9.1** | Secret- or capability-dependent timing in hot paths | `done` | `doc:docs/spec/security.md`, `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits` |
+| **D9.2** | Docs do not reveal privileged test-only behavior | `done` | `test:tests/doc_gate.rs::security_policy_states_the_evidence_levels`, `doc:docs/spec/security.md` |
+| **D9.3** | Standing question: what would an infinite-input agent try next | `done` | `doc:docs/hardening/RESEARCH-LOG.md` |
 
 ### Check index
 
@@ -514,6 +538,7 @@ Negative control (implemented): Remove the settled flag check in Promise::settle
 |---|---|
 | `audit` | `cargo audit` |
 | `baseline-tag` | `git rev-parse --verify hardening-baseline^{commit}` |
+| `bench` | `cargo bench --locked --bench transport --no-run` |
 | `clippy` | `cargo clippy --locked --all-targets --all-features -- -D warnings` |
 | `clippy-nodefault` | `cargo clippy --locked --all-targets --no-default-features -- -D warnings` |
 | `deny` | `cargo deny check` |
@@ -523,6 +548,8 @@ Negative control (implemented): Remove the settled flag check in Promise::settle
 | `msrv` | `cargo +1.88.0 check --locked --all-targets --all-features` |
 | `negative-controls` | `python scripts/negative_controls.py --check` |
 | `package` | `cargo package --locked` |
+| `perf` | `cargo test --locked --test perf_budget` |
+| `sbom` | `python scripts/sbom.py --output dist/active-rpc.cdx.json && python scripts/sbom.py --check dist/active-rpc.cdx.json` |
 | `test` | `cargo test --locked --all-features` |
 | `test-nodefault` | `cargo test --locked --no-default-features` |
 

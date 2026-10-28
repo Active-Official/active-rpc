@@ -68,6 +68,32 @@ fn agent_with_module() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle)
 }
 
 #[test]
+fn global_registry_ceilings_are_finite() {
+    use active_rpc::kernel::{MAX_CHANNELS, MAX_LANES};
+
+    let agent = Agent::with_secret([21u8; 32]);
+    for _ in 0..MAX_LANES {
+        agent
+            .create_lane("lane", Budget::default())
+            .expect("lane below the ceiling");
+    }
+    let error = agent
+        .create_lane("overflow", Budget::default())
+        .expect_err("the lane ceiling must bind");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+
+    for _ in 0..MAX_CHANNELS {
+        agent
+            .create_channel("channel", active_rpc::Direction::Both)
+            .expect("channel below the ceiling");
+    }
+    let error = agent
+        .create_channel("overflow", active_rpc::Direction::Both)
+        .expect_err("the channel ceiling must bind");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+}
+
+#[test]
 fn capability_ids_are_unforgeable() {
     let (agent, provider_id, _cap) = agent_with_module();
     let lane = agent.create_lane("main", Budget::default()).unwrap();
@@ -695,4 +721,381 @@ fn mcp_handshake_is_not_counted_as_a_tool_call() {
         "only tool invocations count, not the handshake"
     );
     assert!(session.policy().allowed.contains("echo"));
+}
+
+#[test]
+fn refusals_are_observable_without_payloads() {
+    let (agent, provider_id, _cap) = agent_with_module();
+    let lane = agent.create_lane("main", Budget::default()).unwrap();
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.budget.max_calls = 1;
+    let cap = agent.mint(provider_id, 0, attrs).expect("cap");
+    let first = agent.call(lane, &cap, "stats", vec![]).expect("first call");
+    first.value().expect("first value");
+    let second = agent
+        .call(lane, &cap, "stats", vec![])
+        .expect_err("second call must exhaust the call budget");
+    assert_eq!(second.code(), "rpc/budget-exceeded");
+
+    let metrics = agent.metrics();
+    assert_eq!(metrics.calls_queued, 1);
+    assert_eq!(metrics.calls_refused, 1);
+    assert_eq!(metrics.budget_exhaustions, 1);
+    assert!(agent.events().iter().any(|event| matches!(
+        event,
+        Event::BudgetExhausted { dimension, .. } if dimension == "call"
+    )));
+}
+
+#[test]
+fn tool_refusals_are_observable_and_carry_no_arguments() {
+    let (agent, provider_id, _cap) = agent_with_module();
+    let lane = agent.create_lane("main", Budget::default()).unwrap();
+    let attrs = CapAttrs::new(&["stats"]).with_tool_policy(ToolPolicy::allow(&["echo"]));
+    let cap = agent.mint(provider_id, 0, attrs).expect("cap");
+    let canary = "tool-refusal-canary-9f31";
+    let error = agent
+        .call(lane, &cap, "stats", vec![Arg::Value(Value::text(canary))])
+        .expect_err("tool policy must refuse");
+    assert_eq!(error.code(), "rpc/tool-policy");
+    let metrics = agent.metrics();
+    assert_eq!(metrics.calls_refused, 1);
+    assert_eq!(metrics.tool_refusals, 1);
+    let log = format!("{:?}", agent.events());
+    assert!(log.contains("ToolRefused"));
+    assert!(!log.contains(canary), "event log leaked an argument value");
+}
+
+#[test]
+fn event_log_is_bounded_but_metrics_stay_exact() {
+    use active_rpc::kernel::MAX_EVENTS;
+
+    let (agent, provider_id, _cap) = agent_with_module();
+    let budget = Budget {
+        max_calls: 40_000,
+        ..Budget::default()
+    };
+    let lane = agent.create_lane("storm", budget).unwrap();
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.budget = budget;
+    let cap = agent.mint(provider_id, 0, attrs).expect("cap");
+    for _ in 0..20_000 {
+        agent.call(lane, &cap, "stats", vec![]).expect("call");
+    }
+    assert!(agent.events().len() <= MAX_EVENTS);
+    assert_eq!(agent.metrics().calls_queued, 20_000);
+}
+
+/// A provider that answers one method and counts drop notifications.
+struct DropSpy {
+    drops: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl Provider for DropSpy {
+    fn name(&self) -> &'static str {
+        "drop-spy"
+    }
+    fn methods(&self) -> Vec<String> {
+        vec!["ping".to_string()]
+    }
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::text("pong")))
+    }
+    fn on_drop(&mut self, _object: u64, _cap: CapId) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+/// Exhaustive small-state model of the capability lifecycle.
+///
+/// Five operations over four steps is 625 sequences. For each, the test drives
+/// the real kernel and compares the observable result (call accepted/refused,
+/// provider notification count) with a hand-written model. This is the bounded
+/// model check required by H6.8; the fuzz target explores longer sequences.
+#[test]
+fn capability_lifecycle_matches_the_bounded_model() {
+    use std::collections::BTreeSet;
+
+    const OPS: u32 = 5;
+    const DEPTH: u32 = 4;
+    for code in 0..OPS.pow(DEPTH) {
+        let mut digits = Vec::new();
+        let mut rest = code;
+        for _ in 0..DEPTH {
+            digits.push(rest % OPS);
+            rest /= OPS;
+        }
+        let drops = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let agent = Agent::with_secret([3u8; 32]);
+        let provider = agent.register(Box::new(DropSpy {
+            drops: std::rc::Rc::clone(&drops),
+        }));
+        let lane = agent.create_lane("life", Budget::default()).expect("lane");
+        let root = agent
+            .mint(provider, 0, CapAttrs::new(&["ping"]))
+            .expect("mint");
+        let mut known: BTreeSet<CapId> = BTreeSet::new();
+        known.insert(root.id());
+        let mut handles = vec![root];
+        let mut revoked = false;
+        for op in digits {
+            match op {
+                0 => {
+                    let result = agent.attenuate(&handles[0], CapAttrs::new(&["ping"]));
+                    if revoked {
+                        assert!(result.is_err(), "attenuation of a revoked cap succeeded");
+                    } else {
+                        let child = result.expect("attenuation of a live cap");
+                        known.insert(child.id());
+                        handles.push(child);
+                    }
+                }
+                1 => {
+                    handles.push(handles[0].clone());
+                }
+                2 => {
+                    agent.revoke(&handles[0]);
+                    revoked = true;
+                }
+                3 => {
+                    handles.pop();
+                    if handles.is_empty() {
+                        break;
+                    }
+                }
+                _ => {
+                    let result = agent.call(lane, &handles[0], "ping", vec![]);
+                    if revoked {
+                        let error = result.expect_err("call on a revoked cap");
+                        assert_eq!(error.code(), "rpc/revoked");
+                    } else {
+                        result.expect("call on a live cap");
+                    }
+                }
+            }
+        }
+        let _ = agent.run();
+        drop(handles);
+        assert_eq!(
+            drops.get(),
+            known.len(),
+            "sequence {code}: every capability id must notify exactly once"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn local_process_timeout_kills_a_hung_child() {
+    use active_rpc::tool::LocalProcess;
+
+    let mut tool = LocalProcess::new("cmd.exe", &["/C", "*"]).with_timeout(150);
+    let mut call = Call::new(
+        "run",
+        vec![
+            Arg::text("/C"),
+            Arg::text("C:\\Windows\\System32\\ping.exe -n 20 127.0.0.1"),
+        ],
+    );
+    call.tool_allows_process = true;
+    let start = std::time::Instant::now();
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a hung child must time out");
+    assert_eq!(error.code(), "rpc/timeout");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "timeout took {:?}",
+        start.elapsed()
+    );
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn local_process_timeout_kills_a_hung_child() {
+    use active_rpc::tool::LocalProcess;
+
+    let mut tool = LocalProcess::new("sh", &["-c", "*"]).with_timeout(150);
+    let mut call = Call::new("run", vec![Arg::text("-c"), Arg::text("sleep 5")]);
+    call.tool_allows_process = true;
+    let start = std::time::Instant::now();
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a hung child must time out");
+    assert_eq!(error.code(), "rpc/timeout");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "timeout took {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn channel_queue_ceiling_bounds_one_sender() {
+    use active_rpc::channel::{Channel, ChannelId, MAX_QUEUED_PER_CHANNEL};
+
+    let mut channel = Channel::new(ChannelId(1), "bounded", Direction::Both);
+    for _ in 0..MAX_QUEUED_PER_CHANNEL {
+        channel
+            .send(active_rpc::LaneId(1), Value::Null, vec![])
+            .expect("below the channel ceiling");
+    }
+    let error = channel
+        .send(active_rpc::LaneId(1), Value::Null, vec![])
+        .expect_err("channel queue must be bounded");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+}
+
+#[test]
+fn destroyed_lanes_and_channels_reclaim_registry_slots() {
+    use active_rpc::kernel::{MAX_CHANNELS, MAX_LANES};
+
+    let agent = Agent::with_secret([15u8; 32]);
+    let mut lanes = Vec::new();
+    for _ in 0..MAX_LANES {
+        lanes.push(agent.create_lane("slot", Budget::default()).expect("lane"));
+    }
+    for lane in lanes {
+        agent.destroy_lane(lane).expect("destroy lane");
+    }
+    for _ in 0..MAX_LANES {
+        let lane = agent
+            .create_lane("reused", Budget::default())
+            .expect("reused lane");
+        agent.destroy_lane(lane).expect("destroy reused lane");
+    }
+
+    let mut channels = Vec::new();
+    for _ in 0..MAX_CHANNELS {
+        channels.push(
+            agent
+                .create_channel("slot", active_rpc::Direction::Both)
+                .expect("channel"),
+        );
+    }
+    for channel in channels {
+        agent.destroy_channel(channel).expect("destroy channel");
+    }
+    for _ in 0..MAX_CHANNELS {
+        let channel = agent
+            .create_channel("reused", active_rpc::Direction::Both)
+            .expect("reused channel");
+        agent
+            .destroy_channel(channel)
+            .expect("destroy reused channel");
+    }
+}
+
+#[test]
+fn promise_ceiling_is_finite_and_refuses_before_charging() {
+    use active_rpc::kernel::MAX_PROMISES;
+
+    let (agent, provider_id, _cap) = agent_with_module();
+    let wide = Budget {
+        max_calls: 200_000,
+        ..Budget::default()
+    };
+    let lane = agent.create_lane("storm", wide).expect("lane");
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.budget = wide;
+    let cap = agent.mint(provider_id, 0, attrs).expect("cap");
+    for _ in 0..MAX_PROMISES {
+        agent
+            .call(lane, &cap, "stats", vec![])
+            .expect("below ceiling");
+    }
+    let refused = agent
+        .call(lane, &cap, "stats", vec![])
+        .expect_err("promise ceiling must bind");
+    assert_eq!(refused.code(), "rpc/budget-exceeded");
+    assert_eq!(agent.metrics().calls_queued as usize, MAX_PROMISES);
+    assert_eq!(agent.metrics().calls_refused, 1);
+}
+
+#[test]
+fn capability_display_and_errors_do_not_print_raw_bits() {
+    let (agent, _provider_id, cap) = agent_with_module();
+    let lane = agent.create_lane("main", Budget::default()).unwrap();
+    let raw_hex = cap.id().hex();
+    let raw_decimal = u128::from_be_bytes(cap.id().0).to_string();
+    assert_eq!(format!("{}", cap.id()), cap.id().correlation_id());
+    assert_ne!(format!("{}", cap.id()), raw_hex);
+
+    let forged = agent.import(CapId([0x5a; 16]));
+    let error = agent
+        .call(lane, &forged, "stats", vec![])
+        .expect_err("forged cap");
+    let rendered = format!("{error} {error:?}");
+    assert!(!rendered.contains("5a5a5a5a"));
+    assert!(!rendered.contains(&raw_hex));
+    assert!(!rendered.contains(&raw_decimal));
+}
+
+#[test]
+fn double_settlement_is_counted_not_hidden() {
+    let (agent, provider_id, _cap) = agent_with_module();
+    let lane = agent.create_lane("main", Budget::default()).unwrap();
+    let cap = agent
+        .mint(provider_id, 0, CapAttrs::new(&["stats"]))
+        .expect("cap");
+    let promise = agent.call(lane, &cap, "stats", vec![]).expect("call");
+    agent
+        .resolve(&promise, Value::Int(1))
+        .expect("first settlement");
+    assert!(agent.resolve(&promise, Value::Int(2)).is_err());
+    assert_eq!(agent.metrics().promises_double_settled, 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn capability_wall_budget_caps_a_slow_tool() {
+    use active_rpc::tool::LocalProcess;
+
+    let mut tool = LocalProcess::new("cmd.exe", &["/C", "*"]).with_timeout(10_000);
+    let mut call = Call::new(
+        "run",
+        vec![
+            Arg::text("/C"),
+            Arg::text("C:\\Windows\\System32\\ping.exe -n 20 127.0.0.1"),
+        ],
+    );
+    call.tool_allows_process = true;
+    call.budget.max_wall_ms = 120;
+    let start = std::time::Instant::now();
+    let error = tool.invoke(0, &call).expect_err("wall budget must bind");
+    assert_eq!(error.code(), "rpc/timeout");
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn dropped_capability_fails_queued_work_with_unknown_capability() {
+    let (agent, provider_id, _cap) = agent_with_module();
+    let lane = agent.create_lane("main", Budget::default()).unwrap();
+    let cap = agent
+        .mint(provider_id, 0, CapAttrs::new(&["stats"]))
+        .expect("cap");
+    let promise = agent.call(lane, &cap, "stats", vec![]).expect("queued");
+    drop(cap);
+    agent.run();
+    let error = promise.value().expect_err("the capability vanished");
+    assert_eq!(error.code(), "rpc/unknown-capability");
+}
+
+#[test]
+fn destroyed_lane_keeps_a_settled_promise_readable() {
+    let (agent, provider_id, _cap) = agent_with_module();
+    let lane = agent.create_lane("main", Budget::default()).unwrap();
+    let cap = agent
+        .mint(provider_id, 0, CapAttrs::new(&["stats"]))
+        .expect("cap");
+    let promise = agent.call(lane, &cap, "stats", vec![]).expect("call");
+    promise.value().expect("settled before destroy");
+    agent.destroy_lane(lane).expect("destroy");
+    assert!(
+        promise.value().is_ok(),
+        "a settled result must survive lane destruction"
+    );
 }

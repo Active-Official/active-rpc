@@ -77,5 +77,13 @@ name = "redteam_battery"
 path = "tests/redteam_battery.rs"
 
 [[test]]
+name = "perf_budget"
+path = "tests/perf_budget.rs"
+
+[[test]]
+name = "doc_gate"
+path = "tests/doc_gate.rs"
+
+[[test]]
 name = "property_tests"
 path = "tests/property_tests.rs"

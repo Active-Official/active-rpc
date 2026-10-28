@@ -109,6 +109,52 @@ fn benches(criterion: &mut Criterion) {
         });
     });
     group.finish();
+
+    // The same eight calls, issued one-at-a-time versus queued together. The
+    // difference is provider round-trips, not call cost, so this pair is the
+    // checked-in evidence for the pipelining claim.
+    let mut group = criterion.benchmark_group("kernel/pipelining");
+    group.bench_function("sequential-8", |bencher| {
+        let (agent, cap, lane) = kernel_fixture();
+        bencher.iter(|| {
+            for _ in 0..8 {
+                let promise = agent.call(lane, &cap, "stats", vec![]).expect("call");
+                black_box(promise.value().expect("value"));
+            }
+        });
+    });
+    group.bench_function("batched-8", |bencher| {
+        let (agent, cap, lane) = kernel_fixture();
+        bencher.iter(|| {
+            let promises: Vec<_> = (0..8)
+                .map(|_| agent.call(lane, &cap, "stats", vec![]).expect("call"))
+                .collect();
+            for promise in promises {
+                black_box(promise.value().expect("value"));
+            }
+        });
+    });
+    group.finish();
+}
+
+fn kernel_fixture() -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(active_rpc::domain::module_from_source(SOURCE, "bench").unwrap());
+    let agent = Agent::new();
+    let provider_id = agent.register(Box::new(provider));
+    let wide = Budget {
+        max_calls: u64::MAX,
+        ..Budget::default()
+    };
+    let cap = agent
+        .mint(
+            provider_id,
+            object,
+            CapAttrs::new(&["stats"]).with_budget(wide),
+        )
+        .unwrap();
+    let lane = agent.create_lane("bench", wide).unwrap();
+    (agent, cap, lane)
 }
 
 criterion_group!(transport_benches, benches);

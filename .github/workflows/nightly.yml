@@ -1,0 +1,44 @@
+name: Nightly fuzz
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_arp1_frame
+          - fuzz_capability_lifecycle
+          - fuzz_promise_graph
+          - fuzz_budget_matrix
+          - fuzz_tool_mcp
+          - fuzz_tool_http
+          - fuzz_tool_process
+          - fuzz_channel_cap_transfer
+          - fuzz_transport_framing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install clang (libFuzzer runtime)
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Long campaign
+        run: cargo fuzz run "${{ matrix.target }}" -- -runs=200000 -print_final_stats=1
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Coverage floor
+        run: |
+          cargo llvm-cov --locked --all-features --json --summary-only --output-path coverage.json
+          python3 scripts/coverage_gate.py coverage.json

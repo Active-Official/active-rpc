@@ -57,15 +57,47 @@ impl CapId {
     /// Logs can correlate two events that mention the same capability without
     /// carrying the authority itself.
     pub fn correlation_id(self) -> String {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"active-rpc/capid-correlation");
-        hasher.update(&self.0);
-        let digest = hasher.finalize();
-        let mut out = String::with_capacity(16);
-        for byte in &digest.as_bytes()[..8] {
-            out.push_str(&format!("{byte:02x}"));
-        }
-        out
+        correlation(&self.0)
+    }
+}
+
+/// Domain-separated, truncated hash used for capability correlation.
+fn correlation(bytes: &[u8; 16]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"active-rpc/capid-correlation");
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(16);
+    for byte in &digest.as_bytes()[..8] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// A capability id carried by an error or diagnostic.
+///
+/// The raw 128 bits stay in memory so the kernel can look the id up, but every
+/// formatting path prints a correlation id. An error log therefore cannot be
+/// replayed as authority (I-3, I-4, H2.18).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CapToken(pub u128);
+
+impl CapToken {
+    /// Correlation id matching [`CapId::correlation_id`] for the same id.
+    pub fn correlation_id(self) -> String {
+        correlation(&self.0.to_be_bytes())
+    }
+}
+
+impl fmt::Debug for CapToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CapToken({})", self.correlation_id())
+    }
+}
+
+impl fmt::Display for CapToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.correlation_id())
     }
 }
 
@@ -79,7 +111,9 @@ impl fmt::Debug for CapId {
 
 impl fmt::Display for CapId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.hex())
+        // Display is a diagnostic surface, like Debug. Raw authority is only
+        // available through the explicitly documented `hex()`.
+        f.write_str(&self.correlation_id())
     }
 }
 

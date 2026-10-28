@@ -121,3 +121,50 @@ Verification of round 7 found four low items; all fixed in 1.1.7:
 ## Round 9 — 2026-10-27 (1.1.7)
 
 Verification round: **NO NEW FINDINGS**.
+
+## Round 10 - 2026-10-27 (hardening H2-H9 delta)
+
+Serve path: Muse-routed Copilot CLI (`muse-spark-1.3-contributor`).
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| Shared-memory compaction copied the wrapped front piece after overwriting its source | critical | fixed: compaction copies through a temporary buffer; desync check moved before the capacity check |
+| Settled jobs and promises were never reclaimed; no job ceiling; `destroy_lane` did not purge them | high | fixed: `destroy_lane` removes the lane, its jobs and its promises; `MAX_PROMISES` also bounds jobs |
+| Destroyed lanes and channels counted toward their registry ceilings forever | high | fixed: ceilings count open lanes, lanes are removed on destroy, `destroy_channel` added; churn test |
+| `MAX_PROMISES` was checked after `meter.charge`, burning budget on a refused call | high | fixed: ceilings checked before charging; promise-ceiling test |
+| `LocalProcess` ignored `Call.budget.max_wall_ms` | high | fixed: effective deadline is `min(tool timeout, wall budget)`; test |
+| `Display for CapId` still printed raw authority bits; `Error::UnknownCapability`/`Revoked` printed the raw u128 | high | fixed: `Display` prints the correlation id; `CapToken` wraps the raw bits and formats only a correlation id; regression |
+| Channel queue was unbounded | high | fixed: `MAX_QUEUED_PER_CHANNEL` with `rpc/budget-exceeded`; test |
+| `with_timeout` could overflow / zero made calls flaky | medium | fixed: clamp 1..=300_000 ms and checked deadline |
+| `decode_capability_table` ignored caller `WireLimits` | medium | fixed: `decode_capability_table_with`; the convenience form delegates with defaults |
+| Lanes/channels and promises used different ceiling codes | medium | fixed: both are `rpc/budget-exceeded` with a dimension |
+| Dispatch comment claimed a budget re-check it did not perform | medium | corrected; tool wall budget is enforced in the adapter |
+| Dispatch fabricated `UnknownCapability(0)` | medium | fixed: the job's real capability travels in the error |
+| cfg audit missed `#[cfg(debug_assertions)]` | medium | fixed: both spellings are scanned |
+| Double settlement was silently swallowed | low | fixed: `Metrics::promises_double_settled`; test |
+| New ceilings and events lacked failing-first tests | medium | fixed: channel ceiling, promise ceiling, registry reclaim, wall budget, Display/error redaction, double settle |
+
+Verification after fixes: full suite, `fmt`, `clippy` (both feature sets),
+`doc`, `package`, battery and negative controls pass. A follow-up verification
+round is recorded below.
+
+## Round 11 - 2026-10-27 (verification of round 10)
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| Dispatch fabricated `UnknownCapability(CapToken(0))` | medium | fixed: the job's real capability travels in the error |
+| A vanished head capability failed as `PipelinedCycle` | medium | fixed: the stuck path maps to `UnknownCapability(cap_token(job.cap))` |
+| `destroy_lane` removed settled promises, so an await saw `UnknownPromise` | medium | fixed: promise records survive lane destruction (the promise ceiling bounds them); jobs are reclaimed |
+
+Regression tests: `dropped_capability_fails_queued_work_with_unknown_capability`,
+`destroyed_lane_keeps_a_settled_promise_readable`.
+
+Verification: full suite, `fmt`, `clippy` (both feature sets), `doc`, the
+negative controls and the red-team battery pass.
+
+## Round 12 - 2026-10-27 (convergence)
+
+Focused convergence review of the three fixes and the surrounding lifecycle,
+registry and `CapToken` paths.
+
+**NO NEW FINDINGS.**

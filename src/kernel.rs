@@ -29,6 +29,29 @@ use crate::lane::{Lane, LaneId};
 use crate::promise::{PromiseId, PromiseRecord, PromiseState};
 use crate::value::{Arg, Call, Response, Value};
 
+/// Global ceiling on lanes in one kernel.
+///
+/// Lane creation is a local operation, but a caller that can create lanes
+/// without bound can exhaust memory. The ceiling is high enough for any real
+/// agent and finite, so a hostile or buggy caller fails closed.
+pub const MAX_LANES: usize = 4_096;
+
+/// Global ceiling on channels in one kernel.
+pub const MAX_CHANNELS: usize = 4_096;
+
+/// Global ceiling on live-and-settled promise records in one kernel.
+///
+/// Promises are removed when the lane is destroyed; the ceiling covers a kernel
+/// that keeps issuing calls on long-lived lanes.
+pub const MAX_PROMISES: usize = 100_000;
+
+/// Ceiling on the retained event log.
+///
+/// The log is diagnostic, not a durable audit trail. Keeping it finite means a
+/// peer that issues calls forever cannot grow kernel memory without bound; the
+/// oldest events are dropped first and [`Metrics`] keeps the totals.
+pub const MAX_EVENTS: usize = 16_384;
+
 /// A provider of capabilities: a module, a tool, a peer.
 pub trait Provider {
     /// Stable adapter name.
@@ -132,6 +155,57 @@ pub enum Event {
         /// Channel.
         channel: ChannelId,
     },
+    /// A call was refused before the provider saw it.
+    CallRefused {
+        /// Issuing lane.
+        lane: LaneId,
+        /// Target capability.
+        cap: CapId,
+        /// Stable error code (`rpc/...`).
+        code: String,
+    },
+    /// A budget ceiling refused work.
+    BudgetExhausted {
+        /// Capability whose budget (or lane ceiling) fired.
+        cap: CapId,
+        /// Dimension: `call`, `byte`, `lane call`, `promises`, ...
+        dimension: String,
+    },
+    /// A tool policy refused work.
+    ToolRefused {
+        /// Capability whose policy fired.
+        cap: CapId,
+        /// Stable reason string; never contains argument values.
+        reason: String,
+    },
+}
+
+/// Point-in-time kernel counters for operators and metrics exporters.
+///
+/// Counters carry no capability ids, arguments or secret material: they are
+/// safe to export by default. Per-capability detail stays in [`Event`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Metrics {
+    /// Calls accepted into the queue.
+    pub calls_queued: u64,
+    /// Calls refused before dispatch.
+    pub calls_refused: u64,
+    /// Refusals caused by a budget ceiling.
+    pub budget_exhaustions: u64,
+    /// Refusals caused by tool policy.
+    pub tool_refusals: u64,
+    /// Capabilities revoked.
+    pub revocations: u64,
+    /// Promises resolved.
+    pub promises_resolved: u64,
+    /// Promises rejected.
+    pub promises_rejected: u64,
+    /// Provider round trips.
+    pub round_trips: u64,
+    /// Capability transfers through channels.
+    pub transfers: u64,
+    /// Settlements attempted on an already-settled promise.
+    pub promises_double_settled: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +240,8 @@ pub struct Kernel {
     channels: BTreeMap<ChannelId, Channel>,
     jobs: BTreeMap<u64, Job>,
     queue: VecDeque<u64>,
-    events: Vec<Event>,
+    events: VecDeque<Event>,
+    metrics: Metrics,
     round_trips: u64,
     next_promise: u64,
     next_job: u64,
@@ -197,7 +272,7 @@ impl CapControl for HandleControl {
         if let Ok(mut kernel) = self.cell.try_borrow_mut() {
             if let Some(record) = kernel.caps.get_mut(&id) {
                 record.refs = record.refs.saturating_add(1);
-                kernel.events.push(Event::CapRetained(id));
+                kernel.push_event(Event::CapRetained(id));
             }
         }
     }
@@ -212,7 +287,7 @@ impl CapControl for HandleControl {
             };
             record.refs = record.refs.saturating_sub(1);
             let last = record.refs == 0;
-            kernel.events.push(Event::CapReleased(id));
+            kernel.push_event(Event::CapReleased(id));
             last
         };
         if !dropped {
@@ -223,7 +298,7 @@ impl CapControl for HandleControl {
             return;
         };
         kernel.meters.remove(&id);
-        kernel.events.push(Event::CapDropped(id));
+        kernel.push_event(Event::CapDropped(id));
         if let Some(provider) = kernel.providers.get_mut(&record.provider) {
             provider.on_drop(record.object, id);
         }
@@ -270,7 +345,8 @@ impl Agent {
             channels: BTreeMap::new(),
             jobs: BTreeMap::new(),
             queue: VecDeque::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
+            metrics: Metrics::default(),
             round_trips: 0,
             next_promise: 0,
             next_job: 0,
@@ -322,7 +398,7 @@ impl Agent {
         let record = CapRecord::new(id, provider, object, attrs.clone());
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.caps.insert(id, record);
-        kernel.events.push(Event::CapMinted { cap: id, provider });
+        kernel.push_event(Event::CapMinted { cap: id, provider });
         Ok(CapHandle::new(Rc::clone(&self.control), id))
     }
 
@@ -333,12 +409,10 @@ impl Agent {
         let record = kernel
             .caps
             .get(&parent_id)
-            .ok_or(Error::UnknownCapability(u128::from_be_bytes(pad128(
-                parent_id,
-            ))))?
+            .ok_or(Error::UnknownCapability(cap_token(parent_id)))?
             .clone();
         if record.revoked {
-            return Err(Error::Revoked(u128::from_be_bytes(pad128(parent_id))));
+            return Err(Error::Revoked(cap_token(parent_id)));
         }
         attrs.budget.check()?;
         let attrs = record.attrs.attenuate(attrs)?;
@@ -349,7 +423,7 @@ impl Agent {
         child.parent = Some(parent_id);
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.caps.insert(id, child);
-        kernel.events.push(Event::CapMinted {
+        kernel.push_event(Event::CapMinted {
             cap: id,
             provider: record.provider,
         });
@@ -385,7 +459,8 @@ impl Agent {
             if let Some(record) = kernel.caps.get_mut(&id) {
                 record.revoked = true;
             }
-            kernel.events.push(Event::CapRevoked(id));
+            kernel.push_event(Event::CapRevoked(id));
+            kernel.metrics.revocations = kernel.metrics.revocations.saturating_add(1);
         }
     }
 
@@ -393,10 +468,14 @@ impl Agent {
     pub fn create_lane(&self, name: impl Into<String>, budget: Budget) -> Result<LaneId> {
         budget.check()?;
         let mut kernel = self.cell.borrow_mut();
+        let open = kernel.lanes.values().filter(|lane| !lane.closed).count();
+        if open >= MAX_LANES {
+            return Err(Error::BudgetExceeded("lanes"));
+        }
         let id = LaneId(kernel.next_lane);
         kernel.next_lane += 1;
         kernel.lanes.insert(id, Lane::new(id, name, budget));
-        kernel.events.push(Event::LaneCreated(id));
+        kernel.push_event(Event::LaneCreated(id));
         Ok(id)
     }
 
@@ -435,7 +514,29 @@ impl Agent {
         for job_id in doomed {
             kernel.fail_job(job_id, Error::UnknownLane(lane.0));
         }
-        kernel.events.push(Event::LaneDestroyed(lane));
+        // Reclaim the dispatch records this lane owns. Promise records stay:
+        // a caller that holds a handle must still see the settled value (or a
+        // rejected one) rather than an unrelated `unknown-promise`. The promise
+        // ceiling bounds them; the kernel itself is the lifetime.
+        kernel.jobs.retain(|_, job| job.lane != lane);
+        for channel in kernel.channels.values_mut() {
+            channel.subscribers.remove(&lane.0);
+        }
+        kernel.lanes.remove(&lane);
+        kernel.push_event(Event::LaneDestroyed(lane));
+        Ok(())
+    }
+
+    /// Destroy a channel and remove it from every lane's subscription set.
+    pub fn destroy_channel(&self, channel: ChannelId) -> Result<()> {
+        let mut kernel = self.cell.borrow_mut();
+        kernel
+            .channels
+            .remove(&channel)
+            .ok_or(Error::UnknownChannel(channel.0))?;
+        for lane in kernel.lanes.values_mut() {
+            lane.channels.remove(&channel.0);
+        }
         Ok(())
     }
 
@@ -446,6 +547,9 @@ impl Agent {
         direction: Direction,
     ) -> Result<ChannelId> {
         let mut kernel = self.cell.borrow_mut();
+        if kernel.channels.len() >= MAX_CHANNELS {
+            return Err(Error::BudgetExceeded("channels"));
+        }
         let id = ChannelId(kernel.next_channel);
         kernel.next_channel += 1;
         kernel
@@ -492,7 +596,7 @@ impl Agent {
                 .get(&cap.id())
                 .ok_or(Error::InvalidArgument("unknown capability"))?;
             if record.revoked {
-                return Err(Error::Revoked(u128::from_be_bytes(pad128(cap.id()))));
+                return Err(Error::Revoked(cap_token(cap.id())));
             }
             // A channel shares (borrows) the capability: the id travels with
             // the message and the sender keeps its handle. No reference is
@@ -505,15 +609,13 @@ impl Agent {
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         let message = record.send(lane, payload, cap_ids.clone())?;
-        kernel.events.push(Event::ChannelSend {
+        kernel.push_event(Event::ChannelSend {
             channel,
             sequence: message.sequence,
         });
         for id in cap_ids {
             kernel.transfers += 1;
-            kernel
-                .events
-                .push(Event::CapTransferred { cap: id, channel });
+            kernel.push_event(Event::CapTransferred { cap: id, channel });
         }
         Ok(message.sequence)
     }
@@ -527,7 +629,7 @@ impl Agent {
             .ok_or(Error::UnknownChannel(channel.0))?;
         let message = record.recv()?;
         if let Some(message) = &message {
-            kernel.events.push(Event::ChannelRecv {
+            kernel.push_event(Event::ChannelRecv {
                 channel,
                 sequence: message.sequence,
             });
@@ -536,7 +638,50 @@ impl Agent {
     }
 
     /// Issue a call. The returned promise is pending until the kernel runs.
+    ///
+    /// Refusals are recorded as [`Event::CallRefused`] plus a specific
+    /// budget/tool event, and in [`Metrics`]. Argument values never enter the
+    /// event log.
     pub fn call(
+        &self,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+    ) -> Result<PromiseHandle> {
+        let cap_id = cap.id();
+        let result = self.call_inner(lane, cap, method, args);
+        if let Err(error) = &result {
+            let mut kernel = self.cell.borrow_mut();
+            kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
+            kernel.push_event(Event::CallRefused {
+                lane,
+                cap: cap_id,
+                code: error.code().to_string(),
+            });
+            match error {
+                Error::BudgetExceeded(dimension) => {
+                    kernel.metrics.budget_exhaustions =
+                        kernel.metrics.budget_exhaustions.saturating_add(1);
+                    kernel.push_event(Event::BudgetExhausted {
+                        cap: cap_id,
+                        dimension: (*dimension).to_string(),
+                    });
+                }
+                Error::ToolPolicy(reason) => {
+                    kernel.metrics.tool_refusals = kernel.metrics.tool_refusals.saturating_add(1);
+                    kernel.push_event(Event::ToolRefused {
+                        cap: cap_id,
+                        reason: (*reason).to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
+    fn call_inner(
         &self,
         lane: LaneId,
         cap: &CapHandle,
@@ -548,12 +693,10 @@ impl Agent {
         let record = kernel
             .caps
             .get(&cap_id)
-            .ok_or(Error::UnknownCapability(u128::from_be_bytes(pad128(
-                cap_id,
-            ))))?
+            .ok_or(Error::UnknownCapability(cap_token(cap_id)))?
             .clone();
         if record.revoked {
-            return Err(Error::Revoked(u128::from_be_bytes(pad128(cap_id))));
+            return Err(Error::Revoked(cap_token(cap_id)));
         }
         let (lane_closed, lane_capacity, lane_budget) = {
             let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
@@ -613,6 +756,15 @@ impl Agent {
         if call_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
+        // Registry ceilings are checked before charging: a refused call must
+        // not consume budget, and the job/promise maps must stay finite even
+        // when the caller never destroys its lane.
+        if kernel.promises.len() >= MAX_PROMISES {
+            return Err(Error::BudgetExceeded("promises"));
+        }
+        if kernel.jobs.len() >= MAX_PROMISES {
+            return Err(Error::BudgetExceeded("jobs"));
+        }
         let meter = kernel
             .meters
             .get_mut(&cap_id)
@@ -663,12 +815,15 @@ impl Agent {
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
             lane_record.pending += 1;
         }
-        kernel.events.push(Event::CallQueued {
+        kernel.push_event(Event::CallQueued {
             job: job_id,
             lane,
             cap: cap_id,
         });
-        // Budgets are enforced again at dispatch with the effective grant.
+        kernel.metrics.calls_queued = kernel.metrics.calls_queued.saturating_add(1);
+        // Budgets are charged here, before the call is queued. Dispatch
+        // re-checks existence and revocation; providers receive the effective
+        // budget in `Call` and tool adapters must enforce their wall ceiling.
         Ok(PromiseHandle {
             agent: self.clone(),
             id: promise_id,
@@ -689,7 +844,12 @@ impl Agent {
                         // Only the jobs that cannot be ordered are failed; work
                         // for other providers stays queued.
                         for job_id in stuck {
-                            kernel.fail_job(job_id, Error::PipelinedCycle);
+                            let error = kernel
+                                .jobs
+                                .get(&job_id)
+                                .map(|job| Error::UnknownCapability(cap_token(job.cap)))
+                                .unwrap_or(Error::PipelinedCycle);
+                            kernel.fail_job(job_id, error);
                         }
                         continue;
                     }
@@ -731,8 +891,14 @@ impl Agent {
             .promises
             .get_mut(&promise.id)
             .ok_or(Error::UnknownPromise(promise.id.0))?;
-        record.resolve(value)?;
-        kernel.events.push(Event::PromiseResolved(promise.id));
+        let settled = record.resolve(value);
+        if settled.is_err() {
+            kernel.metrics.promises_double_settled =
+                kernel.metrics.promises_double_settled.saturating_add(1);
+        }
+        settled?;
+        kernel.push_event(Event::PromiseResolved(promise.id));
+        kernel.metrics.promises_resolved = kernel.metrics.promises_resolved.saturating_add(1);
         Ok(())
     }
 
@@ -782,7 +948,17 @@ impl Agent {
 
     /// The event log.
     pub fn events(&self) -> Vec<Event> {
-        self.cell.borrow().events.clone()
+        self.cell.borrow().events.iter().cloned().collect()
+    }
+
+    /// Point-in-time counters. Contains no capability ids or payloads.
+    pub fn metrics(&self) -> Metrics {
+        let kernel = self.cell.borrow();
+        Metrics {
+            round_trips: kernel.round_trips,
+            transfers: kernel.transfers,
+            ..kernel.metrics
+        }
     }
 
     /// Lane statistics.
@@ -812,9 +988,7 @@ impl Agent {
             .caps
             .get(&cap.id())
             .map(|record| record.attrs.clone())
-            .ok_or(Error::UnknownCapability(u128::from_be_bytes(pad128(
-                cap.id(),
-            ))))
+            .ok_or(Error::UnknownCapability(cap_token(cap.id())))
     }
 
     fn dispatch(&self, batch: Vec<u64>) {
@@ -838,7 +1012,7 @@ impl Agent {
                 .iter()
                 .filter_map(|id| kernel.jobs.get(id).map(|job| job.lane.0))
                 .collect();
-            kernel.events.push(Event::BatchDispatched {
+            kernel.push_event(Event::BatchDispatched {
                 provider: provider_id,
                 jobs: batch.len(),
                 lanes,
@@ -897,10 +1071,8 @@ impl Agent {
                 // after the call was queued must not reach the provider.
                 let record = kernel.caps.get(&job.cap).cloned();
                 let failure = match &record {
-                    None => Some(Error::UnknownCapability(0)),
-                    Some(record) if record.revoked => {
-                        Some(Error::Revoked(u128::from_be_bytes(pad128(record.id))))
-                    }
+                    None => Some(Error::UnknownCapability(cap_token(job.cap))),
+                    Some(record) if record.revoked => Some(Error::Revoked(cap_token(record.id))),
                     Some(_) => failure,
                 };
                 Some((
@@ -931,18 +1103,28 @@ impl Agent {
             match &outcome {
                 Ok(value) => {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
-                        let _ = record.resolve(value.clone());
+                        if record.resolve(value.clone()).is_err() {
+                            kernel.metrics.promises_double_settled =
+                                kernel.metrics.promises_double_settled.saturating_add(1);
+                        }
                     }
-                    kernel.events.push(Event::PromiseResolved(job.promise));
+                    kernel.push_event(Event::PromiseResolved(job.promise));
+                    kernel.metrics.promises_resolved =
+                        kernel.metrics.promises_resolved.saturating_add(1);
                 }
                 Err(error) => {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
-                        let _ = record.reject(error.clone());
+                        if record.reject(error.clone()).is_err() {
+                            kernel.metrics.promises_double_settled =
+                                kernel.metrics.promises_double_settled.saturating_add(1);
+                        }
                     }
-                    kernel.events.push(Event::PromiseRejected {
+                    kernel.push_event(Event::PromiseRejected {
                         promise: job.promise,
                         code: error.code().to_string(),
                     });
+                    kernel.metrics.promises_rejected =
+                        kernel.metrics.promises_rejected.saturating_add(1);
                 }
             }
             if let Some(record) = kernel.jobs.get_mut(job_id) {
@@ -951,7 +1133,7 @@ impl Agent {
             if let Some(lane_record) = kernel.lanes.get_mut(&job.lane) {
                 lane_record.complete();
             }
-            kernel.events.push(Event::JobCompleted {
+            kernel.push_event(Event::JobCompleted {
                 job: *job_id,
                 lane: job.lane,
             });
@@ -965,6 +1147,14 @@ impl Agent {
 }
 
 impl Kernel {
+    /// Append an event, dropping the oldest when the log is full.
+    fn push_event(&mut self, event: Event) {
+        if self.events.len() >= MAX_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
     /// Build the next dispatch batch: all queued jobs for the head job's
     /// provider, ordered so promise producers precede consumers.
     fn next_batch(&mut self) -> std::result::Result<Vec<u64>, Vec<u64>> {
@@ -1042,19 +1232,27 @@ impl Kernel {
             let lane = job.lane;
             let code = error.code().to_string();
             if let Some(record) = self.promises.get_mut(&promise) {
-                let _ = record.reject(error);
+                if record.reject(error).is_err() {
+                    self.metrics.promises_double_settled =
+                        self.metrics.promises_double_settled.saturating_add(1);
+                }
             }
             if let Some(lane_record) = self.lanes.get_mut(&lane) {
                 lane_record.complete();
             }
-            self.events.push(Event::PromiseRejected { promise, code });
-            self.events.push(Event::JobCompleted { job: job_id, lane });
+            self.push_event(Event::PromiseRejected { promise, code });
+            self.metrics.promises_rejected = self.metrics.promises_rejected.saturating_add(1);
+            self.push_event(Event::JobCompleted { job: job_id, lane });
         }
     }
 }
 
 fn pad128(id: CapId) -> [u8; 16] {
     id.0
+}
+
+fn cap_token(id: CapId) -> crate::cap::CapToken {
+    crate::cap::CapToken(u128::from_be_bytes(pad128(id)))
 }
 
 /// A handle to a pending or settled result.

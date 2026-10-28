@@ -29,6 +29,8 @@ jobs:
           # A broken intra-doc link is a documentation defect, not a warning.
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps --all-features
+      - name: Benchmarks compile
+        run: cargo bench --locked --bench transport --no-run
 
   msrv:
     runs-on: ubuntu-latest
@@ -97,3 +99,30 @@ jobs:
             echo "== $target =="
             cargo fuzz run "$target" -- -runs=2000
           done
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install audit tools
+        run: cargo install cargo-audit cargo-deny --locked
+      - name: Advisory audit
+        run: cargo audit
+      - name: Dependency policy
+        run: cargo deny check
+
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate and verify the SBOM
+        run: |
+          mkdir -p dist
+          python3 scripts/sbom.py --output dist/active-rpc.cdx.json
+          python3 scripts/sbom.py --check dist/active-rpc.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/*.cdx.json
