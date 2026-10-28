@@ -59,6 +59,15 @@ jobs:
       - name: Validate the hardening matrix
         run: python3 scripts/hardening_status.py --check
 
+  negative-controls:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # A security test that still passes on a broken build proves nothing.
+      - name: Every security-critical check must fail on a broken build
+        run: python3 scripts/negative_controls.py --check
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

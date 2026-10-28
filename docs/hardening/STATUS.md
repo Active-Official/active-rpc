@@ -104,6 +104,26 @@ residual risks and H6).
 
 The matrix below is validated by `scripts/hardening_status.py --check`.
 
+## Negative controls
+
+`scripts/negative_controls.py` creates a throwaway git worktree at HEAD, proves
+the mapped check passes unmutated, applies one precise source mutation, and
+requires the check to fail with that test in the failure list. A compile error
+or a different test failing is rejected as a false positive. The worktree is
+removed afterwards; the working tree is never modified.
+
+| Control | Invariant | Mutation | Check that must fail |
+|---|---|---|---|
+| `I-3-redaction` | I-3 | module payload redaction disabled | `review_module_payloads_are_redacted` |
+| `I-4-secret` | I-4 | fixed all-zero agent secret | `review_agent_secrets_are_random` |
+| `I-5-attenuation` | I-5 | method-subset check removed | `attenuation_narrows_and_never_widens` |
+| `I-6-dispatch` | I-6 | dispatch revocation re-check removed | `review_revocation_after_queueing_prevents_invocation` |
+| `I-8-bytes` | I-8 | per-call ceiling and meter charge removed | `review_byte_budget_is_charged` |
+| `I-10-trailing` | I-10 | trailing-byte check removed | `wire_rejects_malformed_envelopes` |
+| `C-1-settlement` | C-1 | promise accepts a second settlement | `promise_can_be_cancelled_or_resolved_once` |
+
+Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
+
 ## Gate results (baseline)
 
 | Gate | Result | Evidence |
@@ -118,6 +138,7 @@ The matrix below is validated by `scripts/hardening_status.py --check`.
 | `cargo audit` | pass (1 allowed warning) | local run 2026-10-27 |
 | `cargo deny check` | pass | local run 2026-10-27 |
 | Fuzz smoke (20k runs) | pass | CI run 40559854293 |
+| Negative controls (7) | pass | local run 2026-10-27; CI job `negative-controls` |
 | GitHub Actions on `69acea8` | success | run 40559854293 |
 
 ## Ordered next steps
@@ -127,7 +148,8 @@ The matrix below is validated by `scripts/hardening_status.py --check`.
    lifecycle, promise graph, budget matrix, tool policy, transport framing).
 2. **H2** Build the table-driven red-team battery, including the
    cross-kernel transplant, path canonicalization, event-redaction and tool
-   timeout cases, and script the negative controls.
+   timeout cases. The scripted negative controls are in place; the remaining
+   work is breadth and the research-derived cases.
 3. **H6** Raise the `active-infinity` minimum to the security release, add the
    reproducible-build note, and exercise the yank dry run.
 4. **H7** Prove events and metrics redact payloads and hash capability ids.
@@ -160,23 +182,23 @@ Not signed. H0 is complete; H1–H9 remain.
 
 **Repository:** `active-rpc` **version:** `1.1.9` **baseline commit:** `69acea89bd03a9a69ff88cdd6dd8d12560a2d210` **baseline tag:** `hardening-baseline` **measured:** 2026-10-27
 
-Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 22 done, 55 partial, 62 gap, 20 not applicable. Criticals with an implemented negative control: 0/7. Distinct automated checks resolved: 73.
+Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 23 done, 55 partial, 62 gap, 20 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 81.
 
 | Invariant | Meaning | Status | Checks | Negative control |
 |---|---|---|---|---|
 | **I-1** | Structural secret taint | `covered` | 3 | - |
 | **I-2** | Anti-oracle equality | `n/a` | 0 | - |
-| **I-3** | Secret non-leakage | `covered` | 5 | documented |
-| **I-4** | Capability unforgeability | `covered` | 4 | documented |
-| **I-5** | Attenuation only narrows | `covered` | 7 | documented |
-| **I-6** | Revocation at dispatch | `covered` | 5 | documented |
+| **I-3** | Secret non-leakage | `covered` | 5 | implemented |
+| **I-4** | Capability unforgeability | `covered` | 4 | implemented |
+| **I-5** | Attenuation only narrows | `covered` | 7 | implemented |
+| **I-6** | Revocation at dispatch | `covered` | 5 | implemented |
 | **I-7** | Drop notification | `covered` | 2 | - |
-| **I-8** | Hard budgets | `covered` | 9 | documented |
+| **I-8** | Hard budgets | `covered` | 9 | implemented |
 | **I-9** | Deterministic canonicalization | `covered` | 4 | - |
-| **I-10** | Fail-closed validation | `covered` | 8 | documented |
+| **I-10** | Fail-closed validation | `covered` | 8 | implemented |
 | **I-11** | No ambient authority | `covered` | 4 | - |
 | **I-12** | Domain operations under capability and budget | `covered` | 7 | - |
-| **C-1** | Derived control: promise single settlement | `covered` | 3 | documented |
+| **C-1** | Derived control: promise single settlement | `covered` | 3 | implemented |
 
 | Item | Checklist item | Status | Evidence |
 |---|---|---|---|
@@ -210,6 +232,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 22 
 | **H1.22** | 32-bit target build and test lane | `gap` | - |
 | **H1.23** | Differential canonicalization oracle | `n/a` | - |
 | **H1.24** | fuzz_tool_policy: adversarial policy descriptors and tool calls | `gap` | - |
+| **H2.0** | Scripted negative controls prove each security-critical check fails on a broken build | `done` | `gate:negative-controls` |
 | **H2.1** | Integer overflow and underflow in length and offset arithmetic | `partial` | `test:tests/conformance_tests.rs::header_field_attacks_are_rejected`, `test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected` |
 | **H2.2** | Overlapping and out-of-bounds sections | `n/a` | - |
 | **H2.3** | Deep nesting aimed at stack overflow | `partial` | `test:tests/redteam_tests.rs::review_wire_rejects_deep_value_nesting` |
@@ -358,7 +381,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 22 
 - `test:tests/unit_tests.rs::response_and_error_envelopes_carry_no_payload`
 - `fuzz:framing` — fuzz/fuzz_targets/framing.rs
 
-Negative control (documented): Make Kernel::redact_module_payload a no-op and run the redaction tests → expected: threat_secret_material_never_reaches_the_wire must fail with the canary bytes present in the encoded envelope
+Negative control (implemented): Make Kernel::redact_module_payload a no-op and run the redaction tests → expected: threat_secret_material_never_reaches_the_wire must fail with the canary bytes present in the encoded envelope
 
 </details>
 
@@ -369,7 +392,7 @@ Negative control (documented): Make Kernel::redact_module_payload a no-op and ru
 - `test:tests/redteam_tests.rs::review_agent_secrets_are_random`
 - `test:tests/unit_tests.rs::unknown_method_is_refused`
 
-Negative control (documented): Replace the OS CSPRNG in Agent::new with a fixed seed and mint two agents → expected: review_agent_secrets_are_random must fail because both agents produce the same capability ids
+Negative control (implemented): Replace the OS CSPRNG in Agent::new with a fixed seed and mint two agents → expected: review_agent_secrets_are_random must fail because both agents produce the same capability ids
 
 </details>
 
@@ -383,7 +406,7 @@ Negative control (documented): Replace the OS CSPRNG in Agent::new with a fixed 
 - `test:tests/redteam_tests.rs::threat_escalation_through_metadata`
 - `test:tests/redteam_tests.rs::review_attenuation_validates_the_budget`
 
-Negative control (documented): Allow attenuation to union parent and child method lists and run the monotonicity property and the escalation test → expected: attenuation_is_monotone and threat_escalation_through_metadata must fail on a child that widens the parent
+Negative control (implemented): Allow attenuation to union parent and child method lists and run the monotonicity property and the escalation test → expected: attenuation_is_monotone and threat_escalation_through_metadata must fail on a child that widens the parent
 
 </details>
 
@@ -395,7 +418,7 @@ Negative control (documented): Allow attenuation to union parent and child metho
 - `test:tests/unit_tests.rs::revocation_kills_the_capability_and_its_children`
 - `test:tests/unit_tests.rs::destroyed_lane_refuses_further_calls`
 
-Negative control (documented): Remove the revocation re-check from the dispatch loop and run review_revocation_after_queueing_prevents_invocation → expected: the queued call must reach the provider after revoke, so the test fails with the provider call count at 1
+Negative control (implemented): Remove the revocation re-check from the dispatch loop and run review_revocation_after_queueing_prevents_invocation → expected: the queued call must reach the provider after revoke, so the test fails with the provider call count at 1
 
 </details>
 
@@ -418,7 +441,7 @@ Negative control (documented): Remove the revocation re-check from the dispatch 
 - `test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating`
 - `test:tests/conformance_tests.rs::wire_limits_are_enforced`
 
-Negative control (documented): Charge one byte instead of the recursive wire size in Kernel::call and run review_byte_budget_is_charged → expected: the byte budget no longer fires, so the test fails when the large nested argument is accepted
+Negative control (implemented): Charge one byte instead of the recursive wire size in Kernel::call and run review_byte_budget_is_charged → expected: the byte budget no longer fires, so the test fails when the large nested argument is accepted
 
 </details>
 
@@ -442,7 +465,7 @@ Negative control (documented): Charge one byte instead of the recursive wire siz
 - `test:tests/redteam_tests.rs::threat_malformed_frames_and_bombs`
 - `fuzz:framing` — fuzz/fuzz_targets/framing.rs
 
-Negative control (documented): Skip the trailing-bytes check in Envelope::decode and run the malformed-envelope tests → expected: the trailing-bytes case must be accepted, so wire_rejects_malformed_envelopes fails and names the case
+Negative control (implemented): Skip the trailing-bytes check in Envelope::decode and run the malformed-envelope tests → expected: the trailing-bytes case must be accepted, so wire_rejects_malformed_envelopes fails and names the case
 
 </details>
 
@@ -473,7 +496,7 @@ Negative control (documented): Skip the trailing-bytes check in Envelope::decode
 - `test:tests/redteam_tests.rs::threat_promise_abuse`
 - `test:tests/concurrency_tests.rs::lanes_interleave_in_one_batch`
 
-Negative control (documented): Remove the settled flag check in Promise::settle and run the promise tests → expected: promise_can_be_cancelled_or_resolved_once must fail on the second settlement attempt
+Negative control (implemented): Remove the settled flag check in Promise::settle and run the promise tests → expected: promise_can_be_cancelled_or_resolved_once must fail on the second settlement attempt
 
 </details>
 
@@ -490,6 +513,7 @@ Negative control (documented): Remove the settled flag check in Promise::settle 
 | `fmt` | `cargo fmt --all -- --check` |
 | `fuzz` | `cargo +nightly fuzz run framing -- -runs=20000` |
 | `msrv` | `cargo +1.88.0 check --locked --all-targets --all-features` |
+| `negative-controls` | `python scripts/negative_controls.py --check` |
 | `package` | `cargo package --locked` |
 | `test` | `cargo test --locked --all-features` |
 | `test-nodefault` | `cargo test --locked --no-default-features` |

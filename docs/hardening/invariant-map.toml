@@ -25,6 +25,7 @@ package = "cargo package --locked"
 audit = "cargo audit"
 deny = "cargo deny check"
 fuzz = "cargo +nightly fuzz run framing -- -runs=20000"
+negative-controls = "python scripts/negative_controls.py --check"
 baseline-tag = "git rev-parse --verify hardening-baseline^{commit}"
 
 # ---------------------------------------------------------------------------
@@ -60,7 +61,8 @@ checks = [
   "test:tests/unit_tests.rs::response_and_error_envelopes_carry_no_payload",
   "fuzz:framing",
 ]
-negative_control_status = "documented"
+negative_control_status = "implemented"
+negative_control_check = "script:scripts/negative_controls.py#I-3-redaction"
 negative_control_probe = "Make Kernel::redact_module_payload a no-op and run the redaction tests"
 negative_control_expected = "threat_secret_material_never_reaches_the_wire must fail with the canary bytes present in the encoded envelope"
 note = "Wire-level redaction plus Infinity redaction. H2 adds the scripted probe."
@@ -76,7 +78,8 @@ checks = [
   "test:tests/redteam_tests.rs::review_agent_secrets_are_random",
   "test:tests/unit_tests.rs::unknown_method_is_refused",
 ]
-negative_control_status = "documented"
+negative_control_status = "implemented"
+negative_control_check = "script:scripts/negative_controls.py#I-4-secret"
 negative_control_probe = "Replace the OS CSPRNG in Agent::new with a fixed seed and mint two agents"
 negative_control_expected = "review_agent_secrets_are_random must fail because both agents produce the same capability ids"
 note = "Capability ids are Blake3(secret, serial, parent)[..16]; the secret is 32 CSPRNG bytes."
@@ -95,7 +98,8 @@ checks = [
   "test:tests/redteam_tests.rs::threat_escalation_through_metadata",
   "test:tests/redteam_tests.rs::review_attenuation_validates_the_budget",
 ]
-negative_control_status = "documented"
+negative_control_status = "implemented"
+negative_control_check = "script:scripts/negative_controls.py#I-5-attenuation"
 negative_control_probe = "Allow attenuation to union parent and child method lists and run the monotonicity property and the escalation test"
 negative_control_expected = "attenuation_is_monotone and threat_escalation_through_metadata must fail on a child that widens the parent"
 note = "Methods, budget, path and tool policy all narrow; a zero ceiling is refused."
@@ -112,7 +116,8 @@ checks = [
   "test:tests/unit_tests.rs::revocation_kills_the_capability_and_its_children",
   "test:tests/unit_tests.rs::destroyed_lane_refuses_further_calls",
 ]
-negative_control_status = "documented"
+negative_control_status = "implemented"
+negative_control_check = "script:scripts/negative_controls.py#I-6-dispatch"
 negative_control_probe = "Remove the revocation re-check from the dispatch loop and run review_revocation_after_queueing_prevents_invocation"
 negative_control_expected = "the queued call must reach the provider after revoke, so the test fails with the provider call count at 1"
 note = "Revocation is re-checked after dequeue, immediately before the provider runs."
@@ -143,7 +148,8 @@ checks = [
   "test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating",
   "test:tests/conformance_tests.rs::wire_limits_are_enforced",
 ]
-negative_control_status = "documented"
+negative_control_status = "implemented"
+negative_control_check = "script:scripts/negative_controls.py#I-8-bytes"
 negative_control_probe = "Charge one byte instead of the recursive wire size in Kernel::call and run review_byte_budget_is_charged"
 negative_control_expected = "the byte budget no longer fires, so the test fails when the large nested argument is accepted"
 note = "Calls, bytes, lanes, channels, promises, args, caps and value depth all have finite ceilings."
@@ -175,7 +181,8 @@ checks = [
   "test:tests/redteam_tests.rs::threat_malformed_frames_and_bombs",
   "fuzz:framing",
 ]
-negative_control_status = "documented"
+negative_control_status = "implemented"
+negative_control_check = "script:scripts/negative_controls.py#I-10-trailing"
 negative_control_probe = "Skip the trailing-bytes check in Envelope::decode and run the malformed-envelope tests"
 negative_control_expected = "the trailing-bytes case must be accepted, so wire_rejects_malformed_envelopes fails and names the case"
 note = "Every prefix of a valid envelope is rejected; header field attacks update the length fields consistently."
@@ -217,7 +224,8 @@ checks = [
   "test:tests/redteam_tests.rs::threat_promise_abuse",
   "test:tests/concurrency_tests.rs::lanes_interleave_in_one_batch",
 ]
-negative_control_status = "documented"
+negative_control_status = "implemented"
+negative_control_check = "script:scripts/negative_controls.py#C-1-settlement"
 negative_control_probe = "Remove the settled flag check in Promise::settle and run the promise tests"
 negative_control_expected = "promise_can_be_cancelled_or_resolved_once must fail on the second settlement attempt"
 note = "A promise settles once; a second resolve, reject or cancel is refused. The plan names this control explicitly."
@@ -396,6 +404,12 @@ note = "Infinity canonicalization; ARP1 has a golden-vector conformance suite in
 id = "H1.24"
 title = "fuzz_tool_policy: adversarial policy descriptors and tool calls"
 status = "gap"
+
+[[phases]]
+id = "H2.0"
+title = "Scripted negative controls prove each security-critical check fails on a broken build"
+status = "done"
+checks = ["gate:negative-controls"]
 
 [[phases]]
 id = "H2.1"
