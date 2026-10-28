@@ -1,0 +1,1163 @@
+# Hardening map for active-rpc.
+#
+# Every row in docs/hardening/STATUS.md is generated from this file by
+# scripts/hardening_status.py. A check that does not resolve is a hard error:
+# the matrix cannot claim coverage that the tree does not have.
+
+schema = 1
+
+[repo]
+name = "active-rpc"
+version = "1.1.9"
+commit = "69acea89bd03a9a69ff88cdd6dd8d12560a2d210"
+baseline_tag = "hardening-baseline"
+measured_at = "2026-10-27"
+
+[gates]
+fmt = "cargo fmt --all -- --check"
+clippy = "cargo clippy --locked --all-targets --all-features -- -D warnings"
+clippy-nodefault = "cargo clippy --locked --all-targets --no-default-features -- -D warnings"
+test = "cargo test --locked --all-features"
+test-nodefault = "cargo test --locked --no-default-features"
+doc = "RUSTDOCFLAGS=-D warnings cargo doc --locked --no-deps --all-features"
+msrv = "cargo +1.88.0 check --locked --all-targets --all-features"
+package = "cargo package --locked"
+audit = "cargo audit"
+deny = "cargo deny check"
+fuzz = "cargo +nightly fuzz run framing -- -runs=20000"
+baseline-tag = "git rev-parse --verify hardening-baseline^{commit}"
+
+# ---------------------------------------------------------------------------
+# Invariants (ACTIVE-HARDENING-GUIDE-AND-CHECKLIST.md section 1)
+# ---------------------------------------------------------------------------
+
+[[invariants]]
+id = "I-1"
+title = "Structural secret taint"
+status = "covered"
+checks = [
+  "test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire",
+  "test:tests/redteam_tests.rs::review_module_payloads_are_redacted",
+  "test:tests/integration_tests.rs::redaction_hides_the_secret_cone",
+]
+note = "RPC carries Infinity modules; redaction is enforced before a module payload leaves the kernel. The taint itself lives in active-infinity."
+
+[[invariants]]
+id = "I-2"
+title = "Anti-oracle equality"
+status = "n/a"
+note = "Value::Secret and SecretBytes live in active-infinity; the RPC layer never compares secret values. The Infinity map owns the control."
+
+[[invariants]]
+id = "I-3"
+title = "Secret non-leakage"
+status = "covered"
+critical = true
+checks = [
+  "test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire",
+  "test:tests/redteam_tests.rs::review_module_payloads_are_redacted",
+  "test:tests/integration_tests.rs::redaction_hides_the_secret_cone",
+  "test:tests/unit_tests.rs::response_and_error_envelopes_carry_no_payload",
+  "fuzz:framing",
+]
+negative_control_status = "documented"
+negative_control_probe = "Make Kernel::redact_module_payload a no-op and run the redaction tests"
+negative_control_expected = "threat_secret_material_never_reaches_the_wire must fail with the canary bytes present in the encoded envelope"
+note = "Wire-level redaction plus Infinity redaction. H2 adds the scripted probe."
+
+[[invariants]]
+id = "I-4"
+title = "Capability unforgeability"
+status = "covered"
+critical = true
+checks = [
+  "test:tests/unit_tests.rs::capability_ids_are_unforgeable",
+  "test:tests/redteam_tests.rs::threat_forgery_and_transplant",
+  "test:tests/redteam_tests.rs::review_agent_secrets_are_random",
+  "test:tests/unit_tests.rs::unknown_method_is_refused",
+]
+negative_control_status = "documented"
+negative_control_probe = "Replace the OS CSPRNG in Agent::new with a fixed seed and mint two agents"
+negative_control_expected = "review_agent_secrets_are_random must fail because both agents produce the same capability ids"
+note = "Capability ids are Blake3(secret, serial, parent)[..16]; the secret is 32 CSPRNG bytes."
+
+[[invariants]]
+id = "I-5"
+title = "Attenuation only narrows"
+status = "covered"
+critical = true
+checks = [
+  "test:tests/unit_tests.rs::attenuation_narrows_and_never_widens",
+  "test:tests/unit_tests.rs::attenuated_budget_is_enforced_on_the_real_call_path",
+  "test:tests/unit_tests.rs::read_only_capability_refuses_mutation",
+  "test:tests/unit_tests.rs::path_scope_is_enforced_before_the_provider",
+  "test:tests/property_tests.rs::attenuation_is_monotone",
+  "test:tests/redteam_tests.rs::threat_escalation_through_metadata",
+  "test:tests/redteam_tests.rs::review_attenuation_validates_the_budget",
+]
+negative_control_status = "documented"
+negative_control_probe = "Allow attenuation to union parent and child method lists and run the monotonicity property and the escalation test"
+negative_control_expected = "attenuation_is_monotone and threat_escalation_through_metadata must fail on a child that widens the parent"
+note = "Methods, budget, path and tool policy all narrow; a zero ceiling is refused."
+
+[[invariants]]
+id = "I-6"
+title = "Revocation at dispatch"
+status = "covered"
+critical = true
+checks = [
+  "test:tests/redteam_tests.rs::review_revocation_after_queueing_prevents_invocation",
+  "test:tests/redteam_tests.rs::review_cancelled_and_destroyed_work_never_runs",
+  "test:tests/redteam_tests.rs::threat_revocation_and_lifetime_edges",
+  "test:tests/unit_tests.rs::revocation_kills_the_capability_and_its_children",
+  "test:tests/unit_tests.rs::destroyed_lane_refuses_further_calls",
+]
+negative_control_status = "documented"
+negative_control_probe = "Remove the revocation re-check from the dispatch loop and run review_revocation_after_queueing_prevents_invocation"
+negative_control_expected = "the queued call must reach the provider after revoke, so the test fails with the provider call count at 1"
+note = "Revocation is re-checked after dequeue, immediately before the provider runs."
+
+[[invariants]]
+id = "I-7"
+title = "Drop notification"
+status = "covered"
+checks = [
+  "test:tests/unit_tests.rs::dropping_the_last_handle_notifies_the_provider",
+  "test:tests/redteam_tests.rs::review_channel_shares_capabilities_without_holding_them_alive",
+]
+note = "Refcounted handles; the last drop notifies the provider. Channel shares borrow without creating a reference."
+
+[[invariants]]
+id = "I-8"
+title = "Hard budgets"
+status = "covered"
+critical = true
+checks = [
+  "test:tests/unit_tests.rs::lane_budget_is_independent_and_enforced",
+  "test:tests/redteam_tests.rs::threat_budget_bypass_attempts",
+  "test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget",
+  "test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls",
+  "test:tests/redteam_tests.rs::review_byte_budget_is_charged",
+  "test:tests/redteam_tests.rs::review_wire_rejects_deep_value_nesting",
+  "test:tests/redteam_tests.rs::review_zero_ceilings_are_refused_in_every_budget_field",
+  "test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating",
+  "test:tests/conformance_tests.rs::wire_limits_are_enforced",
+]
+negative_control_status = "documented"
+negative_control_probe = "Charge one byte instead of the recursive wire size in Kernel::call and run review_byte_budget_is_charged"
+negative_control_expected = "the byte budget no longer fires, so the test fails when the large nested argument is accepted"
+note = "Calls, bytes, lanes, channels, promises, args, caps and value depth all have finite ceilings."
+
+[[invariants]]
+id = "I-9"
+title = "Deterministic canonicalization"
+status = "covered"
+checks = [
+  "test:tests/conformance_tests.rs::minimal_request_is_a_stable_golden_vector",
+  "test:tests/conformance_tests.rs::every_encoding_is_stable_under_re_encoding",
+  "test:tests/conformance_tests.rs::capability_table_golden_shape",
+  "test:tests/property_tests.rs::envelope_round_trips",
+]
+note = "ARP1 encoding is a fixed point; the capability table has a pinned golden shape."
+
+[[invariants]]
+id = "I-10"
+title = "Fail-closed validation"
+status = "covered"
+critical = true
+checks = [
+  "test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected",
+  "test:tests/conformance_tests.rs::header_field_attacks_are_rejected",
+  "test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented",
+  "test:tests/unit_tests.rs::wire_rejects_malformed_envelopes",
+  "test:tests/unit_tests.rs::unknown_method_is_refused",
+  "test:tests/property_tests.rs::arbitrary_bytes_never_panic",
+  "test:tests/redteam_tests.rs::threat_malformed_frames_and_bombs",
+  "fuzz:framing",
+]
+negative_control_status = "documented"
+negative_control_probe = "Skip the trailing-bytes check in Envelope::decode and run the malformed-envelope tests"
+negative_control_expected = "the trailing-bytes case must be accepted, so wire_rejects_malformed_envelopes fails and names the case"
+note = "Every prefix of a valid envelope is rejected; header field attacks update the length fields consistently."
+
+[[invariants]]
+id = "I-11"
+title = "No ambient authority"
+status = "covered"
+checks = [
+  "test:tests/redteam_tests.rs::threat_confused_deputy",
+  "test:tests/redteam_tests.rs::review_tool_policy_predicate_matches_the_enforcer",
+  "test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls",
+  "test:tests/unit_tests.rs::read_only_capability_refuses_mutation",
+]
+note = "Providers receive only the caller's capability; tool calls pass through the same policy enforcer, not a second predicate."
+
+[[invariants]]
+id = "I-12"
+title = "Domain operations under capability and budget"
+status = "covered"
+checks = [
+  "test:tests/integration_tests.rs::evaluate_honors_the_capability_budget",
+  "test:tests/integration_tests.rs::evaluate_runs_the_active_engine_over_the_binary_module",
+  "test:tests/integration_tests.rs::stats_hash_and_metadata_are_served_through_capabilities",
+  "test:tests/integration_tests.rs::why_and_impact_answer_with_paths",
+  "test:tests/integration_tests.rs::subgraph_returns_a_valid_module",
+  "test:tests/integration_tests.rs::patch_creates_a_new_module_version",
+  "test:tests/unit_tests.rs::path_scope_is_enforced_before_the_provider",
+]
+note = "evaluate, why, impact, subgraph and patch are reachable only through a capability and charge its budget."
+
+[[invariants]]
+id = "C-1"
+title = "Derived control: promise single settlement"
+status = "covered"
+critical = true
+checks = [
+  "test:tests/unit_tests.rs::promise_can_be_cancelled_or_resolved_once",
+  "test:tests/redteam_tests.rs::threat_promise_abuse",
+  "test:tests/concurrency_tests.rs::lanes_interleave_in_one_batch",
+]
+negative_control_status = "documented"
+negative_control_probe = "Remove the settled flag check in Promise::settle and run the promise tests"
+negative_control_expected = "promise_can_be_cancelled_or_resolved_once must fail on the second settlement attempt"
+note = "A promise settles once; a second resolve, reject or cancel is refused. The plan names this control explicitly."
+
+# ---------------------------------------------------------------------------
+# Checklist items (H0-H9). Infinity-only items are n/a here with a pointer.
+# ---------------------------------------------------------------------------
+
+[[phases]]
+id = "H0.1"
+title = "Inventory all existing tests as an invariant-to-test matrix"
+status = "done"
+checks = ["script:scripts/hardening_status.py"]
+
+[[phases]]
+id = "H0.2"
+title = "Inventory fuzz targets, corpus sizes and coverage snapshots"
+status = "done"
+checks = ["doc:docs/hardening/CORPUS.md", "fuzz:framing"]
+
+[[phases]]
+id = "H0.3"
+title = "Inventory ADRs, SECURITY, REVIEWS, security and performance specs"
+status = "done"
+checks = ["doc:docs/hardening/STATUS.md"]
+
+[[phases]]
+id = "H0.4"
+title = "Confirm license, MSRV, advisories, signing and publish status"
+status = "done"
+checks = ["gate:audit", "gate:deny"]
+
+[[phases]]
+id = "H0.5"
+title = "Tag a hardening baseline"
+status = "done"
+checks = ["gate:baseline-tag"]
+
+[[phases]]
+id = "H0.6"
+title = "Create docs/hardening/STATUS.md"
+status = "done"
+checks = ["script:scripts/hardening_status.py"]
+
+[[phases]]
+id = "H1.1"
+title = "fuzz_decode_infinity"
+status = "n/a"
+note = "Infinity target; see the active-infinity map."
+
+[[phases]]
+id = "H1.2"
+title = "fuzz_stream_reassembly"
+status = "n/a"
+note = "Infinity target; see the active-infinity map."
+
+[[phases]]
+id = "H1.3"
+title = "fuzz_canonical_roundtrip"
+status = "n/a"
+note = "Infinity target; see the active-infinity map."
+
+[[phases]]
+id = "H1.4"
+title = "fuzz_layout_sections"
+status = "n/a"
+note = "Infinity target; see the active-infinity map."
+
+[[phases]]
+id = "H1.5"
+title = "fuzz_graph_cycles"
+status = "n/a"
+note = "Infinity target; see the active-infinity map."
+
+[[phases]]
+id = "H1.6"
+title = "fuzz_secret_positions"
+status = "n/a"
+note = "Infinity target; see the active-infinity map."
+
+[[phases]]
+id = "H1.7"
+title = "fuzz_unit_discriminants"
+status = "n/a"
+note = "Infinity target; see the active-infinity map."
+
+[[phases]]
+id = "H1.8"
+title = "fuzz_projection_agreement"
+status = "n/a"
+note = "Infinity target; see the active-infinity map."
+
+[[phases]]
+id = "H1.9"
+title = "fuzz_arp1_frame: envelope and capability table malformations"
+status = "partial"
+checks = ["fuzz:framing"]
+note = "The framing target covers envelope, capability table and gRPC framing. It is not yet split by attack class."
+
+[[phases]]
+id = "H1.10"
+title = "fuzz_capability_lifecycle"
+status = "gap"
+
+[[phases]]
+id = "H1.11"
+title = "fuzz_promise_graph"
+status = "gap"
+
+[[phases]]
+id = "H1.12"
+title = "fuzz_budget_matrix"
+status = "gap"
+
+[[phases]]
+id = "H1.13"
+title = "fuzz_tool_mcp"
+status = "gap"
+
+[[phases]]
+id = "H1.14"
+title = "fuzz_tool_http"
+status = "gap"
+
+[[phases]]
+id = "H1.15"
+title = "fuzz_tool_process"
+status = "gap"
+
+[[phases]]
+id = "H1.16"
+title = "fuzz_channel_cap_transfer"
+status = "gap"
+
+[[phases]]
+id = "H1.17"
+title = "fuzz_transport_framing"
+status = "gap"
+
+[[phases]]
+id = "H1.18"
+title = "Seed corpus = vectors, examples, almost-valid frames; document classes"
+status = "gap"
+note = "CI writes one ping envelope at run time; nothing is committed."
+
+[[phases]]
+id = "H1.19"
+title = "Every fixed bug adds a minimized seed"
+status = "gap"
+
+[[phases]]
+id = "H1.20"
+title = "CI fuzz budget on PRs, longer on main/nightly, fail on regression"
+status = "partial"
+checks = ["fuzz:framing"]
+note = "20k runs on every push and PR; no nightly lane, no coverage-regression check."
+
+[[phases]]
+id = "H1.21"
+title = "Optional public sanitized corpus"
+status = "gap"
+
+[[phases]]
+id = "H1.22"
+title = "32-bit target build and test lane"
+status = "gap"
+note = "ARP1 length arithmetic is also exposed on 32-bit."
+
+[[phases]]
+id = "H1.23"
+title = "Differential canonicalization oracle"
+status = "n/a"
+note = "Infinity canonicalization; ARP1 has a golden-vector conformance suite instead."
+
+[[phases]]
+id = "H1.24"
+title = "fuzz_tool_policy: adversarial policy descriptors and tool calls"
+status = "gap"
+
+[[phases]]
+id = "H2.1"
+title = "Integer overflow and underflow in length and offset arithmetic"
+status = "partial"
+checks = [
+  "test:tests/conformance_tests.rs::header_field_attacks_are_rejected",
+  "test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected",
+]
+
+[[phases]]
+id = "H2.2"
+title = "Overlapping and out-of-bounds sections"
+status = "n/a"
+note = "ARP1 has no section table; length-prefixed fields are covered by H2.1."
+
+[[phases]]
+id = "H2.3"
+title = "Deep nesting aimed at stack overflow"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::review_wire_rejects_deep_value_nesting"]
+
+[[phases]]
+id = "H2.4"
+title = "Billion-laughs expansion via references"
+status = "n/a"
+note = "ARP1 values contain no shared references; module payloads are validated by Infinity."
+
+[[phases]]
+id = "H2.5"
+title = "Huge sparse claims with tiny actual buffers"
+status = "partial"
+checks = [
+  "test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating",
+  "test:tests/redteam_tests.rs::threat_malformed_frames_and_bombs",
+]
+
+[[phases]]
+id = "H2.6"
+title = "Invalid UTF-8 and encoding confusion"
+status = "partial"
+checks = ["test:tests/unit_tests.rs::wire_rejects_malformed_envelopes"]
+
+[[phases]]
+id = "H2.7"
+title = "Streaming slowloris and oversize total declarations"
+status = "gap"
+
+[[phases]]
+id = "H2.8"
+title = "Forge capability IDs (random, bit-flip, replay, cross-agent)"
+status = "done"
+checks = [
+  "test:tests/unit_tests.rs::capability_ids_are_unforgeable",
+  "test:tests/redteam_tests.rs::threat_forgery_and_transplant",
+  "test:tests/redteam_tests.rs::review_agent_secrets_are_random",
+]
+
+[[phases]]
+id = "H2.9"
+title = "Attenuate then widen (methods, budget, path, tool policy)"
+status = "done"
+checks = [
+  "test:tests/unit_tests.rs::attenuation_narrows_and_never_widens",
+  "test:tests/property_tests.rs::attenuation_is_monotone",
+  "test:tests/redteam_tests.rs::threat_escalation_through_metadata",
+]
+
+[[phases]]
+id = "H2.10"
+title = "Use after revoke or drop; borrowed channel lifetime"
+status = "partial"
+checks = [
+  "test:tests/redteam_tests.rs::threat_revocation_and_lifetime_edges",
+  "test:tests/unit_tests.rs::dropping_the_last_handle_notifies_the_provider",
+]
+
+[[phases]]
+id = "H2.11"
+title = "Confused deputy provider"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::threat_confused_deputy"]
+
+[[phases]]
+id = "H2.12"
+title = "Tool adapter confused deputy"
+status = "partial"
+checks = [
+  "test:tests/redteam_tests.rs::review_tool_policy_predicate_matches_the_enforcer",
+  "test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls",
+]
+
+[[phases]]
+id = "H2.13"
+title = "Revocation racing with dispatch"
+status = "done"
+checks = [
+  "test:tests/redteam_tests.rs::review_revocation_after_queueing_prevents_invocation",
+  "test:tests/redteam_tests.rs::review_cancelled_and_destroyed_work_never_runs",
+]
+
+[[phases]]
+id = "H2.14"
+title = "Secrets in every legal position; scan all export paths"
+status = "partial"
+checks = [
+  "test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire",
+  "test:tests/redteam_tests.rs::review_module_payloads_are_redacted",
+]
+
+[[phases]]
+id = "H2.15"
+title = "Force secrets into error messages"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire"]
+
+[[phases]]
+id = "H2.16"
+title = "Equality and ordering oracle attempts"
+status = "n/a"
+note = "Secret equality lives in Infinity."
+
+[[phases]]
+id = "H2.17"
+title = "Smuggle secrets via extensions, annotations, provenance, projections"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::review_module_payloads_are_redacted"]
+
+[[phases]]
+id = "H2.18"
+title = "Logging and metrics carry no secrets or raw capability bits"
+status = "partial"
+checks = ["test:tests/unit_tests.rs::events_record_the_dispatch_batches"]
+note = "Events exist; no assertion yet that they redact payloads and hash capability ids."
+
+[[phases]]
+id = "H2.19"
+title = "Queue storms under a low call budget"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls"]
+
+[[phases]]
+id = "H2.20"
+title = "Nested value byte bombs under a low byte budget"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget"]
+
+[[phases]]
+id = "H2.21"
+title = "Many lanes, channels and promises to finite limits"
+status = "gap"
+
+[[phases]]
+id = "H2.22"
+title = "Enormous tool payloads and tools that never return"
+status = "gap"
+
+[[phases]]
+id = "H2.23"
+title = "Zero or near-zero ceilings refused where policy needs finite limits"
+status = "done"
+checks = ["test:tests/redteam_tests.rs::review_zero_ceilings_are_refused_in_every_budget_field"]
+
+[[phases]]
+id = "H2.24"
+title = "Single-bit mutation fails validation or changes the hash"
+status = "n/a"
+note = "Infinity mutation class; ARP1 uses re-encode equality in conformance."
+
+[[phases]]
+id = "H2.25"
+title = "Large-corpus hash collision search"
+status = "n/a"
+note = "Infinity content-hash class."
+
+[[phases]]
+id = "H2.26"
+title = "Pipelined vs sequential preserves the authorization side-effect set"
+status = "gap"
+
+[[phases]]
+id = "H2.27"
+title = "Projection hash and redaction agreement"
+status = "n/a"
+note = "Infinity projection class."
+
+[[phases]]
+id = "H2.28"
+title = "Overlapping write capabilities detected or prevented"
+status = "gap"
+
+[[phases]]
+id = "H2.29"
+title = "Audit-only capability cannot write"
+status = "done"
+checks = ["test:tests/unit_tests.rs::read_only_capability_refuses_mutation"]
+
+[[phases]]
+id = "H2.30"
+title = "Stale capability after ownership change refused"
+status = "gap"
+
+[[phases]]
+id = "H2.31"
+title = "Another worker's secret-bearing subgraph denied or fully redacted"
+status = "gap"
+
+[[phases]]
+id = "H2.32"
+title = "Public errors do not enable secret or capability oracles"
+status = "partial"
+checks = ["test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented"]
+
+[[phases]]
+id = "H2.33"
+title = "No debug unlock or test ambient authority in release builds"
+status = "gap"
+
+[[phases]]
+id = "H2.34"
+title = "Fuzz corpus treated as permanently hostile input"
+status = "gap"
+
+[[phases]]
+id = "H2.35"
+title = "Docs and examples do not teach insecure patterns without warnings"
+status = "partial"
+checks = ["doc:SECURITY.md", "doc:README.md"]
+
+[[phases]]
+id = "H2.36"
+title = "Allocation ceiling for untrusted counts"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating"]
+
+[[phases]]
+id = "H2.37"
+title = "Length arithmetic checked on 32-bit and 64-bit widths"
+status = "gap"
+
+[[phases]]
+id = "H2.38"
+title = "Strings and blobs that end exactly at EOF"
+status = "partial"
+checks = ["test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected"]
+
+[[phases]]
+id = "H2.39"
+title = "Extension skip and duplicate-tag arithmetic"
+status = "n/a"
+note = "ARP1 has no extension table."
+
+[[phases]]
+id = "H2.40"
+title = "Abort-free lane under panic=abort"
+status = "gap"
+
+[[phases]]
+id = "H2.41"
+title = "Linear-time validation"
+status = "gap"
+
+[[phases]]
+id = "H2.42"
+title = "Cross-kernel and cross-connection capability transplant or replay"
+status = "gap"
+
+[[phases]]
+id = "H2.43"
+title = "Event and log redaction oracle (no secret bytes, hashed capability ids)"
+status = "gap"
+
+[[phases]]
+id = "H2.44"
+title = "Tool timeout and payload ceiling"
+status = "gap"
+
+[[phases]]
+id = "H2.45"
+title = "Shared-memory frame TOCTOU under concurrent mutation"
+status = "gap"
+
+[[phases]]
+id = "H2.46"
+title = "URL and path allow-list canonicalization bypass"
+status = "gap"
+
+[[phases]]
+id = "H2.47"
+title = "Promise settlement count under concurrent cancel and resolve"
+status = "partial"
+checks = ["test:tests/unit_tests.rs::promise_can_be_cancelled_or_resolved_once"]
+
+[[phases]]
+id = "H3.1"
+title = "Freeze a review scope document"
+status = "gap"
+
+[[phases]]
+id = "H3.2"
+title = "Independent review with recorded findings"
+status = "partial"
+checks = ["doc:REVIEWS.md"]
+
+[[phases]]
+id = "H3.3"
+title = "Triage findings; critical and high fixed before maturity"
+status = "partial"
+checks = ["doc:REVIEWS.md"]
+
+[[phases]]
+id = "H3.4"
+title = "Re-test after fixes with evidence"
+status = "partial"
+checks = ["doc:REVIEWS.md"]
+
+[[phases]]
+id = "H3.5"
+title = "Schedule delta reviews after model or wire changes"
+status = "gap"
+
+[[phases]]
+id = "H3.6"
+title = "Annual revisit in maintenance"
+status = "gap"
+
+[[phases]]
+id = "H4.1"
+title = "Checked-in benchmark matrix"
+status = "partial"
+checks = ["script:benches/transport.rs"]
+
+[[phases]]
+id = "H4.2"
+title = "Infinity encode/decode throughput and latency"
+status = "n/a"
+note = "Infinity performance phase; see the active-infinity map."
+
+[[phases]]
+id = "H4.3"
+title = "RPC call latency, pipelining and concurrency"
+status = "gap"
+
+[[phases]]
+id = "H4.4"
+title = "Sustained load with RSS, allocations, FDs, threads"
+status = "gap"
+
+[[phases]]
+id = "H4.5"
+title = "CI regression gates on the benchmark matrix"
+status = "gap"
+
+[[phases]]
+id = "H4.6"
+title = "Publish docs/performance.md with methodology and numbers"
+status = "partial"
+checks = ["doc:docs/spec/performance.md"]
+
+[[phases]]
+id = "H4.7"
+title = "Explicit DoS scenarios prove budgets cap CPU and memory"
+status = "partial"
+checks = [
+  "test:tests/redteam_tests.rs::threat_budget_bypass_attempts",
+  "test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget",
+]
+
+[[phases]]
+id = "H4.8"
+title = "RSS, FD and thread stability over repeated cycles"
+status = "gap"
+
+[[phases]]
+id = "H4.9"
+title = "FD and thread stability under connection churn"
+status = "gap"
+
+[[phases]]
+id = "H5.1"
+title = "Runnable examples: round-trip, two-agent channel, tools, attenuation"
+status = "partial"
+checks = ["script:examples/loopback.rs"]
+
+[[phases]]
+id = "H5.2"
+title = "Migration from JSON/YAML guide"
+status = "gap"
+
+[[phases]]
+id = "H5.3"
+title = "Why not only Cap'n Proto, FlatBuffers or gRPC"
+status = "gap"
+
+[[phases]]
+id = "H5.4"
+title = "Stable machine-readable error code catalog"
+status = "partial"
+checks = ["test:tests/conformance_tests.rs::every_error_code_is_unique_and_documented"]
+
+[[phases]]
+id = "H5.5"
+title = "Explicit what-is-safe-to-log rules"
+status = "partial"
+checks = ["doc:docs/spec/security.md"]
+
+[[phases]]
+id = "H5.6"
+title = "Misuse documentation"
+status = "partial"
+checks = ["doc:SECURITY.md"]
+
+[[phases]]
+id = "H5.7"
+title = "Optional active-habitat demo"
+status = "gap"
+
+[[phases]]
+id = "H6.1"
+title = "SBOM on every release"
+status = "partial"
+checks = ["doc:docs/release-signing.md"]
+
+[[phases]]
+id = "H6.2"
+title = "cargo deny and advisory audit strict in CI"
+status = "done"
+checks = ["gate:audit", "gate:deny"]
+
+[[phases]]
+id = "H6.3"
+title = "Reproducible builds where feasible, limits documented"
+status = "gap"
+
+[[phases]]
+id = "H6.4"
+title = "Signed tags with allowed_signers enforced"
+status = "partial"
+checks = ["script:release-signing.allowed_signers"]
+
+[[phases]]
+id = "H6.5"
+title = "Dual publish checklist mechanical and reviewed"
+status = "partial"
+checks = ["doc:docs/release-signing.md"]
+
+[[phases]]
+id = "H6.6"
+title = "Yank and advisory process exercised in a dry run"
+status = "gap"
+
+[[phases]]
+id = "H6.7"
+title = "Property tests for attenuation monotonicity"
+status = "done"
+checks = ["test:tests/property_tests.rs::attenuation_is_monotone"]
+
+[[phases]]
+id = "H6.8"
+title = "Bounded or exhaustive capability lifecycle model"
+status = "gap"
+
+[[phases]]
+id = "H6.9"
+title = "Public statement of tested vs fuzzed vs reviewed vs proven"
+status = "partial"
+checks = ["doc:SECURITY.md"]
+
+[[phases]]
+id = "H6.10"
+title = "Exhaustive small-state capability lifecycle model"
+status = "gap"
+
+[[phases]]
+id = "H7.1"
+title = "Structured events for call, settle, revoke, budget, refusal"
+status = "partial"
+checks = ["test:tests/unit_tests.rs::events_record_the_dispatch_batches"]
+
+[[phases]]
+id = "H7.2"
+title = "Default logs carry no secrets or raw capability bits"
+status = "gap"
+
+[[phases]]
+id = "H7.3"
+title = "Metrics without sensitive payloads"
+status = "gap"
+
+[[phases]]
+id = "H7.4"
+title = "Tests that force sensitive data into events fail CI"
+status = "gap"
+
+[[phases]]
+id = "H8.1"
+title = "Written wire and format compatibility policy"
+status = "partial"
+checks = ["doc:docs/spec/wire.md"]
+
+[[phases]]
+id = "H8.2"
+title = "Old Infinity images still validate"
+status = "n/a"
+note = "Infinity owns image compatibility; RPC carries opaque validated payloads."
+
+[[phases]]
+id = "H8.3"
+title = "Unknown flags and fields behavior specified and tested"
+status = "partial"
+checks = [
+  "test:tests/conformance_tests.rs::header_field_attacks_are_rejected",
+  "test:tests/conformance_tests.rs::every_encoding_is_stable_under_re_encoding",
+]
+
+[[phases]]
+id = "H8.4"
+title = "Versioned public conformance suite"
+status = "partial"
+checks = ["test:tests/conformance_tests.rs::capability_table_golden_shape"]
+
+[[phases]]
+id = "H8.5"
+title = "Deprecation windows for shipped behavior"
+status = "gap"
+
+[[phases]]
+id = "H9.1"
+title = "Nightly continuous fuzz with growing corpus"
+status = "partial"
+checks = ["gate:fuzz"]
+
+[[phases]]
+id = "H9.2"
+title = "Periodic independent review cadence"
+status = "partial"
+checks = ["doc:REVIEWS.md"]
+
+[[phases]]
+id = "H9.3"
+title = "Public status section: performance, security posture, residual risks"
+status = "gap"
+
+[[phases]]
+id = "H9.4"
+title = "Hardening checklist reviewed every release"
+status = "gap"
+
+[[phases]]
+id = "H9.5"
+title = "Maturity claim only after H0-H8 complete and H9 sustained"
+status = "gap"
+
+# ---------------------------------------------------------------------------
+# Addendum A: research program (R) and domains (D)
+# ---------------------------------------------------------------------------
+
+[[phases]]
+id = "R-0"
+title = "Research sprint before each phase"
+status = "done"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "R-1"
+title = "Research sibling components after every critical fix"
+status = "partial"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "R-2"
+title = "Full multi-domain pass once per release cycle"
+status = "partial"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "R-3"
+title = "Log every finding in RESEARCH-LOG.md"
+status = "done"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "R-4"
+title = "Every finding becomes a test, item, ADR or n/a note"
+status = "partial"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D1.1"
+title = "At least 15 historical parser bugs with identifiers"
+status = "done"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D1.2"
+title = "Map each historical bug to the wire decoder"
+status = "done"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D1.3"
+title = "Add a test or fuzz oracle per mapped class"
+status = "partial"
+checks = ["fuzz:framing"]
+
+[[phases]]
+id = "D1.4"
+title = "Differential parsing and second checker"
+status = "gap"
+
+[[phases]]
+id = "D2.1"
+title = "At least 10 capability or RPC authz failure patterns"
+status = "done"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D2.2"
+title = "Map authz patterns to kernel, cap, channel, tool, transport"
+status = "done"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D2.3"
+title = "Monotonicity, revoke-at-dispatch and confused-deputy tests"
+status = "partial"
+checks = [
+  "test:tests/property_tests.rs::attenuation_is_monotone",
+  "test:tests/redteam_tests.rs::threat_confused_deputy",
+]
+
+[[phases]]
+id = "D2.4"
+title = "Rights amplification and caretaker patterns"
+status = "gap"
+
+[[phases]]
+id = "D3.1"
+title = "Enumerate every export path"
+status = "done"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D3.2"
+title = "Attempt redaction bypass techniques"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::review_module_payloads_are_redacted"]
+
+[[phases]]
+id = "D3.3"
+title = "Anti-oracle equality in debug and optimized builds"
+status = "n/a"
+note = "Infinity owns secret equality."
+
+[[phases]]
+id = "D3.4"
+title = "Stable error codes do not branch on secret-dependent data"
+status = "gap"
+
+[[phases]]
+id = "D4.1"
+title = "Compare fuzz targets to structure-aware state of the art"
+status = "partial"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D4.2"
+title = "Semantic oracles, not only crash oracles"
+status = "partial"
+checks = ["fuzz:framing"]
+
+[[phases]]
+id = "D4.3"
+title = "Directed seeds for cold paths"
+status = "gap"
+
+[[phases]]
+id = "D4.4"
+title = "Corpus growth and minimize-and-commit policy"
+status = "partial"
+checks = ["doc:docs/hardening/CORPUS.md"]
+
+[[phases]]
+id = "D5.1"
+title = "Map classic DoS classes to budget dimensions"
+status = "partial"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D5.2"
+title = "Prove hostile input hits budget before host OOM"
+status = "partial"
+checks = ["test:tests/redteam_tests.rs::review_capability_table_count_is_capped_before_allocating"]
+
+[[phases]]
+id = "D5.3"
+title = "Compression bombs at transport edges"
+status = "n/a"
+note = "No compression layer."
+
+[[phases]]
+id = "D6.1"
+title = "Escape catalog for HTTP, process and MCP tools"
+status = "done"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D6.2"
+title = "Automate escape attempts as red-team tests"
+status = "partial"
+checks = ["test:tests/unit_tests.rs::tool_policy_is_enforced_on_tool_calls"]
+
+[[phases]]
+id = "D6.3"
+title = "Runtime sandbox escape claims"
+status = "gap"
+
+[[phases]]
+id = "D7.1"
+title = "Audit dependencies for unnecessary privilege"
+status = "partial"
+checks = ["doc:docs/hardening/RESEARCH-LOG.md"]
+
+[[phases]]
+id = "D7.2"
+title = "cargo deny and advisories gate merges"
+status = "done"
+checks = ["gate:audit", "gate:deny"]
+
+[[phases]]
+id = "D7.3"
+title = "Document residual non-reproducibility sources"
+status = "partial"
+checks = ["doc:docs/release-signing.md"]
+
+[[phases]]
+id = "D8.1"
+title = "Capability patterns for writer, auditor, orchestrator"
+status = "gap"
+
+[[phases]]
+id = "D8.2"
+title = "Overlapping, stale and exfiltration grants"
+status = "gap"
+
+[[phases]]
+id = "D8.3"
+title = "Import applicable multi-agent security tests"
+status = "gap"
+
+[[phases]]
+id = "D9.1"
+title = "Secret- or capability-dependent timing in hot paths"
+status = "gap"
+
+[[phases]]
+id = "D9.2"
+title = "Docs do not reveal privileged test-only behavior"
+status = "partial"
+checks = ["doc:docs/spec/security.md"]
+
+[[phases]]
+id = "D9.3"
+title = "Standing question: what would an infinite-input agent try next"
+status = "gap"
