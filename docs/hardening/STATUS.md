@@ -17,6 +17,7 @@ the bottom is generated from `docs/hardening/invariant-map.toml` by
 | Released tag | `v1.1.9` |
 | MSRV | 1.88 |
 | Wire format | ARP1 |
+| Final commit | `c8040b1` |
 | Measured | 2026-10-27 |
 
 ## H0 findings
@@ -186,6 +187,15 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
   remain; the mapped invariants are covered, not every branch.
 - **Timing.** Tool adapters and transports do real I/O and are outside the
   constant-time claim; the kernel itself has no secret-dependent comparison.
+
+### Sustained-assurance window (H9.5)
+
+The maturity claim is point-in-time: every gate above is green on the final
+commit, and the continuous program is configured. The sustained window is
+**seven consecutive green nightly runs** (fuzz matrix plus coverage floor) with
+no new review finding; the nightly workflow is the clock. Until that window
+closes, releases carry "hardening complete, assurance window open" rather than
+an unqualified maturity claim.
 
 ## Maturity sign-off
 
