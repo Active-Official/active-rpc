@@ -15,3 +15,7 @@
 # Release artifacts (attached to tags, not committed)
 *.cdx.json
 
+
+# Python bytecode from the hardening scripts
+__pycache__/
+*.pyc
