@@ -1106,7 +1106,7 @@ fn settled_promise_and_job_records_are_reclaimed() {
 
     let (agent, provider_id, _cap) = agent_with_module();
     let wide = Budget {
-        max_calls: 20_000,
+        max_calls: 200_000,
         ..Budget::default()
     };
     let lane = agent.create_lane("reclaim", wide).expect("lane");
@@ -1115,7 +1115,7 @@ fn settled_promise_and_job_records_are_reclaimed() {
     let cap = agent.mint(provider_id, 0, attrs).expect("cap");
 
     let mut last = None;
-    for _ in 0..5_000 {
+    for _ in 0..110_000 {
         let promise = agent.call(lane, &cap, "stats", vec![]).expect("call");
         promise.value().expect("value");
         last = Some(promise);
