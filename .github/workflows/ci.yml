@@ -126,3 +126,14 @@ jobs:
         with:
           name: sbom
           path: dist/*.cdx.json
+
+  api-surface:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      # The authoritative check: the resolved public API, not a text scan.
+      - name: Generate rustdoc JSON
+        run: cargo +nightly rustdoc --locked --lib --all-features -- -Zunstable-options --output-format json
+      - name: No public secret or raw capability accessor
+        run: python3 scripts/api_surface.py target/doc/active_rpc.json

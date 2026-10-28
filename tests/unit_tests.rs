@@ -1099,3 +1099,91 @@ fn destroyed_lane_keeps_a_settled_promise_readable() {
         "a settled result must survive lane destruction"
     );
 }
+
+#[test]
+fn settled_promise_and_job_records_are_reclaimed() {
+    use active_rpc::kernel::MAX_SETTLED_PROMISES;
+
+    let (agent, provider_id, _cap) = agent_with_module();
+    let wide = Budget {
+        max_calls: 20_000,
+        ..Budget::default()
+    };
+    let lane = agent.create_lane("reclaim", wide).expect("lane");
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.budget = wide;
+    let cap = agent.mint(provider_id, 0, attrs).expect("cap");
+
+    let mut last = None;
+    for _ in 0..5_000 {
+        let promise = agent.call(lane, &cap, "stats", vec![]).expect("call");
+        promise.value().expect("value");
+        last = Some(promise);
+    }
+    assert_eq!(agent.job_count(), 0, "completed jobs must be removed");
+    assert!(
+        agent.promise_count() <= MAX_SETTLED_PROMISES,
+        "settled promises were not trimmed: {}",
+        agent.promise_count()
+    );
+    // Capacity returned: a call after the retention window still succeeds.
+    let after = agent
+        .call(lane, &cap, "stats", vec![])
+        .expect("post-trim call");
+    after.value().expect("post-trim value");
+    last.expect("last handle")
+        .value()
+        .expect("last value readable");
+}
+
+struct BigValue;
+
+impl Provider for BigValue {
+    fn name(&self) -> &'static str {
+        "big"
+    }
+    fn methods(&self) -> Vec<String> {
+        vec!["big".to_string()]
+    }
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::text("x".repeat(1 << 20))))
+    }
+}
+
+#[test]
+fn settled_value_bytes_are_bounded_after_a_drain() {
+    use active_rpc::kernel::MAX_SETTLED_BYTES;
+
+    let agent = Agent::with_secret([19u8; 32]);
+    let provider = agent.register(Box::new(BigValue));
+    let wide = Budget {
+        max_calls: 10_000,
+        max_bytes: 64 << 20,
+        max_value_size: 8 << 20,
+        ..Budget::default()
+    };
+    let lane = agent.create_lane("big", wide).expect("lane");
+    let mut attrs = CapAttrs::new(&["big"]);
+    attrs.budget = wide;
+    let cap = agent.mint(provider, 0, attrs).expect("cap");
+
+    for _ in 0..100 {
+        let promise = agent.call(lane, &cap, "big", vec![]).expect("call");
+        let value = promise.value().expect("value");
+        assert!(value.wire_size() >= 1 << 20);
+    }
+    assert_eq!(agent.job_count(), 0);
+    // 100 MiB of settled values cannot stay pinned under the 64 MiB budget.
+    let retained = agent.promise_count();
+    assert!(
+        retained <= 64,
+        "retained {retained} one-MiB promises, byte budget did not bind"
+    );
+    assert!(
+        (retained as u64) * (1 << 20) <= MAX_SETTLED_BYTES as u64 + (1 << 20),
+        "retained bytes exceed the budget plus the newest value"
+    );
+}

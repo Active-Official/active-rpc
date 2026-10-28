@@ -26,6 +26,7 @@ audit = "cargo audit"
 deny = "cargo deny check"
 fuzz = "cargo +nightly fuzz run fuzz_arp1_frame -- -runs=20000"
 negative-controls = "python scripts/negative_controls.py --check"
+api-surface = "cargo +nightly rustdoc --locked --lib --all-features -- -Zunstable-options --output-format json && python scripts/api_surface.py target/doc/active_rpc.json"
 perf = "cargo test --locked --test perf_budget"
 bench = "cargo bench --locked --bench transport --no-run"
 sbom = "python scripts/sbom.py --output dist/active-rpc.cdx.json && python scripts/sbom.py --check dist/active-rpc.cdx.json"
@@ -57,13 +58,7 @@ id = "I-3"
 title = "Secret non-leakage"
 status = "covered"
 critical = true
-checks = [
-  "test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire",
-  "test:tests/redteam_tests.rs::review_module_payloads_are_redacted",
-  "test:tests/integration_tests.rs::redaction_hides_the_secret_cone",
-  "test:tests/unit_tests.rs::response_and_error_envelopes_carry_no_payload",
-  "fuzz:fuzz_arp1_frame",
-]
+checks = ["test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire", "test:tests/redteam_tests.rs::review_module_payloads_are_redacted", "test:tests/integration_tests.rs::redaction_hides_the_secret_cone", "test:tests/unit_tests.rs::response_and_error_envelopes_carry_no_payload", "fuzz:fuzz_arp1_frame", "gate:api-surface", "test:tests/api_surface.rs::capability_display_and_errors_use_the_correlation_id"]
 negative_control_status = "implemented"
 negative_control_check = "script:scripts/negative_controls.py#I-3-redaction"
 negative_control_probe = "Make Kernel::redact_module_payload a no-op and run the redaction tests"
@@ -75,14 +70,7 @@ id = "I-4"
 title = "Capability unforgeability"
 status = "covered"
 critical = true
-checks = [
-  "test:tests/unit_tests.rs::capability_ids_are_unforgeable",
-  "test:tests/redteam_tests.rs::threat_forgery_and_transplant",
-  "test:tests/redteam_tests.rs::review_agent_secrets_are_random",
-  "test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits",
-  "script:scripts/negative_controls.py#I-4-debug",
-  "test:tests/unit_tests.rs::unknown_method_is_refused",
-]
+checks = ["test:tests/unit_tests.rs::capability_ids_are_unforgeable", "test:tests/redteam_tests.rs::threat_forgery_and_transplant", "test:tests/redteam_tests.rs::review_agent_secrets_are_random", "test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits", "script:scripts/negative_controls.py#I-4-debug", "test:tests/unit_tests.rs::unknown_method_is_refused", "gate:api-surface", "test:tests/api_surface.rs::capability_hex_is_the_single_documented_raw_accessor"]
 negative_control_status = "implemented"
 negative_control_check = "script:scripts/negative_controls.py#I-4-secret"
 negative_control_probe = "Replace the OS CSPRNG in Agent::new with a fixed seed and mint two agents"
@@ -566,7 +554,7 @@ checks = ["test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget",
 id = "H2.21"
 title = "Many lanes, channels and promises to finite limits"
 status = "done"
-checks = ["test:tests/unit_tests.rs::global_registry_ceilings_are_finite", "test:tests/redteam_battery.rs::redteam_battery_is_green", "test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging", "test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots"]
+checks = ["test:tests/unit_tests.rs::global_registry_ceilings_are_finite", "test:tests/redteam_battery.rs::redteam_battery_is_green", "test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging", "test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots", "test:tests/unit_tests.rs::settled_promise_and_job_records_are_reclaimed", "test:tests/unit_tests.rs::settled_value_bytes_are_bounded_after_a_drain"]
 
 [[phases]]
 id = "H2.22"

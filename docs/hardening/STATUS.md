@@ -24,12 +24,12 @@ the bottom is generated from `docs/hardening/invariant-map.toml` by
 
 ### H0.1 Test inventory
 
-109 test functions across the integration binaries plus the library unit tests
+114 test functions across the integration binaries plus the library unit tests
 and a doctest:
 
 | Suite | Tests | What it proves |
 |---|---|---|
-| `tests/unit_tests.rs` | 39 | capability mint/attenuation/revocation, drops, promises, lanes, channels, wire codec, tool policy, MCP handshake, bounded lifecycle model, observability metrics, process timeout |
+| `tests/unit_tests.rs` | 41 | capability mint/attenuation/revocation, drops, promises, lanes, channels, wire codec, tool policy, MCP handshake, bounded lifecycle model, observability metrics, process timeout |
 | `tests/integration_tests.rs` | 8 | real Infinity payloads, TCP peer pipelining, shared-memory transport, domain provider, tools |
 | `tests/property_tests.rs` | 5 | envelope round-trip, attenuation monotonicity, value redaction |
 | `tests/conformance_tests.rs` | 5 | error-code catalog, golden capability table, header attacks, stable encodings |
@@ -106,7 +106,7 @@ drives the shipped entry points.
 | H2.18 | I-3 | raw capability bits and secrets in telemetry |
 | H2.19 | I-8 | queue storm under a low call budget |
 | H2.20 | I-8 | nested byte bomb under a low byte budget |
-| H2.21 | I-8 | lane, channel and promise registries to their ceilings |
+| H2.21 | I-8 | lane, channel, job and promise registries, and their reclamation to their ceilings |
 | H2.23 | I-8 | zero and near-zero ceilings refused |
 | H2.26 | I-12 | pipelined vs sequential authorization side effects |
 | H2.29 | I-12 | read/audit-only capability attempts a write |
@@ -145,7 +145,7 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
 | `cargo fmt --all -- --check` | pass | local run 2026-10-27 |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | pass | local run 2026-10-27 |
 | `cargo clippy --no-default-features -- -D warnings` | pass | local run 2026-10-27 |
-| `cargo test --locked --all-features` | pass (109 tests) | local run + CI |
+| `cargo test --locked --all-features` | pass (114 tests) | local run + CI |
 | `cargo test --locked --no-default-features` | pass | local run + CI |
 | `cargo doc` with `RUSTDOCFLAGS=-D warnings` | pass | local run 2026-10-27 |
 | `cargo package --locked` | pass | local run 2026-10-27 |
@@ -183,6 +183,17 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
   with a scrubbed environment and a wall-clock ceiling, but the program itself
   is trusted code.
 - **`unsafe-libyaml` advisory.** Accepted, unreachable from the parsing path.
+- **Settled promises are retained in a bounded window.** After each drain the
+  kernel keeps the newest `MAX_SETTLED_PROMISES = 1_024` settled records and at
+  most `MAX_SETTLED_BYTES = 64 MiB` of response payloads (the newest record is
+  always kept). A handle whose record was evicted returns `rpc/unknown-promise`;
+  callers that need a long-lived result must copy it out. Pending promises are
+  never evicted, and `MAX_PROMISES` is transient backpressure, not a lifetime
+  quota: completed job records are removed immediately and settled records are
+  trimmed on every drain.
+- **Retained response values are a residual cost.** The 64 MiB window bounds
+  pinned payload memory; one value larger than the window is still retained
+  because it is the result the caller just awaited.
 - **Coverage floors are floors.** 68% line coverage means untested error paths
   remain; the mapped invariants are covered, not every branch.
 - **Timing.** Tool adapters and transports do real I/O and are outside the
@@ -219,14 +230,14 @@ Sign-off: 2026-10-27, Grok (AI coding and security agent)
 
 **Repository:** `active-rpc` **version:** `1.1.9` **baseline commit:** `69acea89bd03a9a69ff88cdd6dd8d12560a2d210` **baseline tag:** `hardening-baseline` **measured:** 2026-10-27
 
-Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136 done, 0 partial, 0 gap, 24 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 136.
+Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136 done, 0 partial, 0 gap, 24 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 141.
 
 | Invariant | Meaning | Status | Checks | Negative control |
 |---|---|---|---|---|
 | **I-1** | Structural secret taint | `covered` | 3 | - |
 | **I-2** | Anti-oracle equality | `n/a` | 0 | - |
-| **I-3** | Secret non-leakage | `covered` | 5 | implemented |
-| **I-4** | Capability unforgeability | `covered` | 6 | implemented |
+| **I-3** | Secret non-leakage | `covered` | 7 | implemented |
+| **I-4** | Capability unforgeability | `covered` | 8 | implemented |
 | **I-5** | Attenuation only narrows | `covered` | 7 | implemented |
 | **I-6** | Revocation at dispatch | `covered` | 5 | implemented |
 | **I-7** | Drop notification | `covered` | 2 | - |
@@ -290,7 +301,7 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136
 | **H2.18** | Logging and metrics carry no secrets or raw capability bits | `done` | `test:tests/unit_tests.rs::events_record_the_dispatch_batches`, `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`, `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::capability_display_and_errors_do_not_print_raw_bits` |
 | **H2.19** | Queue storms under a low call budget | `done` | `test:tests/redteam_tests.rs::review_lane_capacity_counts_queued_calls`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.20** | Nested value byte bombs under a low byte budget | `done` | `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
-| **H2.21** | Many lanes, channels and promises to finite limits | `done` | `test:tests/unit_tests.rs::global_registry_ceilings_are_finite`, `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging`, `test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots` |
+| **H2.21** | Many lanes, channels and promises to finite limits | `done` | `test:tests/unit_tests.rs::global_registry_ceilings_are_finite`, `test:tests/redteam_battery.rs::redteam_battery_is_green`, `test:tests/unit_tests.rs::promise_ceiling_is_finite_and_refuses_before_charging`, `test:tests/unit_tests.rs::destroyed_lanes_and_channels_reclaim_registry_slots`, `test:tests/unit_tests.rs::settled_promise_and_job_records_are_reclaimed`, `test:tests/unit_tests.rs::settled_value_bytes_are_bounded_after_a_drain` |
 | **H2.22** | Enormous tool payloads and tools that never return | `done` | `test:tests/unit_tests.rs::local_process_timeout_kills_a_hung_child`, `test:tests/redteam_tests.rs::threat_argument_bombs_in_memory_budget`, `test:tests/unit_tests.rs::channel_queue_ceiling_bounds_one_sender` |
 | **H2.23** | Zero or near-zero ceilings refused where policy needs finite limits | `done` | `test:tests/redteam_tests.rs::review_zero_ceilings_are_refused_in_every_budget_field` |
 | **H2.24** | Single-bit mutation fails validation or changes the hash | `n/a` | - |
@@ -410,19 +421,21 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136
 
 </details>
 
-<details><summary><strong>I-3</strong> (5 checks)</summary>
+<details><summary><strong>I-3</strong> (7 checks)</summary>
 
 - `test:tests/redteam_tests.rs::threat_secret_material_never_reaches_the_wire`
 - `test:tests/redteam_tests.rs::review_module_payloads_are_redacted`
 - `test:tests/integration_tests.rs::redaction_hides_the_secret_cone`
 - `test:tests/unit_tests.rs::response_and_error_envelopes_carry_no_payload`
 - `fuzz:fuzz_arp1_frame` — fuzz/fuzz_targets/fuzz_arp1_frame.rs
+- `gate:api-surface` — cargo +nightly rustdoc --locked --lib --all-features -- -Zunstable-options --output-format json && python scripts/api_surface.py target/doc/active_rpc.json
+- `test:tests/api_surface.rs::capability_display_and_errors_use_the_correlation_id`
 
 Negative control (implemented): Make Kernel::redact_module_payload a no-op and run the redaction tests → expected: threat_secret_material_never_reaches_the_wire must fail with the canary bytes present in the encoded envelope
 
 </details>
 
-<details><summary><strong>I-4</strong> (6 checks)</summary>
+<details><summary><strong>I-4</strong> (8 checks)</summary>
 
 - `test:tests/unit_tests.rs::capability_ids_are_unforgeable`
 - `test:tests/redteam_tests.rs::threat_forgery_and_transplant`
@@ -430,6 +443,8 @@ Negative control (implemented): Make Kernel::redact_module_payload a no-op and r
 - `test:tests/unit_tests.rs::capability_debug_does_not_print_raw_bits`
 - `script:scripts/negative_controls.py#I-4-debug`
 - `test:tests/unit_tests.rs::unknown_method_is_refused`
+- `gate:api-surface` — cargo +nightly rustdoc --locked --lib --all-features -- -Zunstable-options --output-format json && python scripts/api_surface.py target/doc/active_rpc.json
+- `test:tests/api_surface.rs::capability_hex_is_the_single_documented_raw_accessor`
 
 Negative control (implemented): Replace the OS CSPRNG in Agent::new with a fixed seed and mint two agents → expected: review_agent_secrets_are_random must fail because both agents produce the same capability ids
 
@@ -546,6 +561,7 @@ Negative control (implemented): Remove the settled flag check in Promise::settle
 
 | Gate | Command |
 |---|---|
+| `api-surface` | `cargo +nightly rustdoc --locked --lib --all-features -- -Zunstable-options --output-format json && python scripts/api_surface.py target/doc/active_rpc.json` |
 | `audit` | `cargo audit` |
 | `baseline-tag` | `git rev-parse --verify hardening-baseline^{commit}` |
 | `bench` | `cargo bench --locked --bench transport --no-run` |

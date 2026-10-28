@@ -39,11 +39,28 @@ pub const MAX_LANES: usize = 4_096;
 /// Global ceiling on channels in one kernel.
 pub const MAX_CHANNELS: usize = 4_096;
 
-/// Global ceiling on live-and-settled promise records in one kernel.
+/// Global ceiling on live promise and job records in one kernel.
 ///
-/// Promises are removed when the lane is destroyed; the ceiling covers a kernel
-/// that keeps issuing calls on long-lived lanes.
+/// The ceiling covers a kernel that keeps issuing calls on long-lived lanes and
+/// is a backpressure valve, not a lifetime quota: after each drain the kernel
+/// trims settled promise records to [`MAX_SETTLED_PROMISES`] and
+/// [`MAX_SETTLED_BYTES`], and completed jobs are removed immediately.
 pub const MAX_PROMISES: usize = 100_000;
+
+/// Settled promise records retained per kernel after a drain.
+///
+/// A handle may read its value after the promise settled; the most recent
+/// records are kept so that ordinary await patterns work. Older settled records
+/// are evicted and their handles return `rpc/unknown-promise`. Pending records
+/// are never evicted.
+pub const MAX_SETTLED_PROMISES: usize = 1_024;
+
+/// Bytes of settled values retained per kernel after a drain.
+///
+/// Values can be large; this bounds the payload memory a completed call chain
+/// pins. The newest record is always kept even when it alone exceeds the
+/// budget, so the call that just settled remains readable.
+pub const MAX_SETTLED_BYTES: usize = 64 << 20;
 
 /// Ceiling on the retained event log.
 ///
@@ -241,6 +258,9 @@ pub struct Kernel {
     jobs: BTreeMap<u64, Job>,
     queue: VecDeque<u64>,
     events: VecDeque<Event>,
+    /// Settled promises in settlement order, with the retained value size.
+    settled: VecDeque<(PromiseId, usize)>,
+    settled_bytes: usize,
     metrics: Metrics,
     round_trips: u64,
     next_promise: u64,
@@ -346,6 +366,8 @@ impl Agent {
             jobs: BTreeMap::new(),
             queue: VecDeque::new(),
             events: VecDeque::new(),
+            settled: VecDeque::new(),
+            settled_bytes: 0,
             metrics: Metrics::default(),
             round_trips: 0,
             next_promise: 0,
@@ -836,6 +858,7 @@ impl Agent {
             let batch = {
                 let mut kernel = self.cell.borrow_mut();
                 if kernel.queue.is_empty() {
+                    kernel.trim_settled();
                     return kernel.round_trips;
                 }
                 match kernel.next_batch() {
@@ -899,6 +922,7 @@ impl Agent {
         settled?;
         kernel.push_event(Event::PromiseResolved(promise.id));
         kernel.metrics.promises_resolved = kernel.metrics.promises_resolved.saturating_add(1);
+        kernel.record_settled(promise.id);
         Ok(())
     }
 
@@ -924,9 +948,8 @@ impl Agent {
         if let Some(job_id) = queued {
             kernel.queue.retain(|id| *id != job_id);
             let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
-            if let Some(job) = kernel.jobs.get_mut(&job_id) {
-                job.state = JobState::Done;
-            }
+            kernel.jobs.remove(&job_id);
+            kernel.record_settled(promise.id);
             if let Some(lane) = lane {
                 if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
                     lane_record.complete();
@@ -959,6 +982,16 @@ impl Agent {
             transfers: kernel.transfers,
             ..kernel.metrics
         }
+    }
+
+    /// Number of live promise records (pending plus retained settled).
+    pub fn promise_count(&self) -> usize {
+        self.cell.borrow().promises.len()
+    }
+
+    /// Number of live job records (queued or in flight).
+    pub fn job_count(&self) -> usize {
+        self.cell.borrow().jobs.len()
     }
 
     /// Lane statistics.
@@ -1127,9 +1160,11 @@ impl Agent {
                         kernel.metrics.promises_rejected.saturating_add(1);
                 }
             }
-            if let Some(record) = kernel.jobs.get_mut(job_id) {
-                record.state = JobState::Done;
-            }
+            kernel.record_settled(job.promise);
+            // A completed job no longer needs its Call or arguments. Removing it
+            // here is what makes the jobs ceiling a transient bound rather than
+            // a lifetime quota.
+            kernel.jobs.remove(job_id);
             if let Some(lane_record) = kernel.lanes.get_mut(&job.lane) {
                 lane_record.complete();
             }
@@ -1153,6 +1188,34 @@ impl Kernel {
             self.events.pop_front();
         }
         self.events.push_back(event);
+    }
+
+    /// Remember a settled promise for bounded retention.
+    fn record_settled(&mut self, id: PromiseId) {
+        let size = self
+            .promises
+            .get(&id)
+            .and_then(|record| record.value().ok())
+            .map(|value| value.wire_size() as usize)
+            .unwrap_or(0);
+        self.settled.push_back((id, size));
+        self.settled_bytes = self.settled_bytes.saturating_add(size);
+    }
+
+    /// Trim settled promises after the queue drains.
+    ///
+    /// Only called with no queued job, so no dependency can still need an
+    /// evicted record. The newest settled record always survives.
+    fn trim_settled(&mut self) {
+        while (self.settled.len() > MAX_SETTLED_PROMISES || self.settled_bytes > MAX_SETTLED_BYTES)
+            && self.settled.len() > 1
+        {
+            let Some((id, size)) = self.settled.pop_front() else {
+                break;
+            };
+            self.settled_bytes = self.settled_bytes.saturating_sub(size);
+            self.promises.remove(&id);
+        }
     }
 
     /// Build the next dispatch batch: all queued jobs for the head job's
@@ -1242,6 +1305,8 @@ impl Kernel {
             }
             self.push_event(Event::PromiseRejected { promise, code });
             self.metrics.promises_rejected = self.metrics.promises_rejected.saturating_add(1);
+            self.record_settled(promise);
+            self.jobs.remove(&job_id);
             self.push_event(Event::JobCompleted { job: job_id, lane });
         }
     }
