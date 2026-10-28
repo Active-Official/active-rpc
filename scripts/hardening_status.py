@@ -100,6 +100,16 @@ def resolve(root: Path, check: str, gates: dict) -> tuple[str, str]:
         if not (root / relative).exists():
             raise MapError(f"fuzz target not found: {relative}")
         return kind, relative
+    if kind == "script":
+        relative, _, fragment = ref.partition("#")
+        path = root / relative
+        if not path.exists():
+            raise MapError(f"script path not found: {relative}")
+        if fragment and f'"id": "{fragment}"' not in path.read_text(
+            encoding="utf-8", errors="replace"
+        ):
+            raise MapError(f"script {relative} has no control named {fragment!r}")
+        return kind, ref
     if not (root / ref).exists():
         raise MapError(f"{kind} path not found: {ref}")
     return kind, ref
