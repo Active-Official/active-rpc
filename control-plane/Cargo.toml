@@ -1,0 +1,26 @@
+[package]
+name = "active-control-plane"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Live control plane for Active Infinity and Active RPC: real kernels, real codec timings, a dashboard, REST/WS and MCP."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+active-infinity = { version = "2.1.0", features = ["active-core", "json"] }
+active-rpc = { path = "..", version = "2.0.0" }
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

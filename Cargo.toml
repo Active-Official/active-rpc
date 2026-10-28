@@ -38,6 +38,7 @@ rcgen = { version = "0.13", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+sha2 = "0.10"
 criterion = "0.5"
 
 [[bin]]

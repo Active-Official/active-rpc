@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Active Control Plane</title>
+  <meta name="description" content="Live, real observations from an Active RPC kernel and the Active Infinity codec.">
+  <link rel="icon" href="assets/dash-hero.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="assets/dash-hero.svg" width="44" height="44" alt="Active">
+      <div>
+        <h1>Active Control Plane</h1>
+        <p>Real kernel. Real codec. No simulated telemetry.</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="chip" id="mode-chip">demo</span>
+      <span class="status" id="status"><span class="dot"></span><span id="status-text">connecting</span></span>
+      <button class="icon-button" id="help-toggle" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+      <button class="icon-button" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">◐</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="kpis" aria-label="Key metrics">
+      <article class="kpi"><span class="kpi-label">Calls / second</span><strong id="kpi-cps">0.00</strong><small>kernel metric delta / wall time</small></article>
+      <article class="kpi"><span class="kpi-label">Calls queued</span><strong id="kpi-calls">0</strong><small>calls_queued · cumulative counter</small></article>
+      <article class="kpi"><span class="kpi-label">Promise records</span><strong id="kpi-promises">0</strong><small>Agent::promise_count()</small></article>
+      <article class="kpi"><span class="kpi-label">Provider round-trips</span><strong id="kpi-roundtrips">0</strong><small>Agent::round_trips()</small></article>
+      <article class="kpi"><span class="kpi-label">Refused</span><strong id="kpi-refused">0</strong><small>calls_refused + tool_refusals</small></article>
+      <article class="kpi"><span class="kpi-label">Budget pressure</span><strong id="kpi-pressure">0.0%</strong><small>calls / granted call budgets</small></article>
+      <article class="kpi"><span class="kpi-label">Wire bytes / s</span><strong id="kpi-bytes">0</strong><small>bytes_in + bytes_out delta</small></article>
+      <article class="kpi"><span class="kpi-label">Last error code</span><strong id="kpi-error" class="code-value">none</strong><small>latest event with a stable code</small></article>
+    </section>
+
+    <section class="grid live-grid">
+      <article class="panel live-panel">
+        <div class="panel-head">
+          <h2>Live activity</h2>
+          <div class="head-right">
+            <span class="mode-badge" id="activity-mode">Idle</span>
+            <span class="hint" id="activity-age">listening</span>
+          </div>
+        </div>
+        <p class="live-summary" id="activity-summary">Run a scenario or attach live traffic — this view mirrors the engines.</p>
+        <div class="stage-flow" id="activity-stages" aria-live="polite"></div>
+        <div class="live-meta">
+          <div class="hash-spot" id="hash-spot" hidden>
+            <span>Blake3</span>
+            <code id="activity-hash">—</code>
+            <button class="mini-button" id="copy-hash" type="button">Copy</button>
+          </div>
+          <div class="live-fact" id="activity-bytes">image —</div>
+          <div class="live-fact" id="activity-progress">progress —</div>
+        </div>
+        <div class="promise-wrap">
+          <span class="section-label">Promise chain · real ids</span>
+          <div class="promise-chain" id="promise-chain"><span class="hint">no pipelined batch yet</span></div>
+        </div>
+        <div class="lane-wrap">
+          <span class="section-label">Lane occupancy · kernel registry</span>
+          <div class="lane-bars" id="lane-bars"></div>
+        </div>
+      </article>
+
+      <article class="panel engine-panel">
+        <div class="panel-head">
+          <h2>Engines</h2>
+          <span class="hint" id="engine-counts">4 lanes · 2 channels</span>
+        </div>
+        <div class="engine-grid" id="engine-grid"></div>
+        <div class="cap-list" id="cap-list"></div>
+        <div class="cap-drawer" id="cap-drawer">
+          <span class="hint">Select a capability to inspect its real grants.</span>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel gauges-panel">
+      <div class="panel-head">
+        <h2>Live gauges</h2>
+        <span class="hint">last sample is exact · click any gauge for its definition and samples</span>
+      </div>
+      <div class="gauge-grid" id="gauge-grid"></div>
+    </section>
+
+    <section class="grid secondary">
+      <article class="panel timeline-panel">
+        <div class="panel-head">
+          <h2>Timeline</h2>
+          <div class="head-right">
+            <button class="mini-button" id="focus-scenario" type="button">Focus last scenario</button>
+            <button class="mini-button" id="clear-brush" type="button">Clear</button>
+          </div>
+        </div>
+        <div class="timeline" id="timeline"></div>
+        <p class="hint" id="timeline-hint">Drag across the tracks to brush a time window; the event log follows.</p>
+      </article>
+
+      <article class="panel log-panel">
+        <div class="panel-head">
+          <h2>Event log</h2>
+          <span class="hint" id="event-count">0 events</span>
+        </div>
+        <div class="log-controls">
+          <div class="filter-chips" id="filter-chips" role="group" aria-label="Event filters"></div>
+          <input id="event-search" class="search" type="search" placeholder="Filter detail, code, lane, method…" aria-label="Filter events">
+        </div>
+        <ol id="event-log" class="event-log"></ol>
+        <div class="log-actions">
+          <button class="mini-button" id="download-jsonl" type="button">Download JSONL</button>
+          <button class="mini-button" id="copy-tail" type="button">Copy tail</button>
+          <span class="hint" id="log-cursor">cursor 0</span>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel ladder-panel">
+      <div class="panel-head">
+        <h2>Scenario ladder</h2>
+        <span class="hint">L0–L6 · every step calls the shipped APIs</span>
+      </div>
+      <div class="ladder" id="ladder"></div>
+      <div id="ladder-summary" class="scenario-result">No scenario has run yet.</div>
+    </section>
+
+    <section class="grid lower">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Benchmark desk</h2>
+          <span class="hint">measured samples, no fabricated numbers</span>
+        </div>
+        <div class="bench-controls">
+          <label>Iterations <input id="iterations" type="number" min="5" max="5000" value="200"></label>
+          <button id="run-benchmark" class="primary-button">Run</button>
+          <a id="csv-link" class="ghost-button" href="/benchmark/export.csv" download>CSV</a>
+        </div>
+        <table class="bench-table">
+          <thead><tr><th>Workload</th><th>n</th><th>p50 µs</th><th>p99 µs</th><th>mean µs</th></tr></thead>
+          <tbody id="bench-body"><tr><td colspan="5" class="empty">No benchmark yet.</td></tr></tbody>
+        </table>
+        <p class="hint" id="bench-note"></p>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Agent access</h2>
+          <span class="hint">MCP over stdio</span>
+        </div>
+        <p class="prose">Agents read the same snapshot the dashboard shows. The configuration below launches the MCP server and attaches to this running plane.</p>
+        <pre id="mcp-config" class="code"></pre>
+        <div class="bench-controls">
+          <button id="copy-mcp" class="primary-button">Copy MCP config</button>
+          <a id="download-status" class="ghost-button" download="control-plane-status.ainf">Download status .ainf</a>
+        </div>
+        <div class="status-module">
+          <span>Status module</span>
+          <code id="status-hash">—</code>
+          <span id="status-bytes" class="hint"></span>
+        </div>
+      </article>
+    </section>
+
+    <section class="grid lower">
+      <article class="panel">
+        <div class="panel-head"><h2>What is real here</h2></div>
+        <ul class="truth-list">
+          <li><b>Kernel counters</b> from <code>Agent::metrics()</code>, lane and channel registries.</li>
+          <li><b>Infinity timings</b> from <code>Instant</code> around encode, validate, hash and decode.</li>
+          <li><b>Scenarios</b> run the public capability, promise, budget, tool and streaming paths.</li>
+          <li><b>Benchmark</b> exports raw microsecond samples; p50/p99 are computed, not invented.</li>
+          <li><b>Secrets</b> are a structural kind; UI and MCP receive redacted forms and correlation ids.</li>
+          <li><b>Idle</b> means idle: rates stay at zero until a real delta arrives.</li>
+        </ul>
+        <p class="hint">Local by default on 127.0.0.1. Scenario allow-list is fixed. No payload carries raw capability bits.</p>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Export &amp; attach</h2>
+          <span class="hint">for humans and agents</span>
+        </div>
+        <ul class="truth-list">
+          <li><code>GET /logs/tail?n=200</code> — recent structured events.</li>
+          <li><code>GET /logs/since?id=…</code> — cursor polling for agents.</li>
+          <li><code>GET /logs/export.jsonl</code> — append-ready JSONL.</li>
+          <li><code>GET /engines</code>, <code>/activity</code>, <code>/scenarios/results</code>.</li>
+          <li><code>--read-only</code> hides scenario and benchmark write paths.</li>
+        </ul>
+        <p class="hint">Every event carries ts, category, code, duration_us, bytes, lane, method and scenario_id when known.</p>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    <span>Active Control Plane · active-rpc 2.0.0 · active-infinity 2.1.0</span>
+    <span id="footer-hash">AINF —</span>
+  </footer>
+
+  <aside class="detail-drawer" id="detail-drawer" hidden aria-live="polite">
+    <div class="detail-head">
+      <h3 id="detail-title">Detail</h3>
+      <button class="icon-button" id="detail-close" aria-label="Close detail">×</button>
+    </div>
+    <div id="detail-body" class="detail-body"></div>
+  </aside>
+
+  <aside class="help" id="help" hidden>
+    <div class="detail-head">
+      <h3>Keyboard</h3>
+      <button class="icon-button" id="help-close" aria-label="Close help">×</button>
+    </div>
+    <dl class="help-list">
+      <dt><kbd>r</kbd></dt><dd>Run the selected scenario</dd>
+      <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Move the selected level</dd>
+      <dt><kbd>e</kbd></dt><dd>Download the event log as JSONL</dd>
+      <dt><kbd>f</kbd></dt><dd>Focus the last scenario window</dd>
+      <dt><kbd>?</kbd></dt><dd>Toggle this panel</dd>
+    </dl>
+  </aside>
+
+  <script src="app.js"></script>
+</body>
+</html>

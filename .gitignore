@@ -18,3 +18,5 @@
 # Python bytecode from the hardening scripts
 __pycache__/
 *.pyc
+
+control-plane/target/

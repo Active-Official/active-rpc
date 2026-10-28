@@ -137,3 +137,31 @@ jobs:
         run: cargo +nightly rustdoc --locked --lib --all-features -- -Zunstable-options --output-format json
       - name: No public secret or raw capability accessor
         run: python3 scripts/api_surface.py target/doc/active_rpc.json
+  presentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install image reader
+        run: python -m pip install --quiet pillow==12.3.0
+      - name: README, theme-pair and logo integrity gate
+        run: python scripts/check_presentation.py
+  control-plane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Control plane format
+        run: cargo fmt --check
+        working-directory: control-plane
+      - name: Control plane tests
+        run: cargo test --locked
+        working-directory: control-plane
+      - name: Control plane lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: control-plane
+

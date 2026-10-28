@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="840" viewBox="0 0 2400 840">
+<rect width="2400" height="840" fill="#f7f7f4"/>
+
+<rect x="90" y="150" width="1080" height="600" rx="26" fill="#ffffff" stroke="#dcdcd5" stroke-width="2"/>
+<text x="130" y="212" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="700" fill="#b42318" text-anchor="start" letter-spacing="4">SEQUENTIAL</text>
+<text x="130" y="258" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="31" font-weight="600" fill="#121318" text-anchor="start" letter-spacing="0">Every dependent answer waits for a full round-trip</text>
+<g font-family="'Cascadia Code', 'SFMono-Regular', Consolas, monospace" font-size="23">
+  <text x="150" y="334" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="21" font-weight="600" fill="#848a92" text-anchor="start" letter-spacing="0">client</text>
+  <text x="560" y="334" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="21" font-weight="600" fill="#848a92" text-anchor="start" letter-spacing="0">provider</text>
+  <path d="M250 372h280" stroke="#555b63" stroke-width="3" marker-end="url(#arr)"/>
+  <path d="M530 420h-280" stroke="#555b63" stroke-width="3" marker-end="url(#arr)"/>
+  <path d="M250 478h280" stroke="#555b63" stroke-width="3" marker-end="url(#arr)"/>
+  <path d="M530 526h-280" stroke="#555b63" stroke-width="3" marker-end="url(#arr)"/>
+  <text x="560" y="380" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="400" fill="#555b63" text-anchor="start" letter-spacing="0">call 1</text>
+  <text x="180" y="404" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="400" fill="#555b63" text-anchor="start" letter-spacing="0">wait · result 1</text>
+  <text x="560" y="486" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="400" fill="#555b63" text-anchor="start" letter-spacing="0">call 2 (needs result 1)</text>
+  <text x="180" y="510" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="400" fill="#555b63" text-anchor="start" letter-spacing="0">wait · result 2</text>
+</g>
+<text x="130" y="624" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="27" font-weight="600" fill="#b42318" text-anchor="start" letter-spacing="0">4 round-trips · 2 waits · latency adds up</text>
+<text x="130" y="678" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="23" font-weight="400" fill="#848a92" text-anchor="start" letter-spacing="0">Parallelism is left to the caller; authority is app-level.</text>
+
+<rect x="1220" y="150" width="1090" height="600" rx="26" fill="#ffffff" stroke="#e8590c" stroke-opacity="0.55" stroke-width="2"/>
+<text x="1260" y="212" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="700" fill="#e8590c" text-anchor="start" letter-spacing="4">PIPELINED</text>
+<text x="1260" y="258" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="31" font-weight="600" fill="#121318" text-anchor="start" letter-spacing="0">Dependent calls ride the same batch</text>
+<g font-family="'Cascadia Code', 'SFMono-Regular', Consolas, monospace" font-size="23">
+  <circle cx="1320" cy="392" r="42" fill="#f1f1ed" stroke="#e8590c" stroke-width="4"/>
+  <text x="1320" y="400" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="600" fill="#e8590c" text-anchor="middle" letter-spacing="0">p1</text>
+  <path d="M1362 392h86" stroke="#e8590c" stroke-width="3"/>
+  <circle cx="1500" cy="392" r="42" fill="#f1f1ed" stroke="#e8590c" stroke-width="4"/>
+  <text x="1500" y="400" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="22" font-weight="600" fill="#e8590c" text-anchor="middle" letter-spacing="0">p2</text>
+  <path d="M1542 392h86" stroke="#e8590c" stroke-width="3"/>
+  <rect x="1680" y="344" width="300" height="96" rx="16" fill="#f1f1ed" stroke="#dcdcd5"/>
+  <text x="1830" y="384" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="21" font-weight="700" fill="#848a92" text-anchor="middle" letter-spacing="2">provider batch</text>
+  <text x="1830" y="416" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="26" font-weight="600" fill="#121318" text-anchor="middle" letter-spacing="0">p1 → p2</text>
+  <path d="M1280 490c260 90 640 90 900 0" fill="none" stroke="#e8590c" stroke-width="4" stroke-dasharray="12 10"/>
+  </g>
+<text x="1260" y="650" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="27" font-weight="600" fill="#e8590c" text-anchor="start" letter-spacing="0">1 batch · promises carry dependent work · fewer round-trips</text>
+<text x="1260" y="696" font-family="Segoe UI, Inter, 'Helvetica Neue', Arial, sans-serif" font-size="23" font-weight="400" fill="#848a92" text-anchor="start" letter-spacing="0">Capabilities, lanes, channels and budgets stay explicit.</text>
+
+<defs><marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0 0l8 3-8 3z" fill="#555b63"/></marker></defs>
+</svg>
