@@ -13,6 +13,7 @@ readme = "README.md"
 keywords = ["active", "rpc", "capability", "agents", "pipelining"]
 categories = ["network-programming", "asynchronous", "config"]
 exclude = [
+    "facades/**",
     "target/**",
     "fuzz/corpus/**",
     "fuzz/artifacts/**",

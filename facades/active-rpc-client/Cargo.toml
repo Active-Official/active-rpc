@@ -1,0 +1,18 @@
+[package]
+name = "active-rpc-client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "Client facade for active-rpc agents, calls and promises"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+documentation = "https://docs.rs/active-rpc-client"
+readme = "README.md"
+keywords = ["active", "rpc", "client", "agents", "promises"]
+categories = ["network-programming", "asynchronous"]
+
+
+[dependencies]
+active-rpc = { version = "2.0.0", default-features = false }

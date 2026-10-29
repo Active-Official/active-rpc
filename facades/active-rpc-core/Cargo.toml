@@ -1,0 +1,18 @@
+[package]
+name = "active-rpc-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "Core capability, budget, value and wire types for active-rpc"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+documentation = "https://docs.rs/active-rpc-core"
+readme = "README.md"
+keywords = ["active", "rpc", "capability", "budget", "wire"]
+categories = ["network-programming", "asynchronous"]
+
+
+[dependencies]
+active-rpc = { version = "2.0.0", default-features = false }

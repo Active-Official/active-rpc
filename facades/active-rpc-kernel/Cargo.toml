@@ -1,0 +1,18 @@
+[package]
+name = "active-rpc-kernel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "Kernel facade for active-rpc: agents, capabilities, events, promises and providers"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+documentation = "https://docs.rs/active-rpc-kernel"
+readme = "README.md"
+keywords = ["active", "rpc", "kernel", "capability", "agents"]
+categories = ["network-programming", "asynchronous"]
+
+
+[dependencies]
+active-rpc = { version = "2.0.0", default-features = false }

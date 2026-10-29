@@ -1,0 +1,21 @@
+[package]
+name = "active-rpc-transport"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "Transport facade for active-rpc: in-process, TCP, shared memory and QUIC"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+documentation = "https://docs.rs/active-rpc-transport"
+readme = "README.md"
+keywords = ["active", "rpc", "transport", "quic", "shared-memory"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = ["quic"]
+quic = ["active-rpc/quic"]
+
+[dependencies]
+active-rpc = { version = "2.0.0", default-features = false }
