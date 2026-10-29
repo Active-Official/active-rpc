@@ -12,6 +12,10 @@
 [![docs.rs](https://img.shields.io/docsrs/active-rpc)](https://docs.rs/active-rpc)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
 
+Published crate family: `active-rpc`, `active-rpc-kernel`, `active-rpc-core`,
+`active-rpc-client`, `active-rpc-tools` and `active-rpc-transport`. See
+[`REGISTRY.md`](REGISTRY.md) for the module map.
+
 Thank you for being here. Active RPC is the execution and security model for moving **Active Infinity** modules and authority between services and agents—without ambient permission, without “wait for every hop,” and without treating tools as an afterthought.
 
 If Active RPC lets your agents collaborate directly, pipeline their reasoning, and hold only the authority they need, star the repo so the next team finds a stronger default.
