@@ -518,7 +518,7 @@ pub struct PlaneCore {
     tool_refusals_per_s: f64,
     stream_frames_per_s: f64,
     events: VecDeque<UiEvent>,
-    kernel_events_seen: usize,
+    kernel_events_seen: u64,
     next_event_id: u64,
     last_scenario: Option<ScenarioResult>,
     scenario_results: BTreeMap<String, ScenarioResult>,
@@ -1122,24 +1122,23 @@ impl PlaneCore {
     }
 
     fn capture_kernel_events(&mut self) {
-        let kernel_events = self.agent.events();
-        if kernel_events.is_empty() {
+        let total = self.agent.total_events();
+        if total <= self.kernel_events_seen {
             return;
         }
-        // The kernel keeps a bounded event tape. Capture only the suffix that
-        // arrived since the last read, so identical repeats (three refused
-        // calls in a storm) each become their own event exactly once.
-        if kernel_events.len() < self.kernel_events_seen {
-            self.kernel_events_seen = 0;
-        }
-        if kernel_events.len() == self.kernel_events_seen {
+        let tape = self.agent.events();
+        if tape.is_empty() {
             return;
         }
-        let fresh: Vec<UiEvent> = kernel_events[self.kernel_events_seen..]
+        // The tape is bounded. A monotonic total lets us take only the events
+        // that arrived since the last read, even after the tape wraps.
+        let unseen = (total - self.kernel_events_seen).min(tape.len() as u64) as usize;
+        let start = tape.len() - unseen;
+        let fresh: Vec<UiEvent> = tape[start..]
             .iter()
             .map(|event| self.event_from_kernel(event))
             .collect();
-        self.kernel_events_seen = kernel_events.len();
+        self.kernel_events_seen = total;
         for event in fresh {
             self.record(event);
         }

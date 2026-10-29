@@ -358,6 +358,37 @@ fn repeated_refusals_are_each_recorded() {
 }
 
 #[test]
+fn kernel_event_capture_survives_tape_wrap() {
+    // The kernel tape holds 16,384 events. Drive it past the wrap, then prove
+    // one more scenario still contributes its real kernel events, not just the
+    // scenario note. This is the regression the old length cursor missed.
+    let mut core = PlaneCore::new();
+    while core.agent().total_events() < 16_500 {
+        core.run_scenario("pipeline-stress").expect("stress fill");
+    }
+    let before = core.snapshot();
+    let cursor = before.events.last().map(|event| event.id).unwrap_or(0);
+    let calls_before = before.metrics.calls_queued;
+    core.run_scenario("pipeline-stress")
+        .expect("post-wrap stress");
+    let after = core.snapshot();
+    let fresh = after
+        .events
+        .iter()
+        .filter(|event| event.id > cursor)
+        .count();
+    assert!(
+        fresh > 10,
+        "post-wrap scenario captured only {fresh} events"
+    );
+    assert_eq!(after.metrics.calls_queued, calls_before + 32);
+    assert!(after
+        .events
+        .iter()
+        .any(|event| event.kind == "call_queued" && event.id > cursor));
+}
+
+#[test]
 fn http_and_process_tools_survive_repeated_runs() {
     let mut core = PlaneCore::new();
     for round in 0..10 {

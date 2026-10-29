@@ -56,9 +56,19 @@ Five low findings, all fixed:
 locked build, the negative-path launch assertion, the cursor capture with no
 content dedupe, the MCP picture and the D1 manifest row.
 
+## Round 6 - kernel event-tape wrap
+
+**NO NEW FINDINGS.** `Kernel` now tracks `events_total`, `Agent::total_events()`
+exposes the monotonic count, and `PlaneCore` captures
+`start = tape.len() - min(total - seen, tape.len())`. The reviewer confirmed the
+counter increments on every append including evictions, the cursor advances only
+after capture, and the new test drives the shipped `PlaneCore` past 16,384
+kernel events before proving a post-wrap scenario still contributes real kernel
+events. `cargo test` (control-plane) reports 25 engine tests.
+
 ## Gates at convergence
 
-- `cargo test`: 24 engine tests + 4 HTTP tests.
+- `cargo test`: 25 engine tests + 4 HTTP tests.
 - `cargo clippy --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`: clean.
 - Committed two-launch harness: both launches reproduce 12 queued calls and 7

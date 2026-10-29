@@ -258,6 +258,8 @@ pub struct Kernel {
     jobs: BTreeMap<u64, Job>,
     queue: VecDeque<u64>,
     events: VecDeque<Event>,
+    /// Monotonic count of events ever appended, including evicted ones.
+    events_total: u64,
     /// Settled promises in settlement order, with the retained value size.
     settled: VecDeque<(PromiseId, usize)>,
     settled_bytes: usize,
@@ -366,6 +368,7 @@ impl Agent {
             jobs: BTreeMap::new(),
             queue: VecDeque::new(),
             events: VecDeque::new(),
+            events_total: 0,
             settled: VecDeque::new(),
             settled_bytes: 0,
             metrics: Metrics::default(),
@@ -1000,6 +1003,14 @@ impl Agent {
         self.cell.borrow().events.iter().cloned().collect()
     }
 
+    /// Monotonic total of events ever appended, including evicted ones.
+    ///
+    /// Consumers that tail [`Agent::events`] use this to turn the retained
+    /// suffix into a delta once the bounded tape has wrapped.
+    pub fn total_events(&self) -> u64 {
+        self.cell.borrow().events_total
+    }
+
     /// Point-in-time counters. Contains no capability ids or payloads.
     pub fn metrics(&self) -> Metrics {
         let kernel = self.cell.borrow();
@@ -1221,6 +1232,7 @@ impl Kernel {
             self.events.pop_front();
         }
         self.events.push_back(event);
+        self.events_total = self.events_total.saturating_add(1);
     }
 
     /// Remember a settled promise for bounded retention.
