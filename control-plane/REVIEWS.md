@@ -39,7 +39,7 @@ and the repeated HTTP/process test.
 
 ## Gates at convergence
 
-- `cargo test`: 21 engine tests + 4 HTTP tests.
+- `cargo test`: 23 engine tests + 4 HTTP tests.
 - `cargo clippy --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`: clean.
 - Browser: zero console/page errors, 20 gauges, 22 ladder passes, 500 JSONL
