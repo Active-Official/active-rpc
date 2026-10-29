@@ -184,6 +184,12 @@ ladder, plus REST and WebSocket snapshots and an MCP server for agents.
   <img src="docs/assets/control-plane-benchmark-light.png" alt="Benchmark desk with measured p50/p99 samples and the one-click MCP configuration">
 </picture>
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/control-plane-mcp-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/control-plane-mcp-light.png">
+  <img src="docs/assets/control-plane-mcp-light.png" alt="Agent access panel with the one-click MCP configuration and live status-module hash">
+</picture>
+
 ```bash
 cd control-plane
 cargo run

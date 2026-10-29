@@ -17,6 +17,7 @@
 | `../../control-plane/public/assets/gauge-frame.svg` | D2 reusable gauge bezel, exported from Figma frame 1:20 | 260x160 |
 | `../../control-plane/public/assets/lane-icon.svg` | D3 lane metaphor icon, exported from Figma frame 1:25 | 64x64 |
 | `../../control-plane/public/assets/channel-icon.svg` | D4 channel metaphor icon, exported from Figma frame 1:29 | 64x64 |
+| `../../control-plane/public/assets/dash-hero.svg` | D1 compact Active mark for the app header, Figma frame 1:18 | 128x128 |
 | `../../control-plane/public/assets/cap-icon.svg` | D5 capability token icon, exported from Figma frame 1:34 | 64x64 |
 | `../../control-plane/public/assets/packet-flow.svg` | D6 packet-flow motif, exported from Figma frame 1:40 | 320x72 |
 | `readme-arch-rpc-dark.png` | README theme asset | 1320x462 |

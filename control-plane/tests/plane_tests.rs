@@ -340,6 +340,24 @@ fn every_refusal_facet_is_recorded() {
 }
 
 #[test]
+fn repeated_refusals_are_each_recorded() {
+    let mut core = PlaneCore::new();
+    core.run_scenario("call-storm").expect("call storm");
+    let snapshot = core.snapshot();
+    let budget_refusals = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event.kind == "call_refused" && event.code.as_deref() == Some("rpc/budget-exceeded")
+        })
+        .count();
+    assert!(
+        budget_refusals >= 3,
+        "three storm refusals should each be visible, saw {budget_refusals}"
+    );
+}
+
+#[test]
 fn http_and_process_tools_survive_repeated_runs() {
     let mut core = PlaneCore::new();
     for round in 0..10 {

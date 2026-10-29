@@ -159,6 +159,29 @@ def one_launch(port: int, label: str) -> list[str]:
                 f"dashboard bytes: {len(page)}",
             ]
         )
+
+        # A negative path must be observable too, and every facet must remain.
+        refused_before = after["metrics"]["calls_refused"]
+        tool_before = after["metrics"]["tool_refusals"]
+        refused = post(base, "/demo/scenario/tool-policy")
+        refused_after = get(base, "/metrics")
+        assert refused["result"]["ok"] is True, f"{label}: tool-policy failed"
+        assert refused_after["metrics"]["calls_refused"] == refused_before + 1, (
+            f"{label}: calls_refused delta"
+        )
+        assert refused_after["metrics"]["tool_refusals"] == tool_before + 1, (
+            f"{label}: tool_refusals delta"
+        )
+        assert any(
+            event["kind"] == "tool_refused" for event in refused_after["events"]
+        ), f"{label}: tool_refused event missing"
+        assert any(
+            event["kind"] == "call_refused" and event.get("code") == "rpc/tool-policy"
+            for event in refused_after["events"]
+        ), f"{label}: generic refusing call event missing"
+        log.append(
+            "negative path: calls_refused +1, tool_refusals +1, both facets visible"
+        )
         return log
     finally:
         process.terminate()
@@ -171,7 +194,7 @@ def one_launch(port: int, label: str) -> list[str]:
 
 def main() -> int:
     if not BINARY.exists():
-        subprocess.run(["cargo", "build"], cwd=str(ROOT), check=True)
+        subprocess.run(["cargo", "build", "--locked"], cwd=str(ROOT), check=True)
     lines = []
     for index, port in enumerate(PORTS, start=1):
         lines.extend(one_launch(port, f"launch {index}"))

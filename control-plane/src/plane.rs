@@ -518,6 +518,7 @@ pub struct PlaneCore {
     tool_refusals_per_s: f64,
     stream_frames_per_s: f64,
     events: VecDeque<UiEvent>,
+    kernel_events_seen: usize,
     next_event_id: u64,
     last_scenario: Option<ScenarioResult>,
     scenario_results: BTreeMap<String, ScenarioResult>,
@@ -897,6 +898,7 @@ impl PlaneCore {
             tool_refusals_per_s: 0.0,
             stream_frames_per_s: 0.0,
             events: VecDeque::new(),
+            kernel_events_seen: 0,
             next_event_id: 1,
             last_scenario: None,
             scenario_results: BTreeMap::new(),
@@ -1120,23 +1122,26 @@ impl PlaneCore {
     }
 
     fn capture_kernel_events(&mut self) {
-        let events: Vec<UiEvent> = self
-            .agent
-            .events()
+        let kernel_events = self.agent.events();
+        if kernel_events.is_empty() {
+            return;
+        }
+        // The kernel keeps a bounded event tape. Capture only the suffix that
+        // arrived since the last read, so identical repeats (three refused
+        // calls in a storm) each become their own event exactly once.
+        if kernel_events.len() < self.kernel_events_seen {
+            self.kernel_events_seen = 0;
+        }
+        if kernel_events.len() == self.kernel_events_seen {
+            return;
+        }
+        let fresh: Vec<UiEvent> = kernel_events[self.kernel_events_seen..]
             .iter()
             .map(|event| self.event_from_kernel(event))
             .collect();
-        for event in events {
-            let duplicate = self.events.iter().rev().take(6).any(|existing| {
-                existing.kind == event.kind
-                    && existing.detail == event.detail
-                    && existing.code == event.code
-                    && existing.capability == event.capability
-                    && existing.lane == event.lane
-            });
-            if !duplicate {
-                self.record(event);
-            }
+        self.kernel_events_seen = kernel_events.len();
+        for event in fresh {
+            self.record(event);
         }
     }
 

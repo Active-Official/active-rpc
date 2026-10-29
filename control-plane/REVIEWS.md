@@ -31,18 +31,40 @@ Two new low findings, both fixed:
 - `PlaneCore::run_level` silently clamped out-of-range levels. It now runs
   nothing and the adapters reject the request.
 
-## Round 3 - convergence
+## Round 3 - convergence at the pre-chrome tree
 
 **NO NEW FINDINGS.** The reviewer confirmed the u64 guard, the no-clamp rule,
 the per-connection HTTP stub with read timeout, panic-safe scenario dispatch,
-and the repeated HTTP/process test.
+and the repeated HTTP/process test. At that point the suite had 22 engine tests
+plus 4 HTTP tests.
+
+## Round 4 - shipped-tree review (D2-D6, launch harness, refusal KPI)
+
+Five low findings, all fixed:
+
+| Severity | Finding | Fix |
+|---|---|---|
+| low | `launch_check.py` fallback used `cargo build` without `--locked` | builds with `--locked` |
+| low | launch proof covered only the happy path | now runs `tool-policy`, asserts `calls_refused` +1, `tool_refusals` +1, and both event facets |
+| low | identical repeated refusals collapsed into one event | kernel events are captured by a `kernel_events_seen` cursor; every new event is recorded once with no content dedupe |
+| low | MCP captures were listed but not referenced | both READMEs now show the MCP light/dark picture |
+| low | `dash-hero.svg` was used but absent from the RPC manifest | D1 listed alongside D2-D6 |
+
+## Round 5 - convergence
+
+**NO NEW FINDINGS.** The reviewer re-read the patched tree and confirmed the
+locked build, the negative-path launch assertion, the cursor capture with no
+content dedupe, the MCP picture and the D1 manifest row.
 
 ## Gates at convergence
 
-- `cargo test`: 23 engine tests + 4 HTTP tests.
+- `cargo test`: 24 engine tests + 4 HTTP tests.
 - `cargo clippy --all-targets -- -D warnings`: clean.
 - `cargo fmt --check`: clean.
+- Committed two-launch harness: both launches reproduce 12 queued calls and 7
+  provider round-trips, plus the tool-policy refusal deltas.
 - Browser: zero console/page errors, 20 gauges, 22 ladder passes, 500 JSONL
-  lines, 475 timeline ticks, mobile overflow 0.
+  lines, 494 timeline ticks after the ladder, mobile overflow 0, and
+  MCP `cp_metrics` matching the rendered queue-depth and promise-record gauges.
 - Leak scan: no canary and no 32-hex raw capability id in REST, WS, MCP, JSONL,
   status bytes, screenshots or rendered text.
