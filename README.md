@@ -13,7 +13,8 @@
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
 
 Published crate family: `active-rpc`, `active-rpc-kernel`, `active-rpc-core`,
-`active-rpc-client`, `active-rpc-tools` and `active-rpc-transport`. See
+`active-rpc-client`, `active-rpc-tools`, `active-rpc-transport` and the reserved
+`active-rpc-cli`. See
 [`REGISTRY.md`](REGISTRY.md) for the module map.
 
 Thank you for being here. Active RPC is the execution and security model for moving **Active Infinity** modules and authority between services and agents—without ambient permission, without “wait for every hop,” and without treating tools as an afterthought.

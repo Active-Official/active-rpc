@@ -168,3 +168,20 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: control-plane
 
+
+  facades:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - active-rpc-kernel
+          - active-rpc-core
+          - active-rpc-client
+          - active-rpc-tools
+          - active-rpc-transport
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Facade tests
+        run: cargo test --manifest-path "facades/${{ matrix.crate }}/Cargo.toml"
