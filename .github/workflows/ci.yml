@@ -22,6 +22,8 @@ jobs:
         run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - name: Tests
         run: cargo test --locked --all-features
+      - name: Invariant gate (secret canary and capability authority)
+        run: cargo test --locked --test invariant_gate
       - name: Tests (no default features)
         run: cargo test --locked --no-default-features
       - name: Documentation
@@ -185,3 +187,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Facade tests
         run: cargo test --manifest-path "facades/${{ matrix.crate }}/Cargo.toml"
+

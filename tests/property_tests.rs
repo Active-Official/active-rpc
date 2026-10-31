@@ -12,9 +12,39 @@ use std::collections::BTreeSet;
 
 use active_rpc::budget::Budget;
 use active_rpc::cap::{CapAttrs, CapId};
-use active_rpc::value::{Arg, Value};
+use active_rpc::kernel::Provider;
+use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::wire::{CapDescriptor, Envelope, WireLimits};
+use active_rpc::Agent;
 use proptest::prelude::*;
+
+struct Echo;
+
+impl Provider for Echo {
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["echo".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, call: &Call) -> active_rpc::Result<Response> {
+        let value = call
+            .args
+            .iter()
+            .find_map(|arg| match arg {
+                Arg::Value(value) => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or(Value::Null);
+        Ok(Response::Value(value))
+    }
+}
 
 fn value_strategy() -> impl Strategy<Value = Value> {
     let leaf = prop_oneof![
@@ -150,5 +180,26 @@ proptest! {
             ..parent_budget
         });
         prop_assert!(parent.attenuate(greedy).is_err());
+    }
+
+    #[test]
+    fn revoke_at_dispatch_is_always_enforced(
+        seed in any::<[u8; 32]>(),
+        payload in "[a-zA-Z0-9 _.-]{0,48}",
+    ) {
+        let agent = Agent::with_secret(seed);
+        let provider = agent.register(Box::new(Echo));
+        let cap = agent
+            .mint(provider, 0, CapAttrs::new(&["echo"]))
+            .expect("mint");
+        let lane = agent
+            .create_lane("property", Budget::default())
+            .expect("lane");
+        let promise = agent
+            .call(lane, &cap, "echo", vec![Arg::text(payload)])
+            .expect("queued");
+        agent.revoke(&cap);
+        let error = promise.value().expect_err("revoked call must fail");
+        prop_assert_eq!(error.code(), "rpc/revoked");
     }
 }

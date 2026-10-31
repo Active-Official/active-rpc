@@ -46,6 +46,24 @@ capability id at rest (it is a bearer token).
 - Every frame is bounded and rejected at the boundary.
 - `#![forbid(unsafe_code)]`.
 
+## Maturity invariants (AIM-PROP-2026-10 §2)
+
+These are release gates. A change that weakens one is rejected even if it makes
+a benchmark faster.
+
+| ID | Invariant | Enforced by |
+|---|---|---|
+| I-1 | Structural secret kind; redaction on every export path | `tests/invariant_gate.rs`, unit/red-team/protobuf suites |
+| I-2 | Anti-oracle equality for secrets | `tests/invariant_gate.rs`, unit tests |
+| I-3 | Capability unforgeability; correlation ids in logs | `tests/invariant_gate.rs`, `tests/api_surface.rs` |
+| I-4 | Attenuation only narrows | `tests/property_tests.rs`, conformance tests |
+| I-5 | Revocation enforced at dispatch | `tests/property_tests.rs`, red-team suite |
+| I-6 | Hard budgets fail closed | unit/concurrency/red-team suites |
+| I-7 | Canonical bytes ↔ Blake3 identity stable | conformance/property tests |
+| I-8 | Fail-closed validation; no partial unsafe views | red-team, fuzz and perf-budget suites |
+| I-9 | No ambient authority in kernel/tools/transports | API surface, tool and red-team suites |
+| I-10 | Domain operations under capability + budget | domain/integration suites |
+
 ## What is tested, fuzzed, reviewed, and proven
 
 | Level | What it covers | Where the evidence lives |
