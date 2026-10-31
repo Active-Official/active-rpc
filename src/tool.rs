@@ -83,6 +83,13 @@ pub trait McpTransport {
     fn recv_line(&mut self) -> Result<String>;
 }
 
+/// Largest JSON-RPC line a session accepts, in bytes.
+///
+/// One MiB matches the default MCP argument policy. A server that needs more
+/// is not speaking MCP at this size; the session fails closed instead of
+/// buffering an unbounded line.
+pub const MAX_MCP_LINE_BYTES: usize = 1 << 20;
+
 /// An in-memory transport: requests are answered by a closure.
 pub struct MemoryTransport {
     responses: BTreeMap<String, String>,
@@ -187,8 +194,12 @@ impl McpTransport for StdioTransport {
 
     fn recv_line(&mut self) -> Result<String> {
         let mut line = String::new();
+        // A hostile server can emit an unbounded line; cap the read so it
+        // cannot exhaust memory before the session sees it.
         let read = self
             .stdout
+            .by_ref()
+            .take((MAX_MCP_LINE_BYTES + 1) as u64)
             .read_line(&mut line)
             .map_err(|error| Error::Provider {
                 code: format!("mcp/read:{error}"),
@@ -196,6 +207,11 @@ impl McpTransport for StdioTransport {
         if read == 0 {
             return Err(Error::Provider {
                 code: "mcp/eof".to_string(),
+            });
+        }
+        if read > MAX_MCP_LINE_BYTES {
+            return Err(Error::Provider {
+                code: "mcp/line-too-long".to_string(),
             });
         }
         Ok(line.trim_end().to_string())
@@ -280,17 +296,48 @@ impl<T: McpTransport> McpSession<T> {
 
     fn request(&mut self, method: &str, params: Json) -> Result<Json> {
         self.next_id += 1;
+        let id = self.next_id;
         let payload = json!({
             "jsonrpc": "2.0",
-            "id": self.next_id,
+            "id": id,
             "method": method,
             "params": params,
         });
         self.transport.send_line(&payload.to_string())?;
         let line = self.transport.recv_line()?;
-        serde_json::from_str(&line).map_err(|_| Error::Provider {
+        if line.len() > MAX_MCP_LINE_BYTES {
+            return Err(Error::Provider {
+                code: "mcp/line-too-long".to_string(),
+            });
+        }
+        let response: Json = serde_json::from_str(&line).map_err(|_| Error::Provider {
             code: "mcp/bad-response".to_string(),
-        })
+        })?;
+        // A response must be an object and must answer *this* request. A
+        // mismatched id means the peer is confused or hostile; do not accept
+        // its payload as the answer to a different call.
+        let object = response.as_object().ok_or(Error::Provider {
+            code: "mcp/bad-response".to_string(),
+        })?;
+        match object.get("id") {
+            Some(value) if value.as_u64() == Some(id) => {}
+            Some(_) => {
+                return Err(Error::Provider {
+                    code: "mcp/id-mismatch".to_string(),
+                })
+            }
+            None => {
+                return Err(Error::Provider {
+                    code: "mcp/bad-response".to_string(),
+                })
+            }
+        }
+        if object.get("result").is_none() && object.get("error").is_none() {
+            return Err(Error::Provider {
+                code: "mcp/bad-response".to_string(),
+            });
+        }
+        Ok(response)
     }
 
     /// Discovered tools.

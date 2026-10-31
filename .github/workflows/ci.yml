@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -113,7 +114,8 @@ jobs:
             fuzz_tool_http \
             fuzz_tool_process \
             fuzz_channel_cap_transfer \
-            fuzz_transport_framing; do
+            fuzz_transport_framing \
+            fuzz_bulk_plan; do
             echo "== $target =="
             cargo fuzz run "$target" -- -runs=2000
           done

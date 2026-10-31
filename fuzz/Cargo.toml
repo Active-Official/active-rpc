@@ -73,3 +73,10 @@ path = "fuzz_targets/fuzz_transport_framing.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_bulk_plan"
+path = "fuzz_targets/fuzz_bulk_plan.rs"
+test = false
+doc = false
+bench = false
