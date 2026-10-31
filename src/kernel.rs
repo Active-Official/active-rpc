@@ -223,6 +223,8 @@ pub struct Metrics {
     pub transfers: u64,
     /// Settlements attempted on an already-settled promise.
     pub promises_double_settled: u64,
+    /// Calls refused because the local queue ceiling was reached.
+    pub backpressure_refusals: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +273,11 @@ pub struct Kernel {
     next_channel: u64,
     next_serial: u64,
     next_provider: u64,
+    queue_ceiling: usize,
+    channel_ceiling: usize,
+    idempotency: BTreeMap<(CapId, String, String), PromiseId>,
+    allow_durable: bool,
+    idempotency_order: VecDeque<(CapId, String, String)>,
     now_ms: u64,
     latency_ms: u64,
     transfers: u64,
@@ -379,6 +386,11 @@ impl Agent {
             next_channel: 0,
             next_serial: 0,
             next_provider: 0,
+            queue_ceiling: MAX_PROMISES,
+            channel_ceiling: crate::channel::MAX_QUEUED_PER_CHANNEL,
+            idempotency: BTreeMap::new(),
+            allow_durable: false,
+            idempotency_order: VecDeque::new(),
             now_ms: 0,
             latency_ms: 1,
             transfers: 0,
@@ -407,8 +419,40 @@ impl Agent {
         self.cell.borrow_mut().latency_ms = latency_ms;
     }
 
+    /// Set the per-channel queued-message ceiling. Zero is refused.
+    pub fn set_channel_queue_ceiling(&self, ceiling: usize) -> Result<()> {
+        if ceiling == 0 {
+            return Err(Error::InvalidArgument("channel ceiling must be non-zero"));
+        }
+        self.cell.borrow_mut().channel_ceiling =
+            ceiling.min(crate::channel::MAX_QUEUED_PER_CHANNEL);
+        Ok(())
+    }
+
+    /// Current per-channel queued-message ceiling.
+    pub fn channel_queue_ceiling(&self) -> usize {
+        self.cell.borrow().channel_ceiling
+    }
+
+    /// Allow or refuse durable capability minting. Default: refused.
+    pub fn set_durable_capabilities(&self, allow: bool) {
+        self.cell.borrow_mut().allow_durable = allow;
+    }
+
+    /// Whether durable capability minting is allowed.
+    pub fn durable_capabilities_allowed(&self) -> bool {
+        self.cell.borrow().allow_durable
+    }
+
     /// Mint a first-generation capability.
     pub fn mint(&self, provider: ProviderId, object: u64, attrs: CapAttrs) -> Result<CapHandle> {
+        if attrs.persistence == crate::cap::CapPersistence::Durable
+            && !self.cell.borrow().allow_durable
+        {
+            return Err(Error::CapabilityTable(
+                "durable capability refused by policy",
+            ));
+        }
         attrs.budget.check()?;
         if attrs.methods.is_empty() {
             return Err(Error::InvalidArgument("capability grants no methods"));
@@ -590,6 +634,15 @@ impl Agent {
         if lane_record.closed {
             return Err(Error::UnknownLane(lane.0));
         }
+        let channel_record = kernel
+            .channels
+            .get(&channel)
+            .ok_or(Error::UnknownChannel(channel.0))?;
+        if channel_record.queued() >= kernel.channel_ceiling {
+            kernel.metrics.backpressure_refusals =
+                kernel.metrics.backpressure_refusals.saturating_add(1);
+            return Err(Error::Backpressure("channel queue ceiling reached"));
+        }
         let record = kernel
             .channels
             .get_mut(&channel)
@@ -613,6 +666,15 @@ impl Agent {
         let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
         if lane_record.closed {
             return Err(Error::UnknownLane(lane.0));
+        }
+        let channel_record = kernel
+            .channels
+            .get(&channel)
+            .ok_or(Error::UnknownChannel(channel.0))?;
+        if channel_record.queued() >= kernel.channel_ceiling {
+            kernel.metrics.backpressure_refusals =
+                kernel.metrics.backpressure_refusals.saturating_add(1);
+            return Err(Error::Backpressure("channel queue ceiling reached"));
         }
         let mut cap_ids = Vec::with_capacity(caps.len());
         for cap in caps {
@@ -692,6 +754,10 @@ impl Agent {
                         cap: cap_id,
                         dimension: (*dimension).to_string(),
                     });
+                }
+                Error::Backpressure(_) => {
+                    kernel.metrics.backpressure_refusals =
+                        kernel.metrics.backpressure_refusals.saturating_add(1);
                 }
                 Error::ToolPolicy(reason) => {
                     kernel.metrics.tool_refusals = kernel.metrics.tool_refusals.saturating_add(1);
@@ -789,6 +855,9 @@ impl Agent {
         }
         if kernel.jobs.len() >= MAX_PROMISES {
             return Err(Error::BudgetExceeded("jobs"));
+        }
+        if kernel.jobs.len() >= kernel.queue_ceiling {
+            return Err(Error::Backpressure("queue ceiling reached"));
         }
         let meter = kernel
             .meters
@@ -937,6 +1006,80 @@ impl Agent {
         Ok(())
     }
 
+    /// Set the local queue ceiling. A value of zero is refused.
+    pub fn set_queue_ceiling(&self, ceiling: usize) -> Result<()> {
+        if ceiling == 0 {
+            return Err(Error::InvalidArgument("queue ceiling must be non-zero"));
+        }
+        self.cell.borrow_mut().queue_ceiling = ceiling.min(MAX_PROMISES);
+        Ok(())
+    }
+
+    /// Current local queue ceiling.
+    pub fn queue_ceiling(&self) -> usize {
+        self.cell.borrow().queue_ceiling
+    }
+
+    /// Issue a call with an idempotency key.
+    ///
+    /// A repeated key returns the existing promise when it is pending or
+    /// resolved. A rejected/cancelled promise is forgotten so a mutating call
+    /// can be retried. The key is scoped to the capability id and method.
+    /// Mutating-domain semantics remain the provider's responsibility; this
+    /// cache prevents a second invocation, it does not make a provider atomic.
+    pub fn call_idempotent(
+        &self,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        key: &str,
+    ) -> Result<PromiseHandle> {
+        if key.is_empty() {
+            return Err(Error::InvalidArgument("idempotency key is empty"));
+        }
+        let map_key = (cap.id(), method.to_string(), key.to_string());
+        {
+            let mut kernel = self.cell.borrow_mut();
+            if let Some(id) = kernel.idempotency.get(&map_key).copied() {
+                let reusable = kernel
+                    .promises
+                    .get(&id)
+                    .map(|record| {
+                        matches!(
+                            record.state,
+                            PromiseState::Pending | PromiseState::Resolved(_)
+                        )
+                    })
+                    .unwrap_or(false);
+                if reusable {
+                    if let Some(record) = kernel.promises.get_mut(&id) {
+                        record.handles = record.handles.saturating_add(1);
+                    }
+                    return Ok(PromiseHandle {
+                        agent: self.clone(),
+                        id,
+                    });
+                }
+                kernel.idempotency.remove(&map_key);
+            }
+        }
+        let promise = self.call(lane, cap, method, args)?;
+        let id = promise.id();
+        let mut kernel = self.cell.borrow_mut();
+        kernel.idempotency.insert(map_key.clone(), id);
+        kernel.idempotency_order.push_back(map_key);
+        const MAX_IDEMPOTENCY: usize = 1024;
+        while kernel.idempotency.len() > MAX_IDEMPOTENCY {
+            if let Some(oldest) = kernel.idempotency_order.pop_front() {
+                kernel.idempotency.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        Ok(promise)
+    }
+
     /// Cancel a promise.
     ///
     /// A job that has not been dispatched yet is removed from the queue, so a
@@ -968,6 +1111,64 @@ impl Agent {
             }
         }
         Ok(())
+    }
+
+    /// Cancel a promise and every promise that depends on it.
+    ///
+    /// The tree walk follows queued job dependencies. A dependent whose job is
+    /// still queued is removed before dispatch, so a cancellation prevents the
+    /// provider call and its side effects. An already-settled root is refused;
+    /// dependent promises that already settled are left untouched.
+    pub fn cancel_tree(&self, promise: &PromiseHandle) -> Result<Vec<PromiseId>> {
+        let mut kernel = self.cell.borrow_mut();
+        let root_pending = kernel
+            .promises
+            .get(&promise.id)
+            .ok_or(Error::UnknownPromise(promise.id.0))?
+            .state
+            == PromiseState::Pending;
+        if !root_pending {
+            return Err(Error::PromiseAlreadyResolved(promise.id.0));
+        }
+
+        let mut targets = vec![promise.id];
+        let mut index = 0;
+        while index < targets.len() {
+            let id = targets[index];
+            if let Some(record) = kernel.promises.get_mut(&id) {
+                if record.state == PromiseState::Pending {
+                    record.cancel()?;
+                }
+            }
+            let dependents: Vec<PromiseId> = kernel
+                .jobs
+                .values()
+                .filter(|job| job.deps.contains(&id))
+                .map(|job| job.promise)
+                .collect();
+            for dependent in dependents {
+                if !targets.contains(&dependent) {
+                    targets.push(dependent);
+                }
+            }
+            index += 1;
+        }
+
+        let queued: Vec<(u64, PromiseId, u64)> = kernel
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.state == JobState::Queued && targets.contains(&job.promise))
+            .map(|(id, job)| (*id, job.promise, job.lane.0))
+            .collect();
+        for (job_id, promise_id, lane) in queued {
+            kernel.queue.retain(|queued_id| *queued_id != job_id);
+            kernel.jobs.remove(&job_id);
+            kernel.record_settled(promise_id);
+            if let Some(lane_record) = kernel.lanes.get_mut(&LaneId(lane)) {
+                lane_record.complete();
+            }
+        }
+        Ok(targets)
     }
 
     /// Reference a promise record from a handle.

@@ -150,6 +150,16 @@ impl ToolPolicy {
     }
 }
 
+/// Whether a capability may outlive the process under an explicit policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CapPersistence {
+    /// The default: the capability dies with the process.
+    #[default]
+    Ephemeral,
+    /// May be stored by a deployment-provided secure restore path.
+    Durable,
+}
+
 /// The authority a capability carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapAttrs {
@@ -165,6 +175,8 @@ pub struct CapAttrs {
     pub path_scope: Option<String>,
     /// Tool policy, when the capability targets a tool.
     pub tool_policy: Option<ToolPolicy>,
+    /// Whether the capability is ephemeral or eligible for durable restore.
+    pub persistence: CapPersistence,
 }
 
 impl CapAttrs {
@@ -177,6 +189,7 @@ impl CapAttrs {
             redact: false,
             path_scope: None,
             tool_policy: None,
+            persistence: CapPersistence::Ephemeral,
         }
     }
 
@@ -204,6 +217,12 @@ impl CapAttrs {
         self
     }
 
+    /// Mark the capability eligible for durable restore under policy.
+    pub fn durable(mut self) -> Self {
+        self.persistence = CapPersistence::Durable;
+        self
+    }
+
     /// Mark the capability redacting.
     pub fn redacted(mut self) -> Self {
         self.redact = true;
@@ -219,6 +238,8 @@ impl CapAttrs {
     /// True when `self` is a valid attenuation of `parent`.
     pub fn is_attenuation_of(&self, parent: &CapAttrs) -> bool {
         let methods_ok = self.methods.is_subset(&parent.methods) && !self.methods.is_empty();
+        let persistence_ok = self.persistence != CapPersistence::Durable
+            || parent.persistence == CapPersistence::Durable;
         let budget_ok = self.budget.is_attenuation_of(&parent.budget);
         let read_only_ok = !parent.read_only || self.read_only;
         let redact_ok = !parent.redact || self.redact;
@@ -236,7 +257,7 @@ impl CapAttrs {
             (None, Some(_)) => false,
             (Some(policy), Some(parent)) => policy.is_attenuation_of(parent),
         };
-        methods_ok && budget_ok && read_only_ok && redact_ok && path_ok && tool_ok
+        methods_ok && budget_ok && read_only_ok && redact_ok && path_ok && tool_ok && persistence_ok
     }
 
     /// Attenuate, refusing anything that would widen authority.
@@ -269,6 +290,7 @@ impl CapAttrs {
         }
         let mut attrs = child;
         attrs.budget = attrs.budget.intersect(&self.budget);
+        attrs.persistence = self.persistence;
         Ok(attrs)
     }
 

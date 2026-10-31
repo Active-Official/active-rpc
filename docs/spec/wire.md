@@ -47,6 +47,7 @@ All integers are little-endian.
 |----:|------|---------|
 | 0 | `redact` | the caller asks for redacted output |
 | 1 | `read_only` | the capability is read-only |
+| 2 | `cap_delta` | a negotiated capability-table delta follows the capability slot |
 
 Unknown flag bits are refused (`rpc/wire`).
 
@@ -59,6 +60,7 @@ method      : u32 length | UTF-8 bytes
 args        : u32 count | arg*
 payload     : u32 length | bytes            (an Active Infinity image, optional)
 caps        : u32 count | capability*
+delta       : optional, when flag bit 2: base[32] | removed_count u32 | id[16]* | added_count u32 | capability*
 ```
 
 An envelope with trailing bytes after the capability table is refused.
@@ -116,6 +118,22 @@ A capability table is `u32 count` followed by descriptors:
 A descriptor whose budget disables a ceiling (any `0`) is refused with
 `rpc/capability-table`: there is no unlimited profile on the wire.
 
+### 3.1 Capability-table delta
+
+When flag bit 2 is set, the body ends with:
+
+```text
+base        : 32-byte Blake3 of the peer's current canonical table
+removed     : u32 count | 16-byte id*
+added       : u32 count | capability*
+```
+
+A receiver applies the delta only when `cap_table_hash(current) == base`.
+Unknown base, unknown removal, duplicate addition or malformed descriptor is
+`rpc/capability-table`. A delta never widens authority: added descriptors still
+pass the normal attenuation/import checks. Full tables remain the default and
+remain valid when the flag is clear.
+
 The table is a *description*, never proof. A receiver must look the id up in its
 own registry; an id it did not mint is refused with `rpc/unknown-capability`.
 
@@ -154,6 +172,7 @@ a message.
 | `rpc/unknown-promise` | the promise id was never minted here |
 | `rpc/promise-cancelled` | the promise was cancelled |
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
+| `rpc/backpressure` | the local call queue or channel window is full |
 | `rpc/unresolvable-promise` | the promise can never settle |
 | `rpc/provider` | the provider failed the call |
 | `rpc/domain` | an Active or Infinity domain operation failed (the message carries the Active class, e.g. `X001`) |

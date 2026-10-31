@@ -63,7 +63,9 @@ pub mod value;
 pub mod wire;
 
 pub use budget::{Budget, BudgetMeter};
-pub use cap::{CapAttrs, CapHandle, CapId, CapRecord, CapToken, ProviderId, ToolPolicy};
+pub use cap::{
+    CapAttrs, CapHandle, CapId, CapPersistence, CapRecord, CapToken, ProviderId, ToolPolicy,
+};
 pub use channel::{Channel, ChannelId, Direction, Message};
 pub use error::{Error, Result};
 pub use kernel::{Agent, Event, Metrics, PromiseHandle, Provider};

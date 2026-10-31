@@ -41,6 +41,8 @@ pub enum Error {
     PromiseCancelled(u64),
     /// A promise was resolved twice.
     PromiseAlreadyResolved(u64),
+    /// The local queue or channel window is full; retry after the peer drains.
+    Backpressure(&'static str),
     /// The call references a promise that will never resolve.
     UnresolvablePromise(u64),
     /// The provider failed the call.
@@ -85,6 +87,7 @@ impl Error {
             Error::UnknownPromise(_) => "rpc/unknown-promise",
             Error::PromiseCancelled(_) => "rpc/promise-cancelled",
             Error::PromiseAlreadyResolved(_) => "rpc/promise-resolved",
+            Error::Backpressure(_) => "rpc/backpressure",
             Error::UnresolvablePromise(_) => "rpc/unresolvable-promise",
             Error::Provider { .. } => "rpc/provider",
             Error::Domain(_) => "rpc/domain",
@@ -127,6 +130,7 @@ impl fmt::Display for Error {
             Error::UnknownPromise(id) => write!(f, "unknown promise {id}"),
             Error::PromiseCancelled(id) => write!(f, "promise {id} was cancelled"),
             Error::PromiseAlreadyResolved(id) => write!(f, "promise {id} was already resolved"),
+            Error::Backpressure(what) => write!(f, "backpressure: {what}"),
             Error::UnresolvablePromise(id) => write!(f, "promise {id} can never resolve"),
             Error::Provider { code } => write!(f, "provider failed: {code}"),
             Error::Domain(code) => write!(f, "domain operation failed: {code}"),

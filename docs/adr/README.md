@@ -10,3 +10,5 @@
 | [0006](0006-versioning.md) | Versioning and publishing |
 | [0007](0007-msrv.md) | Minimum supported Rust version 1.88 |
 | [0008](0008-bakeoff-methodology.md) | Public bakeoff methodology and CI regression policy |
+| [0009](0009-capability-table-deltas.md) | Negotiated capability-table deltas |
+| [0010](0010-durable-capabilities.md) | Durable versus ephemeral capabilities |

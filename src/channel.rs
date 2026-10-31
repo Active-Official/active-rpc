@@ -107,6 +107,11 @@ impl Channel {
         }
     }
 
+    /// Number of queued messages not yet received.
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
     /// Whether the channel accepts sends.
     pub fn can_send(&self) -> bool {
         self.direction.can_send() && !self.closed

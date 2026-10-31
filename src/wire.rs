@@ -37,8 +37,10 @@ pub const VERSION: u8 = 1;
 pub const FLAG_REDACT: u16 = 1 << 0;
 /// Flag: the capability is read-only.
 pub const FLAG_READ_ONLY: u16 = 1 << 1;
+/// Flag: the envelope carries a capability-table delta after the full-table slot.
+pub const FLAG_CAP_DELTA: u16 = 1 << 2;
 /// All understood flags.
-pub const FLAG_KNOWN: u16 = FLAG_REDACT | FLAG_READ_ONLY;
+pub const FLAG_KNOWN: u16 = FLAG_REDACT | FLAG_READ_ONLY | FLAG_CAP_DELTA;
 
 /// Envelope kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +109,61 @@ impl CapDescriptor {
     }
 }
 
+/// A capability-table delta negotiated against a known base table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapTableDelta {
+    /// Blake3 hash of the base capability table.
+    pub base: [u8; 32],
+    /// Capability ids removed from the base.
+    pub removed: Vec<CapId>,
+    /// Descriptors added to the base.
+    pub added: Vec<CapDescriptor>,
+}
+
+impl CapTableDelta {
+    /// Build a delta against a base table.
+    pub fn new(base: &[CapDescriptor], removed: Vec<CapId>, added: Vec<CapDescriptor>) -> Self {
+        Self {
+            base: cap_table_hash(base),
+            removed,
+            added,
+        }
+    }
+
+    /// Apply to a base table after checking the base hash. Fail closed on an
+    /// unknown base or a removal of an id that is not present.
+    pub fn apply_to(&self, base: &[CapDescriptor]) -> Result<Vec<CapDescriptor>> {
+        if cap_table_hash(base) != self.base {
+            return Err(Error::CapabilityTable("cap-table delta base mismatch"));
+        }
+        let mut table = base.to_vec();
+        for id in &self.removed {
+            let Some(index) = table.iter().position(|cap| &cap.id == id) else {
+                return Err(Error::CapabilityTable(
+                    "delta removes an unknown capability",
+                ));
+            };
+            table.remove(index);
+        }
+        for descriptor in &self.added {
+            if table.iter().any(|cap| cap.id == descriptor.id) {
+                return Err(Error::CapabilityTable("delta adds an existing capability"));
+            }
+            table.push(descriptor.clone());
+        }
+        table.sort_by_key(|cap| cap.id.hex());
+        Ok(table)
+    }
+}
+
+/// Blake3 hash of the canonical capability table encoding.
+pub fn cap_table_hash(caps: &[CapDescriptor]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let encoded = encode_capability_table(caps).unwrap_or_default();
+    out.copy_from_slice(blake3::hash(&encoded).as_bytes());
+    out
+}
+
 /// One Active RPC envelope.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Envelope {
@@ -126,6 +183,8 @@ pub struct Envelope {
     pub redact: bool,
     /// Read-only hint.
     pub read_only: bool,
+    /// Optional capability-table delta relative to a negotiated base.
+    pub cap_delta: Option<CapTableDelta>,
 }
 
 /// Envelope size and count ceilings for untrusted input.
@@ -184,6 +243,7 @@ impl Envelope {
             caps: Vec::new(),
             redact: false,
             read_only: false,
+            cap_delta: None,
         }
     }
 
@@ -198,6 +258,7 @@ impl Envelope {
             caps: Vec::new(),
             redact: false,
             read_only: false,
+            cap_delta: None,
         }
     }
 
@@ -212,7 +273,14 @@ impl Envelope {
             caps: Vec::new(),
             redact: false,
             read_only: false,
+            cap_delta: None,
         }
+    }
+
+    /// Attach a capability-table delta and set the negotiation flag.
+    pub fn with_cap_delta(mut self, delta: CapTableDelta) -> Self {
+        self.cap_delta = Some(delta);
+        self
     }
 
     /// Attach an Infinity payload.
@@ -240,6 +308,9 @@ impl Envelope {
         if self.read_only {
             flags |= FLAG_READ_ONLY;
         }
+        if self.cap_delta.is_some() {
+            flags |= FLAG_CAP_DELTA;
+        }
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&self.request_id.to_le_bytes());
         write_str(&mut out, &self.method)?;
@@ -258,6 +329,17 @@ impl Envelope {
         out.extend_from_slice(&(self.caps.len() as u32).to_le_bytes());
         for cap in &self.caps {
             write_cap(&mut out, cap)?;
+        }
+        if let Some(delta) = &self.cap_delta {
+            out.extend_from_slice(&delta.base);
+            out.extend_from_slice(&(delta.removed.len() as u32).to_le_bytes());
+            for id in &delta.removed {
+                out.extend_from_slice(&id.0);
+            }
+            out.extend_from_slice(&(delta.added.len() as u32).to_le_bytes());
+            for cap in &delta.added {
+                write_cap(&mut out, cap)?;
+            }
         }
         Ok(out)
     }
@@ -314,6 +396,43 @@ impl Envelope {
         for _ in 0..cap_count {
             caps.push(read_cap(bytes, &mut cursor, limits.max_methods)?);
         }
+        let cap_delta = if flags & FLAG_CAP_DELTA != 0 {
+            if cursor + 32 > bytes.len() {
+                return Err(Error::Wire("truncated cap-table delta"));
+            }
+            let mut base = [0u8; 32];
+            base.copy_from_slice(&bytes[cursor..cursor + 32]);
+            cursor += 32;
+            let removed_count = read_u32(bytes, &mut cursor)?;
+            if removed_count > limits.max_caps {
+                return Err(Error::CapabilityTable("too many delta removals"));
+            }
+            let mut removed = Vec::with_capacity(removed_count as usize);
+            for _ in 0..removed_count {
+                if cursor + 16 > bytes.len() {
+                    return Err(Error::Wire("truncated delta id"));
+                }
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&bytes[cursor..cursor + 16]);
+                cursor += 16;
+                removed.push(CapId(id));
+            }
+            let added_count = read_u32(bytes, &mut cursor)?;
+            if added_count > limits.max_caps {
+                return Err(Error::CapabilityTable("too many delta additions"));
+            }
+            let mut added = Vec::with_capacity(added_count as usize);
+            for _ in 0..added_count {
+                added.push(read_cap(bytes, &mut cursor, limits.max_methods)?);
+            }
+            Some(CapTableDelta {
+                base,
+                removed,
+                added,
+            })
+        } else {
+            None
+        };
         if cursor != bytes.len() {
             return Err(Error::Wire("trailing bytes"));
         }
@@ -326,6 +445,7 @@ impl Envelope {
             caps,
             redact: flags & FLAG_REDACT != 0,
             read_only: flags & FLAG_READ_ONLY != 0,
+            cap_delta,
         })
     }
 
