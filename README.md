@@ -155,7 +155,7 @@ let _ = second.value()?;
 | Identity | Mutual-TLS peer identity; a capability introduced to one peer is refused for another |
 | Cap / attenuate | Authority and narrowing |
 | Domain | Infinity-backed evaluate / why / impact / subgraph / patch |
-| Tools | MCP, HTTP, LocalProcess adapters |
+| Tools | MCP, HTTP, LocalProcess adapters; `wasm-tools` runs fuel-metered WASM guests with no host imports |
 | Wire (ARP1) | Envelope + capability table |
 | Transports | In-process, shm, TCP, QUIC (mutual TLS), HTTP/2 (`http2`), interop bridge |
 | Bulk | `ARBL`/`ARBC` chunked transfer with per-chunk hashes and resume |

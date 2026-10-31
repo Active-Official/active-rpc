@@ -66,6 +66,8 @@ pub mod security;
 pub mod tool;
 pub mod transport;
 pub mod value;
+#[cfg(feature = "wasm-tools")]
+pub mod wasm_tool;
 pub mod wire;
 
 pub use budget::{Budget, BudgetMeter};

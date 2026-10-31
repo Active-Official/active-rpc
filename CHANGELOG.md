@@ -25,6 +25,11 @@ unchanged.
   `ReplayPackage::replay` re-executes it against a fresh kernel and compares
   every entry. Packages store argument sizes, never values. The CLI gains
   `replay dump` and `replay run`.
+- **Fuel-metered WebAssembly guest tools** (`wasm-tools`, ADR-0019):
+  `wasm_tool::WasmTool` runs a sandboxed guest with no host imports, a bounded
+  linear memory and a fuel budget, reachable only through a minted capability.
+  Out-of-fuel, traps, imports and oversized input/output each report a stable
+  `wasm/...` provider code.
 - **Payload accounting**: `Agent::call_with_payload` and
   `call_as_with_payload` charge an envelope payload against `max_bytes`; the
   CLI, examples and peer binaries use them.
