@@ -1,4 +1,4 @@
-# Release signing and attestation
+# Release attestation and the SBOM
 
 What protects a release artifact today, what the Sigstore/cosign spike measured,
 and what a deployment should verify. The runbook (`docs/release-runbook.md`) is
@@ -122,3 +122,5 @@ This is a registry-side setting plus a short job; it is not enabled here because
 it needs the crates.io account to register the publisher first, and the current
 runbook publishes by hand with a scoped token that is never stored in the
 repository.
+
+

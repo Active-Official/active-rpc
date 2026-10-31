@@ -29,7 +29,7 @@ as input, which is how a release that was created by hand gets its SBOM. The
 workflow is the gate for M-5.1: an SBOM that is not attached is a failed run,
 not a missing file someone notices later.
 
-Signing, attestation and the Sigstore spike: `docs/release/signing.md`.
+Signing, attestation and the Sigstore spike: `docs/release-attestation.md`.
 
 
 ## Order
@@ -107,3 +107,4 @@ replaced 0.3.0 and `active-rpc-cli -V` prints `active-rpc-cli 0.3.1 (active-rpc
 2.2.0)`. A consumer crate with `active-rpc = "2.2.0"` mints a capability and
 gets an in-process echo response. `active-rpc 2.2.0` on crates.io is yanked
 `false`; the SBOM for the release lists 197 components.
+

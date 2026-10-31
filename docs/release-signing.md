@@ -1,7 +1,9 @@
 # Release signing
 
 Every release tag in this repository is signed. This document records the key,
-why it is an SSH key, and how anyone can verify a tag.
+why it is an SSH key, and how anyone can verify a tag. Artifact attestation
+(SBOM, Sigstore spike, trusted publishing) is in
+[`release-attestation.md`](release-attestation.md).
 
 ## The key
 

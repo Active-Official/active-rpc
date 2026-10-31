@@ -143,6 +143,17 @@ impl CapTableDelta {
         if cap_table_hash(base) != self.base {
             return Err(Error::CapabilityTable("cap-table delta base mismatch"));
         }
+        for cap in &self.added {
+            // The programmatic path must not admit something the wire path would
+            // refuse: a descriptor whose budget disables a ceiling is invalid
+            // whichever way it arrived.
+            cap.budget
+                .check()
+                .map_err(|_| Error::CapabilityTable("budget disables a ceiling"))?;
+            if cap.id.0 == [0u8; 16] {
+                return Err(Error::CapabilityTable("zero capability id"));
+            }
+        }
         let mut table = base.to_vec();
         for id in &self.removed {
             let Some(index) = table.iter().position(|cap| &cap.id == id) else {
@@ -166,7 +177,11 @@ impl CapTableDelta {
 /// Blake3 hash of the canonical capability table encoding.
 pub fn cap_table_hash(caps: &[CapDescriptor]) -> [u8; 32] {
     let mut out = [0u8; 32];
-    let encoded = encode_capability_table(caps).unwrap_or_default();
+    // The table encoding cannot fail for a descriptor set that came from the
+    // decoder (counts and strings are already bounded), and a failure here must
+    // not silently hash the empty table: two different tables would collide on
+    // the delta base.
+    let encoded = encode_capability_table(caps).expect("capability table encodes");
     out.copy_from_slice(blake3::hash(&encoded).as_bytes());
     out
 }
@@ -668,7 +683,13 @@ fn read_value_at(bytes: &[u8], cursor: &mut usize, depth: usize, budget: usize) 
     let tag = read_u8(bytes, cursor)?;
     let value = match tag {
         0 => Value::Null,
-        1 => Value::Bool(read_u8(bytes, cursor)? != 0),
+        1 => match read_u8(bytes, cursor)? {
+            // A boolean that decodes but re-encodes to a different byte breaks
+            // re-encode stability (§8.5), so only 0 and 1 are admissible.
+            0 => Value::Bool(false),
+            1 => Value::Bool(true),
+            _ => return Err(Error::Wire("boolean is not 0 or 1")),
+        },
         2 => Value::Int(read_u64(bytes, cursor)? as i64),
         3 => Value::Float(f64::from_bits(read_u64(bytes, cursor)?)),
         4 => Value::Text(read_str(bytes, cursor, budget as u32)?),
@@ -694,7 +715,12 @@ fn read_value_at(bytes: &[u8], cursor: &mut usize, depth: usize, budget: usize) 
             let mut entries = std::collections::BTreeMap::new();
             for _ in 0..count {
                 let key = read_str(bytes, cursor, budget as u32)?;
-                entries.insert(key, read_value_at(bytes, cursor, depth + 1, budget)?);
+                let value = read_value_at(bytes, cursor, depth + 1, budget)?;
+                if entries.insert(key, value).is_some() {
+                    // A duplicate key decodes to one entry and re-encodes shorter,
+                    // so two byte images would name one value.
+                    return Err(Error::Wire("duplicate map key"));
+                }
             }
             Value::Map(entries)
         }
@@ -733,12 +759,28 @@ fn read_budget(bytes: &[u8], cursor: &mut usize) -> Result<Budget> {
 }
 
 fn read_cap(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<CapDescriptor> {
+    // Every fault inside a descriptor is a capability-table fault (§3.1), so the
+    // scalar readers are mapped here instead of leaking `rpc/wire`.
+    let table = |error: Error| match error {
+        // A descriptor-level refusal keeps its reason; only the scalar readers
+        // (which speak `rpc/wire`) are translated.
+        Error::CapabilityTable(_) => error,
+        Error::Wire(message) => Error::CapabilityTable(message),
+        _ => Error::CapabilityTable("malformed capability descriptor"),
+    };
+    read_cap_inner(bytes, cursor, max_methods).map_err(table)
+}
+
+fn read_cap_inner(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<CapDescriptor> {
     let mut id = [0u8; 16];
     if *cursor + 16 > bytes.len() {
         return Err(Error::CapabilityTable("truncated capability id"));
     }
     id.copy_from_slice(&bytes[*cursor..*cursor + 16]);
     *cursor += 16;
+    if id == [0u8; 16] {
+        return Err(Error::CapabilityTable("zero capability id"));
+    }
     let count = read_u32(bytes, cursor)?;
     if count > max_methods {
         return Err(Error::CapabilityTable("too many methods"));
@@ -751,8 +793,16 @@ fn read_cap(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<CapDes
     budget
         .check()
         .map_err(|_| Error::CapabilityTable("budget disables a ceiling"))?;
-    let read_only = read_u8(bytes, cursor)? != 0;
-    let redact = read_u8(bytes, cursor)? != 0;
+    let read_only = match read_u8(bytes, cursor)? {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::CapabilityTable("read_only is not 0 or 1")),
+    };
+    let redact = match read_u8(bytes, cursor)? {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::CapabilityTable("redact is not 0 or 1")),
+    };
     let path_scope = read_opt_str(bytes, cursor, 1024)?;
     Ok(CapDescriptor {
         id: CapId(id),
