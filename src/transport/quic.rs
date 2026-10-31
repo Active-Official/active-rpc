@@ -18,10 +18,16 @@
 //! table, prove a malformed frame is answered with an error envelope rather than
 //! a panic, and prove two client certificates produce two distinct identities.
 //!
+//! Concurrency: the endpoint accepts continuously and drives every connection in
+//! its own task. A peer that connects and then goes quiet therefore holds one
+//! connection slot (`MAX_CONNECTIONS`) instead of the accept loop, which is what
+//! lets one agent's long-lived session coexist with the next agent's handshake.
+//!
 //! TLS is self-signed and loopback-only by design: internet-scale QUIC (public
 //! CA, NAT traversal, load balancing) is explicitly out of scope.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -397,72 +403,107 @@ fn mutual_tls_material() -> Result<MutualMaterial> {
     })
 }
 
+/// Concurrent connections one server keeps open before it stops accepting.
+///
+/// A depleted slot drops the incoming connection, so a flood of half-open
+/// handshakes costs one task each up to this bound and nothing beyond it.
+const MAX_CONNECTIONS: usize = 256;
+
 async fn serve<H>(endpoint: quinn::Endpoint, handler: Arc<Mutex<H>>, max_calls: usize)
 where
     H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
 {
-    let mut served = 0usize;
+    let served = Arc::new(AtomicUsize::new(0));
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     while let Some(incoming) = endpoint.accept().await {
-        let handler = Arc::clone(&handler);
-        let connection = match incoming.await {
-            Ok(connection) => connection,
+        // Each connection is driven in its own task. `incoming.await` is where
+        // an abandoned or refused handshake parks for its timeout; awaiting it
+        // inline would hold the accept loop and stall every other peer.
+        let permit = match Arc::clone(&slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            // At the cap: dropping `incoming` closes the connection.
             Err(_) => continue,
         };
-        let peer = peer_identity(&connection);
-        loop {
-            let (mut send, mut recv) = match connection.accept_bi().await {
-                Ok(stream) => stream,
-                Err(_) => break,
+        let handler = Arc::clone(&handler);
+        let served = Arc::clone(&served);
+        let endpoint = endpoint.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let connection = match incoming.await {
+                Ok(connection) => connection,
+                Err(_) => return,
             };
-            let request = match recv.read_to_end(MAX_FRAME_BYTES).await {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    // The stream failed mid-frame. Answering with an error
-                    // envelope is best-effort (the peer may be gone), but it
-                    // gives a live peer a stable code instead of silence.
-                    let response = Envelope::error(0, &Error::Wire("stream read failed"));
-                    let _ = send_envelope(&mut send, &response).await;
-                    let _ = send.finish();
-                    break;
-                }
-            };
-            let envelope = match decode_call(&request) {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    let response = Envelope::error(0, &error);
-                    let _ = send_envelope(&mut send, &response).await;
-                    let _ = send.finish();
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped())
-                            .await;
-                    served += 1;
-                    if max_calls != 0 && served >= max_calls {
-                        endpoint.close(0u32.into(), b"served");
-                        return;
-                    }
-                    continue;
-                }
-            };
-            let response = {
-                let mut handler = match handler.lock() {
-                    Ok(handler) => handler,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                handler(envelope, peer.clone())
-            };
-            let _ = send_envelope(&mut send, &response).await;
-            let _ = send.finish();
-            served += 1;
-            if max_calls != 0 && served >= max_calls {
-                // Give the peer a moment to drain the stream before the
-                // endpoint closes; closing first would abort the response.
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped())
-                    .await;
-                endpoint.close(0u32.into(), b"served");
+            serve_connection(&endpoint, &handler, &served, max_calls, connection).await;
+        });
+    }
+}
+
+async fn serve_connection<H>(
+    endpoint: &quinn::Endpoint,
+    handler: &Arc<Mutex<H>>,
+    served: &AtomicUsize,
+    max_calls: usize,
+    connection: quinn::Connection,
+) where
+    H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope,
+{
+    let peer = peer_identity(&connection);
+    loop {
+        let (mut send, mut recv) = match connection.accept_bi().await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        let request = match recv.read_to_end(MAX_FRAME_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // The stream failed mid-frame. Answering with an error
+                // envelope is best-effort (the peer may be gone), but it
+                // gives a live peer a stable code instead of silence.
+                let response = Envelope::error(0, &Error::Wire("stream read failed"));
+                let _ = send_envelope(&mut send, &response).await;
+                let _ = send.finish();
                 return;
             }
+        };
+        let envelope = match decode_call(&request) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                let response = Envelope::error(0, &error);
+                let _ = send_envelope(&mut send, &response).await;
+                let _ = send.finish();
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped())
+                    .await;
+                if exhausted(served, max_calls) {
+                    endpoint.close(0u32.into(), b"served");
+                    return;
+                }
+                continue;
+            }
+        };
+        let response = {
+            let mut handler = match handler.lock() {
+                Ok(handler) => handler,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            handler(envelope, peer.clone())
+        };
+        let _ = send_envelope(&mut send, &response).await;
+        let _ = send.finish();
+        if exhausted(served, max_calls) {
+            // Give the peer a moment to drain the stream before the endpoint
+            // closes; closing first would abort the response.
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped()).await;
+            endpoint.close(0u32.into(), b"served");
+            return;
         }
     }
+}
+
+/// Count one served call and report whether the server's budget is spent.
+fn exhausted(served: &AtomicUsize, max_calls: usize) -> bool {
+    let total = served.fetch_add(1, Ordering::SeqCst) + 1;
+    max_calls != 0 && total >= max_calls
 }
 
 /// The authenticated identity of a QUIC peer, when the session carried a

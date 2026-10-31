@@ -63,6 +63,64 @@ kernel memory without bound.
   and the payload is copied into the caller's buffer; there is no deserialize
   step on the transport path.
 
+## Domain provider hot path (M-4.1, 2026-10-31)
+
+`cargo bench --bench domain` (criterion, 100 samples, 2 s warm-up, 5 s
+measurement). Host: Intel Xeon E5-1650 v4 @ 3.60 GHz, 6 cores / 12 threads,
+Windows 10 Pro, `rustc 1.99.1`, machine shared with other work during the run,
+so read the intervals, not the third digit. Fixture: a 35-node module
+(`benches/domain.rs`) with nested tables, an array, a quantity expression, an
+environment default, string interpolation and one secret.
+
+| Arm | Median | 95% interval | What it is |
+|---|---|---|---|
+| `floor/noop_invoke` | 7 ns | 6.6–7.5 ns | provider trait call, no work |
+| `content_hash/shipped_cached` | 476 ns | 439–527 ns | `content_hash` on a warm slot |
+| `content_hash/removed_encode_hash` | 53.6 µs | 50.7–57.6 µs | encode + hash on every call (the old path) |
+| `stats/shipped` | 3.0 µs | 2.9–3.1 µs | `stats` over the stored module |
+| `stats/removed_clone` | 5.0 µs | 4.5–5.7 µs | `module.clone()`, the copy the old path made per call |
+| `path/why` | 26.6 µs | 25.0–29.3 µs | `why` on `services.auth_url` |
+| `path/subgraph` | 42.4 µs | 37.7–48.1 µs | `subgraph` on `services` (cone + encode) |
+| `evaluate/root` | 273 µs | 246–307 µs | Infinity evaluation of the whole module |
+| `evaluate/scoped` | 188 µs | 183–195 µs | Infinity evaluation of one subtree |
+
+Components, measured alone:
+
+| Component | Median | Note |
+|---|---|---|
+| `ir::hash_hex` (published 2.3.0) | 4.1 µs | 32 `format!` allocations per hash |
+| local one-allocation formatter | inside the 476 ns `content_hash` arm | same 64 characters, one allocation |
+| `Module::edges()` | 2.5 µs | builds, sorts and dedups a `Vec` for a count |
+| `Module::node_count()` | 0.65 ns | inline |
+| `encode` | 41 µs | canonical image of the fixture |
+
+Two costs were removed from every call to a module capability:
+
+- **The per-call module clone.** `ModuleProvider::invoke` used to start with
+  `self.require(object)?.clone()` for every method, including read-only ones.
+  The slot is now taken out of the map for the duration of the call and put back
+  on every exit path, so a read-only call copies nothing and a refused call
+  never drops the object. `stats` measures 3.0 µs including the map round trip,
+  below the 5.0 µs the bare clone costs.
+- **The per-call canonical re-encode in `content_hash`.** The hash is computed
+  once per module version, cached in the slot and cleared by `patch`;
+  `install_canonical_image` seeds it from the bytes it was handed so a transport
+  that already validated an image never encodes it at all. A warm call is 476 ns
+  against 53.6 µs for the re-encode, about 113x.
+
+The remaining cost centres are named rather than hidden. `stats` is dominated by
+`Module::edges()`, which materialises, sorts and deduplicates the edge list for a
+count that only needs `len`; adding a counted accessor to the codec is the fix and
+needs a codec release. `content_hash` still formats 64 hex characters per call
+because the published `active_infinity::ir::hash_hex` allocates per byte; the
+codec tree carries the one-allocation formatter and this crate formats locally
+until the next dependency bump adopts it.
+
+`why`, `subgraph` and `evaluate` are Infinity work: `why` builds a dependency
+map and walks the cone, `subgraph` copies the cone and encodes it, and
+`evaluate` runs the engine. None of them re-encodes for the answer's sake; the
+subgraph encode is the payload.
+
 ## Regression policy
 
 A change that moves a benchmark by more than 20% on the same machine needs a

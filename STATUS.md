@@ -21,8 +21,9 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 |---|---|---|
 | M-0 baseline | complete | baseline SHAs and residual import in the program register |
 | M-1 capability maximum | complete | `tests/dispatch_authority_matrix.rs`, full-attribute attenuation properties, QUIC binding, H2.47, `docs/spec/security.md` §8 |
-| M-3 RPC residuals | in progress | M-3.1 receipts (`ARRL`), M-3.2 durable profile, M-3.3 WASM ABI v2, M-3.4 clock ADR, M-3.5 deployment identity, M-3.6 bridge doc gate |
-| M-4..M-8 | pending | speed, supply chain, Copilot marathon, innovations, release |
+| M-3 RPC residuals | complete | M-3.1 receipts (`ARRL`), M-3.2 durable profile, M-3.3 WASM ABI v2, M-3.4 clock ADR, M-3.5 deployment identity, M-3.6 bridge doc gate |
+| M-4 speed and transport | in progress | M-4.1 hot path: no per-call module clone, cached canonical hash, `benches/domain.rs`, numbers in `docs/spec/performance.md` |
+| M-5..M-8 | pending | supply chain, Copilot marathon, innovations, release |
 
 ## Phase status
 

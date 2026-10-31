@@ -33,7 +33,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps --all-features
       - name: Benchmarks compile
-        run: cargo bench --locked --bench transport --no-run
+        run: cargo bench --locked --benches --no-run
 
   perf-gate:
     runs-on: ubuntu-latest

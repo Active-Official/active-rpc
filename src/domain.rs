@@ -24,7 +24,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use active_infinity::interop::{
     dependencies, dependents, impact, secret_tainted_paths, subgraph, why,
 };
-use active_infinity::{decode, encode, AnnotationKind, InfinityModule, Inode, NodeId, Provenance};
+use active_infinity::{
+    decode, encode, AnnotationKind, InfinityModule, Inode, InterpPart, NodeId, PatchOp, Provenance,
+    SchemaFieldSpec,
+};
 
 use crate::cap::CapId;
 use crate::error::{Error, Result};
@@ -48,9 +51,19 @@ pub const METHODS: &[&str] = &[
     "provenance",
 ];
 
+/// A stored module plus its cached canonical hash.
+///
+/// The hash is what `content_hash` returns. Caching it removes a full encode
+/// per call for a monitoring loop, and installing canonical bytes can seed it
+/// without encoding at all. Any replacement (a patch) clears it.
+struct ModuleSlot {
+    module: InfinityModule,
+    hash: Option<[u8; 32]>,
+}
+
 /// A provider that serves domain operations on Infinity modules.
 pub struct ModuleProvider {
-    modules: BTreeMap<u64, InfinityModule>,
+    modules: BTreeMap<u64, ModuleSlot>,
     next_object: u64,
     /// Drop notifications received (object id, capability).
     pub drops: Vec<(u64, CapId)>,
@@ -76,16 +89,49 @@ impl ModuleProvider {
     }
 
     /// Install a module and return the object id to mint capabilities for.
+    ///
+    /// The canonical hash is computed lazily on the first `content_hash` call.
     pub fn install(&mut self, module: InfinityModule) -> u64 {
+        self.install_slot(ModuleSlot { module, hash: None })
+    }
+
+    /// Install a module from a canonical image and seed its cached hash.
+    ///
+    /// The bytes are validated as canonical first, so the cached hash is the
+    /// hash of exactly those bytes and no re-encode is needed until the module
+    /// is patched. This is the path a transport or a store should use: the
+    /// payload it already has is the canonical form.
+    pub fn install_canonical_image(&mut self, bytes: &[u8]) -> Result<u64> {
+        active_infinity::validate_canonical(bytes, active_infinity::Limits::default())
+            .map_err(|error| Error::Payload(error.code().to_string()))?;
+        let module = active_infinity::decode(bytes)
+            .map_err(|error| Error::Payload(error.code().to_string()))?;
+        let hash = active_infinity::content_hash(bytes)
+            .map_err(|error| Error::Payload(error.code().to_string()))?;
+        Ok(self.install_slot(ModuleSlot {
+            module,
+            hash: Some(hash),
+        }))
+    }
+
+    fn install_slot(&mut self, slot: ModuleSlot) -> u64 {
         let id = self.next_object;
         self.next_object += 1;
-        self.modules.insert(id, module);
+        self.modules.insert(id, slot);
         id
     }
 
     /// Read a module back (tests and local callers).
     pub fn module(&self, object: u64) -> Option<&InfinityModule> {
-        self.modules.get(&object)
+        self.modules.get(&object).map(|slot| &slot.module)
+    }
+
+    /// The cached canonical hash of a module, when it has been computed.
+    ///
+    /// `None` means "not computed yet"; it does not mean the module has no
+    /// hash. `content_hash` fills it.
+    pub fn cached_hash(&self, object: u64) -> Option<[u8; 32]> {
+        self.modules.get(&object).and_then(|slot| slot.hash)
     }
 
     /// Number of modules installed (including patch results).
@@ -93,9 +139,14 @@ impl ModuleProvider {
         self.modules.len()
     }
 
-    fn require(&self, object: u64) -> Result<&InfinityModule> {
+    /// Remove a module for the duration of one call and put it back afterwards.
+    ///
+    /// Taking the slot by value avoids a full deep clone for every read-only
+    /// method (`stats`, `why`, `subgraph`, …). The module is re-inserted on
+    /// every path, including errors, so a failed call never drops the object.
+    fn take(&mut self, object: u64) -> Result<ModuleSlot> {
         self.modules
-            .get(&object)
+            .remove(&object)
             .ok_or(Error::InvalidArgument("unknown module"))
     }
 
@@ -113,119 +164,143 @@ impl ModuleProvider {
             .ok_or(Error::InvalidArgument("path does not resolve"))?;
         Ok((path, node))
     }
-}
 
-impl Provider for ModuleProvider {
-    fn name(&self) -> &'static str {
-        "module"
-    }
-
-    fn methods(&self) -> Vec<String> {
-        METHODS.iter().map(|method| method.to_string()).collect()
-    }
-
-    fn mutating(&self, method: &str) -> bool {
-        method == "patch"
-    }
-
-    fn invoke(&mut self, object: u64, call: &Call) -> Result<Response> {
-        self.calls += 1;
-        let module = self.require(object)?.clone();
-        let response = match call.method.as_str() {
+    /// Serve one call against a slot that has been taken out of the map.
+    ///
+    /// Read-only methods borrow the module, so a call copies nothing; the two
+    /// methods that change or hash the canonical bytes handle the slot
+    /// themselves. `content_hash` reuses the cached hash, and `patch` clones
+    /// only on the mutating path.
+    fn serve(&self, slot: &mut ModuleSlot, call: &Call) -> Result<Response> {
+        match call.method.as_str() {
             "evaluate" => {
-                let module = match Self::path_arg(call) {
-                    Some(path) => {
-                        let node = active_infinity::interop::resolve_path(&module, &path)
-                            .ok_or(Error::InvalidArgument("path does not resolve"))?;
-                        restrict(&module, node)?
-                    }
-                    None => module,
-                };
                 let budget = call.budget.to_active_budget();
-                let (value, _diagnostics) = active_infinity::interop::evaluate(&module, budget)
-                    .map_err(|error| match &error {
-                        active_infinity::Error::Evaluation(code) => Error::Domain(code),
-                        other => Error::Payload(other.code().to_string()),
-                    })?;
-                Response::Value(security::from_active_value(&value))
+                let (value, _diagnostics) = match Self::path_arg(call) {
+                    Some(path) => {
+                        let node = active_infinity::interop::resolve_path(&slot.module, &path)
+                            .ok_or(Error::InvalidArgument("path does not resolve"))?;
+                        let sub = restrict(&slot.module, node)?;
+                        active_infinity::interop::evaluate(&sub, budget)
+                    }
+                    // No path means the module root: evaluate in place rather
+                    // than cloning the whole arena.
+                    None => active_infinity::interop::evaluate(&slot.module, budget),
+                }
+                .map_err(|error| match &error {
+                    active_infinity::Error::Evaluation(code) => Error::Domain(code),
+                    other => Error::Payload(other.code().to_string()),
+                })?;
+                Ok(Response::Value(security::from_active_value(&value)))
             }
             "why" => {
-                let (_path, node) = self.resolve(&module, call)?;
-                let labels = why(&module, node);
-                Response::Labels(apply_redaction(&module, labels, call.redact))
+                let (_path, node) = self.resolve(&slot.module, call)?;
+                let labels = why(&slot.module, node);
+                Ok(Response::Labels(apply_redaction(
+                    &slot.module,
+                    labels,
+                    call.redact,
+                )))
             }
             "impact" => {
-                let (_path, node) = self.resolve(&module, call)?;
-                let labels = impact(&module, node);
-                Response::Labels(apply_redaction(&module, labels, call.redact))
+                let (_path, node) = self.resolve(&slot.module, call)?;
+                let labels = impact(&slot.module, node);
+                Ok(Response::Labels(apply_redaction(
+                    &slot.module,
+                    labels,
+                    call.redact,
+                )))
             }
             "subgraph" => {
-                let (_path, node) = self.resolve(&module, call)?;
-                let sub = restrict(&module, node)?;
-                Response::Module(redacted_module_bytes(&sub)?)
+                let (_path, node) = self.resolve(&slot.module, call)?;
+                let sub = restrict(&slot.module, node)?;
+                Ok(Response::Module(redacted_module_bytes(&sub)?))
             }
             "patch" => {
-                let (_path, node) = self.resolve(&module, call)?;
                 if call.read_only {
                     return Err(Error::ReadOnly);
                 }
-                let replacement = call
-                    .args
-                    .iter()
-                    .find_map(|arg| match arg {
-                        // The first argument names the target path; the
-                        // replacement is the next literal.
-                        Arg::Value(Value::Path(_)) => None,
-                        Arg::Value(value) => literal_node(value),
-                        _ => None,
-                    })
-                    .ok_or(Error::InvalidArgument("patch needs a literal value"))?;
-                let mut patched = module.clone();
-                *patched.node_mut(node)? = replacement;
-                patched.set_provenance(Some(Provenance {
-                    producer: Some("active-rpc/patch".to_string()),
-                    timestamp_ms: 0,
-                    model: None,
-                    tool: Some("patch".to_string()),
-                    parent: None,
-                    entries: Vec::new(),
-                }));
-                let bytes = redacted_module_bytes(&patched)?;
+                let (patched, bytes) = {
+                    let module = &slot.module;
+                    let (_path, node) = self.resolve(module, call)?;
+                    let replacement = call
+                        .args
+                        .iter()
+                        .find_map(|arg| match arg {
+                            // The first argument names the target path; the
+                            // replacement is the next literal.
+                            Arg::Value(Value::Path(_)) => None,
+                            Arg::Value(value) => literal_node(value),
+                            _ => None,
+                        })
+                        .ok_or(Error::InvalidArgument("patch needs a literal value"))?;
+                    let mut patched = module.clone();
+                    *patched.node_mut(node)? = replacement;
+                    patched.set_provenance(Some(Provenance {
+                        producer: Some("active-rpc/patch".to_string()),
+                        timestamp_ms: 0,
+                        model: None,
+                        tool: Some("patch".to_string()),
+                        parent: None,
+                        entries: Vec::new(),
+                    }));
+                    // Encode before committing, so a refused payload leaves the
+                    // original module in place.
+                    let bytes = redacted_module_bytes(&patched)?;
+                    (patched, bytes)
+                };
                 // A patch advances the object in place: every holder of a
                 // capability for it observes the new version, which is what
                 // "patch returns the new module capability" means without a
                 // provider-side mint hook. Mint a fresh capability when
-                // isolation is required.
-                self.modules.insert(object, patched);
-                Response::Module(bytes)
+                // isolation is required. The cached hash no longer describes
+                // the module, so it is cleared.
+                slot.module = patched;
+                slot.hash = None;
+                Ok(Response::Module(bytes))
             }
             "dependents" => {
-                let (_path, node) = self.resolve(&module, call)?;
-                let labels: Vec<String> = dependents(&module, node)
+                let (_path, node) = self.resolve(&slot.module, call)?;
+                let labels: Vec<String> = dependents(&slot.module, node)
                     .into_iter()
-                    .map(|id| active_infinity::interop::node_label(&module, id))
+                    .map(|id| active_infinity::interop::node_label(&slot.module, id))
                     .collect();
-                Response::Labels(apply_redaction(&module, labels, call.redact))
-            }
-            "dependencies" => {
-                let (_path, node) = self.resolve(&module, call)?;
-                let labels: Vec<String> = dependencies(&module, node)
-                    .into_iter()
-                    .map(|id| active_infinity::interop::node_label(&module, id))
-                    .collect();
-                Response::Labels(apply_redaction(&module, labels, call.redact))
-            }
-            "content_hash" => {
-                let bytes =
-                    encode(&module).map_err(|error| Error::Payload(error.code().to_string()))?;
-                let hash = active_infinity::content_hash(&bytes)
-                    .map_err(|error| Error::Payload(error.code().to_string()))?;
-                Response::Value(Value::Text(format!(
-                    "blake3:{}",
-                    active_infinity::ir::hash_hex(&hash)
+                Ok(Response::Labels(apply_redaction(
+                    &slot.module,
+                    labels,
+                    call.redact,
                 )))
             }
+            "dependencies" => {
+                let (_path, node) = self.resolve(&slot.module, call)?;
+                let labels: Vec<String> = dependencies(&slot.module, node)
+                    .into_iter()
+                    .map(|id| active_infinity::interop::node_label(&slot.module, id))
+                    .collect();
+                Ok(Response::Labels(apply_redaction(
+                    &slot.module,
+                    labels,
+                    call.redact,
+                )))
+            }
+            "content_hash" => {
+                let hash = match slot.hash {
+                    Some(hash) => hash,
+                    None => {
+                        let bytes = encode(&slot.module)
+                            .map_err(|error| Error::Payload(error.code().to_string()))?;
+                        let hash = active_infinity::content_hash(&bytes)
+                            .map_err(|error| Error::Payload(error.code().to_string()))?;
+                        slot.hash = Some(hash);
+                        hash
+                    }
+                };
+                Ok(Response::Value(Value::Text(format!(
+                    "blake3:{}",
+                    hex32(&hash)
+                ))))
+            }
             "stats" => {
+                let module = &slot.module;
                 let mut map = BTreeMap::new();
                 map.insert("nodes".to_string(), Value::Int(module.node_count() as i64));
                 map.insert("edges".to_string(), Value::Int(module.edges().len() as i64));
@@ -243,10 +318,11 @@ impl Provider for ModuleProvider {
                     "has_provenance".to_string(),
                     Value::Bool(module.provenance().is_some()),
                 );
-                Response::Value(Value::Map(map))
+                Ok(Response::Value(Value::Map(map)))
             }
             "annotations" => {
-                let tainted_ids = tainted_nodes(&module);
+                let module = &slot.module;
+                let tainted_ids = tainted_nodes(module);
                 let mut out = Vec::new();
                 for annotation in module.annotations() {
                     let (kind, text) = match &annotation.kind {
@@ -274,9 +350,9 @@ impl Provider for ModuleProvider {
                         .collect(),
                     ));
                 }
-                Response::Value(Value::List(out))
+                Ok(Response::Value(Value::List(out)))
             }
-            "provenance" => match module.provenance() {
+            "provenance" => Ok(match slot.module.provenance() {
                 None => Response::Value(Value::Null),
                 Some(prov) => {
                     let mut map = BTreeMap::new();
@@ -295,14 +371,34 @@ impl Provider for ModuleProvider {
                     );
                     Response::Value(Value::Map(map))
                 }
-            },
-            other => {
-                return Err(Error::MethodNotGranted {
-                    method: other.to_string(),
-                })
-            }
-        };
-        Ok(response)
+            }),
+            other => Err(Error::MethodNotGranted {
+                method: other.to_string(),
+            }),
+        }
+    }
+}
+
+impl Provider for ModuleProvider {
+    fn name(&self) -> &'static str {
+        "module"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        METHODS.iter().map(|method| method.to_string()).collect()
+    }
+
+    fn mutating(&self, method: &str) -> bool {
+        method == "patch"
+    }
+
+    fn invoke(&mut self, object: u64, call: &Call) -> Result<Response> {
+        self.calls += 1;
+        let mut slot = self.take(object)?;
+        let outcome = self.serve(&mut slot, call);
+        // Re-insert on every path: a refused call must not drop the object.
+        self.modules.insert(object, slot);
+        outcome
     }
 
     fn on_drop(&mut self, object: u64, cap: CapId) {
@@ -466,44 +562,147 @@ fn restrict(module: &InfinityModule, node: NodeId) -> Result<InfinityModule> {
         let target = *map
             .get(id)
             .ok_or(Error::InvalidArgument("subgraph node missing from the map"))?;
-        let rewritten = remap_children(source, &map)?;
+        let rewritten = remap_node(source, &map)?;
         *sub.node_mut(target)? = rewritten;
     }
     sub.set_root(map.get(&node).copied());
     Ok(sub)
 }
 
-/// Rewrite a node's child references through `map`.
-fn remap_children(node: &Inode, map: &BTreeMap<NodeId, NodeId>) -> Result<Inode> {
-    let resolve = |id: NodeId| -> Result<NodeId> {
+/// Rewrite every node reference through `map`.
+///
+/// The match is exhaustive over [`Inode`]: a new child-bearing variant in the
+/// codec makes this fail to compile, which is what stops a projection from
+/// carrying a dangling reference. (The earlier version handled five variants
+/// and cloned the rest, so a cone containing an interpolation encoded to an
+/// invalid module.)
+fn remap_node(node: &Inode, map: &BTreeMap<NodeId, NodeId>) -> Result<Inode> {
+    let map_id = |id: NodeId| -> Result<NodeId> {
         map.get(&id)
             .copied()
             .ok_or(Error::InvalidArgument("subgraph is not closed"))
     };
-    let rewritten = match node {
+    let map_opt = |id: Option<NodeId>| -> Result<Option<NodeId>> {
+        match id {
+            Some(id) => Ok(Some(map_id(id)?)),
+            None => Ok(None),
+        }
+    };
+    let out = match node {
+        Inode::Quantity { value, unit } => Inode::Quantity {
+            value: map_id(*value)?,
+            unit: unit.clone(),
+        },
         Inode::Array { elements } => Inode::Array {
             elements: elements
                 .iter()
-                .map(|id| resolve(*id))
+                .map(|child| map_id(*child))
                 .collect::<Result<_>>()?,
         },
         Inode::Table { fields } => Inode::Table {
             fields: fields
                 .iter()
-                .map(|(name, id)| Ok((name.clone(), resolve(*id)?)))
+                .map(|(name, child)| Ok((name.clone(), map_id(*child)?)))
                 .collect::<Result<_>>()?,
         },
-        Inode::Quantity { value, unit } => Inode::Quantity {
-            value: resolve(*value)?,
-            unit: unit.clone(),
-        },
-        Inode::Ref(id) => Inode::Ref(resolve(*id)?),
         Inode::SecretRef { locator } => Inode::SecretRef {
-            locator: resolve(*locator)?,
+            locator: map_id(*locator)?,
         },
-        other => other.clone(),
+        Inode::Ref(child) => Inode::Ref(map_id(*child)?),
+        Inode::Env { name, default } => Inode::Env {
+            name: name.clone(),
+            default: map_opt(*default)?,
+        },
+        Inode::Interpolate { parts } => Inode::Interpolate {
+            parts: parts
+                .iter()
+                .map(|part| match part {
+                    InterpPart::Literal(text) => Ok(InterpPart::Literal(text.clone())),
+                    InterpPart::Expr(child) => Ok(InterpPart::Expr(map_id(*child)?)),
+                })
+                .collect::<Result<_>>()?,
+        },
+        Inode::Binary { op, lhs, rhs } => Inode::Binary {
+            op: *op,
+            lhs: map_id(*lhs)?,
+            rhs: map_id(*rhs)?,
+        },
+        Inode::Unary { op, expr } => Inode::Unary {
+            op: *op,
+            expr: map_id(*expr)?,
+        },
+        Inode::Constrained { target, constraint } => Inode::Constrained {
+            target: map_id(*target)?,
+            constraint: constraint.clone(),
+        },
+        Inode::Patch(op) => Inode::Patch(match op {
+            PatchOp::Set { path, value } => PatchOp::Set {
+                path: path.clone(),
+                value: map_id(*value)?,
+            },
+            PatchOp::Remove { path } => PatchOp::Remove { path: path.clone() },
+            PatchOp::Rename { from, to } => PatchOp::Rename {
+                from: from.clone(),
+                to: to.clone(),
+            },
+        }),
+        Inode::SchemaField(spec) => Inode::SchemaField(SchemaFieldSpec {
+            typ: spec.typ.clone(),
+            min: map_opt(spec.min)?,
+            max: map_opt(spec.max)?,
+            min_len: map_opt(spec.min_len)?,
+            max_len: map_opt(spec.max_len)?,
+            pattern: map_opt(spec.pattern)?,
+            default: map_opt(spec.default)?,
+            deprecated: spec.deprecated.clone(),
+        }),
+        Inode::SchemaTable { fields, closed } => Inode::SchemaTable {
+            fields: fields
+                .iter()
+                .map(|(name, child)| Ok((name.clone(), map_id(*child)?)))
+                .collect::<Result<_>>()?,
+            closed: *closed,
+        },
+        Inode::SchemaArray { element } => Inode::SchemaArray {
+            element: map_id(*element)?,
+        },
+        Inode::Semantic { tag, inner } => Inode::Semantic {
+            tag: *tag,
+            inner: map_id(*inner)?,
+        },
+        Inode::ContentAddressed { media_type, data } => Inode::ContentAddressed {
+            media_type: map_id(*media_type)?,
+            data: map_id(*data)?,
+        },
+        // Leaves carry no node references.
+        Inode::Null
+        | Inode::Bool(_)
+        | Inode::Int(_)
+        | Inode::Float(_)
+        | Inode::Str(_)
+        | Inode::DurationMs(_)
+        | Inode::Secret(_)
+        | Inode::Ident(_)
+        | Inode::Blob { .. } => node.clone(),
     };
-    Ok(rewritten)
+    Ok(out)
+}
+
+/// Lowercase hex for a content address, one allocation.
+///
+/// `active_infinity::ir::hash_hex` formats each byte with `format!` (32
+/// allocations per hash, about 4 µs on the benchmark host). The codec's own
+/// formatter is fixed in the Active-Infinity tree; this local copy keeps the hot
+/// path fast on the published 2.3.0 dependency and goes away with the next
+/// dependency bump.
+fn hex32(hash: &[u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in hash {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn literal_node(value: &Value) -> Option<Inode> {
