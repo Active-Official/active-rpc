@@ -106,3 +106,28 @@ fn assets_manifest_and_approved_mark_exist() {
         "active-mark.png is not the approved source"
     );
 }
+
+/// The bridge is interop, never the native protocol, and the deployment guide
+/// states that bound capabilities are refused through it.
+#[test]
+fn the_bridge_is_documented_as_interop_only() {
+    let readme = std::fs::read_to_string(root().join("README.md")).expect("README.md");
+    assert!(
+        readme.contains("interop bridge") || readme.contains("Interop bridges"),
+        "the README must name the bridge as interop"
+    );
+    let interop =
+        std::fs::read_to_string(root().join("docs/spec/interop.md")).expect("docs/spec/interop.md");
+    assert!(interop.contains("bridge"));
+    assert!(interop.contains("native"));
+    assert!(
+        interop.contains("bound capability") || interop.contains("bound caps"),
+        "the interop spec must state that bound capabilities are refused"
+    );
+    assert!(interop.contains("rpc/identity"));
+    let deployment = std::fs::read_to_string(root().join("docs/deployment/identity.md"))
+        .expect("deployment identity guide");
+    assert!(deployment.contains("interop only"));
+    assert!(deployment.contains("start_with_identity"));
+    assert!(deployment.contains("rpc/identity"));
+}

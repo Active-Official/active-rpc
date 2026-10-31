@@ -13,6 +13,16 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 | CI | every job green on both `Active-Official` and `RatioArtificiosa` at the release commit |
 | Tag | signed `v2.2.0`, identical object on both orgs |
 | GitHub Release | [Active-Official](https://github.com/Active-Official/active-rpc/releases/tag/v2.2.0) and [RatioArtificiosa](https://github.com/RatioArtificiosa/active-rpc/releases/tag/v2.2.0), marked Latest, with `active-rpc-2.2.0.cdx.json` |
+| Authenticity | `ReceiptLog` (`ARRL`) for durable receipts; `CapabilityRecord` for durable capabilities; WASM ABI v2 host policy |
+
+## Absolute Max program (AMAX-PROP-2026-10-31)
+
+| Phase | State | Evidence |
+|---|---|---|
+| M-0 baseline | complete | baseline SHAs and residual import in the program register |
+| M-1 capability maximum | complete | `tests/dispatch_authority_matrix.rs`, full-attribute attenuation properties, QUIC binding, H2.47, `docs/spec/security.md` §8 |
+| M-3 RPC residuals | in progress | M-3.1 receipts (`ARRL`), M-3.2 durable profile, M-3.3 WASM ABI v2, M-3.4 clock ADR, M-3.5 deployment identity, M-3.6 bridge doc gate |
+| M-4..M-8 | pending | speed, supply chain, Copilot marathon, innovations, release |
 
 ## Phase status
 
@@ -45,15 +55,20 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 
 1. **Replay packages are integrity checks, not signatures.** The checksum
    detects corruption and naive edits; authenticity needs a signature.
-2. **WASM guest tools have no host imports in ABI v1.** A host-call ABI requires
-   a capability policy and a new ADR.
-3. **QUIC demos use a self-signed certificate**; mutual TLS and identity binding
-   are covered by tests, but a deployment supplies its own CA.
-4. **TTL uses the kernel's virtual clock.** A wall-clock policy needs an ADR.
+2. **WASM ABI v2 grants only a clock, CSPRNG bytes and a bounded log.**
+   Filesystem and network imports need a capability-scoped allow-list and their
+   own ADR.
+3. **QUIC production identity is documented, not enforced by the kernel.**
+   `start_with_identity` takes a deployment CA and chain; issuing and rotating
+   certificates stays the deployment's job (`docs/deployment/identity.md`).
+4. **TTL is virtual by default.** `use_wall_clock(true)` follows real time and
+   never moves backwards, but a lease must be minted after the mode is chosen
+   (ADR-0022).
 5. **The Connect/gRPC bridge presents no peer identity**, so bound capabilities
    are refused through it; bridge-level authentication is the gateway's job.
-6. **Receipts are in-memory and per kernel.** Durable receipts belong with the
-   persistence work.
+6. **Receipts are durable only when exported.** `ReceiptLog` is append-only and
+   chain-verified, but the kernel writes nothing to disk by itself and rotation
+   is manual (ADR-0021).
 7. **Facade crates** (`active-rpc-*` 0.1.x) pin the kernel with a caret range and
    are released separately.
 8. **Benchmarks are single-host**; the tables record the methodology.

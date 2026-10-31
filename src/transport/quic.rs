@@ -35,7 +35,10 @@ use crate::wire::{Envelope, WireLimits};
 pub struct QuicServer {
     address: String,
     certificate: CertificateDer<'static>,
-    ca: Option<TestCa>,
+    /// Trust root clients must use (the test CA or a deployment CA).
+    ca: Option<CertificateDer<'static>>,
+    /// The in-process test CA, when this server minted one.
+    test_ca: Option<TestCa>,
     client: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
     runtime: tokio::runtime::Runtime,
     endpoint: quinn::Endpoint,
@@ -79,6 +82,7 @@ impl QuicServer {
         H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
     {
         let mut ca = None;
+        let mut test_ca = None;
         let mut client = None;
         let (server_config, certificate) = if mutual {
             let material = mutual_tls_material()?;
@@ -101,7 +105,8 @@ impl QuicServer {
             let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
             config.transport_config(Arc::new(transport_config()));
             client = Some((material.client.clone(), material.client_key));
-            ca = Some(material.ca);
+            ca = Some(material.ca.der.clone());
+            test_ca = Some(material.ca);
             (config, material.server)
         } else {
             let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -135,7 +140,97 @@ impl QuicServer {
             address: bound,
             certificate,
             ca,
+            test_ca,
             client,
+            runtime,
+            endpoint,
+            task,
+        })
+    }
+}
+
+/// A deployment-supplied server identity: the certificate chain and its key.
+///
+/// The test server generates its own certificate; a deployment passes the
+/// certificate its own CA issued, so clients can verify the server against the
+/// trust root they already have.
+pub struct ServerIdentity {
+    /// Certificate chain, leaf first.
+    pub chain: Vec<CertificateDer<'static>>,
+    /// Private key for the leaf certificate.
+    pub key: PrivateKeyDer<'static>,
+}
+
+impl QuicServer {
+    /// Bind a server on `bind` with a deployment certificate and, optionally,
+    /// mutual TLS rooted at `client_ca`.
+    ///
+    /// Unlike [`QuicServer::start_mutual_tls`], no certificate authority is
+    /// generated and no client credentials are minted: the deployment owns its
+    /// CA and its certificates. `client_ca` turns client authentication on; a
+    /// client that presents no certificate, or one from another CA, fails the
+    /// handshake.
+    pub fn start_with_identity<H>(
+        max_calls: usize,
+        handler: H,
+        bind: std::net::SocketAddr,
+        identity: ServerIdentity,
+        client_ca: Option<CertificateDer<'static>>,
+    ) -> Result<QuicServer>
+    where
+        H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
+    {
+        if identity.chain.is_empty() {
+            return Err(Error::Transport(
+                "server identity has no certificate".to_string(),
+            ));
+        }
+        let certificate = identity.chain[0].clone();
+        let tls = match &client_ca {
+            Some(ca) => {
+                let mut roots = rustls::RootCertStore::empty();
+                roots
+                    .add(ca.clone())
+                    .map_err(|error| Error::Transport(format!("client trust root: {error}")))?;
+                let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                    .build()
+                    .map_err(|error| Error::Transport(format!("client verifier: {error}")))?;
+                rustls::ServerConfig::builder()
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(identity.chain, identity.key)
+                    .map_err(|error| Error::Transport(format!("server tls: {error}")))?
+            }
+            None => rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(identity.chain, identity.key)
+                .map_err(|error| Error::Transport(format!("server tls: {error}")))?,
+        };
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+            .map_err(|error| Error::Transport(format!("quic config: {error}")))?;
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(Arc::new(transport_config()));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| Error::Transport(format!("runtime: {error}")))?;
+        let endpoint = runtime
+            .block_on(async { quinn::Endpoint::server(config, bind) })
+            .map_err(|error| Error::Transport(format!("bind: {error}")))?;
+        let bound = endpoint
+            .local_addr()
+            .map_err(|error| Error::Transport(format!("local addr: {error}")))?
+            .to_string();
+        let handler = Arc::new(Mutex::new(handler));
+        let endpoint_for_task = endpoint.clone();
+        let task = runtime.spawn(async move {
+            serve(endpoint_for_task, handler, max_calls).await;
+        });
+        Ok(QuicServer {
+            address: bound,
+            certificate,
+            ca: client_ca,
+            test_ca: None,
+            client: None,
             runtime,
             endpoint,
             task,
@@ -146,7 +241,6 @@ impl QuicServer {
     pub fn address(&self) -> &str {
         &self.address
     }
-
     /// The self-signed certificate a client must trust.
     pub fn certificate(&self) -> &CertificateDer<'static> {
         &self.certificate
@@ -154,7 +248,7 @@ impl QuicServer {
 
     /// The certificate authority a mutual-TLS client must trust.
     pub fn ca_certificate(&self) -> Option<&CertificateDer<'static>> {
-        self.ca.as_ref().map(|ca| &ca.der)
+        self.ca.as_ref()
     }
 
     /// A client certificate and key signed by this server's CA.
@@ -173,7 +267,7 @@ impl QuicServer {
         &self,
         subject: &str,
     ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-        let ca = self.ca.as_ref().ok_or(Error::TransportUnavailable(
+        let ca = self.test_ca.as_ref().ok_or(Error::TransportUnavailable(
             "server has no mutual-TLS certificate authority",
         ))?;
         ca.issue_client(subject)
