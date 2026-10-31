@@ -23,9 +23,9 @@ dependencies = [
 
 [[package]]
 name = "active-infinity"
-version = "2.1.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11e1fa77d4e9035c80ad3831ad9f19ed1b3b5ebc95409c7970d8d6dd833ffc52"
+checksum = "445432eb6d9dc73aa379ca999271ec4c0fae6bb4b2fbbbbcceb9bb9ae2f9dec5"
 dependencies = [
  "active-core",
  "blake3",
