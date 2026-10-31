@@ -16,6 +16,32 @@ the trade-off, not a universal winner.
 | hostile-input budgets | first-class (`Limits`, fail closed) | caller-supplied | verifier options | size limits | caller-supplied |
 | stable error codes | yes (`infinity/*`, `rpc/*`) | no catalog | no catalog | no catalog | no catalog |
 
+## Agent transport comparison (Active RPC vs common RPC stacks)
+
+This table is about the authorization and agent-model fit. Performance is
+measured separately in `docs/spec/performance.md`; no speed claim is made here.
+
+| Property | Active RPC | gRPC | Cap'n Proto RPC | JSON-RPC | MCP |
+|---|---|---|---|---|---|
+| authority carried with the call | attenuable capability | ambient TLS/service identity | capability (object reference) | none beyond transport | server-defined |
+| attenuation before delegation | yes, kernel-enforced | no standard | capability narrowing by reference | no | no |
+| revoke at dispatch | yes | no standard | reference lifetime | no | no |
+| promise pipelining | yes, dependency graph | no (streams are separate) | yes (promises) | no | no |
+| payload identity | canonical AINF + Blake3 | protobuf schema | schema-defined | arbitrary JSON | JSON |
+| secrets as a structural kind | yes | no | no | no | no |
+| tools under capability + budget | yes | separate auth layer | no standard | no | server policy |
+| hard per-call/byte budgets | yes | no standard | no standard | no | no |
+| stable error-code catalog | yes (`rpc/*`) | status codes | exception/status | application-defined | JSON-RPC codes |
+| transports | in-process, TCP, SHM, QUIC, Connect bridge | HTTP/2 | TCP/QUIC | any | stdio/HTTP |
+
+**Where it fits:** Active RPC is the strongest fit when an agent delegates
+authority to another agent, needs a dependent pipeline without a round trip per
+hop, or must move a secret-bearing module without letting a projection become
+the source of truth. gRPC remains the right bridge for existing HTTP/2 estates;
+Cap'n Proto remains attractive for schema-first object graphs; JSON-RPC and MCP
+remain simple tool surfaces. Active RPC ships bridges for those ecosystems
+rather than asking them to disappear.
+
 ## When another format is the better choice
 
 - **Cap'n Proto / FlatBuffers** when you control both ends, already have a

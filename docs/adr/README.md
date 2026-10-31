@@ -9,3 +9,4 @@
 | [0005](0005-promises.md) | Promises, batching and what "pipelined" measures |
 | [0006](0006-versioning.md) | Versioning and publishing |
 | [0007](0007-msrv.md) | Minimum supported Rust version 1.88 |
+| [0008](0008-bakeoff-methodology.md) | Public bakeoff methodology and CI regression policy |

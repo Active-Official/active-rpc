@@ -50,6 +50,10 @@ path = "src/bin/peer.rs"
 name = "transport"
 harness = false
 
+[[bench]]
+name = "bakeoff"
+harness = false
+
 [lib]
 name = "active_rpc"
 path = "src/lib.rs"
