@@ -87,7 +87,8 @@ Active RPC answers those with **capabilities**, **promises**, **lanes**, **chann
 ### Concurrency that matches real agents
 
 - **Lanes** — independent execution contexts with budgets.  
-- **Channels** — named streams for conversation and capability transfer.  
+- **Channels** — named streams for conversation and capability transfer, with
+  per-capability topic sets that attenuation can narrow.  
 - **Tools as capabilities** — MCP, HTTP allow-lists, sandboxed local processes—invoked under the same rules as everything else.
 
 ### Domain power on real modules

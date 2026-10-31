@@ -67,6 +67,8 @@ pub struct Message {
     pub payload: Value,
     /// Capabilities transferred with this message.
     pub caps: Vec<CapId>,
+    /// Topic this message was published on, when the publisher named one.
+    pub topic: Option<String>,
     /// Monotonic sequence within the channel.
     pub sequence: u64,
 }
@@ -124,6 +126,17 @@ impl Channel {
 
     /// Queue a message.
     pub fn send(&mut self, from: LaneId, payload: Value, caps: Vec<CapId>) -> Result<Message> {
+        self.send_topic(from, None, payload, caps)
+    }
+
+    /// Queue a message on a topic.
+    pub fn send_topic(
+        &mut self,
+        from: LaneId,
+        topic: Option<&str>,
+        payload: Value,
+        caps: Vec<CapId>,
+    ) -> Result<Message> {
         if self.closed {
             return Err(Error::InvalidArgument("channel is closed"));
         }
@@ -137,6 +150,7 @@ impl Channel {
             from,
             payload,
             caps,
+            topic: topic.map(str::to_string),
             sequence: self.next_sequence,
         };
         self.next_sequence += 1;
@@ -147,10 +161,31 @@ impl Channel {
 
     /// Take the oldest message.
     pub fn recv(&mut self) -> Result<Option<Message>> {
+        self.take_at(0)
+    }
+
+    /// Take the oldest message published on `topic`.
+    ///
+    /// Messages on other topics stay queued, in order.
+    pub fn recv_topic(&mut self, topic: &str) -> Result<Option<Message>> {
         if !self.direction.can_receive() {
             return Err(Error::InvalidArgument("channel is send-only"));
         }
-        match self.queue.pop_front() {
+        let index = self
+            .queue
+            .iter()
+            .position(|message| message.topic.as_deref() == Some(topic));
+        match index {
+            Some(index) => self.take_at(index),
+            None => Ok(None),
+        }
+    }
+
+    fn take_at(&mut self, index: usize) -> Result<Option<Message>> {
+        if !self.direction.can_receive() {
+            return Err(Error::InvalidArgument("channel is send-only"));
+        }
+        match self.queue.remove(index) {
             Some(message) => {
                 self.received += 1;
                 Ok(Some(message))

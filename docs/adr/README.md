@@ -16,3 +16,9 @@
 | [0012](0012-http2-transport.md) | A native HTTP/2 transport for ARP1 |
 | [0013](0013-bulk-transfer.md) | Bulk (carousel) transfer with per-chunk hashes |
 | [0014](0014-observability-schema.md) | An observability schema that carries no authority |
+| [0015](0015-time-bounded-capabilities.md) | Time-bounded capabilities |
+| [0016](0016-capability-receipts.md) | Capability receipts |
+| [0017](0017-introduction-modules.md) | Peer introduction modules in Active Infinity |
+| [0018](0018-replay-packages.md) | Deterministic replay packages |
+| [0019](0019-wasm-guest-tools.md) | Fuel-metered WebAssembly guest tools |
+| [0020](0020-capability-filtered-topics.md) | Capability-filtered pub/sub topics |

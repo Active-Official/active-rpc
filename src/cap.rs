@@ -173,6 +173,10 @@ pub struct CapAttrs {
     pub redact: bool,
     /// Dotted path prefix the capability is confined to (inclusive).
     pub path_scope: Option<String>,
+    /// Topics a publisher may use, when the capability is a pub/sub grant.
+    ///
+    /// `None` means no topic restriction. Attenuation may only narrow the set.
+    pub topics: Option<BTreeSet<String>>,
     /// Tool policy, when the capability targets a tool.
     pub tool_policy: Option<ToolPolicy>,
     /// Whether the capability is ephemeral or eligible for durable restore.
@@ -202,6 +206,7 @@ impl CapAttrs {
             read_only: false,
             redact: false,
             path_scope: None,
+            topics: None,
             tool_policy: None,
             persistence: CapPersistence::Ephemeral,
             bound_to: None,
@@ -248,6 +253,12 @@ impl CapAttrs {
     /// Attach a tool policy.
     pub fn with_tool_policy(mut self, policy: ToolPolicy) -> Self {
         self.tool_policy = Some(policy);
+        self
+    }
+
+    /// Restrict a publisher to a fixed topic set.
+    pub fn restrict_topics(mut self, topics: &[&str]) -> Self {
+        self.topics = Some(topics.iter().map(|topic| topic.to_string()).collect());
         self
     }
 
@@ -308,6 +319,13 @@ impl CapAttrs {
             (Some(_), None) => false,
             (Some(parent), Some(child)) => child <= parent,
         };
+        // Topics only narrow: an unrestricted child under a restricted parent
+        // would recover authority the parent withheld.
+        let topics_ok = match (&self.topics, &parent.topics) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(child), Some(parent)) => child.is_subset(parent),
+        };
         methods_ok
             && budget_ok
             && read_only_ok
@@ -317,6 +335,7 @@ impl CapAttrs {
             && persistence_ok
             && binding_ok
             && ttl_ok
+            && topics_ok
     }
 
     /// Attenuate, refusing anything that would widen authority.
@@ -355,6 +374,13 @@ impl CapAttrs {
                 }
                 Some(_) => {}
             }
+        }
+        // A topic set may only be narrowed.
+        match (&child.topics, &self.topics) {
+            (_, None) => {}
+            (None, Some(_)) => return Err(Error::Escalation("topic restriction removed")),
+            (Some(child), Some(parent)) if child.is_subset(parent) => {}
+            (Some(_), Some(_)) => return Err(Error::Escalation("topic set widens")),
         }
         match (&child.path_scope, &self.path_scope) {
             (_, None) => {}

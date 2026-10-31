@@ -876,6 +876,86 @@ impl Agent {
         Ok(message.sequence)
     }
 
+    /// Publish a message on a topic under a capability.
+    ///
+    /// The capability is the authority: it must be live (not revoked and not
+    /// expired), and when it carries a topic set the topic must be in it. The
+    /// message transfers no capabilities; use [`Agent::send`] for that.
+    pub fn publish(
+        &self,
+        lane: LaneId,
+        channel: ChannelId,
+        cap: &CapHandle,
+        topic: &str,
+        payload: Value,
+    ) -> Result<u64> {
+        let mut kernel = self.cell.borrow_mut();
+        let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+        if lane_record.closed {
+            return Err(Error::UnknownLane(lane.0));
+        }
+        let record = kernel
+            .caps
+            .get(&cap.id())
+            .ok_or(Error::UnknownCapability(cap_token(cap.id())))?
+            .clone();
+        if record.revoked {
+            return Err(Error::Revoked(cap_token(cap.id())));
+        }
+        if record
+            .expires_at
+            .is_some_and(|expires_at| kernel.now_ms >= expires_at)
+        {
+            kernel.push_event(Event::CapExpired(cap.id()));
+            return Err(Error::Revoked(cap_token(cap.id())));
+        }
+        if let Some(topics) = &record.attrs.topics {
+            if !topics.contains(topic) {
+                return Err(Error::TopicNotGranted(topic.to_string()));
+            }
+        }
+        if !kernel.channels.contains_key(&channel) {
+            return Err(Error::UnknownChannel(channel.0));
+        }
+        let ceiling = kernel.channel_ceiling;
+        if kernel
+            .channels
+            .get(&channel)
+            .is_some_and(|record| record.queued() >= ceiling)
+        {
+            kernel.metrics.backpressure_refusals =
+                kernel.metrics.backpressure_refusals.saturating_add(1);
+            return Err(Error::Backpressure("channel queue ceiling reached"));
+        }
+        let record = kernel
+            .channels
+            .get_mut(&channel)
+            .ok_or(Error::UnknownChannel(channel.0))?;
+        let message = record.send_topic(lane, Some(topic), payload, Vec::new())?;
+        kernel.push_event(Event::ChannelSend {
+            channel,
+            sequence: message.sequence,
+        });
+        Ok(message.sequence)
+    }
+
+    /// Receive the next message published on `topic`.
+    pub fn recv_topic(&self, channel: ChannelId, topic: &str) -> Result<Option<Message>> {
+        let mut kernel = self.cell.borrow_mut();
+        let record = kernel
+            .channels
+            .get_mut(&channel)
+            .ok_or(Error::UnknownChannel(channel.0))?;
+        let message = record.recv_topic(topic)?;
+        if let Some(message) = &message {
+            kernel.push_event(Event::ChannelRecv {
+                channel,
+                sequence: message.sequence,
+            });
+        }
+        Ok(message)
+    }
+
     /// Receive the next message on a channel.
     pub fn recv(&self, channel: ChannelId) -> Result<Option<Message>> {
         let mut kernel = self.cell.borrow_mut();

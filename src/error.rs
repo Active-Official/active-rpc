@@ -25,6 +25,8 @@ pub enum Error {
     ReadOnly,
     /// A path restriction rejected the call.
     PathNotGranted(String),
+    /// A pub/sub topic is outside the capability's topic set.
+    TopicNotGranted(String),
     /// A tool policy rejected the call.
     ToolPolicy(&'static str),
     /// The capability has been revoked or its provider disappeared.
@@ -87,6 +89,7 @@ impl Error {
             Error::Escalation(_) => "rpc/attenuation-escalation",
             Error::ReadOnly => "rpc/read-only",
             Error::PathNotGranted(_) => "rpc/path-not-granted",
+            Error::TopicNotGranted(_) => "rpc/topic-not-granted",
             Error::ToolPolicy(_) => "rpc/tool-policy",
             Error::Revoked(_) => "rpc/revoked",
             Error::BudgetExceeded(_) => "rpc/budget-exceeded",
@@ -133,6 +136,7 @@ impl fmt::Display for Error {
             Error::Escalation(what) => write!(f, "attenuation would widen authority: {what}"),
             Error::ReadOnly => write!(f, "capability is read-only"),
             Error::PathNotGranted(path) => write!(f, "path {path} is outside the capability"),
+            Error::TopicNotGranted(topic) => write!(f, "topic {topic} is outside the capability"),
             Error::ToolPolicy(what) => write!(f, "tool policy rejects the call: {what}"),
             Error::Revoked(id) => write!(f, "capability {id} is revoked"),
             Error::BudgetExceeded(kind) => write!(f, "{kind} budget exhausted"),

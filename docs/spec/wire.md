@@ -164,6 +164,7 @@ a message.
 | `rpc/attenuation-escalation` | an attenuation would widen authority |
 | `rpc/read-only` | a mutating method on a read-only capability |
 | `rpc/path-not-granted` | a path argument is outside the capability's scope |
+| `rpc/topic-not-granted` | a pub/sub topic is outside the capability's topic set |
 | `rpc/tool-policy` | the tool policy refuses the call |
 | `rpc/revoked` | the capability (or an ancestor) was revoked |
 | `rpc/budget-exceeded` | a call, byte or lane budget is exhausted |

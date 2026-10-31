@@ -30,6 +30,11 @@ unchanged.
   linear memory and a fuel budget, reachable only through a minted capability.
   Out-of-fuel, traps, imports and oversized input/output each report a stable
   `wasm/...` provider code.
+- **Capability-filtered pub/sub topics** (ADR-0020): `CapAttrs.topics` restricts
+  a publisher to a topic set that attenuation can only narrow;
+  `Agent::publish` refuses other topics with `rpc/topic-not-granted` and
+  re-checks revocation and expiry, and `Agent::recv_topic` takes only the
+  requested topic while leaving the rest queued.
 - **Payload accounting**: `Agent::call_with_payload` and
   `call_as_with_payload` charge an envelope payload against `max_bytes`; the
   CLI, examples and peer binaries use them.
