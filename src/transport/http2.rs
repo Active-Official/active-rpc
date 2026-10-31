@@ -33,7 +33,7 @@
 //! transport cannot prove who connected. Authority still comes only from the
 //! envelope's capability table.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -49,6 +49,33 @@ pub const CONTENT_TYPE: &str = "application/arp1";
 /// Largest request body the transport accepts.
 pub const MAX_BODY: usize = 64 << 20;
 
+/// Largest decoded header list, in RFC 9113 field bytes (name + value + 32 each).
+///
+/// An HPACK block can expand far beyond the bytes on the wire — one 100-byte
+/// field can name a header the peer never sent — so the decoder, not the socket,
+/// has to bound the result. 32 KiB is generous for `content-type` plus tracing
+/// headers and small enough that 128 concurrent streams stay a bounded amount of
+/// memory.
+pub const MAX_HEADER_LIST: u32 = 32 << 10;
+/// Largest number of header fields in one request.
+pub const MAX_HEADER_FIELDS: usize = 64;
+/// Largest frame either side will emit or accept (RFC 9113 minimum).
+pub const MAX_FRAME: u32 = 16 << 10;
+/// Concurrent streams one connection may carry.
+pub const MAX_CONCURRENT_STREAMS: u32 = 128;
+/// Flow-control window for one stream.
+pub const MAX_STREAM_WINDOW: u32 = 256 << 10;
+/// Flow-control window for one connection.
+pub const MAX_CONNECTION_WINDOW: u32 = 2 << 20;
+/// Request-body bytes one connection may be accumulating across all streams.
+///
+/// A peer that opens every allowed stream with the largest allowed body would
+/// otherwise pin `MAX_CONCURRENT_STREAMS * MAX_BODY` of memory. This is the cap
+/// that turns that into a refusal. The default leaves room for two maximum-size
+/// bodies in flight, so the documented per-request ceiling (`MAX_BODY`) is
+/// reachable; [`Http2Server::with_inflight_budget`] tightens it per deployment.
+pub const MAX_INFLIGHT_BODY: usize = 128 << 20;
+
 /// An HTTP/2 server bound to a loopback port.
 ///
 /// `serve` consumes the server: the listener is moved into the runtime, which
@@ -58,6 +85,7 @@ pub struct Http2Server {
     listener: Option<std::net::TcpListener>,
     address: String,
     limits: WireLimits,
+    inflight_budget: usize,
 }
 
 impl std::fmt::Debug for Http2Server {
@@ -89,6 +117,7 @@ impl Http2Server {
             listener: Some(listener),
             address,
             limits: WireLimits::default(),
+            inflight_budget: MAX_INFLIGHT_BODY,
         })
     }
 
@@ -100,6 +129,18 @@ impl Http2Server {
     /// Use tighter wire limits.
     pub fn with_limits(mut self, limits: WireLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Cap the request-body bytes this server accumulates per connection.
+    ///
+    /// A body that would take a connection over the budget is refused with
+    /// `429` before it is buffered. The default is [`MAX_INFLIGHT_BODY`], which
+    /// leaves room for two maximum-size bodies; a deployment that serves many
+    /// small calls can tighten it, and one that accepts maximum-size bodies must
+    /// leave room for at least one.
+    pub fn with_inflight_budget(mut self, bytes: usize) -> Self {
+        self.inflight_budget = bytes.max(1);
         self
     }
 
@@ -116,6 +157,7 @@ impl Http2Server {
             .take()
             .ok_or(Error::Transport("server was already served".to_string()))?;
         let limits = self.limits;
+        let inflight_budget = self.inflight_budget;
         let handler = Arc::new(Mutex::new(handler));
         let served = Arc::new(AtomicU64::new(0));
         self.runtime.block_on(async move {
@@ -141,6 +183,7 @@ impl Http2Server {
                     Arc::clone(&handler),
                     Arc::clone(&served),
                     limits,
+                    inflight_budget,
                 ));
             }
             while let Some(joined) = active.join_next().await {
@@ -158,14 +201,25 @@ async fn serve_connection<S, H>(
     handler: Arc<Mutex<H>>,
     served: Arc<AtomicU64>,
     limits: WireLimits,
+    inflight_budget: usize,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     H: FnMut(Envelope) -> Envelope + Send + 'static,
 {
-    let mut connection = h2::server::handshake(io)
+    let mut builder = h2::server::Builder::new();
+    builder
+        .max_header_list_size(MAX_HEADER_LIST)
+        .max_frame_size(MAX_FRAME)
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .initial_window_size(MAX_STREAM_WINDOW)
+        .initial_connection_window_size(MAX_CONNECTION_WINDOW);
+    let mut connection = builder
+        .handshake(io)
         .await
         .map_err(|error| Error::Transport(format!("h2 handshake: {error}")))?;
+    // Body bytes this connection is accumulating across live streams.
+    let inflight = Arc::new(AtomicUsize::new(0));
     // Streams are handled concurrently; the join set keeps the connection alive
     // until every response has been written.
     let mut streams = tokio::task::JoinSet::new();
@@ -178,8 +232,10 @@ where
         };
         let handler = Arc::clone(&handler);
         let served = Arc::clone(&served);
+        let inflight = Arc::clone(&inflight);
         streams.spawn(async move {
-            let handled = handle_stream(request, respond, handler, limits).await?;
+            let handled =
+                handle_stream(request, respond, handler, limits, inflight, inflight_budget).await?;
             if handled {
                 served.fetch_add(1, Ordering::Relaxed);
             }
@@ -199,10 +255,26 @@ async fn handle_stream<H>(
     mut respond: h2::server::SendResponse<Bytes>,
     handler: Arc<Mutex<H>>,
     limits: WireLimits,
+    inflight: Arc<AtomicUsize>,
+    inflight_budget: usize,
 ) -> Result<bool>
 where
     H: FnMut(Envelope) -> Envelope,
 {
+    // Header budgets first: a compressed block can decode to far more than the
+    // peer sent, so the decoded list is what is checked.
+    let header_bytes: usize = request
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+        .sum();
+    if header_bytes > MAX_HEADER_LIST as usize || request.headers().len() > MAX_HEADER_FIELDS {
+        return respond_status(
+            &mut respond,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            b"rpc/wire",
+        );
+    }
     if request.method() != Method::POST {
         return respond_status(
             &mut respond,
@@ -227,6 +299,7 @@ where
     }
     let mut body = request.into_body();
     let mut bytes = Vec::new();
+    let mut reservation = Reservation::new(inflight);
     // The caller's wire ceiling bounds the body; `MAX_BODY` is the hard cap.
     let ceiling = limits.max_bytes.min(MAX_BODY);
     loop {
@@ -236,6 +309,14 @@ where
                     return respond_status(
                         &mut respond,
                         StatusCode::PAYLOAD_TOO_LARGE,
+                        b"rpc/wire",
+                    );
+                }
+                if !reservation.reserve(chunk.len(), inflight_budget) {
+                    // The connection already holds its budget in other streams.
+                    return respond_status(
+                        &mut respond,
+                        StatusCode::TOO_MANY_REQUESTS,
                         b"rpc/wire",
                     );
                 }
@@ -295,6 +376,40 @@ where
     Ok(true)
 }
 
+/// Bytes of request body one stream has reserved on its connection.
+///
+/// The guard releases everything it holds when the stream ends, on every path,
+/// so a reset or a refused response cannot leak budget.
+struct Reservation {
+    budget: Arc<AtomicUsize>,
+    held: usize,
+}
+
+impl Reservation {
+    fn new(budget: Arc<AtomicUsize>) -> Self {
+        Self { budget, held: 0 }
+    }
+
+    /// Reserve `bytes` if the connection stays under `limit`.
+    fn reserve(&mut self, bytes: usize, limit: usize) -> bool {
+        let total = self.budget.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if total > limit {
+            self.budget.fetch_sub(bytes, Ordering::Relaxed);
+            return false;
+        }
+        self.held += bytes;
+        true
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.held != 0 {
+            self.budget.fetch_sub(self.held, Ordering::Relaxed);
+        }
+    }
+}
+
 fn respond_status(
     respond: &mut h2::server::SendResponse<Bytes>,
     status: StatusCode,
@@ -346,9 +461,18 @@ impl Http2Client {
             stream
                 .set_nodelay(true)
                 .map_err(|error| Error::Transport(format!("nodelay: {error}")))?;
-            let (sender, connection) = h2::client::handshake(stream)
-                .await
-                .map_err(|error| Error::Transport(format!("h2 handshake: {error}")))?;
+            let (sender, connection) = {
+                let mut builder = h2::client::Builder::new();
+                // The same budgets bound what a hostile server can send us:
+                // a response header block decodes into memory the client pays.
+                builder
+                    .max_header_list_size(MAX_HEADER_LIST)
+                    .max_frame_size(MAX_FRAME);
+                builder
+                    .handshake(stream)
+                    .await
+                    .map_err(|error| Error::Transport(format!("h2 handshake: {error}")))?
+            };
             let task = tokio::spawn(async move {
                 // The connection future drives every stream; it ends when the
                 // client closes the sender or the server goes away.
@@ -379,7 +503,7 @@ impl Http2Client {
     /// Send one call and decode the response.
     pub fn call(&mut self, envelope: &Envelope) -> Result<Envelope> {
         let body = envelope.encode()?;
-        let (status, response) = self.request(PATH, CONTENT_TYPE, &body)?;
+        let (status, response) = self.request(PATH, CONTENT_TYPE, &[], &body)?;
         if status != StatusCode::OK {
             let code = String::from_utf8_lossy(&response).trim().to_string();
             return Err(match code.as_str() {
@@ -454,20 +578,40 @@ impl Http2Client {
         content_type: &str,
         body: &[u8],
     ) -> Result<(StatusCode, Vec<u8>)> {
-        self.request(path, content_type, body)
+        self.request(path, content_type, &[], body)
+    }
+
+    /// Send a request with extra header fields (for header-budget tests).
+    ///
+    /// A refusal from the server's header budget arrives either as a `431`
+    /// response or as a stream reset; both mean the request never reached the
+    /// handler.
+    pub fn request_with_headers(
+        &mut self,
+        path: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<(StatusCode, Vec<u8>)> {
+        self.request(path, content_type, headers, body)
     }
 
     fn request(
         &mut self,
         path: &str,
         content_type: &str,
+        headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<(StatusCode, Vec<u8>)> {
         let mut sender = self.sender.clone();
-        let request = Request::builder()
+        let mut builder = Request::builder()
             .method(Method::POST)
             .uri(path)
-            .header(http::header::CONTENT_TYPE, content_type)
+            .header(http::header::CONTENT_TYPE, content_type);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder
             .body(())
             .map_err(|error| Error::Transport(format!("request: {error}")))?;
         let payload = Bytes::copy_from_slice(body);

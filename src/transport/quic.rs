@@ -409,6 +409,13 @@ fn mutual_tls_material() -> Result<MutualMaterial> {
 /// handshakes costs one task each up to this bound and nothing beyond it.
 const MAX_CONNECTIONS: usize = 256;
 
+/// Concurrent bidirectional streams (calls) one QUIC connection may carry.
+pub const MAX_CONCURRENT_STREAMS: u32 = 256;
+/// Receive window for one stream: bounded buffering per call.
+pub const STREAM_RECEIVE_WINDOW: u32 = 1 << 20;
+/// Receive window for one connection: the real cap on buffered bytes.
+pub const CONNECTION_RECEIVE_WINDOW: u32 = 8 << 20;
+
 async fn serve<H>(endpoint: quinn::Endpoint, handler: Arc<Mutex<H>>, max_calls: usize)
 where
     H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
@@ -649,6 +656,12 @@ impl QuicClient {
 }
 
 /// Keep-alive and idle settings suitable for agent traffic.
+///
+/// The stream and flow-control limits are amplification bounds: ARP1 carries one
+/// call per bidirectional stream, so the number of concurrent streams is the
+/// number of calls a peer can have in flight, and the windows bound how many
+/// bytes it can pin before we read them. Unidirectional streams are refused
+/// because this transport never uses one.
 fn transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
@@ -657,5 +670,9 @@ fn transport_config() -> quinn::TransportConfig {
             .try_into()
             .expect("valid idle timeout"),
     ));
+    config.max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into());
+    config.max_concurrent_uni_streams(0u32.into());
+    config.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
+    config.receive_window(CONNECTION_RECEIVE_WINDOW.into());
     config
 }

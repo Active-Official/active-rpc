@@ -72,6 +72,11 @@ that would violate one stops and needs an ADR.
 | Capability replay by another peer | an introduced capability is bound to the peer's verified fingerprint; dispatch and channel transfer refuse a different or missing identity | `identity`, `Kernel::call_as` |
 | Loopback relaxation used off-host | the policy decides from connection addresses; `strict()` refuses loopback without a certificate | `IdentityPolicy` |
 | A claimed certificate treated as identity | only a certificate the TLS stack verified produces a `PeerIdentity`; the verifier trusts a deployment CA | `transport::quic` |
+| HPACK amplification (a small compressed block decoding to a huge header list) | the server advertises `SETTINGS_MAX_HEADER_LIST_SIZE = 32 KiB` and checks the decoded list (name + value + 32 per field) and a 64-field cap before touching the request | `transport::http2::MAX_HEADER_LIST`, `handle_stream` |
+| Stream-count amplification | `SETTINGS_MAX_CONCURRENT_STREAMS = 128`; window sizes bound flow-control buffering | `transport::http2`, `transport::quic::MAX_CONCURRENT_STREAMS` |
+| Body amplification across streams | one connection may accumulate at most `MAX_INFLIGHT_BODY` of request body; a stream that would exceed it is answered `429` before buffering | `transport::http2::MAX_INFLIGHT_BODY`, `Reservation` |
+| QUIC stream-count and window flooding | 256 bidirectional streams, no unidirectional streams, 1 MiB stream / 8 MiB connection receive windows | `transport::quic::transport_config` |
+| HTTP/3 QPACK amplification | not reachable: this transport carries ARP1 on raw QUIC streams, with no QPACK or HTTP/3 header layer | ADR-0012 addendum, ADR-0023 |
 
 ## 4. Non-goals
 

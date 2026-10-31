@@ -75,3 +75,51 @@ content-type: application/arp1
   interoperability with third-party gRPC clients.
 - **WebSocket upgrade.** Rejected: it is another handshake and another framing
   layer for a stream that HTTP/2 already multiplexes.
+
+## Addendum: size budgets (M-4.3, 2026-10-31)
+
+The transport accepted the `h2` defaults, which are generous: a header list is
+bounded by a large default, there is no field-count cap, stream concurrency is
+whatever the connection advertises, and each stream could buffer up to the body
+ceiling. That is the amplification class the Absolute Max proposal names, so the
+budgets are now explicit constants in `transport::http2` and enforced in three
+places.
+
+| Budget | Value | Enforced by |
+|---|---|---|
+| `MAX_HEADER_LIST` | 32 KiB of decoded field bytes (`name + value + 32` per field) | advertised in `SETTINGS_MAX_HEADER_LIST_SIZE`, then re-checked on the decoded request |
+| `MAX_HEADER_FIELDS` | 64 | checked on the decoded request; `h2` does not limit the count |
+| `MAX_FRAME` | 16 KiB | `SETTINGS_MAX_FRAME_SIZE` on both sides |
+| `MAX_CONCURRENT_STREAMS` | 128 | `SETTINGS_MAX_CONCURRENT_STREAMS` |
+| `MAX_STREAM_WINDOW` / `MAX_CONNECTION_WINDOW` | 256 KiB / 2 MiB | `SETTINGS_INITIAL_WINDOW_SIZE` and the connection window |
+| `MAX_INFLIGHT_BODY` | 128 MiB per connection | per-stream `Reservation` guard; over budget is `429` before buffering |
+
+Why each one exists:
+
+- **Header list.** HPACK is a compression layer: a few bytes on the wire can
+  decode to a header list far larger than the frame that carried it. The bound
+  belongs on the decoded list, not on the socket, and a peer that ignores the
+  advertised setting is still refused by the explicit check.
+- **Field count.** A peer can spend the byte budget on a thousand tiny fields,
+  which costs the server a thousand `HeaderValue` allocations per request. The
+  cap is 64, far above `content-type` plus tracing headers.
+- **In-flight body.** 128 streams times a 64 MiB body ceiling is 8 GiB of
+  attacker-chosen memory. The connection-wide reservation turns that into a
+  `429`. The default leaves room for two maximum-size bodies, so the documented
+  per-request ceiling is still reachable; `with_inflight_budget` tightens it per
+  deployment.
+- **QUIC.** Raw QUIC has no header-compression layer at all (see below), so the
+  equivalent bounds are stream count and receive windows:
+  `MAX_CONCURRENT_STREAMS = 256`, no unidirectional streams, 1 MiB per stream and
+  8 MiB per connection.
+
+**HTTP/3 is out of scope by construction.** ARP1 rides a QUIC bidirectional
+stream, one call per stream, with no HTTP/3 framing and therefore no QPACK
+dynamic table. The ecosystem's QPACK amplification class does not apply to this
+transport; a deployment that terminates HTTP/3 in front of an Active RPC service
+owns that layer, and ADR-0023 records why the I/O layer stays on tokio.
+
+Tests: `tests/http2_budget_tests.rs` proves that an oversized header field, an
+over-count field list and an over-budget body never reach the provider, that a
+refused request leaves the server able to serve the next one, and that
+tracing-sized headers and a body under the budget are served.
