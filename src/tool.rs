@@ -118,7 +118,10 @@ pub const MAX_MCP_DESCRIPTION_BYTES: usize = 4 << 10;
 fn bounded_description(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_MCP_DESCRIPTION_BYTES));
     for character in text.chars() {
-        if out.len() >= MAX_MCP_DESCRIPTION_BYTES {
+        // Reserve the whole encoded character: checking only the current length
+        // would let a multi-byte character straddle the ceiling by up to three
+        // bytes.
+        if out.len() + character.len_utf8() > MAX_MCP_DESCRIPTION_BYTES {
             break;
         }
         if character.is_control() || is_bidi_override(character) {

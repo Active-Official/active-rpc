@@ -290,3 +290,21 @@ fn an_ordinary_tool_name_still_passes() {
     assert_eq!(session.tools().len(), 1);
     assert_eq!(session.tools()[0].name, "fs.read-file_2");
 }
+
+/// The cap counts bytes, so a multi-byte character must not be able to straddle
+/// it and overshoot by its remaining bytes.
+#[test]
+fn a_multibyte_character_cannot_straddle_the_description_ceiling() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let prefix = "x".repeat(active_rpc::tool::MAX_MCP_DESCRIPTION_BYTES - 1);
+    let list = tool_list_response(&format!(r#"[{{"name":"read","description":"{prefix}é"}}]"#));
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    let description = &session.tools()[0].description;
+    assert_eq!(
+        description.len(),
+        active_rpc::tool::MAX_MCP_DESCRIPTION_BYTES - 1,
+        "the straddling character must be dropped, not truncated"
+    );
+    assert!(description.is_char_boundary(description.len()));
+}

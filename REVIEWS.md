@@ -248,3 +248,42 @@ charge.
 the envelope payload (the CLI, `examples/thin_peer.rs` and `src/bin/peer.rs`),
 that the CLI reads payloads through a bounded reader, and that format, clippy,
 the full suite and the CLI suite are green.
+
+## Round 20 - 2026-10-31 (C-11 and C-12 delta)
+
+Scope: `637e962..HEAD` (TTL bounds, receipts, intro modules, replay packages,
+WASM tools, pub/sub topics, bridge specification) plus the working tree.
+Path: Copilot CLI via the Meta Muse proxy, `--reasoning-effort xhigh`.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| TTL checked only when queueing: a call that expires during its round trip still ran | high | fixed: dispatch re-checks `expires_at`, settles `rpc/revoked` and emits `CapExpired`; `a_call_that_expires_while_queued_never_reaches_the_provider` (provider panics if reached) |
+| `publish` ignored the identity binding and charged no budget | high | fixed: `publish` delegates to `publish_as`, which checks `bound_to` and charges the payload against cap x lane bytes; `a_capability_bound_to_a_peer_publishes_only_through_that_peer`, `a_publish_charges_the_capability_byte_budget` |
+| `attenuate`, `introduce_to`, `send_as` checked revocation but not expiry | high | fixed in all three, with `CapExpired`; `every_authority_path_refuses_an_expired_capability` |
+| Replay had no total body ceiling (100k x 1 MiB transient) | high | fixed: `MAX_PACKAGE_BYTES` (64 MiB) and `MAX_ARG_TOTAL_BYTES` (16 MiB); two ceiling tests |
+| WASM compiled an unbounded module and had no recursion or stack ceiling | high | fixed: 1 MiB module cap, `set_max_recursion_depth(1024)`, `set_max_stack_height(1 MiB)`, fail-open limit validation; three tests |
+| Bridge aborted `serve` on a truncated body and both sides allocated the announced length | high | fixed: 400 + continue, incremental reads; `a_truncated_body_gets_a_400_and_the_bridge_keeps_serving`, `a_short_response_body_is_a_transport_error` |
+| `cap.expired` was emitted but missing from `EVENT_NAMES` | medium | fixed; the projection test now requires the closed set and the projected events to match exactly |
+| MCP tool descriptions were unbounded and could carry ANSI/bidi text | medium | fixed: 4 KiB cap, control and bidi characters replaced; `a_tool_description_is_capped_and_stripped_of_control_characters` |
+| Tool names could spoof another entry in an operator allow-list | medium | fixed: `[A-Za-z0-9_.-]{1,128}` and unique (`mcp/tool-name`); six tests |
+| Missing `tools/call` id-mismatch test | low | added |
+| `fuzz_docker.py --all` skipped `fuzz_bulk_plan` | low | fixed |
+| Nightly `fuzz_capability_lifecycle` asserted against a locally minted capability because the "other" seed expanded to the same secret | low | harness fixed (flip seed byte 0); crash input committed as a seed; `tests/fuzz_regression_tests.rs` pins both halves |
+| `Recorder` recorded an attenuation only on success, so the parent clone's retain/release events were unreproducible | high | found by the new `fuzz_replay_package` target; fixed by recording every attempt; two regression tests |
+
+Verified and rejected: a property-test generator for `topics`/`ttl_ms` (the
+fuzz targets already drive both), and an "id is authority" note (already in
+`cap.rs` and `SECURITY.md`).
+
+## Round 21 - 2026-10-31 (verification)
+
+All twelve dispositions VERIFIED at `7805a8e`, with the suites named in round
+20 passing. One new finding:
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| `bounded_description` could overshoot the 4 KiB cap by up to three bytes when a multi-byte character straddled it | low | fixed: reserve `len_utf8()`; `a_multibyte_character_cannot_straddle_the_description_ceiling` |
+
+No authority over-refusals, no test bypassing the shipped path, no other bound
+bypass. Gates after the fix: clippy both feature sets, 283 tests with all
+features, 256 without, CLI 15, control-plane 25.
