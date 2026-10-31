@@ -294,6 +294,9 @@ pub struct Kernel {
     idempotency_order: VecDeque<(CapId, String, String)>,
     now_ms: u64,
     latency_ms: u64,
+    /// When true, dispatch advances the clock to wall time instead of by one
+    /// simulated round trip. The clock never decreases in either mode.
+    wall_clock: bool,
     transfers: u64,
     receipts: std::collections::VecDeque<crate::receipts::Receipt>,
     receipts_enabled: bool,
@@ -410,6 +413,7 @@ impl Agent {
             idempotency_order: VecDeque::new(),
             now_ms: 0,
             latency_ms: 1,
+            wall_clock: false,
             transfers: 0,
             receipts: std::collections::VecDeque::new(),
             receipts_enabled: false,
@@ -594,6 +598,36 @@ impl Agent {
         };
         let attrs = record.attrs(ttl_ms);
         self.mint_bound(peer, provider, record.object, attrs)
+    }
+
+    /// The kernel's current logical time, in milliseconds.
+    ///
+    /// Always monotonic. In the default (virtual) mode it advances by one
+    /// simulated round trip per dispatch; in wall-clock mode it tracks
+    /// `SystemTime` and never moves backwards.
+    pub fn now_ms(&self) -> u64 {
+        self.cell.borrow().now_ms
+    }
+
+    /// Select the clock the kernel uses for deadlines.
+    ///
+    /// The default is virtual: deterministic and replayable. Wall-clock mode is
+    /// for a long-running agent that mints capabilities whose lifetime must
+    /// follow real time. Enabling it jumps `now_ms` forward to the wall clock
+    /// (never backwards), so a pending deadline can only expire earlier, never
+    /// later. Disabling it keeps the current time and returns to simulated
+    /// advancement.
+    pub fn use_wall_clock(&self, enabled: bool) {
+        let mut kernel = self.cell.borrow_mut();
+        kernel.wall_clock = enabled;
+        if enabled {
+            kernel.now_ms = kernel.now_ms.max(wall_now_ms());
+        }
+    }
+
+    /// Whether the kernel follows the wall clock.
+    pub fn uses_wall_clock(&self) -> bool {
+        self.cell.borrow().wall_clock
     }
 
     /// Whether durable capability minting is allowed.
@@ -1823,7 +1857,11 @@ impl Agent {
         let (provider_id, provider) = {
             let mut kernel = self.cell.borrow_mut();
             kernel.round_trips += 1;
-            kernel.now_ms = kernel.now_ms.saturating_add(kernel.latency_ms);
+            kernel.now_ms = if kernel.wall_clock {
+                kernel.now_ms.max(wall_now_ms())
+            } else {
+                kernel.now_ms.saturating_add(kernel.latency_ms)
+            };
             let Some(first) = batch.first().and_then(|id| kernel.jobs.get(id)) else {
                 return;
             };
@@ -2151,6 +2189,14 @@ impl Kernel {
             self.push_event(Event::JobCompleted { job: job_id, lane });
         }
     }
+}
+
+/// Milliseconds since the Unix epoch, or 0 if the clock is before it.
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn pad128(id: CapId) -> [u8; 16] {
