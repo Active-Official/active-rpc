@@ -204,3 +204,47 @@ red-team battery pass.
 trim's pinned-record skip, the late handle-reference assignment, and the
 interactions with pipelined dependencies, cancel, failure, destroy and cloning.
 The 2,000-call batch test drives the shipped drain/read path.
+
+## Round 17 - 2026-10-31 (C-6..C-10 delta: transports, CLI, hardening)
+
+Scope: `git diff 8415a61..HEAD` - identity/HTTP2/bulk/observability, the new
+`active-rpc-cli`, MCP hardening and the new test matrices. Serve path: Copilot
+CLI routed at the Meta Muse proxy (`muse-spark-1.3-contributor`, xhigh).
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| HTTP/2 called a blocking kernel handler inside async stream tasks, stalling the runtime under concurrent streams | high | fixed: `handle_stream` runs the handler under `tokio::task::block_in_place`; the transport matrix test exercises concurrent streams |
+| A call charged only its arguments; an envelope payload moved bytes for free and could be amplified by the echo | high | fixed: `Agent::call_with_payload` / `call_as_with_payload` add the payload to `max_bytes`; `tests/payload_budget.rs` proves the refusal and the spend |
+| CLI `events` buffered an unbounded control-plane response; `--payload` read any file size | high | fixed: 8 MiB event ceiling and 64 MiB payload ceiling, `--payload` and `--text` are mutually exclusive |
+| CLI QUIC peer slept 200 ms and then force-closed, racing the last response | medium | fixed: `QuicServer::wait()` waits for the serving task, which drains before closing; manual QUIC round trip passes |
+| `loadgen` ids could collide past 1,000 requests per worker and a failed connection miscounted | medium | fixed: shared atomic id counter; a failed connection reports its whole assignment as errors |
+| `fuzz_bulk_plan` only exercised error paths | low | fixed: decodes a generated plan, asserts structural invariants, verifies its own bytes and re-decodes the encoding |
+| `McpSession::next_id` could overflow in debug builds | low | fixed: wrapping increment that skips the reserved zero id |
+
+Also hardened in this delta and confirmed by the reviewer: bounded MCP line
+reads (1 MiB), response-id matching (`mcp/id-mismatch`), refusal of responses
+without `result`/`error`, and the per-tenant tests (foreign caps, budgets,
+events, revocation).
+
+Verification: `cargo fmt --all --check`, clippy `-D warnings` on both feature
+sets, `cargo test --locked --all-features`, `cargo test --locked`, CLI tests and
+lint, fuzz crate check.
+
+## Round 18 - 2026-10-31 (verification of round 17)
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| `src/bin/peer.rs` TCP dispatch still used `Agent::call`, bypassing the new payload charge | high | fixed: `call_with_payload` with the envelope length (same as the examples) |
+| The CLI payload ceiling checked file metadata first; pipes report zero and a growing file bypassed it | high | fixed: read through `File::take(MAX_PAYLOAD_BYTES + 1)` and reject on overflow |
+
+The other round-17 fixes were confirmed: `block_in_place` holds no lock across an
+await, the kernel charge is a single saturating add, `QuicServer::wait` drains
+before closing, MCP ids wrap past zero, and `payload_budget` fails without the
+charge.
+
+## Round 19 - 2026-10-31 (convergence)
+
+**NO NEW FINDINGS.** The reviewer verified that every dispatch path now charges
+the envelope payload (the CLI, `examples/thin_peer.rs` and `src/bin/peer.rs`),
+that the CLI reads payloads through a bounded reader, and that format, clippy,
+the full suite and the CLI suite are green.

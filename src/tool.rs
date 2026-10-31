@@ -295,7 +295,12 @@ impl<T: McpTransport> McpSession<T> {
     }
 
     fn request(&mut self, method: &str, params: Json) -> Result<Json> {
-        self.next_id += 1;
+        // JSON-RPC ids wrap rather than panic in a long-lived session; id 0 is
+        // skipped because it is the conventional "no id" notification value.
+        self.next_id = self.next_id.wrapping_add(1);
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
         let id = self.next_id;
         let payload = json!({
             "jsonrpc": "2.0",

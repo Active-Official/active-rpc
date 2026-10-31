@@ -190,6 +190,22 @@ impl QuicServer {
             endpoint.wait_idle().await;
         });
     }
+
+    /// Wait for the server to serve its call budget and close on its own.
+    ///
+    /// The serving task drains the last response before it closes the endpoint,
+    /// so this is the graceful counterpart to [`QuicServer::shutdown`]. It
+    /// returns only after the task finished; a server started with
+    /// `max_calls == 0` never returns on its own.
+    pub fn wait(self) {
+        let runtime = self.runtime;
+        let endpoint = self.endpoint;
+        let task = self.task;
+        runtime.block_on(async {
+            let _ = task.await;
+            endpoint.wait_idle().await;
+        });
+    }
 }
 
 struct MutualMaterial {

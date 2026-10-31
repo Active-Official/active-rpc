@@ -189,7 +189,15 @@ fn dispatch(
             Ok(Value::Map(map))
         }
         _ => {
-            let promise = agent.call(lane, module_cap, &envelope.method, envelope.args.clone())?;
+            // Charge the envelope payload against the capability's byte budget,
+            // exactly as the thin-client peers do.
+            let promise = agent.call_with_payload(
+                lane,
+                module_cap,
+                &envelope.method,
+                envelope.args.clone(),
+                envelope.payload.len() as u64,
+            )?;
             promise.value()
         }
     }

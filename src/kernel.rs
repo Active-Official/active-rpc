@@ -842,6 +842,22 @@ impl Agent {
         self.call_as(None, lane, cap, method, args)
     }
 
+    /// Issue a call that carries an envelope payload of `payload_bytes`.
+    ///
+    /// Transport dispatchers use this so the payload bytes an envelope carries
+    /// are charged against the same `max_bytes` ceiling as the arguments. A
+    /// peer cannot move a large Infinity image for free.
+    pub fn call_with_payload(
+        &self,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        payload_bytes: u64,
+    ) -> Result<PromiseHandle> {
+        self.call_as_with_payload(None, lane, cap, method, args, payload_bytes)
+    }
+
     /// Issue a call on behalf of the peer the transport authenticated.
     ///
     /// `None` means no identity was presented. A capability bound with
@@ -856,8 +872,21 @@ impl Agent {
         method: &str,
         args: Vec<Arg>,
     ) -> Result<PromiseHandle> {
+        self.call_as_with_payload(peer, lane, cap, method, args, 0)
+    }
+
+    /// [`Agent::call_as`] with an envelope payload charged against the budget.
+    pub fn call_as_with_payload(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        payload_bytes: u64,
+    ) -> Result<PromiseHandle> {
         let cap_id = cap.id();
-        let result = self.call_inner(peer, lane, cap, method, args);
+        let result = self.call_inner(peer, lane, cap, method, args, payload_bytes);
         if let Err(error) = &result {
             let mut kernel = self.cell.borrow_mut();
             kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
@@ -903,6 +932,7 @@ impl Agent {
         cap: &CapHandle,
         method: &str,
         args: Vec<Arg>,
+        payload_bytes: u64,
     ) -> Result<PromiseHandle> {
         let mut kernel = self.cell.borrow_mut();
         let cap_id = cap.id();
@@ -978,7 +1008,11 @@ impl Agent {
                 return Err(Error::ToolPolicy("argument too large"));
             }
         }
-        let call_bytes: u64 = args.iter().map(|arg| arg.wire_size()).sum();
+        let call_bytes: u64 = args
+            .iter()
+            .map(|arg| arg.wire_size())
+            .sum::<u64>()
+            .saturating_add(payload_bytes);
         let effective = record.attrs.budget.intersect(&lane_budget);
         if call_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));

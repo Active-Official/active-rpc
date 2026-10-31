@@ -260,11 +260,16 @@ where
         }
     };
     let response = {
-        let mut handler = match handler.lock() {
-            Ok(handler) => handler,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        handler(envelope)
+        // A kernel handler is single-threaded and may block on the kernel
+        // loop; `block_in_place` moves the runtime worker aside instead of
+        // stalling every other stream on this runtime.
+        tokio::task::block_in_place(|| {
+            let mut handler = match handler.lock() {
+                Ok(handler) => handler,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            handler(envelope)
+        })
     };
     let encoded = match response.encode() {
         Ok(encoded) => encoded,

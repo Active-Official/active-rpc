@@ -156,7 +156,13 @@ fn dispatch(kernel: &Agent, lane: LaneId, request: &Envelope) -> Envelope {
         return Envelope::error(request.request_id, &Error::UnknownCapability(CapToken(0)));
     };
     let cap = kernel.import(descriptor.id);
-    match kernel.call(lane, &cap, &request.method, request.args.clone()) {
+    match kernel.call_with_payload(
+        lane,
+        &cap,
+        &request.method,
+        request.args.clone(),
+        request.payload.len() as u64,
+    ) {
         Ok(promise) => {
             let _ = kernel.run();
             match promise.value() {
@@ -264,10 +270,30 @@ fn method(flags: &BTreeMap<String, String>) -> String {
         .unwrap_or_else(|| "echo".to_string())
 }
 
+/// Largest payload the CLI will read from a file or send in one call.
+const MAX_PAYLOAD_BYTES: u64 = 64 << 20;
+/// Largest control-plane response the CLI will buffer.
+const MAX_EVENT_BODY_BYTES: u64 = 8 << 20;
+
 fn payload(flags: &BTreeMap<String, String>) -> Result<Vec<u8>, CliError> {
+    if flags.get("--payload").is_some() && flags.get("--text").is_some() {
+        return Err(CliError::usage("use either --payload or --text, not both"));
+    }
     if let Some(path) = flags.get("--payload").filter(|value| !value.is_empty()) {
-        return std::fs::read(path)
-            .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")));
+        // Read through a bounded reader: metadata can lie (pipes report zero)
+        // and the file can grow between the check and the read.
+        let file = std::fs::File::open(path)
+            .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_PAYLOAD_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
+        if bytes.len() as u64 > MAX_PAYLOAD_BYTES {
+            return Err(CliError::usage(format!(
+                "{path} is larger than the {MAX_PAYLOAD_BYTES}-byte payload ceiling"
+            )));
+        }
+        return Ok(bytes);
     }
     Ok(flags
         .get("--text")
@@ -504,12 +530,9 @@ fn peer_quic(kernel: Kernel, limit: usize, flags: &BTreeMap<String, String>) -> 
             break;
         }
     }
-    // Shut down only after the calls we promised: `shutdown` closes the
-    // endpoint, so running it earlier would refuse the client's handshake.
-    // The drain pause lets the last response leave the socket: quinn buffers
-    // stream writes and a close would drop them.
-    std::thread::sleep(Duration::from_millis(200));
-    server.shutdown();
+    // Wait for the serving task: it drains the last response and closes the
+    // endpoint itself, so the client always reads its reply.
+    server.wait();
     Ok(())
 }
 
@@ -648,21 +671,25 @@ fn loadgen(args: &[String]) -> CliResult {
     let payload = payload(&flags)?;
     let total = requests.max(concurrency);
     let started = Instant::now();
+    let next_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let mut handles = Vec::new();
     for worker in 0..concurrency {
         let address = address.clone();
         let method = method.clone();
         let payload = payload.clone();
+        let next_id = std::sync::Arc::clone(&next_id);
         let per_worker = total / concurrency + usize::from(worker < total % concurrency);
         handles.push(std::thread::spawn(move || {
             let mut latencies = Vec::with_capacity(per_worker);
             let mut errors = 0usize;
             let mut transport = match TcpTransport::connect(&address) {
                 Ok(transport) => transport,
-                Err(_) => return (Vec::new(), per_worker.max(1)),
+                // The worker could not open its connection: every request it
+                // was assigned failed.
+                Err(_) => return (Vec::new(), per_worker),
             };
-            for index in 0..per_worker {
-                let id = (worker * 1_000 + index) as u64 + 1;
+            for _ in 0..per_worker {
+                let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let envelope = request(id, &method, Vec::new(), &payload, Some(cap));
                 let started = Instant::now();
                 let result = transport
@@ -809,9 +836,15 @@ fn http_get(url: &str) -> Result<String, CliError> {
     )
     .map_err(|error| CliError::transport(error.to_string()))?;
     let mut response = Vec::new();
-    stream
+    let mut limited = std::io::Read::by_ref(&mut stream).take(MAX_EVENT_BODY_BYTES + 1);
+    limited
         .read_to_end(&mut response)
         .map_err(|error| CliError::transport(error.to_string()))?;
+    if response.len() as u64 > MAX_EVENT_BODY_BYTES {
+        return Err(CliError::transport(format!(
+            "control-plane response exceeded the {MAX_EVENT_BODY_BYTES}-byte ceiling"
+        )));
+    }
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
