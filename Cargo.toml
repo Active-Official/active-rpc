@@ -46,6 +46,7 @@ bytes = { version = "1", optional = true }
 proptest = "1"
 sha2 = "0.10"
 criterion = "0.5"
+prost = "0.13"
 
 [[bin]]
 name = "active-rpc-peer"

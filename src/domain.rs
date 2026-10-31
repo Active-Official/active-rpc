@@ -452,19 +452,22 @@ fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
 fn restrict(module: &InfinityModule, node: NodeId) -> Result<InfinityModule> {
     let cone = subgraph(module, &[node]);
     let mut sub = InfinityModule::new();
+    // Allocate the destination ids first, then copy each reachable node once
+    // with its references already rewritten. The older shape cloned every node
+    // twice (once into the module and once to remap its children).
     let mut map = BTreeMap::new();
     for id in &cone {
-        let cloned = module
-            .get(*id)
-            .cloned()
-            .ok_or(Error::InvalidArgument("subgraph node disappeared"))?;
-        map.insert(*id, sub.push(cloned));
+        map.entry(*id).or_insert_with(|| sub.push(Inode::Null));
     }
-    for (old, new) in &map {
-        if let Some(node) = module.get(*old).cloned() {
-            let rewritten = remap_children(&node, &map)?;
-            *sub.node_mut(*new)? = rewritten;
-        }
+    for id in &cone {
+        let source = module
+            .get(*id)
+            .ok_or(Error::InvalidArgument("subgraph node disappeared"))?;
+        let target = *map
+            .get(id)
+            .ok_or(Error::InvalidArgument("subgraph node missing from the map"))?;
+        let rewritten = remap_children(source, &map)?;
+        *sub.node_mut(target)? = rewritten;
     }
     sub.set_root(map.get(&node).copied());
     Ok(sub)

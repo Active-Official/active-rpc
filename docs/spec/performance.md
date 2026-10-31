@@ -70,3 +70,69 @@ note here and a fresh baseline in the same commit. CI compiles the benchmark
 binary (`cargo bench --no-run`) and runs `tests/perf_budget.rs`; it does not gate
 on cross-machine absolute time. The 32-bit lane runs the same budget tests under
 i686, where `usize` arithmetic is the risk.
+
+## Bakeoff (C-7, 2026-10-30)
+
+Host: Intel Xeon E5-1650 v4 @ 3.60 GHz, Windows 10 Pro, 64 GiB RAM,
+`rustc 1.99.1`. Criterion, 20 samples, 1 s warm-up, 2 s measurement, otherwise
+idle machine. Run the same commands to reproduce:
+
+```text
+cargo bench --all-features --bench bakeoff -- "rpc_protocol"
+cargo bench --all-features --bench bakeoff -- "rpc_bakeoff"
+cargo run --release --example perf_matrix --all-features
+python scripts/perf_gate.py perf-matrix.json
+```
+
+### Protocol message path: ARP1 versus gRPC
+
+Same logical call (method, one integer argument, 4 KiB payload). The gRPC
+adapter uses `prost` plus the five-byte gRPC prefix; the message is built once
+and only encoding and prefix/length validation are timed. HTTP/2 framing and
+HPACK headers are excluded, so this isolates the call encoding; the transport
+benchmarks cover in-process and shared-memory framing, not HTTP/2.
+
+| Operation | ARP1 | gRPC message | Ratio |
+|---|---|---|---|
+| encode | 723 ns | 1.37 µs | 0.53x (ARP1 faster) |
+| decode | 443 ns | 497 ns | 0.89x (ARP1 faster) |
+
+This is not a claim that ARP1 beats gRPC end to end: gRPC carries HTTP/2
+headers, trailers and a richer status model that a deployment may need. It is
+the message-path share, which is what the envelope controls.
+
+### Envelope throughput
+
+`examples/perf_matrix` (p50):
+
+| Args | Bytes | encode | decode |
+|---|---|---|---|
+| 1,000 | 10,036 | 7.9 µs | 24.4 µs |
+| 4,000 | 40,036 | 28.0 µs | 98.5 µs |
+
+Decode pays for value-tree allocation; encode writes a flat buffer. The 4x
+argument growth costs 3.5x encode and 4.0x decode, inside the gate's linearity
+ceiling.
+
+### Kernel throughput and pipelining
+
+| Workload | Wall time | Round trips |
+|---|---|---|
+| 1,000 sequential `echo` calls | 2.58 ms (2.6 µs/call) | 1,000 |
+| 4,000 sequential `echo` calls | 11.0 ms (2.8 µs/call) | 4,000 |
+| 100 calls, one dependent promise chain | 372 µs | 1 |
+| 100 calls, one at a time | 378 µs | 100 |
+
+Wall time is dominated by per-call work in both shapes; the durable claim is the
+round-trip count. A dependency chain does the same work in one dispatch and
+therefore one batch, which is what removes the per-hop latency of a real
+transport.
+
+### The gate
+
+`scripts/perf_gate.py` enforces tail stability (p95 ≤ 4× p50, or 5x for a
+1,000-call batch, plus slack for one scheduler hiccup), linear scaling (4k/1k ≤
+10x encode, 12x decode, 12x calls) and the encoded-size sanity check. `--baseline
+docs/spec/perf-baseline.json` adds an absolute comparison (p50 ≤ 1.6x, p99 ≤
+3.0x) for a release machine. CI runs the ratio gate in the `perf-gate` job; the
+matrix is uploaded as an artifact.
