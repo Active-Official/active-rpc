@@ -1,0 +1,77 @@
+.TH ACTIVE-RPC-CLI 1 "2026-10-31" "active-rpc-cli 0.2.0" "User Commands"
+.SH NAME
+active-rpc-cli \- capability-based RPC peer, caller and load generator
+.SH SYNOPSIS
+.B active-rpc-cli
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B active-rpc-cli
+drives the real Active RPC capability kernel and transport stack. Peers mint
+capabilities, calls travel as native ARP1 envelopes, and refusals surface their
+stable
+.I rpc/...
+codes. Interop transports (Connect, HTTP/2) are adapters; native ARP1 over TCP
+is the baseline.
+.SH COMMANDS
+.TP
+.B doctor
+Version, transports, compiled features, budget defaults and exit codes.
+.TP
+.B peer [--transport tcp|http2|connect|quic] [--limit N] [--methods echo,sum] [--cert-out PATH]
+Start a demo peer with a real kernel and one minted capability. Prints
+transport, addr, cap and, for
+.BR quic ,
+the certificate path.
+.B --limit
+counts connections for tcp and http2, requests for connect and calls for quic.
+.TP
+.B call --addr \fIHOST:PORT\fR [--transport ...] [--cap HEX] [--method M] [--payload FILE | --text TEXT] [--cert FILE]
+Issue one call and print kind, id, payload length and the decoded value.
+.TP
+.B pipeline --addr \fIHOST:PORT\fR --cap \fIHEX\fR [--calls N] [--method M] [--payload FILE]
+Send N calls on one connection before reading any response; prints the
+round-trip count.
+.TP
+.B loadgen --addr \fIHOST:PORT\fR --cap \fIHEX\fR [--requests N] [--concurrency C] [--method M] [--payload FILE]
+Controlled load over C connections; prints p50, p95, p99 and throughput.
+.TP
+.B bridge [--limit N]
+Serve the Connect/gRPC interop adapter against the demo kernel.
+.TP
+.B events [--plane URL] [--after ID] [--follow] [--interval-ms N]
+Tail the control-plane event stream. Events carry correlation ids, never raw
+authority.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Refusal or a failed request, for example
+.I rpc/method-not-granted
+or
+.IR rpc/unknown-capability .
+.TP
+.B 2
+Usage error.
+.TP
+.B 3
+Transport or codec failure: connect, handshake or frame.
+.SH EXAMPLES
+.nf
+active-rpc-cli peer --limit 4 > peer.txt
+ADDR=$(awk -F= '/^addr=/{print $2}' peer.txt)
+CAP=$(awk -F= '/^cap=/{print $2}' peer.txt)
+active-rpc-cli call --addr "$ADDR" --cap "$CAP" --method echo --text hello
+active-rpc-cli pipeline --addr "$ADDR" --cap "$CAP" --calls 16
+active-rpc-cli loadgen --addr "$ADDR" --cap "$CAP" --requests 200 --concurrency 8
+active-rpc-cli events --plane http://127.0.0.1:8787 --follow
+fi
+.SH NOTES
+Capabilities print as opaque ids; the CLI never prints authority bits or secret
+material. The quic peer uses the self-signed demo mode and exits after
+.B --limit
+calls; the library's own QUIC tests cover mutual TLS and identity binding.
+.SH SEE ALSO
+.BR active-infinity-cli (1)

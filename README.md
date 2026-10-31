@@ -13,13 +13,38 @@
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
 
 Published crate family: `active-rpc`, `active-rpc-kernel`, `active-rpc-core`,
-`active-rpc-client`, `active-rpc-tools`, `active-rpc-transport` and the reserved
+`active-rpc-client`, `active-rpc-tools`, `active-rpc-transport` and
 `active-rpc-cli`. See
 [`REGISTRY.md`](REGISTRY.md) for the module map.
 
 Thank you for being here. Active RPC is the execution and security model for moving **Active Infinity** modules and authority between services and agents—without ambient permission, without “wait for every hop,” and without treating tools as an afterthought.
 
 If Active RPC lets your agents collaborate directly, pipeline their reasoning, and hold only the authority they need, star the repo so the next team finds a stronger default.
+
+---
+
+## Install and use the CLI
+
+```text
+cargo install active-rpc-cli              # from crates.io
+cargo install --path cli/active-rpc-cli   # from this checkout
+```
+
+```text
+active-rpc-cli doctor
+active-rpc-cli peer --limit 4 > peer.txt
+ADDR=$(awk -F= '/^addr=/{print $2}' peer.txt)
+CAP=$(awk -F= '/^cap=/{print $2}' peer.txt)
+active-rpc-cli call --addr "$ADDR" --cap "$CAP" --method echo --text hello
+active-rpc-cli pipeline --addr "$ADDR" --cap "$CAP" --calls 16
+active-rpc-cli loadgen --addr "$ADDR" --cap "$CAP" --requests 200 --concurrency 8
+active-rpc-cli events --plane http://127.0.0.1:8787 --follow
+```
+
+Exit codes are stable: `0` success, `1` refusal or failed request (for example
+`rpc/method-not-granted`), `2` usage, `3` transport or codec failure. The manual
+page is [`docs/man/active-rpc-cli.1`](docs/man/active-rpc-cli.1); the full
+reference is [`cli/active-rpc-cli/README.md`](cli/active-rpc-cli/README.md).
 
 ---
 
