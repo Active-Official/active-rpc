@@ -71,3 +71,11 @@ then `doctor` and a real `peer`/`call` round trip from the registry build.
 
 A CLI-only patch release is recorded here with its commit and does not move the
 library tag: the tag names the library version, and the CLI has its own.
+
+| 2026-10-31 | 2.2.0 | 0.3.1 | `3aba8e3` | CLI-only patch; the library tag stays `v2.2.0` | `active-rpc-cli` 0.3.1 |
+
+Registry verification: `cargo install active-rpc-cli --version 0.3.1 --locked`
+replaced 0.3.0 and `active-rpc-cli -V` prints `active-rpc-cli 0.3.1 (active-rpc
+2.2.0)`. A consumer crate with `active-rpc = "2.2.0"` mints a capability and
+gets an in-process echo response. `active-rpc 2.2.0` on crates.io is yanked
+`false`; the SBOM for the release lists 197 components.
