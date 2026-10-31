@@ -60,3 +60,42 @@ imports:  none; a module that declares any import is refused
 - Host functions are deliberately absent in v1. A v2 that imports host calls
   must route them through the same capability checks and is a new ADR.
 - Output is text in v1; binary results should use a module value later.
+
+## Addendum (2026-10-31) — ABI v2: declared host imports
+
+ABI v1 allowed no imports at all, which made a guest that needs the time or
+entropy impossible to write. ABI v2 keeps deny-by-default and lets the
+**embedder** declare a host policy per tool instance:
+
+```rust
+WasmHostPolicy { clock, random, log, max_log_bytes }   // every flag defaults to false
+WasmTool::from_bytes_with_policy(bytes, limits, policy)
+```
+
+| Import | Signature | Grant | Bound |
+|---|---|---|---|
+| `env.clock_ms` | `() -> i64` | `clock` | wall-clock milliseconds since the Unix epoch |
+| `env.random` | `(ptr u32, len u32) -> i32` | `random` | at most 64 KiB per call, OS CSPRNG; bounds-checked against guest memory |
+| `env.log` | `(ptr u32, len u32) -> i32` | `log` | at most `max_log_bytes` (policy ceiling 64 KiB) per call, captured by the host |
+
+Rules:
+
+- Construction lists the module's imports and refuses the whole module
+  (`wasm/import`) if any import is not granted. A policy flag of `false` means
+  the import must not exist, so the module cannot silently depend on it.
+- `from_bytes` keeps the v1 behavior (`WasmHostPolicy::default()`), so existing
+  guests and tests are unchanged.
+- The host functions are read-only: clock, entropy and a per-call log buffer.
+  They cannot touch the filesystem, the network, the environment or the kernel.
+- Fuel, recursion, stack, memory and output ceilings are unchanged; the log is
+  captured even when the guest traps, because it is diagnostic evidence.
+- The kernel still gates whether the tool runs at all: the capability that
+  points at the tool is the only way in, and its budget applies.
+
+Limits of the profile:
+
+- `clock_ms` is wall-clock, so a recorded session that calls a guest using it is
+  not byte-deterministic. Replay packages record the demo provider, not WASM
+  guests; keeping a guest deterministic requires it to take the time as input.
+- There is no filesystem or network import. Adding one requires a new policy
+  field, a capability-scoped path or address allow-list, and its own ADR.

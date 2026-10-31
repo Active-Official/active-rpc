@@ -5,7 +5,7 @@
 use active_rpc::cap::CapAttrs;
 use active_rpc::kernel::Provider;
 use active_rpc::value::{Arg, Value};
-use active_rpc::wasm_tool::{WasmLimits, WasmTool};
+use active_rpc::wasm_tool::{WasmHostPolicy, WasmLimits, WasmTool};
 use active_rpc::{Agent, Budget, Error};
 
 const CONSTANT: &str = r#"
@@ -295,4 +295,157 @@ fn a_limit_that_would_fail_open_is_a_configuration_error() {
             .expect_err("a fail-open limit must be refused");
         assert_eq!(error_code(Err::<(), _>(error)), "wasm/limits", "{limits:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// ABI v2: declared host imports
+// ---------------------------------------------------------------------------
+
+const CLOCK_GUEST: &str = r#"
+(module
+  (import "env" "clock_ms" (func $clock (result i64)))
+  (memory (export "memory") 2)
+  (func (export "run") (param i32) (result i32)
+    (i64.store (i32.const 65536) (call $clock))
+    i32.const 8))
+"#;
+
+const RANDOM_GUEST: &str = r#"
+(module
+  (import "env" "random" (func $random (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (func (export "run") (param i32) (result i32)
+    (drop (call $random (i32.const 0) (i32.const 8)))
+    (memory.copy (i32.const 65536) (i32.const 0) (i32.const 8))
+    i32.const 8))
+"#;
+
+const LOG_GUEST: &str = r#"
+(module
+  (import "env" "log" (func $log (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 0) "hello")
+  (func (export "run") (param i32) (result i32)
+    (drop (call $log (i32.const 0) (i32.const 5)))
+    i32.const 0))
+"#;
+
+const OVERLOG_GUEST: &str = r#"
+(module
+  (import "env" "log" (func $log (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 0) "hello")
+  (func (export "run") (param i32) (result i32)
+    (drop (call $log (i32.const 0) (i32.const 100000)))
+    i32.const 0))
+"#;
+
+const UNKNOWN_IMPORT_GUEST: &str = r#"
+(module
+  (import "env" "net" (func $net (param i32) (result i32)))
+  (memory (export "memory") 2)
+  (func (export "run") (param i32) (result i32) i32.const 0))
+"#;
+
+#[test]
+fn a_host_import_is_refused_without_a_policy() {
+    for guest in [CLOCK_GUEST, RANDOM_GUEST, LOG_GUEST] {
+        let error = WasmTool::from_bytes(guest.as_bytes(), WasmLimits::default())
+            .expect_err("v1 must refuse every import");
+        assert_eq!(error_code(Err::<(), _>(error)), "wasm/import");
+    }
+}
+
+#[test]
+fn a_granted_clock_import_returns_the_wall_clock() {
+    let policy = WasmHostPolicy {
+        clock: true,
+        ..WasmHostPolicy::default()
+    };
+    let mut tool =
+        WasmTool::from_bytes_with_policy(CLOCK_GUEST.as_bytes(), WasmLimits::default(), policy)
+            .expect("compile");
+    assert!(tool.host_policy().clock);
+    let output = tool.call(b"").expect("run");
+    assert_eq!(output.len(), 8);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&output);
+    let reported = i64::from_le_bytes(bytes);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64;
+    assert!(
+        (now - reported).abs() < 3_600_000,
+        "clock {reported} is not near {now}"
+    );
+}
+
+#[test]
+fn a_granted_random_import_fills_guest_memory() {
+    let policy = WasmHostPolicy {
+        random: true,
+        ..WasmHostPolicy::default()
+    };
+    let mut tool =
+        WasmTool::from_bytes_with_policy(RANDOM_GUEST.as_bytes(), WasmLimits::default(), policy)
+            .expect("compile");
+    let first = tool.call(b"").expect("run");
+    let second = tool.call(b"").expect("run again");
+    assert_eq!(first.len(), 8);
+    assert_eq!(second.len(), 8);
+    assert_ne!(first, second, "two CSPRNG fills matched");
+}
+
+#[test]
+fn a_granted_log_import_is_captured_and_capped() {
+    let policy = WasmHostPolicy {
+        log: true,
+        max_log_bytes: 16,
+        ..WasmHostPolicy::default()
+    };
+    let mut tool =
+        WasmTool::from_bytes_with_policy(LOG_GUEST.as_bytes(), WasmLimits::default(), policy)
+            .expect("compile");
+    tool.call(b"").expect("run");
+    assert_eq!(tool.log(), b"hello");
+    assert_eq!(tool.take_log(), b"hello");
+    assert!(tool.log().is_empty(), "take_log drains the buffer");
+
+    // A guest that asks for more than the cap gets -1 and the log stays empty.
+    let mut over =
+        WasmTool::from_bytes_with_policy(OVERLOG_GUEST.as_bytes(), WasmLimits::default(), policy)
+            .expect("compile");
+    over.call(b"").expect("run");
+    assert!(over.log().is_empty(), "the over-cap write must be refused");
+}
+
+#[test]
+fn an_unknown_import_is_refused_even_with_every_grant() {
+    let policy = WasmHostPolicy {
+        clock: true,
+        random: true,
+        log: true,
+        max_log_bytes: 128,
+    };
+    let error = WasmTool::from_bytes_with_policy(
+        UNKNOWN_IMPORT_GUEST.as_bytes(),
+        WasmLimits::default(),
+        policy,
+    )
+    .expect_err("an undeclared import must be refused");
+    assert_eq!(error_code(Err::<(), _>(error)), "wasm/import");
+}
+
+#[test]
+fn a_log_policy_over_the_ceiling_is_a_configuration_error() {
+    let policy = WasmHostPolicy {
+        log: true,
+        max_log_bytes: active_rpc::wasm_tool::MAX_HOST_LOG + 1,
+        ..WasmHostPolicy::default()
+    };
+    let error =
+        WasmTool::from_bytes_with_policy(LOG_GUEST.as_bytes(), WasmLimits::default(), policy)
+            .expect_err("an over-cap log policy must be refused");
+    assert_eq!(error_code(Err::<(), _>(error)), "wasm/limits");
 }

@@ -72,20 +72,68 @@ impl Default for WasmLimits {
     }
 }
 
+/// Host functions a guest may import (ABI v2).
+///
+/// Deny-by-default: every flag starts `false`, so a tool built without an
+/// explicit policy behaves exactly like ABI v1 and a module that imports
+/// anything is refused with `wasm/import`. Each granted import is a *declared*
+/// host capability of that tool instance; the kernel still gates whether the
+/// tool runs at all through the capability that points at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WasmHostPolicy {
+    /// `env.clock_ms() -> i64`: milliseconds since the Unix epoch.
+    pub clock: bool,
+    /// `env.random(ptr, len) -> i32`: fills guest memory from the OS CSPRNG.
+    pub random: bool,
+    /// `env.log(ptr, len) -> i32`: appends to a bounded host-side log.
+    pub log: bool,
+    /// Largest log a guest may produce in one call, in bytes.
+    pub max_log_bytes: usize,
+}
+
+/// Largest log a guest may emit in one call, whatever the policy asks for.
+pub const MAX_HOST_LOG: usize = 64 << 10;
+
+/// Largest buffer `env.random` will fill in one call.
+pub const MAX_HOST_RANDOM: u32 = 64 << 10;
+
+/// The wasmi store state: the resource ceilings and the host log.
+struct HostState {
+    limits: wasmi::StoreLimits,
+    log: Vec<u8>,
+    max_log: usize,
+}
+
 /// A sandboxed guest tool.
 pub struct WasmTool {
     engine: Engine,
     module: Module,
     limits: WasmLimits,
+    host: WasmHostPolicy,
+    /// Host log captured from the most recent call.
+    log: Vec<u8>,
 }
 
 impl WasmTool {
     /// Compile a guest from WASM bytes (or WAT text, which wasmi accepts).
+    ///
+    /// This is the ABI v1 entry point: the host policy is deny-by-default, so
+    /// any import is refused.
     pub fn from_bytes(bytes: &[u8], limits: WasmLimits) -> Result<WasmTool> {
-        // Every ceiling is validated before anything is allocated or compiled.
-        // A zero fuel budget or a zero output area would fail open (nothing to
-        // charge, nothing to bound), so they are configuration errors rather
-        // than surprises at call time.
+        Self::from_bytes_with_policy(bytes, limits, WasmHostPolicy::default())
+    }
+
+    /// Compile a guest with an explicit host policy (ABI v2).
+    ///
+    /// Every ceiling is validated before anything is allocated or compiled. A
+    /// module may import only the functions the policy grants; anything else is
+    /// refused before instantiation, so a guest can never reach a host function
+    /// the embedder did not declare.
+    pub fn from_bytes_with_policy(
+        bytes: &[u8],
+        limits: WasmLimits,
+        mut host: WasmHostPolicy,
+    ) -> Result<WasmTool> {
         if bytes.is_empty() || bytes.len() > MAX_MODULE_BYTES {
             return Err(provider("wasm/module"));
         }
@@ -99,6 +147,12 @@ impl WasmTool {
         if limits.max_output_bytes == 0 || limits.max_output_bytes > OUTPUT_OFFSET {
             return Err(provider("wasm/limits"));
         }
+        if host.max_log_bytes > MAX_HOST_LOG {
+            return Err(provider("wasm/limits"));
+        }
+        if !host.log {
+            host.max_log_bytes = 0;
+        }
         let mut config = Config::default();
         config.consume_fuel(true);
         // A recursive guest must trap on the engine's depth ceiling instead of
@@ -107,16 +161,23 @@ impl WasmTool {
         config.set_max_stack_height(MAX_STACK_BYTES);
         let engine = Engine::new(&config);
         let module = Module::new(&engine, bytes).map_err(|_| provider("wasm/module"))?;
-        // No host imports in ABI v1: anything the guest asks for is refused
-        // before instantiation, so a capability can never silently widen into a
-        // host function.
-        if module.imports().next().is_some() {
-            return Err(provider("wasm/import"));
+        for import in module.imports() {
+            let allowed = match (import.module(), import.name()) {
+                ("env", "clock_ms") => host.clock,
+                ("env", "random") => host.random,
+                ("env", "log") => host.log,
+                _ => false,
+            };
+            if !allowed {
+                return Err(provider("wasm/import"));
+            }
         }
         Ok(WasmTool {
             engine,
             module,
             limits,
+            host,
+            log: Vec::new(),
         })
     }
 
@@ -125,23 +186,118 @@ impl WasmTool {
         self.limits
     }
 
+    /// The host policy this tool was built with.
+    pub fn host_policy(&self) -> WasmHostPolicy {
+        self.host
+    }
+
+    /// The log the guest produced during the most recent call.
+    pub fn log(&self) -> &[u8] {
+        &self.log
+    }
+
+    /// Take the log produced during the most recent call.
+    pub fn take_log(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.log)
+    }
+
     /// Run the guest on `input` and return its output.
     pub fn call(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         if input.len() > OUTPUT_OFFSET {
             return Err(provider("wasm/input"));
         }
-        let store_limits = StoreLimitsBuilder::new()
+        let limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.max_memory_bytes)
             .instances(1)
             .memories(1)
             .tables(4)
             .build();
-        let mut store = Store::new(&self.engine, store_limits);
-        store.limiter(|state| state);
+        let state = HostState {
+            limits,
+            log: Vec::new(),
+            max_log: self.host.max_log_bytes,
+        };
+        let mut store = Store::new(&self.engine, state);
+        store.limiter(|state| &mut state.limits);
         store
             .set_fuel(self.limits.fuel)
             .map_err(|_| provider("wasm/fuel"))?;
-        let linker = Linker::new(&self.engine);
+        let mut linker = Linker::new(&self.engine);
+        if self.host.clock {
+            linker
+                .func_wrap("env", "clock_ms", || -> i64 {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis() as i64)
+                        .unwrap_or(0)
+                })
+                .map_err(|_| provider("wasm/import"))?;
+        }
+        if self.host.random {
+            linker
+                .func_wrap(
+                    "env",
+                    "random",
+                    |mut caller: wasmi::Caller<'_, HostState>, ptr: u32, len: u32| -> i32 {
+                        if len > MAX_HOST_RANDOM {
+                            return -1;
+                        }
+                        let Some(memory) = caller
+                            .get_export("memory")
+                            .and_then(|export| export.into_memory())
+                        else {
+                            return -1;
+                        };
+                        let mut buffer = vec![0u8; len as usize];
+                        if getrandom::fill(&mut buffer).is_err() {
+                            return -1;
+                        }
+                        let data = memory.data_mut(&mut caller);
+                        let start = ptr as usize;
+                        let Some(end) = start.checked_add(buffer.len()) else {
+                            return -1;
+                        };
+                        if end > data.len() {
+                            return -1;
+                        }
+                        data[start..end].copy_from_slice(&buffer);
+                        0
+                    },
+                )
+                .map_err(|_| provider("wasm/import"))?;
+        }
+        if self.host.log {
+            linker
+                .func_wrap(
+                    "env",
+                    "log",
+                    |mut caller: wasmi::Caller<'_, HostState>, ptr: u32, len: u32| -> i32 {
+                        let cap = caller.data().max_log;
+                        let used = caller.data().log.len();
+                        if used + len as usize > cap {
+                            return -1;
+                        }
+                        let Some(memory) = caller
+                            .get_export("memory")
+                            .and_then(|export| export.into_memory())
+                        else {
+                            return -1;
+                        };
+                        let data = memory.data(&caller);
+                        let start = ptr as usize;
+                        let Some(end) = start.checked_add(len as usize) else {
+                            return -1;
+                        };
+                        if end > data.len() {
+                            return -1;
+                        }
+                        let chunk = data[start..end].to_vec();
+                        caller.data_mut().log.extend_from_slice(&chunk);
+                        0
+                    },
+                )
+                .map_err(|_| provider("wasm/import"))?;
+        }
         let instance = linker
             .instantiate_and_start(&mut store, &self.module)
             .map_err(|_| provider("wasm/instantiate"))?;
@@ -161,6 +317,9 @@ impl WasmTool {
         let returned = match run.call(&mut store, input.len() as i32) {
             Ok(value) => value,
             Err(error) => {
+                // Keep whatever the guest logged before it trapped: the log is
+                // diagnostic evidence, not a success signal.
+                self.log = std::mem::take(&mut store.data_mut().log);
                 // wasmi reports an exhausted budget as an out-of-fuel trap.
                 let out_of_fuel = error.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel)
                     || matches!(error.kind(), wasmi::errors::ErrorKind::Fuel(_));
@@ -171,6 +330,7 @@ impl WasmTool {
                 }));
             }
         };
+        self.log = std::mem::take(&mut store.data_mut().log);
         if returned < 0 {
             return Err(provider("wasm/output"));
         }
@@ -204,7 +364,8 @@ impl Provider for WasmTool {
     }
 
     fn mutating(&self, _method: &str) -> bool {
-        // The guest has no host imports, so it cannot mutate host state.
+        // The declared host functions are read-only: a clock reading, CSPRNG
+        // bytes and a per-call log buffer. A guest cannot change host state.
         false
     }
 

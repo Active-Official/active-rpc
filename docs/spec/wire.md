@@ -217,11 +217,13 @@ grants another.
 ### WASM guest tool codes (`wasm-tools`)
 
 A `wasm_tool::WasmTool` provider reports failures as `rpc/provider` with one of
-these inner codes (ADR-0019): `wasm/module`, `wasm/import`,
+these inner codes (ADR-0019): `wasm/module`, `wasm/limits`, `wasm/import`,
 `wasm/instantiate`, `wasm/memory`, `wasm/entry`, `wasm/fuel`, `wasm/trap`,
-`wasm/input`, `wasm/output`. The guest has no host imports in ABI v1; its ABI is
-`memory` plus `run(len: i32) -> i32` with input at offset 0 and output at offset
-65536.
+`wasm/input`, `wasm/output`. The guest ABI is `memory` plus
+`run(len: i32) -> i32` with input at offset 0 and output at offset 65536. ABI v1
+allows no imports; ABI v2 lets the embedder grant `env.clock_ms`,
+`env.random(ptr, len)` and `env.log(ptr, len)` per tool instance, and refuses
+any other import with `wasm/import`.
 
 ---
 
