@@ -55,6 +55,7 @@ pub mod channel;
 pub mod domain;
 pub mod error;
 pub mod identity;
+pub mod intro;
 pub mod kernel;
 pub mod lane;
 pub mod observability;

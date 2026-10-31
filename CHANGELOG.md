@@ -16,6 +16,10 @@ unchanged.
   method, at_ms, mac }`, authenticated with a keyed hash under the kernel
   secret. Arguments and secrets never enter a receipt; `verify_receipt`
   detects edits and foreign kernels.
+- **Peer introduction modules** (ADR-0017): `Agent::intro` describes providers,
+  granted methods and the default budget ceilings as a canonical AINF module
+  that any binding can validate and hash. It carries no capability ids or
+  secrets.
 - **Payload accounting**: `Agent::call_with_payload` and
   `call_as_with_payload` charge an envelope payload against `max_bytes`; the
   CLI, examples and peer binaries use them.

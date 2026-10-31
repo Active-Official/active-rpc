@@ -418,6 +418,28 @@ impl Agent {
         Agent { cell, control }
     }
 
+    /// Describe this agent's surface as a canonical Active Infinity module.
+    ///
+    /// The module lists provider names, granted methods and the default budget
+    /// ceilings. It carries no capability ids, arguments or secrets, and its
+    /// bytes are deterministic for a given provider table.
+    pub fn intro(&self) -> Result<Vec<u8>> {
+        let (providers, budget) = {
+            let kernel = self.cell.borrow();
+            let providers: Vec<(String, Vec<String>)> = kernel
+                .providers
+                .values()
+                .map(|provider| (provider.name().to_string(), provider.methods()))
+                .collect();
+            (providers, Budget::default())
+        };
+        crate::intro::build(
+            &format!("active-rpc/{}", crate::VERSION),
+            &providers,
+            &budget,
+        )
+    }
+
     /// Enable or disable capability receipts.
     ///
     /// When enabled, every admitted call appends a [`crate::Receipt`] to a
