@@ -43,6 +43,9 @@ pub enum Error {
     PromiseAlreadyResolved(u64),
     /// The local queue or channel window is full; retry after the peer drains.
     Backpressure(&'static str),
+    /// The peer's authenticated identity is missing or does not match the
+    /// capability's binding.
+    Identity(&'static str),
     /// The call references a promise that will never resolve.
     UnresolvablePromise(u64),
     /// The provider failed the call.
@@ -88,6 +91,7 @@ impl Error {
             Error::PromiseCancelled(_) => "rpc/promise-cancelled",
             Error::PromiseAlreadyResolved(_) => "rpc/promise-resolved",
             Error::Backpressure(_) => "rpc/backpressure",
+            Error::Identity(_) => "rpc/identity",
             Error::UnresolvablePromise(_) => "rpc/unresolvable-promise",
             Error::Provider { .. } => "rpc/provider",
             Error::Domain(_) => "rpc/domain",
@@ -131,6 +135,7 @@ impl fmt::Display for Error {
             Error::PromiseCancelled(id) => write!(f, "promise {id} was cancelled"),
             Error::PromiseAlreadyResolved(id) => write!(f, "promise {id} was already resolved"),
             Error::Backpressure(what) => write!(f, "backpressure: {what}"),
+            Error::Identity(what) => write!(f, "peer identity refused: {what}"),
             Error::UnresolvablePromise(id) => write!(f, "promise {id} can never resolve"),
             Error::Provider { code } => write!(f, "provider failed: {code}"),
             Error::Domain(code) => write!(f, "domain operation failed: {code}"),

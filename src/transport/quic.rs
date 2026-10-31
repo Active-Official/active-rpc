@@ -5,9 +5,18 @@
 //! every other transport carries. Multiplexing and 0-RTT are QUIC's own; this
 //! module only adds framing.
 //!
-//! The tests start a server, move a real Infinity payload plus a capability
+//! Two server modes exist:
+//!
+//! - [`QuicServer::start`] is the development mode: a self-signed server
+//!   certificate, no client certificate. It is convenient on loopback and must
+//!   not be used for a listener reachable off-host.
+//! - [`QuicServer::start_mutual_tls`] verifies a client certificate against a
+//!   generated CA and hands the authenticated [`PeerIdentity`] to the handler,
+//!   which is what capability binding needs (see [`crate::identity`]).
+//!
+//! The tests start a real server, move an Infinity payload plus a capability
 //! table, prove a malformed frame is answered with an error envelope rather than
-//! a panic, and run an agent-to-agent pipelined call over the wire.
+//! a panic, and prove two client certificates produce two distinct identities.
 //!
 //! TLS is self-signed and loopback-only by design: internet-scale QUIC (public
 //! CA, NAT traversal, load balancing) is explicitly out of scope.
@@ -18,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::error::{Error, Result};
+use crate::identity::PeerIdentity;
 use crate::transport::{frame, read_frame, MAX_FRAME_BYTES};
 use crate::wire::{Envelope, WireLimits};
 
@@ -25,6 +35,8 @@ use crate::wire::{Envelope, WireLimits};
 pub struct QuicServer {
     address: String,
     certificate: CertificateDer<'static>,
+    ca: Option<TestCa>,
+    client: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
     runtime: tokio::runtime::Runtime,
     endpoint: quinn::Endpoint,
     task: tokio::task::JoinHandle<()>,
@@ -34,6 +46,7 @@ impl std::fmt::Debug for QuicServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuicServer")
             .field("address", &self.address)
+            .field("mutual_tls", &self.ca.is_some())
             .finish()
     }
 }
@@ -42,19 +55,65 @@ impl QuicServer {
     /// Bind a loopback server that answers `handler` for every call.
     ///
     /// `max_calls` stops the server after that many calls (0 = run until closed).
-    pub fn start<H>(max_calls: usize, handler: H) -> Result<QuicServer>
+    pub fn start<H>(max_calls: usize, mut handler: H) -> Result<QuicServer>
     where
         H: FnMut(Envelope) -> Envelope + Send + 'static,
     {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .map_err(|error| Error::Transport(format!("certificate: {error}")))?;
-        let certificate = CertificateDer::from(certified.cert.der().to_vec());
-        let key =
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
-        let mut server_config =
-            quinn::ServerConfig::with_single_cert(vec![certificate.clone()], key)
+        Self::start_inner(max_calls, move |envelope, _peer| handler(envelope), false)
+    }
+
+    /// Bind a loopback server that requires a client certificate.
+    ///
+    /// The handler receives the authenticated peer identity. The client verifier
+    /// refuses a handshake that carries no certificate, so a successful call
+    /// always carries `Some(identity)`.
+    pub fn start_mutual_tls<H>(max_calls: usize, handler: H) -> Result<QuicServer>
+    where
+        H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
+    {
+        Self::start_inner(max_calls, handler, true)
+    }
+
+    fn start_inner<H>(max_calls: usize, handler: H, mutual: bool) -> Result<QuicServer>
+    where
+        H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
+    {
+        let mut ca = None;
+        let mut client = None;
+        let (server_config, certificate) = if mutual {
+            let material = mutual_tls_material()?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(material.ca.der.clone())
+                .map_err(|error| Error::Transport(format!("client roots: {error}")))?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|error| Error::Transport(format!("client verifier: {error}")))?;
+            let tls = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![material.server.clone()],
+                    material.server_key.clone_key(),
+                )
+                .map_err(|error| Error::Transport(format!("server tls: {error}")))?;
+            let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+                .map_err(|error| Error::Transport(format!("quic config: {error}")))?;
+            let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+            config.transport_config(Arc::new(transport_config()));
+            client = Some((material.client.clone(), material.client_key));
+            ca = Some(material.ca);
+            (config, material.server)
+        } else {
+            let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .map_err(|error| Error::Transport(format!("certificate: {error}")))?;
+            let certificate = CertificateDer::from(certified.cert.der().to_vec());
+            let key =
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+            let mut config = quinn::ServerConfig::with_single_cert(vec![certificate.clone()], key)
                 .map_err(|error| Error::Transport(format!("server config: {error}")))?;
-        server_config.transport_config(Arc::new(transport_config()));
+            config.transport_config(Arc::new(transport_config()));
+            (config, certificate)
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -75,6 +134,8 @@ impl QuicServer {
         Ok(QuicServer {
             address: bound,
             certificate,
+            ca,
+            client,
             runtime,
             endpoint,
             task,
@@ -91,6 +152,33 @@ impl QuicServer {
         &self.certificate
     }
 
+    /// The certificate authority a mutual-TLS client must trust.
+    pub fn ca_certificate(&self) -> Option<&CertificateDer<'static>> {
+        self.ca.as_ref().map(|ca| &ca.der)
+    }
+
+    /// A client certificate and key signed by this server's CA.
+    pub fn client_credentials(&self) -> Option<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+        self.client
+            .as_ref()
+            .map(|(certificate, key)| (certificate.clone(), key.clone_key()))
+    }
+
+    /// Issue another client certificate from this server's test CA.
+    ///
+    /// Used to prove that two distinct peers receive distinct identities. The CA
+    /// is generated in-process and lives only for this server, so this is a
+    /// single-host facility, not a certificate authority for a deployment.
+    pub fn issue_client_credentials(
+        &self,
+        subject: &str,
+    ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+        let ca = self.ca.as_ref().ok_or(Error::TransportUnavailable(
+            "server has no mutual-TLS certificate authority",
+        ))?;
+        ca.issue_client(subject)
+    }
+
     /// Stop the server and wait for the task.
     pub fn shutdown(self) {
         self.endpoint.close(0u32.into(), b"done");
@@ -104,9 +192,104 @@ impl QuicServer {
     }
 }
 
+struct MutualMaterial {
+    ca: TestCa,
+    server: CertificateDer<'static>,
+    server_key: PrivateKeyDer<'static>,
+    client: CertificateDer<'static>,
+    client_key: PrivateKeyDer<'static>,
+}
+
+/// A throwaway certificate authority for loopback mutual TLS.
+///
+/// The key exists so a test can issue a second client certificate and prove two
+/// peers receive different identities. It never leaves the process and is not a
+/// deployment CA: a real deployment supplies CA-signed certificates and a
+/// verifier rooted in its own trust store.
+struct TestCa {
+    certificate: rcgen::Certificate,
+    /// DER encoding of `certificate`, for trust stores.
+    der: CertificateDer<'static>,
+    key: rcgen::KeyPair,
+}
+
+impl TestCa {
+    fn issue_client(
+        &self,
+        subject: &str,
+    ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+        use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair};
+        if subject.is_empty() {
+            return Err(Error::InvalidArgument(
+                "a client certificate needs a subject",
+            ));
+        }
+        let mut params = CertificateParams::new(Vec::new())
+            .map_err(|error| Error::Transport(format!("client params: {error}")))?;
+        params.distinguished_name.push(DnType::CommonName, subject);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let key = KeyPair::generate()
+            .map_err(|error| Error::Transport(format!("client key: {error}")))?;
+        let certificate = params
+            .signed_by(&key, &self.certificate, &self.key)
+            .map_err(|error| Error::Transport(format!("client cert: {error}")))?;
+        Ok((
+            CertificateDer::from(certificate.der().to_vec()),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        ))
+    }
+}
+
+/// A throwaway CA with one server certificate and one client certificate.
+fn mutual_tls_material() -> Result<MutualMaterial> {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    };
+
+    let mut ca_params = CertificateParams::new(Vec::new())
+        .map_err(|error| Error::Transport(format!("ca params: {error}")))?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "active-rpc test ca");
+    let ca_key =
+        KeyPair::generate().map_err(|error| Error::Transport(format!("ca key: {error}")))?;
+    let ca_certificate = ca_params
+        .self_signed(&ca_key)
+        .map_err(|error| Error::Transport(format!("ca cert: {error}")))?;
+    let der = CertificateDer::from(ca_certificate.der().to_vec());
+    let ca = TestCa {
+        certificate: ca_certificate,
+        der,
+        key: ca_key,
+    };
+
+    let mut server_params = CertificateParams::new(vec!["localhost".to_string()])
+        .map_err(|error| Error::Transport(format!("server params: {error}")))?;
+    server_params
+        .distinguished_name
+        .push(DnType::CommonName, "active-rpc server");
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server_key =
+        KeyPair::generate().map_err(|error| Error::Transport(format!("server key: {error}")))?;
+    let server = server_params
+        .signed_by(&server_key, &ca.certificate, &ca.key)
+        .map_err(|error| Error::Transport(format!("server cert: {error}")))?;
+
+    let (client, client_key) = ca.issue_client("active-rpc client")?;
+
+    Ok(MutualMaterial {
+        ca,
+        server: CertificateDer::from(server.der().to_vec()),
+        server_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+        client,
+        client_key,
+    })
+}
+
 async fn serve<H>(endpoint: quinn::Endpoint, handler: Arc<Mutex<H>>, max_calls: usize)
 where
-    H: FnMut(Envelope) -> Envelope + Send + 'static,
+    H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
 {
     let mut served = 0usize;
     while let Some(incoming) = endpoint.accept().await {
@@ -115,6 +298,7 @@ where
             Ok(connection) => connection,
             Err(_) => continue,
         };
+        let peer = peer_identity(&connection);
         loop {
             let (mut send, mut recv) = match connection.accept_bi().await {
                 Ok(stream) => stream,
@@ -146,7 +330,7 @@ where
                     Ok(handler) => handler,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                handler(envelope)
+                handler(envelope, peer.clone())
             };
             let _ = send_envelope(&mut send, &response).await;
             let _ = send.finish();
@@ -161,6 +345,18 @@ where
             }
         }
     }
+}
+
+/// The authenticated identity of a QUIC peer, when the session carried a
+/// certificate.
+///
+/// Only a certificate the TLS stack verified reaches this function: an
+/// unauthenticated session has no peer certificate and yields `None`.
+pub fn peer_identity(connection: &quinn::Connection) -> Option<PeerIdentity> {
+    let any = connection.peer_identity()?;
+    let chain = any.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    let leaf = chain.first()?;
+    Some(PeerIdentity::from_certificate(leaf.as_ref()))
 }
 
 fn decode_call(bytes: &[u8]) -> Result<Envelope> {
@@ -191,10 +387,6 @@ pub struct QuicClient {
 impl QuicClient {
     /// Connect, trusting `certificate` for `localhost`.
     pub fn connect(address: &str, certificate: &CertificateDer<'static>) -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| Error::Transport(format!("runtime: {error}")))?;
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(certificate.clone())
@@ -202,6 +394,40 @@ impl QuicClient {
         let mut client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots))
             .map_err(|error| Error::Transport(format!("client config: {error}")))?;
         client_config.transport_config(Arc::new(transport_config()));
+        Self::from_config(address, client_config)
+    }
+
+    /// Connect with mutual TLS: trust `ca`, present `certificate` and `key`.
+    ///
+    /// This is the client half of [`QuicServer::start_mutual_tls`]. The server
+    /// sees [`PeerIdentity::from_certificate`] for this certificate, which is
+    /// what a bound capability compares against.
+    pub fn connect_mutual_tls(
+        address: &str,
+        ca: &CertificateDer<'static>,
+        certificate: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(ca.clone())
+            .map_err(|error| Error::Transport(format!("trust: {error}")))?;
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![certificate], key)
+            .map_err(|error| Error::Transport(format!("client auth: {error}")))?;
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+            .map_err(|error| Error::Transport(format!("client quic config: {error}")))?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        client_config.transport_config(Arc::new(transport_config()));
+        Self::from_config(address, client_config)
+    }
+
+    fn from_config(address: &str, client_config: quinn::ClientConfig) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| Error::Transport(format!("runtime: {error}")))?;
         let address: SocketAddr = address
             .parse()
             .map_err(|_| Error::Transport("invalid QUIC address".to_string()))?;

@@ -22,6 +22,7 @@ that would violate one stops and needs an ADR.
 | I-10 | Fail-closed validation: malformed, truncated, overlapping, cyclic or over-budget input is rejected with a stable code. |
 | I-11 | No ambient authority: no hidden global permission in the kernel, tools or transports. |
 | I-12 | Domain operations run only under a valid capability and within budget. |
+| I-13 | Identity binding: a capability introduced to one authenticated peer is refused for every other peer. |
 
 ## 1. Assets
 
@@ -68,12 +69,16 @@ that would violate one stops and needs an ADR.
 | Shared-memory overwrite | frames are refused rather than wrapping over unread data | `shm` |
 | Stream splicing (QUIC / bridge) | one stream per call, framed length, per-frame gRPC prefix | `quic`, `connect` |
 | Resource exhaustion via lanes | per-lane call budget and lane destruction | `lane`, `Kernel::call` |
+| Capability replay by another peer | an introduced capability is bound to the peer's verified fingerprint; dispatch and channel transfer refuse a different or missing identity | `identity`, `Kernel::call_as` |
+| Loopback relaxation used off-host | the policy decides from connection addresses; `strict()` refuses loopback without a certificate | `IdentityPolicy` |
+| A claimed certificate treated as identity | only a certificate the TLS stack verified produces a `PeerIdentity`; the verifier trusts a deployment CA | `transport::quic` |
 
 ## 4. Non-goals
 
-- **Network authentication of peers.** QUIC uses a self-signed certificate on
-  loopback; a deployment terminates TLS with its own identity. Capabilities, not
-  network identity, carry authority.
+- **Network authentication as a source of authority.** TLS identity decides
+  *who* may use a capability that was introduced to them; it grants nothing by
+  itself, and a deployment roots the verifier in its own CA. Capabilities remain
+  the only authority.
 - **Confidentiality of a capability id at rest.** An id is a bearer token; store
   it like a key.
 - **Side channels.** Batch composition is observable by design (it is the

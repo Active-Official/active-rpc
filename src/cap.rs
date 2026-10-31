@@ -177,6 +177,13 @@ pub struct CapAttrs {
     pub tool_policy: Option<ToolPolicy>,
     /// Whether the capability is ephemeral or eligible for durable restore.
     pub persistence: CapPersistence,
+    /// Peer fingerprint this capability was introduced to.
+    ///
+    /// `None` means the capability is usable by any caller that holds it (the
+    /// in-process default). `Some` binds dispatch to that authenticated peer:
+    /// a call that presents a different or missing identity is refused with
+    /// `rpc/identity`. See [`crate::identity`].
+    pub bound_to: Option<[u8; crate::identity::FINGERPRINT_LEN]>,
 }
 
 impl CapAttrs {
@@ -190,6 +197,7 @@ impl CapAttrs {
             path_scope: None,
             tool_policy: None,
             persistence: CapPersistence::Ephemeral,
+            bound_to: None,
         }
     }
 
@@ -235,11 +243,33 @@ impl CapAttrs {
         self
     }
 
+    /// Bind the capability to one authenticated peer fingerprint.
+    ///
+    /// An already-bound capability cannot be rebound: use [`CapAttrs::attenuate`]
+    /// or mint a new capability instead.
+    pub fn bound_to(mut self, fingerprint: [u8; crate::identity::FINGERPRINT_LEN]) -> Self {
+        self.bound_to = Some(fingerprint);
+        self
+    }
+
+    /// True when the capability is bound to a specific peer.
+    pub fn is_bound(&self) -> bool {
+        self.bound_to.is_some()
+    }
+
     /// True when `self` is a valid attenuation of `parent`.
     pub fn is_attenuation_of(&self, parent: &CapAttrs) -> bool {
         let methods_ok = self.methods.is_subset(&parent.methods) && !self.methods.is_empty();
         let persistence_ok = self.persistence != CapPersistence::Durable
             || parent.persistence == CapPersistence::Durable;
+        // Identity binding is monotone: a bound parent stays bound to the same
+        // peer, an omitted child binding inherits the parent's, and an unbound
+        // parent may be narrowed to one peer.
+        let binding_ok = match (parent.bound_to, self.bound_to) {
+            (None, _) => true,
+            (Some(_), None) => true,
+            (Some(parent_peer), Some(child_peer)) => parent_peer == child_peer,
+        };
         let budget_ok = self.budget.is_attenuation_of(&parent.budget);
         let read_only_ok = !parent.read_only || self.read_only;
         let redact_ok = !parent.redact || self.redact;
@@ -257,7 +287,14 @@ impl CapAttrs {
             (None, Some(_)) => false,
             (Some(policy), Some(parent)) => policy.is_attenuation_of(parent),
         };
-        methods_ok && budget_ok && read_only_ok && redact_ok && path_ok && tool_ok && persistence_ok
+        methods_ok
+            && budget_ok
+            && read_only_ok
+            && redact_ok
+            && path_ok
+            && tool_ok
+            && persistence_ok
+            && binding_ok
     }
 
     /// Attenuate, refusing anything that would widen authority.
@@ -291,6 +328,12 @@ impl CapAttrs {
         let mut attrs = child;
         attrs.budget = attrs.budget.intersect(&self.budget);
         attrs.persistence = self.persistence;
+        attrs.bound_to = match (self.bound_to, attrs.bound_to) {
+            (Some(parent_peer), None) => Some(parent_peer),
+            (Some(parent_peer), Some(child_peer)) if parent_peer == child_peer => Some(parent_peer),
+            (Some(_), Some(_)) => return Err(Error::Escalation("identity binding changes")),
+            (None, child_binding) => child_binding,
+        };
         Ok(attrs)
     }
 

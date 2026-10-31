@@ -53,6 +53,7 @@ pub mod cap;
 pub mod channel;
 pub mod domain;
 pub mod error;
+pub mod identity;
 pub mod kernel;
 pub mod lane;
 pub mod promise;
@@ -68,6 +69,9 @@ pub use cap::{
 };
 pub use channel::{Channel, ChannelId, Direction, Message};
 pub use error::{Error, Result};
+pub use identity::{
+    AdmittedIdentity, IdentityKind, IdentityPolicy, PeerIdentity, TrustLevel, FINGERPRINT_LEN,
+};
 pub use kernel::{Agent, Event, Metrics, PromiseHandle, Provider};
 pub use lane::{Lane, LaneId};
 pub use promise::{PromiseId, PromiseState};

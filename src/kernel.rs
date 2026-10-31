@@ -25,6 +25,7 @@ use crate::budget::{Budget, BudgetMeter};
 use crate::cap::{CapAttrs, CapControl, CapHandle, CapId, CapRecord, ProviderId, ToolPolicy};
 use crate::channel::{Channel, ChannelId, Direction, Message};
 use crate::error::{Error, Result};
+use crate::identity::{PeerIdentity, FINGERPRINT_LEN};
 use crate::lane::{Lane, LaneId};
 use crate::promise::{PromiseId, PromiseRecord, PromiseState};
 use crate::value::{Arg, Call, Response, Value};
@@ -113,6 +114,13 @@ pub enum Event {
     CapDropped(CapId),
     /// A capability was revoked.
     CapRevoked(CapId),
+    /// A capability was introduced to an authenticated peer and bound to it.
+    CapIntroduced {
+        /// Introduced capability.
+        cap: CapId,
+        /// Peer fingerprint the capability is now bound to.
+        fingerprint: [u8; FINGERPRINT_LEN],
+    },
     /// A lane was created.
     LaneCreated(LaneId),
     /// A lane was destroyed.
@@ -225,6 +233,8 @@ pub struct Metrics {
     pub promises_double_settled: u64,
     /// Calls refused because the local queue ceiling was reached.
     pub backpressure_refusals: u64,
+    /// Calls refused because the peer's identity did not match the capability.
+    pub identity_refusals: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +481,69 @@ impl Agent {
         Ok(CapHandle::new(Rc::clone(&self.control), id))
     }
 
+    /// Mint a capability bound to one authenticated peer.
+    ///
+    /// The binding is recorded on the capability and enforced at dispatch: the
+    /// same id presented by another peer, or with no identity, is refused with
+    /// `rpc/identity`.
+    pub fn mint_bound(
+        &self,
+        peer: &PeerIdentity,
+        provider: ProviderId,
+        object: u64,
+        attrs: CapAttrs,
+    ) -> Result<CapHandle> {
+        if peer.is_anonymous() {
+            return Err(Error::Identity(
+                "cannot bind a capability to an anonymous peer",
+            ));
+        }
+        self.mint(provider, object, attrs.bound_to(peer.fingerprint()))
+    }
+
+    /// Introduce an existing capability to a peer.
+    ///
+    /// Binds the capability to that peer's authenticated fingerprint and returns
+    /// the descriptor to send over the transport. A capability already bound to
+    /// a different peer is refused rather than rebound, so introduction can
+    /// never move authority between principals.
+    pub fn introduce_to(
+        &self,
+        cap: &CapHandle,
+        peer: &PeerIdentity,
+    ) -> Result<crate::wire::CapDescriptor> {
+        if peer.is_anonymous() {
+            return Err(Error::Identity(
+                "cannot introduce a capability to an anonymous peer",
+            ));
+        }
+        let fingerprint = peer.fingerprint();
+        let mut kernel = self.cell.borrow_mut();
+        let record = kernel
+            .caps
+            .get_mut(&cap.id())
+            .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+        if record.revoked {
+            return Err(Error::Revoked(cap_token(cap.id())));
+        }
+        match record.attrs.bound_to {
+            Some(bound) if bound != fingerprint => {
+                return Err(Error::Identity(
+                    "capability is already bound to another peer",
+                ))
+            }
+            _ => {}
+        }
+        record.attrs.bound_to = Some(fingerprint);
+        let descriptor = crate::wire::CapDescriptor::from_attrs(record.id, &record.attrs);
+        let introduced = record.id;
+        kernel.push_event(Event::CapIntroduced {
+            cap: introduced,
+            fingerprint,
+        });
+        Ok(descriptor)
+    }
+
     /// Attenuate a capability. Refuses any widening.
     pub fn attenuate(&self, parent: &CapHandle, attrs: CapAttrs) -> Result<CapHandle> {
         let parent_id = parent.id();
@@ -662,6 +735,23 @@ impl Agent {
         payload: Value,
         caps: &[CapHandle],
     ) -> Result<u64> {
+        self.send_as(None, lane, channel, payload, caps)
+    }
+
+    /// Send a message on behalf of the peer the transport authenticated.
+    ///
+    /// A capability bound to a peer may only be sent by that peer, and a bound
+    /// capability cannot be transferred at all: a channel cannot prove who will
+    /// read the message, so delegation across an identity boundary must use
+    /// [`Agent::introduce_to`] explicitly.
+    pub fn send_as(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        channel: ChannelId,
+        payload: Value,
+        caps: &[CapHandle],
+    ) -> Result<u64> {
         let mut kernel = self.cell.borrow_mut();
         let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
         if lane_record.closed {
@@ -684,6 +774,17 @@ impl Agent {
                 .ok_or(Error::InvalidArgument("unknown capability"))?;
             if record.revoked {
                 return Err(Error::Revoked(cap_token(cap.id())));
+            }
+            if let Some(bound) = record.attrs.bound_to {
+                let presented = peer.map(|identity| identity.fingerprint());
+                if presented != Some(bound) {
+                    return Err(Error::Identity(
+                        "capability is bound to a different peer identity",
+                    ));
+                }
+                return Err(Error::Identity(
+                    "a bound capability cannot be transferred over a channel",
+                ));
             }
             // A channel shares (borrows) the capability: the id travels with
             // the message and the sender keeps its handle. No reference is
@@ -736,8 +837,25 @@ impl Agent {
         method: &str,
         args: Vec<Arg>,
     ) -> Result<PromiseHandle> {
+        self.call_as(None, lane, cap, method, args)
+    }
+
+    /// Issue a call on behalf of the peer the transport authenticated.
+    ///
+    /// `None` means no identity was presented. A capability bound with
+    /// [`Agent::introduce_to`] is refused unless the presented fingerprint
+    /// matches, which is how a capability handed to one peer stays useless to
+    /// every other one.
+    pub fn call_as(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+    ) -> Result<PromiseHandle> {
         let cap_id = cap.id();
-        let result = self.call_inner(lane, cap, method, args);
+        let result = self.call_inner(peer, lane, cap, method, args);
         if let Err(error) = &result {
             let mut kernel = self.cell.borrow_mut();
             kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
@@ -759,6 +877,10 @@ impl Agent {
                     kernel.metrics.backpressure_refusals =
                         kernel.metrics.backpressure_refusals.saturating_add(1);
                 }
+                Error::Identity(_) => {
+                    kernel.metrics.identity_refusals =
+                        kernel.metrics.identity_refusals.saturating_add(1);
+                }
                 Error::ToolPolicy(reason) => {
                     kernel.metrics.tool_refusals = kernel.metrics.tool_refusals.saturating_add(1);
                     kernel.push_event(Event::ToolRefused {
@@ -774,6 +896,7 @@ impl Agent {
 
     fn call_inner(
         &self,
+        peer: Option<&PeerIdentity>,
         lane: LaneId,
         cap: &CapHandle,
         method: &str,
@@ -788,6 +911,17 @@ impl Agent {
             .clone();
         if record.revoked {
             return Err(Error::Revoked(cap_token(cap_id)));
+        }
+        // Identity binding is checked before any authority is exercised: a
+        // capability introduced to one peer must be useless to another, even
+        // with the exact same id.
+        if let Some(bound) = record.attrs.bound_to {
+            let presented = peer.map(|identity| identity.fingerprint());
+            if presented != Some(bound) {
+                return Err(Error::Identity(
+                    "capability is bound to a different peer identity",
+                ));
+            }
         }
         let (lane_closed, lane_capacity, lane_budget) = {
             let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;

@@ -93,3 +93,7 @@ path = "tests/doc_gate.rs"
 [[test]]
 name = "property_tests"
 path = "tests/property_tests.rs"
+
+[[test]]
+name = "identity_tests"
+path = "tests/identity_tests.rs"

@@ -173,6 +173,7 @@ a message.
 | `rpc/promise-cancelled` | the promise was cancelled |
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
 | `rpc/backpressure` | the local call queue or channel window is full |
+| `rpc/identity` | the peer's authenticated identity is missing or does not match the capability's binding |
 | `rpc/unresolvable-promise` | the promise can never settle |
 | `rpc/provider` | the provider failed the call |
 | `rpc/domain` | an Active or Infinity domain operation failed (the message carries the Active class, e.g. `X001`) |
@@ -194,7 +195,7 @@ a message.
 | in-process | none | envelopes move by value; `bytes_written() == 0` |
 | TCP | `u32` length + envelope | cross-process, `MAX_FRAME_BYTES` = 64 MiB |
 | shared memory | `u32` length + envelope in a ring | zero-copy reads via `with_frame` |
-| QUIC | `u32` length + envelope on one bi-directional stream, one stream per call | TLS with a self-signed certificate on loopback |
+| QUIC | `u32` length + envelope on one bi-directional stream, one stream per call | TLS with a self-signed certificate on loopback; `start_mutual_tls` verifies a client certificate and exposes the authenticated peer identity |
 | Connect/gRPC | HTTP/1.1 `POST /active.rpc.v1.Agent/Call`, body framed as `[0][len u32 BE][envelope]`, content type `application/connect+active-infinity` or `application/grpc+active-infinity` | a malformed frame is a `400` with an `rpc/…` body; the same framing fits an HTTP/2 gRPC server |
 
 A malformed frame is always an error at the frame boundary: no transport retries,
