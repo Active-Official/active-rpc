@@ -128,6 +128,16 @@ round-trip count. A dependency chain does the same work in one dispatch and
 therefore one batch, which is what removes the per-hop latency of a real
 transport.
 
+### Subgraph materialization
+
+`why` and `impact` already return label lists computed over the cone; they never
+build a module, so there is nothing to make lazy there. `subgraph` must return a
+module, and the C-7 audit found it cloned every reachable node twice (once into
+the destination, once to rewrite its children). It now allocates the destination
+ids first, then copies each node once with references rewritten
+(`domain::restrict`). The result is byte-identical; the work is one clone per
+node instead of two.
+
 ### The gate
 
 `scripts/perf_gate.py` enforces tail stability (p95 ≤ 4× p50, or 5x for a
