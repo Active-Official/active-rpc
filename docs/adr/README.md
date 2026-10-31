@@ -15,3 +15,4 @@
 | [0011](0011-transport-identity.md) | Transport identity and capability binding |
 | [0012](0012-http2-transport.md) | A native HTTP/2 transport for ARP1 |
 | [0013](0013-bulk-transfer.md) | Bulk (carousel) transfer with per-chunk hashes |
+| [0014](0014-observability-schema.md) | An observability schema that carries no authority |

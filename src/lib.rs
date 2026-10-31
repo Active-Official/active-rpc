@@ -57,6 +57,7 @@ pub mod error;
 pub mod identity;
 pub mod kernel;
 pub mod lane;
+pub mod observability;
 pub mod promise;
 pub mod security;
 pub mod tool;

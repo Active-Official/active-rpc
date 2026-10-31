@@ -1366,6 +1366,50 @@ impl Agent {
         self.cell.borrow().jobs.len()
     }
 
+    /// Project the retained event window into the observability schema.
+    ///
+    /// Sequences are monotonic across evictions: a reader can page with
+    /// `last_sequence + 1` without missing or repeating a record.
+    pub fn trace(&self) -> Vec<crate::observability::TraceEvent> {
+        let kernel = self.cell.borrow();
+        let total = kernel.events_total;
+        let len = kernel.events.len() as u64;
+        let first = total.saturating_sub(len);
+        kernel
+            .events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| crate::observability::project(event, first + index as u64))
+            .collect()
+    }
+
+    /// The retained events as one JSON array in the observability schema.
+    pub fn trace_json(&self) -> String {
+        crate::observability::to_json_array(&self.trace())
+    }
+
+    /// Counters and gauges as JSON (`active-rpc/metrics/1`).
+    pub fn metrics_json(&self) -> String {
+        let metrics = self.metrics();
+        crate::observability::metrics_json(
+            &metrics,
+            self.promise_count(),
+            self.job_count(),
+            self.lane_count(),
+            self.channel_count(),
+        )
+    }
+
+    /// Number of live lanes.
+    pub fn lane_count(&self) -> usize {
+        self.cell.borrow().lanes.len()
+    }
+
+    /// Number of live channels.
+    pub fn channel_count(&self) -> usize {
+        self.cell.borrow().channels.len()
+    }
+
     /// Lane statistics.
     pub fn lane(&self, lane: LaneId) -> Result<Lane> {
         self.cell

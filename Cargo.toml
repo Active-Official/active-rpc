@@ -110,3 +110,7 @@ path = "tests/http2_tests.rs"
 [[test]]
 name = "bulk_tests"
 path = "tests/bulk_tests.rs"
+
+[[test]]
+name = "observability_tests"
+path = "tests/observability_tests.rs"

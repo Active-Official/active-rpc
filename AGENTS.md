@@ -5,10 +5,11 @@ security bug, not a formatting bug.
 
 ## Read first
 
-1. `docs/spec/wire.md` — envelope, capability table, error codes.
-2. `docs/spec/security.md` — threats and controls.
-3. `docs/adr/` — kernel design, transports, capability identity, promises.
-4. `CHECKLIST.md` / `PROPOSAL.md` — plan and context.
+1. `docs/spec/wire.md` - envelope, capability table, transports, bulk frames, error codes.
+2. `docs/spec/security.md` - threats and controls.
+3. `docs/spec/observability.md` - event and metrics schemas (correlation ids only).
+4. `docs/adr/` - kernel design, transports, identity, bulk, observability, promises.
+5. `CHECKLIST.md` / `PROPOSAL.md` - plan and context.
 
 ## Non-negotiable invariants
 
@@ -16,6 +17,9 @@ security bug, not a formatting bug.
 - Attenuation is monotone; widening is an error.
 - Budget is charged before work and never exceeds capability ∩ lane.
 - `Value::Secret` is the only secret representation on the wire.
+- A capability introduced to one peer is refused for every other peer
+  (`rpc/identity`); bulk frames are data, never authority.
+- Telemetry carries correlation ids, never raw capability ids or arguments.
 - The kernel stays deterministic: no I/O, threads or clocks; add an event.
 - `#![forbid(unsafe_code)]` stays.
 
