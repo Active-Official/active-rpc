@@ -8,7 +8,7 @@ use active_rpc::cap::CapAttrs;
 use active_rpc::channel::Direction;
 use active_rpc::identity::{IdentityKind, IdentityPolicy, PeerIdentity, TrustLevel};
 use active_rpc::value::{Arg, Call, Response, Value};
-use active_rpc::{Agent, Budget, Envelope, Provider};
+use active_rpc::{Agent, Budget, Provider};
 
 struct Echo;
 
@@ -275,6 +275,8 @@ fn a_bound_capability_cannot_be_transferred_over_a_channel() {
 #[test]
 fn quic_mutual_tls_delivers_distinct_peer_identities_and_refuses_anonymous_clients() {
     use std::sync::mpsc;
+
+    use active_rpc::Envelope;
 
     let (tx, rx) = mpsc::channel::<String>();
     let server =

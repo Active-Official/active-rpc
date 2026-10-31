@@ -49,6 +49,7 @@
 #![deny(missing_docs)]
 
 pub mod budget;
+pub mod bulk;
 pub mod cap;
 pub mod channel;
 pub mod domain;

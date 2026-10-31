@@ -199,6 +199,7 @@ fn every_error_code_is_unique_and_documented() {
         Error::PromiseAlreadyResolved(1),
         Error::Backpressure("queue"),
         Error::Identity("peer"),
+        Error::Bulk("chunk"),
         Error::UnresolvablePromise(1),
         Error::Provider { code: "x".into() },
         Error::Domain("X001"),

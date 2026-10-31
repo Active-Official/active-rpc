@@ -174,6 +174,7 @@ a message.
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
 | `rpc/backpressure` | the local call queue or channel window is full |
 | `rpc/identity` | the peer's authenticated identity is missing or does not match the capability's binding |
+| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash |
 | `rpc/unresolvable-promise` | the promise can never settle |
 | `rpc/provider` | the provider failed the call |
 | `rpc/domain` | an Active or Infinity domain operation failed (the message carries the Active class, e.g. `X001`) |
@@ -223,3 +224,37 @@ guesses or forwards a partially decoded envelope.
    are redacted projections.
 5. The envelope can be re-encoded to the same bytes.
 6. Value nesting stays within 64 levels.
+
+---
+
+---
+
+## 9. Bulk transfer frames
+
+A body larger than one frame travels as a plan plus chunk frames (ADR-0013).
+Both are ordinary transport frames; the layouts below are little-endian unless
+stated.
+
+**Plan** (`ARBL`):
+
+```text
+"ARBL" | version u8 | chunk_size u32 | total u64 | chunk_count u32 | root [32]
+       | chunk_hash [32] * chunk_count
+```
+
+`root = Blake3("active-rpc/bulk-root/v1\0", version, chunk_size, total, count, hashes)`.
+A decoder recomputes the root and refuses a plan that does not match it.
+
+**Chunk** (`ARBC`):
+
+```text
+"ARBC" | version u8 | index u32 | offset u64 | length u32 | hash [32] | bytes
+```
+
+`offset` must equal `index * chunk_size`, `length` must match the plan, and
+`hash = Blake3("active-rpc/bulk-chunk/v1\0", bytes)`. A duplicate chunk with
+identical bytes is idempotent; conflicting bytes are `rpc/bulk`. A receiver
+assembles only after every index is present and the root verifies.
+
+A bulk body is data, never authority: authority stays on the ARP1 envelope that
+opens the transfer.

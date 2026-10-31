@@ -14,3 +14,4 @@
 | [0010](0010-durable-capabilities.md) | Durable versus ephemeral capabilities |
 | [0011](0011-transport-identity.md) | Transport identity and capability binding |
 | [0012](0012-http2-transport.md) | A native HTTP/2 transport for ARP1 |
+| [0013](0013-bulk-transfer.md) | Bulk (carousel) transfer with per-chunk hashes |
