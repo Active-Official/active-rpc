@@ -69,6 +69,16 @@ peeled to `9f1348cc7b270ad7165b43545dfeaf69d19ff9bc`.
 Install verification: `cargo install active-rpc-cli --version 0.3.0 --locked`
 then `doctor` and a real `peer`/`call` round trip from the registry build.
 
+### Release objects
+
+| Tag | Active-Official | RatioArtificiosa | Assets |
+|-----|-----------------|------------------|--------|
+| `v2.2.0` | https://github.com/Active-Official/active-rpc/releases/tag/v2.2.0 | https://github.com/RatioArtificiosa/active-rpc/releases/tag/v2.2.0 | `active-rpc-2.2.0.cdx.json` (197 components) |
+
+Both are marked **Latest** (`gh api repos/<owner>/active-rpc/releases/latest`
+returns `v2.2.0`). The notes summarise the release, the hardening and the
+verification; the tag is verified with `--verify-tag` at creation.
+
 A CLI-only patch release is recorded here with its commit and does not move the
 library tag: the tag names the library version, and the CLI has its own.
 

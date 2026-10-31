@@ -11,6 +11,8 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 | CLI | `active-rpc-cli` 0.3.1 |
 | ARP1 envelope | unchanged through the maturity program |
 | CI | every job green on both `Active-Official` and `RatioArtificiosa` at the release commit |
+| Tag | signed `v2.2.0`, identical object on both orgs |
+| GitHub Release | [Active-Official](https://github.com/Active-Official/active-rpc/releases/tag/v2.2.0) and [RatioArtificiosa](https://github.com/RatioArtificiosa/active-rpc/releases/tag/v2.2.0), marked Latest, with `active-rpc-2.2.0.cdx.json` |
 
 ## Phase status
 
