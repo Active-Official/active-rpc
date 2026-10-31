@@ -186,6 +186,22 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: control-plane
 
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # End-to-end CLI contract: real peer, real capability, real transports
+      # (tcp, connect, http2), refusals, pipelining and load generation.
+      - name: CLI tests
+        run: cargo test --locked
+        working-directory: cli/active-rpc-cli
+      - name: CLI lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: cli/active-rpc-cli
+
 
   facades:
     runs-on: ubuntu-latest

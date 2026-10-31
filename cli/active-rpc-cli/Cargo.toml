@@ -1,0 +1,23 @@
+[package]
+name = "active-rpc-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "Production CLI for Active RPC: peer, call, pipeline, loadgen, bridge, events and doctor"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+documentation = "https://docs.rs/active-rpc-cli"
+readme = "README.md"
+keywords = ["active", "rpc", "cli", "capability", "agents"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+active-rpc = { path = "../..", version = "2.0.0", features = ["quic", "http2"] }
+serde_json = "1"
+rustls-pki-types = "1"
+
+[[bin]]
+name = "active-rpc-cli"
+path = "src/main.rs"
