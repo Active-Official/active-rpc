@@ -1,10 +1,16 @@
 # Changelog - Active RPC
 
-## Unreleased
+## 2.1.0 - 2026-10-31
 
 Additive transport and telemetry work from the Active Maturity Program. The
 `ARP1` envelope layout is unchanged; new code strings extend the error
 vocabulary.
+
+### Tooling
+
+- **`active-rpc-cli` 0.2.0**: `doctor`, `peer` (tcp, connect, http2, quic),
+  `call`, `pipeline`, `loadgen`, `bridge`, `events`, stable exit codes and
+  end-to-end tests that spawn a real kernel peer.
 
 ### Added
 

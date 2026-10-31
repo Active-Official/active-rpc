@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "active-rpc"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "active-core",
  "active-infinity",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "active-rpc-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "active-rpc",
  "rustls-pki-types",

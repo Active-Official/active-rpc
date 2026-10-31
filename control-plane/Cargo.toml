@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 active-infinity = { version = "2.1.0", features = ["active-core", "json"] }
-active-rpc = { path = "..", version = "2.0.0" }
+active-rpc = { path = "..", version = "2.1.0" }
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 crossbeam-channel = "0.5"
