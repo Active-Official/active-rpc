@@ -1,6 +1,10 @@
 # Changelog - Active RPC
 
-## Unreleased
+## 2.2.0 - 2026-10-31
+
+Maturity release for the Active Maturity Program: time-bounded capabilities,
+receipts, replay packages, WASM guest tools and topic-filtered pub/sub on top of
+2.1.0. The ARP1 envelope layout is unchanged.
 
 Additive work from the hardening and innovation phases. The `ARP1` layout is
 unchanged.

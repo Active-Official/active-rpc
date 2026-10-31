@@ -46,6 +46,12 @@ Exit codes are stable: `0` success, `1` refusal or failed request (for example
 page is [`docs/man/active-rpc-cli.1`](docs/man/active-rpc-cli.1); the full
 reference is [`cli/active-rpc-cli/README.md`](cli/active-rpc-cli/README.md).
 
+### Measured performance
+
+[`docs/spec/performance.md`](docs/spec/performance.md) records the measured
+encode/dispatch tables, the protocol bakeoff and the `perf-gate` regression
+policy; the baseline is [`docs/spec/perf-baseline.json`](docs/spec/perf-baseline.json).
+
 ---
 
 ## The thirty-second version
