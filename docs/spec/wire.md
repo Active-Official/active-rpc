@@ -196,7 +196,8 @@ a message.
 | TCP | `u32` length + envelope | cross-process, `MAX_FRAME_BYTES` = 64 MiB |
 | shared memory | `u32` length + envelope in a ring | zero-copy reads via `with_frame` |
 | QUIC | `u32` length + envelope on one bi-directional stream, one stream per call | TLS with a self-signed certificate on loopback; `start_mutual_tls` verifies a client certificate and exposes the authenticated peer identity |
-| Connect/gRPC | HTTP/1.1 `POST /active.rpc.v1.Agent/Call`, body framed as `[0][len u32 BE][envelope]`, content type `application/connect+active-infinity` or `application/grpc+active-infinity` | a malformed frame is a `400` with an `rpc/…` body; the same framing fits an HTTP/2 gRPC server |
+| HTTP/2 | `POST /active.rpc.v1.Agent/Call`, body is the bare envelope, content type `application/arp1` | feature `http2`; one connection, concurrent streams; a non-200 answer carries an `rpc/...` body |
+| Connect/gRPC | HTTP/1.1 `POST /active.rpc.v1.Agent/Call`, body framed as `[0][len u32 BE][envelope]`, content type `application/connect+active-infinity` or `application/grpc+active-infinity` | a malformed frame is a `400` with an `rpc/...` body; HTTP/1.1, one request per connection |
 
 A malformed frame is always an error at the frame boundary: no transport retries,
 guesses or forwards a partially decoded envelope.

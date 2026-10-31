@@ -25,6 +25,8 @@ use crate::error::{Error, Result};
 use crate::wire::{Envelope, WireLimits};
 
 pub mod connect;
+#[cfg(feature = "http2")]
+pub mod http2;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod shm;

@@ -24,6 +24,8 @@ exclude = [
 default = ["quic"]
 # Real QUIC transport over loopback (quinn + rustls).
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio"]
+# Native HTTP/2 transport carrying raw ARP1 envelopes.
+http2 = ["dep:h2", "dep:http", "dep:bytes", "dep:tokio"]
 
 [dependencies]
 active-infinity = "2.1.0"
@@ -36,6 +38,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rcgen = { version = "0.13", optional = true }
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 proptest = "1"
@@ -97,3 +102,7 @@ path = "tests/property_tests.rs"
 [[test]]
 name = "identity_tests"
 path = "tests/identity_tests.rs"
+
+[[test]]
+name = "http2_tests"
+path = "tests/http2_tests.rs"
