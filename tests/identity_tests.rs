@@ -356,3 +356,136 @@ fn quic_mutual_tls_delivers_distinct_peer_identities_and_refuses_anonymous_clien
     assert_eq!(observed, vec![first_expected, second_expected]);
     server.shutdown();
 }
+
+/// A capability bound to a QUIC peer is dispatched only for that peer.
+///
+/// The handler runs on the transport thread, so the kernel stays on the main
+/// thread: each request is forwarded with the peer identity the TLS handshake
+/// proved, dispatched with `call_as`, and answered. The same capability id
+/// presented by a second, validly authenticated client is refused with
+/// `rpc/identity`; a client with no certificate never completes the handshake.
+#[cfg(feature = "quic")]
+#[test]
+fn quic_dispatches_a_bound_capability_only_for_the_bound_peer() {
+    use std::sync::mpsc;
+    use std::thread;
+
+    use active_rpc::cap::CapAttrs;
+    use active_rpc::wire::{CapDescriptor, Envelope, Kind};
+    use active_rpc::{Budget, CapHandle};
+
+    let (tx, rx) = mpsc::channel::<(Envelope, Option<PeerIdentity>, mpsc::Sender<Envelope>)>();
+    let server = active_rpc::transport::quic::QuicServer::start_mutual_tls(
+        2,
+        move |envelope: Envelope, peer: Option<PeerIdentity>| {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if tx.send((envelope, peer, reply_tx)).is_err() {
+                return Envelope::error(0, &active_rpc::Error::Transport("kernel gone".into()));
+            }
+            reply_rx.recv().unwrap_or_else(|_| {
+                Envelope::error(0, &active_rpc::Error::Transport("kernel dropped".into()))
+            })
+        },
+    )
+    .expect("start mutual-tls server");
+    let address = server.address().to_string();
+    let ca = server.ca_certificate().cloned().expect("ca");
+    let (owner_cert, owner_key) = server.client_credentials().expect("owner credentials");
+    let owner_peer = PeerIdentity::from_certificate(owner_cert.as_ref());
+    let (stranger_cert, stranger_key) = server
+        .issue_client_credentials("active-rpc quic stranger")
+        .expect("stranger credentials");
+    assert_ne!(
+        owner_peer.fingerprint(),
+        PeerIdentity::from_certificate(stranger_cert.as_ref()).fingerprint()
+    );
+
+    let agent = Agent::with_secret([0x57; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let admitted = admitted(&owner_peer);
+    let cap: CapHandle = agent
+        .mint_bound(&admitted, provider, 0, CapAttrs::new(&["echo"]))
+        .expect("bound cap");
+    let lane = agent.create_lane("quic", Budget::default()).expect("lane");
+    let descriptor = CapDescriptor {
+        id: cap.id(),
+        methods: ["echo".to_string()].into_iter().collect(),
+        budget: Budget::default(),
+        read_only: false,
+        redact: false,
+        path_scope: None,
+    };
+
+    fn request(id: u64, descriptor: &CapDescriptor) -> Envelope {
+        let mut envelope = Envelope::request(
+            id,
+            "echo",
+            vec![active_rpc::value::Arg::Value(Value::text("quic"))],
+        );
+        envelope.caps = vec![descriptor.clone()];
+        envelope
+    }
+
+    let owner_address = address.clone();
+    let owner_ca = ca.clone();
+    let owner_descriptor = descriptor.clone();
+    let owner = thread::spawn(move || {
+        let client = active_rpc::transport::quic::QuicClient::connect_mutual_tls(
+            &owner_address,
+            &owner_ca,
+            owner_cert,
+            owner_key,
+        )
+        .expect("owner client");
+        client
+            .call(&request(1, &owner_descriptor))
+            .expect("owner call")
+    });
+    let stranger_address = address.clone();
+    let stranger_ca = ca.clone();
+    let stranger_descriptor = descriptor.clone();
+    let stranger = thread::spawn(move || {
+        let client = active_rpc::transport::quic::QuicClient::connect_mutual_tls(
+            &stranger_address,
+            &stranger_ca,
+            stranger_cert,
+            stranger_key,
+        )
+        .expect("stranger client");
+        client
+            .call(&request(2, &stranger_descriptor))
+            .expect("stranger call")
+    });
+
+    for (envelope, peer, reply) in rx {
+        let presented = peer.as_ref();
+        let imported = agent.import(
+            envelope
+                .caps
+                .first()
+                .map(|descriptor| descriptor.id)
+                .expect("descriptor"),
+        );
+        let response =
+            match agent.call_as(presented, lane, &imported, "echo", envelope.args.clone()) {
+                Ok(promise) => {
+                    agent.run();
+                    match promise.value() {
+                        Ok(value) => Envelope::response(envelope.request_id, value),
+                        Err(error) => Envelope::error(envelope.request_id, &error),
+                    }
+                }
+                Err(error) => Envelope::error(envelope.request_id, &error),
+            };
+        let _ = reply.send(response);
+    }
+
+    let owner_response = owner.join().expect("owner thread");
+    assert_eq!(owner_response.kind, Kind::Response);
+    assert_eq!(owner_response.first_value(), Some(&Value::text("quic")));
+
+    let stranger_response = stranger.join().expect("stranger thread");
+    assert_eq!(stranger_response.kind, Kind::Error);
+    assert_eq!(stranger_response.method, "rpc/identity");
+    server.shutdown();
+}

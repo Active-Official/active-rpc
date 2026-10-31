@@ -144,3 +144,28 @@ timing differences that remain are:
 No secret value is compared, ordered, hashed for equality, or branched on inside
 the kernel. `Value::Secret` has no equality; the anti-oracle test asserts that
 comparing a secret with itself, or with another secret, never yields `true`.
+
+## 8. Capability maximum (absolute-max baseline)
+
+The table maps every trait in the Absolute Max proposal (§2.2) to the code that
+enforces it and the test that would fail if the enforcement were removed. A
+`planned` row names the checklist item that lands it; nothing in this table is
+aspirational without a date.
+
+| Trait | Enforcement | Evidence | Status |
+|---|---|---|---|
+| Unforgeable | `CapId::derive` from the kernel secret; registry lookup on every dispatch; foreign ids are unknown | `capability_ids_are_unforgeable`, H2.8/H2.42, `tests/fuzz_regression_tests.rs` | enforced |
+| Attenuation monotonic | `CapAttrs::attenuate` refuses any widening of methods, all seven budget fields, read-only, redaction, path, topics, TTL, tool policy, persistence or binding | `attenuation_accepts_exactly_the_monotone_children`, `widening_any_single_attribute_is_refused`, `attenuation_is_monotone`, H2.9 | enforced |
+| Revoke at dispatch | `Kernel::dispatch` re-reads the record and refuses a revoked or expired capability before the provider runs | `revoke_at_dispatch_is_always_enforced`, `dispatch_authority_matrix`, H2.10 | enforced |
+| TTL | `CapAttrs::ttl_ms` becomes an absolute deadline; checked at queue, at dispatch, and on every other authority entry | `tests/cap_ttl_tests.rs`, `dispatch_authority_matrix` | enforced (virtual clock; ADR for wall clock under M-3.4) |
+| Budgets | Capability budget ∩ lane budget, charged before the call; queue/promise/job ceilings fail closed | `tests/backpressure_tests.rs`, `tests/payload_budget.rs`, `tests/concurrency_tests.rs` | enforced |
+| Method/path scope | `grants` and `covers_path` run before the provider; path arguments are checked against the scope | H2.29, `tests/redteam_tests.rs` | enforced |
+| Identity binding | `bound_to` is compared with the transport-authenticated `PeerIdentity` at every entry; rebinding is an escalation | `tests/identity_tests.rs` (TCP, Connect, HTTP/2, QUIC), `tests/transport_binding_matrix.rs` | enforced |
+| Tool/WASM scope | `ToolPolicy` allowlist and argument ceiling; the WASM host has no imports in ABI v1 and bounds fuel, memory, recursion and output | `tests/mcp_hardening_tests.rs`, `tests/wasm_tool_tests.rs` | enforced (host ABI v2 under M-3.3) |
+| Promise safety | A pipelined call runs under its own capability; a promise carries a value, never authority; a refused dependency stops the chain; cycles are refused | H2.26, H2.47, `a_refused_dependency_stops_the_pipeline` | enforced |
+| Lane isolation | Per-lane budgets and closed lanes; destroying a lane removes its queued work | `tests/concurrency_tests.rs`, `dispatch_authority_matrix` | enforced |
+| Transfer explicit | Capabilities move only as `Arg::Cap` or channel messages; a bound capability cannot cross a channel | `a_bound_capability_cannot_be_transferred_over_a_channel` | enforced |
+| Durable receipts | In-memory ring today; a durable, exportable log is the next step | `tests/receipts_tests.rs` | planned (M-3.1) |
+| Durable capabilities | `CapPersistence::Durable` is refused by policy until a restore profile exists | `tests/persistence_tests.rs` | planned profile (M-3.2) |
+| Topic filters | `CapAttrs::topics` restricts `publish`; attenuation only narrows | `tests/topic_tests.rs` | enforced |
+| No oracle | Secrets never compare, never render, never enter a receipt; capability ids are correlated for telemetry | `tests/invariant_gate.rs`, H2.43, `tests/observability_tests.rs` | enforced |

@@ -142,6 +142,12 @@ const CASES: &[Case] = &[
         check: h2_45_shm,
     },
     Case {
+        id: "H2.47",
+        invariant: "I-5",
+        threat: "a promise pipeline launders a method or bypasses a budget",
+        check: h2_47_pipeline_authority,
+    },
+    Case {
         id: "H2.46",
         invariant: "I-11",
         threat: "absolute, dot-segment or encoded path escape",
@@ -907,4 +913,73 @@ fn redteam_battery_is_green() {
         CASES.len(),
         failures.join("\n")
     );
+}
+
+fn h2_47_pipeline_authority() -> std::result::Result<(), String> {
+    let agent = agent(47);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    let provider = provider(&agent, &calls, &drops);
+    let lane = agent
+        .create_lane("main", Budget::default())
+        .map_err(|e| e.to_string())?;
+    let narrow = mint(&agent, provider, &["ping"]);
+    let wide = mint(&agent, provider, &["echo"]);
+
+    // A promise produced under the narrow capability flows into a call under
+    // the wide one as a value. The wide capability must not gain `ping`.
+    let first = agent
+        .call(lane, &narrow, "ping", vec![])
+        .map_err(|e| e.to_string())?;
+    let second = agent
+        .call(
+            lane,
+            &wide,
+            "echo",
+            vec![active_rpc::Arg::Promise(first.id())],
+        )
+        .map_err(|e| e.to_string())?;
+    let _ = second.value();
+    let refused = agent
+        .call(lane, &wide, "ping", vec![])
+        .expect_err("the wide capability gained a method through the pipeline");
+    if refused.code() != "rpc/method-not-granted" {
+        return Err(format!(
+            "expected rpc/method-not-granted, got {}",
+            refused.code()
+        ));
+    }
+
+    // A pipelined call is still charged to its own capability: a one-call
+    // budget is exhausted by the first pipeline, so the second is refused.
+    let mut tight = CapAttrs::new(&["echo"]);
+    tight.budget.max_calls = 1;
+    let tight_cap = agent.mint(provider, 0, tight).map_err(|e| e.to_string())?;
+    let first = agent
+        .call(lane, &tight_cap, "echo", vec![])
+        .map_err(|e| e.to_string())?;
+    let _ = first.value();
+    let expired_budget = agent
+        .call(lane, &tight_cap, "echo", vec![])
+        .expect_err("the pipeline bypassed the call budget");
+    if expired_budget.code() != "rpc/budget-exceeded" {
+        return Err(format!(
+            "expected rpc/budget-exceeded, got {}",
+            expired_budget.code()
+        ));
+    }
+
+    // A promise id is not a capability: importing bytes derived from it is an
+    // unknown capability at dispatch.
+    let forged = agent.import(CapId([47u8; 16]));
+    let refused = agent
+        .call(lane, &forged, "echo", vec![])
+        .expect_err("a forged id was accepted");
+    if refused.code() != "rpc/unknown-capability" {
+        return Err(format!(
+            "expected rpc/unknown-capability, got {}",
+            refused.code()
+        ));
+    }
+    Ok(())
 }
