@@ -184,6 +184,13 @@ pub struct CapAttrs {
     /// a call that presents a different or missing identity is refused with
     /// `rpc/identity`. See [`crate::identity`].
     pub bound_to: Option<[u8; crate::identity::FINGERPRINT_LEN]>,
+    /// Optional lifetime in milliseconds from the moment of minting.
+    ///
+    /// The kernel resolves it to an absolute [`CapRecord::expires_at`] against
+    /// its own clock. An expired capability is refused at dispatch exactly like
+    /// a revoked one; attenuation can only shorten the lifetime, never extend
+    /// it.
+    pub ttl_ms: Option<u64>,
 }
 
 impl CapAttrs {
@@ -198,6 +205,7 @@ impl CapAttrs {
             tool_policy: None,
             persistence: CapPersistence::Ephemeral,
             bound_to: None,
+            ttl_ms: None,
         }
     }
 
@@ -252,6 +260,12 @@ impl CapAttrs {
         self
     }
 
+    /// Bound the capability's lifetime, in milliseconds from minting.
+    pub fn with_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.ttl_ms = Some(ttl_ms);
+        self
+    }
+
     /// True when the capability is bound to a specific peer.
     pub fn is_bound(&self) -> bool {
         self.bound_to.is_some()
@@ -287,6 +301,13 @@ impl CapAttrs {
             (None, Some(_)) => false,
             (Some(policy), Some(parent)) => policy.is_attenuation_of(parent),
         };
+        // A lifetime is authority too: a bounded parent cannot have an unbounded
+        // child, and a child may not outlive its parent.
+        let ttl_ok = match (parent.ttl_ms, self.ttl_ms) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(parent), Some(child)) => child <= parent,
+        };
         methods_ok
             && budget_ok
             && read_only_ok
@@ -295,6 +316,7 @@ impl CapAttrs {
             && tool_ok
             && persistence_ok
             && binding_ok
+            && ttl_ok
     }
 
     /// Attenuate, refusing anything that would widen authority.
@@ -323,6 +345,16 @@ impl CapAttrs {
             return Err(Error::Escalation(
                 "durable capability under an ephemeral parent",
             ));
+        }
+        // A bounded lifetime may only be shortened.
+        if let Some(parent_ttl) = self.ttl_ms {
+            match child.ttl_ms {
+                None => return Err(Error::Escalation("lifetime removed")),
+                Some(child_ttl) if child_ttl > parent_ttl => {
+                    return Err(Error::Escalation("lifetime grows"));
+                }
+                Some(_) => {}
+            }
         }
         match (&child.path_scope, &self.path_scope) {
             (_, None) => {}
@@ -388,6 +420,8 @@ pub struct CapRecord {
     pub refs: u32,
     /// Revoked capabilities are refused even if the id is known.
     pub revoked: bool,
+    /// Absolute kernel time after which the capability is refused, in ms.
+    pub expires_at: Option<u64>,
 }
 
 impl CapRecord {
@@ -401,6 +435,7 @@ impl CapRecord {
             parent: None,
             refs: 1,
             revoked: false,
+            expires_at: None,
         }
     }
 }

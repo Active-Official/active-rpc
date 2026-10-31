@@ -1,5 +1,33 @@
 # Changelog - Active RPC
 
+## Unreleased
+
+Additive work from the hardening and innovation phases. The `ARP1` layout is
+unchanged.
+
+### Added
+
+- **Time-bounded capabilities** (`CapAttrs::ttl_ms`, ADR-0015): the kernel
+  resolves a TTL against its clock and refuses an expired capability exactly
+  like a revoked one (`rpc/revoked`, plus `Event::CapExpired`). Attenuation can
+  only shorten a lifetime.
+- **Payload accounting**: `Agent::call_with_payload` and
+  `call_as_with_payload` charge an envelope payload against `max_bytes`; the
+  CLI, examples and peer binaries use them.
+- **`QuicServer::wait`**: waits for the serving task, which drains the last
+  response before closing.
+
+### Security
+
+- MCP sessions bound every inbound line (1 MiB), require the response id to
+  match the request (`mcp/id-mismatch`) and refuse responses with neither
+  `result` nor `error`; a hostile server can no longer exhaust memory or answer
+  a different call.
+- HTTP/2 runs a blocking kernel handler under `block_in_place`, so one stream
+  cannot stall the runtime.
+- New suites: multi-tenant cross-talk, malicious MCP sequences, transport ×
+  capability binding, payload budgets, bulk and compressed-frame fuzzing.
+
 ## 2.1.0 - 2026-10-31
 
 Additive transport and telemetry work from the Active Maturity Program. The

@@ -180,6 +180,10 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.event = "cap.revoked";
             trace.cap = Some(cap.correlation_id());
         }
+        Event::CapExpired(cap) => {
+            trace.event = "cap.expired";
+            trace.cap = Some(cap.correlation_id());
+        }
         Event::CapIntroduced { cap, fingerprint } => {
             trace.event = "cap.introduced";
             trace.cap = Some(cap.correlation_id());

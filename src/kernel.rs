@@ -114,6 +114,8 @@ pub enum Event {
     CapDropped(CapId),
     /// A capability was revoked.
     CapRevoked(CapId),
+    /// A capability's lifetime elapsed; it is refused exactly like a revocation.
+    CapExpired(CapId),
     /// A capability was introduced to an authenticated peer and bound to it.
     CapIntroduced {
         /// Introduced capability.
@@ -474,7 +476,9 @@ impl Agent {
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, None);
-        let record = CapRecord::new(id, provider, object, attrs.clone());
+        let expires_at = attrs.ttl_ms.map(|ttl| kernel.now_ms.saturating_add(ttl));
+        let mut record = CapRecord::new(id, provider, object, attrs.clone());
+        record.expires_at = expires_at;
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.caps.insert(id, record);
         kernel.push_event(Event::CapMinted { cap: id, provider });
@@ -565,6 +569,16 @@ impl Agent {
         let id = CapId::derive(&kernel.secret, serial, Some(&parent_id));
         let mut child = CapRecord::new(id, record.provider, record.object, attrs.clone());
         child.parent = Some(parent_id);
+        // A derived capability never outlives its parent: keep the parent's
+        // absolute expiry when the child asked for a longer (or no) lifetime.
+        child.expires_at = match (record.expires_at, attrs.ttl_ms) {
+            (Some(parent_expiry), Some(ttl)) => {
+                Some(parent_expiry.min(kernel.now_ms.saturating_add(ttl)))
+            }
+            (Some(parent_expiry), None) => Some(parent_expiry),
+            (None, Some(ttl)) => Some(kernel.now_ms.saturating_add(ttl)),
+            (None, None) => None,
+        };
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.caps.insert(id, child);
         kernel.push_event(Event::CapMinted {
@@ -942,6 +956,15 @@ impl Agent {
             .ok_or(Error::UnknownCapability(cap_token(cap_id)))?
             .clone();
         if record.revoked {
+            return Err(Error::Revoked(cap_token(cap_id)));
+        }
+        if record
+            .expires_at
+            .is_some_and(|expires_at| kernel.now_ms >= expires_at)
+        {
+            // An expired capability is refused exactly like a revoked one. The
+            // event lets an operator see the difference.
+            kernel.push_event(Event::CapExpired(cap_id));
             return Err(Error::Revoked(cap_token(cap_id)));
         }
         // Identity binding is checked before any authority is exercised: a

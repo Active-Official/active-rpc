@@ -629,8 +629,8 @@ fn category_for(kind: &str) -> &'static str {
         "call_queued" | "call_settled" | "job" => "calls",
         "batch" | "channel_msg" => "batch",
         "call_refused" | "tool_refused" | "budget" => "refusals",
-        "cap_mint" | "cap_revoke" | "cap_introduce" | "cap_lifecycle" | "lane_created"
-        | "lane_closed" => "caps",
+        "cap_mint" | "cap_revoke" | "cap_expired" | "cap_introduce" | "cap_lifecycle"
+        | "lane_created" | "lane_closed" => "caps",
         "scenario" => "scenario",
         "benchmark" => "benchmark",
         "tool" => "tool",
@@ -1018,6 +1018,13 @@ impl PlaneCore {
                 kind: "cap_revoke".into(),
                 capability: Some(cap.correlation_id()),
                 detail: "capability revoked".into(),
+                ..base
+            },
+            Event::CapExpired(cap) => UiEvent {
+                category: category_for("cap_expired").into(),
+                kind: "cap_expired".into(),
+                capability: Some(cap.correlation_id()),
+                detail: "capability lifetime elapsed".into(),
                 ..base
             },
             Event::CapIntroduced { cap, fingerprint } => UiEvent {
