@@ -134,6 +134,12 @@ Unknown base, unknown removal, duplicate addition or malformed descriptor is
 pass the normal attenuation/import checks. Full tables remain the default and
 remain valid when the flag is clear.
 
+The load path is exercised, not just the arithmetic: `tests/cap_delta_load_tests.rs`
+runs four concurrent negotiators over TCP for 120 chained deltas each, asserts
+that the peer's applied table hashes to the table the sender computed at every
+step, that the base table is never mutated in place, and that replaying a spent
+delta against the new table is refused with `rpc/capability-table`.
+
 The table is a *description*, never proof. A receiver must look the id up in its
 own registry; an id it did not mint is refused with `rpc/unknown-capability`.
 
