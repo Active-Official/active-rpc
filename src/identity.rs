@@ -105,20 +105,6 @@ impl PeerIdentity {
         }
     }
 
-    /// Reconstruct an identity the transport already verified (for example the
-    /// server side of a QUIC connection reconstructed from the peer's chain).
-    pub fn from_parts(
-        kind: IdentityKind,
-        subject: impl Into<String>,
-        fingerprint: [u8; FINGERPRINT_LEN],
-    ) -> Self {
-        Self {
-            kind,
-            subject: subject.into(),
-            fingerprint,
-        }
-    }
-
     /// How the identity was established.
     pub fn kind(&self) -> IdentityKind {
         self.kind

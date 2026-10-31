@@ -25,7 +25,7 @@ use crate::budget::{Budget, BudgetMeter};
 use crate::cap::{CapAttrs, CapControl, CapHandle, CapId, CapRecord, ProviderId, ToolPolicy};
 use crate::channel::{Channel, ChannelId, Direction, Message};
 use crate::error::{Error, Result};
-use crate::identity::{PeerIdentity, FINGERPRINT_LEN};
+use crate::identity::{AdmittedIdentity, PeerIdentity, FINGERPRINT_LEN};
 use crate::lane::{Lane, LaneId};
 use crate::promise::{PromiseId, PromiseRecord, PromiseState};
 use crate::value::{Arg, Call, Response, Value};
@@ -481,27 +481,29 @@ impl Agent {
         Ok(CapHandle::new(Rc::clone(&self.control), id))
     }
 
-    /// Mint a capability bound to one authenticated peer.
+    /// Mint a capability bound to one admitted peer.
     ///
     /// The binding is recorded on the capability and enforced at dispatch: the
     /// same id presented by another peer, or with no identity, is refused with
-    /// `rpc/identity`.
+    /// `rpc/identity`. The parameter is an [`AdmittedIdentity`], which only
+    /// [`crate::identity::IdentityPolicy::admit`] can produce, so a caller
+    /// cannot bind a capability to an identity the transport never verified.
     pub fn mint_bound(
         &self,
-        peer: &PeerIdentity,
+        peer: &AdmittedIdentity,
         provider: ProviderId,
         object: u64,
         attrs: CapAttrs,
     ) -> Result<CapHandle> {
-        if peer.is_anonymous() {
+        if !peer.can_bind() {
             return Err(Error::Identity(
-                "cannot bind a capability to an anonymous peer",
+                "cannot bind a capability to an unauthenticated peer",
             ));
         }
         self.mint(provider, object, attrs.bound_to(peer.fingerprint()))
     }
 
-    /// Introduce an existing capability to a peer.
+    /// Introduce an existing capability to an admitted peer.
     ///
     /// Binds the capability to that peer's authenticated fingerprint and returns
     /// the descriptor to send over the transport. A capability already bound to
@@ -510,11 +512,11 @@ impl Agent {
     pub fn introduce_to(
         &self,
         cap: &CapHandle,
-        peer: &PeerIdentity,
+        peer: &AdmittedIdentity,
     ) -> Result<crate::wire::CapDescriptor> {
-        if peer.is_anonymous() {
+        if !peer.can_bind() {
             return Err(Error::Identity(
-                "cannot introduce a capability to an anonymous peer",
+                "cannot introduce a capability to an unauthenticated peer",
             ));
         }
         let fingerprint = peer.fingerprint();

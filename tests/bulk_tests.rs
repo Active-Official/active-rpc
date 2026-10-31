@@ -133,7 +133,7 @@ fn resume_sends_only_the_missing_chunks() {
     }
 
     let missing = receiver.missing();
-    let resumed = sender.frames_for(&missing);
+    let resumed = sender.frames_for(&missing).expect("resume frames");
     assert_eq!(resumed.len(), missing.len());
     for frame in resumed {
         receiver.accept(&frame).expect("resumed chunk");
@@ -186,6 +186,15 @@ fn chunk_size_is_bounded() {
             .code(),
         "rpc/bulk"
     );
+}
+
+#[test]
+fn a_resume_request_outside_the_plan_is_an_error() {
+    let sender = BulkSender::new(body(100_000), 64 * 1024).expect("sender");
+    let error = sender
+        .frames_for(&[0, 9])
+        .expect_err("index outside the plan");
+    assert_eq!(error.code(), "rpc/bulk");
 }
 
 #[test]
@@ -243,7 +252,10 @@ fn a_bulk_transfer_over_tcp_resumes_after_a_dropped_connection() {
     for frame in all.iter().take(3) {
         receiver.accept(frame).expect("replay");
     }
-    for frame in sender.frames_for(&receiver.missing()) {
+    for frame in sender
+        .frames_for(&receiver.missing())
+        .expect("resume frames")
+    {
         write_frame(&mut second, &frame).expect("write resumed chunk");
     }
     drop(second);

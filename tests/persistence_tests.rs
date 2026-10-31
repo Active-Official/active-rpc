@@ -65,12 +65,21 @@ fn durable_caps_are_refused_until_policy_allows_them() {
 fn durable_cannot_be_promoted_by_attenuation() {
     let parent = CapAttrs::new(&["echo"]);
     let durable_child = CapAttrs::new(&["echo"]).durable();
-    let downgraded = parent.attenuate(durable_child).expect("safe downgrade");
-    assert_eq!(downgraded.persistence, CapPersistence::Ephemeral);
+    let error = parent
+        .attenuate(durable_child)
+        .expect_err("promotion must be refused");
+    assert_eq!(error.code(), "rpc/attenuation-escalation");
 
+    // A child of a durable capability may narrow its lifetime but never
+    // inherits a longer one than it asked for.
     let durable_parent = CapAttrs::new(&["echo"]).durable();
     let child = durable_parent
         .attenuate(CapAttrs::new(&["echo"]))
         .expect("child");
-    assert_eq!(child.persistence, CapPersistence::Durable);
+    assert_eq!(child.persistence, CapPersistence::Ephemeral);
+
+    let same = durable_parent
+        .attenuate(CapAttrs::new(&["echo"]).durable())
+        .expect("durable child");
+    assert_eq!(same.persistence, CapPersistence::Durable);
 }

@@ -124,6 +124,63 @@ fn http2_enforces_wire_limits_from_the_server_side() {
 }
 
 #[test]
+fn one_bad_stream_does_not_break_the_connection() {
+    let server = Http2Server::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let serve = std::thread::spawn(move || server.serve(1, handler));
+
+    let mut client = Http2Client::connect(&address).expect("connect");
+    let first = client.call(&sample_envelope(1)).expect("first call");
+    assert_eq!(first.request_id, 1);
+
+    let (status, body) = client
+        .request_raw(PATH, CONTENT_TYPE, b"\xff\xff\xff")
+        .expect("malformed stream");
+    assert_eq!(status.as_u16(), 400);
+    assert_eq!(body, b"rpc/wire");
+
+    let second = client
+        .call(&sample_envelope(2))
+        .expect("connection survives");
+    assert_eq!(second.request_id, 2);
+    drop(client);
+    let served = serve.join().expect("join").expect("serve");
+    assert_eq!(served, 2, "only well-formed requests are counted");
+}
+
+#[test]
+fn two_clients_are_served_while_the_first_connection_stays_open() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let server = Http2Server::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let serve = std::thread::spawn(move || server.serve(2, handler));
+
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut first = Http2Client::connect(&address).expect("first connect");
+        let first_response = first.call(&sample_envelope(1)).expect("first call");
+        // Keep `first` open: a serial accept loop would never reach the second
+        // client until this connection closed.
+        let mut second = Http2Client::connect(&address).expect("second connect");
+        let second_response = second.call(&sample_envelope(2)).expect("second call");
+        tx.send((first_response.request_id, second_response.request_id))
+            .ok();
+        drop(first);
+        drop(second);
+    });
+
+    let (first, second) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("both clients served concurrently");
+    assert_eq!((first, second), (1, 2));
+    worker.join().expect("worker");
+    let served = serve.join().expect("join").expect("serve");
+    assert_eq!(served, 2);
+}
+
+#[test]
 fn http2_client_surfaces_a_server_error_envelope_code() {
     let server = Http2Server::bind_loopback().expect("bind");
     let address = server.address().to_string();

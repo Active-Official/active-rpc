@@ -46,6 +46,11 @@ content-type: application/arp1
 
 ## Consequences
 
+- The transport is cleartext (h2c) and loopback-only through its single
+  constructor. It carries no peer identity, so a capability bound to a peer
+  (`ADR-0011`) cannot be introduced over it; a deployment that needs
+  authenticated peers uses QUIC mutual TLS. TLS termination for a remote HTTP/2
+  listener belongs to the deployment's terminator.
 - Restricted networks get multiplexing and one handshake, with the same wire
   semantics as QUIC. A deployment chooses HTTP/3 (QUIC) where UDP is allowed and
   HTTP/2 where it is not; the envelope does not change.

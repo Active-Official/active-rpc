@@ -306,7 +306,15 @@ where
             };
             let request = match recv.read_to_end(MAX_FRAME_BYTES).await {
                 Ok(bytes) => bytes,
-                Err(_) => break,
+                Err(_) => {
+                    // The stream failed mid-frame. Answering with an error
+                    // envelope is best-effort (the peer may be gone), but it
+                    // gives a live peer a stable code instead of silence.
+                    let response = Envelope::error(0, &Error::Wire("stream read failed"));
+                    let _ = send_envelope(&mut send, &response).await;
+                    let _ = send.finish();
+                    break;
+                }
             };
             let envelope = match decode_call(&request) {
                 Ok(envelope) => envelope,

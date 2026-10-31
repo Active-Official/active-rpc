@@ -350,8 +350,17 @@ impl BulkSender {
     }
 
     /// Frames for exactly the indexes a receiver reports as missing.
-    pub fn frames_for(&self, missing: &[u32]) -> Vec<Vec<u8>> {
-        missing
+    ///
+    /// An index outside the plan is an error rather than a silently dropped
+    /// frame: a resume request that asks for a chunk this body never had is a
+    /// protocol bug, and answering with silence would stall the transfer.
+    pub fn frames_for(&self, missing: &[u32]) -> Result<Vec<Vec<u8>>> {
+        for index in missing {
+            if *index >= self.plan.chunks {
+                return Err(Error::Bulk("requested chunk is outside the plan"));
+            }
+        }
+        Ok(missing
             .iter()
             .filter_map(|index| {
                 let start = *index as usize * self.plan.chunk;
@@ -361,7 +370,7 @@ impl BulkSender {
                 let end = (start + self.plan.chunk).min(self.bytes.len());
                 Some(BulkChunk::new(*index, self.plan.chunk, &self.bytes[start..end]).encode())
             })
-            .collect()
+            .collect())
     }
 }
 

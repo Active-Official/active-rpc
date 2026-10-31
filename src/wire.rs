@@ -97,6 +97,13 @@ pub struct CapDescriptor {
 
 impl CapDescriptor {
     /// Build a descriptor from attributes.
+    /// Build the wire view of a capability.
+    ///
+    /// A descriptor carries the subset a peer can use to *plan* a call: id,
+    /// methods, budget, read-only, redaction and path scope. Persistence, the tool
+    /// policy and the identity binding stay local to the minting kernel and are
+    /// never widened by a descriptor; a descriptor grants nothing on the receiving
+    /// side either (the registry is the authority).
     pub fn from_attrs(id: CapId, attrs: &CapAttrs) -> Self {
         Self {
             id,

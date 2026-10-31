@@ -22,6 +22,16 @@
 //! A malformed body, an oversized body, a wrong path or a wrong media type is a
 //! `4xx` with a stable `rpc/...` body. It is never a panic and never a silently
 //! dropped stream.
+//!
+//! # Security posture
+//!
+//! The listener is cleartext HTTP/2 (h2c) bound to loopback by
+//! [`Http2Server::bind_loopback`], the only constructor. A deployment places it
+//! behind its TLS terminator, or uses the QUIC mutual-TLS transport when peer
+//! authentication is required. This transport carries no `PeerIdentity`: a
+//! capability bound to a peer cannot be introduced over it, because the
+//! transport cannot prove who connected. Authority still comes only from the
+//! envelope's capability table.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,7 +122,12 @@ impl Http2Server {
             let listener = tokio::net::TcpListener::from_std(listener)
                 .map_err(|error| Error::Transport(format!("listener: {error}")))?;
             let mut accepted = 0usize;
-            while accepted < connections {
+            let connection_budget = connections;
+            // Connections are independent: a peer that resets mid-handshake must
+            // not stall the listener or take other connections down. Each one
+            // runs to completion on the runtime.
+            let mut active = tokio::task::JoinSet::new();
+            while accepted < connection_budget {
                 let (stream, _) = listener
                     .accept()
                     .await
@@ -121,7 +136,17 @@ impl Http2Server {
                 stream
                     .set_nodelay(true)
                     .map_err(|error| Error::Transport(format!("nodelay: {error}")))?;
-                serve_connection(stream, Arc::clone(&handler), Arc::clone(&served), limits).await?;
+                active.spawn(serve_connection(
+                    stream,
+                    Arc::clone(&handler),
+                    Arc::clone(&served),
+                    limits,
+                ));
+            }
+            while let Some(joined) = active.join_next().await {
+                // A connection error is that peer's problem; the served count
+                // only reflects complete requests.
+                let _ = joined;
             }
             Ok(served.load(Ordering::Relaxed))
         })
@@ -162,13 +187,9 @@ where
         });
     }
     while let Some(joined) = streams.join_next().await {
-        match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(error) => {
-                return Err(Error::Transport(format!("h2 stream task: {error}")));
-            }
-        }
+        // A stream that fails (reset, oversized body) ends that stream; HTTP/2
+        // keeps the connection usable for the streams that follow.
+        let _ = joined;
     }
     Ok(())
 }
@@ -206,10 +227,12 @@ where
     }
     let mut body = request.into_body();
     let mut bytes = Vec::new();
+    // The caller's wire ceiling bounds the body; `MAX_BODY` is the hard cap.
+    let ceiling = limits.max_bytes.min(MAX_BODY);
     loop {
         match body.data().await {
             Some(Ok(chunk)) => {
-                if bytes.len() + chunk.len() > MAX_BODY {
+                if bytes.len() + chunk.len() > ceiling {
                     return respond_status(
                         &mut respond,
                         StatusCode::PAYLOAD_TOO_LARGE,
@@ -220,8 +243,8 @@ where
                 bytes.extend_from_slice(&chunk);
                 let _ = body.flow_control().release_capacity(len);
             }
-            Some(Err(error)) => {
-                return Err(Error::Transport(format!("h2 body: {error}")));
+            Some(Err(_)) => {
+                return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
             }
             None => break,
         }
@@ -394,7 +417,7 @@ impl Http2Client {
                     let response = response
                         .await
                         .map_err(|error| Error::Transport(format!("response: {error}")))?;
-                    read_response(response).await
+                    read_response(response, limits.max_bytes.min(MAX_BODY)).await
                 }));
             }
             let mut out = Vec::with_capacity(tasks.len());
@@ -443,6 +466,7 @@ impl Http2Client {
             .body(())
             .map_err(|error| Error::Transport(format!("request: {error}")))?;
         let payload = Bytes::copy_from_slice(body);
+        let limits = self.limits;
         self.runtime.block_on(async move {
             let (response, mut send) = sender
                 .send_request(request, false)
@@ -452,7 +476,7 @@ impl Http2Client {
             let response = response
                 .await
                 .map_err(|error| Error::Transport(format!("response: {error}")))?;
-            read_response(response).await
+            read_response(response, limits.max_bytes.min(MAX_BODY)).await
         })
     }
 }
@@ -463,14 +487,17 @@ impl Drop for Http2Client {
     }
 }
 
-async fn read_response(response: Response<h2::RecvStream>) -> Result<(StatusCode, Vec<u8>)> {
+async fn read_response(
+    response: Response<h2::RecvStream>,
+    ceiling: usize,
+) -> Result<(StatusCode, Vec<u8>)> {
     let status = response.status();
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     loop {
         match body.data().await {
             Some(Ok(chunk)) => {
-                if bytes.len() + chunk.len() > MAX_BODY {
+                if bytes.len() + chunk.len() > ceiling {
                     return Err(Error::Wire("HTTP/2 response exceeds the ceiling"));
                 }
                 let len = chunk.len();

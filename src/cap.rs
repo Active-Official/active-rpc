@@ -314,6 +314,16 @@ impl CapAttrs {
         if self.redact && !child.redact {
             return Err(Error::Escalation("redaction cannot be lifted"));
         }
+        // Persistence is monotone in the same direction as every other
+        // authority: a durable capability may not be derived from an ephemeral
+        // one, and a child never inherits a longer lifetime than it asked for.
+        if child.persistence == CapPersistence::Durable
+            && self.persistence != CapPersistence::Durable
+        {
+            return Err(Error::Escalation(
+                "durable capability under an ephemeral parent",
+            ));
+        }
         match (&child.path_scope, &self.path_scope) {
             (_, None) => {}
             (Some(child_path), Some(parent)) if is_path_prefix(parent, child_path) => {}
@@ -327,7 +337,6 @@ impl CapAttrs {
         }
         let mut attrs = child;
         attrs.budget = attrs.budget.intersect(&self.budget);
-        attrs.persistence = self.persistence;
         attrs.bound_to = match (self.bound_to, attrs.bound_to) {
             (Some(parent_peer), None) => Some(parent_peer),
             (Some(parent_peer), Some(child_peer)) if parent_peer == child_peer => Some(parent_peer),

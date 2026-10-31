@@ -142,7 +142,12 @@ fn the_projection_carries_correlation_ids_and_never_raw_authority() {
 fn a_kernel_trace_has_monotonic_sequences_and_no_raw_ids() {
     let agent = Agent::with_secret([0x61; 32]);
     let provider = agent.register(Box::new(Echo));
-    let alice = PeerIdentity::from_certificate(b"observability-peer");
+    let alice = IdentityPolicy::default()
+        .admit(
+            Some(&PeerIdentity::from_certificate(b"observability-peer")),
+            true,
+        )
+        .expect("admitted");
     let first = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap one");
@@ -154,7 +159,7 @@ fn a_kernel_trace_has_monotonic_sequences_and_no_raw_ids() {
 
     let promise = agent
         .call_as(
-            Some(&alice),
+            Some(alice.identity()),
             lane,
             &first,
             "echo",
@@ -224,7 +229,12 @@ fn metrics_json_matches_the_kernel_counters() {
 fn identity_refusals_are_counted_and_visible() {
     let agent = Agent::with_secret([0x63; 32]);
     let provider = agent.register(Box::new(Echo));
-    let alice = PeerIdentity::from_certificate(b"alice-observability");
+    let alice = IdentityPolicy::default()
+        .admit(
+            Some(&PeerIdentity::from_certificate(b"alice-observability")),
+            true,
+        )
+        .expect("admitted");
     let cap = agent
         .mint_bound(&alice, provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");

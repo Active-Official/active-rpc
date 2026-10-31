@@ -31,6 +31,23 @@ security bug, not a formatting bug.
 - Run: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test`, `cargo test --no-default-features`.
 
+## Context recovery
+
+A compaction can leave an agent with a summary but not the thread. Before
+continuing work, read:
+
+1. `CHECKLIST.md` (current phase, unchecked rows) and the matching
+   `PROPOSAL.md` section.
+2. `docs/hardening/STATUS.md` for the last verified state.
+3. `python scripts/recall.py --turns 20` for the recent turns of the newest Grok
+   session for this workspace.
+4. The workspace memory topic under
+   `~/.grok/memory-v2/workspaces/<workspace>/topics/`.
+
+Update the memory topic after each phase, and add the phase commit hash to
+`CHECKLIST.md`. That is what makes the next session start from work instead of
+from zero.
+
 ## Remotes
 
 `origin` is `Active-Official/active-rpc`; `ratio` is `RatioArtificiosa/active-rpc`.

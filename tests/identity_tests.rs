@@ -6,7 +6,9 @@
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::channel::Direction;
-use active_rpc::identity::{IdentityKind, IdentityPolicy, PeerIdentity, TrustLevel};
+use active_rpc::identity::{
+    AdmittedIdentity, IdentityKind, IdentityPolicy, PeerIdentity, TrustLevel,
+};
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::{Agent, Budget, Provider};
 
@@ -40,6 +42,13 @@ impl Provider for Echo {
 
 fn identity(seed: &[u8]) -> PeerIdentity {
     PeerIdentity::from_certificate(seed)
+}
+
+/// Admit a certificate identity through the production policy.
+fn admitted(peer: &PeerIdentity) -> AdmittedIdentity {
+    IdentityPolicy::default()
+        .admit(Some(peer), true)
+        .expect("identity admitted")
 }
 
 #[test]
@@ -111,8 +120,10 @@ fn certificate_identities_are_stable_and_subject_sensitive() {
 fn a_capability_bound_to_one_peer_is_refused_for_every_other_peer() {
     let agent = Agent::with_secret([0x51; 32]);
     let provider = agent.register(Box::new(Echo));
-    let alice = identity(b"alice-cert");
-    let bob = identity(b"bob-cert");
+    let alice_id = identity(b"alice-cert");
+    let bob_id = identity(b"bob-cert");
+    let alice = admitted(&alice_id);
+    let bob = admitted(&bob_id);
     let cap = agent
         .mint_bound(&alice, provider, 0, CapAttrs::new(&["echo"]))
         .expect("bound cap");
@@ -120,7 +131,7 @@ fn a_capability_bound_to_one_peer_is_refused_for_every_other_peer() {
 
     let promise = agent
         .call_as(
-            Some(&alice),
+            Some(alice.identity()),
             lane,
             &cap,
             "echo",
@@ -131,7 +142,7 @@ fn a_capability_bound_to_one_peer_is_refused_for_every_other_peer() {
     assert_eq!(promise.value().expect("value"), Value::text("ok"));
 
     let error = agent
-        .call_as(Some(&bob), lane, &cap, "echo", vec![])
+        .call_as(Some(bob.identity()), lane, &cap, "echo", vec![])
         .expect_err("bob must be refused");
     assert_eq!(error.code(), "rpc/identity");
 
@@ -161,8 +172,8 @@ fn an_unbound_capability_keeps_working_without_an_identity() {
 fn introduction_binds_once_and_cannot_move_between_peers() {
     let agent = Agent::with_secret([0x53; 32]);
     let provider = agent.register(Box::new(Echo));
-    let alice = identity(b"alice-cert");
-    let bob = identity(b"bob-cert");
+    let alice = admitted(&identity(b"alice-cert"));
+    let bob = admitted(&identity(b"bob-cert"));
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -187,8 +198,8 @@ fn introduction_binds_once_and_cannot_move_between_peers() {
 fn attenuation_keeps_the_binding_and_refuses_a_rebind() {
     let agent = Agent::with_secret([0x54; 32]);
     let provider = agent.register(Box::new(Echo));
-    let alice = identity(b"alice-cert");
-    let bob = identity(b"bob-cert");
+    let alice = admitted(&identity(b"alice-cert"));
+    let bob = admitted(&identity(b"bob-cert"));
     let cap = agent
         .mint_bound(&alice, provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -228,17 +239,15 @@ fn an_anonymous_peer_cannot_receive_an_introduction() {
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
 
+    let anonymous = IdentityPolicy::local()
+        .admit(Some(&PeerIdentity::anonymous()), false)
+        .expect("anonymous admitted");
     let error = agent
-        .introduce_to(&cap, &PeerIdentity::anonymous())
+        .introduce_to(&cap, &anonymous)
         .expect_err("anonymous refused");
     assert_eq!(error.code(), "rpc/identity");
     let error = agent
-        .mint_bound(
-            &PeerIdentity::anonymous(),
-            provider,
-            0,
-            CapAttrs::new(&["echo"]),
-        )
+        .mint_bound(&anonymous, provider, 0, CapAttrs::new(&["echo"]))
         .expect_err("anonymous refused");
     assert_eq!(error.code(), "rpc/identity");
 }
@@ -247,7 +256,7 @@ fn an_anonymous_peer_cannot_receive_an_introduction() {
 fn a_bound_capability_cannot_be_transferred_over_a_channel() {
     let agent = Agent::with_secret([0x56; 32]);
     let provider = agent.register(Box::new(Echo));
-    let alice = identity(b"alice-cert");
+    let alice = admitted(&identity(b"alice-cert"));
     let cap = agent
         .mint_bound(&alice, provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -258,7 +267,13 @@ fn a_bound_capability_cannot_be_transferred_over_a_channel() {
     agent.subscribe(lane, channel).expect("subscribe");
 
     let error = agent
-        .send_as(Some(&alice), lane, channel, Value::text("x"), &[cap])
+        .send_as(
+            Some(alice.identity()),
+            lane,
+            channel,
+            Value::text("x"),
+            &[cap],
+        )
         .expect_err("bound capabilities do not travel over channels");
     assert_eq!(error.code(), "rpc/identity");
 
