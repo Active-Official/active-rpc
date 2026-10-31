@@ -629,7 +629,8 @@ fn category_for(kind: &str) -> &'static str {
         "call_queued" | "call_settled" | "job" => "calls",
         "batch" | "channel_msg" => "batch",
         "call_refused" | "tool_refused" | "budget" => "refusals",
-        "cap_mint" | "cap_revoke" | "cap_lifecycle" | "lane_created" | "lane_closed" => "caps",
+        "cap_mint" | "cap_revoke" | "cap_introduce" | "cap_lifecycle" | "lane_created"
+        | "lane_closed" => "caps",
         "scenario" => "scenario",
         "benchmark" => "benchmark",
         "tool" => "tool",
@@ -1017,6 +1018,20 @@ impl PlaneCore {
                 kind: "cap_revoke".into(),
                 capability: Some(cap.correlation_id()),
                 detail: "capability revoked".into(),
+                ..base
+            },
+            Event::CapIntroduced { cap, fingerprint } => UiEvent {
+                category: category_for("cap_introduce").into(),
+                kind: "cap_introduce".into(),
+                capability: Some(cap.correlation_id()),
+                detail: format!(
+                    "capability introduced to peer {}",
+                    fingerprint
+                        .iter()
+                        .take(8)
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                ),
                 ..base
             },
             Event::LaneCreated(lane) => UiEvent {
