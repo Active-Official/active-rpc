@@ -4,7 +4,9 @@
 
 | Version | Security fixes |
 |---|---|
-| 1.0.x | yes |
+| 2.2.x | yes |
+| 2.1.x | until 2.2.0 + 12 months |
+| 1.0.x | no (superseded) |
 
 ## Reporting a vulnerability
 
@@ -46,6 +48,27 @@ capability id at rest (it is a bearer token).
 - Every frame is bounded and rejected at the boundary.
 - `#![forbid(unsafe_code)]`.
 
+### Authority domain
+
+A kernel's secret *is* its authority domain. Capability ids are
+`Blake3("active-rpc/cap" || secret || serial || parent_id)`, so two kernels that
+share a secret derive the same id for the same serial, and an id minted by one
+is meaningful to the other. That is the design: unforgeability comes from the
+secret, and holding the secret is equivalent to holding every capability the
+kernel can mint. Two consequences for deployments:
+
+- Never copy a kernel secret between processes that are not one logical agent.
+  Persistent hosts derive the secret once and keep it; `Agent::new()` takes a
+  fresh OS seed per process.
+- "A capability from another kernel is refused" therefore holds across kernels
+  with **different** secrets, which the fuzz target and
+  `tests/fuzz_regression_tests.rs` assert explicitly.
+
+An id observed by a peer is a bearer token: with it, and with no binding, the
+peer can call while the capability lives. Use `CapAttrs::bound_to` (via
+`Kernel::mint_bound`) to tie a capability to an admitted transport identity, and
+`CapAttrs::ttl_ms` to bound its life.
+
 ## Maturity invariants (AIM-PROP-2026-10 §2)
 
 These are release gates. A change that weakens one is rejected even if it makes
@@ -69,7 +92,7 @@ a benchmark faster.
 | Level | What it covers | Where the evidence lives |
 |---|---|---|
 | **Tested** | kernel, capability lifecycle, attenuation, revocation, promises, lanes, channels, tools, transports, the red-team battery, negative controls and performance budgets | `tests/`, `docs/hardening/STATUS.md` |
-| **Fuzzed** | nine structure-aware targets: envelope, capability lifecycle, promise graph, budget matrix, MCP/HTTP/process tools, channel transfers, transport framing | `fuzz/`, committed corpora, nightly 200k-run campaign |
+| **Fuzzed** | twelve structure-aware targets: envelope, capability lifecycle, promise graph, budget matrix, MCP/HTTP/process tools, channel transfers, transport framing, bulk plans, replay packages, topic policy | `fuzz/`, committed corpora, nightly campaign per target |
 | **Reviewed** | independent review rounds with triaged findings and regression tests for every fix | `REVIEWS.md`, `docs/hardening/REVIEW-SCOPE.md` |
 | **Proven** | monotone attenuation, revoke-at-dispatch and single settlement are stated as invariants and property/model-tested; they are **not** machine-checked proofs | `docs/spec/security.md` |
 

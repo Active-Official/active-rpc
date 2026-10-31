@@ -52,12 +52,22 @@ impl Provider for Echo {
     }
 }
 
-pub fn agent(seed: &[u8]) -> Agent {
+/// Expand a fuzz seed into a kernel secret by cycling it.
+///
+/// Exposed so a target that needs a *different* kernel can perturb the seed and
+/// be sure the secret differs: `data` and `data` with byte 0 flipped can never
+/// produce the same secret, while an unrelated seed may (a seed of all `0x06`
+/// expands to exactly the same 32 bytes as a one-byte seed of `0x06`).
+pub fn secret(seed: &[u8]) -> [u8; 32] {
     let mut secret = [0u8; 32];
     for (slot, byte) in secret.iter_mut().zip(seed.iter().cycle()) {
         *slot = *byte;
     }
-    Agent::with_secret(secret)
+    secret
+}
+
+pub fn agent(seed: &[u8]) -> Agent {
+    Agent::with_secret(secret(seed))
 }
 
 pub fn methods(data: &[u8]) -> Vec<&'static str> {

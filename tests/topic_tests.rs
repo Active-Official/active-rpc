@@ -152,6 +152,34 @@ fn attenuation_cannot_widen_or_drop_the_topic_set() {
 }
 
 #[test]
+fn the_empty_topic_set_is_the_narrowest_grant() {
+    // `Some(empty)` is a subset of `Some(empty)`: attenuating it to itself is
+    // not a widening, and the child still publishes nothing. This is the one
+    // case where "same set" is a legal attenuation of a restricted grant.
+    let fixture = fixture();
+    let parent = cap(&fixture, CapAttrs::new(&["echo"]).restrict_topics(&[]));
+    let child = fixture
+        .agent
+        .attenuate(&parent, CapAttrs::new(&["echo"]).restrict_topics(&[]))
+        .expect("an empty set attenuated to itself");
+    let channel = fixture
+        .agent
+        .create_channel("empty", Direction::Both)
+        .expect("channel");
+    let error = fixture
+        .agent
+        .publish(fixture.lane, channel, &child, "any", Value::text("x"))
+        .expect_err("an empty topic grant publishes nothing");
+    assert_eq!(error.code(), "rpc/topic-not-granted");
+    // It still cannot be widened, though.
+    let error = fixture
+        .agent
+        .attenuate(&child, CapAttrs::new(&["echo"]).restrict_topics(&["any"]))
+        .expect_err("widening an empty set must be refused");
+    assert_eq!(error.code(), "rpc/attenuation-escalation");
+}
+
+#[test]
 fn a_subscriber_receives_only_its_topic_and_others_stay_queued() {
     let fixture = fixture();
     let cap = cap(
@@ -209,13 +237,18 @@ fn an_expired_capability_cannot_publish() {
         .agent
         .create_channel("news", Direction::Both)
         .expect("channel");
-    // Advance the clock with one admitted call.
+    // Advance the clock past the deadline. The call is itself refused at
+    // dispatch (the deadline is re-checked there), and the round trip still
+    // moves the virtual clock to the expiry instant.
     let promise = fixture
         .agent
         .call(fixture.lane, &cap, "echo", Vec::new())
-        .expect("call");
+        .expect("queued");
     fixture.agent.run();
-    promise.value().expect("value");
+    assert_eq!(
+        promise.value().expect_err("expired at dispatch").code(),
+        "rpc/revoked"
+    );
     let error = fixture
         .agent
         .publish(fixture.lane, channel, &cap, "a", Value::text("no"))
@@ -258,6 +291,106 @@ fn plain_send_and_recv_still_carry_no_topic() {
     assert_eq!(message.payload, Value::text("plain"));
     let _ = Arg::text("unused");
     let _ = Budget::default();
+}
+
+#[test]
+fn a_capability_bound_to_a_peer_publishes_only_through_that_peer() {
+    use active_rpc::identity::{IdentityPolicy, PeerIdentity};
+
+    let fixture = fixture();
+    let owner = PeerIdentity::from_certificate(b"topic-owner");
+    let stranger = PeerIdentity::from_certificate(b"topic-stranger");
+    let admitted = IdentityPolicy::default()
+        .admit(Some(&owner), true)
+        .expect("admit");
+    let cap = fixture
+        .agent
+        .mint_bound(&admitted, fixture.provider, 0, CapAttrs::new(&["echo"]))
+        .expect("bound cap");
+    let channel = fixture
+        .agent
+        .create_channel("bound", Direction::Both)
+        .expect("channel");
+
+    // An unauthenticated publish cannot exercise a bound capability: a channel
+    // cannot prove who published.
+    let error = fixture
+        .agent
+        .publish(fixture.lane, channel, &cap, "news", Value::text("x"))
+        .expect_err("a bound capability must not publish without a peer");
+    assert_eq!(error.code(), "rpc/identity");
+
+    let error = fixture
+        .agent
+        .publish_as(
+            Some(&stranger),
+            fixture.lane,
+            channel,
+            &cap,
+            "news",
+            Value::text("x"),
+        )
+        .expect_err("another peer must not publish with it");
+    assert_eq!(error.code(), "rpc/identity");
+
+    fixture
+        .agent
+        .publish_as(
+            Some(&owner),
+            fixture.lane,
+            channel,
+            &cap,
+            "news",
+            Value::text("bound"),
+        )
+        .expect("the bound peer publishes");
+    let message = fixture
+        .agent
+        .recv_topic(channel, "news")
+        .expect("recv")
+        .expect("queued");
+    assert_eq!(message.payload, Value::text("bound"));
+}
+
+#[test]
+fn a_publish_charges_the_capability_byte_budget() {
+    let fixture = fixture();
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.budget.max_bytes = 8;
+    let cap = cap(&fixture, attrs);
+    let channel = fixture
+        .agent
+        .create_channel("budget", Direction::Both)
+        .expect("channel");
+
+    let error = fixture
+        .agent
+        .publish(
+            fixture.lane,
+            channel,
+            &cap,
+            "news",
+            Value::text("a".repeat(32)),
+        )
+        .expect_err("a payload over the byte budget must be refused");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    // The refusal did not queue anything.
+    assert!(fixture
+        .agent
+        .recv_topic(channel, "news")
+        .expect("recv")
+        .is_none());
+
+    // A payload inside the ceiling is charged and published.
+    fixture
+        .agent
+        .publish(fixture.lane, channel, &cap, "news", Value::text("ok"))
+        .expect("publish inside the budget");
+    assert!(fixture
+        .agent
+        .recv_topic(channel, "news")
+        .expect("recv")
+        .is_some());
 }
 
 #[test]

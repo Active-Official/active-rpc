@@ -31,6 +31,20 @@ pub const MAX_STRING: usize = 1 << 20;
 /// Largest synthesized argument a replay call may carry.
 pub const MAX_ARG_BYTES: u64 = 1 << 20;
 
+/// Largest package the decoder accepts, in bytes.
+///
+/// The per-field ceilings (operation count, trace count, string length) do not
+/// bound the body: a package can be arbitrarily large while every field is
+/// legal. The whole body is held in memory and hashed before decoding, so the
+/// total needs its own ceiling.
+pub const MAX_PACKAGE_BYTES: usize = 64 << 20;
+
+/// Largest sum of declared argument sizes in one package, in bytes.
+///
+/// Replay synthesizes an argument of the declared size for each call, so the
+/// per-call ceiling alone would allow 100k × 1 MiB of transient allocation.
+pub const MAX_ARG_TOTAL_BYTES: u64 = 16 << 20;
+
 /// Fixed demo secret: replay ordinals are secret-independent, but a fixed
 /// secret keeps the recorded package bytes reproducible for tests and CI.
 const DEMO_SECRET: [u8; 32] = [0x6b; 32];
@@ -157,6 +171,9 @@ impl ReplayPackage {
         if bytes.len() < MIN {
             return Err(Error::Replay("package is shorter than its header".into()));
         }
+        if bytes.len() > MAX_PACKAGE_BYTES {
+            return Err(Error::Replay("package exceeds the size ceiling".into()));
+        }
         let body_len = bytes.len() - 32;
         let (body, checksum) = bytes.split_at(body_len);
         if blake3::hash(body).as_bytes() != checksum {
@@ -178,6 +195,7 @@ impl ReplayPackage {
             return Err(Error::Replay("too many operations".into()));
         }
         let mut ops = Vec::with_capacity(op_count.min(1024));
+        let mut arg_total: u64 = 0;
         for _ in 0..op_count {
             let tag = reader.u8()?;
             let op = match tag {
@@ -201,6 +219,12 @@ impl ReplayPackage {
                     let arg_bytes = reader.u64()?;
                     if arg_bytes > MAX_ARG_BYTES {
                         return Err(Error::Replay("argument size exceeds the ceiling".into()));
+                    }
+                    arg_total = arg_total.saturating_add(arg_bytes);
+                    if arg_total > MAX_ARG_TOTAL_BYTES {
+                        return Err(Error::Replay(
+                            "declared argument sizes exceed the package ceiling".into(),
+                        ));
                     }
                     Op::Call {
                         cap,
@@ -329,7 +353,8 @@ pub struct Recorder {
     ordinals: BTreeMap<CapId, u32>,
     ops: Vec<Op>,
     trace: Vec<Trace>,
-    seen: usize,
+    /// Events ever captured, including ones the bounded tape has evicted.
+    seen_total: u64,
     latency_ms: u64,
 }
 
@@ -348,10 +373,10 @@ impl Recorder {
             ordinals: BTreeMap::new(),
             ops: vec![Op::SetLatency(latency_ms)],
             trace: Vec::new(),
-            seen: 0,
+            seen_total: 0,
             latency_ms,
         };
-        recorder.capture();
+        recorder.capture()?;
         Ok(recorder)
     }
 
@@ -373,6 +398,10 @@ impl Recorder {
     }
 
     /// Mint a capability and return its ordinal.
+    ///
+    /// The attempt is recorded even when the kernel refuses it: a refusal that
+    /// emits an event must be reproducible by replay, and a refused mint is a
+    /// legitimate input.
     pub fn mint(&mut self, methods: &[&str], ttl_ms: Option<u64>) -> Result<u32> {
         let attrs = attrs_for(
             &methods
@@ -381,18 +410,25 @@ impl Recorder {
                 .collect::<Vec<_>>(),
             ttl_ms,
         );
-        let cap = self.agent.mint(self.provider, 0, attrs)?;
         self.ops.push(Op::Mint {
             methods: methods.iter().map(|method| method.to_string()).collect(),
             ttl_ms,
         });
+        let cap = self.agent.mint(self.provider, 0, attrs)?;
         let ordinal = self.caps.len() as u32;
         self.caps.push(cap);
-        self.capture();
+        self.capture()?;
         Ok(ordinal)
     }
 
     /// Attenuate a capability and return the child ordinal.
+    ///
+    /// The parent is cloned and the attempt is recorded *before* the kernel
+    /// decides. A refused attenuation still retains and releases the parent
+    /// handle, so those events are part of the trace; recording the attempt is
+    /// what lets replay reproduce them. An ordinal that does not exist is a
+    /// recorder bug, not a decision, and is refused before anything is
+    /// recorded.
     pub fn attenuate(&mut self, parent: u32, methods: &[&str], ttl_ms: Option<u64>) -> Result<u32> {
         let handle =
             self.caps.get(parent as usize).cloned().ok_or_else(|| {
@@ -405,15 +441,15 @@ impl Recorder {
                 .collect::<Vec<_>>(),
             ttl_ms,
         );
-        let child = self.agent.attenuate(&handle, attrs)?;
         self.ops.push(Op::Attenuate {
             parent,
             methods: methods.iter().map(|method| method.to_string()).collect(),
             ttl_ms,
         });
+        let child = self.agent.attenuate(&handle, attrs)?;
         let ordinal = self.caps.len() as u32;
         self.caps.push(child);
-        self.capture();
+        self.capture()?;
         Ok(ordinal)
     }
 
@@ -440,7 +476,7 @@ impl Recorder {
         } else {
             self.agent.run();
         }
-        self.capture();
+        self.capture()?;
         Ok(())
     }
 
@@ -453,7 +489,7 @@ impl Recorder {
             .ok_or_else(|| Error::Replay(format!("capability ordinal {cap} does not exist")))?;
         self.agent.revoke(&handle);
         self.ops.push(Op::Revoke { cap });
-        self.capture();
+        self.capture()?;
         Ok(())
     }
 
@@ -466,13 +502,13 @@ impl Recorder {
         }
     }
 
-    fn capture(&mut self) {
+    fn capture(&mut self) -> Result<()> {
         capture(
             &self.agent,
-            &mut self.seen,
+            &mut self.seen_total,
             &mut self.trace,
             &mut self.ordinals,
-        );
+        )
     }
 }
 
@@ -485,21 +521,33 @@ fn attrs_for(methods: &[String], ttl_ms: Option<u64>) -> CapAttrs {
     }
 }
 
+/// Append the events the tape gained since `seen_total`.
+///
+/// The kernel tape is bounded (`MAX_EVENTS`). If it wrapped between two
+/// captures, events the session produced were evicted before they could be
+/// recorded, and a package built from what is left would not replay. That is
+/// a refusal (`rpc/replay`), not a silently truncated trace.
 fn capture(
     agent: &Agent,
-    seen: &mut usize,
+    seen_total: &mut u64,
     trace: &mut Vec<Trace>,
     ordinals: &mut BTreeMap<CapId, u32>,
-) {
+) -> Result<()> {
     let events = agent.events();
-    // The kernel tape is bounded; if it wrapped, keep whatever it holds.
-    if *seen > events.len() {
-        *seen = 0;
+    let total = agent.total_events();
+    let retained = events.len() as u64;
+    let missed = total.saturating_sub(*seen_total);
+    if missed > retained {
+        return Err(Error::Replay(
+            "the event tape wrapped; the session is too long to record".into(),
+        ));
     }
-    for event in &events[*seen..] {
+    let skip = (retained - missed) as usize;
+    for event in &events[skip..] {
         trace.push(trace_of(event, ordinals));
     }
-    *seen = events.len();
+    *seen_total = total;
+    Ok(())
 }
 
 fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {

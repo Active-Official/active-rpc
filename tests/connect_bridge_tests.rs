@@ -228,3 +228,123 @@ fn a_revoked_capability_is_refused_over_the_bridge() {
     assert_eq!(response.kind, Kind::Error);
     assert_eq!(response.method, "rpc/revoked");
 }
+
+/// A truncated body is one bad connection: the bridge answers 400 and keeps
+/// accepting. Before this, the read error aborted `serve`, so one hostile
+/// connection could refuse service to every later caller.
+#[test]
+fn a_truncated_body_gets_a_400_and_the_bridge_keeps_serving() {
+    use std::io::{Read, Write};
+
+    let agent = Agent::with_secret([0x4f; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("mint");
+    let lane = agent
+        .create_lane("bridge", Budget::default())
+        .expect("lane");
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let cap_id = cap.id();
+
+    let bad_address = address.clone();
+    let bad = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(&bad_address).expect("connect");
+        // Announce 64 bytes, send three, then close the write side.
+        stream
+            .write_all(
+                b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: active-rpc\r\ncontent-type: application/connect+active-infinity\r\ncontent-length: 64\r\n\r\nabc",
+            )
+            .expect("write");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    });
+
+    let mut served = 0;
+    server
+        .serve(1, |envelope| {
+            served += 1;
+            dispatch(&agent, lane, &envelope)
+        })
+        .expect("serve");
+    let response = bad.join().expect("bad client");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "expected a 400, got {response:?}"
+    );
+    // The truncated connection never reached the kernel.
+    assert_eq!(served, 0);
+
+    // A healthy client still works against the same server object, which is
+    // the point: one bad connection did not take the bridge down. The client
+    // connects on its own thread because `serve` blocks on accept.
+    let good_address = address.clone();
+    let good = thread::spawn(move || {
+        let mut client = ConnectClient::connect(&good_address).expect("connect");
+        client
+            .call(&request(16, "echo", vec![descriptor(cap_id, &["echo"])]))
+            .expect("call")
+    });
+    server
+        .serve(1, |envelope| {
+            served += 1;
+            dispatch(&agent, lane, &envelope)
+        })
+        .expect("serve");
+    let response = good.join().expect("good client");
+    assert_eq!(served, 1);
+    assert_eq!(response.kind, Kind::Response);
+    assert_eq!(response.first_value(), Some(&Value::text("bridged")));
+}
+
+/// A server that announces a large body and sends a few bytes makes the client
+/// fail without allocating the announced size.
+#[test]
+fn a_short_response_body_is_a_transport_error() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let address = listener.local_addr().expect("addr").to_string();
+    let serving = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        // Consume the whole request head first: closing with unread bytes makes
+        // Windows answer with a reset instead of a clean end of stream.
+        {
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line.trim_end().is_empty() {
+                    break;
+                }
+            }
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 60000000\r\n\r\nabcd")
+            .expect("write");
+        stream.flush().expect("flush");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+        // Keep the socket open briefly so the client observes end of stream
+        // rather than a reset.
+        thread::sleep(std::time::Duration::from_millis(200));
+    });
+    let mut client = ConnectClient::connect(&address).expect("connect");
+    let error = client
+        .call(&request(17, "echo", Vec::new()))
+        .expect_err("a short body must be refused");
+    assert!(
+        error.to_string().contains("shorter than declared"),
+        "{error}"
+    );
+    serving.join().expect("server");
+}

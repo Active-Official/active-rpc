@@ -4,7 +4,9 @@
 //!
 //! Invariants under test (I-4, I-5, I-6, I-7):
 //!
-//! 1. A capability minted by one kernel is not accepted by another.
+//! 1. A capability minted by a kernel with a *different* secret is not accepted
+//!    by another. (Two kernels that share a secret are one authority domain, so
+//!    the target derives the second kernel from a seed that cannot collide.)
 //! 2. Attenuation accepts a subset and refuses any widening.
 //! 3. A revoked capability is refused at the next call, and its children die.
 //! 4. Forging or importing an unknown id is refused.
@@ -91,7 +93,15 @@ fuzz_target!(|data: &[u8]| {
             }
             5 => {
                 // A forged id, including an id from another kernel.
-                let other = common::agent(&[byte.wrapping_add(1)]);
+                //
+                // The second kernel must have a *different* secret. Two kernels
+                // that share a secret are the same authority domain by design
+                // (see SECURITY.md), so the transplant check only means
+                // something across distinct secrets. Flipping byte 0 of the
+                // seed guarantees that, because the secret starts at seed[0].
+                let mut other_seed = data.to_vec();
+                other_seed[0] ^= 0xff;
+                let other = common::agent(&other_seed);
                 let other_provider = other.register(Box::new(common::Echo::default()));
                 let foreign = common::mint(&other, other_provider, &["ping"], Budget::default());
                 let transplanted = agent.import(foreign.id());

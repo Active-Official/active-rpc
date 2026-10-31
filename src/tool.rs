@@ -90,6 +90,54 @@ pub trait McpTransport {
 /// buffering an unbounded line.
 pub const MAX_MCP_LINE_BYTES: usize = 1 << 20;
 
+/// The longest tool name a session accepts, in bytes.
+pub const MAX_MCP_TOOL_NAME_BYTES: usize = 128;
+
+/// Whether an advertised tool name is plain identifier text.
+///
+/// Tool names reach an operator-facing allow-list and the method table. A bidi
+/// override or a control character would let a hostile server advertise
+/// `read\u{202E}pyf` and have a UI render it as `read`. Dots are allowed because
+/// real servers use them for namespacing.
+fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_MCP_TOOL_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// The longest tool description a session keeps, in bytes.
+pub const MAX_MCP_DESCRIPTION_BYTES: usize = 4 << 10;
+
+/// Cap a description and replace control characters with spaces.
+///
+/// The text is still untrusted: a renderer must escape it for its own output
+/// context. Replacing control characters here means a description can never
+/// carry a terminal escape or a bidi override into a log line.
+fn bounded_description(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(MAX_MCP_DESCRIPTION_BYTES));
+    for character in text.chars() {
+        if out.len() >= MAX_MCP_DESCRIPTION_BYTES {
+            break;
+        }
+        if character.is_control() || is_bidi_override(character) {
+            out.push(' ');
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+/// Bidi control characters that can reorder rendered text.
+fn is_bidi_override(character: char) -> bool {
+    matches!(
+        character,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+    )
+}
+
 /// An in-memory transport: requests are answered by a closure.
 pub struct MemoryTransport {
     responses: BTreeMap<String, String>,
@@ -281,13 +329,32 @@ impl<T: McpTransport> McpSession<T> {
                 if name.is_empty() {
                     continue;
                 }
+                // A tool name reaches an operator-facing allow-list and the
+                // method table, so it must be plain ASCII identifier text. A
+                // bidi override or control character would let a hostile server
+                // advertise `read\u{202E}fpd` and have it render as `read`.
+                if !valid_tool_name(name) {
+                    return Err(Error::Provider {
+                        code: "mcp/tool-name".to_string(),
+                    });
+                }
+                if session.tools.iter().any(|tool| tool.name == name) {
+                    // Two entries with one name make the allow-list ambiguous:
+                    // the index selects one, the name selects the other.
+                    return Err(Error::Provider {
+                        code: "mcp/tool-name".to_string(),
+                    });
+                }
+                // The description is free text shown to an operator. It is
+                // capped so a hostile server cannot make the client buffer a
+                // megabyte per tool, and control characters (including ANSI
+                // escapes) are replaced so the text cannot drive a terminal.
+                let description = bounded_description(
+                    item.get("description").and_then(Json::as_str).unwrap_or(""),
+                );
                 session.tools.push(McpToolDef {
                     name: name.to_string(),
-                    description: item
-                        .get("description")
-                        .and_then(Json::as_str)
-                        .unwrap_or("")
-                        .to_string(),
+                    description,
                 });
             }
         }

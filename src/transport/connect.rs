@@ -172,10 +172,18 @@ impl BridgeServer {
             write_http_response(&mut stream, 415, b"rpc/wire")?;
             return Ok(0);
         }
-        let mut body = vec![0u8; content_length];
-        if let Err(error) = reader.read_exact(&mut body) {
+        let mut body = Vec::with_capacity(content_length.min(64 * 1024));
+        let read = reader
+            .by_ref()
+            .take(content_length as u64)
+            .read_to_end(&mut body);
+        if read.is_err() || body.len() != content_length {
+            // A truncated body is one bad connection, not a server failure:
+            // answer 400 for it and keep accepting the next one. Growing the
+            // buffer with the bytes that arrive means a header that announces
+            // 64 MiB and sends ten bytes costs 64 KiB, not 64 MiB.
             let _ = write_http_response(&mut stream, 400, b"rpc/wire");
-            return Err(Error::Transport(format!("body: {error}")));
+            return Ok(0);
         }
         let (message, rest) = match grpc_unframe(&body) {
             Ok(parts) => parts,
@@ -347,10 +355,20 @@ impl ConnectClient {
         if length > MAX_BODY {
             return Err(Error::Wire("response exceeds the ceiling"));
         }
-        let mut response = vec![0u8; length];
-        reader
-            .read_exact(&mut response)
+        // Grow with the bytes that actually arrive: a hostile server that
+        // announces 64 MiB and sends ten bytes must not cost a 64 MiB
+        // allocation. `take` stops at the declared length.
+        let mut response = Vec::with_capacity(length.min(64 * 1024));
+        let read = reader
+            .by_ref()
+            .take(length as u64)
+            .read_to_end(&mut response)
             .map_err(|error| Error::Transport(format!("response: {error}")))?;
+        if read != length {
+            return Err(Error::Transport(
+                "response body is shorter than declared".to_string(),
+            ));
+        }
         Ok((status, response))
     }
 }

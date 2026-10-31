@@ -41,6 +41,60 @@ fn a_recorded_session_replays_with_the_same_trace() {
     assert_eq!(decoded.encode(), encoded);
 }
 
+/// A refused attenuation still retains and releases the parent handle. Those
+/// events are part of the trace, so the attempt itself has to be recorded;
+/// otherwise replay cannot reproduce them (found by `fuzz_replay_package`).
+#[test]
+fn a_refused_attenuation_is_recorded_and_replays() {
+    let mut recorder = session(5);
+    let parent = recorder.mint(&["echo"], None).expect("mint");
+    let error = recorder
+        .attenuate(parent, &["echo", "sum"], None)
+        .expect_err("widening must be refused");
+    assert_eq!(error.code(), "rpc/attenuation-escalation");
+    // A later operation flushes the retain/release pair the refused attempt
+    // left on the kernel tape.
+    recorder.mint(&["echo"], None).expect("mint");
+    let package = recorder.package();
+
+    // The refused attempt is in the input list, and its retain/release pair is
+    // in the trace.
+    assert!(
+        package
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Attenuate { parent: 0, .. })),
+        "the refused attenuation was not recorded: {:?}",
+        package.ops
+    );
+    assert!(
+        package
+            .trace
+            .iter()
+            .any(|entry| entry.event == "cap.retained"),
+        "trace: {:?}",
+        package.trace
+    );
+
+    package.replay().expect("a refused attenuation must replay");
+    let decoded = ReplayPackage::decode(&package.encode()).expect("decode");
+    decoded.replay().expect("the decoded package must replay");
+}
+
+/// A refused mint has no side effects, but it is still an input: recording it
+/// keeps the op list a faithful transcript, and replay reproduces the refusal.
+#[test]
+fn a_refused_mint_is_recorded_and_replays() {
+    let mut recorder = session(5);
+    let error = recorder
+        .mint(&[], None)
+        .expect_err("a grant with no methods must be refused");
+    assert_eq!(error.code(), "rpc/invalid-argument");
+    let package = recorder.package();
+    assert!(matches!(package.ops.last(), Some(Op::Mint { methods, .. }) if methods.is_empty()));
+    package.replay().expect("a refused mint must replay");
+}
+
 #[test]
 fn a_tampered_byte_is_refused() {
     let encoded = demo_session().encode();
@@ -170,4 +224,37 @@ fn arguments_never_enter_the_package() {
     let encoded = String::from_utf8_lossy(&package.encode()).into_owned();
     assert!(!encoded.contains("secret"));
     assert!(!encoded.contains("canary"));
+}
+
+#[test]
+fn a_declared_argument_total_over_the_ceiling_is_refused() {
+    // Each call is legal on its own (1 MiB); together they exceed the
+    // package-wide ceiling, which bounds the transient allocation a replay can
+    // force.
+    let ops = (0..17)
+        .map(|_| Op::Call {
+            cap: 0,
+            method: "echo".to_string(),
+            arg_bytes: 1 << 20,
+        })
+        .collect();
+    let package = ReplayPackage {
+        latency_ms: 0,
+        ops,
+        trace: Vec::new(),
+    };
+    let error = ReplayPackage::decode(&package.encode()).expect_err("total ceiling");
+    assert_eq!(error.code(), "rpc/replay");
+    assert!(error.to_string().contains("argument sizes"), "{error}");
+}
+
+#[test]
+fn a_package_larger_than_the_size_ceiling_is_refused() {
+    use active_rpc::replay::MAX_PACKAGE_BYTES;
+
+    let mut bytes = vec![0u8; MAX_PACKAGE_BYTES + 1];
+    bytes[..4].copy_from_slice(b"ARRP");
+    let error = ReplayPackage::decode(&bytes).expect_err("size ceiling");
+    assert_eq!(error.code(), "rpc/replay");
+    assert!(error.to_string().contains("size ceiling"), "{error}");
 }

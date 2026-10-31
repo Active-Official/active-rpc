@@ -189,11 +189,66 @@ a message.
 | `rpc/pipelined-cycle` | pipelined calls form a dependency cycle |
 | `rpc/invalid-argument` | a caller-supplied argument is out of range |
 
+### MCP adapter codes
+
+An `McpSession` reports adapter failures as `rpc/provider` with one of these
+inner codes. Every one is a fail-closed refusal; none is retryable without a new
+session:
+
+| Code | Condition |
+|------|-----------|
+| `mcp/bad-json` | the request line could not be serialised (client bug) |
+| `mcp/no-response` | the transport returned nothing for a request |
+| `mcp/eof` | the server closed its stdout |
+| `mcp/line-too-long` | a line exceeded 1 MiB before parsing |
+| `mcp/bad-response` | the response is not a JSON object with `result` or `error`, or has no `id` |
+| `mcp/id-mismatch` | the response `id` is not the integer this client sent |
+| `mcp/initialize` | the server answered `initialize` with an error |
+| `mcp/tool-name` | an advertised tool name is not `[A-Za-z0-9_.-]{1,128}`, or two tools share a name |
+| `mcp/spawn:<err>` | the child process could not be started |
+| `mcp/read:<err>`, `mcp/write:<err>`, `mcp/stdin`, `mcp/stdout` | transport I/O failed |
+| `mcp/<code>` | the server returned a JSON-RPC error; `<code>` is its numeric code |
+
+A tool name is validated because it becomes an allow-list entry and a method
+name. Control characters, bidi overrides and duplicates are refused at
+handshake rather than filtered silently, so an operator never sees one name and
+grants another.
+
+### WASM guest tool codes (`wasm-tools`)
+
+A `wasm_tool::WasmTool` provider reports failures as `rpc/provider` with one of
+these inner codes (ADR-0019): `wasm/module`, `wasm/import`,
+`wasm/instantiate`, `wasm/memory`, `wasm/entry`, `wasm/fuel`, `wasm/trap`,
+`wasm/input`, `wasm/output`. The guest has no host imports in ABI v1; its ABI is
+`memory` plus `run(len: i32) -> i32` with input at offset 0 and output at offset
+65536.
+
 ---
 
-## 6. Transports
+### Channel and topic authority
 
-| Transport | Framing | Notes |
+A channel carries messages in one process; it is not a wire format. The rules a
+transport must preserve when it forwards one:
+
+- **A live capability publishes.** `Agent::publish` requires the capability to
+  exist, be unrevoked and be unexpired (`rpc/revoked`), and when it carries a
+  topic set the topic must be a member (`rpc/topic-not-granted`).
+- **A bound capability needs its peer.** A capability bound with `mint_bound`
+  publishes only through `Agent::publish_as`, and the presented peer fingerprint
+  must match the binding (`rpc/identity`). A channel cannot prove who published,
+  so the unauthenticated `publish` refuses a bound capability outright.
+- **Bytes are charged.** The payload's wire size is charged against the
+  capability budget intersected with the lane's (`rpc/budget-exceeded`). A
+  refused publish charges nothing and queues nothing.
+- **A transfer never carries a bound capability.** `Agent::send_as` refuses to
+  put a bound capability on a channel; delegation across an identity boundary
+  uses `introduce_to` explicitly. Both paths refuse an expired capability.
+- **A full channel is backpressure.** The queue ceiling answers
+  `rpc/backpressure`; it never drops a message silently.
+
+---
+
+## 6. Transports| Transport | Framing | Notes |
 |-----------|---------|-------|
 | in-process | none | envelopes move by value; `bytes_written() == 0` |
 | TCP | `u32` length + envelope | cross-process, `MAX_FRAME_BYTES` = 64 MiB |

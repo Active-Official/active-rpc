@@ -54,7 +54,11 @@ Semantics:
 3. **Decisions are the trace.** Refusals (including an expired capability and a
    revoked one) appear as trace entries. Replay executes every operation,
    tolerates kernel refusals as recorded, and compares the whole trace; the first
-   difference is reported with its index.
+   difference is reported with its index. **Every attempt is recorded, including
+   one the kernel refuses**: a refused attenuation clones the parent handle
+   first, so it emits `cap.retained`/`cap.released`, and a trace that carried
+   those events without the input would not replay. A bad ordinal (a recorder
+   bug, not a decision) is still refused before anything is recorded.
 4. **Integrity, not authenticity.** Blake3 detects corruption and naive edits.
    A party that can rewrite the file can also recompute the checksum; a package
    is a debug artifact, not a signed attestation. Signing belongs with the
@@ -67,3 +71,12 @@ Semantics:
   package end to end; both are covered by the CLI test suite.
 - Replay is deterministic because the kernel clock is virtual (`set_latency`
   advances it per batch); a future wall-clock mode needs a recorded time source.
+- The decoder enforces a total package ceiling (64 MiB) and a ceiling on the
+  sum of declared argument sizes (16 MiB), in addition to the per-field limits:
+  the field limits alone allow an arbitrarily large body and 100k × 1 MiB of
+  transient allocation during replay.
+- The recorder tails the kernel tape by *total* event count. If the bounded tape
+  wrapped between two captures, the recorder refuses with `rpc/replay` instead
+  of shipping a trace with a missing prefix. No current operation emits enough
+  events in one gap to reach this, so it is a guard rather than a reachable
+  state today.

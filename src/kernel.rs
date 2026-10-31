@@ -577,14 +577,27 @@ impl Agent {
         }
         let fingerprint = peer.fingerprint();
         let mut kernel = self.cell.borrow_mut();
-        let record = kernel
-            .caps
-            .get_mut(&cap.id())
-            .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
-        if record.revoked {
+        let (revoked, expired, already_bound) = {
+            let record = kernel
+                .caps
+                .get(&cap.id())
+                .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+            (
+                record.revoked,
+                record
+                    .expires_at
+                    .is_some_and(|expires_at| kernel.now_ms >= expires_at),
+                record.attrs.bound_to,
+            )
+        };
+        if revoked {
             return Err(Error::Revoked(cap_token(cap.id())));
         }
-        match record.attrs.bound_to {
+        if expired {
+            kernel.push_event(Event::CapExpired(cap.id()));
+            return Err(Error::Revoked(cap_token(cap.id())));
+        }
+        match already_bound {
             Some(bound) if bound != fingerprint => {
                 return Err(Error::Identity(
                     "capability is already bound to another peer",
@@ -592,6 +605,10 @@ impl Agent {
             }
             _ => {}
         }
+        let record = kernel
+            .caps
+            .get_mut(&cap.id())
+            .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
         record.attrs.bound_to = Some(fingerprint);
         let descriptor = crate::wire::CapDescriptor::from_attrs(record.id, &record.attrs);
         let introduced = record.id;
@@ -612,6 +629,13 @@ impl Agent {
             .ok_or(Error::UnknownCapability(cap_token(parent_id)))?
             .clone();
         if record.revoked {
+            return Err(Error::Revoked(cap_token(parent_id)));
+        }
+        if record
+            .expires_at
+            .is_some_and(|expires_at| kernel.now_ms >= expires_at)
+        {
+            kernel.push_event(Event::CapExpired(parent_id));
             return Err(Error::Revoked(cap_token(parent_id)));
         }
         attrs.budget.check()?;
@@ -843,6 +867,13 @@ impl Agent {
             if record.revoked {
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
+            if record
+                .expires_at
+                .is_some_and(|expires_at| kernel.now_ms >= expires_at)
+            {
+                kernel.push_event(Event::CapExpired(cap.id()));
+                return Err(Error::Revoked(cap_token(cap.id())));
+            }
             if let Some(bound) = record.attrs.bound_to {
                 let presented = peer.map(|identity| identity.fingerprint());
                 if presented != Some(bound) {
@@ -879,8 +910,13 @@ impl Agent {
     /// Publish a message on a topic under a capability.
     ///
     /// The capability is the authority: it must be live (not revoked and not
-    /// expired), and when it carries a topic set the topic must be in it. The
-    /// message transfers no capabilities; use [`Agent::send`] for that.
+    /// expired), and when it carries a topic set the topic must be in it. A
+    /// capability bound to a peer publishes only through
+    /// [`Agent::publish_as`]: a channel cannot prove who published, so an
+    /// unauthenticated publish cannot exercise a bound capability. The payload
+    /// is charged against the capability's byte budget intersected with the
+    /// lane's. The message transfers no capabilities; use [`Agent::send`] for
+    /// that.
     pub fn publish(
         &self,
         lane: LaneId,
@@ -889,9 +925,25 @@ impl Agent {
         topic: &str,
         payload: Value,
     ) -> Result<u64> {
+        self.publish_as(None, lane, channel, cap, topic, payload)
+    }
+
+    /// [`Agent::publish`] on behalf of the peer the transport authenticated.
+    pub fn publish_as(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        channel: ChannelId,
+        cap: &CapHandle,
+        topic: &str,
+        payload: Value,
+    ) -> Result<u64> {
         let mut kernel = self.cell.borrow_mut();
-        let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
-        if lane_record.closed {
+        let (lane_closed, lane_budget) = {
+            let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+            (lane_record.closed, lane_record.budget)
+        };
+        if lane_closed {
             return Err(Error::UnknownLane(lane.0));
         }
         let record = kernel
@@ -909,24 +961,47 @@ impl Agent {
             kernel.push_event(Event::CapExpired(cap.id()));
             return Err(Error::Revoked(cap_token(cap.id())));
         }
+        if record.attrs.bound_to.is_some() {
+            let presented = peer.map(|identity| identity.fingerprint());
+            if presented != record.attrs.bound_to {
+                return Err(Error::Identity(
+                    "capability is bound to a different peer identity",
+                ));
+            }
+        }
         if let Some(topics) = &record.attrs.topics {
             if !topics.contains(topic) {
                 return Err(Error::TopicNotGranted(topic.to_string()));
             }
         }
-        if !kernel.channels.contains_key(&channel) {
-            return Err(Error::UnknownChannel(channel.0));
+        // Channel state is checked before the budget is charged: a refused
+        // publish must not consume the capability's bytes.
+        let (can_send, queued) = {
+            let channel_record = kernel
+                .channels
+                .get(&channel)
+                .ok_or(Error::UnknownChannel(channel.0))?;
+            (channel_record.can_send(), channel_record.queued())
+        };
+        if !can_send {
+            return Err(Error::InvalidArgument("channel is closed or receive-only"));
         }
         let ceiling = kernel.channel_ceiling;
-        if kernel
-            .channels
-            .get(&channel)
-            .is_some_and(|record| record.queued() >= ceiling)
-        {
+        if queued >= ceiling {
             kernel.metrics.backpressure_refusals =
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("channel queue ceiling reached"));
         }
+        let bytes = payload.wire_size();
+        let effective = record.attrs.budget.intersect(&lane_budget);
+        if bytes > effective.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
+        }
+        let meter = kernel
+            .meters
+            .get_mut(&cap.id())
+            .ok_or(Error::InvalidArgument("capability has no meter"))?;
+        meter.charge(bytes)?;
         let record = kernel
             .channels
             .get_mut(&channel)
@@ -1723,24 +1798,44 @@ impl Agent {
                         other => args.push(other.clone()),
                     }
                 }
-                // Authority is re-checked at dispatch: a capability revoked
-                // after the call was queued must not reach the provider.
+                // Authority is re-checked at dispatch: a capability revoked or
+                // expired after the call was queued must not reach the
+                // provider. Dispatch advances the virtual clock by one round
+                // trip, so a call that was live when queued can expire before
+                // it runs; that is the same refusal as a revocation.
                 let record = kernel.caps.get(&job.cap).cloned();
+                let mut expired = false;
                 let failure = match &record {
                     None => Some(Error::UnknownCapability(cap_token(job.cap))),
                     Some(record) if record.revoked => Some(Error::Revoked(cap_token(record.id))),
-                    Some(_) => failure,
+                    Some(record) => {
+                        if record
+                            .expires_at
+                            .is_some_and(|expires_at| kernel.now_ms >= expires_at)
+                        {
+                            expired = true;
+                            Some(Error::Revoked(cap_token(record.id)))
+                        } else {
+                            failure
+                        }
+                    }
                 };
                 Some((
                     job,
                     args,
                     failure,
                     record.map(|record| record.object).unwrap_or(0),
+                    expired,
                 ))
             };
-            let Some((job, args, failure, object)) = prepared else {
+            let Some((job, args, failure, object, expired)) = prepared else {
                 continue;
             };
+            if expired {
+                self.cell
+                    .borrow_mut()
+                    .push_event(Event::CapExpired(job.cap));
+            }
 
             // Phase 2: run provider code with no borrow held.
             let outcome = match failure {

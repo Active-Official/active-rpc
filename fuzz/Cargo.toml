@@ -80,3 +80,17 @@ path = "fuzz_targets/fuzz_bulk_plan.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_replay_package"
+path = "fuzz_targets/fuzz_replay_package.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_topic_policy"
+path = "fuzz_targets/fuzz_topic_policy.rs"
+test = false
+doc = false
+bench = false

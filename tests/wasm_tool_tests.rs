@@ -224,3 +224,75 @@ fn the_provider_reports_its_single_method() {
     assert_eq!(tool.name(), "wasm");
     assert_eq!(tool.methods(), vec!["run".to_string()]);
 }
+
+/// A recursive guest hits the engine's depth ceiling and traps. Without the
+/// ceiling it would consume the host stack while it still had fuel.
+#[test]
+fn unbounded_recursion_traps_instead_of_crashing_the_host() {
+    use active_rpc::wasm_tool::MAX_FUEL;
+
+    const RECURSE: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func $recurse (param i32) (result i32)
+    (call $recurse (local.get 0)))
+  (func (export "run") (param i32) (result i32)
+    (call $recurse (i32.const 0))))
+"#;
+    let limits = WasmLimits {
+        // Plenty of fuel, so a trap proves the depth ceiling fired rather than
+        // the meter.
+        fuel: MAX_FUEL,
+        ..WasmLimits::default()
+    };
+    let mut tool = WasmTool::from_bytes(RECURSE.as_bytes(), limits).expect("compile");
+    let code = error_code(tool.call(b""));
+    assert!(
+        matches!(code.as_str(), "wasm/trap" | "wasm/fuel"),
+        "unexpected code {code}"
+    );
+}
+
+#[test]
+fn a_module_larger_than_the_ceiling_is_refused_before_compiling() {
+    let bytes = vec![0u8; active_rpc::wasm_tool::MAX_MODULE_BYTES + 1];
+    let error = WasmTool::from_bytes(&bytes, WasmLimits::default())
+        .expect_err("an oversized module must be refused");
+    assert_eq!(error_code(Err::<(), _>(error)), "wasm/module");
+    let error = WasmTool::from_bytes(&[], WasmLimits::default())
+        .expect_err("an empty module must be refused");
+    assert_eq!(error_code(Err::<(), _>(error)), "wasm/module");
+}
+
+#[test]
+fn a_limit_that_would_fail_open_is_a_configuration_error() {
+    // Zero fuel, zero output and a memory window outside the supported band are
+    // refused when the tool is built, not discovered at call time.
+    let cases = [
+        WasmLimits {
+            fuel: 0,
+            ..WasmLimits::default()
+        },
+        WasmLimits {
+            fuel: active_rpc::wasm_tool::MAX_FUEL + 1,
+            ..WasmLimits::default()
+        },
+        WasmLimits {
+            max_output_bytes: 0,
+            ..WasmLimits::default()
+        },
+        WasmLimits {
+            max_memory_bytes: 0,
+            ..WasmLimits::default()
+        },
+        WasmLimits {
+            max_memory_bytes: active_rpc::wasm_tool::MAX_MEMORY_BYTES + 1,
+            ..WasmLimits::default()
+        },
+    ];
+    for limits in cases {
+        let error = WasmTool::from_bytes(CONSTANT.as_bytes(), limits)
+            .expect_err("a fail-open limit must be refused");
+        assert_eq!(error_code(Err::<(), _>(error)), "wasm/limits", "{limits:?}");
+    }
+}

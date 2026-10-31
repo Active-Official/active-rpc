@@ -31,6 +31,9 @@ TARGETS = [
     "fuzz_tool_process",
     "fuzz_channel_cap_transfer",
     "fuzz_transport_framing",
+    "fuzz_bulk_plan",
+    "fuzz_replay_package",
+    "fuzz_topic_policy",
 ]
 
 

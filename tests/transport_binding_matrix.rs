@@ -131,6 +131,130 @@ fn assert_response(response: &Envelope) {
     assert_eq!(response.kind, Kind::Response, "method={}", response.method);
 }
 
+/// Dispatch with an authenticated peer, as a transport that verified one would.
+fn dispatch_authenticated(
+    agent: &Agent,
+    lane: active_rpc::LaneId,
+    envelope: &Envelope,
+    peer: &PeerIdentity,
+) -> Envelope {
+    let Some(descriptor) = envelope.caps.first() else {
+        return Envelope::error(
+            envelope.request_id,
+            &active_rpc::Error::UnknownCapability(active_rpc::CapToken(0)),
+        );
+    };
+    let cap = agent.import(descriptor.id);
+    match agent.call_as(
+        Some(peer),
+        lane,
+        &cap,
+        &envelope.method,
+        envelope.args.clone(),
+    ) {
+        Ok(promise) => {
+            agent.run();
+            match promise.value() {
+                Ok(value) => Envelope::response(envelope.request_id, value),
+                Err(error) => Envelope::error(envelope.request_id, &error),
+            }
+        }
+        Err(error) => Envelope::error(envelope.request_id, &error),
+    }
+}
+
+fn peer(certificate: &[u8]) -> PeerIdentity {
+    PeerIdentity::from_certificate(certificate)
+}
+
+#[test]
+fn tcp_accepts_a_bound_capability_only_for_the_bound_identity() {
+    let fixture = fixture();
+    let bound_id = fixture.bound.id();
+    let owner = peer(b"transport-matrix-peer");
+    let stranger = peer(b"some-other-peer");
+    let (listener, address) = bind_loopback().expect("bind");
+    let client = thread::spawn(move || {
+        let mut transport = TcpTransport::connect(&address).expect("connect");
+        transport.send(&request(bound_id)).expect("send");
+        let first = transport.recv().expect("recv").expect("response");
+        transport.send(&request(bound_id)).expect("send");
+        let second = transport.recv().expect("recv").expect("response");
+        (first, second)
+    });
+    let (stream, _) = listener.accept().expect("accept");
+    let transport = TcpTransport::new(stream).expect("transport");
+    let mut calls = 0;
+    serve_connection(transport, |envelope| {
+        calls += 1;
+        if calls == 1 {
+            dispatch_authenticated(&fixture.agent, fixture.lane, &envelope, &owner)
+        } else {
+            dispatch_authenticated(&fixture.agent, fixture.lane, &envelope, &stranger)
+        }
+    })
+    .expect("serve");
+    let (first, second) = client.join().expect("client");
+    assert_response(&first);
+    assert_refused(&second, "rpc/identity");
+}
+
+#[test]
+fn connect_accepts_a_bound_capability_only_for_the_bound_identity() {
+    let fixture = fixture();
+    let bound_id = fixture.bound.id();
+    let owner = peer(b"transport-matrix-peer");
+    let stranger = peer(b"some-other-peer");
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let client = thread::spawn(move || {
+        let mut client = ConnectClient::connect(&address).expect("connect");
+        let first = client.call(&request(bound_id)).expect("call");
+        let second = client.call(&request(bound_id)).expect("call");
+        (first, second)
+    });
+    let mut calls = 0;
+    server
+        .serve(2, |envelope| {
+            calls += 1;
+            if calls == 1 {
+                dispatch_authenticated(&fixture.agent, fixture.lane, &envelope, &owner)
+            } else {
+                dispatch_authenticated(&fixture.agent, fixture.lane, &envelope, &stranger)
+            }
+        })
+        .expect("serve");
+    let (first, second) = client.join().expect("client");
+    assert_response(&first);
+    assert_refused(&second, "rpc/identity");
+}
+
+#[test]
+fn a_wire_descriptor_cannot_move_a_capability_to_another_provider() {
+    // The registry is the authority: the descriptor may *name* a capability, but
+    // the bound record (provider, object, identity, budget) is what dispatches.
+    let fixture = fixture();
+    let mut envelope = request(fixture.bound.id());
+    if let Some(descriptor) = envelope.caps.first_mut() {
+        descriptor.methods = ["echo", "not_granted"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        descriptor.read_only = true;
+    }
+    let owner = peer(b"transport-matrix-peer");
+    let response = dispatch_authenticated(&fixture.agent, fixture.lane, &envelope, &owner);
+    // The widened descriptor did not widen the grant, and the call still
+    // succeeds because `echo` was actually granted.
+    assert_response(&response);
+    assert_eq!(response.first_value(), Some(&Value::text("payload")));
+
+    let mut escalated = request(fixture.bound.id());
+    escalated.method = "not_granted".to_string();
+    let response = dispatch_authenticated(&fixture.agent, fixture.lane, &escalated, &owner);
+    assert_refused(&response, "rpc/method-not-granted");
+}
+
 #[test]
 fn tcp_refuses_a_bound_capability_and_accepts_an_unbound_one() {
     let fixture = fixture();

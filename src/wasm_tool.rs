@@ -28,6 +28,29 @@ pub const INPUT_OFFSET: usize = 0;
 /// Output area: the guest writes its result here.
 pub const OUTPUT_OFFSET: usize = 64 * 1024;
 
+/// Largest module the host compiles, in bytes.
+///
+/// Compilation happens before any fuel exists, so an unbounded module is an
+/// unbounded allocation and an unbounded compile. One MiB is far above any
+/// hand-written tool and far below a denial-of-service payload.
+pub const MAX_MODULE_BYTES: usize = 1 << 20;
+
+/// Largest fuel budget a caller may configure.
+pub const MAX_FUEL: u64 = 10_000_000_000;
+
+/// Smallest linear memory a caller may configure: enough for the input and
+/// output areas.
+pub const MIN_MEMORY_BYTES: usize = 2 * OUTPUT_OFFSET;
+
+/// Largest linear memory a caller may configure.
+pub const MAX_MEMORY_BYTES: usize = 1 << 30;
+
+/// Recursion ceiling imposed on the engine, independent of the fuel budget.
+const MAX_RECURSION_DEPTH: usize = 1_024;
+
+/// Value-stack ceiling imposed on the engine, in bytes.
+const MAX_STACK_BYTES: usize = 1 << 20;
+
 /// Resource ceilings for a guest tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmLimits {
@@ -59,11 +82,29 @@ pub struct WasmTool {
 impl WasmTool {
     /// Compile a guest from WASM bytes (or WAT text, which wasmi accepts).
     pub fn from_bytes(bytes: &[u8], limits: WasmLimits) -> Result<WasmTool> {
-        if limits.max_output_bytes > OUTPUT_OFFSET {
+        // Every ceiling is validated before anything is allocated or compiled.
+        // A zero fuel budget or a zero output area would fail open (nothing to
+        // charge, nothing to bound), so they are configuration errors rather
+        // than surprises at call time.
+        if bytes.is_empty() || bytes.len() > MAX_MODULE_BYTES {
+            return Err(provider("wasm/module"));
+        }
+        if limits.fuel == 0 || limits.fuel > MAX_FUEL {
+            return Err(provider("wasm/limits"));
+        }
+        if limits.max_memory_bytes < MIN_MEMORY_BYTES || limits.max_memory_bytes > MAX_MEMORY_BYTES
+        {
+            return Err(provider("wasm/limits"));
+        }
+        if limits.max_output_bytes == 0 || limits.max_output_bytes > OUTPUT_OFFSET {
             return Err(provider("wasm/limits"));
         }
         let mut config = Config::default();
         config.consume_fuel(true);
+        // A recursive guest must trap on the engine's depth ceiling instead of
+        // exhausting the host stack while it still has fuel.
+        config.set_max_recursion_depth(MAX_RECURSION_DEPTH);
+        config.set_max_stack_height(MAX_STACK_BYTES);
         let engine = Engine::new(&config);
         let module = Module::new(&engine, bytes).map_err(|_| provider("wasm/module"))?;
         // No host imports in ABI v1: anything the guest asks for is refused

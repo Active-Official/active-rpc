@@ -25,7 +25,10 @@ impl CapId {
     /// Derive an id from the kernel secret, serial and parent.
     ///
     /// Deterministic for a given kernel (which makes tests and replays stable),
-    /// unpredictable to a peer without the secret.
+    /// unpredictable to a peer without the secret. Two kernels that share a
+    /// secret are one authority domain and derive identical ids: never copy a
+    /// secret between processes that are not the same logical agent
+    /// (`SECURITY.md`, "Authority domain").
     pub fn derive(secret: &[u8; 32], serial: u64, parent: Option<&CapId>) -> CapId {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"active-rpc/cap");
