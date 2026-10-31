@@ -22,3 +22,4 @@
 | [0018](0018-replay-packages.md) | Deterministic replay packages |
 | [0019](0019-wasm-guest-tools.md) | Fuel-metered WebAssembly guest tools |
 | [0020](0020-capability-filtered-topics.md) | Capability-filtered pub/sub topics |
+| [0021](0021-durable-receipt-log.md) | Durable receipt log (`ARRL`) |

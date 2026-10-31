@@ -20,6 +20,14 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// A fresh temporary directory per test.
+fn sandbox(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("active-rpc-cli-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("sandbox");
+    dir
+}
+
 /// A peer process kept alive until the test drops it.
 struct Peer {
     child: Child,
@@ -314,4 +322,60 @@ fn version_prints_the_cli_and_kernel() {
         );
         assert!(text.contains("(active-rpc "), "{text}");
     }
+}
+
+#[test]
+fn receipts_dump_verify_and_tamper_paths() {
+    let dir = sandbox("receipts");
+    let log = dir.join("session.arrl");
+    let log_arg = log.to_str().expect("log path");
+
+    let dump = run(&["receipts", "dump", "--output", log_arg]);
+    assert!(dump.status.success(), "{}", stderr(&dump));
+    assert!(
+        stdout(&dump).contains("wrote 3 receipts"),
+        "{}",
+        stdout(&dump)
+    );
+    assert!(log.is_file());
+
+    let verify = run(&["receipts", "verify", log_arg]);
+    assert!(verify.status.success(), "{}", stderr(&verify));
+    let text = stdout(&verify);
+    assert!(text.starts_with("ok 3 receipts"), "{text}");
+    let head = text
+        .split_whitespace()
+        .last()
+        .expect("head hash")
+        .to_string();
+    assert_eq!(head.len(), 64);
+
+    let show = run(&["receipts", "show", log_arg, "--limit", "2"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let shown = stdout(&show);
+    let lines: Vec<&str> = shown.lines().collect();
+    assert_eq!(lines.len(), 2, "{shown}");
+    assert!(lines[0].starts_with("1 "), "{}", lines[0]);
+    assert!(lines[1].starts_with("2 "), "{}", lines[1]);
+
+    // A tampered record fails verification with the receipt class.
+    let mut bytes = std::fs::read(&log).expect("read log");
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    std::fs::write(&log, &bytes).expect("tamper");
+    let refused = run(&["receipts", "verify", log_arg]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr(&refused).contains("rpc/receipt"),
+        "{}",
+        stderr(&refused)
+    );
+
+    // A missing log is a usage error, not a panic.
+    let missing = run(&[
+        "receipts",
+        "verify",
+        dir.join("nope.arrl").to_str().unwrap(),
+    ]);
+    assert_eq!(missing.status.code(), Some(2));
 }

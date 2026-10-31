@@ -53,6 +53,8 @@ pub enum Error {
     /// A replay package is malformed, tampered with, or disagrees with the
     /// decisions it recorded.
     Replay(String),
+    /// A receipt log is malformed, truncated, reordered or fails its chain.
+    Receipt(String),
     /// The call references a promise that will never resolve.
     UnresolvablePromise(u64),
     /// The provider failed the call.
@@ -102,6 +104,7 @@ impl Error {
             Error::Identity(_) => "rpc/identity",
             Error::Bulk(_) => "rpc/bulk",
             Error::Replay(_) => "rpc/replay",
+            Error::Receipt(_) => "rpc/receipt",
             Error::UnresolvablePromise(_) => "rpc/unresolvable-promise",
             Error::Provider { .. } => "rpc/provider",
             Error::Domain(_) => "rpc/domain",
@@ -149,6 +152,7 @@ impl fmt::Display for Error {
             Error::Identity(what) => write!(f, "peer identity refused: {what}"),
             Error::Bulk(what) => write!(f, "bulk transfer rejected: {what}"),
             Error::Replay(what) => write!(f, "replay package rejected: {what}"),
+            Error::Receipt(what) => write!(f, "receipt log rejected: {what}"),
             Error::UnresolvablePromise(id) => write!(f, "promise {id} can never resolve"),
             Error::Provider { code } => write!(f, "provider failed: {code}"),
             Error::Domain(code) => write!(f, "domain operation failed: {code}"),
@@ -169,5 +173,12 @@ impl std::error::Error for Error {}
 impl From<active_infinity::Error> for Error {
     fn from(error: active_infinity::Error) -> Self {
         Error::Payload(error.code().to_string())
+    }
+}
+
+impl Error {
+    /// Build a receipt-log refusal from anything string-like.
+    pub fn receipt(reason: impl Into<String>) -> Self {
+        Error::Receipt(reason.into())
     }
 }

@@ -315,3 +315,11 @@ assembles only after every index is present and the root verifies.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.
+
+### Receipt log (`ARRL`)
+
+A durable audit log is not an ARP1 message, but it is a format peers and
+operators exchange, so its refusal class is part of the contract:
+`rpc/receipt`. The layout, chain rules and verification modes are in
+ADR-0021; `receipts verify` checks the chain without the kernel secret, and
+`ReceiptLog::verify_macs` adds the keyed check.

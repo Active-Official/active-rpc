@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::kernel::Provider;
+use active_rpc::receipts::ReceiptLog;
 use active_rpc::replay::{Recorder, ReplayPackage};
 use active_rpc::transport::connect::{BridgeServer, ConnectClient};
 use active_rpc::transport::http2::{Http2Client, Http2Server};
@@ -82,6 +83,7 @@ fn run(args: Vec<String>) -> CliResult {
         "bridge" => bridge(&args),
         "events" => events(&args),
         "replay" => replay(&args),
+        "receipts" => receipts(&args),
         "help" | "--help" | "-h" => {
             println!("{}", help_text());
             Ok(())
@@ -992,6 +994,139 @@ fn read_bounded(path: &str, ceiling: u64) -> Result<Vec<u8>, CliError> {
 }
 
 // ---------------------------------------------------------------------------
+// receipts
+// ---------------------------------------------------------------------------
+
+/// Largest receipt log the CLI will read, in bytes.
+const MAX_RECEIPT_LOG: u64 = 16 << 20;
+
+const RECEIPTS_USAGE: &str = "usage: receipts dump [--output PATH]\n       receipts verify <log>\n       receipts show <log> [--limit N]";
+
+fn receipts(args: &[String]) -> CliResult {
+    let (positional, flags) = split_args(&args[1..]);
+    match positional.first().map(String::as_str) {
+        Some("dump") => receipts_dump(&flags),
+        Some("verify") => {
+            let path = positional
+                .get(1)
+                .ok_or_else(|| CliError::usage(RECEIPTS_USAGE.to_string()))?;
+            receipts_verify(path)
+        }
+        Some("show") => {
+            let path = positional
+                .get(1)
+                .ok_or_else(|| CliError::usage(RECEIPTS_USAGE.to_string()))?;
+            let limit = match flags.get("--limit").filter(|value| !value.is_empty()) {
+                Some(value) => value
+                    .parse::<usize>()
+                    .map_err(|_| CliError::usage("--limit expects a number".to_string()))?,
+                None => usize::MAX,
+            };
+            receipts_show(path, limit)
+        }
+        _ => Err(CliError::usage(RECEIPTS_USAGE.to_string())),
+    }
+}
+
+/// Record a demo session with receipts enabled and export the log.
+fn receipts_dump(flags: &BTreeMap<String, String>) -> CliResult {
+    let output = flags
+        .get("--output")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| CliError::usage(RECEIPTS_USAGE.to_string()))?;
+    let agent = Agent::with_secret([0x5e; 32]);
+    agent.enable_receipts(true);
+    let provider = agent.register(Box::new(DemoProvider));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo", "sum"]))
+        .map_err(refusal)?;
+    let lane = agent
+        .create_lane("receipts", Budget::default())
+        .map_err(refusal)?;
+    for method in ["echo", "echo", "sum"] {
+        let promise = agent
+            .call(lane, &cap, method, vec![Arg::Value(Value::Int(2))])
+            .map_err(refusal)?;
+        agent.run();
+        promise.value().map_err(refusal)?;
+    }
+    // A refusal is not an admitted decision and produces no receipt.
+    let _ = agent.call(lane, &cap, "refuse", Vec::new());
+    let receipts = agent.receipts();
+    let log = ReceiptLog::create(&output)
+        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+    log.append_all(&receipts)
+        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+    println!("wrote {} receipts to {output}", receipts.len());
+    println!("head {}", hex32(&log.head_hash().map_err(refusal)?));
+    Ok(())
+}
+
+fn receipts_verify(path: &str) -> CliResult {
+    let log = open_receipt_log(path)?;
+    let records = log
+        .records()
+        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+    println!(
+        "ok {} receipts, head {}",
+        records.len(),
+        hex32(&log.head_hash().map_err(refusal)?)
+    );
+    Ok(())
+}
+
+fn receipts_show(path: &str, limit: usize) -> CliResult {
+    let log = open_receipt_log(path)?;
+    let records = log
+        .records()
+        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+    for receipt in records.iter().take(limit) {
+        println!(
+            "{} {} {} {}",
+            receipt.sequence, receipt.at_ms, receipt.cap, receipt.method
+        );
+    }
+    Ok(())
+}
+
+fn open_receipt_log(path: &str) -> Result<ReceiptLog, CliError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
+    if metadata.len() > MAX_RECEIPT_LOG {
+        return Err(CliError::usage(format!(
+            "{path} is larger than the {MAX_RECEIPT_LOG}-byte ceiling"
+        )));
+    }
+    ReceiptLog::open(path).map_err(|error| CliError::usage(format!("{}: {error}", error.code())))
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The demo provider used by `receipts dump`: deterministic, free of I/O.
+struct DemoProvider;
+
+impl Provider for DemoProvider {
+    fn name(&self) -> &'static str {
+        "demo"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["echo".to_string(), "sum".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::Text(call.method.clone())))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // help
 // ---------------------------------------------------------------------------
 
@@ -1028,6 +1163,13 @@ usage: active-rpc-cli <command> [options]
   replay run <package>
       Replay a package against a fresh kernel and compare every decision;
       a tampered or divergent package is refused.
+  receipts dump [--output PATH]
+      Record a demo session with receipts enabled into an append-only ARRL log
+      (correlation ids, methods and times only; no arguments or secrets).
+  receipts verify <log>
+      Verify the log's record hashes and chain links (no key needed).
+  receipts show <log> [--limit N]
+      Print sequence, time, correlation id and method per record.
   help
       This text.
   version

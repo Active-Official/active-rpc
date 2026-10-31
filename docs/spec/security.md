@@ -165,7 +165,7 @@ aspirational without a date.
 | Promise safety | A pipelined call runs under its own capability; a promise carries a value, never authority; a refused dependency stops the chain; cycles are refused | H2.26, H2.47, `a_refused_dependency_stops_the_pipeline` | enforced |
 | Lane isolation | Per-lane budgets and closed lanes; destroying a lane removes its queued work | `tests/concurrency_tests.rs`, `dispatch_authority_matrix` | enforced |
 | Transfer explicit | Capabilities move only as `Arg::Cap` or channel messages; a bound capability cannot cross a channel | `a_bound_capability_cannot_be_transferred_over_a_channel` | enforced |
-| Durable receipts | In-memory ring today; a durable, exportable log is the next step | `tests/receipts_tests.rs` | planned (M-3.1) |
+| Durable receipts | `ReceiptLog` (`ARRL`): append-only, hash-chained, no arguments or secrets; chain verifies without the key, MACs with it | `tests/receipts_tests.rs`, `tests/receipt_log_tests.rs`, ADR-0021 | enforced |
 | Durable capabilities | `CapPersistence::Durable` is refused by policy until a restore profile exists | `tests/persistence_tests.rs` | planned profile (M-3.2) |
 | Topic filters | `CapAttrs::topics` restricts `publish`; attenuation only narrows | `tests/topic_tests.rs` | enforced |
 | No oracle | Secrets never compare, never render, never enter a receipt; capability ids are correlated for telemetry | `tests/invariant_gate.rs`, H2.43, `tests/observability_tests.rs` | enforced |
