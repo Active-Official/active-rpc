@@ -121,6 +121,43 @@ map and walks the cone, `subgraph` copies the cone and encodes it, and
 `evaluate` runs the engine. None of them re-encodes for the answer's sake; the
 subgraph encode is the payload.
 
+## TCP syscall path (M-4.2, 2026-10-31)
+
+`cargo run --release --example tcp_bench -- <calls> <payload>`: one loopback
+connection, sequential request/response round trips through the shipped
+`TcpTransport`, one server thread. Run in a Docker Desktop Linux container
+(Windows 11 / Hyper-V host, Xeon E5-1650 v4, `rustc 1.99.1`), syscall census
+with `strace -f -c` over 2,064 calls.
+
+| Measurement | Before | After |
+|---|---|---|
+| Syscalls per call | 8.05 | 4.05 |
+| Total syscalls (2,064 calls) | 16,613 | 8,357 |
+| Time in syscalls (strace) | 1.64 s | 0.94 s |
+| p50 round trip, 256 B payload | 95 µs | 86 µs |
+| Requests/s, 256 B | 8,907 | 10,700 |
+
+A frame now leaves in one `writev` (header and body as two slices) instead of
+`write` + `write`, and `TcpTransport` reads through an 8 KiB buffer so a header
+read and its body read cost one `recvfrom` instead of two. Bulk payloads:
+
+| Payload | p50 | Requests/s | Bytes/s (both directions) |
+|---|---|---|---|
+| 4 KiB | 93 µs | 9,820 | 80 MB/s |
+| 64 KiB | 146 µs | 6,131 | 803 MB/s |
+
+The per-call cost is flat from 256 B to 4 KiB, which says the round trip is
+scheduling-bound in a container VM, not byte-bound. That is the measured basis
+for ADR-0023 (no io_uring backend): io_uring can batch syscalls, not peer
+wake-ups. Reproduce the census with:
+
+```text
+docker run --rm -v "$PWD:/work" -w /work -e CARGO_TARGET_DIR=/tmp/target \
+  active-all-toolchains:phase2 bash -lc \
+  "cargo build --release --example tcp_bench && \
+   strace -f -c -o /tmp/s.txt /tmp/target/release/examples/tcp_bench 2000 256"
+```
+
 ## Regression policy
 
 A change that moves a benchmark by more than 20% on the same machine needs a

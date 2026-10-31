@@ -18,7 +18,7 @@
 //! envelope shape.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{BufReader, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use crate::error::{Error, Result};
@@ -153,13 +153,21 @@ impl Transport for InProcessTransport {
 // ---------------------------------------------------------------------------
 
 /// A length-prefixed envelope channel over a TCP connection.
+///
+/// Reads go through an 8 KiB buffer: a header read and the body read that
+/// follows it are served from the same `recv`, so one envelope costs one receive
+/// syscall instead of two. Writes are a single vectored call for the header and
+/// the body.
 #[derive(Debug)]
 pub struct TcpTransport {
-    stream: TcpStream,
+    stream: BufReader<TcpStream>,
     inbox: VecDeque<Envelope>,
     written: u64,
     limits: WireLimits,
 }
+
+/// Receive buffer for one connection.
+const TCP_READ_BUFFER: usize = 8 << 10;
 
 impl TcpTransport {
     /// Wrap an established stream.
@@ -168,7 +176,7 @@ impl TcpTransport {
             .set_nodelay(true)
             .map_err(|error| Error::Transport(error.to_string()))?;
         Ok(Self {
-            stream,
+            stream: BufReader::with_capacity(TCP_READ_BUFFER, stream),
             inbox: VecDeque::new(),
             written: 0,
             limits: WireLimits::default(),
@@ -196,7 +204,7 @@ impl Transport for TcpTransport {
 
     fn send(&mut self, envelope: &Envelope) -> Result<()> {
         let bytes = envelope.encode()?;
-        write_frame(&mut self.stream, &bytes)?;
+        write_frame(self.stream.get_mut(), &bytes)?;
         self.written += (bytes.len() + 4) as u64;
         Ok(())
     }
@@ -281,10 +289,23 @@ pub fn read_frame<R: Read>(reader: &mut R, limits: &WireLimits) -> Result<Option
 }
 
 /// Write one exact frame to a generic writer.
+///
+/// Header and body travel in one vectored write, so a TCP frame costs one send
+/// syscall. `IoSlice::advance_slices` handles a short write; a zero write is an
+/// error rather than a spin.
 pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
+    let header = frame(body.len())?;
+    let mut slices: [IoSlice<'_>; 2] = [IoSlice::new(&header), IoSlice::new(body)];
+    let mut bufs: &mut [IoSlice<'_>] = &mut slices;
+    while !bufs.is_empty() {
+        match writer.write_vectored(bufs) {
+            Ok(0) => return Err(Error::Transport("write returned zero bytes".to_string())),
+            Ok(written) => IoSlice::advance_slices(&mut bufs, written),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(Error::Transport(error.to_string())),
+        }
+    }
     writer
-        .write_all(&frame(body.len())?)
-        .and_then(|_| writer.write_all(body))
-        .and_then(|_| writer.flush())
+        .flush()
         .map_err(|error| Error::Transport(error.to_string()))
 }
