@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::kernel::Provider;
+use active_rpc::replay::{Recorder, ReplayPackage};
 use active_rpc::transport::connect::{BridgeServer, ConnectClient};
 use active_rpc::transport::http2::{Http2Client, Http2Server};
 use active_rpc::transport::quic::{QuicClient, QuicServer};
@@ -80,6 +81,7 @@ fn run(args: Vec<String>) -> CliResult {
         "loadgen" => loadgen(&args),
         "bridge" => bridge(&args),
         "events" => events(&args),
+        "replay" => replay(&args),
         "help" | "--help" | "-h" => {
             println!("{}", help_text());
             Ok(())
@@ -892,6 +894,96 @@ fn dechunk(body: &[u8]) -> Result<String, CliError> {
 }
 
 // ---------------------------------------------------------------------------
+// replay
+// ---------------------------------------------------------------------------
+
+/// Largest replay package the CLI will read.
+const MAX_PACKAGE_BYTES: u64 = 64 << 20;
+
+fn replay(args: &[String]) -> CliResult {
+    let (positional, flags) = split_args(&args[1..]);
+    match positional.first().map(String::as_str) {
+        Some("dump") => {
+            let package = demo_package()?;
+            let path = flags
+                .get("--output")
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "session.arrp".to_string());
+            std::fs::write(&path, package.encode())
+                .map_err(|error| CliError::transport(format!("cannot write {path}: {error}")))?;
+            println!(
+                "wrote {path} ops={} trace={}",
+                package.ops.len(),
+                package.trace.len()
+            );
+            Ok(())
+        }
+        Some("run") => {
+            let path = positional
+                .get(1)
+                .ok_or_else(|| CliError::usage("replay run needs a package path"))?;
+            let bytes = read_bounded(path, MAX_PACKAGE_BYTES)?;
+            let package = ReplayPackage::decode(&bytes)
+                .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+            package
+                .replay()
+                .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+            println!(
+                "ok ops={} trace={} latency_ms={}",
+                package.ops.len(),
+                package.trace.len(),
+                package.latency_ms
+            );
+            Ok(())
+        }
+        _ => Err(CliError::usage(
+            "usage: replay dump [--output PATH]\n       replay run <package>",
+        )),
+    }
+}
+
+/// A deterministic demo session: mint, calls, a refusal, attenuation, a TTL
+/// expiration and a revocation, all against the real kernel.
+fn demo_package() -> Result<ReplayPackage, CliError> {
+    let mut recorder = Recorder::new(10).map_err(refusal)?;
+    let echo = recorder.mint(&["echo", "sum"], None).map_err(refusal)?;
+    recorder.call(echo, "echo", 12).map_err(refusal)?;
+    recorder.call(echo, "refuse", 0).map_err(refusal)?;
+    let child = recorder
+        .attenuate(echo, &["echo"], Some(60_000))
+        .map_err(refusal)?;
+    recorder.call(child, "echo", 4).map_err(refusal)?;
+    // The TTL is short enough that the fourth call lands after it.
+    let ttl = recorder.mint(&["echo"], Some(25)).map_err(refusal)?;
+    for _ in 0..4 {
+        recorder.call(ttl, "echo", 0).map_err(refusal)?;
+    }
+    recorder.revoke(echo).map_err(refusal)?;
+    recorder.call(echo, "echo", 0).map_err(refusal)?;
+    Ok(recorder.package())
+}
+
+fn refusal(error: active_rpc::Error) -> CliError {
+    CliError::refused(format!("{}: {error}", error.code()))
+}
+
+fn read_bounded(path: &str, ceiling: u64) -> Result<Vec<u8>, CliError> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
+    let mut bytes = Vec::new();
+    file.take(ceiling + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
+    if bytes.len() as u64 > ceiling {
+        return Err(CliError::usage(format!(
+            "{path} is larger than the {ceiling}-byte ceiling"
+        )));
+    }
+    Ok(bytes)
+}
+
+// ---------------------------------------------------------------------------
 // help
 // ---------------------------------------------------------------------------
 
@@ -922,6 +1014,12 @@ usage: active-rpc-cli <command> [options]
       Serve the Connect/gRPC interop bridge against the demo kernel.
   events [--plane URL] [--after ID] [--follow] [--interval-ms N]
       Tail the control-plane event stream (correlation ids only).
+  replay dump [--output PATH]
+      Record a deterministic demo session (mint, calls, refusal, TTL expiry,
+      revocation) into a replay package.
+  replay run <package>
+      Replay a package against a fresh kernel and compare every decision;
+      a tampered or divergent package is refused.
   help
       This text.
 
@@ -934,6 +1032,8 @@ Examples:
   active-rpc-cli pipeline --addr 127.0.0.1:5000 --cap <hex> --calls 16
   active-rpc-cli loadgen --addr 127.0.0.1:5000 --cap <hex> --requests 200 --concurrency 8
   active-rpc-cli events --plane http://127.0.0.1:8787 --follow
+  active-rpc-cli replay dump --output session.arrp
+  active-rpc-cli replay run session.arrp
 
 Capabilities are printed as opaque ids; the CLI never prints authority bits.",
         env!("CARGO_PKG_VERSION")

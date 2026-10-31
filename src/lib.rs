@@ -61,6 +61,7 @@ pub mod lane;
 pub mod observability;
 pub mod promise;
 pub mod receipts;
+pub mod replay;
 pub mod security;
 pub mod tool;
 pub mod transport;
@@ -80,6 +81,7 @@ pub use kernel::{Agent, Event, Metrics, PromiseHandle, Provider};
 pub use lane::{Lane, LaneId};
 pub use promise::{PromiseId, PromiseState};
 pub use receipts::Receipt;
+pub use replay::{Op, ReplayPackage, Trace};
 pub use value::{Arg, Call, Response, Value};
 pub use wire::{CapDescriptor, Envelope, Kind, WireLimits};
 

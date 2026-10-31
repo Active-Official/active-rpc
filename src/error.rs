@@ -48,6 +48,9 @@ pub enum Error {
     Identity(&'static str),
     /// A bulk-transfer plan or chunk is malformed, truncated or fails its hash.
     Bulk(&'static str),
+    /// A replay package is malformed, tampered with, or disagrees with the
+    /// decisions it recorded.
+    Replay(String),
     /// The call references a promise that will never resolve.
     UnresolvablePromise(u64),
     /// The provider failed the call.
@@ -95,6 +98,7 @@ impl Error {
             Error::Backpressure(_) => "rpc/backpressure",
             Error::Identity(_) => "rpc/identity",
             Error::Bulk(_) => "rpc/bulk",
+            Error::Replay(_) => "rpc/replay",
             Error::UnresolvablePromise(_) => "rpc/unresolvable-promise",
             Error::Provider { .. } => "rpc/provider",
             Error::Domain(_) => "rpc/domain",
@@ -140,6 +144,7 @@ impl fmt::Display for Error {
             Error::Backpressure(what) => write!(f, "backpressure: {what}"),
             Error::Identity(what) => write!(f, "peer identity refused: {what}"),
             Error::Bulk(what) => write!(f, "bulk transfer rejected: {what}"),
+            Error::Replay(what) => write!(f, "replay package rejected: {what}"),
             Error::UnresolvablePromise(id) => write!(f, "promise {id} can never resolve"),
             Error::Provider { code } => write!(f, "provider failed: {code}"),
             Error::Domain(code) => write!(f, "domain operation failed: {code}"),

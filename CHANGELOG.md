@@ -20,6 +20,11 @@ unchanged.
   granted methods and the default budget ceilings as a canonical AINF module
   that any binding can validate and hash. It carries no capability ids or
   secrets.
+- **Deterministic replay packages** (ADR-0018): `replay::Recorder` records a
+  session's operations and decision trace into the `ARRP` format;
+  `ReplayPackage::replay` re-executes it against a fresh kernel and compares
+  every entry. Packages store argument sizes, never values. The CLI gains
+  `replay dump` and `replay run`.
 - **Payload accounting**: `Agent::call_with_payload` and
   `call_as_with_payload` charge an envelope payload against `max_bytes`; the
   CLI, examples and peer binaries use them.

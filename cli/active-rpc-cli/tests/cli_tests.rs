@@ -267,3 +267,37 @@ fn bridge_serves_the_connect_adapter() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("kind=response"));
 }
+
+#[test]
+fn replay_dump_and_run_round_trip() {
+    let path = std::env::temp_dir().join(format!("active-rpc-replay-{}.arrp", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let dump = run(&["replay", "dump", "--output", path.to_str().expect("utf8")]);
+    assert!(dump.status.success(), "{}", stderr(&dump));
+    assert!(stdout(&dump).contains("ops="));
+    let bytes = std::fs::read(&path).expect("package");
+    assert_eq!(&bytes[..4], b"ARRP");
+
+    let replayed = run(&["replay", "run", path.to_str().expect("utf8")]);
+    assert!(replayed.status.success(), "{}", stderr(&replayed));
+    assert!(stdout(&replayed).contains("ok ops="));
+
+    let mut tampered = bytes;
+    tampered[40] ^= 0x01;
+    std::fs::write(&path, &tampered).expect("tampered");
+    let refused = run(&["replay", "run", path.to_str().expect("utf8")]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr(&refused).contains("rpc/replay"),
+        "{}",
+        stderr(&refused)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn replay_without_a_subcommand_is_a_usage_error() {
+    let output = run(&["replay"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("replay dump"));
+}

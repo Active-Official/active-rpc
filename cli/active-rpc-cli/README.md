@@ -20,6 +20,8 @@ active-rpc-cli <command> [options]
           [--method M] [--payload FILE]
   bridge [--limit N]
   events [--plane URL] [--after ID] [--follow] [--interval-ms N]
+  replay dump [--output PATH]
+  replay run <package>
   help
 ```
 
@@ -45,6 +47,8 @@ must trust with `--cert`.
 | `loadgen` | C connections, N requests, real latency percentiles and throughput. Respects the capability budget. |
 | `bridge` | Serves the Connect/gRPC interop adapter against the demo kernel. |
 | `events` | Tails the control-plane event stream; events carry correlation ids, never raw authority. |
+| `replay dump` | Records a deterministic demo session (mint, calls, a refusal, a TTL expiry, a revocation) as an `ARRP` package. |
+| `replay run` | Re-executes a package against a fresh kernel and compares every decision; a tampered or divergent package exits `1`. |
 
 ## Exit codes
 
@@ -74,6 +78,10 @@ active-rpc-cli loadgen --addr "$ADDR" --cap "$CAP" --requests 200 --concurrency 
 # Interop bridge and event tail
 active-rpc-cli bridge --limit 2
 active-rpc-cli events --plane http://127.0.0.1:8787 --follow
+
+# Record a session and verify it replays identically
+active-rpc-cli replay dump --output session.arrp
+active-rpc-cli replay run session.arrp
 ```
 
 ## Notes

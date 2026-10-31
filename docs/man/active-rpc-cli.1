@@ -42,6 +42,17 @@ Serve the Connect/gRPC interop adapter against the demo kernel.
 .B events [--plane URL] [--after ID] [--follow] [--interval-ms N]
 Tail the control-plane event stream. Events carry correlation ids, never raw
 authority.
+.TP
+.B replay dump [--output PATH]
+Record a deterministic demo session (mint, calls, a refusal, a TTL expiry and a
+revocation) as an
+.I ARRP
+package.
+.TP
+.B replay run \fIpackage\fR
+Re-execute a package against a fresh kernel and compare every decision. A
+tampered, truncated or divergent package exits 1 with
+.IR rpc/replay .
 .SH EXIT STATUS
 .TP
 .B 0
@@ -67,6 +78,8 @@ active-rpc-cli call --addr "$ADDR" --cap "$CAP" --method echo --text hello
 active-rpc-cli pipeline --addr "$ADDR" --cap "$CAP" --calls 16
 active-rpc-cli loadgen --addr "$ADDR" --cap "$CAP" --requests 200 --concurrency 8
 active-rpc-cli events --plane http://127.0.0.1:8787 --follow
+active-rpc-cli replay dump --output session.arrp
+active-rpc-cli replay run session.arrp
 fi
 .SH NOTES
 Capabilities print as opaque ids; the CLI never prints authority bits or secret
