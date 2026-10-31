@@ -27,6 +27,44 @@ separately: `pipelining_costs_one_round_trip_and_sequential_costs_two` asserts
 form, and `cross_process_peer_pipelines_in_one_round_trip` proves the same over
 a real TCP peer (16 pipelined calls, 1 round trip).
 
+### 2026-10-31 refresh
+
+Same host as the bakeoff below (Xeon E5-1650 v4, Windows 10 Pro, `rustc 1.99.1`),
+criterion 60–100 samples, 1–2 s warm-up, 3–5 s measurement, machine shared with
+other work, so intervals are the honest part of each row.
+
+| Operation | 2026-10-27 baseline | 2026-10-31 | Interval |
+|---|---|---|---|
+| envelope encode (868 B) | 273 ns | 247 ns | 239–256 ns |
+| envelope decode (868 B) | 703 ns | 669 ns | 647–698 ns |
+| in-process transport round trip | 724 ns | 615 ns | 573–673 ns |
+| shared-memory transport round trip | 1.09 µs | 1.31 µs | 1.18–1.47 µs |
+| kernel call + dispatch (`call-and-run`) | 6.63 µs | 6.45 µs | 6.17–6.80 µs |
+| 8 sequential call-and-wait | 52.9 µs | 58.9 µs | 51.8–67.6 µs |
+| 8 queued calls, one drain | 55.1 µs | 55.8 µs | 49.9–64.0 µs |
+
+No regression is claimed or hidden: the shared-memory and eight-call rows moved
+by less than the ±15% this shared machine wobbles between runs (criterion's own
+change test reported "no change in performance detected" on a re-run), and the
+code on those paths did not change in this program. The encode, in-process and
+dispatch rows are within their intervals of the baseline.
+
+### HTTP/2 transport (2026-10-31)
+
+`transport/http2` in the same bench binary: one server thread for the lifetime
+of the group, one client connection, so the numbers exclude connection setup.
+
+| Shape | Median | Per call |
+|---|---|---|
+| one call (`call`) | 134 µs | 134 µs |
+| eight calls multiplexed (`call-many-8`) | 396 µs | 49.5 µs |
+
+Multiplexing is the reason the transport exists: eight concurrent calls on one
+connection cost 2.7x less per call than eight sequential ones. The absolute
+number is Windows loopback latency plus HTTP/2 framing (see the TCP syscall path
+section: a bare TCP round trip is ~109 µs on this host), not a protocol
+overhead.
+
 ## Sustained-load and hostile-input budgets
 
 `tests/perf_budget.rs` enforces the bounds; numbers are the current pass:

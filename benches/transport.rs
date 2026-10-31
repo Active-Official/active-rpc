@@ -157,5 +157,44 @@ fn kernel_fixture() -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
     (agent, cap, lane)
 }
 
+/// The native HTTP/2 transport over loopback: one call, then eight calls
+/// multiplexed on one connection. The server runs on its own thread for the
+/// lifetime of the group, so the numbers exclude handshakes.
+#[cfg(feature = "http2")]
+fn bench_http2(criterion: &mut Criterion) {
+    use active_rpc::transport::http2::{Http2Client, Http2Server};
+
+    let server = Http2Server::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let handle = std::thread::spawn(move || {
+        server
+            .serve(1, |envelope: Envelope| {
+                Envelope::response(envelope.request_id, Value::text("pong"))
+            })
+            .expect("serve");
+    });
+    let mut client = Http2Client::connect(&address).expect("connect");
+    let request = Envelope::request(1, "ping", vec![]);
+
+    let mut group = criterion.benchmark_group("transport/http2");
+    group.bench_function("call", |bencher| {
+        bencher.iter(|| black_box(client.call(&request).expect("call")));
+    });
+    group.bench_function("call-many-8", |bencher| {
+        bencher.iter(|| {
+            let batch: Vec<Envelope> = (0..8u64)
+                .map(|id| Envelope::request(id, "ping", vec![]))
+                .collect();
+            black_box(client.call_many(&batch).expect("calls"))
+        });
+    });
+    group.finish();
+    drop(client);
+    handle.join().expect("server thread");
+}
+
+#[cfg(feature = "http2")]
+criterion_group!(transport_benches, benches, bench_http2);
+#[cfg(not(feature = "http2"))]
 criterion_group!(transport_benches, benches);
 criterion_main!(transport_benches);
