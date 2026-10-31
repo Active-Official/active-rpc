@@ -14,6 +14,24 @@ maturity release; the executed record lives in `STATUS.md`.
    library version is resolvable.
 4. `STATUS.md` reflects the candidate state and its residual risks.
 
+## The release workflow
+
+Pushing the tag runs `.github/workflows/release.yml` in that repository, which
+
+1. re-runs the format, clippy and test gates on the tagged commit,
+2. generates `dist/active-rpc-<version>.cdx.json` from `cargo metadata --locked`
+   and verifies it with `scripts/sbom.py --check`,
+3. creates the GitHub Release (generated notes) if it does not exist, uploads the
+   SBOM, and **asserts the asset is attached** (`gh release view --json assets`).
+
+The same job can be run for an existing tag with `workflow_dispatch` and the tag
+as input, which is how a release that was created by hand gets its SBOM. The
+workflow is the gate for M-5.1: an SBOM that is not attached is a failed run,
+not a missing file someone notices later.
+
+Signing, attestation and the Sigstore spike: `docs/release/signing.md`.
+
+
 ## Order
 
 1. **Commit and push both remotes.**

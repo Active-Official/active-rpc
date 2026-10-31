@@ -1,0 +1,68 @@
+name: Release
+
+# A tag is the release trigger. This job re-runs the gates on the tagged commit,
+# generates the CycloneDX SBOM for the exact locked graph, and attaches it to the
+# GitHub Release. The release notes are generated from the commits since the
+# previous tag; crates.io publishing stays a human step (see
+# `docs/release-runbook.md`) so a registry token is never held by CI.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish the SBOM for (for example v2.3.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Resolve the tag
+        id: tag
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Tests
+        run: cargo test --locked --all-features
+      - name: SBOM
+        run: |
+          version="${{ steps.tag.outputs.version }}"
+          mkdir -p dist
+          python3 scripts/sbom.py --output "dist/active-rpc-${version}.cdx.json"
+          python3 scripts/sbom.py --check "dist/active-rpc-${version}.cdx.json"
+      - name: Publish the release and its SBOM
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${{ steps.tag.outputs.version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists; attaching the SBOM"
+          else
+            gh release create "$tag" --title "active-rpc ${version}" --generate-notes
+          fi
+          gh release upload "$tag" "dist/active-rpc-${version}.cdx.json" --clobber
+      - name: Verify the asset is attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${{ steps.tag.outputs.version }}"
+          gh release view "$tag" --json assets \
+            --jq '.assets[].name' | grep -qx "active-rpc-${version}.cdx.json"
+          echo "SBOM attached to $tag"

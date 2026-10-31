@@ -22,8 +22,9 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 | M-0 baseline | complete | baseline SHAs and residual import in the program register |
 | M-1 capability maximum | complete | `tests/dispatch_authority_matrix.rs`, full-attribute attenuation properties, QUIC binding, H2.47, `docs/spec/security.md` §8 |
 | M-3 RPC residuals | complete | M-3.1 receipts (`ARRL`), M-3.2 durable profile, M-3.3 WASM ABI v2, M-3.4 clock ADR, M-3.5 deployment identity, M-3.6 bridge doc gate |
-| M-4 speed and transport | in progress | M-4.1 hot path: no per-call module clone, cached canonical hash, `benches/domain.rs`, numbers in `docs/spec/performance.md` |
-| M-5..M-8 | pending | supply chain, Copilot marathon, innovations, release |
+| M-4 speed and transport | complete | M-4.1 hot path (no per-call clone, cached canonical hash), M-4.2 ADR-0023 (no io_uring; 8→4 syscalls/call), M-4.3 H2/QUIC budgets, M-4.4 cap-delta load, M-4.5 measured performance.md |
+| M-5 supply chain | complete | `release.yml` attaches and asserts the CycloneDX SBOM, `audit.toml` + `cargo audit --deny warnings`, `cargo deny check` clean, `docs/release/signing.md` records the cosign spike and trusted-publishing path |
+| M-6..M-8 | pending | Copilot marathon, innovations, release |
 
 ## Phase status
 

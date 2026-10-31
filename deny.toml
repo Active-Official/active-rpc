@@ -5,6 +5,10 @@ ignore = ["RUSTSEC-2024-0449"]
 
 [licenses]
 allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CC0-1.0"]
+# The allowance list is deliberately wider than the current graph (feature and
+# platform combinations pull different crates), so an unused entry is not a
+# finding.
+unused-allowed-license = "allow"
 
 [bans]
 multiple-versions = "allow"
