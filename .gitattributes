@@ -1,0 +1,6 @@
+# Byte-exact inputs. Fuzz seeds and conformance vectors are hostile bytes, not
+# text: a line-ending conversion on checkout would change what the fuzzer and
+# the conformance runner read.
+fuzz/corpus/** -text
+tests/vectors/** -text
+conformance/** -text
