@@ -59,6 +59,7 @@ pub mod intro;
 pub mod kernel;
 pub mod lane;
 pub mod observability;
+pub mod persistence;
 pub mod promise;
 pub mod receipts;
 pub mod replay;
@@ -81,6 +82,7 @@ pub use identity::{
 };
 pub use kernel::{Agent, Event, Metrics, PromiseHandle, Provider};
 pub use lane::{Lane, LaneId};
+pub use persistence::CapabilityRecord;
 pub use promise::{PromiseId, PromiseState};
 pub use receipts::{Receipt, ReceiptLog};
 pub use replay::{Op, ReplayPackage, Trace};

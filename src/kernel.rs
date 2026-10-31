@@ -22,7 +22,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use crate::budget::{Budget, BudgetMeter};
-use crate::cap::{CapAttrs, CapControl, CapHandle, CapId, CapRecord, ProviderId, ToolPolicy};
+use crate::cap::{
+    CapAttrs, CapControl, CapHandle, CapId, CapPersistence, CapRecord, ProviderId, ToolPolicy,
+};
 use crate::channel::{Channel, ChannelId, Direction, Message};
 use crate::error::{Error, Result};
 use crate::identity::{AdmittedIdentity, PeerIdentity, FINGERPRINT_LEN};
@@ -501,6 +503,97 @@ impl Agent {
     /// Allow or refuse durable capability minting. Default: refused.
     pub fn set_durable_capabilities(&self, allow: bool) {
         self.cell.borrow_mut().allow_durable = allow;
+    }
+
+    /// Export a durable capability's authority as a record.
+    ///
+    /// Only a `Durable` capability can be exported, and only while it is live:
+    /// a record of a dead grant is useless and a record of an ephemeral grant
+    /// would turn a process-local capability into a persisted credential. The
+    /// record carries no id and no secret.
+    pub fn export_capability(
+        &self,
+        cap: &CapHandle,
+    ) -> Result<crate::persistence::CapabilityRecord> {
+        let kernel = self.cell.borrow();
+        let record = kernel
+            .caps
+            .get(&cap.id())
+            .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+        if record.attrs.persistence != CapPersistence::Durable {
+            return Err(Error::persistence(
+                "only a durable capability can be exported",
+            ));
+        }
+        if record.revoked {
+            return Err(Error::Revoked(cap_token(cap.id())));
+        }
+        if let Some(expires_at) = record.expires_at {
+            if kernel.now_ms >= expires_at {
+                return Err(Error::Revoked(cap_token(cap.id())));
+            }
+        }
+        let provider = kernel
+            .providers
+            .get(&record.provider)
+            .ok_or_else(|| Error::persistence("the provider is no longer registered"))?;
+        Ok(crate::persistence::CapabilityRecord {
+            provider: provider.name().to_string(),
+            object: record.object,
+            methods: record.attrs.methods.clone(),
+            budget: record.attrs.budget,
+            read_only: record.attrs.read_only,
+            redact: record.attrs.redact,
+            path_scope: record.attrs.path_scope.clone(),
+            topics: record.attrs.topics.clone(),
+            tool_policy: record.attrs.tool_policy.clone(),
+            bound_to: record.attrs.bound_to,
+            expires_at: record.expires_at,
+        })
+    }
+
+    /// Restore a durable capability as a fresh, peer-bound capability.
+    ///
+    /// The restored capability has a new id (ids are kernel-specific), the
+    /// recorded authority, the original absolute deadline and a binding to
+    /// `peer`. Restoring is refused unless durable capabilities are enabled,
+    /// the provider is registered, the deadline has not passed and the record
+    /// is not bound to a different peer. A record alone is therefore not
+    /// authority: the deployment must admit the peer too.
+    pub fn restore_capability(
+        &self,
+        record: &crate::persistence::CapabilityRecord,
+        peer: &crate::identity::AdmittedIdentity,
+    ) -> Result<CapHandle> {
+        if !self.durable_capabilities_allowed() {
+            return Err(Error::persistence(
+                "durable capabilities are not enabled for this agent",
+            ));
+        }
+        if let Some(bound) = record.bound_to {
+            if bound != peer.fingerprint() {
+                return Err(Error::Identity("the record is bound to a different peer"));
+            }
+        }
+        let provider = {
+            let kernel = self.cell.borrow();
+            kernel
+                .providers
+                .iter()
+                .find(|(_, provider)| provider.name() == record.provider)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| Error::persistence("the record names an unknown provider"))?
+        };
+        let now = self.cell.borrow().now_ms;
+        let ttl_ms = match record.expires_at {
+            Some(expires_at) if expires_at <= now => {
+                return Err(Error::persistence("the record's deadline has passed"))
+            }
+            Some(expires_at) => Some(expires_at - now),
+            None => None,
+        };
+        let attrs = record.attrs(ttl_ms);
+        self.mint_bound(peer, provider, record.object, attrs)
     }
 
     /// Whether durable capability minting is allowed.

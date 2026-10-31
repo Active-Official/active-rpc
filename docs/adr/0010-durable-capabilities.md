@@ -31,3 +31,47 @@ Explicit opt-in plus a local-only policy keeps the default fail-closed.
   kernel behavior.
 - A durable cap is still revocable and still attenuates monotonically.
 - The wire format is unchanged; a remote peer cannot request durability.
+
+## Addendum (2026-10-31) — minimal restore profile
+
+The original decision left restore entirely to the deployment. This addendum
+defines the smallest profile the kernel itself supports, so a deployment does
+not have to invent a format.
+
+### Record
+
+`CapabilityRecord` (`active-rpc/capability-record/1`) is the authority metadata
+of a durable capability: provider name, object, methods, budget, read-only,
+redaction, path scope, topics, tool policy, binding and absolute deadline. It
+carries **no id and no secret**; ids derive from the kernel secret and mean
+nothing elsewhere. `Agent::export_capability` exports only a live `Durable`
+capability and refuses an ephemeral one.
+
+### Restore
+
+`Agent::restore_capability(record, admitted_peer)` is a **re-mint**, never a
+resurrection:
+
+- the id is new (and differs even in the same kernel);
+- the authority is exactly the record's, with the record's absolute deadline as
+  the remaining TTL, so a restored capability cannot outlive the original;
+- the capability is bound to the admitted peer. An unbound record becomes bound;
+  a record bound to another peer is refused with `rpc/identity`.
+
+Restore is refused (`rpc/persistence`) unless the agent enabled durable
+capabilities and the provider is registered, and refused once the deadline has
+passed.
+
+### Why this is safe
+
+A record alone is not authority: using it requires a deployment that opted into
+durable capabilities *and* a transport that admitted the peer the restore names.
+The record is metadata, so it can be stored in a configuration system; it must
+still be protected like an ACL file, because it describes exactly what an
+admitted peer may do.
+
+### Evidence
+
+`tests/capability_record_tests.rs`: round trip, ephemeral refusal, policy
+refusal, passed deadline, cross-peer refusal, unknown provider, malformed and
+oversized records, and deadline preservation across restore.

@@ -55,6 +55,9 @@ pub enum Error {
     Replay(String),
     /// A receipt log is malformed, truncated, reordered or fails its chain.
     Receipt(String),
+    /// A durable capability record is malformed, or the durable profile
+    /// refuses the export or the restore.
+    Persistence(&'static str),
     /// The call references a promise that will never resolve.
     UnresolvablePromise(u64),
     /// The provider failed the call.
@@ -105,6 +108,7 @@ impl Error {
             Error::Bulk(_) => "rpc/bulk",
             Error::Replay(_) => "rpc/replay",
             Error::Receipt(_) => "rpc/receipt",
+            Error::Persistence(_) => "rpc/persistence",
             Error::UnresolvablePromise(_) => "rpc/unresolvable-promise",
             Error::Provider { .. } => "rpc/provider",
             Error::Domain(_) => "rpc/domain",
@@ -153,6 +157,7 @@ impl fmt::Display for Error {
             Error::Bulk(what) => write!(f, "bulk transfer rejected: {what}"),
             Error::Replay(what) => write!(f, "replay package rejected: {what}"),
             Error::Receipt(what) => write!(f, "receipt log rejected: {what}"),
+            Error::Persistence(what) => write!(f, "durable capability refused: {what}"),
             Error::UnresolvablePromise(id) => write!(f, "promise {id} can never resolve"),
             Error::Provider { code } => write!(f, "provider failed: {code}"),
             Error::Domain(code) => write!(f, "domain operation failed: {code}"),
@@ -177,6 +182,11 @@ impl From<active_infinity::Error> for Error {
 }
 
 impl Error {
+    /// Build a durable-capability refusal.
+    pub fn persistence(reason: &'static str) -> Self {
+        Error::Persistence(reason)
+    }
+
     /// Build a receipt-log refusal from anything string-like.
     pub fn receipt(reason: impl Into<String>) -> Self {
         Error::Receipt(reason.into())
