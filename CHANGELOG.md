@@ -11,6 +11,11 @@ unchanged.
   resolves a TTL against its clock and refuses an expired capability exactly
   like a revoked one (`rpc/revoked`, plus `Event::CapExpired`). Attenuation can
   only shorten a lifetime.
+- **Capability receipts** (ADR-0016): `Agent::enable_receipts` records every
+  admitted call in a bounded ring as `Receipt { sequence, cap correlation id,
+  method, at_ms, mac }`, authenticated with a keyed hash under the kernel
+  secret. Arguments and secrets never enter a receipt; `verify_receipt`
+  detects edits and foreign kernels.
 - **Payload accounting**: `Agent::call_with_payload` and
   `call_as_with_payload` charge an envelope payload against `max_bytes`; the
   CLI, examples and peer binaries use them.

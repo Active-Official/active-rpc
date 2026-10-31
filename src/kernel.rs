@@ -293,6 +293,9 @@ pub struct Kernel {
     now_ms: u64,
     latency_ms: u64,
     transfers: u64,
+    receipts: std::collections::VecDeque<crate::receipts::Receipt>,
+    receipts_enabled: bool,
+    next_receipt: u64,
 }
 
 /// Control half of a capability handle: reference counting and provider
@@ -406,10 +409,37 @@ impl Agent {
             now_ms: 0,
             latency_ms: 1,
             transfers: 0,
+            receipts: std::collections::VecDeque::new(),
+            receipts_enabled: false,
+            next_receipt: 0,
         };
         let cell: KernelCell = Rc::new(RefCell::new(kernel));
         let control: Rc<dyn CapControl> = Rc::new(HandleControl::new(Rc::clone(&cell)));
         Agent { cell, control }
+    }
+
+    /// Enable or disable capability receipts.
+    ///
+    /// When enabled, every admitted call appends a [`crate::Receipt`] to a
+    /// bounded ring. Disabling also clears the ring. Receipts carry the
+    /// capability's correlation id and the method, never arguments or secrets.
+    pub fn enable_receipts(&self, enabled: bool) {
+        let mut kernel = self.cell.borrow_mut();
+        kernel.receipts_enabled = enabled;
+        if !enabled {
+            kernel.receipts.clear();
+        }
+    }
+
+    /// The receipts recorded so far, oldest first.
+    pub fn receipts(&self) -> Vec<crate::Receipt> {
+        self.cell.borrow().receipts.iter().cloned().collect()
+    }
+
+    /// Verify that a receipt came from this kernel and was not edited.
+    pub fn verify_receipt(&self, receipt: &crate::Receipt) -> bool {
+        let secret = self.cell.borrow().secret;
+        receipt.verify(&secret)
     }
 
     /// The shared cell, for transports and adapters that need direct access.
@@ -1063,6 +1093,22 @@ impl Agent {
         kernel
             .promises
             .insert(promise_id, PromiseRecord::new(promise_id, lane.0));
+
+        // The call is authorized: record the decision before it is queued.
+        if kernel.receipts_enabled {
+            kernel.next_receipt = kernel.next_receipt.saturating_add(1);
+            let receipt = crate::receipts::Receipt::seal(
+                &kernel.secret,
+                kernel.next_receipt,
+                cap_id,
+                method,
+                kernel.now_ms,
+            );
+            kernel.receipts.push_back(receipt);
+            if kernel.receipts.len() > crate::receipts::MAX_RECEIPTS {
+                kernel.receipts.pop_front();
+            }
+        }
 
         let job_id = kernel.next_job;
         kernel.next_job += 1;
