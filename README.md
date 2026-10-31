@@ -162,6 +162,11 @@ let _ = second.value()?;
 | Bulk | `ARBL`/`ARBC` chunked transfer with per-chunk hashes and resume |
 | Observability | `active-rpc/observability/1` events and `active-rpc/metrics/1` counters, correlation ids only |
 
+Specifications: [`docs/spec/wire.md`](docs/spec/wire.md) (ARP1, bulk frames,
+error codes), [`docs/spec/interop.md`](docs/spec/interop.md) (the Connect/gRPC
+bridge) and [`docs/spec/observability.md`](docs/spec/observability.md); the
+decisions behind them are in [`docs/adr/`](docs/adr/README.md).
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme-arch-rpc-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/readme-arch-rpc-light.png">
