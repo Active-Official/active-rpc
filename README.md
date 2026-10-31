@@ -127,11 +127,14 @@ let _ = second.value()?;
 | Piece | Role |
 |-------|------|
 | Kernel | Capability table, promises, lanes/channels, dispatch |
+| Identity | Mutual-TLS peer identity; a capability introduced to one peer is refused for another |
 | Cap / attenuate | Authority and narrowing |
-| Domain | Infinity-backed evaluate / why / impact / … |
+| Domain | Infinity-backed evaluate / why / impact / subgraph / patch |
 | Tools | MCP, HTTP, LocalProcess adapters |
 | Wire (ARP1) | Envelope + capability table |
-| Transports | In-process, shm, TCP, QUIC, interop bridge |
+| Transports | In-process, shm, TCP, QUIC (mutual TLS), HTTP/2 (`http2`), interop bridge |
+| Bulk | `ARBL`/`ARBC` chunked transfer with per-chunk hashes and resume |
+| Observability | `active-rpc/observability/1` events and `active-rpc/metrics/1` counters, correlation ids only |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme-arch-rpc-dark.png">

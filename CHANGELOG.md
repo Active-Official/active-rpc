@@ -1,5 +1,47 @@
 # Changelog - Active RPC
 
+## Unreleased
+
+Additive transport and telemetry work from the Active Maturity Program. The
+`ARP1` envelope layout is unchanged; new code strings extend the error
+vocabulary.
+
+### Added
+
+- **Transport identity and capability binding** (`identity`, ADR-0011).
+  `PeerIdentity`, `IdentityPolicy`, `AdmittedIdentity`. `CapAttrs::bound_to`,
+  `Agent::mint_bound`, `Agent::introduce_to`, `Agent::call_as`, `Agent::send_as`.
+  A capability introduced to one peer is refused for every other peer with
+  `rpc/identity`. QUIC mutual TLS (`QuicServer::start_mutual_tls`,
+  `QuicClient::connect_mutual_tls`) exposes the verified peer identity.
+- **Native HTTP/2 transport** (feature `http2`, ADR-0012): bare ARP1 envelopes,
+  content type `application/arp1`, one connection with concurrent streams and
+  `Http2Client::call_many`.
+- **Bulk transfer** (`bulk`, ADR-0013): `ARBL` plan and `ARBC` chunk frames,
+  per-chunk and root Blake3 hashes, resume with `frames_for(missing)`, a
+  configurable receiver ceiling, and `rpc/bulk` for malformed frames.
+- **Observability schema** (ADR-0014): `Agent::trace`, `trace_json`,
+  `metrics_json`; `active-rpc/observability/1` and `active-rpc/metrics/1`;
+  correlation ids only, with a closed event-name set.
+- `Metrics::identity_refusals`, `Agent::lane_count`, `Agent::channel_count`.
+
+### Changed
+
+- Attenuation is monotone for persistence: a durable capability cannot be
+  derived from an ephemeral one, and a child no longer inherits a longer
+  lifetime than it requested (`rpc/attenuation-escalation`).
+- `CapDescriptor` documentation now states which capability fields stay local
+  (persistence, tool policy, identity binding).
+
+### Fixed
+
+- HTTP/2 serves connections concurrently, isolates a failed stream from its
+  connection, and applies `WireLimits` to request and response bodies.
+- A QUIC stream that fails mid-frame receives an `rpc/wire` error envelope when
+  the peer is still reachable.
+- `BulkSender::frames_for` rejects an index outside the plan instead of silently
+  dropping it.
+
 ## 2.0.0 - 2026-10-28
 
 Hardening release with one breaking error-type change. The `ARP1` wire format is
