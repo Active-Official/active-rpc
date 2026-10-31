@@ -86,6 +86,14 @@ fn run(args: Vec<String>) -> CliResult {
             println!("{}", help_text());
             Ok(())
         }
+        "version" | "--version" | "-V" => {
+            println!(
+                "active-rpc-cli {} (active-rpc {})",
+                env!("CARGO_PKG_VERSION"),
+                active_rpc::VERSION
+            );
+            Ok(())
+        }
         other => Err(CliError::usage(format!(
             "unknown command {other}\n\n{}",
             help_text()
@@ -1022,6 +1030,8 @@ usage: active-rpc-cli <command> [options]
       a tampered or divergent package is refused.
   help
       This text.
+  version
+      Print the CLI and kernel versions.
 
 Exit codes: 0 success, 1 refusal or failed request, 2 usage, 3 transport or
 codec failure.

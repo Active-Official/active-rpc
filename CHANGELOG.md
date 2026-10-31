@@ -1,5 +1,10 @@
 # Changelog - Active RPC
 
+## CLI 0.3.1 - 2026-10-31
+
+- `version` (also `--version`, `-V`) prints the CLI and kernel versions, and
+  the command appears in `help`.
+
 ## 2.2.0 - 2026-10-31
 
 Maturity release for the Active Maturity Program: time-bounded capabilities,

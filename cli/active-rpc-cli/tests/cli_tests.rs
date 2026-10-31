@@ -301,3 +301,17 @@ fn replay_without_a_subcommand_is_a_usage_error() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("replay dump"));
 }
+
+#[test]
+fn version_prints_the_cli_and_kernel() {
+    for flag in ["version", "--version", "-V"] {
+        let output = run(&[flag]);
+        assert!(output.status.success(), "{flag}: {}", stderr(&output));
+        let text = stdout(&output);
+        assert!(
+            text.contains(concat!("active-rpc-cli ", env!("CARGO_PKG_VERSION"))),
+            "{text}"
+        );
+        assert!(text.contains("(active-rpc "), "{text}");
+    }
+}

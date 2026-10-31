@@ -13,7 +13,7 @@ publishes as `active-rpc-cli`.
 | [`active-rpc-client`](https://crates.io/crates/active-rpc-client) | 0.1.1 | Agent, call and promise client surface |
 | [`active-rpc-tools`](https://crates.io/crates/active-rpc-tools) | 0.1.1 | MCP, HTTP and sandboxed local-process adapters |
 | [`active-rpc-transport`](https://crates.io/crates/active-rpc-transport) | 0.1.1 | In-process, TCP, shared-memory and QUIC transports |
-| [`active-rpc-cli`](https://crates.io/crates/active-rpc-cli) | 0.3.0 | `doctor`, `peer`, `call`, `pipeline`, `loadgen`, `bridge`, `events` and `replay` |
+| [`active-rpc-cli`](https://crates.io/crates/active-rpc-cli) | 0.3.1 | `doctor`, `peer`, `call`, `pipeline`, `loadgen`, `bridge`, `events` and `replay` |
 
 Each facade is a thin, versioned re-export of the shipped module. The main
 crate remains the implementation and the source of truth.

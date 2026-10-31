@@ -8,7 +8,7 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 | Item | Value |
 |------|-------|
 | Library | `active-rpc` 2.2.0 |
-| CLI | `active-rpc-cli` 0.3.0 |
+| CLI | `active-rpc-cli` 0.3.1 |
 | ARP1 envelope | unchanged through the maturity program |
 | CI | every job green on both `Active-Official` and `RatioArtificiosa` at the release commit |
 
@@ -21,7 +21,7 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 | C-6 transports: identity, HTTP/2, bulk, observability | complete | ADR-0011..0014 |
 | C-7 speed and bakeoffs | complete | `docs/spec/performance.md`, `perf-gate` |
 | C-8 polyglot thin clients | complete | `active-infinity/polyglot/rpc`, encoder conformance |
-| C-9 CLI | complete | `active-rpc-cli` 0.3.0 on crates.io, man page, 15 CLI tests |
+| C-9 CLI | complete | `active-rpc-cli` 0.3.1 on crates.io, man page, 16 CLI tests |
 | C-10 hardening | complete | nightly fuzz (twelve targets), multi-tenant stress, malicious MCP, transport × cap matrix, review rounds 17-21 |
 | C-11 innovations | complete | TTL caps (0015), receipts (0016), intro modules (0017), replay (0018), WASM tools (0019), topics (0020) |
 | C-12 interop | complete | `docs/spec/interop.md` + bridge tests |

@@ -56,6 +56,18 @@ maturity release; the executed record lives in `STATUS.md`.
 
 ## Executed record
 
-| Date | Kernel | CLI | Remotes |
-|------|--------|-----|---------|
-| 2026-10-31 | 2.2.0 | 0.3.0 | Active-Official + RatioArtificiosa, same SHA |
+| Date | Kernel | CLI | Commit | Tag (both remotes) | crates.io |
+|------|--------|-----|--------|--------------------|-----------|
+| 2026-10-31 | 2.2.0 | 0.3.0 | `9f1348c` (`v2.2.0^{}`) | `c27ee6b` on Active-Official and RatioArtificiosa, identical peeled SHA | `active-rpc` 2.2.0, `active-rpc-cli` 0.3.0 |
+| 2026-10-31 | 2.1.0 | 0.2.0 | `69f2d92` (`v2.1.0^{}`) | backfilled tag for the published 2.1.0 | `active-rpc` 2.1.0 |
+
+Release commit `9f1348c` resolves `active-infinity` 2.3.0 from crates.io in the
+lock; CI 41203912741 (Active-Official) and 41203915377 (RatioArtificiosa), both
+green. Tag object `c27ee6b8eec2ef0be807a80299464cf7fba01d44` on both remotes,
+peeled to `9f1348cc7b270ad7165b43545dfeaf69d19ff9bc`.
+
+Install verification: `cargo install active-rpc-cli --version 0.3.0 --locked`
+then `doctor` and a real `peer`/`call` round trip from the registry build.
+
+A CLI-only patch release is recorded here with its commit and does not move the
+library tag: the tag names the library version, and the CLI has its own.
