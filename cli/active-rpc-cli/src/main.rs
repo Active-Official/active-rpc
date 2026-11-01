@@ -168,13 +168,7 @@ fn dispatch(kernel: &Agent, lane: LaneId, request: &Envelope) -> Envelope {
         return Envelope::error(request.request_id, &Error::UnknownCapability(CapToken(0)));
     };
     let cap = kernel.import(descriptor.id);
-    match kernel.call_with_payload(
-        lane,
-        &cap,
-        &request.method,
-        request.args.clone(),
-        request.payload.len() as u64,
-    ) {
+    match kernel.call_from_envelope(None, lane, &cap, request) {
         Ok(promise) => {
             let _ = kernel.run();
             match promise.value() {

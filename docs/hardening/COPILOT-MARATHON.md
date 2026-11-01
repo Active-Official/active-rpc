@@ -17,7 +17,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-01 | wire ARP1 | `src/wire.rs` | CLEAN | 6 fixed, 2 rejected, 0 open | this commit |
 | R-02 | kernel dispatch | `src/kernel.rs` | CLEAN (rounds 1-3) | 24 fixed / 2 rejected / 2 low open (contract) | this commit |
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
-| R-04 | promises / pipeline | `src/promise.rs` | round 1: 14 fixed | 14 fixed / 0 rejected / 0 open | this commit |
+| R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | pending | — | — |
 | R-07 | domain ops | `src/domain.rs` | pending | — | — |
@@ -69,6 +69,35 @@ API and not for the defect.
 | M-6 | medium | revoking one restored copy left its siblings alive | **fixed**: restore refuses a second live copy of a credential and revoke dooms every live capability carrying a tombstoned record id; `restoring_the_same_record_twice_is_refused` |
 | M-7 | medium | `send` charged nothing and needed no capability | **fixed**: a send charges the lane's bytes (payload plus one id per transfer) and one lane call, and a channel has a queued-byte ceiling; `a_send_consumes_the_lane_byte_budget`, `a_channel_accounts_for_queued_bytes` |
 | L-8 | low | a vanished provider was `rpc/invalid-argument` at call time and `rpc/provider` at dispatch | **fixed**: both are `rpc/provider` |
+
+### R-04 promises / pipeline - 2026-11-01 (round 2)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `09704cc`.
+Twelve findings; the round-1 table above stays valid for the parts it verified.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | the envelope guard was per method: `active-rpc-cli peer` served every connection through `call_with_payload` and accepted a decoded `Arg::Promise` | **fixed**: the refusal moved to the kernel boundary (`call_with_origin(.., from_peer)`), and the CLI uses `call_from_envelope`; `an_envelope_cannot_carry_authority_arguments` |
+| F2 | high | `await_promise` from `on_drop` spun: the delivering provider is not `dispatching`, so the round-1 guard did not fire | **fixed**: the loop now requires a round trip to have happened, else `rpc/unresolvable-promise`; `awaiting_from_on_drop_returns_instead_of_spinning` (hangs pre-fix) |
+| F3 | medium | phase 3 and `fail_job` emitted `PromiseResolved`/`PromiseRejected` and advanced the counters after a *failed* transition | **fixed**: both are inside `settled_now` |
+| F4 | medium | an in-batch cancelled promise never became trim-eligible, so repeated cancellations leak records until the promise ceiling wedges the kernel | **fixed**: `cancel` records the terminal state for an in-batch job too |
+| F5 | medium | the empty-batch arm trimmed settled records while the queue still held a consumer for them (spurious `rpc/pipelined-cycle`) | **fixed**: no trim while the queue is non-empty |
+| F6 | medium | `cancel_tree`'s queue filter was O(jobs × queue): 10 000 jobs = 658 ms (measured) | **fixed**: one `BTreeSet` of queued ids |
+| F7 | medium | `order_candidates` scanned `ordered` per dependency: a 2 000-link chain = 808 ms (measured) | **fixed**: a `BTreeSet` of promises produced in the batch |
+| F8 | medium | the idempotency key ignored the arguments: the same key with different arguments returned the first result | **fixed**: the cache stores an argument fingerprint (shape and content, secrets by marker only) and refuses a mismatch; `an_idempotency_key_refuses_different_arguments` |
+| F9 | low | a cached replay was refused at the lane call ceiling, exactly when a retry is needed | **fixed**: the capacity check is on the miss path; `a_cached_replay_is_served_at_the_lane_ceiling` |
+| F12 | low | settlement walks a provider-controlled value with no depth bound: a 200 000-deep response aborted the process | **fixed**: dispatch refuses a value deeper than the wire limit as `rpc/provider`; `a_provider_value_deeper_than_the_wire_limit_is_refused` |
+
+Carried (documented, not fixed here):
+
+| # | Sev | Reason |
+|---|-----|--------|
+| F10 | low | a `PromiseHandle` is not bound to its kernel, so two agents in one process can mix ids; the fix is a kernel nonce in every handle-accepting method, which changes the handle type |
+| F11 | low | idempotent refusals skip `CallRefused`/metrics; the accounting helper exists (`note_refusal`) and the wiring is a follow-up |
+| F13 | note | `JobState::Done` is vestigial; the invariant "a job leaves `jobs` only at settlement" should be asserted or the enum removed |
+
+Gate: `cargo test --all-features` 444 passed, 0 failed; the CLI suite 17 passed;
+clippy clean on both feature sets and the CLI; fmt clean.
 
 ### R-05 lanes / channels - 2026-11-01 (round 1)
 

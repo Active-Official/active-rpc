@@ -352,9 +352,9 @@ pub struct Kernel {
     delivering: BTreeSet<ProviderId>,
     /// Payload bytes queued across every channel.
     queued_channel_bytes: u64,
-    idempotency: BTreeMap<(CapId, LaneId, String, String), PromiseId>,
+    idempotency: BTreeMap<IdempotencyKey, (PromiseId, [u8; 32])>,
     allow_durable: bool,
-    idempotency_order: VecDeque<(CapId, LaneId, String, String)>,
+    idempotency_order: VecDeque<IdempotencyKey>,
     now_ms: u64,
     latency_ms: u64,
     /// When true, dispatch advances the clock to wall time instead of by one
@@ -1901,6 +1901,34 @@ impl Agent {
         args: Vec<Arg>,
         payload_bytes: u64,
     ) -> Result<PromiseHandle> {
+        self.call_with_origin(peer, lane, cap, method, args, payload_bytes, false)
+    }
+
+    /// One call with an explicit origin.
+    ///
+    /// `from_peer` marks arguments that a transport decoded: those can never
+    /// carry authority, because a promise id names a result this kernel computed
+    /// for someone else and a capability id in an argument is opaque data.
+    #[allow(clippy::too_many_arguments)]
+    fn call_with_origin(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        payload_bytes: u64,
+        from_peer: bool,
+    ) -> Result<PromiseHandle> {
+        if from_peer
+            && args
+                .iter()
+                .any(|arg| matches!(arg, Arg::Promise(_) | Arg::Cap(_)))
+        {
+            return Err(Error::Wire(
+                "an envelope cannot carry a promise or capability argument",
+            ));
+        }
         let cap_id = cap.id();
         let result = self.call_inner(peer, lane, cap, method, args, payload_bytes);
         if let Err(error) = &result {
@@ -2195,8 +2223,10 @@ impl Agent {
                 kernel.apply_deferred_refops();
                 match kernel.next_batch() {
                     Ok(batch) if batch.is_empty() => {
+                        // Work is queued (for a provider being notified), so
+                        // nothing may be trimmed: a queued consumer may still
+                        // need its producer's record.
                         kernel.apply_deferred_refops();
-                        kernel.trim_settled();
                         return kernel.round_trips;
                     }
                     Ok(batch) => batch,
@@ -2249,7 +2279,14 @@ impl Agent {
             if self.cell.borrow().queue.is_empty() {
                 return Err(Error::UnresolvablePromise(promise.id.0));
             }
+            let before = self.round_trips();
             self.run();
+            if self.round_trips() == before && !self.cell.borrow().queue.is_empty() {
+                // No batch ran: the only queued work belongs to a provider that
+                // is being notified (a drop handler awaiting its own call).
+                // Spinning here would burn CPU with no settlement.
+                return Err(Error::UnresolvablePromise(promise.id.0));
+            }
         }
     }
 
@@ -2382,6 +2419,7 @@ impl Agent {
         if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
             return Err(Error::InvalidArgument("idempotency key is too long"));
         }
+        let fingerprint = args_fingerprint(&args);
         // A replay is an exercise of authority in one lane: the key is scoped
         // to it, and the lane must still exist and have capacity, exactly as a
         // fresh call requires.
@@ -2391,14 +2429,19 @@ impl Agent {
             if lane_record.closed {
                 return Err(Error::UnknownLane(lane.0));
             }
-            if !lane_record.has_capacity() {
-                return Err(Error::BudgetExceeded("lane call"));
-            }
+            // Capacity is checked on the miss path only: a cached replay makes
+            // no call, and refusing it at the ceiling would defeat the retry
+            // idempotency exists for.
         }
         let map_key = (cap.id(), lane, method.to_string(), key.to_string());
         {
             let mut kernel = self.cell.borrow_mut();
-            if let Some(id) = kernel.idempotency.get(&map_key).copied() {
+            if let Some((id, stored_args)) = kernel.idempotency.get(&map_key).copied() {
+                if stored_args != fingerprint {
+                    return Err(Error::InvalidArgument(
+                        "the idempotency key was used with different arguments",
+                    ));
+                }
                 {
                     let record = kernel
                         .caps
@@ -2448,10 +2491,21 @@ impl Agent {
             // deque grows with caller-controlled keys.
             kernel.idempotency_order.retain(|queued| *queued != map_key);
         }
+        if !self
+            .cell
+            .borrow()
+            .lanes
+            .get(&lane)
+            .is_some_and(|record| record.has_capacity())
+        {
+            return Err(Error::BudgetExceeded("lane call"));
+        }
         let promise = self.call_as(peer, lane, cap, method, args)?;
         let id = promise.id();
         let mut kernel = self.cell.borrow_mut();
-        kernel.idempotency.insert(map_key.clone(), id);
+        kernel
+            .idempotency
+            .insert(map_key.clone(), (id, fingerprint));
         kernel.idempotency_order.push_back(map_key);
         const MAX_IDEMPOTENCY: usize = 1024;
         while kernel.idempotency.len() > MAX_IDEMPOTENCY {
@@ -2502,6 +2556,11 @@ impl Agent {
                     lane_record.complete();
                 }
             }
+        } else if kernel.jobs.values().any(|job| job.promise == promise.id) {
+            // The job is in the current batch. Its phase 3 cannot settle a
+            // cancelled record, so nothing would ever make it trim-eligible:
+            // record the terminal state here.
+            kernel.record_settled(promise.id);
         }
         Ok(())
     }
@@ -2554,10 +2613,11 @@ impl Agent {
         }
 
         let targets_set: BTreeSet<PromiseId> = seen;
+        let queued_ids: BTreeSet<u64> = kernel.queue.iter().copied().collect();
         let queued: Vec<(u64, PromiseId, u64)> = kernel
             .jobs
             .iter()
-            .filter(|(id, job)| kernel.queue.contains(id) && targets_set.contains(&job.promise))
+            .filter(|(id, job)| queued_ids.contains(id) && targets_set.contains(&job.promise))
             .map(|(id, job)| (*id, job.promise, job.lane.0))
             .collect();
         for (job_id, promise_id, lane) in queued {
@@ -2978,7 +3038,20 @@ impl Agent {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         guard.provider_mut().invoke(object, &call)
                     })) {
-                        Ok(result) => result.map(Response::into_value),
+                        Ok(Ok(response)) => {
+                            let value = response.into_value();
+                            // Settlement hashes and walks the value; an
+                            // unbounded one would abort the process where no
+                            // catch_unwind can reach.
+                            if value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
+                                Err(Error::Provider {
+                                    code: "rpc/provider".to_string(),
+                                })
+                            } else {
+                                Ok(value)
+                            }
+                        }
+                        Ok(Err(error)) => Err(error),
                         Err(payload) => {
                             self.cell.borrow_mut().push_event(Event::ProviderPanicked {
                                 provider: provider_id,
@@ -3008,9 +3081,11 @@ impl Agent {
                                 kernel.metrics.promises_double_settled.saturating_add(1);
                         }
                     }
-                    kernel.push_event(Event::PromiseResolved(job.promise));
-                    kernel.metrics.promises_resolved =
-                        kernel.metrics.promises_resolved.saturating_add(1);
+                    if settled_now {
+                        kernel.push_event(Event::PromiseResolved(job.promise));
+                        kernel.metrics.promises_resolved =
+                            kernel.metrics.promises_resolved.saturating_add(1);
+                    }
                 }
                 Err(error) => {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
@@ -3021,12 +3096,14 @@ impl Agent {
                                 kernel.metrics.promises_double_settled.saturating_add(1);
                         }
                     }
-                    kernel.push_event(Event::PromiseRejected {
-                        promise: job.promise,
-                        code: error.code().to_string(),
-                    });
-                    kernel.metrics.promises_rejected =
-                        kernel.metrics.promises_rejected.saturating_add(1);
+                    if settled_now {
+                        kernel.push_event(Event::PromiseRejected {
+                            promise: job.promise,
+                            code: error.code().to_string(),
+                        });
+                        kernel.metrics.promises_rejected =
+                            kernel.metrics.promises_rejected.saturating_add(1);
+                    }
                 }
             }
             if settled_now {
@@ -3178,7 +3255,10 @@ impl Kernel {
                     .unwrap_or(false)
                     // An idempotency key that still names this promise must keep
                     // it: replaying the key has to return the original result.
-                    || self.idempotency.values().any(|mapped| mapped == id);
+                    || self
+                        .idempotency
+                        .values()
+                        .any(|(mapped, _)| mapped == id);
                 if !pinned {
                     victim = Some(index);
                     break;
@@ -3281,6 +3361,7 @@ impl Kernel {
     /// producer may be queued on another provider).
     fn order_candidates(&self, candidates: &[u64]) -> Vec<u64> {
         let mut ordered: Vec<u64> = Vec::new();
+        let mut produced: BTreeSet<PromiseId> = BTreeSet::new();
         let mut pending: Vec<u64> = candidates.to_vec();
         let mut progress = true;
         while progress && !pending.is_empty() {
@@ -3290,17 +3371,18 @@ impl Kernel {
                 let id = pending[index];
                 let ready = match self.jobs.get(&id) {
                     Some(job) => job.deps.iter().all(|dep| {
-                        // Resolved already, or produced by an ordered job.
+                        // Resolved already, or produced earlier in this batch.
                         match self.promises.get(dep) {
                             Some(record) if record.state.is_settled() => true,
-                            _ => ordered.iter().any(|other| {
-                                self.jobs.get(other).map(|job| job.promise) == Some(*dep)
-                            }),
+                            _ => produced.contains(dep),
                         }
                     }),
                     None => true,
                 };
                 if ready {
+                    if let Some(job) = self.jobs.get(&id) {
+                        produced.insert(job.promise);
+                    }
                     ordered.push(id);
                     pending.remove(index);
                     progress = true;
@@ -3368,6 +3450,110 @@ fn durable_ceiling_reached(kernel: &Kernel) -> bool {
         .filter(|record| record.attrs.persistence == CapPersistence::Durable)
         .count();
     kernel.revoked_records.len().saturating_add(live) >= MAX_TOMBSTONES
+}
+
+/// Fingerprint of an argument list: shape and content, no secret bytes.
+///
+/// An idempotency key must not answer a *different* request, so the cache
+/// compares this before returning the stored promise. A secret contributes its
+/// marker and size only: hashing its content would be an oracle.
+fn args_fingerprint(args: &[Arg]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(args.len() as u64).to_le_bytes());
+    let mut stack: Vec<&Value> = Vec::new();
+    for arg in args {
+        match arg {
+            Arg::Value(value) => {
+                hasher.update(b"v");
+                stack.push(value);
+                while let Some(value) = stack.pop() {
+                    match value {
+                        Value::Null => {
+                            hasher.update(b"\0");
+                        }
+                        Value::Bool(flag) => {
+                            hasher.update(b"b");
+                            hasher.update(&[u8::from(*flag)]);
+                        }
+                        Value::Int(number) => {
+                            hasher.update(b"i");
+                            hasher.update(&number.to_le_bytes());
+                        }
+                        Value::Float(number) => {
+                            hasher.update(b"f");
+                            hasher.update(&number.to_bits().to_le_bytes());
+                        }
+                        Value::Text(text) => {
+                            hasher.update(b"t");
+                            hasher.update(&(text.len() as u64).to_le_bytes());
+                            hasher.update(text.as_bytes());
+                        }
+                        Value::Path(path) => {
+                            hasher.update(b"p");
+                            hasher.update(&(path.len() as u64).to_le_bytes());
+                            hasher.update(path.as_bytes());
+                        }
+                        Value::Module(bytes) => {
+                            hasher.update(b"m");
+                            hasher.update(&(bytes.len() as u64).to_le_bytes());
+                            hasher.update(bytes);
+                        }
+                        Value::Secret => {
+                            hasher.update(b"s");
+                        }
+                        Value::List(items) => {
+                            hasher.update(b"l");
+                            hasher.update(&(items.len() as u64).to_le_bytes());
+                            stack.extend(items.iter().rev());
+                        }
+                        Value::Map(entries) => {
+                            hasher.update(b"o");
+                            hasher.update(&(entries.len() as u64).to_le_bytes());
+                            for (key, _) in entries.iter().rev() {
+                                hasher.update(&(key.len() as u64).to_le_bytes());
+                                hasher.update(key.as_bytes());
+                            }
+                            stack.extend(entries.values().rev());
+                        }
+                    }
+                }
+            }
+            Arg::Promise(id) => {
+                hasher.update(b"q");
+                hasher.update(&id.0.to_le_bytes());
+            }
+            Arg::Cap(id) => {
+                hasher.update(b"c");
+                hasher.update(&id.0);
+            }
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Key of the idempotency cache: capability, lane, method and caller key.
+type IdempotencyKey = (CapId, LaneId, String, String);
+
+/// True when a provider's value nests deeper than the wire accepts.
+///
+/// The decoder caps nesting at 64; a provider can build anything. Settlement
+/// hashes and walks the value, so an unbounded one overflows the stack and
+/// aborts the process (a panic cannot be caught).
+fn value_too_deep(value: &Value, limit: usize) -> bool {
+    let mut stack: Vec<(&Value, usize)> = vec![(value, 1)];
+    while let Some((value, depth)) = stack.pop() {
+        if depth > limit {
+            return true;
+        }
+        match value {
+            Value::List(items) => stack.extend(items.iter().map(|item| (item, depth + 1))),
+            Value::Map(entries) => {
+                stack.extend(entries.values().map(|item| (item, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn cap_token(id: CapId) -> crate::cap::CapToken {

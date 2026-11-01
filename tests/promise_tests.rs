@@ -574,3 +574,155 @@ fn an_unbound_record_is_refused_by_restore() {
         .expect_err("a record must name its peer");
     assert_eq!(error.code(), "rpc/identity", "{error}");
 }
+
+/// A drop handler that awaits a call queued on its own provider cannot make
+/// progress: the provider is checked out, so the answer is "unresolvable", not a
+/// spin. (Regressing this hangs the suite, which is how the round-2 livelock was
+/// found.)
+#[test]
+fn awaiting_from_on_drop_returns_instead_of_spinning() {
+    type Slot = (Agent, active_rpc::PromiseHandle);
+
+    struct AwaitsInDrop {
+        slot: Rc<std::cell::RefCell<Option<Slot>>>,
+        seen: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Provider for AwaitsInDrop {
+        fn name(&self) -> &'static str {
+            "awaits-in-drop"
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["go".to_string()]
+        }
+
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Ok(Response::Value(Value::text("ok")))
+        }
+
+        fn on_drop(&mut self, _object: u64, _cap: active_rpc::CapId) {
+            let (agent, promise) = self.slot.borrow().clone().expect("slot");
+            let outcome = agent.await_promise(&promise);
+            assert!(outcome.is_err(), "await in on_drop must not report success");
+            self.seen.set(self.seen.get() + 1);
+        }
+    }
+
+    let seen = Rc::new(std::cell::Cell::new(0));
+    let slot: Rc<std::cell::RefCell<Option<Slot>>> = Rc::new(std::cell::RefCell::new(None));
+    let agent = Agent::with_secret([0x56; 32]);
+    let provider = agent.register(Box::new(AwaitsInDrop {
+        slot: Rc::clone(&slot),
+        seen: Rc::clone(&seen),
+    }));
+    // One capability is released (its drop runs the handler); the other carries
+    // a queued call the handler awaits while the provider is being notified.
+    let doomed = agent
+        .mint(provider, 0, CapAttrs::new(&["go"]))
+        .expect("doomed");
+    let survivor = agent
+        .mint(provider, 1, CapAttrs::new(&["go"]))
+        .expect("survivor");
+    let lane = agent
+        .create_lane("queued", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call(lane, &survivor, "go", Vec::new())
+        .expect("queued call");
+    *slot.borrow_mut() = Some((agent.clone(), promise.clone()));
+    drop(doomed);
+    assert_eq!(seen.get(), 1);
+    // The queued call still runs once the notification is over.
+    agent.run();
+    promise.value().expect("the queued call still settles");
+}
+
+/// A key answers exactly the request it was issued for.
+#[test]
+fn an_idempotency_key_refuses_different_arguments() {
+    let (agent, provider, lane) = agent();
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    let first = agent
+        .call_idempotent(
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::Value(Value::text("one"))],
+            "same",
+        )
+        .expect("first");
+    agent.run();
+    first.value().expect("value");
+    let error = agent
+        .call_idempotent(
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::Value(Value::text("two"))],
+            "same",
+        )
+        .expect_err("a different request under one key is a client bug");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// A cached replay is served even when the lane's call budget is spent.
+#[test]
+fn a_cached_replay_is_served_at_the_lane_ceiling() {
+    let (agent, provider, _lane) = agent();
+    let lane = agent.create_lane("capped", Budget::calls(1)).expect("lane");
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    let first = agent
+        .call_idempotent(lane, &cap, "echo", vec![], "k")
+        .expect("first");
+    agent.run();
+    first.value().expect("value");
+    let replay = agent
+        .call_idempotent(lane, &cap, "echo", vec![], "k")
+        .expect("a replay makes no call");
+    assert_eq!(replay.id(), first.id());
+}
+
+/// A provider value deeper than the wire limit is a provider fault, not a stack
+/// overflow at settlement.
+#[test]
+fn a_provider_value_deeper_than_the_wire_limit_is_refused() {
+    struct Deep;
+    impl Provider for Deep {
+        fn name(&self) -> &'static str {
+            "deep"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["deep".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            let mut value = Value::text("leaf");
+            for _ in 0..200 {
+                value = Value::list(vec![value]);
+            }
+            Ok(Response::Value(value))
+        }
+    }
+
+    let agent = Agent::with_secret([0x57; 32]);
+    let provider = agent.register(Box::new(Deep));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["deep"]))
+        .expect("cap");
+    let lane = agent.create_lane("deep", Budget::default()).expect("lane");
+    let promise = agent.call(lane, &cap, "deep", Vec::new()).expect("call");
+    agent.run();
+    let error = promise.value().expect_err("too deep is a provider fault");
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+}
