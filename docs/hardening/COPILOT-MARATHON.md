@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | pending | — | — |
+| R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried | 10 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-09 | transports | `src/transport/**` | pending | — | — |
 | R-10 | bulk | `src/bulk.rs` | pending | — | — |
 | R-11 | identity | `src/identity.rs` | pending | — | — |
@@ -167,6 +167,33 @@ The reviewer applied its fixes directly to the working tree; they are in commit
 Gate after the D-2..D-12 work: `cargo test --all-features` 466 passed, 0 failed
 (and the `--no-default-features` suite green); clippy clean on both feature sets;
 fmt clean.
+
+### R-08 tools / MCP - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`
+(probes compiled against an isolated `git archive` snapshot because this
+worktree was being edited). Five highs, four mediums, six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `LocalProcess` joined its pipe readers with no deadline: a descendant that inherited the pipe kept the call alive past the ceiling (measured 8.2 s on a 300 ms grant) | **fixed**: the readers report over a channel and the wait is bounded; `taskkill /T` ends the tree on Windows; `capability_wall_budget_caps_a_slow_tool` (19 s child, 120 ms ceiling, returns < 5 s) |
+| 2 | high | MCP had no deadline: a silent server held the dispatch thread forever | **fixed**: the transport trait has a deadline-aware read, `StdioTransport` reads on a thread and abandons the wait; `a_silent_stdio_server_times_out` (real silent child at 400 ms) |
+| 3 | high | `HttpTool` ignored the wall ceiling (fixed 10 s, no write timeout) | **fixed**: read and write timeouts are `min(10 s, ceiling)` |
+| 4 | high | HTTP connect was unbounded (21.15 s measured to a blackhole) | **fixed**: resolve, then `connect_timeout` per address under the ceiling |
+| 5 | high | the response status and header lines were unbounded (a 64 MiB line accepted; a header stream aborts the allocator) | **fixed**: `read_line_bounded` per line plus a 64 KiB / 128-field block budget |
+| 6 | medium | after an over-long MCP line the session resynchronised on the tail, so one stream answered two calls | **fixed**: the reader thread stops on a framing error, so the tail can never answer a later request |
+| 7 | medium | the tool-list duplicate check was a scan (32 000 tools: 12.7 s) | **fixed**: a `BTreeSet` |
+| 8 | medium | a bare program name resolves through the ambient `PATH`; `cwd` is inherited | **carried**: requiring an absolute program path is a contract change (the control plane spawns `cmd`/`sh` by name); logged for the R-19 control-plane pass |
+| 9 | medium | a timeout kills the child, not its descendants, and the readers were detached | **partly fixed**: the tree is ended on Windows and the reader wait is bounded everywhere; a Unix process group needs a `libc`-level `setsid`, carried |
+| 10 | low | `Transfer-Encoding: chunked` was returned as a body | **fixed**: anything but `identity` is refused, as are 1xx and non-`HTTP/1.x` status lines |
+| 11 | low | a GET always sent `content-length: 4` | carried with #8 (the request shape belongs to the same pass) |
+| 12 | low | the outbound MCP line was uncapped | **fixed**: refused before send |
+| 13 | low | non-text process arguments were silently dropped | **fixed**: `rpc/invalid-argument` |
+| 14 | low | an MCP notification desynchronised the session | carried: fail-closed today (an unexpected frame is fatal), a skip-up-to-N rule is a protocol decision |
+| 15 | low | `bounded_description` missed U+2028/U+2029 and invisible formatters | carried with #8 (same small edit) |
+
+Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
+feature sets; fmt clean.
 
 ### R-07 domain operations - 2026-11-01 (round 1, in progress)
 
