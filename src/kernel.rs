@@ -2906,6 +2906,45 @@ impl Agent {
         Ok(())
     }
 
+    /// Charge a provider's response against the grant, before it is delivered.
+    ///
+    /// `max_bytes` is documented as the payload bytes moved *through* a
+    /// capability, and a response moves through it. Charging here keeps the
+    /// "charged before work" rule for the request and still makes the ceiling an
+    /// egress bound: a response that does not fit settles as
+    /// `rpc/budget-exceeded` instead of leaving the kernel for free.
+    fn charge_egress(&self, job: &Job, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut kernel = self.cell.borrow_mut();
+        if let Some(lane_record) = kernel.lanes.get(&job.lane) {
+            if lane_record.bytes.saturating_add(bytes) > lane_record.budget.max_bytes {
+                return Err(Error::BudgetExceeded("lane byte"));
+            }
+        }
+        let mut chain: Vec<CapId> = kernel
+            .caps
+            .get(&job.cap)
+            .map(|record| record.lineage.clone())
+            .unwrap_or_default();
+        chain.push(job.cap);
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get(id) {
+                meter.check_bytes(bytes)?;
+            }
+        }
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get_mut(id) {
+                meter.charge_bytes(bytes)?;
+            }
+        }
+        if let Some(lane_record) = kernel.lanes.get_mut(&job.lane) {
+            lane_record.bytes = lane_record.bytes.saturating_add(bytes);
+        }
+        Ok(())
+    }
+
     fn dispatch(&self, batch: Vec<u64>) {
         // No kernel borrow is held while a provider runs: a provider may hold an
         // `Agent` and call back into the kernel, and a re-entrant borrow would
@@ -3119,6 +3158,16 @@ impl Agent {
                         }
                     }
                 }
+            };
+
+            // Egress is charged before settlement: a response larger than the
+            // remaining grant never leaves the kernel.
+            let outcome = match outcome {
+                Ok(value) => match self.charge_egress(&job, value.wire_size()) {
+                    Ok(()) => Ok(value),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
             };
 
             // Phase 3: settle under a write borrow.

@@ -19,7 +19,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
-| R-06 | budget | `src/budget.rs` | round 1: 2 fixed, 3 carried | 2 fixed / 0 rejected / 3 open | this commit |
+| R-06 | budget | `src/budget.rs` | round 1: 3 fixed, 2 carried | 3 fixed / 0 rejected / 2 open | this commit |
 | R-07 | domain ops | `src/domain.rs` | pending | — | — |
 | R-08 | tools / MCP | `src/tool.rs` | pending | — | — |
 | R-09 | transports | `src/transport/**` | pending | — | — |
@@ -107,11 +107,11 @@ Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `64ea410`.
 |---|-----|---------|-------------|
 | 1 | critical | a sealed record was never consumed: export → restore → spend → drop → restore refilled the same grant without bound, so a record stored in a config system was an unlimited credential | **fixed**: `Kernel.consumed_records` marks a record on export and `Kernel.restored_records` marks it on restore; a second export or restore is `rpc/persistence`; `an_exported_record_is_consumed`, `a_record_restores_once_per_kernel` |
 | 2 | high | export recorded only the capability's own remainder and restore minted an unlineaged capability, so a restored child escaped the parent's grant | **fixed**: export clamps the record to the minimum remaining of the capability *and* every ancestor, then **reserves** that grant on every meter (`BudgetMeter::check_reserve`/`reserve`), so the local subtree cannot spend it twice; `a_restored_child_cannot_outspend_its_parent` |
-| 3 | medium | response bytes are not a budget dimension: a 32-byte grant can return 1 MiB, and `patch`/`why`/`impact`/`subgraph` never consult the call budget | **carried**: making `max_bytes` an egress bound changes the provider contract (a provider would fail *after* doing the work). It needs an ADR that states the asymmetry or a two-phase budget; `budget.rs` now says the ceiling bounds ingress |
+| 3 | medium | response bytes are not a budget dimension: a 32-byte grant can return 1 MiB | **fixed**: dispatch charges the response's wire size against the capability, its ancestors and the lane before settlement, so a response that does not fit settles as `rpc/budget-exceeded`; `a_response_larger_than_the_remaining_grant_is_refused`, and `budget.rs` says the ceiling covers both directions |
 | 4 | medium | `max_wall_ms` is enforced only by `LocalProcess`; MCP has no deadline and HTTP uses a fixed 10 s | **carried**: threading the ceiling into the adapters is mechanical but changes three adapters' timeouts; logged for R-08 (tools) where the adapters are audited |
 | 5 | low | send/publish refusals advance `budget_exhaustions` without an `Event::BudgetExhausted`, and the dimension vocabulary has more values than the spec lists | **carried** with #3/#4; the event and the spec list are one change |
 
-Gate: `cargo test --all-features` 447 passed, 0 failed; clippy clean on both
+Gate: `cargo test --all-features` 448 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
 
 ### R-05 lanes / channels - 2026-11-01 (round 1)

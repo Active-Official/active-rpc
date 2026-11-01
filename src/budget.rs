@@ -1,9 +1,12 @@
 //! Hard resource budgets.
 //!
 //! Every capability carries a budget, and attenuation can only shrink it. The
-//! kernel charges calls, bytes and wall time; domain operations translate the
-//! same budget into the Active evaluator's limits, so a call cannot spend more
-//! than the caller granted even inside the evaluator.
+//! kernel charges calls and bytes: the request when the call is queued, the
+//! resolved arguments when a promise grows at dispatch, and the response before
+//! it is delivered. `max_wall_ms` is enforced by the adapters that can measure
+//! time (`LocalProcess` today). Domain operations translate the same budget into
+//! the Active evaluator's limits, so a call cannot spend more than the caller
+//! granted even inside the evaluator.
 
 use crate::error::{Error, Result};
 
@@ -12,7 +15,9 @@ use crate::error::{Error, Result};
 pub struct Budget {
     /// Maximum calls through this capability (and its children in total).
     pub max_calls: u64,
-    /// Maximum payload bytes moved through this capability.
+    /// Maximum payload bytes moved through this capability, in both
+    /// directions: arguments, envelope payload and the response the provider
+    /// returns.
     pub max_bytes: u64,
     /// Maximum wall-clock milliseconds for one call.
     pub max_wall_ms: u64,

@@ -1168,9 +1168,11 @@ fn settled_value_bytes_are_bounded_after_a_drain() {
 
     let agent = Agent::with_secret([19u8; 32]);
     let provider = agent.register(Box::new(BigValue));
+    // The byte grant covers 100 one-MiB responses (egress is charged too); the
+    // retention ceiling is what this test is about.
     let wide = Budget {
         max_calls: 10_000,
-        max_bytes: 64 << 20,
+        max_bytes: 512 << 20,
         max_value_size: 8 << 20,
         ..Budget::default()
     };
