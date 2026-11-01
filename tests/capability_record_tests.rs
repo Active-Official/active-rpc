@@ -53,6 +53,7 @@ fn peer(certificate: &[u8]) -> PeerIdentity {
 fn durable_agent() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle) {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x91; 32]);
     let provider = agent.register(Box::new(Echo));
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
@@ -138,6 +139,7 @@ fn restore_requires_the_durable_policy() {
 fn restore_refuses_a_passed_deadline() {
     let agent = Agent::with_secret([0x74; 32]);
     agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x92; 32]);
     agent.set_latency(100);
     let provider = agent.register(Box::new(Echo));
     let mut attrs = CapAttrs::new(&["echo"]).with_ttl_ms(100);
@@ -158,6 +160,7 @@ fn restore_refuses_a_passed_deadline() {
 fn restore_refuses_a_record_bound_to_another_peer() {
     let agent = Agent::with_secret([0x75; 32]);
     agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x93; 32]);
     let provider = agent.register(Box::new(Echo));
     let owner = admitted(b"owner-a");
     let mut attrs = CapAttrs::new(&["echo"]);
@@ -185,6 +188,8 @@ fn restore_refuses_an_unknown_provider() {
     let (agent, _provider, cap) = durable_agent();
     let mut record = agent.export_capability(&cap).expect("export");
     record.provider = "not-registered".to_string();
+    // Re-seal: the point of this case is provider resolution, not the seal.
+    record.seal_with(&[0x91; 32]);
     let error = agent
         .restore_capability(&record, &admitted(b"durable-owner"))
         .expect_err("an unknown provider must not restore");
@@ -215,6 +220,7 @@ fn a_malformed_or_oversized_record_is_refused() {
 fn a_restored_capability_keeps_the_original_deadline() {
     let agent = Agent::with_secret([0x76; 32]);
     agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x94; 32]);
     agent.set_latency(100);
     let provider = agent.register(Box::new(Echo));
     let mut attrs = CapAttrs::new(&["echo"]).with_ttl_ms(1_000);

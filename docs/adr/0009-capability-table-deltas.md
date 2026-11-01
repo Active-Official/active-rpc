@@ -37,3 +37,17 @@ descriptor order.
 - A lost/reordered base is a hard error, not a silent full-table fallback.
 - A later ADR may add an explicit reset delta; the current format always
   requires the base hash.
+
+## Hardening (2026-11-01)
+
+- A table has a ceiling. The decoder bounds one envelope's additions and
+  removals, but a connection keeps one table and applies delta after delta, so
+  `apply_to` refuses a result longer than `MAX_CAP_TABLE` (4096 descriptors)
+  with `rpc/capability-table`.
+- Descriptors are canonical or refused: a repeated method name decodes to a
+  smaller set than the bytes encode (so the frame would not round-trip and a
+  base negotiated on raw bytes would diverge), and a descriptor with no method
+  grants nothing. Both are `rpc/capability-table`, on the wire path and in
+  `apply_to` alike.
+- `cap_table_hash` returns a `Result` instead of asserting that the table
+  encodes: a table with no hash cannot be confused with a real base.

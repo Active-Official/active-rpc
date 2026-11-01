@@ -233,15 +233,24 @@ fn attenuation_narrows_and_never_widens() {
     let tool = agent
         .attenuate(
             &cap,
-            CapAttrs::new(&["stats"]).with_tool_policy(ToolPolicy::allow(&["read"])),
+            CapAttrs::new(&["stats"]).with_tool_policy(ToolPolicy::allow(&["stats"])),
         )
         .unwrap();
     let error = agent
         .attenuate(
             &tool,
-            CapAttrs::new(&["stats"]).with_tool_policy(ToolPolicy::allow(&["write"])),
+            CapAttrs::new(&["stats"]).with_tool_policy(ToolPolicy::allow(&["stats", "read"])),
         )
         .expect_err("tool escalation");
+    assert_eq!(error.code(), "rpc/attenuation-escalation");
+    // A policy may not name a tool the parent never granted, even under a
+    // policy-less parent: the effective parent policy is its own method set.
+    let error = agent
+        .attenuate(
+            &cap,
+            CapAttrs::new(&["stats"]).with_tool_policy(ToolPolicy::allow(&["read"])),
+        )
+        .expect_err("a policy cannot grant an unheld tool");
     assert_eq!(error.code(), "rpc/attenuation-escalation");
 }
 

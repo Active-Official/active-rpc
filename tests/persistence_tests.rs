@@ -37,7 +37,7 @@ fn durable_caps_are_refused_until_policy_allows_them() {
     let error = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]).durable())
         .unwrap_err();
-    assert_eq!(error.code(), "rpc/capability-table");
+    assert_eq!(error.code(), "rpc/persistence");
 
     agent.set_durable_capabilities(true);
     let cap = agent

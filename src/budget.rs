@@ -112,17 +112,21 @@ impl Budget {
         }
     }
 
-    /// Map onto the Active evaluator's budget. The evaluator gets the same
-    /// ceilings, so a capability cannot be used to outspend its grant.
+    /// Map onto the Active evaluator's budget.
+    ///
+    /// The evaluator's ceilings never exceed the grant: a capability cannot be
+    /// used to outspend the bytes it was given just because its per-value
+    /// ceiling is larger. `max_keys` and `max_total_value_size` are derived
+    /// from the grant and then clamped to it.
     pub fn to_active_budget(&self) -> active_core::Budget {
         active_core::Budget {
             max_nodes: self.max_nodes,
             max_depth: self.max_depth,
             max_array_len: self.max_array_len,
-            max_keys: self.max_depth.saturating_mul(64),
+            max_keys: self.max_array_len.min(self.max_depth.saturating_mul(64)),
             max_wall_ms: self.max_wall_ms,
             max_value_size: self.max_value_size,
-            max_total_value_size: self.max_value_size.saturating_mul(4),
+            max_total_value_size: self.max_value_size.min(self.max_bytes),
         }
     }
 }
@@ -165,16 +169,63 @@ impl BudgetMeter {
         self.budget.max_calls.saturating_sub(self.calls)
     }
 
-    /// Charge one call and `bytes` of payload.
-    pub fn charge(&mut self, bytes: u64) -> Result<()> {
+    /// Refuse unless one more call of `bytes` fits under every ceiling.
+    ///
+    /// Kept separate from [`BudgetMeter::charge`] so a caller that charges a
+    /// chain of meters (a capability and its ancestors) can check them all
+    /// before charging any: a refused call must not consume part of a grant.
+    /// Arithmetic is checked, so a hostile byte count cannot wrap the counter
+    /// and quietly disable the ceiling.
+    pub fn check(&self, bytes: u64) -> Result<()> {
         if self.calls >= self.budget.max_calls {
             return Err(Error::BudgetExceeded("call"));
         }
-        if self.bytes.saturating_add(bytes) > self.budget.max_bytes {
+        let total = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(Error::BudgetExceeded("byte"))?;
+        if total > self.budget.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
-        self.calls += 1;
-        self.bytes += bytes;
+        Ok(())
+    }
+
+    /// Refuse unless `bytes` more fit under the byte ceiling.
+    ///
+    /// Used when an already-charged call grows at dispatch: the extra bytes are
+    /// checked against every meter in the chain before any of them is charged.
+    pub fn check_bytes(&self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let total = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(Error::BudgetExceeded("byte"))?;
+        if total > self.budget.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
+        }
+        Ok(())
+    }
+
+    /// Charge bytes without consuming a call.
+    ///
+    /// Used when a queued argument grew at dispatch: a promise that resolved to
+    /// a larger value than its placeholder still has to be paid for.
+    pub fn charge_bytes(&mut self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.check_bytes(bytes)?;
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Charge one call and `bytes` of payload.
+    pub fn charge(&mut self, bytes: u64) -> Result<()> {
+        self.check(bytes)?;
+        self.calls = self.calls.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
         Ok(())
     }
 }

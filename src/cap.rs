@@ -41,6 +41,20 @@ impl CapId {
         CapId(id)
     }
 
+    /// Derive the durable record identity of a capability.
+    ///
+    /// Domain-separated from [`CapId::derive`]: a record id authorizes a
+    /// durable restore only together with a sealed record, and it is what a
+    /// revocation tombstones.
+    pub fn derive_record(secret: &[u8; 32], serial: u64, parent: Option<&CapId>) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"active-rpc/record-id");
+        hasher.update(secret);
+        hasher.update(&serial.to_le_bytes());
+        hasher.update(&parent.map(|id| id.0).unwrap_or([0u8; 16]));
+        *hasher.finalize().as_bytes()
+    }
+
     /// Hex form for logs and errors.
     ///
     /// This is the raw capability id and **is** authority: possession of it is
@@ -152,7 +166,6 @@ impl ToolPolicy {
             && (!self.allow_process || parent.allow_process)
     }
 }
-
 /// Whether a capability may outlive the process under an explicit policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CapPersistence {
@@ -285,7 +298,36 @@ impl CapAttrs {
         self.bound_to.is_some()
     }
 
+    /// The tool policy this capability grants when it carries no explicit one.
+    ///
+    /// A capability without a `ToolPolicy` still bounds the tool surface: only
+    /// its own methods, at most its byte budget, and never a local process.
+    /// Attenuation compares a child policy against this effective policy, so a
+    /// "narrowing" child cannot add process execution or widen the byte
+    /// ceiling that the parent never granted.
+    pub fn effective_tool_policy(&self) -> ToolPolicy {
+        match &self.tool_policy {
+            Some(policy) => policy.clone(),
+            None => ToolPolicy {
+                allowed: self.methods.clone(),
+                max_arg_bytes: self.budget.max_bytes,
+                allow_process: false,
+            },
+        }
+    }
+
     /// True when `self` is a valid attenuation of `parent`.
+    ///
+    /// This is the predicate; [`CapAttrs::attenuate`] is the operation, and the
+    /// two agree by construction (a property test pins it). Two notes for a
+    /// caller that validates attributes from another source:
+    ///
+    /// - A child that omits the identity binding reports monotone because
+    ///   attenuation *inherits* the parent's binding; apply `parent.bound_to`
+    ///   to the child before minting, or use `attenuate`.
+    /// - A parent without a tool policy is compared through
+    ///   [`CapAttrs::effective_tool_policy`], so a "narrowing" policy can never
+    ///   add process execution or widen the parent's byte ceiling.
     pub fn is_attenuation_of(&self, parent: &CapAttrs) -> bool {
         let methods_ok = self.methods.is_subset(&parent.methods) && !self.methods.is_empty();
         let persistence_ok = self.persistence != CapPersistence::Durable
@@ -308,11 +350,12 @@ impl CapAttrs {
             (None, Some(_)) => false,
         };
         let tool_ok = match (&self.tool_policy, &parent.tool_policy) {
-            // A parent without a policy leaves the tool surface open; adding one
-            // on the child narrows it, which `attenuate` also accepts.
-            (_, None) => true,
+            // A parent without an explicit policy still bounds the tool
+            // surface: its methods, its byte budget, no process.
+            (Some(policy), None) => policy.is_attenuation_of(&parent.effective_tool_policy()),
             // Dropping the parent's policy widens authority.
             (None, Some(_)) => false,
+            (None, None) => true,
             (Some(policy), Some(parent)) => policy.is_attenuation_of(parent),
         };
         // A lifetime is authority too: a bounded parent cannot have an unbounded
@@ -392,8 +435,10 @@ impl CapAttrs {
             (None, Some(_)) => return Err(Error::Escalation("path scope removed")),
         }
         match (&child.tool_policy, &self.tool_policy) {
-            (_, None) => {}
             (Some(policy), Some(parent)) if policy.is_attenuation_of(parent) => {}
+            (Some(policy), None) if policy.is_attenuation_of(&self.effective_tool_policy()) => {}
+            (None, Some(_)) => return Err(Error::Escalation("tool policy removed")),
+            (None, None) => {}
             _ => return Err(Error::Escalation("tool policy widens")),
         }
         let mut attrs = child;
@@ -413,6 +458,11 @@ impl CapAttrs {
     }
 
     /// Whether `path` is inside the capability's scope.
+    ///
+    /// The kernel enforces this walk over `Value::Path` arguments, recursively.
+    /// A provider that takes a path must therefore read the `Path` variant and
+    /// never a text that happens to look like one, or the scope check never
+    /// sees the argument.
     pub fn covers_path(&self, path: &str) -> bool {
         match &self.path_scope {
             None => true,
@@ -454,6 +504,13 @@ pub struct CapRecord {
     pub revoked: bool,
     /// Absolute kernel time after which the capability is refused, in ms.
     pub expires_at: Option<u64>,
+    /// Stable identity of this capability's durable record.
+    ///
+    /// Derived from the kernel secret at mint time, so it is unforgeable and
+    /// survives an export/restore round trip in this authority domain. It is
+    /// what revocation tombstones: an exported record of a revoked capability
+    /// stays dead no matter how many times it is presented.
+    pub record_id: [u8; 32],
 }
 
 impl CapRecord {
@@ -469,6 +526,7 @@ impl CapRecord {
             refs: 1,
             revoked: false,
             expires_at: None,
+            record_id: [0u8; 32],
         }
     }
 }
@@ -519,13 +577,13 @@ impl CapHandle {
         self.id
     }
 
-    /// Surrender this handle without releasing its reference.
+    /// True when this handle owns a reference to the capability.
     ///
-    /// Used when a reference moves (channel transfer): the receiver becomes
-    /// responsible for the reference the sender held.
-    pub fn into_id(mut self) -> CapId {
-        self.owning = false;
-        self.id
+    /// An imported handle names a capability it never retained, so the
+    /// authority belongs to whoever minted it. Operations that turn a live
+    /// capability into a durable credential require an owning handle.
+    pub fn is_owning(&self) -> bool {
+        self.owning
     }
 }
 

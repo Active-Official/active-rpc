@@ -647,11 +647,14 @@ impl Provider for HttpTool {
                 })
             }
         };
+        // The path is a `Value::Path` and nothing else. Accepting a text
+        // argument that starts with `/` would give a caller a second, invisible
+        // route to the path: the kernel's path scope walks `Value::Path`, so a
+        // text path would reach the adapter without ever being checked.
         let path = call
             .args
             .iter()
             .find_map(|arg| match arg {
-                Arg::Value(Value::Text(text)) if text.starts_with('/') => Some(text.clone()),
                 Arg::Value(Value::Path(path)) => Some(path.clone()),
                 _ => None,
             })

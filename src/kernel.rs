@@ -39,6 +39,18 @@ use crate::value::{Arg, Call, Response, Value};
 /// agent and finite, so a hostile or buggy caller fails closed.
 pub const MAX_LANES: usize = 4_096;
 
+/// Global ceiling on live capabilities in one kernel.
+///
+/// A capability is a registry entry, so an unbounded registry is an
+/// unbounded allocation a peer could drive by asking for attenuations.
+pub const MAX_CAPS: usize = 65_536;
+
+/// Deepest capability chain attenuation may build.
+///
+/// Each link copies its ancestors, so the memory of a chain grows with the
+/// square of its length; a chain is also the unit revocation walks.
+pub const MAX_LINEAGE_DEPTH: usize = 64;
+
 /// Largest idempotency key a caller may present.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 
@@ -260,6 +272,10 @@ struct Job {
     deps: Vec<PromiseId>,
     promise: PromiseId,
     state: JobState,
+    /// Argument bytes measured when the call was queued, with promises counted
+    /// at their placeholder size. Dispatch charges the difference once the
+    /// promises resolve.
+    args_bytes: u64,
 }
 
 /// The deterministic kernel: providers, capabilities, budgets and promises.
@@ -294,6 +310,11 @@ pub struct Kernel {
     channel_ceiling: usize,
     /// Drops whose provider was checked out for a call.
     deferred_drops: Vec<(ProviderId, u64, CapId)>,
+    /// Reference operations that arrived while the kernel was borrowed.
+    ///
+    /// Shared with the handle control, which cannot borrow the kernel from a
+    /// `Drop` that runs inside a dispatch phase.
+    deferred_refops: Rc<std::cell::RefCell<Vec<(CapId, bool)>>>,
     /// True while a dispatch batch has its provider checked out.
     dispatching: bool,
     idempotency: BTreeMap<(CapId, String, String), PromiseId>,
@@ -308,6 +329,11 @@ pub struct Kernel {
     receipts: std::collections::VecDeque<crate::receipts::Receipt>,
     receipts_enabled: bool,
     next_receipt: u64,
+    /// Deployment key that seals durable records. Without it a record cannot
+    /// be exported or restored: an unverifiable credential is not accepted.
+    record_key: Option<[u8; 32]>,
+    /// Record ids tombstoned by a revocation.
+    revoked_records: BTreeSet<[u8; 32]>,
 }
 
 /// Control half of a capability handle: reference counting and provider
@@ -315,54 +341,48 @@ pub struct Kernel {
 /// `Rc<dyn CapControl>` without exposing the kernel itself.
 pub(crate) struct HandleControl {
     cell: KernelCell,
+    /// Reference operations that could not take the kernel borrow.
+    deferred_refops: Rc<std::cell::RefCell<Vec<(CapId, bool)>>>,
 }
 
 impl HandleControl {
-    fn new(cell: KernelCell) -> Self {
-        Self { cell }
+    /// Apply one reference operation to the kernel.
+    fn apply(kernel: &mut Kernel, id: CapId, retain: bool) {
+        if retain {
+            if let Some(record) = kernel.caps.get_mut(&id) {
+                record.refs = record.refs.saturating_add(1);
+                kernel.push_event(Event::CapRetained(id));
+            }
+            return;
+        }
+        let Some(record) = kernel.caps.get_mut(&id) else {
+            return;
+        };
+        record.refs = record.refs.saturating_sub(1);
+        let last = record.refs == 0;
+        kernel.push_event(Event::CapReleased(id));
+        if last {
+            Kernel::drop_record(kernel, id);
+        }
     }
 }
 
 impl CapControl for HandleControl {
     fn retain(&self, id: CapId) {
-        if let Ok(mut kernel) = self.cell.try_borrow_mut() {
-            if let Some(record) = kernel.caps.get_mut(&id) {
-                record.refs = record.refs.saturating_add(1);
-                kernel.push_event(Event::CapRetained(id));
-            }
+        match self.cell.try_borrow_mut() {
+            Ok(mut kernel) => Self::apply(&mut kernel, id, true),
+            // The kernel is borrowed by the dispatch phase that is running a
+            // provider. Losing the operation would leave a handle that is never
+            // matched by a release (or a release that never balances a
+            // retain), so it is queued and applied at the next borrow point.
+            Err(_) => self.deferred_refops.borrow_mut().push((id, true)),
         }
     }
 
     fn release(&self, id: CapId) {
-        let dropped = {
-            let Ok(mut kernel) = self.cell.try_borrow_mut() else {
-                return;
-            };
-            let Some(record) = kernel.caps.get_mut(&id) else {
-                return;
-            };
-            record.refs = record.refs.saturating_sub(1);
-            let last = record.refs == 0;
-            kernel.push_event(Event::CapReleased(id));
-            last
-        };
-        if !dropped {
-            return;
-        }
-        let mut kernel = self.cell.borrow_mut();
-        let Some(record) = kernel.caps.remove(&id) else {
-            return;
-        };
-        kernel.meters.remove(&id);
-        kernel.push_event(Event::CapDropped(id));
-        if let Some(provider) = kernel.providers.get_mut(&record.provider) {
-            provider.on_drop(record.object, id);
-        } else {
-            // The provider is checked out for a call it is currently running;
-            // the drop is delivered when that batch finishes.
-            kernel
-                .deferred_drops
-                .push((record.provider, record.object, id));
+        match self.cell.try_borrow_mut() {
+            Ok(mut kernel) => Self::apply(&mut kernel, id, false),
+            Err(_) => self.deferred_refops.borrow_mut().push((id, false)),
         }
     }
 }
@@ -397,6 +417,7 @@ impl Agent {
 
     /// Create an agent with a fixed secret (tests, deterministic replays).
     pub fn with_secret(secret: [u8; 32]) -> Self {
+        let deferred_refops = Rc::new(std::cell::RefCell::new(Vec::new()));
         let kernel = Kernel {
             secret,
             providers: BTreeMap::new(),
@@ -433,9 +454,15 @@ impl Agent {
             receipts: std::collections::VecDeque::new(),
             receipts_enabled: false,
             next_receipt: 0,
+            record_key: None,
+            revoked_records: BTreeSet::new(),
+            deferred_refops: Rc::clone(&deferred_refops),
         };
         let cell: KernelCell = Rc::new(RefCell::new(kernel));
-        let control: Rc<dyn CapControl> = Rc::new(HandleControl::new(Rc::clone(&cell)));
+        let control: Rc<dyn CapControl> = Rc::new(HandleControl {
+            cell: Rc::clone(&cell),
+            deferred_refops,
+        });
         Agent { cell, control }
     }
 
@@ -524,16 +551,38 @@ impl Agent {
         self.cell.borrow_mut().allow_durable = allow;
     }
 
+    /// Set the key that seals capability records.
+    ///
+    /// A record is a credential: whoever can write one can mint the authority
+    /// it describes. The key binds every field to the deployment, so a record
+    /// that was edited, fabricated or copied from another deployment is refused
+    /// before any capability is minted. Without a key the kernel exports and
+    /// restores nothing, which is the fail-closed default.
+    pub fn set_record_seal_key(&self, key: [u8; 32]) {
+        self.cell.borrow_mut().record_key = Some(key);
+    }
+
+    /// The record seal key, if one is configured.
+    fn record_key(&self) -> Option<[u8; 32]> {
+        self.cell.borrow().record_key
+    }
+
     /// Export a durable capability's authority as a record.
     ///
-    /// Only a `Durable` capability can be exported, and only while it is live:
-    /// a record of a dead grant is useless and a record of an ephemeral grant
-    /// would turn a process-local capability into a persisted credential. The
-    /// record carries no id and no secret.
+    /// Only a `Durable` capability can be exported, only while it is live, and
+    /// only through the handle that owns it: an imported (id-only) handle has no
+    /// authority of its own to persist. The record carries no capability id and
+    /// no secret; it carries the capability's record id, which a revocation
+    /// tombstones.
     pub fn export_capability(
         &self,
         cap: &CapHandle,
     ) -> Result<crate::persistence::CapabilityRecord> {
+        if !cap.is_owning() {
+            return Err(Error::persistence(
+                "an imported handle cannot export authority",
+            ));
+        }
         let kernel = self.cell.borrow();
         let record = kernel
             .caps
@@ -561,7 +610,10 @@ impl Agent {
             .providers
             .get(&record.provider)
             .ok_or_else(|| Error::persistence("the provider is no longer registered"))?;
-        Ok(crate::persistence::CapabilityRecord {
+        let key = kernel
+            .record_key
+            .ok_or_else(|| Error::persistence("no record seal key is configured"))?;
+        let mut record = crate::persistence::CapabilityRecord {
             provider: provider.name().to_string(),
             object: record.object,
             methods: record.attrs.methods.clone(),
@@ -574,17 +626,23 @@ impl Agent {
             bound_to: record.attrs.bound_to,
             expires_at: record.expires_at,
             wall_clock: kernel.wall_clock,
-        })
+            record_id: record.record_id,
+            seal: None,
+        };
+        record.seal_with(&key);
+        Ok(record)
     }
 
     /// Restore a durable capability as a fresh, peer-bound capability.
     ///
     /// The restored capability has a new id (ids are kernel-specific), the
     /// recorded authority, the original absolute deadline and a binding to
-    /// `peer`. Restoring is refused unless durable capabilities are enabled,
-    /// the provider is registered, the deadline has not passed and the record
-    /// is not bound to a different peer. A record alone is therefore not
-    /// authority: the deployment must admit the peer too.
+    /// `peer`. Restoring is refused unless durable capabilities are enabled, a
+    /// record seal key is configured, the record's seal verifies, its record id
+    /// was never tombstoned by a revocation, the provider is registered, the
+    /// deadline has not passed and the record is not bound to a different peer.
+    /// A record alone is therefore not authority: it must have been sealed by
+    /// this deployment, and the peer must be admitted too.
     pub fn restore_capability(
         &self,
         record: &crate::persistence::CapabilityRecord,
@@ -594,6 +652,24 @@ impl Agent {
             return Err(Error::persistence(
                 "durable capabilities are not enabled for this agent",
             ));
+        }
+        let key = self
+            .record_key()
+            .ok_or_else(|| Error::persistence("no record seal key is configured"))?;
+        // The seal comes before every other field: a forged record must not be
+        // able to steer which check reports the refusal.
+        if !record.seal_is_valid(&key) {
+            return Err(Error::persistence(
+                "the record is not sealed by this deployment",
+            ));
+        }
+        if self
+            .cell
+            .borrow()
+            .revoked_records
+            .contains(&record.record_id)
+        {
+            return Err(Error::Revoked(record_token(&record.record_id)));
         }
         if let Some(bound) = record.bound_to {
             if bound != peer.fingerprint() {
@@ -634,7 +710,13 @@ impl Agent {
             None => None,
         };
         let attrs = record.attrs(ttl_ms);
-        self.mint_bound(peer, provider, record.object, attrs)
+        let restored = self.mint_bound(peer, provider, record.object, attrs)?;
+        // Keep the record identity: a revocation that reaches this capability
+        // must tombstone the same record id the credential carries.
+        if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {
+            live.record_id = record.record_id;
+        }
+        Ok(restored)
     }
 
     /// The kernel's current logical time, in milliseconds.
@@ -677,8 +759,8 @@ impl Agent {
         if attrs.persistence == crate::cap::CapPersistence::Durable
             && !self.cell.borrow().allow_durable
         {
-            return Err(Error::CapabilityTable(
-                "durable capability refused by policy",
+            return Err(Error::persistence(
+                "durable capabilities are not enabled for this agent",
             ));
         }
         attrs.budget.check()?;
@@ -689,12 +771,16 @@ impl Agent {
         if !kernel.providers.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
         }
+        if kernel.caps.len() >= MAX_CAPS {
+            return Err(Error::BudgetExceeded("caps"));
+        }
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, None);
         let expires_at = attrs.ttl_ms.map(|ttl| kernel.now_ms.saturating_add(ttl));
         let mut record = CapRecord::new(id, provider, object, attrs.clone());
         record.expires_at = expires_at;
+        record.record_id = CapId::derive_record(&kernel.secret, serial, None);
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.caps.insert(id, record);
         kernel.push_event(Event::CapMinted { cap: id, provider });
@@ -815,9 +901,15 @@ impl Agent {
             && (record.attrs.persistence == CapPersistence::Durable
                 || attrs.persistence == CapPersistence::Durable)
         {
-            return Err(Error::CapabilityTable(
-                "durable capability refused by policy",
+            return Err(Error::persistence(
+                "durable capabilities are not enabled for this agent",
             ));
+        }
+        if kernel.caps.len() >= MAX_CAPS {
+            return Err(Error::BudgetExceeded("caps"));
+        }
+        if record.lineage.len() >= MAX_LINEAGE_DEPTH {
+            return Err(Error::Escalation("capability chain is too deep"));
         }
         let attrs = record.attrs.attenuate(attrs)?;
         let serial = kernel.next_serial;
@@ -825,6 +917,7 @@ impl Agent {
         let id = CapId::derive(&kernel.secret, serial, Some(&parent_id));
         let mut child = CapRecord::new(id, record.provider, record.object, attrs.clone());
         child.parent = Some(parent_id);
+        child.record_id = CapId::derive_record(&kernel.secret, serial, Some(&parent_id));
         child.lineage = record.lineage.clone();
         child.lineage.push(parent_id);
         // A derived capability never outlives its parent: keep the parent's
@@ -857,25 +950,47 @@ impl Agent {
     }
 
     /// Revoke a capability and every capability derived from it.
+    ///
+    /// The subtree is found once, through a parent/lineage index, instead of
+    /// rescanning every capability per doomed id: revoking a wide tree is a
+    /// linear walk. Each doomed record also tombstones its durable record id,
+    /// so a record exported before the revocation cannot restore the authority.
     pub fn revoke(&self, cap: &CapHandle) {
         let mut kernel = self.cell.borrow_mut();
+        // id -> the capabilities that name it as an ancestor. `lineage` holds
+        // every ancestor including the immediate parent, and survives the
+        // dropped intermediate that would break a `parent` walk.
+        let mut children: BTreeMap<CapId, Vec<CapId>> = BTreeMap::new();
+        for (child, record) in &kernel.caps {
+            for ancestor in &record.lineage {
+                children.entry(*ancestor).or_default().push(*child);
+            }
+            if let Some(parent) = record.parent {
+                if !record.lineage.contains(&parent) {
+                    children.entry(parent).or_default().push(*child);
+                }
+            }
+        }
         let mut doomed = BTreeSet::new();
         let mut stack = vec![cap.id()];
         while let Some(id) = stack.pop() {
             if !doomed.insert(id) {
                 continue;
             }
-            for (child, record) in &kernel.caps {
-                // `parent` is enough while the intermediate lives; `lineage`
-                // keeps the subtree reachable after it is dropped.
-                if record.parent == Some(id) || record.lineage.contains(&id) {
-                    stack.push(*child);
-                }
+            if let Some(descendants) = children.get(&id) {
+                stack.extend(descendants.iter().copied());
             }
         }
         for id in doomed {
-            if let Some(record) = kernel.caps.get_mut(&id) {
-                record.revoked = true;
+            let record_id = match kernel.caps.get_mut(&id) {
+                Some(record) => {
+                    record.revoked = true;
+                    Some(record.record_id)
+                }
+                None => None,
+            };
+            if let Some(record_id) = record_id {
+                kernel.revoked_records.insert(record_id);
             }
             kernel.push_event(Event::CapRevoked(id));
             kernel.metrics.revocations = kernel.metrics.revocations.saturating_add(1);
@@ -1184,7 +1299,10 @@ impl Agent {
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("channel queue ceiling reached"));
         }
-        let bytes = payload.wire_size();
+        // The topic name is metadata the channel stores and forwards, so it is
+        // payload as far as the grant is concerned: charging only the value let
+        // a 1 KiB topic ride through a 32-byte budget.
+        let bytes = payload.wire_size().saturating_add(topic.len() as u64);
         let effective = record.attrs.budget.intersect(&lane_budget);
         if bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
@@ -1192,11 +1310,20 @@ impl Agent {
         if lane_bytes.saturating_add(bytes) > lane_budget.max_bytes {
             return Err(Error::BudgetExceeded("lane byte"));
         }
-        let meter = kernel
-            .meters
-            .get_mut(&cap.id())
-            .ok_or(Error::InvalidArgument("capability has no meter"))?;
-        meter.charge(bytes)?;
+        // A publish is a call through the capability and through every
+        // ancestor, exactly like `call_inner`.
+        let mut chain: Vec<CapId> = record.lineage.clone();
+        chain.push(cap.id());
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get(id) {
+                meter.check(bytes)?;
+            }
+        }
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get_mut(id) {
+                meter.charge(bytes)?;
+            }
+        }
         let record = kernel
             .channels
             .get_mut(&channel)
@@ -1429,22 +1556,18 @@ impl Agent {
             }
         }
         // Tool policy is enforced here too.
+        let args_bytes: u64 = args.iter().map(Arg::wire_size).sum();
         if let Some(policy) = &record.attrs.tool_policy {
             if !policy.allowed.contains(method) {
                 return Err(Error::ToolPolicy("tool not allowed"));
             }
             // Count every argument shape, recursively: a nested list or map
             // must not slip past the tool's payload ceiling.
-            let bytes: u64 = args.iter().map(Arg::wire_size).sum();
-            if bytes > policy.max_arg_bytes {
+            if args_bytes > policy.max_arg_bytes {
                 return Err(Error::ToolPolicy("argument too large"));
             }
         }
-        let call_bytes: u64 = args
-            .iter()
-            .map(|arg| arg.wire_size())
-            .sum::<u64>()
-            .saturating_add(payload_bytes);
+        let call_bytes: u64 = args_bytes.saturating_add(payload_bytes);
         let effective = record.attrs.budget.intersect(&lane_budget);
         if call_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
@@ -1474,11 +1597,22 @@ impl Agent {
         if kernel.jobs.len() >= kernel.queue_ceiling {
             return Err(Error::Backpressure("queue ceiling reached"));
         }
-        let meter = kernel
-            .meters
-            .get_mut(&cap_id)
-            .ok_or(Error::InvalidArgument("capability has no meter"))?;
-        meter.charge(call_bytes)?;
+        // The budget of a capability bounds its whole subtree: a call through a
+        // child is also a call through every ancestor, so the grant of a parent
+        // is not multiplied by the branching factor of its delegations. Every
+        // meter in the chain is checked before any is charged.
+        let mut chain: Vec<CapId> = record.lineage.clone();
+        chain.push(cap_id);
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get(id) {
+                meter.check(call_bytes)?;
+            }
+        }
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get_mut(id) {
+                meter.charge(call_bytes)?;
+            }
+        }
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
             lane_record.bytes = lane_record.bytes.saturating_add(call_bytes);
         }
@@ -1534,6 +1668,7 @@ impl Agent {
             deps,
             promise: promise_id,
             state: JobState::Queued,
+            args_bytes,
         };
         kernel.jobs.insert(job_id, job);
         kernel.queue.push_back(job_id);
@@ -1574,9 +1709,13 @@ impl Agent {
                     return kernel.round_trips;
                 }
                 if kernel.queue.is_empty() {
+                    kernel.apply_deferred_refops();
                     kernel.trim_settled();
                     return kernel.round_trips;
                 }
+                // Reference operations that arrived during a provider call are
+                // applied before the next batch is chosen.
+                kernel.apply_deferred_refops();
                 match kernel.next_batch() {
                     Ok(batch) => batch,
                     Err(stuck) => {
@@ -1993,6 +2132,44 @@ impl Agent {
             .ok_or(Error::UnknownCapability(cap_token(cap.id())))
     }
 
+    /// Charge the bytes a resolved promise added to a queued call.
+    ///
+    /// The call was charged at queue time with each promise counted at its
+    /// placeholder size. A promise that resolves to a larger value must not
+    /// deliver it for free: the difference is charged to the capability, to
+    /// every ancestor and to the lane before the provider runs.
+    fn charge_dispatch_delta(&self, job: &Job, extra: u64) -> Result<()> {
+        if extra == 0 {
+            return Ok(());
+        }
+        let mut kernel = self.cell.borrow_mut();
+        if let Some(lane_record) = kernel.lanes.get(&job.lane) {
+            if lane_record.bytes.saturating_add(extra) > lane_record.budget.max_bytes {
+                return Err(Error::BudgetExceeded("lane byte"));
+            }
+        }
+        let mut chain: Vec<CapId> = kernel
+            .caps
+            .get(&job.cap)
+            .map(|record| record.lineage.clone())
+            .unwrap_or_default();
+        chain.push(job.cap);
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get(id) {
+                meter.check_bytes(extra)?;
+            }
+        }
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get_mut(id) {
+                meter.charge_bytes(extra)?;
+            }
+        }
+        if let Some(lane_record) = kernel.lanes.get_mut(&job.lane) {
+            lane_record.bytes = lane_record.bytes.saturating_add(extra);
+        }
+        Ok(())
+    }
+
     fn dispatch(&self, batch: Vec<u64>) {
         // No kernel borrow is held while a provider runs: a provider may hold an
         // `Agent` and call back into the kernel, and a re-entrant borrow would
@@ -2082,7 +2259,7 @@ impl Agent {
                 // it runs; that is the same refusal as a revocation.
                 let record = kernel.caps.get(&job.cap).cloned();
                 let mut expired = false;
-                let failure = match &record {
+                let mut failure = match &record {
                     None => Some(Error::UnknownCapability(cap_token(job.cap))),
                     Some(record) if record.revoked => Some(Error::Revoked(cap_token(record.id))),
                     Some(record) => {
@@ -2097,15 +2274,50 @@ impl Agent {
                         }
                     }
                 };
+                // A promise argument was a placeholder when the call was
+                // queued. Its value is authority-bearing too, so the path
+                // scope, the tool ceiling and the byte budget are re-checked
+                // against what the provider is about to receive.
+                let resolved_bytes: u64 = args.iter().map(Arg::wire_size).sum();
+                if failure.is_none() {
+                    if let Some(record) = &record {
+                        if let Some(scope) = &record.attrs.path_scope {
+                            for arg in &args {
+                                if let Arg::Value(value) = arg {
+                                    if let Some(path) = path_outside_scope(value, scope) {
+                                        failure = Some(Error::PathNotGranted(path));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if failure.is_none() {
+                            if let Some(policy) = &record.attrs.tool_policy {
+                                if resolved_bytes > policy.max_arg_bytes {
+                                    failure = Some(Error::ToolPolicy("argument too large"));
+                                }
+                            }
+                        }
+                        if failure.is_none() && resolved_bytes > job.call.budget.max_bytes {
+                            failure = Some(Error::BudgetExceeded("byte"));
+                        }
+                    }
+                }
+                let extra = if failure.is_none() {
+                    resolved_bytes.saturating_sub(job.args_bytes)
+                } else {
+                    0
+                };
                 Some((
                     job,
                     args,
                     failure,
                     record.map(|record| record.object).unwrap_or(0),
                     expired,
+                    extra,
                 ))
             };
-            let Some((job, args, failure, object, expired)) = prepared else {
+            let Some((job, args, failure, object, expired, extra)) = prepared else {
                 continue;
             };
             if expired {
@@ -2113,7 +2325,12 @@ impl Agent {
                     .borrow_mut()
                     .push_event(Event::CapExpired(job.cap));
             }
-
+            // The bytes a promise resolved into are paid for before the
+            // provider runs, by the capability and by every ancestor.
+            let failure = match failure {
+                Some(error) => Some(error),
+                None => self.charge_dispatch_delta(&job, extra).err(),
+            };
             // Phase 2: run provider code with no borrow held.
             let outcome = match failure {
                 Some(error) => Err(error),
@@ -2212,6 +2429,33 @@ impl Kernel {
             .unwrap_or(0);
         self.settled.push_back((id, size));
         self.settled_bytes = self.settled_bytes.saturating_add(size);
+    }
+
+    /// Remove a capability whose last reference died and notify its provider.
+    ///
+    /// The provider may be checked out for a call it is running; the drop is
+    /// then queued and delivered when the batch finishes.
+    fn drop_record(kernel: &mut Kernel, id: CapId) {
+        let Some(record) = kernel.caps.remove(&id) else {
+            return;
+        };
+        kernel.meters.remove(&id);
+        kernel.push_event(Event::CapDropped(id));
+        if let Some(provider) = kernel.providers.get_mut(&record.provider) {
+            provider.on_drop(record.object, id);
+        } else {
+            kernel
+                .deferred_drops
+                .push((record.provider, record.object, id));
+        }
+    }
+
+    /// Apply reference operations that arrived while the kernel was borrowed.
+    fn apply_deferred_refops(&mut self) {
+        let ops: Vec<(CapId, bool)> = self.deferred_refops.borrow_mut().drain(..).collect();
+        for (id, retain) in ops {
+            HandleControl::apply(self, id, retain);
+        }
     }
 
     /// Trim settled promises after the queue drains.
@@ -2395,6 +2639,16 @@ fn pad128(id: CapId) -> [u8; 16] {
 
 fn cap_token(id: CapId) -> crate::cap::CapToken {
     crate::cap::CapToken(u128::from_be_bytes(pad128(id)))
+}
+
+/// Correlation token for a durable record id.
+///
+/// A revoked record is reported with the same `rpc/revoked` code as a revoked
+/// capability; the token correlates to the record, never to a live capability.
+fn record_token(record_id: &[u8; 32]) -> crate::cap::CapToken {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&record_id[..16]);
+    crate::cap::CapToken(u128::from_be_bytes(bytes))
 }
 
 /// A handle to a pending or settled result.

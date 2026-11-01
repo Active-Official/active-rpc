@@ -18,10 +18,10 @@ fn delta_applies_to_the_negotiated_base_and_rejects_wrong_bases() {
     let base = vec![descriptor(1, "echo"), descriptor(2, "evaluate")];
     let removed = vec![CapId([2u8; 16])];
     let added = vec![descriptor(3, "stats")];
-    let delta = CapTableDelta::new(&base, removed.clone(), added.clone());
+    let delta = CapTableDelta::new(&base, removed.clone(), added.clone()).expect("delta");
     let expected = vec![descriptor(1, "echo"), descriptor(3, "stats")];
     assert_eq!(delta.apply_to(&base).expect("apply"), expected);
-    assert_eq!(delta.base, cap_table_hash(&base));
+    assert_eq!(delta.base, cap_table_hash(&base).expect("hash"));
 
     let mut wrong = base.clone();
     wrong.push(descriptor(4, "why"));
@@ -41,7 +41,7 @@ fn delta_applies_to_the_negotiated_base_and_rejects_wrong_bases() {
 #[test]
 fn delta_survives_the_envelope_and_sets_the_negotiation_flag() {
     let base = vec![descriptor(1, "echo")];
-    let delta = CapTableDelta::new(&base, vec![], vec![descriptor(2, "stats")]);
+    let delta = CapTableDelta::new(&base, vec![], vec![descriptor(2, "stats")]).expect("delta");
     let envelope = Envelope::request(7, "echo", vec![]).with_cap_delta(delta.clone());
     let bytes = envelope.encode().expect("encode");
     let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
@@ -69,7 +69,7 @@ fn a_full_table_envelope_has_no_delta() {
 #[test]
 fn delta_additions_cannot_reuse_an_existing_id() {
     let base = vec![descriptor(1, "echo")];
-    let delta = CapTableDelta::new(&base, vec![], vec![descriptor(1, "ping")]);
+    let delta = CapTableDelta::new(&base, vec![], vec![descriptor(1, "ping")]).expect("delta");
     assert_eq!(
         delta.apply_to(&base).unwrap_err().code(),
         "rpc/capability-table"
@@ -79,7 +79,7 @@ fn delta_additions_cannot_reuse_an_existing_id() {
 #[test]
 fn delta_removals_are_order_independent_but_the_result_is_sorted() {
     let base = vec![descriptor(3, "c"), descriptor(1, "a"), descriptor(2, "b")];
-    let delta = CapTableDelta::new(&base, vec![CapId([2u8; 16])], vec![]);
+    let delta = CapTableDelta::new(&base, vec![CapId([2u8; 16])], vec![]).expect("delta");
     let applied = delta.apply_to(&base).expect("apply");
     let ids: Vec<CapId> = applied.iter().map(|cap| cap.id).collect();
     assert_eq!(ids, vec![CapId([1u8; 16]), CapId([3u8; 16])]);

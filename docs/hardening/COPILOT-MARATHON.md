@@ -16,7 +16,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 |----|---------|-------|-------|------------------------------------|---------|
 | R-01 | wire ARP1 | `src/wire.rs` | CLEAN | 6 fixed, 2 rejected, 0 open | this commit |
 | R-02 | kernel dispatch | `src/kernel.rs` | round 2: CLEAN for critical/high/medium | 16 fixed / 2 rejected / 2 low open (contract) | this commit |
-| R-03 | capabilities | `src/cap.rs` | round 1 in progress | — | — |
+| R-03 | capabilities | `src/cap.rs` | round 1: 20 fixed, 0 open | 20 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | pending | — | — |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | pending | — | — |
 | R-06 | budget | `src/budget.rs` | pending | — | — |
@@ -78,6 +78,49 @@ Carried (contract decisions, logged rather than half-fixed):
 |---|-----|--------|
 | 8b | low | `topics: None` means "any topic" and a grant with no publish method can publish; channel authority is ambient by design, so changing it needs an ADR |
 | 17 | low | `recv`/`recv_topic` ignore lane subscription; subscription is advisory today and the contract needs an ADR |
+
+### R-03 capabilities - 2026-11-01 (round 1)
+
+Reviewer: Copilot CLI routed to CommandCode DeepSeek V4.1 Flash, `xhigh`, with
+repository tool access. Tests: `tests/marathon_cap_tests.rs` (17); all 17 fail
+against the pre-fix tree, proved by stashing `src/` and adding only the API
+surface the tests name (no behavioural shim).
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | critical | path scope was checked only against the queued arguments, so a promise argument delivered a `Path` the scope never saw | **fixed**: dispatch re-walks the resolved arguments; `a_pipelined_argument_cannot_carry_a_path_outside_the_scope` (asserts the provider never runs) |
+| 2 | critical | the byte budget and the tool argument ceiling counted a promise as its 8-byte placeholder | **fixed**: dispatch measures the resolved arguments, refuses over the effective budget and the policy ceiling, and charges the difference to the capability, every ancestor and the lane before the provider runs; `a_pipelined_argument_is_charged_at_dispatch` |
+| 3 | critical | a policy-less parent accepted any child `ToolPolicy`, so attenuation could grant `allow_process` | **fixed**: `CapAttrs::effective_tool_policy` (own methods, own byte budget, no process) is the parent for the comparison, in the predicate and in `attenuate`; `attenuation_cannot_add_process_execution` |
+| 4 | high | a durable record revived a revoked capability | **fixed**: `CapRecord::record_id` (secret-derived, carried in the record) is tombstoned by `revoke` and refused by `restore_capability` with `rpc/revoked`; `a_revoked_durable_capability_cannot_be_restored` |
+| 5 | high | records were unauthenticated authority: whoever wrote the JSON could mint what it described | **fixed**: `Agent::set_record_seal_key` + keyed Blake3 seal over every field, constant-time check before any field is read; a kernel without a key exports and restores nothing; `an_edited_or_unsealed_record_is_refused` |
+| 6 | high | a child call did not consume the parent's budget, so delegation multiplied the grant | **fixed**: a call charges its whole lineage, checked first and then charged; publish does the same; `a_child_call_consumes_the_parent_budget` |
+| 7 | high | `parse_hex32` sliced a 64-**byte** string of multi-byte characters and panicked | **fixed**: ASCII is required before slicing; `a_non_ascii_record_field_is_refused_without_panicking` |
+| 8 | medium | `BudgetMeter::charge` compared with `saturating_add` and then added, so a byte count at the ceiling panicked in debug and wrapped in release | **fixed**: `checked_add` through `check`/`charge`, plus `check_bytes`/`charge_bytes` for dispatch; `a_meter_at_the_ceiling_never_wraps` |
+| 9 | medium | `HttpTool` took a path from `Value::Text` that starts with `/`, so the kernel's path scope never saw it | **fixed**: the adapter reads `Value::Path` only; `a_text_argument_is_not_an_http_path` |
+| 10 | medium | `to_active_budget` derived ceilings larger than the grant (`max_value_size * 4`) | **fixed**: derived ceilings are clamped to the grant; `evaluator_ceilings_never_exceed_the_grant` |
+| 11 | medium | `CapTableDelta::apply_to` had no table ceiling | **fixed**: `MAX_CAP_TABLE` (4096) with `rpc/capability-table`; `a_delta_cannot_grow_the_table_past_its_ceiling` |
+| 12 | medium | `retain`/`release` returned silently when the kernel was borrowed, so a handle dropped inside a provider notification lost its release | **fixed**: the operation is queued on a shared `Rc<RefCell<Vec<(CapId, bool)>>>` and applied at the next kernel borrow; `a_drop_inside_a_provider_notification_is_applied` |
+| 13 | low | `CapabilityRecord::attrs` dropped `bound_to`, so the natural restore path minted an unbound capability | **fixed**: the binding is carried; `record_attrs_preserves_the_binding` |
+| 14 | low | `export_capability` accepted an id-only (imported) handle | **fixed**: `CapHandle::is_owning` gates export; `export_from_an_imported_handle_is_refused` |
+| 15 | low | duplicate method names decoded to a smaller set and re-encoded differently | **fixed**: a duplicate is `rpc/capability-table`; `a_descriptor_is_canonical_or_refused` |
+| 16 | low | a descriptor with no methods was accepted by the wire and by `apply_to` | **fixed**: refused in both; `a_descriptor_is_canonical_or_refused` |
+| 17 | low | durable-policy refusals used `rpc/capability-table` (a hostile-peer fault) while export/restore used `rpc/persistence` | **fixed**: both are `rpc/persistence`; `tests/persistence_tests.rs` and the round-1 kernel test updated |
+| 18 | low | `CapHandle::into_id` leaked a reference and had no caller | **fixed**: removed |
+| 19 | low | the registry and the attenuation chain were unbounded, and `revoke` was quadratic | **fixed**: `MAX_CAPS` (65536), `MAX_LINEAGE_DEPTH` (64), and a single parent/lineage index per revoke; `the_registry_and_the_lineage_are_bounded` |
+| 20 | low | `cap_table_hash` asserted the encoding succeeded | **fixed**: it returns `Result`, so an unencodable table has no hash |
+
+Also closed in this round (found while fixing): `publish` charged only the
+payload, so a 1 KiB topic name rode through a 32-byte grant; it now charges
+topic bytes and the lineage (`tests/topic_tests.rs`,
+`a_publish_charges_the_capability_byte_budget`).
+
+Documented residual (the predicate is honest, the operation is strict): a child
+that omits the identity binding reports monotone because `attenuate` inherits
+the parent's binding. `CapAttrs::is_attenuation_of` now says so, and a caller
+validating foreign attributes must apply the binding itself.
+
+Gate: `cargo test --all-features` 401 passed, 0 failed; clippy clean on both
+feature sets; fmt clean.
 
 ### R-01 wire ARP1 — 2026-10-31
 

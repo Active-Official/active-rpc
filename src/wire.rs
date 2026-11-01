@@ -129,19 +129,32 @@ pub struct CapTableDelta {
 
 impl CapTableDelta {
     /// Build a delta against a base table.
-    pub fn new(base: &[CapDescriptor], removed: Vec<CapId>, added: Vec<CapDescriptor>) -> Self {
-        Self {
-            base: cap_table_hash(base),
+    pub fn new(
+        base: &[CapDescriptor],
+        removed: Vec<CapId>,
+        added: Vec<CapDescriptor>,
+    ) -> Result<Self> {
+        Ok(Self {
+            base: cap_table_hash(base)?,
             removed,
             added,
-        }
+        })
     }
 
     /// Apply to a base table after checking the base hash. Fail closed on an
     /// unknown base or a removal of an id that is not present.
     pub fn apply_to(&self, base: &[CapDescriptor]) -> Result<Vec<CapDescriptor>> {
-        if cap_table_hash(base) != self.base {
+        if cap_table_hash(base)? != self.base {
             return Err(Error::CapabilityTable("cap-table delta base mismatch"));
+        }
+        if base.len() < self.removed.len() {
+            return Err(Error::CapabilityTable("delta removes more than the base"));
+        }
+        let resulting = base.len() - self.removed.len() + self.added.len();
+        if resulting > MAX_CAP_TABLE {
+            return Err(Error::CapabilityTable(
+                "cap-table delta exceeds the table ceiling",
+            ));
         }
         for cap in &self.added {
             // The programmatic path must not admit something the wire path would
@@ -152,6 +165,9 @@ impl CapTableDelta {
                 .map_err(|_| Error::CapabilityTable("budget disables a ceiling"))?;
             if cap.id.0 == [0u8; 16] {
                 return Err(Error::CapabilityTable("zero capability id"));
+            }
+            if cap.methods.is_empty() {
+                return Err(Error::CapabilityTable("capability grants no methods"));
             }
         }
         // An added id that already exists in the *base* table is a replacement.
@@ -184,16 +200,20 @@ impl CapTableDelta {
     }
 }
 
+/// Largest capability table a delta may build.
+///
+/// The decoder bounds one envelope's additions and removals, but a connection
+/// keeps one table and applies every delta it receives: without a ceiling a
+/// peer could grow the negotiated table until memory runs out.
+pub const MAX_CAP_TABLE: usize = 4_096;
+
 /// Blake3 hash of the canonical capability table encoding.
-pub fn cap_table_hash(caps: &[CapDescriptor]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    // The table encoding cannot fail for a descriptor set that came from the
-    // decoder (counts and strings are already bounded), and a failure here must
-    // not silently hash the empty table: two different tables would collide on
-    // the delta base.
-    let encoded = encode_capability_table(caps).expect("capability table encodes");
-    out.copy_from_slice(blake3::hash(&encoded).as_bytes());
-    out
+///
+/// Fails closed: a table that cannot be encoded has no hash, so it can never
+/// collide with a real base and be accepted as a delta base by accident.
+pub fn cap_table_hash(caps: &[CapDescriptor]) -> Result<[u8; 32]> {
+    let encoded = encode_capability_table(caps)?;
+    Ok(*blake3::hash(&encoded).as_bytes())
 }
 
 /// One Active RPC envelope.
@@ -795,9 +815,20 @@ fn read_cap_inner(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<
     if count > max_methods {
         return Err(Error::CapabilityTable("too many methods"));
     }
+    if count == 0 {
+        // A descriptor that grants no method is not a capability; `mint` and
+        // `attenuate` refuse it, so the wire path must not admit one either.
+        return Err(Error::CapabilityTable("capability grants no methods"));
+    }
     let mut methods = BTreeSet::new();
     for _ in 0..count {
-        methods.insert(read_str(bytes, cursor, 256)?);
+        let method = read_str(bytes, cursor, 256)?;
+        if !methods.insert(method) {
+            // A duplicate would decode to a smaller set than the bytes encode,
+            // so re-encoding would not reproduce the frame and a delta base
+            // negotiated on raw bytes would diverge.
+            return Err(Error::CapabilityTable("duplicate method name"));
+        }
     }
     let budget = read_budget(bytes, cursor)?;
     budget

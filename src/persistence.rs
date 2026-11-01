@@ -57,11 +57,24 @@ pub struct CapabilityRecord {
     /// for the virtual round-trip clock. A bounded record is only meaningful in
     /// its own domain.
     pub wall_clock: bool,
+    /// Stable identity of the exported capability.
+    ///
+    /// A record is accepted only if its id was never tombstoned by a
+    /// revocation, so the id is authority-bearing metadata: it is derived from
+    /// the kernel secret and is not a capability by itself.
+    pub record_id: [u8; 32],
+    /// Keyed MAC over every other field, when the record was sealed.
+    ///
+    /// A record is a credential: whoever writes one can mint the authority it
+    /// describes. The seal binds the fields to a deployment key so a record
+    /// that was edited, truncated or fabricated is refused before it is
+    /// re-minted.
+    pub seal: Option<String>,
 }
 
 impl CapabilityRecord {
-    /// Render the record as JSON.
-    pub fn to_json(&self) -> String {
+    /// The record's fields as a JSON map, without the seal.
+    fn fields(&self) -> Map<String, Json> {
         let mut map = Map::new();
         map.insert("format".into(), RECORD_FORMAT.into());
         map.insert("provider".into(), self.provider.clone().into());
@@ -122,6 +135,51 @@ impl CapabilityRecord {
             },
         );
         map.insert("wall_clock".into(), self.wall_clock.into());
+        map.insert("record_id".into(), hex(&self.record_id).into());
+        map
+    }
+
+    /// The bytes a seal covers: every field, canonically ordered, no seal.
+    pub fn seal_material(&self) -> Vec<u8> {
+        Json::Object(self.fields()).to_string().into_bytes()
+    }
+
+    /// Seal the record with a deployment key.
+    pub fn seal_with(&mut self, key: &[u8; 32]) {
+        let digest = blake3::keyed_hash(key, &self.seal_material());
+        self.seal = Some(digest.to_hex().to_string());
+    }
+
+    /// True when the record carries a seal this key produced.
+    ///
+    /// The comparison is constant-time: an attacker who can submit records must
+    /// not learn the seal byte by byte from timing.
+    pub fn seal_is_valid(&self, key: &[u8; 32]) -> bool {
+        let Some(seal) = self.seal.as_deref() else {
+            return false;
+        };
+        if seal.len() != 64 {
+            return false;
+        }
+        let digest = blake3::keyed_hash(key, &self.seal_material());
+        let expected = digest.to_hex();
+        let mut difference = 0u8;
+        for (left, right) in seal.as_bytes().iter().zip(expected.as_bytes()) {
+            difference |= left ^ right;
+        }
+        difference == 0
+    }
+
+    /// Render the record as JSON.
+    pub fn to_json(&self) -> String {
+        let mut map = self.fields();
+        map.insert(
+            "seal".into(),
+            match &self.seal {
+                Some(seal) => seal.clone().into(),
+                None => Json::Null,
+            },
+        );
         Json::Object(map).to_string()
     }
 
@@ -230,6 +288,18 @@ impl CapabilityRecord {
             .get("wall_clock")
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let record_id = match value.get("record_id") {
+            Some(Json::String(text)) => parse_hex32(text)?,
+            _ => return Err(Error::persistence("missing record id")),
+        };
+        if record_id == [0u8; 32] {
+            return Err(Error::persistence("the record id is not a record id"));
+        }
+        let seal = match value.get("seal") {
+            None | Some(Json::Null) => None,
+            Some(Json::String(text)) if text.len() == 64 && text.is_ascii() => Some(text.clone()),
+            Some(_) => return Err(Error::persistence("the seal is malformed")),
+        };
         Ok(Self {
             provider: provider.to_string(),
             object,
@@ -243,6 +313,8 @@ impl CapabilityRecord {
             bound_to,
             expires_at,
             wall_clock,
+            record_id,
+            seal,
         })
     }
 
@@ -259,6 +331,7 @@ impl CapabilityRecord {
         attrs.path_scope = self.path_scope.clone();
         attrs.topics = self.topics.clone();
         attrs.tool_policy = self.tool_policy.clone();
+        attrs.bound_to = self.bound_to;
         attrs.persistence = CapPersistence::Durable;
         attrs.ttl_ms = ttl_ms;
         attrs
@@ -286,8 +359,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Parse 64 hex characters into 32 bytes.
+///
+/// ASCII is required before slicing: a 64-byte string of multi-byte characters
+/// would otherwise be cut inside a code point and panic. A record that arrives
+/// from a store or a peer must never turn a parse fault into a process fault.
 fn parse_hex32(text: &str) -> Result<[u8; 32]> {
-    if text.len() != 64 {
+    if text.len() != 64 || !text.is_ascii() {
         return Err(Error::persistence("fingerprint must be 64 hex characters"));
     }
     let mut out = [0u8; 32];

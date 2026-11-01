@@ -79,7 +79,7 @@ fn serve(listener: TcpListener, connections: usize, served: Arc<AtomicUsize>) {
                     served.fetch_add(1, Ordering::Relaxed);
                     Envelope::response(
                         envelope.request_id,
-                        Value::Module(cap_table_hash(&table).to_vec()),
+                        Value::Module(cap_table_hash(&table).expect("hash").to_vec()),
                     )
                 }
                 Err(error) => Envelope::error(envelope.request_id, &error),
@@ -105,7 +105,7 @@ fn concurrent_negotiators_agree_with_the_peer_on_every_step() {
             let mut table = base_table();
             for step in 0..STEPS {
                 let (removed, added) = plan(negotiator as u64 + 1, step, &table);
-                let delta = CapTableDelta::new(&table, removed, added);
+                let delta = CapTableDelta::new(&table, removed, added).expect("delta");
                 let expected = delta.apply_to(&table).expect("client-side apply");
                 let request = Envelope::request(step as u64, "negotiate", vec![Arg::text("t")])
                     .with_cap_delta(delta.clone());
@@ -113,7 +113,9 @@ fn concurrent_negotiators_agree_with_the_peer_on_every_step() {
                 let response = transport.recv().expect("recv").expect("response");
                 assert_eq!(
                     response.first_value(),
-                    Some(&Value::Module(cap_table_hash(&expected).to_vec())),
+                    Some(&Value::Module(
+                        cap_table_hash(&expected).expect("hash").to_vec()
+                    )),
                     "negotiator {negotiator} step {step}: the peer applied a different table"
                 );
                 // The base is never modified in place.
@@ -153,7 +155,7 @@ fn a_stale_base_is_refused_under_concurrency() {
     let mut transport = TcpTransport::connect(&address).expect("connect");
     let base = base_table();
     // One good delta moves the server's table.
-    let first = CapTableDelta::new(&base, vec![], vec![descriptor(90, "stats")]);
+    let first = CapTableDelta::new(&base, vec![], vec![descriptor(90, "stats")]).expect("delta");
     let request = Envelope::request(1, "negotiate", vec![]).with_cap_delta(first.clone());
     transport.send(&request).expect("send");
     let response = transport.recv().expect("recv").expect("response");

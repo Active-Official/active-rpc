@@ -137,7 +137,7 @@ fn disabling_durable_refuses_attenuation_and_export() {
     let error = agent
         .attenuate(&durable, CapAttrs::new(&["echo"]).durable())
         .expect_err("durable attenuation is refused by policy");
-    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
     let error = agent
         .export_capability(&durable)
         .expect_err("export is refused by policy");
@@ -233,7 +233,7 @@ fn a_delta_cannot_replace_an_id_with_a_wider_descriptor() {
     };
     let added = vec![CapDescriptor::from_attrs(cap.id(), &wider)];
     let delta = CapTableDelta {
-        base: active_rpc::wire::cap_table_hash(&base),
+        base: active_rpc::wire::cap_table_hash(&base).expect("hash"),
         removed: vec![cap.id()],
         added,
     };

@@ -43,9 +43,20 @@ capability id at rest (it is a bearer token).
 
 - The registry is the authority: a wire descriptor never grants anything.
 - Attenuation is monotone; any widening is `rpc/attenuation-escalation`.
-- Budget is charged per call and intersects capability with lane.
+- Budget is charged per call and intersects capability with lane. A call also
+  charges every ancestor's meter, so a delegation tree cannot multiply its
+  grant, and a promise argument that resolves larger than its placeholder pays
+  the difference before the provider runs.
+- A capability without an explicit tool policy still bounds the tool surface:
+  its own methods, at most its byte budget, and never a local process. A child
+  policy is compared against that effective policy, so "adding a policy" cannot
+  grant process execution.
+- Durable records are credentials: a record is accepted only if its seal
+  verifies under the deployment key, and a revoked capability's record id is
+  tombstoned so an earlier export cannot revive it (ADR-0010).
 - Secret material is represented by `Value::Secret`, never by bytes.
-- Every frame is bounded and rejected at the boundary.
+- Every frame is bounded and rejected at the boundary; the capability registry,
+  the attenuation chain depth and a negotiated capability table have ceilings.
 - `#![forbid(unsafe_code)]`.
 
 ### Authority domain

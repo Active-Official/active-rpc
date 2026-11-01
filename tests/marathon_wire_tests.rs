@@ -96,7 +96,7 @@ fn a_read_only_flag_that_is_not_zero_or_one_is_a_table_fault() {
 fn a_delta_addition_with_a_zero_budget_is_refused() {
     let base: Vec<CapDescriptor> = Vec::new();
     let delta = CapTableDelta {
-        base: cap_table_hash(&base),
+        base: cap_table_hash(&base).expect("hash"),
         removed: Vec::new(),
         added: vec![CapDescriptor {
             id: CapId([3u8; 16]),

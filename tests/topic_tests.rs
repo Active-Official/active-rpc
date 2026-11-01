@@ -356,7 +356,7 @@ fn a_capability_bound_to_a_peer_publishes_only_through_that_peer() {
 fn a_publish_charges_the_capability_byte_budget() {
     let fixture = fixture();
     let mut attrs = CapAttrs::new(&["echo"]);
-    attrs.budget.max_bytes = 8;
+    attrs.budget.max_bytes = 16;
     let cap = cap(&fixture, attrs);
     let channel = fixture
         .agent
@@ -380,6 +380,17 @@ fn a_publish_charges_the_capability_byte_budget() {
         .recv_topic(channel, "news")
         .expect("recv")
         .is_none());
+
+    // The topic name is payload too: a short value under a long topic still
+    // has to fit the same grant.
+    let mut small_attrs = CapAttrs::new(&["echo"]);
+    small_attrs.budget.max_bytes = 8;
+    let small = self::cap(&fixture, small_attrs);
+    let error = fixture
+        .agent
+        .publish(fixture.lane, channel, &small, "a-long-topic-name", Value::text("x"))
+        .expect_err("the topic name is charged");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
 
     // A payload inside the ceiling is charged and published.
     fixture

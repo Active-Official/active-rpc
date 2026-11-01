@@ -43,9 +43,24 @@ not have to invent a format.
 `CapabilityRecord` (`active-rpc/capability-record/1`) is the authority metadata
 of a durable capability: provider name, object, methods, budget, read-only,
 redaction, path scope, topics, tool policy, binding and absolute deadline. It
-carries **no id and no secret**; ids derive from the kernel secret and mean
-nothing elsewhere. `Agent::export_capability` exports only a live `Durable`
-capability and refuses an ephemeral one.
+carries no capability id and no secret; ids derive from the kernel secret and
+mean nothing elsewhere. `Agent::export_capability` exports only a live `Durable`
+capability, only through the handle that owns it, and refuses an ephemeral one.
+
+Two fields make the record a credential rather than a suggestion:
+
+- `record_id` is a secret-derived identity for the capability. It survives an
+  export/restore round trip inside one authority domain and is what a
+  revocation tombstones: `revoke` inserts the record id of every capability in
+  the doomed subtree, and `restore_capability` refuses a tombstoned id with
+  `rpc/revoked`. A record exported before the revocation therefore cannot
+  revive the authority.
+- `seal` is a keyed Blake3 MAC over every other field, keyed by the deployment
+  key set with `Agent::set_record_seal_key`. Without a key the kernel exports
+  and restores nothing (`rpc/persistence`). With one, an edited, fabricated or
+  foreign record fails the check before any field is read, and the comparison
+  is constant-time. The key must be deployment-provided: a per-process kernel
+  secret cannot verify a record written by another process.
 
 ### Restore
 
@@ -59,15 +74,17 @@ resurrection:
   a record bound to another peer is refused with `rpc/identity`.
 
 Restore is refused (`rpc/persistence`) unless the agent enabled durable
-capabilities and the provider is registered, and refused once the deadline has
-passed.
+capabilities, a seal key is configured and the seal verifies, and the provider
+is registered. A tombstoned record id is `rpc/revoked`. A record whose deadline
+has passed is refused, and so is one whose clock mode differs from the restoring
+kernel's (ADR-0015).
 
 ### Why this is safe
 
 A record alone is not authority: using it requires a deployment that opted into
-durable capabilities *and* a transport that admitted the peer the restore names.
-The record is metadata, so it can be stored in a configuration system; it must
-still be protected like an ACL file, because it describes exactly what an
+durable capabilities, holds the seal key, and admitted the peer the restore
+names. The record is metadata, so it can be stored in a configuration system; it
+must still be protected like an ACL file, because it describes exactly what an
 admitted peer may do.
 
 ### Evidence

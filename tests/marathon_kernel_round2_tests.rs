@@ -100,6 +100,7 @@ fn a_cross_provider_pipeline_settles() {
 fn a_wall_clock_record_does_not_restore_unbounded_in_virtual_mode() {
     let source = Agent::with_secret([0x6c; 32]);
     source.set_durable_capabilities(true);
+    source.set_record_seal_key([0x9c; 32]);
     source.use_wall_clock(true);
     let provider = source.register(Box::new(Echo));
     let mut attrs = CapAttrs::new(&["echo"]).durable();
@@ -109,6 +110,7 @@ fn a_wall_clock_record_does_not_restore_unbounded_in_virtual_mode() {
 
     let target = Agent::with_secret([0x6d; 32]);
     target.set_durable_capabilities(true);
+    target.set_record_seal_key([0x9c; 32]);
     target.register(Box::new(Echo));
     let peer = admitted(b"peer");
     let error = target
@@ -255,6 +257,7 @@ fn on_drop_is_delivered_when_a_provider_releases_during_its_own_call() {
 fn restore_refuses_an_ambiguous_provider_name() {
     let source = Agent::with_secret([0x70; 32]);
     source.set_durable_capabilities(true);
+    source.set_record_seal_key([0x9d; 32]);
     let provider = source.register(Box::new(Echo));
     let cap = source
         .mint(provider, 0, CapAttrs::new(&["echo"]).durable())
@@ -263,6 +266,7 @@ fn restore_refuses_an_ambiguous_provider_name() {
 
     let target = Agent::with_secret([0x71; 32]);
     target.set_durable_capabilities(true);
+    target.set_record_seal_key([0x9d; 32]);
     target.register(Box::new(Echo));
     target.register(Box::new(Echo)); // same name
     let peer = admitted(b"peer");
@@ -277,6 +281,7 @@ fn restore_refuses_an_ambiguous_provider_name() {
 fn a_record_carries_its_clock_mode() {
     let source = Agent::with_secret([0x72; 32]);
     source.set_durable_capabilities(true);
+    source.set_record_seal_key([0x9e; 32]);
     source.use_wall_clock(true);
     let provider = source.register(Box::new(Echo));
     let cap = source
