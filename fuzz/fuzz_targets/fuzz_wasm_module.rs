@@ -1,0 +1,74 @@
+#![no_main]
+
+//! The WebAssembly sandbox: arbitrary module bytes must be refused or run under
+//! the ceilings, never panic, never abort and never stall the host.
+//!
+//! Invariants under test:
+//!
+//! 1. `from_bytes_with_policy` is total over arbitrary bytes: it returns a tool
+//!    or a `wasm/...` refusal, never a panic or an unbounded compile.
+//! 2. A tool the constructor accepted either runs under the limits and returns
+//!    bounded output, or refuses with a `wasm/...` code. A huge declared table
+//!    or memory is a refusal, not an allocation.
+//! 3. The host log is per call: a refusal leaves it empty.
+//!
+//! Run with `cargo +nightly fuzz run fuzz_wasm_module -- -runs=200000`.
+
+use libfuzzer_sys::fuzz_target;
+
+use active_rpc::wasm_tool::{WasmHostPolicy, WasmLimits, WasmTool};
+
+/// Small ceilings keep one execution cheap: the point is the parser and the
+/// sandbox, not a long-running guest.
+const LIMITS: WasmLimits = WasmLimits {
+    fuel: 50_000,
+    max_memory_bytes: 2 * 65_536,
+    max_output_bytes: 65_536,
+    max_table_elements: 256,
+};
+
+fn policy() -> WasmHostPolicy {
+    WasmHostPolicy {
+        clock: true,
+        random: true,
+        log: true,
+        max_log_bytes: 64,
+        accept_wat: false,
+    }
+}
+
+fuzz_target!(|data: &[u8]| {
+    // A module over this size is refused by the ceiling before compiling, and a
+    // bigger input would only slow the campaign down.
+    if data.is_empty() || data.len() > 64 * 1024 {
+        return;
+    }
+    match WasmTool::from_bytes_with_policy(data, LIMITS, policy()) {
+        Ok(mut tool) => {
+            let input = &data[..data.len().min(1024)];
+            match tool.call(input) {
+                Ok(output) => assert!(
+                    output.len() <= LIMITS.max_output_bytes,
+                    "the sandbox returned more output than its ceiling"
+                ),
+                Err(error) => assert!(
+                    error.code().starts_with("rpc/"),
+                    "an unexpected error class: {error}"
+                ),
+            }
+            // The clock is seeded by the embedder, so a granted clock never
+            // reaches the operating system.
+            tool.set_time_ms(1);
+            let _ = tool.call(input);
+        }
+        Err(error) => {
+            // Every construction refusal is a provider-coded `wasm/...` error.
+            assert_eq!(error.code(), "rpc/provider", "unexpected: {error}");
+            let text = error.to_string();
+            assert!(
+                text.contains("wasm/"),
+                "a construction refusal must name its wasm code: {text}"
+            );
+        }
+    }
+});

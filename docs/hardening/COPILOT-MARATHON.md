@@ -27,7 +27,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
 | R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-3: 13 + 16 + 19 findings | 48 fixed / 0 rejected / 0 open | this commit |
-| R-14 | wasm tools | `src/wasm_tool.rs` | pending | — | — |
+| R-14 | wasm tools | `src/wasm_tool.rs` | round 1: 1 critical + 3 highs + 5 mediums + 6 lows fixed | 15 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | pending | — | — |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | pending | — | — |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | pending | — | — |
@@ -194,6 +194,38 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-14 wasm tools - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0448410`,
+with probes run against the real module. One critical, three highs, five
+mediums, six lows. The critical is the first finding in this program that a
+`catch_unwind` could not contain: a 130-byte module asked for 1.6 GB of table
+and the allocator aborted the process.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| W1 | critical | table elements were unbounded (`StoreLimits` default), so a tiny module forces a tens-of-GB allocation and Rust aborts the host | **fixed**: `WasmLimits::max_table_elements` (default 1 024, ceiling 65 536) is set on the limiter and validated; `a_module_with_a_huge_table_is_refused_without_allocating_it` (refused in < 2 s, not allocated) |
+| W2 | high | a guest-sized linear memory was allocated unmetered at instantiate (256 MiB in 3.3 s at ~0 fuel), and the ceiling allowed 1 GiB | **fixed**: the memory ceiling drops to 256 MiB, the store limiter refuses a larger declared memory, and the refusal is classified `wasm/limits`; `a_memory_beyond_the_limit_fails_to_instantiate` |
+| W3 | high | no wall or byte budget reached the adapter; `MAX_FUEL` allowed minutes of interpretation under any grant | **fixed**: the call's `max_wall_ms` buys `FUEL_PER_MS` (5 000) fuel and the smaller of the two applies; `MAX_FUEL` drops to 1e9; `a_wall_budget_bounds_the_fuel_a_guest_may_burn` |
+| W4 | high | host imports were fixed per tool instance, so any `run` grant inherited clock/random/log and a `read_only` grant ran guest code | **fixed for what a capability can express**: `mutating` is now `true`, so a read-only grant is refused; per-capability import attenuation is recorded as the accepted design of ADR-0019 (the policy is the embedder's, per instance) |
+| W5 | medium | `env.clock_ms` read `SystemTime` behind the kernel's back: a covert channel and a replay-determinism hole | **fixed**: the guest reads `Call::now_ms` (new field, the kernel's clock); an embedder outside the kernel seeds `set_time_ms`; `a_granted_clock_import_reports_the_embedder_clock`, `a_guest_reads_the_kernel_clock_through_the_kernel` |
+| W6 | medium | the import allow-list matched name only, not kind or signature | **fixed**: `ExternType::Func` with the exact `FuncType`; `an_import_with_the_right_name_but_the_wrong_kind_is_refused` |
+| W7 | medium | out-of-fuel during `start` was reported as `wasm/instantiate` | **fixed**: `classify_instantiation` (fuel, import, limits, instantiate); `a_start_function_out_of_fuel_is_a_fuel_refusal` |
+| W8 | medium | a non-text argument was dropped and the guest ran on empty input, reporting success | **fixed**: exactly one text/module argument, no payload; `a_call_must_carry_exactly_one_text_or_module_argument` |
+| W9 | medium | no fuzz target reached the sandbox | **fixed**: `fuzz_wasm_module` (4000 runs, 155 units, 67 MB RSS, no crash) with valid binary seeds, in all three workflow lists |
+| W10 | low | a refused call handed back the previous call's log | **fixed**: `call` clears the log first and `invoke` keeps a trap's log; `a_refused_call_leaves_no_log_from_an_earlier_one` |
+| W11 | low | binary output was converted with `from_utf8_lossy`, reporting success on mangled bytes | **fixed**: valid UTF-8 stays text, anything else travels as a module value; `binary_output_travels_as_a_module_value` |
+| W12 | low | `mutating` returned `false` while `invoke` mutated provider state | **fixed** (see W4) |
+| W13 | low | `used + len` could wrap on a 32-bit host | **fixed**: `saturating_add` |
+| W14 | low | WebAssembly text was accepted as module bytes, and compilation is unmetered | **fixed**: the `\0asm` magic is required unless `accept_wat`; tests assemble their fixtures with the `wat` dev-dependency; `a_text_module_is_refused_by_default` |
+| W15 | low | the ADR error table omitted `wasm/limits` and the text rule | **fixed**: the table and the limits section are current |
+
+Gate: `cargo test --all-features` 583 passed, 0 failed across 66 suites;
+`--no-default-features` 523 passed, 0 failed; clippy, fmt and
+`cargo doc -D warnings` clean on both feature sets; `tests/wasm_tool_tests.rs`
+24 and `tests/wasm_hardening_tests.rs` 10 (new); `fuzz_wasm_module` 4000 runs,
+155 units, 67 MB, no crash.
 
 ### R-13 receipts - 2026-11-01 (round 3)
 

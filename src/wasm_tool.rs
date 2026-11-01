@@ -21,7 +21,9 @@ use crate::error::{Error, Result};
 use crate::kernel::Provider;
 use crate::value::{Arg, Call, Response, Value};
 
-use wasmi::{Config, Engine, Linker, Module, Store, StoreLimitsBuilder};
+use wasmi::{
+    Config, Engine, ExternType, FuncType, Linker, Module, Store, StoreLimitsBuilder, ValType,
+};
 
 /// Input area: the host writes the call argument here.
 pub const INPUT_OFFSET: usize = 0;
@@ -36,14 +38,35 @@ pub const OUTPUT_OFFSET: usize = 64 * 1024;
 pub const MAX_MODULE_BYTES: usize = 1 << 20;
 
 /// Largest fuel budget a caller may configure.
-pub const MAX_FUEL: u64 = 10_000_000_000;
+///
+/// At roughly 4 000 fuel per millisecond of interpreted work on a developer
+/// machine, this is a few minutes of CPU: enough for a heavy batch tool, far
+/// below "a call that never returns". A capability's wall budget
+/// (`Call::budget.max_wall_ms`) tightens it per call.
+pub const MAX_FUEL: u64 = 1_000_000_000;
+
+/// Fuel a guest may burn per millisecond of its wall budget.
+///
+/// The interpreter costs roughly 4 000 fuel per millisecond of debug-build work,
+/// so this rate makes a wall budget binding (a 100 ms grant buys 500 000 fuel)
+/// without throttling a fast guest. It is a proportional ceiling, not a
+/// deadline: a guest that never executes an instruction cannot exceed it, and
+/// the interpreter cannot outrun it by more than the measurement error.
+pub const FUEL_PER_MS: u64 = 5_000;
+
+/// Largest table a guest may declare or grow to, in elements.
+///
+/// A table element is a 16-byte slot, so a 1 MiB ceiling is 16 MiB of host
+/// memory; without a ceiling a 140-byte module can ask for tens of gigabytes,
+/// and a failed allocation aborts the process instead of returning an error.
+pub const MAX_TABLE_ELEMENTS: usize = 1 << 16;
 
 /// Smallest linear memory a caller may configure: enough for the input and
 /// output areas.
 pub const MIN_MEMORY_BYTES: usize = 2 * OUTPUT_OFFSET;
 
 /// Largest linear memory a caller may configure.
-pub const MAX_MEMORY_BYTES: usize = 1 << 30;
+pub const MAX_MEMORY_BYTES: usize = 256 << 20;
 
 /// Recursion ceiling imposed on the engine, independent of the fuel budget.
 const MAX_RECURSION_DEPTH: usize = 1_024;
@@ -60,6 +83,8 @@ pub struct WasmLimits {
     pub max_memory_bytes: usize,
     /// Maximum output the guest may return, in bytes.
     pub max_output_bytes: usize,
+    /// Maximum table the guest may declare or grow to, in elements.
+    pub max_table_elements: usize,
 }
 
 impl Default for WasmLimits {
@@ -68,6 +93,7 @@ impl Default for WasmLimits {
             fuel: 1_000_000,
             max_memory_bytes: 16 << 20,
             max_output_bytes: 64 << 10,
+            max_table_elements: 1_024,
         }
     }
 }
@@ -81,7 +107,7 @@ impl Default for WasmLimits {
 /// tool runs at all through the capability that points at it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WasmHostPolicy {
-    /// `env.clock_ms() -> i64`: milliseconds since the Unix epoch.
+    /// `env.clock_ms() -> i64`: milliseconds from the kernel's clock.
     pub clock: bool,
     /// `env.random(ptr, len) -> i32`: fills guest memory from the OS CSPRNG.
     pub random: bool,
@@ -89,6 +115,13 @@ pub struct WasmHostPolicy {
     pub log: bool,
     /// Largest log a guest may produce in one call, in bytes.
     pub max_log_bytes: usize,
+    /// Accept WebAssembly *text* as well as binary.
+    ///
+    /// Off by default: a 1 MiB text module can expand into far more compiled
+    /// code than 1 MiB, and compilation happens before any fuel is charged. An
+    /// embedder that compiles its own hand-written tools can turn it on for
+    /// those, and must never turn it on for bytes from a peer.
+    pub accept_wat: bool,
 }
 
 /// Largest log a guest may emit in one call, whatever the policy asks for.
@@ -112,6 +145,12 @@ pub struct WasmTool {
     host: WasmHostPolicy,
     /// Host log captured from the most recent call.
     log: Vec<u8>,
+    /// Time the guest sees when the clock import is granted.
+    ///
+    /// Seeded by the embedder: the kernel passes `Call::now_ms`, so the guest
+    /// follows the kernel's clock policy (virtual by default). A tool driven
+    /// outside the kernel sees 0 until it calls [`WasmTool::set_time_ms`].
+    now_ms: u64,
 }
 
 impl WasmTool {
@@ -137,6 +176,12 @@ impl WasmTool {
         if bytes.is_empty() || bytes.len() > MAX_MODULE_BYTES {
             return Err(provider("wasm/module"));
         }
+        // Text modules expand far beyond their own size during compilation, and
+        // compilation happens before any fuel exists. Only an embedder that
+        // compiles its own tools may feed text.
+        if !host.accept_wat && !bytes.starts_with(b"\0asm") {
+            return Err(provider("wasm/module"));
+        }
         if limits.fuel == 0 || limits.fuel > MAX_FUEL {
             return Err(provider("wasm/limits"));
         }
@@ -145,6 +190,9 @@ impl WasmTool {
             return Err(provider("wasm/limits"));
         }
         if limits.max_output_bytes == 0 || limits.max_output_bytes > OUTPUT_OFFSET {
+            return Err(provider("wasm/limits"));
+        }
+        if limits.max_table_elements == 0 || limits.max_table_elements > MAX_TABLE_ELEMENTS {
             return Err(provider("wasm/limits"));
         }
         if host.max_log_bytes > MAX_HOST_LOG {
@@ -161,15 +209,24 @@ impl WasmTool {
         config.set_max_stack_height(MAX_STACK_BYTES);
         let engine = Engine::new(&config);
         let module = Module::new(&engine, bytes).map_err(|_| provider("wasm/module"))?;
+        // The policy is about *functions*: an import with a granted name but the
+        // wrong kind or signature is not a granted import, and accepting it
+        // would rest the guarantee on the linker's own resolution instead of on
+        // this check.
         for import in module.imports() {
-            let allowed = match (import.module(), import.name()) {
-                ("env", "clock_ms") => host.clock,
-                ("env", "random") => host.random,
-                ("env", "log") => host.log,
-                _ => false,
+            let expected = match (import.module(), import.name()) {
+                ("env", "clock_ms") if host.clock => Some(FuncType::new([], [ValType::I64])),
+                ("env", "random") if host.random => {
+                    Some(FuncType::new([ValType::I32, ValType::I32], [ValType::I32]))
+                }
+                ("env", "log") if host.log => {
+                    Some(FuncType::new([ValType::I32, ValType::I32], [ValType::I32]))
+                }
+                _ => None,
             };
-            if !allowed {
-                return Err(provider("wasm/import"));
+            match (expected, import.ty()) {
+                (Some(expected), ExternType::Func(actual)) if actual == &expected => {}
+                _ => return Err(provider("wasm/import")),
             }
         }
         Ok(WasmTool {
@@ -178,7 +235,22 @@ impl WasmTool {
             limits,
             host,
             log: Vec::new(),
+            now_ms: 0,
         })
+    }
+
+    /// Seed the time the clock import reports.
+    ///
+    /// The kernel does this per call from `Call::now_ms`; an embedder that runs
+    /// a tool outside the kernel sets it explicitly, so the guest never reads
+    /// the operating system's clock behind the kernel's back.
+    pub fn set_time_ms(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    /// The time the clock import currently reports.
+    pub fn time_ms(&self) -> u64 {
+        self.now_ms
     }
 
     /// The limits this tool enforces.
@@ -203,11 +275,16 @@ impl WasmTool {
 
     /// Run the guest on `input` and return its output.
     pub fn call(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+        // Every refusal below must leave no log behind: `log()` is documented as
+        // this call's evidence, and a stale buffer would attribute one caller's
+        // bytes to another caller's failed call.
+        self.log.clear();
         if input.len() > OUTPUT_OFFSET {
             return Err(provider("wasm/input"));
         }
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.limits.max_memory_bytes)
+            .table_elements(self.limits.max_table_elements)
             .instances(1)
             .memories(1)
             .tables(4)
@@ -224,13 +301,13 @@ impl WasmTool {
             .map_err(|_| provider("wasm/fuel"))?;
         let mut linker = Linker::new(&self.engine);
         if self.host.clock {
+            // The kernel's clock, not the operating system's: a guest that can
+            // read real time breaks replay determinism and gets a covert channel
+            // the kernel claims not to have. The embedder seeds it
+            // (`set_time_ms`, or `Call::now_ms` through the kernel).
+            let now = self.now_ms as i64;
             linker
-                .func_wrap("env", "clock_ms", || -> i64 {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|elapsed| elapsed.as_millis() as i64)
-                        .unwrap_or(0)
-                })
+                .func_wrap("env", "clock_ms", move || -> i64 { now })
                 .map_err(|_| provider("wasm/import"))?;
         }
         if self.host.random {
@@ -274,7 +351,9 @@ impl WasmTool {
                     |mut caller: wasmi::Caller<'_, HostState>, ptr: u32, len: u32| -> i32 {
                         let cap = caller.data().max_log;
                         let used = caller.data().log.len();
-                        if used + len as usize > cap {
+                        // Saturating: a hostile 32-bit `len` must not wrap the
+                        // comparison into a pass.
+                        if used.saturating_add(len as usize) > cap {
                             return -1;
                         }
                         let Some(memory) = caller
@@ -300,7 +379,7 @@ impl WasmTool {
         }
         let instance = linker
             .instantiate_and_start(&mut store, &self.module)
-            .map_err(|_| provider("wasm/instantiate"))?;
+            .map_err(classify_instantiation)?;
         let memory = instance
             .get_memory(&store, "memory")
             .ok_or_else(|| provider("wasm/memory"))?;
@@ -364,9 +443,10 @@ impl Provider for WasmTool {
     }
 
     fn mutating(&self, _method: &str) -> bool {
-        // The declared host functions are read-only: a clock reading, CSPRNG
-        // bytes and a per-call log buffer. A guest cannot change host state.
-        false
+        // A run mutates this tool: the guest log is provider state and a guest
+        // can spend fuel, allocate memory and read a clock. Reporting "no" would
+        // let a read-only capability run third-party code.
+        true
     }
 
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
@@ -375,26 +455,102 @@ impl Provider for WasmTool {
                 method: call.method.clone(),
             });
         }
-        let input = call
-            .args
-            .iter()
-            .find_map(|arg| match arg {
+        // Exactly one input, and nothing else: dropping arguments silently would
+        // let a caller believe the guest processed data it never saw, and a
+        // payload this adapter does not consume must not disappear either.
+        if !call.payload.is_empty() {
+            return Err(Error::InvalidArgument(
+                "the wasm adapter reads its input from a single argument, not a payload",
+            ));
+        }
+        let mut input = None;
+        for arg in &call.args {
+            let bytes = match arg {
                 Arg::Value(Value::Text(text)) => Some(text.as_bytes().to_vec()),
                 Arg::Value(Value::Module(bytes)) => Some(bytes.clone()),
                 _ => None,
-            })
-            .unwrap_or_default();
-        let output = self.call(&input)?;
-        // ABI v1 treats the guest output as text. Binary results should travel
-        // as a module value in a future version.
-        Ok(Response::Value(Value::Text(
-            String::from_utf8_lossy(&output).into_owned(),
-        )))
+            };
+            if input.is_some() || bytes.is_none() {
+                return Err(Error::InvalidArgument(
+                    "the wasm adapter takes exactly one text or module argument",
+                ));
+            }
+            input = bytes;
+        }
+        let Some(input) = input else {
+            return Err(Error::InvalidArgument(
+                "the wasm adapter takes exactly one text or module argument",
+            ));
+        };
+
+        // The call's wall budget bounds the guest: fuel is a proxy for CPU time,
+        // and a capability that granted 100 ms must not buy minutes of
+        // interpretation because the tool's default fuel is generous.
+        let granted = call.budget.max_wall_ms.saturating_mul(FUEL_PER_MS);
+        let fuel = self.limits.fuel.min(granted);
+        if fuel == 0 {
+            return Err(Error::BudgetExceeded("wall"));
+        }
+        let mut limits = self.limits;
+        limits.fuel = fuel;
+        let mut tool = WasmTool {
+            engine: self.engine.clone(),
+            module: self.module.clone(),
+            limits,
+            host: self.host,
+            log: Vec::new(),
+            now_ms: call.now_ms,
+        };
+        let result = tool.call(&input);
+        // Keep the guest's log even when the call was refused: a trap is exactly
+        // when its diagnostics matter, and `call` cleared the buffer first so it
+        // can only hold this call's bytes.
+        self.log = std::mem::take(&mut tool.log);
+        let output = result?;
+        // Guest output is bytes: a lossy UTF-8 conversion would hand the caller
+        // text the guest never produced. Binary results travel as a module value.
+        if std::str::from_utf8(&output).is_ok() {
+            Ok(Response::Value(Value::Text(
+                String::from_utf8(output).expect("checked above"),
+            )))
+        } else {
+            Ok(Response::Module(output))
+        }
     }
 }
 
 fn provider(code: &str) -> Error {
     Error::Provider {
         code: code.to_string(),
+    }
+}
+
+/// Classify an instantiation failure.
+///
+/// The `start` function runs out of the same fuel pool as `run`, so an
+/// out-of-fuel trap there is a budget refusal, not a malformed module; a link
+/// or type failure is an import-policy refusal; a resource-limit refusal is a
+/// limits refusal. Anything else stays `wasm/instantiate`.
+fn classify_instantiation(error: wasmi::Error) -> Error {
+    let out_of_fuel = error.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel)
+        || matches!(error.kind(), wasmi::errors::ErrorKind::Fuel(_));
+    if out_of_fuel {
+        return provider("wasm/fuel");
+    }
+    match error.kind() {
+        wasmi::errors::ErrorKind::Linker(_) => provider("wasm/import"),
+        wasmi::errors::ErrorKind::Instantiation(
+            wasmi::errors::InstantiationError::TooManyInstances
+            | wasmi::errors::InstantiationError::TooManyTables
+            | wasmi::errors::InstantiationError::TooManyMemories
+            | wasmi::errors::InstantiationError::FailedToInstantiateMemory(_)
+            | wasmi::errors::InstantiationError::FailedToInstantiateTable(_)
+            | wasmi::errors::InstantiationError::ElementSegmentDoesNotFit { .. },
+        ) => provider("wasm/limits"),
+        wasmi::errors::ErrorKind::Memory(_) | wasmi::errors::ErrorKind::Table(_) => {
+            provider("wasm/limits")
+        }
+        wasmi::errors::ErrorKind::Instantiation(_) => provider("wasm/import"),
+        _ => provider("wasm/instantiate"),
     }
 }

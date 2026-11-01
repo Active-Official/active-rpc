@@ -68,6 +68,15 @@ const BIG_OUTPUT: &str = r#"
     i32.const 70000))
 "#;
 
+/// Compile a WAT fixture into the binary form a peer would send.
+///
+/// The sandbox refuses WebAssembly *text* by default (a 1 MiB text module can
+/// expand into far more compiled code than 1 MiB), so every fixture goes through
+/// the assembler first; `a_text_module_is_refused_by_default` pins that rule.
+fn binary(wat: &str) -> Vec<u8> {
+    wat::parse_str(wat).expect("the fixture is valid WAT")
+}
+
 fn error_code(result: active_rpc::Result<impl std::fmt::Debug>) -> String {
     match result {
         Ok(value) => panic!("the guest was accepted: {value:?}"),
@@ -78,14 +87,13 @@ fn error_code(result: active_rpc::Result<impl std::fmt::Debug>) -> String {
 
 #[test]
 fn a_guest_runs_and_returns_no_output() {
-    let mut tool =
-        WasmTool::from_bytes(CONSTANT.as_bytes(), WasmLimits::default()).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
     assert!(tool.call(b"ignored").expect("run").is_empty());
 }
 
 #[test]
 fn a_guest_round_trips_its_input_through_memory() {
-    let mut tool = WasmTool::from_bytes(ECHO.as_bytes(), WasmLimits::default()).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(ECHO), WasmLimits::default()).expect("compile");
     assert_eq!(tool.call(b"hello").expect("run"), b"hello");
     assert_eq!(tool.call(b"").expect("empty"), b"");
 }
@@ -96,19 +104,19 @@ fn fuel_exhaustion_is_refused_with_its_own_code() {
         fuel: 10_000,
         ..WasmLimits::default()
     };
-    let mut tool = WasmTool::from_bytes(BURN.as_bytes(), limits).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(BURN), limits).expect("compile");
     assert_eq!(error_code(tool.call(b"")), "wasm/fuel");
 }
 
 #[test]
 fn a_trap_is_refused_with_its_own_code() {
-    let mut tool = WasmTool::from_bytes(TRAP.as_bytes(), WasmLimits::default()).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(TRAP), WasmLimits::default()).expect("compile");
     assert_eq!(error_code(tool.call(b"")), "wasm/trap");
 }
 
 #[test]
 fn a_guest_with_host_imports_is_refused_before_it_runs() {
-    let error = WasmTool::from_bytes(IMPORT.as_bytes(), WasmLimits::default())
+    let error = WasmTool::from_bytes(&binary(IMPORT), WasmLimits::default())
         .expect_err("imports are not part of ABI v1");
     assert_eq!(error.code(), "rpc/provider");
     assert_eq!(error_code(Err::<(), _>(error)), "wasm/import");
@@ -116,8 +124,7 @@ fn a_guest_with_host_imports_is_refused_before_it_runs() {
 
 #[test]
 fn a_missing_entry_point_is_refused() {
-    let mut tool =
-        WasmTool::from_bytes(NO_ENTRY.as_bytes(), WasmLimits::default()).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(NO_ENTRY), WasmLimits::default()).expect("compile");
     assert_eq!(error_code(tool.call(b"")), "wasm/entry");
 }
 
@@ -127,8 +134,10 @@ fn a_memory_beyond_the_limit_fails_to_instantiate() {
         max_memory_bytes: 1 << 20,
         ..WasmLimits::default()
     };
-    let mut tool = WasmTool::from_bytes(BIG_MEMORY.as_bytes(), limits).expect("compile");
-    assert_eq!(error_code(tool.call(b"")), "wasm/instantiate");
+    let mut tool = WasmTool::from_bytes(&binary(BIG_MEMORY), limits).expect("compile");
+    // A declared memory beyond the ceiling is a resource refusal, not a
+    // malformed module: the guest never runs and the host never allocates it.
+    assert_eq!(error_code(tool.call(b"")), "wasm/limits");
 }
 
 #[test]
@@ -137,14 +146,13 @@ fn output_beyond_the_ceiling_is_refused() {
         max_output_bytes: 1024,
         ..WasmLimits::default()
     };
-    let mut tool = WasmTool::from_bytes(BIG_OUTPUT.as_bytes(), limits).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(BIG_OUTPUT), limits).expect("compile");
     assert_eq!(error_code(tool.call(b"")), "wasm/output");
 }
 
 #[test]
 fn input_beyond_the_input_window_is_refused() {
-    let mut tool =
-        WasmTool::from_bytes(CONSTANT.as_bytes(), WasmLimits::default()).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
     let oversized = vec![0u8; 64 * 1024 + 1];
     assert_eq!(error_code(tool.call(&oversized)), "wasm/input");
 }
@@ -152,7 +160,7 @@ fn input_beyond_the_input_window_is_refused() {
 #[test]
 fn a_capability_runs_the_guest_through_the_kernel() {
     let agent = Agent::with_secret([0x2b; 32]);
-    let tool = WasmTool::from_bytes(ECHO.as_bytes(), WasmLimits::default()).expect("compile");
+    let tool = WasmTool::from_bytes(&binary(ECHO), WasmLimits::default()).expect("compile");
     let provider = agent.register(Box::new(tool));
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
@@ -171,7 +179,7 @@ fn a_capability_runs_the_guest_through_the_kernel() {
 #[test]
 fn the_kernel_refuses_a_method_the_capability_does_not_grant() {
     let agent = Agent::with_secret([0x2c; 32]);
-    let tool = WasmTool::from_bytes(CONSTANT.as_bytes(), WasmLimits::default()).expect("compile");
+    let tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
     let provider = agent.register(Box::new(tool));
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["other"]))
@@ -190,13 +198,15 @@ fn a_fuel_refusal_reaches_the_caller_through_the_kernel() {
         fuel: 10_000,
         ..WasmLimits::default()
     };
-    let tool = WasmTool::from_bytes(BURN.as_bytes(), limits).expect("compile");
+    let tool = WasmTool::from_bytes(&binary(BURN), limits).expect("compile");
     let provider = agent.register(Box::new(tool));
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
         .expect("mint");
     let lane = agent.create_lane("wasm", Budget::default()).expect("lane");
-    let promise = agent.call(lane, &cap, "run", Vec::new()).expect("queued");
+    let promise = agent
+        .call(lane, &cap, "run", vec![Arg::text("")])
+        .expect("queued");
     agent.run();
     let error = promise.value().expect_err("the guest must be stopped");
     assert!(
@@ -208,7 +218,7 @@ fn a_fuel_refusal_reaches_the_caller_through_the_kernel() {
 #[test]
 fn a_tool_without_a_capability_is_unreachable() {
     let agent = Agent::with_secret([0x2e; 32]);
-    let tool = WasmTool::from_bytes(CONSTANT.as_bytes(), WasmLimits::default()).expect("compile");
+    let tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
     let _provider = agent.register(Box::new(tool));
     let lane = agent.create_lane("wasm", Budget::default()).expect("lane");
     let imported = agent.import(active_rpc::CapId([0; 16]));
@@ -220,7 +230,7 @@ fn a_tool_without_a_capability_is_unreachable() {
 
 #[test]
 fn the_provider_reports_its_single_method() {
-    let tool = WasmTool::from_bytes(CONSTANT.as_bytes(), WasmLimits::default()).expect("compile");
+    let tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
     assert_eq!(tool.name(), "wasm");
     assert_eq!(tool.methods(), vec!["run".to_string()]);
 }
@@ -245,7 +255,7 @@ fn unbounded_recursion_traps_instead_of_crashing_the_host() {
         fuel: MAX_FUEL,
         ..WasmLimits::default()
     };
-    let mut tool = WasmTool::from_bytes(RECURSE.as_bytes(), limits).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(RECURSE), limits).expect("compile");
     let code = error_code(tool.call(b""));
     assert!(
         matches!(code.as_str(), "wasm/trap" | "wasm/fuel"),
@@ -291,7 +301,7 @@ fn a_limit_that_would_fail_open_is_a_configuration_error() {
         },
     ];
     for limits in cases {
-        let error = WasmTool::from_bytes(CONSTANT.as_bytes(), limits)
+        let error = WasmTool::from_bytes(&binary(CONSTANT), limits)
             .expect_err("a fail-open limit must be refused");
         assert_eq!(error_code(Err::<(), _>(error)), "wasm/limits", "{limits:?}");
     }
@@ -350,34 +360,79 @@ const UNKNOWN_IMPORT_GUEST: &str = r#"
 #[test]
 fn a_host_import_is_refused_without_a_policy() {
     for guest in [CLOCK_GUEST, RANDOM_GUEST, LOG_GUEST] {
-        let error = WasmTool::from_bytes(guest.as_bytes(), WasmLimits::default())
+        let error = WasmTool::from_bytes(&binary(guest), WasmLimits::default())
             .expect_err("v1 must refuse every import");
         assert_eq!(error_code(Err::<(), _>(error)), "wasm/import");
     }
 }
 
 #[test]
-fn a_granted_clock_import_returns_the_wall_clock() {
+fn a_granted_clock_import_reports_the_embedder_clock() {
     let policy = WasmHostPolicy {
         clock: true,
         ..WasmHostPolicy::default()
     };
     let mut tool =
-        WasmTool::from_bytes_with_policy(CLOCK_GUEST.as_bytes(), WasmLimits::default(), policy)
+        WasmTool::from_bytes_with_policy(&binary(CLOCK_GUEST), WasmLimits::default(), policy)
             .expect("compile");
     assert!(tool.host_policy().clock);
+    // A guest must not read the operating system's clock behind the kernel's
+    // back: it sees the time the embedder seeded, so a virtual-clock kernel
+    // stays deterministic (and a wall-clock one passes `Call::now_ms`).
+    assert_eq!(tool.time_ms(), 0);
     let output = tool.call(b"").expect("run");
     assert_eq!(output.len(), 8);
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&output);
-    let reported = i64::from_le_bytes(bytes);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_millis() as i64;
+    assert_eq!(
+        i64::from_le_bytes(output[..8].try_into().expect("8 bytes")),
+        0
+    );
+
+    tool.set_time_ms(1_793_571_941_004);
+    let output = tool.call(b"").expect("run");
+    assert_eq!(
+        i64::from_le_bytes(output[..8].try_into().expect("8 bytes")),
+        1_793_571_941_004,
+        "the guest reads the seeded time"
+    );
+}
+
+/// Through the kernel the guest sees the kernel's clock, not the host's.
+#[test]
+fn a_guest_reads_the_kernel_clock_through_the_kernel() {
+    let agent = Agent::with_secret([0x3a; 32]);
+    agent.enable_receipts(true);
+    let policy = WasmHostPolicy {
+        clock: true,
+        ..WasmHostPolicy::default()
+    };
+    let tool =
+        WasmTool::from_bytes_with_policy(&binary(CLOCK_GUEST), WasmLimits::default(), policy)
+            .expect("compile");
+    let provider = agent.register(Box::new(tool));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["run"]))
+        .expect("mint");
+    let lane = agent
+        .create_lane("wasm-clock", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call(lane, &cap, "run", vec![Arg::text("")])
+        .expect("call");
+    agent.run();
+    let value = promise.value().expect("value");
+    let text = match value {
+        Value::Text(text) => text,
+        other => panic!("expected text, got {other:?}"),
+    };
+    let reported = i64::from_le_bytes(
+        text.as_bytes()
+            .try_into()
+            .expect("the guest returned eight bytes"),
+    );
+    let kernel_time = agent.now_ms() as i64;
     assert!(
-        (now - reported).abs() < 3_600_000,
-        "clock {reported} is not near {now}"
+        reported <= kernel_time && reported > 0,
+        "the guest read {reported}, the kernel clock was {kernel_time}"
     );
 }
 
@@ -388,7 +443,7 @@ fn a_granted_random_import_fills_guest_memory() {
         ..WasmHostPolicy::default()
     };
     let mut tool =
-        WasmTool::from_bytes_with_policy(RANDOM_GUEST.as_bytes(), WasmLimits::default(), policy)
+        WasmTool::from_bytes_with_policy(&binary(RANDOM_GUEST), WasmLimits::default(), policy)
             .expect("compile");
     let first = tool.call(b"").expect("run");
     let second = tool.call(b"").expect("run again");
@@ -405,7 +460,7 @@ fn a_granted_log_import_is_captured_and_capped() {
         ..WasmHostPolicy::default()
     };
     let mut tool =
-        WasmTool::from_bytes_with_policy(LOG_GUEST.as_bytes(), WasmLimits::default(), policy)
+        WasmTool::from_bytes_with_policy(&binary(LOG_GUEST), WasmLimits::default(), policy)
             .expect("compile");
     tool.call(b"").expect("run");
     assert_eq!(tool.log(), b"hello");
@@ -414,7 +469,7 @@ fn a_granted_log_import_is_captured_and_capped() {
 
     // A guest that asks for more than the cap gets -1 and the log stays empty.
     let mut over =
-        WasmTool::from_bytes_with_policy(OVERLOG_GUEST.as_bytes(), WasmLimits::default(), policy)
+        WasmTool::from_bytes_with_policy(&binary(OVERLOG_GUEST), WasmLimits::default(), policy)
             .expect("compile");
     over.call(b"").expect("run");
     assert!(over.log().is_empty(), "the over-cap write must be refused");
@@ -427,9 +482,10 @@ fn an_unknown_import_is_refused_even_with_every_grant() {
         random: true,
         log: true,
         max_log_bytes: 128,
+        accept_wat: true,
     };
     let error = WasmTool::from_bytes_with_policy(
-        UNKNOWN_IMPORT_GUEST.as_bytes(),
+        &binary(UNKNOWN_IMPORT_GUEST),
         WasmLimits::default(),
         policy,
     )
@@ -444,8 +500,7 @@ fn a_log_policy_over_the_ceiling_is_a_configuration_error() {
         max_log_bytes: active_rpc::wasm_tool::MAX_HOST_LOG + 1,
         ..WasmHostPolicy::default()
     };
-    let error =
-        WasmTool::from_bytes_with_policy(LOG_GUEST.as_bytes(), WasmLimits::default(), policy)
-            .expect_err("an over-cap log policy must be refused");
+    let error = WasmTool::from_bytes_with_policy(&binary(LOG_GUEST), WasmLimits::default(), policy)
+        .expect_err("an over-cap log policy must be refused");
     assert_eq!(error_code(Err::<(), _>(error)), "wasm/limits");
 }

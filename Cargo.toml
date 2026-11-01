@@ -50,6 +50,9 @@ proptest = "1"
 sha2 = "0.10"
 criterion = "0.5"
 prost = "0.13"
+# The wasm tests assemble their WAT fixtures into binary modules: the sandbox
+# refuses text by default, and a peer only ever sends binary.
+wat = "1"
 
 [[bin]]
 name = "active-rpc-peer"

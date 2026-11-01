@@ -170,6 +170,14 @@ pub struct Call {
     /// here. The bytes were charged against the caller's grant on ingress, so a
     /// provider must not charge them again.
     pub payload: Vec<u8>,
+    /// The kernel's clock at dispatch.
+    ///
+    /// A provider that needs a time (a sandboxed guest reading a clock, a
+    /// timestamp in a log) reads it here instead of asking the operating system,
+    /// so the call follows the kernel's clock policy: deterministic in the
+    /// default virtual mode and real when the kernel was switched to the wall
+    /// clock.
+    pub now_ms: u64,
 }
 
 impl Call {
@@ -184,6 +192,7 @@ impl Call {
             tool_allows_process: false,
             budget: crate::budget::Budget::default(),
             payload: Vec::new(),
+            now_ms: 0,
         }
     }
 

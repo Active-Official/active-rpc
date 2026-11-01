@@ -32,25 +32,36 @@ imports:  none; a module that declares any import is refused
 ### Limits
 
 - **Fuel**: `WasmLimits::fuel` (default 1,000,000) is set before instantiation and
-  covers `start` and `run`. An out-of-fuel trap is reported as `wasm/fuel`.
+  covers `start` and `run`. An out-of-fuel trap is reported as `wasm/fuel`,
+  including one raised by the `start` function. A capability's wall budget
+  bounds it further: the call gets at most `max_wall_ms × FUEL_PER_MS`
+  (5 000 fuel per millisecond), so a 100 ms grant buys 500 000 fuel whatever the
+  tool's default is.
 - **Memory**: a `StoreLimits` limiter caps linear memory at
-  `max_memory_bytes` (default 16 MiB); a module that asks for more fails to
-  instantiate.
+  `max_memory_bytes` (default 16 MiB, ceiling 256 MiB); a module that asks for
+  more fails to instantiate with `wasm/limits`.
+- **Table**: `max_table_elements` (default 1 024, ceiling 65 536) bounds every
+  table the guest declares or grows. Without it a 140-byte module can ask for
+  tens of gigabytes and a failed allocation aborts the process.
 - **Output**: `max_output_bytes` (default 64 KiB) bounds the returned length.
 - **Input**: at most 64 KiB, the input window before the output area.
+- **Module text**: WebAssembly *text* is refused (`wasm/module`) unless the
+  embedder sets `WasmHostPolicy::accept_wat`. Text expands far beyond its own
+  size during compilation, and compilation happens before any fuel is charged.
 
 ### Error codes (provider class `rpc/provider`)
 
 | Code | Meaning |
 |------|---------|
-| `wasm/module` | the guest did not compile |
-| `wasm/import` | the guest declares an import (host functions are not part of v1) |
-| `wasm/instantiate` | instantiation failed, including memory limits |
+| `wasm/module` | the guest did not compile, or was not binary module bytes |
+| `wasm/import` | the guest imports something the policy does not grant (wrong name, kind or signature) |
+| `wasm/limits` | a declared or grown resource is over a ceiling (memory, table) |
+| `wasm/instantiate` | instantiation failed for another reason |
 | `wasm/memory` | the exported memory is missing or too small for the exchange |
 | `wasm/entry` | the `run` export is missing or has the wrong type |
-| `wasm/fuel` | the fuel budget was exhausted |
+| `wasm/fuel` | the fuel budget was exhausted, in `start` or in `run` |
 | `wasm/trap` | the guest trapped for another reason |
-| `wasm/input` | the call input exceeds the input window |
+| `wasm/input` | the call input is missing, exceeds the input window, or is not one text/module argument |
 | `wasm/output` | the returned length is negative or over the ceiling |
 
 ## Consequences
@@ -59,7 +70,31 @@ imports:  none; a module that declares any import is refused
   default builds are unchanged.
 - Host functions are deliberately absent in v1. A v2 that imports host calls
   must route them through the same capability checks and is a new ADR.
-- Output is text in v1; binary results should use a module value later.
+- Output is text when the guest returns valid UTF-8; other bytes travel as a
+  module value, so a binary result is never mangled into replacement
+  characters.
+
+## Addendum (2026-11-01) — R-14 hostile review
+
+A hostile review of the sandbox found one critical and three high findings; all
+are closed, and the contract tightened in five places:
+
+- **Tables are bounded** (`max_table_elements`). A module declaring a huge table
+  used to be instantiated for real: 130 bytes of WAT asked for ~1.6 GB, and an
+  allocation failure aborts the process, which `catch_unwind` cannot contain.
+- **A call's wall budget bounds the fuel** (`FUEL_PER_MS`), so a capability that
+  granted 100 ms no longer buys minutes of interpretation.
+- **The clock is the kernel's.** `env.clock_ms` used to read `SystemTime` behind
+  the kernel's back, which is a covert channel and a replay-determinism hole. It
+  now reports `Call::now_ms` (the kernel's clock); an embedder outside the kernel
+  must seed it with `WasmTool::set_time_ms`.
+- **Imports are matched on kind and signature**, not just on name: a memory
+  called `env.log` is not a granted function.
+- **`mutating` is honest.** A run mutates provider state (the guest log), so a
+  read-only capability is refused instead of running third-party code.
+- Smaller: the instantiate error is classified (fuel vs import vs limits), a call
+  must carry exactly one text/module argument, a refusal leaves no stale log, and
+  `used + len` cannot wrap on a 32-bit host.
 
 ## Addendum (2026-10-31) — ABI v2: declared host imports
 

@@ -2370,6 +2370,9 @@ impl Agent {
                 .unwrap_or(false),
             budget: effective,
             payload,
+            // The queue time is only a placeholder; dispatch stamps the clock it
+            // actually decided at (see `dispatch`).
+            now_ms: kernel.now_ms,
         };
         let job = Job {
             id: job_id,
@@ -3238,7 +3241,7 @@ impl Agent {
         // `Agent` and call back into the kernel, and a re-entrant borrow would
         // panic (or, with `try_borrow_mut`, silently drop a refcount update).
         // Each phase takes a short borrow and returns owned data.
-        let (provider_id, provider) = {
+        let (provider_id, provider, now_ms) = {
             let mut kernel = self.cell.borrow_mut();
             kernel.round_trips += 1;
             kernel.now_ms = if kernel.wall_clock {
@@ -3265,7 +3268,10 @@ impl Agent {
             });
             kernel.dispatching = true;
             let provider = kernel.providers.remove(&provider_id);
-            (provider_id, provider)
+            // Captured with the provider so phase 2 (which holds no borrow) can
+            // stamp the call time without borrowing the cell again.
+            let now_ms = kernel.now_ms;
+            (provider_id, provider, now_ms)
         };
         let Some(provider) = provider else {
             let mut kernel = self.cell.borrow_mut();
@@ -3413,10 +3419,13 @@ impl Agent {
             let outcome = match failure {
                 Some(error) => Err(error),
                 None => {
-                    let call = Call {
+                    let mut call = Call {
                         args,
                         ..job.call.clone()
                     };
+                    // The decision time, from the kernel's clock, so a provider
+                    // that reads a clock follows the kernel's policy.
+                    call.now_ms = now_ms;
                     // A provider panic settles this job as a provider fault and
                     // is resumed after the batch: a leaked job would leave its
                     // promise pending forever, and the host still sees the
