@@ -140,7 +140,7 @@ refuses.
 | 7 | low | the lineage clamp skips an ancestor whose meter is missing (`if let Some`), so the clamp degrades fail-open if the "an ancestor outlives its descendants" invariant is ever broken | **carried**: today unreachable (`drop_record` refuses an ancestor with `descendants > 0`); the fail-closed form needs an error path no test can reach |
 | 8 | low | `object` is a provider-local id: a restart with a different registration order re-mints a credential against a different object | **documented** in ADR-0010 as a provider contract; a name-based object identity is a record format change |
 
-Gate: `cargo test --all-features` 452 passed, 0 failed; `cargo test
+Gate: `cargo test --all-features` 456 passed, 0 failed; `cargo test
 --no-default-features` 0 failed; clippy clean on both feature sets; fmt clean.
 
 ### R-07 domain operations - 2026-11-01 (round 1, in progress)
