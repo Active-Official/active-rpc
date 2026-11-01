@@ -2564,8 +2564,9 @@ impl Agent {
     ///
     /// [`Agent::call_as`] takes a bare [`PeerIdentity`], which a caller can only
     /// produce through the transport's report; this takes the type
-    /// [`IdentityPolicy::admit`] returned, so a dispatcher that has one has
-    /// already run the policy and cannot silently drop the trust level.
+    /// [`crate::identity::IdentityPolicy::admit`] returned, so a dispatcher that
+    /// has one has already run the policy and cannot silently drop the trust
+    /// level.
     pub fn call_peer(
         &self,
         lane: LaneId,
