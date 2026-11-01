@@ -172,6 +172,18 @@ impl ModuleProvider {
     /// themselves. `content_hash` reuses the cached hash, and `patch` clones
     /// only on the mutating path.
     fn serve(&self, slot: &mut ModuleSlot, call: &Call) -> Result<Response> {
+        // A scoped capability is confined to its subtree. A pathless form would
+        // return (or rewrite) the whole module, and a path outside the scope is
+        // not this capability's data: both are refused here, because the kernel
+        // can only check the arguments it can see and these methods address the
+        // module by name.
+        if let Some(scope) = &call.path_scope {
+            match Self::path_arg(call) {
+                Some(path) if crate::cap::is_path_prefix(scope, &path) => {}
+                Some(path) => return Err(Error::PathNotGranted(path)),
+                None => return Err(Error::PathNotGranted(scope.clone())),
+            }
+        }
         match call.method.as_str() {
             "evaluate" => {
                 let budget = call.budget.to_active_budget();

@@ -19,7 +19,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
-| R-06 | budget | `src/budget.rs` | round 1: 3 fixed, 2 carried | 3 fixed / 0 rejected / 2 open | this commit |
+| R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | pending | — | — |
 | R-08 | tools / MCP | `src/tool.rs` | pending | — | — |
 | R-09 | transports | `src/transport/**` | pending | — | — |
@@ -113,6 +113,35 @@ Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `64ea410`.
 
 Gate: `cargo test --all-features` 448 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-06 budgets - 2026-11-01 (round 2)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `22c3d66`
+plus `d801371`. Tests: `tests/promise_tests.rs` (4 new, failing-first;
+`tests/r06_audit_probe*.rs` were the scratch probes and are removed).
+
+Verified clean, by probe rather than by reading: export → restore → re-export →
+restore across three kernels carries the grant once (3 calls in, 3 calls out,
+0 in the exporting kernels); a child attenuated *after* an export cannot see the
+reserved grant (the chain is charged, not the child's ceiling); a restore whose
+`mint_restored` fails does **not** consume the record; a dropped parent handle
+still binds its child; two sibling exports cannot each carry the ancestor's
+whole remainder; and an export of a spent, revoked or expired capability still
+refuses.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a refused export still burned the grant and the record: the empty-path-scope check ran *after* `reserve` and after `consumed_records.insert`, so one malformed field destroyed the authority and made the record unexportable | **fixed**: the check moved above the reserve; `a_refused_export_keeps_the_grant_and_the_record` |
+| 2 | high | a tombstone did not reach a live capability: `tombstone_record` only filled the set, and dispatch never consults it, so a credential restored before the kill list was replayed kept serving its whole lease | **fixed**: `tombstone_record` revokes every live capability carrying the id (shared `revoke_subtree` with `revoke`); `a_tombstone_revokes_the_live_capability_it_names` |
+| 3 | medium | `consumed_records` and `restored_records` had no ceiling and are not covered by `durable_ceiling_reached`: 70 000 export/drop cycles grew the set forever (measured) | **fixed**: `MAX_RECORD_IDS` (65 536) with `set_record_id_ceiling`; a new export or restore past it is `rpc/budget-exceeded`; `the_record_id_sets_are_bounded` |
+| 4 | low | a sealed record whose budget disables a ceiling was refused as `rpc/invalid-argument`, outside the durable vocabulary | **fixed**: restore reports `rpc/persistence`; `a_record_that_disables_a_ceiling_is_a_durable_refusal` |
+| 5 | low | ADR-0010 still said "one live capability per credential", while the code restores once per kernel and consumes on export | **fixed**: the ADR addendum states consumption, the lineage reserve, the bounded sets, the kill-switch semantics and the startup order |
+| 6 | low | an export and a restore emit no event (`CapMinted` is reused), so authority leaving the process is not on the trace | **carried**: the event names are a schema change with `docs/spec/observability.md` and the ADR-0014 list; one change |
+| 7 | low | the lineage clamp skips an ancestor whose meter is missing (`if let Some`), so the clamp degrades fail-open if the "an ancestor outlives its descendants" invariant is ever broken | **carried**: today unreachable (`drop_record` refuses an ancestor with `descendants > 0`); the fail-closed form needs an error path no test can reach |
+| 8 | low | `object` is a provider-local id: a restart with a different registration order re-mints a credential against a different object | **documented** in ADR-0010 as a provider contract; a name-based object identity is a record format change |
+
+Gate: `cargo test --all-features` 452 passed, 0 failed; `cargo test
+--no-default-features` 0 failed; clippy clean on both feature sets; fmt clean.
 
 ### R-05 lanes / channels - 2026-11-01 (round 1)
 

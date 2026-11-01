@@ -793,3 +793,138 @@ fn a_restored_child_cannot_outspend_its_parent() {
         .expect_err("the ancestor's grant is spent");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }
+
+/// An export refused before it hands out a record must cost nothing: the grant
+/// stays with the capability and the record id is not burned, or a deployment
+/// that presents one malformed field loses both.
+#[test]
+fn a_refused_export_keeps_the_grant_and_the_record() {
+    let (agent, provider) = durable_agent();
+    let owner = admitted(b"owner");
+    let caller = PeerIdentity::from_certificate(b"owner");
+    // `from_json` refuses an empty path scope, so this record could never be
+    // restored; the export refuses it at the source.
+    let mut attrs = CapAttrs::new(&["echo"])
+        .with_budget(Budget::calls(2))
+        .with_path("");
+    attrs.persistence = CapPersistence::Durable;
+    let cap = agent.mint_bound(&owner, provider, 0, attrs).expect("cap");
+
+    let refused = agent
+        .export_capability(&cap)
+        .expect_err("empty scope refused");
+    assert_eq!(refused.code(), "rpc/persistence", "{refused}");
+
+    // The grant did not move: both calls are still here.
+    let lane = agent.create_lane("kept", Budget::default()).expect("lane");
+    for _ in 0..2 {
+        let promise = agent
+            .call_as(Some(&caller), lane, &cap, "echo", Vec::new())
+            .expect("the refused export burned the grant");
+        agent.run();
+        promise.value().expect("value");
+    }
+    let error = agent
+        .call_as(Some(&caller), lane, &cap, "echo", Vec::new())
+        .expect_err("the grant is spent by calls, not by the refusal");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+
+    // And the refusal is still the empty scope, not "already exported".
+    let again = agent.export_capability(&cap).expect_err("still refused");
+    assert!(
+        again.to_string().contains("empty path scope"),
+        "the record id was consumed by the refused export: {again}"
+    );
+}
+
+/// A tombstone is a kill switch: a capability restored from the record before
+/// the kill list was replayed must be revoked, not left alive for its lease.
+#[test]
+fn a_tombstone_revokes_the_live_capability_it_names() {
+    let (source, provider) = durable_agent();
+    let cap = bound_durable(&source, provider, None);
+    let record = source.export_capability(&cap).expect("export");
+
+    let restarted = Agent::with_secret([0x52; 32]);
+    restarted.set_durable_capabilities(true);
+    restarted.set_record_seal_key([0x86; 32]);
+    restarted.register(Box::new(Echo));
+    let restored = restarted
+        .restore_capability(&record, &admitted(b"owner"))
+        .expect("restore");
+    // The deployment replays its persistent kill list after the restore path
+    // already ran; the live copy is the authority that has to die.
+    restarted
+        .tombstone_record(record.record_id)
+        .expect("replay the tombstone");
+    let lane = restarted
+        .create_lane("killed", Budget::default())
+        .expect("lane");
+    let owner = PeerIdentity::from_certificate(b"owner");
+    let error = restarted
+        .call_as(Some(&owner), lane, &restored, "echo", Vec::new())
+        .expect_err("a tombstoned credential must not dispatch");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+    // Attenuation is a use of the authority too.
+    let error = restarted
+        .attenuate(&restored, CapAttrs::new(&["echo"]).durable())
+        .expect_err("a tombstoned credential cannot be attenuated");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+/// The record-id sets are bounded: a kernel that keeps exporting refuses the
+/// export that would grow the set past its ceiling.
+#[test]
+fn the_record_id_sets_are_bounded() {
+    let (agent, provider) = durable_agent();
+    agent.set_record_id_ceiling(2).expect("ceiling");
+    assert_eq!(agent.record_id_ceiling(), 2);
+    let mut records = Vec::new();
+    for index in 0..2 {
+        let cap = bound_durable(&agent, provider, None);
+        records.push(agent.export_capability(&cap).expect("export"));
+        drop(cap);
+        assert_eq!(agent.consumed_record_count(), index + 1);
+    }
+    let third = bound_durable(&agent, provider, None);
+    let error = agent
+        .export_capability(&third)
+        .expect_err("the consumed set is full");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert_eq!(agent.consumed_record_count(), 2);
+
+    // The same ceiling bounds restores, so a record replay cannot grow the set.
+    let restarted = Agent::with_secret([0x52; 32]);
+    restarted.set_durable_capabilities(true);
+    restarted.set_record_seal_key([0x86; 32]);
+    restarted.set_record_id_ceiling(1).expect("ceiling");
+    restarted.register(Box::new(Echo));
+    let first = restarted
+        .restore_capability(&records[0], &admitted(b"owner"))
+        .expect("first restore");
+    drop(first);
+    let error = restarted
+        .restore_capability(&records[1], &admitted(b"owner"))
+        .expect_err("the restored set is full");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert_eq!(restarted.restored_record_count(), 1);
+}
+
+/// A sealed record whose budget disables a ceiling is a durable refusal, not a
+/// caller argument error.
+#[test]
+fn a_record_that_disables_a_ceiling_is_a_durable_refusal() {
+    let (source, provider) = durable_agent();
+    let cap = bound_durable(&source, provider, None);
+    let mut record = source.export_capability(&cap).expect("export");
+    record.budget.max_bytes = 0;
+    record.seal_with(&[0x86; 32]);
+    let restarted = Agent::with_secret([0x52; 32]);
+    restarted.set_durable_capabilities(true);
+    restarted.set_record_seal_key([0x86; 32]);
+    restarted.register(Box::new(Echo));
+    let error = restarted
+        .restore_capability(&record, &admitted(b"owner"))
+        .expect_err("a zero ceiling is refused");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+}

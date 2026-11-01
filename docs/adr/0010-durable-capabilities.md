@@ -74,13 +74,57 @@ resurrection:
   is refused with `rpc/identity`. Export itself refuses a capability that names
   no peer: a credential that restores for anybody is not a credential, and an
   earlier unbound export would escape a later `introduce_to`;
-- one live capability per credential. A second restore of the same record while
-  a copy is live is refused (`rpc/persistence`), because revocation walks ids
-  and could not reach an independent copy.
+- two restores of the same record are refused (`rpc/persistence`): one while
+  a copy is live, because revocation walks ids and could not reach an
+  independent copy; and one after the copy is dropped, because the record is
+  spent. A kernel remembers the ids it restored, so dropping the handle does
+  not make the credential restorable again in that process. A restart starts
+  with an empty set, which is why the kill list has to be replayed.
 
 Restore is refused (`rpc/persistence`) unless the agent enabled durable
 capabilities, a seal key is configured and the seal verifies, and the provider
 is registered. A tombstoned record id is `rpc/revoked`.
+
+### Consumption and reservation
+
+Export is a transfer, not a copy, and the kernel treats it as one:
+
+- a record is consumed by its export. Exporting the same capability twice is
+  `rpc/persistence`, and the id stays consumed after the capability is dropped,
+  so one credential cannot produce two records;
+- the record carries the minimum remaining budget of the capability *and* every
+  ancestor, and that grant is reserved on the same chain
+  (`BudgetMeter::check_reserve`/`reserve`). The local subtree can no longer spend
+  what the record now holds, so restoring a child cannot outspend the parent it
+  was derived from;
+- a refusal that happens before a record is handed out (an empty path scope, no
+  seal key, an unbound capability) costs nothing: the grant is not reserved and
+  the id is not consumed;
+- a record whose budget disables a ceiling is refused as `rpc/persistence`, not
+  as a caller argument error;
+- both id sets are bounded (`MAX_RECORD_IDS`, 65 536). Past the ceiling a new
+  export or restore is refused with `rpc/budget-exceeded` rather than growing
+  the set without bound.
+
+A tombstone is a kill switch, not only a restore filter: `tombstone_record`
+revokes every live capability carrying that record id (and its subtree), so a
+restore that ran before the kill list was replayed cannot outlive the replay.
+
+### Startup order
+
+The kill list is replayed with `tombstone_record`. A deployment that also
+restores records at startup must replay first; the kernel makes the later
+tombstone reach a live copy, but an unrestored credential is the only one where
+the order is invisible.
+
+### Object identity (residual)
+
+`object` is the provider's local object id, not a name. A restore re-mints the
+recorded authority against whatever the registered provider calls that id, so a
+provider must keep object ids stable across restarts of the same deployment; a
+registration order that changes maps a restored credential onto a different
+object. A name-based object identity would be a record format change.
+
 
 Tombstones live in memory, so a process restart would otherwise resurrect every
 record exported before the kill switch. A deployment replays its persistent kill

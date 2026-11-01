@@ -52,6 +52,15 @@ pub const MAX_CAPS: usize = 65_536;
 /// capability is refused rather than letting an operator lose a kill switch.
 pub const MAX_TOMBSTONES: usize = 65_536;
 
+/// Ceiling on the record ids one kernel remembers as exported or restored.
+///
+/// The two sets exist so one credential cannot be exported or restored twice;
+/// without a ceiling a kernel that keeps exporting would remember a 32-byte id
+/// per export forever, because the capability itself can be dropped. Past the
+/// ceiling a new export or restore is refused (fail-closed) rather than growing
+/// the set without bound.
+pub const MAX_RECORD_IDS: usize = 65_536;
+
 /// Deepest capability chain attenuation may build.
 ///
 /// Each link copies its ancestors, so the memory of a chain grows with the
@@ -373,6 +382,8 @@ pub struct Kernel {
     consumed_records: BTreeSet<[u8; 32]>,
     /// Record ids already restored by this kernel.
     restored_records: BTreeSet<[u8; 32]>,
+    /// Ceiling on either record-id set.
+    record_id_ceiling: usize,
 }
 
 /// Control half of a capability handle: reference counting and provider
@@ -642,6 +653,7 @@ impl Agent {
             revoked_records: BTreeSet::new(),
             consumed_records: BTreeSet::new(),
             restored_records: BTreeSet::new(),
+            record_id_ceiling: MAX_RECORD_IDS,
             children: BTreeMap::new(),
             deferred_refops: Rc::clone(&deferred_refops),
         };
@@ -816,6 +828,18 @@ impl Agent {
                 "a durable record must name the peer it was bound to",
             ));
         }
+        // Every refusal that means "this record cannot be built" comes before
+        // the reserve: a grant must not be burned by a record that is never
+        // handed out. `from_json` refuses an empty scope, so such a record
+        // could never be restored either.
+        if record
+            .attrs
+            .path_scope
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(Error::persistence("an empty path scope is not a scope"));
+        }
         // A record describes what is left, not what was granted, and the
         // transfer is real: what the record carries is reserved on this
         // capability *and* on every ancestor, so restoring it cannot create a
@@ -824,6 +848,11 @@ impl Agent {
             return Err(Error::persistence(
                 "the record was already exported and consumed",
             ));
+        }
+        // The mark set is bounded: past the ceiling a new export is refused
+        // rather than letting a long-lived kernel remember ids forever.
+        if kernel.consumed_records.len() >= kernel.record_id_ceiling {
+            return Err(Error::BudgetExceeded("records"));
         }
         let meter = kernel
             .meters
@@ -859,16 +888,6 @@ impl Agent {
             }
         }
         kernel.consumed_records.insert(record.record_id);
-        if record
-            .attrs
-            .path_scope
-            .as_deref()
-            .is_some_and(str::is_empty)
-        {
-            // `from_json` refuses an empty scope, so such a record could never
-            // be restored: refuse it at the source instead of writing it.
-            return Err(Error::persistence("an empty path scope is not a scope"));
-        }
         let mut record = crate::persistence::CapabilityRecord {
             provider: provider_name,
             object: record.object,
@@ -957,6 +976,9 @@ impl Agent {
             if kernel.restored_records.contains(&record.record_id) {
                 return Err(Error::persistence("the record was already restored"));
             }
+            if kernel.restored_records.len() >= kernel.record_id_ceiling {
+                return Err(Error::BudgetExceeded("records"));
+            }
         }
         let provider = {
             let kernel = self.cell.borrow();
@@ -999,6 +1021,12 @@ impl Agent {
             }
             None => None,
         };
+        // A record whose budget disables a ceiling is not restorable; it is a
+        // durable refusal, not a bad argument from the caller.
+        record
+            .budget
+            .check()
+            .map_err(|_| Error::persistence("the record's budget disables a ceiling"))?;
         let attrs = record.attrs(ttl_ms);
         let restored = self.mint_restored(peer, provider, record.object, attrs)?;
         self.cell
@@ -1323,48 +1351,7 @@ impl Agent {
         if !kernel.caps.contains_key(&id) {
             return Err(Error::UnknownCapability(cap_token(id)));
         }
-        let mut doomed = BTreeSet::new();
-        let mut stack = vec![id];
-        while let Some(id) = stack.pop() {
-            if !doomed.insert(id) {
-                continue;
-            }
-            if let Some(descendants) = kernel.children.get(&id) {
-                stack.extend(descendants.iter().copied());
-            }
-        }
-        // Every capability restored from the same record is revoked with it: a
-        // peer that restored twice before the kill switch must not keep a copy.
-        let record_ids: BTreeSet<[u8; 32]> = doomed
-            .iter()
-            .filter_map(|id| kernel.caps.get(id).map(|record| record.record_id))
-            .collect();
-        for (id, record) in &kernel.caps {
-            if record_ids.contains(&record.record_id) {
-                doomed.insert(*id);
-            }
-        }
-        for id in doomed {
-            let record_id = match kernel.caps.get_mut(&id) {
-                Some(record) => {
-                    record.revoked = true;
-                    // Only a durable record can ever be restored, so only its
-                    // id needs a tombstone; an ephemeral one would leak an
-                    // entry per mint/revoke cycle forever.
-                    if record.attrs.persistence == CapPersistence::Durable {
-                        Some(record.record_id)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            };
-            if let Some(record_id) = record_id {
-                kernel.revoked_records.insert(record_id);
-            }
-            kernel.push_event(Event::CapRevoked(id));
-            kernel.metrics.revocations = kernel.metrics.revocations.saturating_add(1);
-        }
+        revoke_subtree(&mut kernel, [id]);
         Ok(())
     }
 
@@ -1373,6 +1360,11 @@ impl Agent {
     /// Tombstones live in memory, so process restarts would otherwise resurrect
     /// every exported record. A deployment replays its kill list here at
     /// startup; the ceiling is checked so the set can never grow without bound.
+    ///
+    /// A tombstone is a kill switch, so it also revokes every live capability
+    /// carrying the id: a restore path that ran before the replay would
+    /// otherwise keep a copy of a revoked credential alive for its whole lease,
+    /// because dispatch never consults the tombstone set.
     pub fn tombstone_record(&self, record_id: [u8; 32]) -> Result<()> {
         let mut kernel = self.cell.borrow_mut();
         if kernel.revoked_records.len() >= MAX_TOMBSTONES
@@ -1381,6 +1373,15 @@ impl Agent {
             return Err(Error::BudgetExceeded("tombstones"));
         }
         kernel.revoked_records.insert(record_id);
+        let live: Vec<CapId> = kernel
+            .caps
+            .iter()
+            .filter(|(_, record)| record.record_id == record_id)
+            .map(|(id, _)| *id)
+            .collect();
+        if !live.is_empty() {
+            revoke_subtree(&mut kernel, live);
+        }
         Ok(())
     }
 
@@ -1392,6 +1393,30 @@ impl Agent {
     /// True when a record id was tombstoned by a revocation.
     pub fn record_is_tombstoned(&self, record_id: &[u8; 32]) -> bool {
         self.cell.borrow().revoked_records.contains(record_id)
+    }
+
+    /// Set the ceiling on the record ids a kernel remembers. Zero is refused.
+    pub fn set_record_id_ceiling(&self, ceiling: usize) -> Result<()> {
+        if ceiling == 0 {
+            return Err(Error::InvalidArgument("record id ceiling must be non-zero"));
+        }
+        self.cell.borrow_mut().record_id_ceiling = ceiling.min(MAX_RECORD_IDS);
+        Ok(())
+    }
+
+    /// Current record-id ceiling.
+    pub fn record_id_ceiling(&self) -> usize {
+        self.cell.borrow().record_id_ceiling
+    }
+
+    /// Record ids this kernel has exported and consumed.
+    pub fn consumed_record_count(&self) -> usize {
+        self.cell.borrow().consumed_records.len()
+    }
+
+    /// Record ids this kernel has restored.
+    pub fn restored_record_count(&self) -> usize {
+        self.cell.borrow().restored_records.len()
     }
 
     /// Create a lane.
@@ -3552,6 +3577,56 @@ fn durable_ceiling_reached(kernel: &Kernel) -> bool {
         .filter(|record| record.attrs.persistence == CapPersistence::Durable)
         .count();
     kernel.revoked_records.len().saturating_add(live) >= MAX_TOMBSTONES
+}
+
+/// Revoke `seeds`, every capability derived from them and every capability that
+/// carries one of their record ids; tombstone each durable record.
+///
+/// One walk, shared by `revoke` and `tombstone_record`, so a kill switch cannot
+/// reach a capability that a revocation would have reached.
+fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
+    let mut doomed = BTreeSet::new();
+    let mut stack: Vec<CapId> = seeds.into_iter().collect();
+    while let Some(id) = stack.pop() {
+        if !doomed.insert(id) {
+            continue;
+        }
+        if let Some(descendants) = kernel.children.get(&id) {
+            stack.extend(descendants.iter().copied());
+        }
+    }
+    // Every capability restored from the same record is revoked with it: a peer
+    // that restored twice before the kill switch must not keep a copy.
+    let record_ids: BTreeSet<[u8; 32]> = doomed
+        .iter()
+        .filter_map(|id| kernel.caps.get(id).map(|record| record.record_id))
+        .collect();
+    for (id, record) in &kernel.caps {
+        if record_ids.contains(&record.record_id) {
+            doomed.insert(*id);
+        }
+    }
+    for id in doomed {
+        let record_id = match kernel.caps.get_mut(&id) {
+            Some(record) => {
+                record.revoked = true;
+                // Only a durable record can ever be restored, so only its id
+                // needs a tombstone; an ephemeral one would leak an entry per
+                // mint/revoke cycle forever.
+                if record.attrs.persistence == CapPersistence::Durable {
+                    Some(record.record_id)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        if let Some(record_id) = record_id {
+            kernel.revoked_records.insert(record_id);
+        }
+        kernel.push_event(Event::CapRevoked(id));
+        kernel.metrics.revocations = kernel.metrics.revocations.saturating_add(1);
+    }
 }
 
 /// Fingerprint of an argument list: shape and content, no secret bytes.
