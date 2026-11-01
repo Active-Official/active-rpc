@@ -287,7 +287,17 @@ impl CapabilityRecord {
         };
         let bound_to = match value.get("bound_to") {
             None | Some(Json::Null) => None,
-            Some(Json::String(text)) => Some(parse_hex32(text)?),
+            Some(Json::String(text)) => {
+                let fingerprint = parse_hex32(text)?;
+                // The all-zero fingerprint is the anonymous constant: a record
+                // naming it would restore for a peer that proved nothing.
+                if !crate::identity::bindable(fingerprint) {
+                    return Err(Error::persistence(
+                        "binding names an anonymous or loopback identity",
+                    ));
+                }
+                Some(fingerprint)
+            }
             Some(_) => return Err(Error::persistence("binding is malformed")),
         };
         let expires_at = match value.get("expires_at") {

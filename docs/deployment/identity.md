@@ -13,11 +13,22 @@ the transport authenticated:
 
 - right peer → the call runs;
 - wrong peer → `rpc/identity`;
-- no identity → `rpc/identity`.
+- no identity → `rpc/identity`;
+- a **loopback** peer → `rpc/identity`.
+
+Only a **certificate** peer can hold a binding. The loopback relaxation admits a
+local caller without a certificate, but every local process shares that one
+identity, so binding a capability to it would hand the capability to every
+process on the host. A loopback caller may use an *unbound* capability; bind one
+only to a verified certificate. `introduce_to` binds the capability and every
+live capability derived from it, so a child minted before the introduction
+cannot be used by another peer or transferred over a channel.
 
 The fingerprint is a Blake3 hash over the peer's DER certificate, domain
 separated (`active-rpc/peer-identity/v1`). It is stable across reconnects for the
-same certificate and different for every other certificate.
+same certificate and different for every other certificate. `with_subject`
+attaches an operator-facing **label**; the fingerprint does not change, because
+it is the binding key the transport presents.
 
 Identity is not authority by itself: it only answers *who* may use a capability
 that was already introduced to them.

@@ -281,7 +281,9 @@ impl CapAttrs {
     /// Bind the capability to one authenticated peer fingerprint.
     ///
     /// An already-bound capability cannot be rebound: use [`CapAttrs::attenuate`]
-    /// or mint a new capability instead.
+    /// or mint a new capability instead. The kernel refuses a value that names
+    /// no peer — the all-zero (anonymous) fingerprint or the shared loopback
+    /// one — so this setter is a request, not a grant.
     pub fn bound_to(mut self, fingerprint: [u8; crate::identity::FINGERPRINT_LEN]) -> Self {
         self.bound_to = Some(fingerprint);
         self
@@ -333,8 +335,11 @@ impl CapAttrs {
         let persistence_ok = self.persistence != CapPersistence::Durable
             || parent.persistence == CapPersistence::Durable;
         // Identity binding is monotone: a bound parent stays bound to the same
-        // peer, an omitted child binding inherits the parent's, and an unbound
-        // parent may be narrowed to one peer.
+        // peer, and an unbound parent may be narrowed to one peer. A child that
+        // carries no binding of its own is reported as a valid attenuation
+        // because `attenuate` inherits the parent's binding — this predicate
+        // models that merge, so a caller that wants a bound child must go
+        // through `attenuate` (or set the binding itself).
         let binding_ok = match (parent.bound_to, self.bound_to) {
             (None, _) => true,
             (Some(_), None) => true,

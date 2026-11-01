@@ -828,6 +828,11 @@ impl Agent {
                 "a durable record must name the peer it was bound to",
             ));
         }
+        if !record.attrs.bound_to.is_some_and(crate::identity::bindable) {
+            return Err(Error::Identity(
+                "a durable record cannot name an anonymous or loopback identity",
+            ));
+        }
         // Every refusal that means "this record cannot be built" comes before
         // the reserve: a grant must not be burned by a record that is never
         // handed out. `from_json` refuses an empty scope, so such a record
@@ -956,7 +961,10 @@ impl Agent {
         let Some(bound) = record.bound_to else {
             return Err(Error::Identity("the record names no peer"));
         };
-        if bound != peer.fingerprint() {
+        if !crate::identity::matches(
+            crate::identity::presented_fingerprint(Some(peer.identity())),
+            bound,
+        ) {
             return Err(Error::Identity("the record is bound to a different peer"));
         }
         {
@@ -1086,6 +1094,7 @@ impl Agent {
             ));
         }
         attrs.budget.check()?;
+        check_binding(&attrs)?;
         if attrs.methods.is_empty() {
             return Err(Error::InvalidArgument("capability grants no methods"));
         }
@@ -1136,10 +1145,15 @@ impl Agent {
         }
         if attrs
             .bound_to
-            .is_some_and(|bound| bound != peer.fingerprint())
+            .is_some_and(|bound| !crate::identity::matches(Some(peer.fingerprint()), bound))
         {
             return Err(Error::Identity(
                 "the capability is already bound to a different peer",
+            ));
+        }
+        if !peer.can_bind() {
+            return Err(Error::Identity(
+                "only a certificate peer can hold a binding",
             ));
         }
         self.mint(provider, object, attrs.bound_to(peer.fingerprint()))
@@ -1163,6 +1177,7 @@ impl Agent {
         }
         let attrs = attrs.bound_to(peer.fingerprint());
         attrs.budget.check()?;
+        check_binding(&attrs)?;
         if attrs.methods.is_empty() {
             return Err(Error::InvalidArgument("capability grants no methods"));
         }
@@ -1233,11 +1248,30 @@ impl Agent {
             }
             _ => {}
         }
+        // Bind the live subtree, not only this capability. A child minted before
+        // the introduction would otherwise stay usable by another peer and
+        // transferable over a channel while its parent is locked to this one.
+        let subtree = descendants_of(&kernel.children, cap.id());
+        for id in &subtree {
+            if let Some(child) = kernel.caps.get(id) {
+                if let Some(bound) = child.attrs.bound_to {
+                    if bound != fingerprint {
+                        return Err(Error::Identity(
+                            "a descendant is already bound to another peer",
+                        ));
+                    }
+                }
+            }
+        }
+        for id in std::iter::once(cap.id()).chain(subtree) {
+            if let Some(child) = kernel.caps.get_mut(&id) {
+                child.attrs.bound_to = Some(fingerprint);
+            }
+        }
         let record = kernel
             .caps
-            .get_mut(&cap.id())
+            .get(&cap.id())
             .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
-        record.attrs.bound_to = Some(fingerprint);
         let descriptor = crate::wire::CapDescriptor::from_attrs(record.id, &record.attrs);
         let introduced = record.id;
         kernel.push_event(Event::CapIntroduced {
@@ -1292,6 +1326,7 @@ impl Agent {
             ));
         }
         let attrs = record.attrs.attenuate(attrs)?;
+        check_binding(&attrs)?;
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, Some(&parent_id));
@@ -1664,8 +1699,7 @@ impl Agent {
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
             if let Some(bound) = record.attrs.bound_to {
-                let presented = peer.map(|identity| identity.fingerprint());
-                if presented != Some(bound) {
+                if !crate::identity::matches(crate::identity::presented_fingerprint(peer), bound) {
                     return Err(Error::Identity(
                         "capability is bound to a different peer identity",
                     ));
@@ -1786,9 +1820,8 @@ impl Agent {
             kernel.push_event(Event::CapExpired(cap.id()));
             return Err(Error::Revoked(cap_token(cap.id())));
         }
-        if record.attrs.bound_to.is_some() {
-            let presented = peer.map(|identity| identity.fingerprint());
-            if presented != record.attrs.bound_to {
+        if let Some(bound) = record.attrs.bound_to {
+            if !crate::identity::matches(crate::identity::presented_fingerprint(peer), bound) {
                 return Err(Error::Identity(
                     "capability is bound to a different peer identity",
                 ));
@@ -2110,8 +2143,7 @@ impl Agent {
         // capability introduced to one peer must be useless to another, even
         // with the exact same id.
         if let Some(bound) = record.attrs.bound_to {
-            let presented = peer.map(|identity| identity.fingerprint());
-            if presented != Some(bound) {
+            if !crate::identity::matches(crate::identity::presented_fingerprint(peer), bound) {
                 return Err(Error::Identity(
                     "capability is bound to a different peer identity",
                 ));
@@ -2528,6 +2560,23 @@ impl Agent {
         self.call_idempotent_as_with_payload(peer, lane, cap, method, args, 0, key)
     }
 
+    /// Issue a call on behalf of a peer the policy admitted.
+    ///
+    /// [`Agent::call_as`] takes a bare [`PeerIdentity`], which a caller can only
+    /// produce through the transport's report; this takes the type
+    /// [`IdentityPolicy::admit`] returned, so a dispatcher that has one has
+    /// already run the policy and cannot silently drop the trust level.
+    pub fn call_peer(
+        &self,
+        lane: LaneId,
+        cap: &CapHandle,
+        peer: &crate::identity::AdmittedIdentity,
+        method: &str,
+        args: Vec<Arg>,
+    ) -> Result<PromiseHandle> {
+        self.call_as(Some(peer.identity()), lane, cap, method, args)
+    }
+
     /// [`Agent::call_idempotent_as`] for a call that carries `payload_bytes`.
     ///
     /// The payload size is part of the fingerprint: replaying a key with a
@@ -2589,8 +2638,10 @@ impl Agent {
                         return Err(Error::Revoked(cap_token(cap.id())));
                     }
                     if let Some(bound) = record.attrs.bound_to {
-                        let presented = peer.map(|identity| identity.fingerprint());
-                        if presented != Some(bound) {
+                        if !crate::identity::matches(
+                            crate::identity::presented_fingerprint(peer),
+                            bound,
+                        ) {
                             return Err(Error::Identity(
                                 "capability is bound to a different peer identity",
                             ));
@@ -3686,6 +3737,38 @@ fn durable_ceiling_reached(kernel: &Kernel) -> bool {
 ///
 /// One walk, shared by `revoke` and `tombstone_record`, so a kill switch cannot
 /// reach a capability that a revocation would have reached.
+/// Refuse a binding that names no real peer.
+///
+/// The all-zero fingerprint is the anonymous constant and the loopback
+/// fingerprint is shared by every local process; a capability bound to either
+/// would be usable by a peer that never proved anything.
+fn check_binding(attrs: &CapAttrs) -> Result<()> {
+    if let Some(bound) = attrs.bound_to {
+        if !crate::identity::bindable(bound) {
+            return Err(Error::Identity(
+                "a capability cannot be bound to an anonymous or loopback identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every live descendant of `root` in the children index.
+fn descendants_of(children: &BTreeMap<CapId, BTreeSet<CapId>>, root: CapId) -> Vec<CapId> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if let Some(descendants) = children.get(&id) {
+            for child in descendants {
+                if seen.insert(*child) {
+                    stack.push(*child);
+                }
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
 fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
     let mut doomed = BTreeSet::new();
     let mut stack: Vec<CapId> = seeds.into_iter().collect();

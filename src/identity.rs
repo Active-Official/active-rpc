@@ -57,16 +57,20 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
-    /// Identity from a verified certificate.
+    /// Identity from a certificate a transport verified.
     ///
     /// `certificate` is the DER encoding the transport authenticated; only its
     /// digest is retained, so the identity is safe to log and compare. The
     /// default subject is a short certificate label; use
     /// [`PeerIdentity::with_subject`] to attach the principal a deployment
     /// extracted from the certificate's SAN.
+    ///
+    /// This is record-keeping, not proof: it cannot tell whether the chain was
+    /// verified. Only a transport that verified it may call this, and the kernel
+    /// treats the value as the caller's claim about its own connection.
     pub fn from_certificate(certificate: &[u8]) -> Self {
         let fingerprint = fingerprint_for("", certificate);
-        let subject = format!("cert:{}", hex_prefix(&fingerprint, 8));
+        let subject = format!("cert:{}", hex_prefix(&fingerprint, 16));
         Self {
             kind: IdentityKind::MutualTls,
             subject,
@@ -76,23 +80,28 @@ impl PeerIdentity {
 
     /// Attach the verified principal name for this certificate.
     ///
-    /// The fingerprint is recomputed over the subject, so two identities that
-    /// differ only in name never compare equal.
+    /// The subject is a **label**; the fingerprint stays the digest of the
+    /// certificate bytes, because that is what a transport presents at dispatch.
+    /// Recomputing it here would break every binding made before the name was
+    /// attached. Two identities for the same certificate with different subjects
+    /// are distinct values (equality includes the subject) but share a
+    /// fingerprint, which is exactly the binding key.
     pub fn with_subject(self, subject: impl Into<String>) -> Self {
-        let subject = subject.into();
         Self {
-            fingerprint: fingerprint_for(&subject, &self.fingerprint),
-            subject,
-            kind: self.kind,
+            subject: subject.into(),
+            ..self
         }
     }
 
     /// The loopback identity admitted by [`IdentityPolicy::trust_loopback`].
+    ///
+    /// It is a **relaxed** identity, not a peer: every local process shares it,
+    /// so [`AdmittedIdentity::can_bind`] refuses to bind a capability to it.
     pub fn loopback() -> Self {
         Self {
             kind: IdentityKind::Loopback,
             subject: "loopback".to_string(),
-            fingerprint: fingerprint_for("loopback", b"loopback"),
+            fingerprint: loopback_fingerprint(),
         }
     }
 
@@ -138,10 +147,52 @@ impl PeerIdentity {
 fn fingerprint_for(subject: &str, evidence: &[u8]) -> [u8; FINGERPRINT_LEN] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(FINGERPRINT_DOMAIN);
-    hasher.update(&(subject.len() as u32).to_le_bytes());
+    // A subject is a label (a certificate SAN or a fixed word); `u32` framing is
+    // unambiguous for anything a certificate can carry. A longer one is refused
+    // rather than truncated into a colliding framing.
+    let length = u32::try_from(subject.len()).unwrap_or(u32::MAX);
+    hasher.update(&length.to_le_bytes());
     hasher.update(subject.as_bytes());
     hasher.update(evidence);
     *hasher.finalize().as_bytes()
+}
+
+fn loopback_fingerprint() -> [u8; FINGERPRINT_LEN] {
+    fingerprint_for("loopback", b"loopback")
+}
+
+/// Whether a fingerprint names a peer that can hold a binding.
+///
+/// The all-zero fingerprint is the anonymous constant and the loopback
+/// fingerprint is shared by every local process: binding to either would make
+/// the capability usable by a peer that never proved anything.
+pub fn bindable(fingerprint: [u8; FINGERPRINT_LEN]) -> bool {
+    fingerprint != [0u8; FINGERPRINT_LEN] && fingerprint != loopback_fingerprint()
+}
+
+/// The fingerprint a peer presents, or `None` when it presented no identity.
+///
+/// An anonymous peer has no fingerprint. Comparing its zero constant as a value
+/// would let a capability bound to `[0; 32]` match it, so the absence has to be
+/// modelled as absence.
+pub fn presented_fingerprint(peer: Option<&PeerIdentity>) -> Option<[u8; FINGERPRINT_LEN]> {
+    peer.filter(|identity| !identity.is_anonymous())
+        .map(PeerIdentity::fingerprint)
+}
+
+/// Compare a presented fingerprint with a bound one without a short circuit.
+///
+/// The value is a public label, so this is defence in depth: a caller learns
+/// nothing usable from the comparison's timing either way.
+pub fn matches(presented: Option<[u8; FINGERPRINT_LEN]>, bound: [u8; FINGERPRINT_LEN]) -> bool {
+    let Some(presented) = presented else {
+        return false;
+    };
+    let mut difference = 0u8;
+    for (left, right) in presented.iter().zip(bound.iter()) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 fn hex_prefix(bytes: &[u8; FINGERPRINT_LEN], len: usize) -> String {
@@ -199,11 +250,12 @@ impl AdmittedIdentity {
 
     /// True when a capability may be bound to this peer.
     ///
-    /// Only an authenticated or explicitly loopback peer can be bound: an
-    /// unauthenticated peer has no stable identity to bind to, so introduction
-    /// to it is refused rather than recorded as a wildcard.
+    /// Only a **certificate** peer can hold a binding. A loopback peer is shared
+    /// by every local process and an unauthenticated peer is nobody in
+    /// particular, so a capability bound to either would be usable by a peer
+    /// that never proved anything. An unbound capability works for both.
     pub fn can_bind(&self) -> bool {
-        self.trust != TrustLevel::Unauthenticated
+        self.trust == TrustLevel::Authenticated
     }
 }
 

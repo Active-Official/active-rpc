@@ -2,7 +2,25 @@
 
 ## Unreleased
 
-Hardening from the R-09 (transports) and R-10 (bulk) audit rounds.
+Hardening from the R-09 (transports), R-10 (bulk) and R-11 (identity) audit
+rounds.
+
+### Identity
+
+- **An anonymous peer presents no fingerprint.** Binding to the all-zero
+  constant used to match one; the kernel now models "no identity" as absence at
+  every check and refuses a zero binding at mint, attenuation, restore and record
+  parse (`rpc/identity`). Comparisons are constant-time.
+- **A loopback peer cannot hold a binding.** Every local process shares that
+  identity, so a capability bound to it was a capability for the whole host.
+  Binding requires a verified certificate; loopback may use unbound capabilities.
+- **Introduction binds the subtree.** `introduce_to` binds the capability and
+  every live capability derived from it, so a child minted beforehand cannot stay
+  usable by another peer or transferable over a channel.
+- `with_subject` is a label: it no longer re-hashes the fingerprint, which is the
+  binding key.
+- `Agent::call_peer` takes the `AdmittedIdentity` the policy returned, so mint and
+  dispatch share one gate.
 
 ### Bulk transfer
 

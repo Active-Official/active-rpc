@@ -24,7 +24,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
-| R-11 | identity | `src/identity.rs` | pending | — | — |
+| R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
 | R-12 | replay | `src/replay.rs` | pending | — | — |
 | R-13 | receipts | `src/receipts.rs` | pending | — | — |
 | R-14 | wasm tools | `src/wasm_tool.rs` | pending | — | — |
@@ -194,6 +194,33 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-11 identity - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `2361b7d`.
+No critical. Three highs were fail-open binding paths, two mediums were contract
+and availability, three lows defence-in-depth. All fixed here.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the all-zero (anonymous) fingerprint is a wildcard: `bound_to([0;32])` matched an anonymous peer, contradicting I-13 and the API docs | **fixed**: `identity::presented_fingerprint` models "no identity" as `None`; `identity::matches` is a constant-time compare; the kernel uses both at all five enforcement sites, and `mint`/`attenuate`/`restore`/`from_json` refuse a zero binding; `a_zero_fingerprint_binding_is_refused` |
+| 2 | high | every loopback peer shares one *bindable* fingerprint, so a capability bound to `admit(None, true)` was usable by any local process (and by a co-hosted TLS terminator) | **fixed**: `AdmittedIdentity::can_bind` requires `TrustLevel::Authenticated`; `mint_bound`/`introduce_to` refuse a loopback peer; the deployment guide and ADR-0011 say so; `a_loopback_peer_cannot_hold_a_binding`, and the policy test now asserts the refusal |
+| 3 | high | the verification contract was honour-system: `PeerIdentity::from_certificate` accepts any bytes and `admit` returns `Authenticated` without touching them | **fixed in documentation and types**: `from_certificate` states it is record-keeping, not proof; `Agent::call_peer` takes the `AdmittedIdentity` the policy returned, so mint and dispatch share one gate; `call_peer_uses_the_admitted_identity` |
+| 4 | medium | `with_subject` re-hashed the fingerprint, so attaching a SAN broke every binding and the "digest of the certificate" claim | **fixed**: the subject is a label and the fingerprint is untouched; the identity value still includes the label. `certificate_identities_are_stable_and_subject_sensitive` now pins that |
+| 5 | medium | `introduce_to` bound only the root; children minted earlier stayed usable by another peer and transferable | **fixed**: introduction binds the live subtree (validated first: a descendant bound to another peer refuses the introduction); `introduction_binds_the_existing_subtree` |
+| 6 | low | the default `cert:` label was 8 bytes of the fingerprint, and the subject length was framed as `u32` | **fixed**: 16 bytes; the length is `u32::try_from` with a saturated fallback rather than a truncating cast |
+| 7 | low | `bound_to` accepted zeros and rebinding; the record parser accepted a zero binding while rejecting a zero record id | **fixed** with #1: the kernel validates every path that sets a binding, and `CapabilityRecord::from_json` refuses an unbindable fingerprint |
+| 8 | low | five fingerprint comparisons short-circuited | **fixed**: `identity::matches` folds the difference; the value is a public label, so this is defence in depth |
+
+Documented residual: a caller that fabricates a `PeerIdentity` in-process can bind
+to it. No wire path reaches that — the QUIC transport reads only the leaf rustls
+verified, HTTP/2 and the bridge present no identity, and an envelope has no
+identity field — and the kernel treats the value as the caller's claim about its
+own connection.
+
+Gate: `cargo test --all-features` 518 passed, 0 failed; `--no-default-features`
+469 passed; clippy and fmt clean in three configurations; control plane 30 and
+CLI 17 pass; the identity and bulk suites pass in `rust:1.88-bookworm`.
 
 ### R-10 bulk transfer - 2026-11-01 (round 1)
 

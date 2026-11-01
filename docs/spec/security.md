@@ -22,7 +22,7 @@ that would violate one stops and needs an ADR.
 | I-10 | Fail-closed validation: malformed, truncated, overlapping, cyclic or over-budget input is rejected with a stable code. |
 | I-11 | No ambient authority: no hidden global permission in the kernel, tools or transports. |
 | I-12 | Domain operations run only under a valid capability and within budget. |
-| I-13 | Identity binding: a capability introduced to one authenticated peer is refused for every other peer. |
+| I-13 | Identity binding: a capability introduced to one authenticated peer is refused for every other peer, including that peer's derived subtree. |
 
 ## 1. Assets
 
@@ -70,8 +70,8 @@ that would violate one stops and needs an ADR.
 | Shared-memory overwrite | frames are refused rather than wrapping over unread data | `shm` |
 | Stream splicing (QUIC / bridge) | one stream per call, framed length, per-frame gRPC prefix | `quic`, `connect` |
 | Resource exhaustion via lanes | per-lane call budget and lane destruction | `lane`, `Kernel::call` |
-| Capability replay by another peer | an introduced capability is bound to the peer's verified fingerprint; dispatch and channel transfer refuse a different or missing identity | `identity`, `Kernel::call_as` |
-| Loopback relaxation used off-host | the policy decides from connection addresses; `strict()` refuses loopback without a certificate | `IdentityPolicy` |
+| Capability replay by another peer | an introduced capability is bound to the peer's verified fingerprint; dispatch and channel transfer refuse a different or missing identity, and an anonymous peer presents no fingerprint at all | `identity`, `Kernel::call_as` |
+| Loopback relaxation used off-host | the policy decides from connection addresses; `strict()` refuses loopback without a certificate, and a loopback peer cannot hold a binding because every local process shares that identity | `IdentityPolicy` |
 | A claimed certificate treated as identity | only a certificate the TLS stack verified produces a `PeerIdentity`; the verifier trusts a deployment CA | `transport::quic` |
 | HPACK amplification (a small compressed block decoding to a huge header list) | the server advertises `SETTINGS_MAX_HEADER_LIST_SIZE = 32 KiB` and checks the decoded list (name + value + 32 per field) and a 64-field cap before touching the request | `transport::http2::MAX_HEADER_LIST`, `handle_stream` |
 | Stream-count amplification | `SETTINGS_MAX_CONCURRENT_STREAMS = 128`; window sizes bound flow-control buffering | `transport::http2`, `transport::quic::MAX_CONCURRENT_STREAMS` |

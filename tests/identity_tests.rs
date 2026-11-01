@@ -65,7 +65,12 @@ fn loopback_is_relaxed_by_default_and_strict_policy_refuses_it() {
         .expect("loopback admitted");
     assert_eq!(admitted.trust(), TrustLevel::LoopbackRelaxed);
     assert_eq!(admitted.identity().kind(), IdentityKind::Loopback);
-    assert!(admitted.can_bind());
+    // Every local process shares the loopback identity, so a capability bound
+    // to it would be usable by a peer that proved nothing.
+    assert!(
+        !admitted.can_bind(),
+        "a loopback peer cannot hold a binding"
+    );
 
     let error = IdentityPolicy::strict()
         .admit(None, true)
@@ -111,9 +116,12 @@ fn certificate_identities_are_stable_and_subject_sensitive() {
     assert_eq!(first.fingerprint_hex().len(), 64);
 
     let renamed = first.clone().with_subject("agent-alpha");
-    assert_ne!(renamed.fingerprint(), first.fingerprint());
+    // The subject is a label; the fingerprint is the certificate digest the
+    // transport presents, so a rename must not move the binding key.
+    assert_eq!(renamed.fingerprint(), first.fingerprint());
     assert_eq!(renamed.subject(), "agent-alpha");
     assert_eq!(renamed.kind(), IdentityKind::MutualTls);
+    assert_ne!(renamed, first, "the identity value includes the label");
 }
 
 #[test]
@@ -488,4 +496,136 @@ fn quic_dispatches_a_bound_capability_only_for_the_bound_peer() {
     assert_eq!(stranger_response.kind, Kind::Error);
     assert_eq!(stranger_response.method, "rpc/identity");
     server.shutdown();
+}
+
+/// The all-zero fingerprint is the anonymous constant. Binding to it would make
+/// the capability usable by a peer that proved nothing, so the kernel refuses it
+/// at mint instead of storing a wildcard.
+#[test]
+fn a_zero_fingerprint_binding_is_refused() {
+    let agent = Agent::with_secret([0x61; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let error = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]).bound_to([0u8; 32]))
+        .expect_err("an anonymous binding is a wildcard");
+    assert_eq!(error.code(), "rpc/identity");
+
+    // The dispatch comparison itself must also treat an anonymous peer as
+    // presenting no fingerprint at all.
+    let anonymous = PeerIdentity::anonymous();
+    assert_eq!(
+        active_rpc::identity::presented_fingerprint(Some(&anonymous)),
+        None
+    );
+    assert!(!active_rpc::identity::matches(None, [0u8; 32]));
+    assert!(!active_rpc::identity::bindable([0u8; 32]));
+    assert!(!active_rpc::identity::bindable(
+        PeerIdentity::loopback().fingerprint()
+    ));
+}
+
+/// Every local process shares the loopback identity, so a capability bound to it
+/// would be usable by any of them.
+#[test]
+fn a_loopback_peer_cannot_hold_a_binding() {
+    let agent = Agent::with_secret([0x62; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let loopback = IdentityPolicy::default()
+        .admit(None, true)
+        .expect("loopback admitted");
+    let error = agent
+        .mint_bound(&loopback, provider, 0, CapAttrs::new(&["echo"]))
+        .expect_err("a loopback peer cannot be bound");
+    assert_eq!(error.code(), "rpc/identity");
+
+    let unbound = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("unbound cap");
+    let error = agent
+        .introduce_to(&unbound, &loopback)
+        .expect_err("a loopback peer cannot receive an introduction");
+    assert_eq!(error.code(), "rpc/identity");
+}
+
+/// A child minted before the introduction must travel with it: otherwise the
+/// unbound child is usable by another peer and transferable over a channel.
+#[test]
+fn introduction_binds_the_existing_subtree() {
+    let agent = Agent::with_secret([0x63; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice_id = identity(b"alice-subtree");
+    let alice = admitted(&alice_id);
+    let root = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("root");
+    let child = agent
+        .attenuate(&root, CapAttrs::new(&["echo"]))
+        .expect("child");
+    agent
+        .introduce_to(&root, &alice)
+        .expect("introduction binds the tree");
+    let lane = agent.create_lane("main", Budget::default()).expect("lane");
+
+    let error = agent
+        .call(lane, &child, "echo", vec![])
+        .expect_err("the child travels with the root");
+    assert_eq!(error.code(), "rpc/identity");
+
+    let promise = agent
+        .call_peer(
+            lane,
+            &child,
+            &alice,
+            "echo",
+            vec![Arg::value(Value::Int(1))],
+        )
+        .expect("the bound peer may use the child");
+    agent.run();
+    assert_eq!(promise.value().expect("value"), Value::Int(1));
+
+    let channel = agent
+        .create_channel("ops", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
+    let error = agent
+        .send_as(
+            Some(alice.identity()),
+            lane,
+            channel,
+            Value::text("x"),
+            &[child],
+        )
+        .expect_err("a bound child cannot be transferred");
+    assert_eq!(error.code(), "rpc/identity");
+}
+
+/// `call_peer` is the typed gate: an admitted identity works, a different one is
+/// refused exactly like `call_as`.
+#[test]
+fn call_peer_uses_the_admitted_identity() {
+    let agent = Agent::with_secret([0x65; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(&identity(b"alice-call-peer"));
+    let bob = admitted(&identity(b"bob-call-peer"));
+    let cap = agent
+        .mint_bound(&alice, provider, 0, CapAttrs::new(&["echo"]))
+        .expect("bound cap");
+    let lane = agent.create_lane("main", Budget::default()).expect("lane");
+
+    let promise = agent
+        .call_peer(
+            lane,
+            &cap,
+            &alice,
+            "echo",
+            vec![Arg::value(Value::text("hi"))],
+        )
+        .expect("admitted peer may call");
+    agent.run();
+    assert_eq!(promise.value().expect("value"), Value::text("hi"));
+
+    let error = agent
+        .call_peer(lane, &cap, &bob, "echo", vec![])
+        .expect_err("another admitted peer is refused");
+    assert_eq!(error.code(), "rpc/identity");
 }

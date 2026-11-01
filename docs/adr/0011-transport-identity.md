@@ -27,16 +27,22 @@ introduction is a bearer token with no audience.
    default requires an identity and relaxes loopback only; `strict()` requires a
    certificate even on loopback; `local()` admits anonymous peers for
    development and marks them unbindable. `loopback` must come from connection
-   addresses, never from a header.
+   addresses, never from a header. A **loopback** peer is admissible but *not*
+   bindable: every local process shares that one identity, so a binding to it
+   would be a binding to the host. An anonymous peer presents no fingerprint at
+   all, and the kernel refuses the all-zero constant as a binding.
 3. **`CapAttrs::bound_to`** records the fingerprint a capability was introduced
-   to. Dispatch (`call_as`) refuses a bound capability when the presented
-   identity is missing or different (`rpc/identity`). `send_as` refuses to
-   transfer a bound capability over a channel: a channel cannot prove who reads
-   the message, so delegation across an identity boundary is an explicit
-   `introduce_to`.
+   to. Dispatch (`call_as`, `call_peer`) refuses a bound capability when the
+   presented identity is missing, anonymous or different (`rpc/identity`).
+   Binding validates: a zero or loopback fingerprint is refused at mint, at
+   attenuation and at export. `send_as` refuses to transfer a bound capability
+   over a channel: a channel cannot prove who reads the message, so delegation
+   across an identity boundary is an explicit `introduce_to`.
 4. **Attenuation is monotone for binding.** A child inherits the parent's
    binding; it may add a binding when the parent has none; it may never change
-   or drop one. Rebinding is `rpc/attenuation-escalation`.
+   or drop one. Rebinding is `rpc/attenuation-escalation`. `introduce_to` binds
+   the capability **and every live capability derived from it**, so a child
+   minted before the introduction cannot stay unbound.
 5. **QUIC mutual TLS is the first implementation.** `QuicServer::start_mutual_tls`
    verifies a client certificate against a CA and hands the identity to the
    handler. `QuicClient::connect_mutual_tls` presents a client certificate.
