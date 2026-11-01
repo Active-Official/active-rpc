@@ -359,7 +359,7 @@ fn revocation_kills_the_capability_and_its_children() {
     let (agent, _provider, cap) = agent_with_module();
     let lane = agent.create_lane("main", Budget::default()).unwrap();
     let child = agent.attenuate(&cap, CapAttrs::new(&["stats"])).unwrap();
-    agent.revoke(&cap);
+    agent.revoke(&cap).expect("revoke");
     let error = agent
         .call(lane, &child, "stats", vec![])
         .expect_err("revoked child");
@@ -866,7 +866,7 @@ fn capability_lifecycle_matches_the_bounded_model() {
                     handles.push(handles[0].clone());
                 }
                 2 => {
-                    agent.revoke(&handles[0]);
+                    agent.revoke(&handles[0]).expect("revoke");
                     revoked = true;
                 }
                 3 => {

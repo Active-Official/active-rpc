@@ -70,12 +70,25 @@ resurrection:
 - the id is new (and differs even in the same kernel);
 - the authority is exactly the record's, with the record's absolute deadline as
   the remaining TTL, so a restored capability cannot outlive the original;
-- the capability is bound to the admitted peer. An unbound record becomes bound;
-  a record bound to another peer is refused with `rpc/identity`.
+- the capability is bound to the admitted peer. A record bound to another peer
+  is refused with `rpc/identity`. Export itself refuses a capability that names
+  no peer: a credential that restores for anybody is not a credential, and an
+  earlier unbound export would escape a later `introduce_to`;
+- one live capability per credential. A second restore of the same record while
+  a copy is live is refused (`rpc/persistence`), because revocation walks ids
+  and could not reach an independent copy.
 
 Restore is refused (`rpc/persistence`) unless the agent enabled durable
 capabilities, a seal key is configured and the seal verifies, and the provider
-is registered. A tombstoned record id is `rpc/revoked`. A record whose deadline
+is registered. A tombstoned record id is `rpc/revoked`.
+
+Tombstones live in memory, so a process restart would otherwise resurrect every
+record exported before the kill switch. A deployment replays its persistent kill
+list with `Agent::tombstone_record` at startup and can read the set back with
+`record_is_tombstoned` and `record_tombstone_count`. Only a durable record is
+tombstoned (an ephemeral one can never be restored) and the set has a ceiling: a
+new durable mint is refused rather than evicting a tombstone, because eviction
+is fail-open. A record whose deadline
 has passed is refused, and so is one whose clock mode differs from the restoring
 kernel's (ADR-0015).
 

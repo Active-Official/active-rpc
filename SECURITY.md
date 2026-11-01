@@ -52,8 +52,15 @@ capability id at rest (it is a bearer token).
   policy is compared against that effective policy, so "adding a policy" cannot
   grant process execution.
 - Durable records are credentials: a record is accepted only if its seal
-  verifies under the deployment key, and a revoked capability's record id is
-  tombstoned so an earlier export cannot revive it (ADR-0010).
+  verifies under the deployment key, it names the peer it was issued to, and it
+  is the only live copy of that credential. A revoked capability's record id is
+  tombstoned; a deployment replays its kill list at startup, because tombstones
+  are memory-only (ADR-0010).
+- A capability's budget bounds its whole subtree even after the parent handle is
+  dropped: an ancestor's record and meter live while a derived capability can
+  still call through it.
+- Provider callbacks (`on_drop`) and provider code (`invoke`) run with no kernel
+  borrow held, and a provider panic cannot wedge the kernel.
 - Secret material is represented by `Value::Secret`, never by bytes.
 - Every frame is bounded and rejected at the boundary; the capability registry,
   the attenuation chain depth and a negotiated capability table have ceilings.

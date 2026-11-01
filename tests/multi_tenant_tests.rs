@@ -164,7 +164,7 @@ fn event_logs_carry_only_the_local_tenants_capabilities() {
 fn revocation_is_scoped_to_the_agent_that_holds_the_capability() {
     let (first, first_cap, first_lane) = tenant(0x77);
     let (second, second_cap, second_lane) = tenant(0x88);
-    first.revoke(&first_cap);
+    first.revoke(&first_cap).expect("revoke");
     let error = call_text(&first, first_lane, &first_cap, "revoked")
         .expect_err("revoked capability must be refused");
     assert!(matches!(error, Error::Revoked(_)) || error.code() == "rpc/revoked");

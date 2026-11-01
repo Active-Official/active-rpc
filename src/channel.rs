@@ -25,6 +25,21 @@ use crate::value::Value;
 /// memory without bound.
 pub const MAX_QUEUED_PER_CHANNEL: usize = 4_096;
 
+/// Largest queued payload a channel may hold, in bytes.
+///
+/// The message count alone is not a memory ceiling: 4 096 messages of the
+/// largest frame a peer can send is 256 GiB. The byte ceiling is what a sender
+/// actually has to pay for.
+pub const MAX_QUEUED_BYTES: u64 = 64 << 20;
+
+/// Wire size of one queued message: payload, transferred ids and topic name.
+fn queued_size(payload: &Value, caps: &[CapId], topic: Option<&str>) -> u64 {
+    payload
+        .wire_size()
+        .saturating_add((caps.len() as u64).saturating_mul(16))
+        .saturating_add(topic.map_or(0, |name| name.len() as u64))
+}
+
 /// Channel identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChannelId(pub u64);
@@ -87,6 +102,8 @@ pub struct Channel {
     closed: bool,
     /// Lanes subscribed to this channel.
     pub subscribers: BTreeSet<u64>,
+    /// Payload bytes currently queued.
+    queued_bytes: u64,
     /// Total messages sent (including those already received).
     pub sent: u64,
     /// Total messages received.
@@ -102,6 +119,7 @@ impl Channel {
             direction,
             queue: VecDeque::new(),
             next_sequence: 0,
+            queued_bytes: 0,
             closed: false,
             subscribers: BTreeSet::new(),
             sent: 0,
@@ -146,6 +164,10 @@ impl Channel {
         if self.queue.len() >= MAX_QUEUED_PER_CHANNEL {
             return Err(Error::BudgetExceeded("channel queue"));
         }
+        let bytes = queued_size(&payload, &caps, topic);
+        if self.queued_bytes.saturating_add(bytes) > MAX_QUEUED_BYTES {
+            return Err(Error::BudgetExceeded("channel bytes"));
+        }
         let message = Message {
             from,
             payload,
@@ -155,6 +177,7 @@ impl Channel {
         };
         self.next_sequence += 1;
         self.sent += 1;
+        self.queued_bytes = self.queued_bytes.saturating_add(bytes);
         self.queue.push_back(message.clone());
         Ok(message)
     }
@@ -188,6 +211,8 @@ impl Channel {
         match self.queue.remove(index) {
             Some(message) => {
                 self.received += 1;
+                let bytes = queued_size(&message.payload, &message.caps, message.topic.as_deref());
+                self.queued_bytes = self.queued_bytes.saturating_sub(bytes);
                 Ok(Some(message))
             }
             None => Ok(None),
@@ -197,6 +222,11 @@ impl Channel {
     /// Peek at the oldest message without consuming it.
     pub fn peek(&self) -> Option<&Message> {
         self.queue.front()
+    }
+
+    /// Payload bytes currently queued.
+    pub fn queued_bytes(&self) -> u64 {
+        self.queued_bytes
     }
 
     /// Number of queued messages.

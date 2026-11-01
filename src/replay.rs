@@ -487,7 +487,7 @@ impl Recorder {
             .get(cap as usize)
             .cloned()
             .ok_or_else(|| Error::Replay(format!("capability ordinal {cap} does not exist")))?;
-        self.agent.revoke(&handle);
+        self.agent.revoke(&handle)?;
         self.ops.push(Op::Revoke { cap });
         self.capture()?;
         Ok(())

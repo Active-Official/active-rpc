@@ -50,6 +50,8 @@ fn peer(certificate: &[u8]) -> PeerIdentity {
     PeerIdentity::from_certificate(certificate)
 }
 
+/// A durable capability bound to `durable-owner`: a record must name the
+/// peer it was issued to, so an unbound one cannot be exported at all.
 fn durable_agent() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle) {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
@@ -57,7 +59,10 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle) {
     let provider = agent.register(Box::new(Echo));
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
-    let cap = agent.mint(provider, 0, attrs).expect("durable cap");
+    let owner = admitted(b"durable-owner");
+    let cap = agent
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect("durable cap");
     (agent, provider, cap)
 }
 
@@ -76,11 +81,15 @@ fn a_durable_capability_round_trips_through_a_record() {
     assert!(!text.contains("***SECRET***"));
 
     // Restore for an admitted peer: same authority, new id, bound to the peer.
+    // The source handle is released first: one live capability per credential,
+    // so a record is not a way to mint a second copy of a live grant.
+    let original = cap.id();
+    drop(cap);
     let owner = admitted(b"durable-owner");
     let restored = agent.restore_capability(&parsed, &owner).expect("restore");
     assert_ne!(
         restored.id(),
-        cap.id(),
+        original,
         "restore re-mints, it does not resurrect"
     );
     let lane = agent
@@ -144,10 +153,18 @@ fn restore_refuses_a_passed_deadline() {
     let provider = agent.register(Box::new(Echo));
     let mut attrs = CapAttrs::new(&["echo"]).with_ttl_ms(100);
     attrs.persistence = CapPersistence::Durable;
-    let cap = agent.mint(provider, 0, attrs).expect("cap");
+    let owner = admitted(b"durable-owner");
+    let cap = agent.mint_bound(&owner, provider, 0, attrs).expect("cap");
     let record = agent.export_capability(&cap).expect("export before expiry");
+    drop(cap);
+    // Advance the clock past the deadline through another capability.
+    let other = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("clock cap");
     let lane = agent.create_lane("clock", Budget::default()).expect("lane");
-    let promise = agent.call(lane, &cap, "echo", Vec::new()).expect("advance");
+    let promise = agent
+        .call(lane, &other, "echo", Vec::new())
+        .expect("advance");
     agent.run();
     let _ = promise.value();
     let error = agent
@@ -174,13 +191,15 @@ fn restore_refuses_a_record_bound_to_another_peer() {
         .restore_capability(&record, &admitted(b"owner-b"))
         .expect_err("a bound record must not move");
     assert_eq!(error.code(), "rpc/identity");
-    // The same peer restores it.
+    // The same peer restores it, once the source handle is gone.
+    let original = cap.id();
+    drop(cap);
     let restored = agent
         .restore_capability(&record, &admitted(b"owner-a"))
         .expect("restore for the bound peer");
     // Restore always re-mints, even in the same kernel: a record is authority
     // metadata, not an id.
-    assert_ne!(restored.id(), cap.id());
+    assert_ne!(restored.id(), original);
 }
 
 #[test]
@@ -225,8 +244,10 @@ fn a_restored_capability_keeps_the_original_deadline() {
     let provider = agent.register(Box::new(Echo));
     let mut attrs = CapAttrs::new(&["echo"]).with_ttl_ms(1_000);
     attrs.persistence = CapPersistence::Durable;
-    let cap = agent.mint(provider, 0, attrs).expect("cap");
+    let owner = admitted(b"durable-owner");
+    let cap = agent.mint_bound(&owner, provider, 0, attrs).expect("cap");
     let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
     let owner = admitted(b"durable-owner");
     let restored = agent.restore_capability(&record, &owner).expect("restore");
     // The restored deadline is the original absolute one: at t=1000 it is
@@ -261,7 +282,9 @@ fn a_restored_capability_keeps_the_original_deadline() {
         .value()
         .expect_err("the restored deadline must hold at dispatch");
     assert_eq!(error.code(), "rpc/revoked");
-    // And the record cannot be restored after that point either.
+    // And the record cannot be restored after that point either. The restored
+    // handle is released first, so the deadline is what refuses it.
+    drop(restored);
     let record_error = agent
         .restore_capability(&record, &owner)
         .expect_err("the record's deadline passed");

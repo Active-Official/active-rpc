@@ -105,7 +105,10 @@ fn a_wall_clock_record_does_not_restore_unbounded_in_virtual_mode() {
     let provider = source.register(Box::new(Echo));
     let mut attrs = CapAttrs::new(&["echo"]).durable();
     attrs.ttl_ms = Some(60_000);
-    let cap = source.mint(provider, 0, attrs).expect("durable cap");
+    let owner = admitted(b"peer");
+    let cap = source
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect("durable cap");
     let record = source.export_capability(&cap).expect("export");
 
     let target = Agent::with_secret([0x6d; 32]);
@@ -259,8 +262,9 @@ fn restore_refuses_an_ambiguous_provider_name() {
     source.set_durable_capabilities(true);
     source.set_record_seal_key([0x9d; 32]);
     let provider = source.register(Box::new(Echo));
+    let owner = admitted(b"peer");
     let cap = source
-        .mint(provider, 0, CapAttrs::new(&["echo"]).durable())
+        .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]).durable())
         .expect("cap");
     let record = source.export_capability(&cap).expect("export");
 
@@ -284,8 +288,9 @@ fn a_record_carries_its_clock_mode() {
     source.set_record_seal_key([0x9e; 32]);
     source.use_wall_clock(true);
     let provider = source.register(Box::new(Echo));
+    let owner = admitted(b"peer");
     let cap = source
-        .mint(provider, 0, CapAttrs::new(&["echo"]).durable())
+        .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]).durable())
         .expect("cap");
     let record = source.export_capability(&cap).expect("export");
     assert!(record.wall_clock);

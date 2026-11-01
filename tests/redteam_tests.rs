@@ -321,7 +321,7 @@ fn threat_revocation_and_lifetime_edges() {
     // Calling through a dropped handle is refused: the registry no longer knows
     // the id.
     let leftover = agent.import(cap.id());
-    agent.revoke(&cap);
+    agent.revoke(&cap).expect("revoke");
     assert_eq!(
         agent
             .call(lane, &leftover, "stats", vec![])
@@ -453,7 +453,7 @@ fn counting_agent() -> (
 fn review_revocation_after_queueing_prevents_invocation() {
     let (agent, calls, cap, lane) = counting_agent();
     let promise = agent.call(lane, &cap, "ping", vec![]).unwrap();
-    agent.revoke(&cap);
+    agent.revoke(&cap).expect("revoke");
     let error = promise.value().expect_err("revoked before dispatch");
     assert_eq!(error.code(), "rpc/revoked");
     assert_eq!(calls.load(Ordering::SeqCst), 0, "provider must not run");

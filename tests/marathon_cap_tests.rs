@@ -97,10 +97,15 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     (agent, provider)
 }
 
+/// A durable capability bound to the peer that restores it: a record must
+/// name its peer, so an unbound one cannot be exported.
 fn durable_cap(agent: &Agent, provider: active_rpc::ProviderId) -> CapHandle {
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
-    agent.mint(provider, 0, attrs).expect("durable cap")
+    let owner = admitted(b"owner");
+    agent
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect("durable cap")
 }
 
 /// A promise argument was a placeholder when the scope check ran; the value it
@@ -228,7 +233,7 @@ fn a_revoked_durable_capability_cannot_be_restored() {
     let (agent, provider) = durable_agent();
     let cap = durable_cap(&agent, provider);
     let record = agent.export_capability(&cap).expect("export");
-    agent.revoke(&cap);
+    agent.revoke(&cap).expect("revoke");
     let error = agent
         .restore_capability(&record, &admitted(b"revive"))
         .expect_err("a revoked record must not restore");

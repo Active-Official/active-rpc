@@ -57,7 +57,7 @@ fn revocation_reaches_a_grandchild_through_a_dropped_intermediate() {
         .attenuate(&child, CapAttrs::new(&["echo"]))
         .expect("grandchild");
     drop(child); // the intermediate record is removed
-    agent.revoke(&root);
+    agent.revoke(&root).expect("revoke");
     let error = settle(&agent, lane, &grandchild).expect_err("the grandchild must be revoked");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -99,7 +99,7 @@ fn an_idempotent_replay_is_refused_after_revoke() {
         .expect("first");
     agent.run();
     first.value().expect("ok");
-    agent.revoke(&cap);
+    agent.revoke(&cap).expect("revoke");
     let error = agent
         .call_idempotent(lane, &cap, "echo", Vec::new(), "key-1")
         .expect_err("a replay must re-check liveness");

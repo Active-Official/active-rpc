@@ -15,8 +15,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | ID | Section | Paths | State | Findings (fixed / rejected / open) | Commits |
 |----|---------|-------|-------|------------------------------------|---------|
 | R-01 | wire ARP1 | `src/wire.rs` | CLEAN | 6 fixed, 2 rejected, 0 open | this commit |
-| R-02 | kernel dispatch | `src/kernel.rs` | round 2: CLEAN for critical/high/medium | 16 fixed / 2 rejected / 2 low open (contract) | this commit |
-| R-03 | capabilities | `src/cap.rs` | round 1: 20 fixed, 0 open | 20 fixed / 0 rejected / 0 open | this commit |
+| R-02 | kernel dispatch | `src/kernel.rs` | CLEAN (rounds 1-3) | 24 fixed / 2 rejected / 2 low open (contract) | this commit |
+| R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-2) | 29 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | pending | — | — |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | pending | — | — |
 | R-06 | budget | `src/budget.rs` | pending | — | — |
@@ -49,6 +49,49 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-02 kernel dispatch - 2026-11-01 (round 3)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, repository tool
+access. Tests: `tests/marathon_round2_fixes_tests.rs`; twelve of its thirteen
+tests fail on the pre-fix tree (one of them hangs, which the reviewer predicted:
+"control-flow certain; not executed"). The thirteenth exercises API that only
+exists after the fix and passes with an accessor shim, so it is evidence for the
+API and not for the defect.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| H-1 | high | export stamped the export-time clock mode, not the deadline's domain | **fixed**: `CapRecord.wall_clock` is set at mint and inherited by attenuation; export writes it and attenuation refuses a parent whose deadline is in another domain; `a_record_keeps_the_clock_mode_its_deadline_was_taken_in`, `attenuation_refuses_a_clock_mode_change` |
+| H-2 | high | dropping the parent handle freed the ancestor meters, so every child spent the grant again | **fixed**: `CapRecord.descendants` keeps an ancestor's record and meter alive while any derived capability can call through it, and removal cascades up the lineage; `dropping_the_parent_handle_keeps_the_subtree_bound` |
+| H-3 | high | a provider that awaited a promise spun forever (regression from round 2) | **fixed**: `await_promise` refuses with `rpc/provider` while a dispatch owns the kernel; `a_provider_awaiting_its_own_call_is_refused` (hangs pre-fix) |
+| M-4 | medium | a provider unwind left `dispatching` set and the provider removed, wedging the kernel | **fixed**: `DispatchGuard` restores both on unwind; `a_panicking_provider_does_not_wedge_the_kernel` |
+| M-5 | medium | `on_drop` ran with the kernel mutably borrowed, so any agent call panicked | **fixed**: every notification is queued and delivered by `deliver_pending_drops` with no borrow held; a provider that is already being notified queues the nested drop; `a_provider_may_use_the_agent_inside_on_drop` |
+| M-6 | medium | revoking one restored copy left its siblings alive | **fixed**: restore refuses a second live copy of a credential and revoke dooms every live capability carrying a tombstoned record id; `restoring_the_same_record_twice_is_refused` |
+| M-7 | medium | `send` charged nothing and needed no capability | **fixed**: a send charges the lane's bytes (payload plus one id per transfer) and one lane call, and a channel has a queued-byte ceiling; `a_send_consumes_the_lane_byte_budget`, `a_channel_accounts_for_queued_bytes` |
+| L-8 | low | a vanished provider was `rpc/invalid-argument` at call time and `rpc/provider` at dispatch | **fixed**: both are `rpc/provider` |
+
+### R-03 capabilities - 2026-11-01 (round 2)
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | a derived capability freed its ancestors' meters when the parent handle dropped | **fixed** with the same `descendants` accounting as R-02 H-2 |
+| F2 | high | tombstones were memory-only, so a restart resurrected a revoked durable record, and `revoke` on a dropped record was a silent no-op | **fixed**: `Agent::tombstone_record` / `record_is_tombstoned` / `record_tombstone_count` let a deployment replay its kill list, and `revoke` returns `Result` with `rpc/unknown-capability` for an id that is not live; `a_tombstone_replayed_at_startup_refuses_the_record` (API-addition test) |
+| F3 | medium | one record restored into N independent grants | **fixed**: `restoring_the_same_record_twice_is_refused` |
+| F4 | low | every revocation tombstoned an ephemeral record id, forever | **fixed**: only durable records are tombstoned, and the set has a ceiling (`MAX_TOMBSTONES`) that refuses a new durable mint instead of evicting; `a_revocation_tombstones_only_durable_records` |
+| F5 | low | the deferred ref-op drain was one-shot, so a retain queued during the drain could be overtaken | **fixed**: `enqueue_or_apply` keeps FIFO across both paths and the drain loops (bounded); exercised by `a_drop_raised_inside_on_drop_is_delivered_once` |
+| F6 | medium | `on_drop` ran under a borrow | **fixed** with R-02 M-5 |
+| F7 | low | `revoke` rebuilt the whole ancestor index per call | **fixed**: `Kernel.children` is maintained on attenuation and drop, so a revocation walks only its subtree. Event volume stays one `CapRevoked` per record (the honest record of the action); the aggregate event is not worth a contract change |
+| F8 | medium | `await_promise` livelocked inside a provider | **fixed** with R-02 H-3 |
+| F9 | low | an unbound record exported before `introduce_to` restored for any peer | **fixed**: export refuses an unbound durable capability (`rpc/identity`); `an_unbound_durable_capability_cannot_be_exported` |
+
+Carried as accepted residuals (documented, not defects): `max_bytes` bounds
+ingress, not egress; `Value::wire_size` recurses under the decoder's nesting
+limit; a revoked capability keeps its registry slot while a handle exists;
+rotating the seal key invalidates earlier records (by design, documented in
+ADR-0010).
+
+Gate: `cargo test --all-features` 414 passed, 0 failed; clippy clean on both
+feature sets; fmt clean.
 
 ### R-02 kernel dispatch - 2026-11-01 (round 2)
 

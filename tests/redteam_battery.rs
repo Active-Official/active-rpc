@@ -329,7 +329,7 @@ fn h2_10_revoke() -> std::result::Result<(), String> {
     let promise = agent
         .call(lane, &cap, "ping", vec![])
         .map_err(|e| e.to_string())?;
-    agent.revoke(&cap);
+    agent.revoke(&cap).expect("revoke");
     let _ = promise.value();
     if calls.load(Ordering::SeqCst) != 0 {
         return Err("a revoked queued call reached the provider".into());
@@ -438,7 +438,7 @@ fn h2_13_race() -> std::result::Result<(), String> {
     let promise = agent
         .call(lane, &cap, "ping", vec![])
         .map_err(|e| e.to_string())?;
-    agent.revoke(&cap);
+    agent.revoke(&cap).expect("revoke");
     agent.run();
     let _ = promise.value();
     if calls.load(Ordering::SeqCst) != 0 {

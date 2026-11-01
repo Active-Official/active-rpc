@@ -219,7 +219,7 @@ fn a_revoked_capability_is_refused_over_the_bridge() {
     let lane = agent
         .create_lane("bridge", Budget::default())
         .expect("lane");
-    agent.revoke(&cap);
+    agent.revoke(&cap).expect("revoke");
     let responses = over_bridge(
         vec![request(15, "echo", vec![descriptor(cap.id(), &["echo"])])],
         move |envelope| dispatch(&agent, lane, envelope),

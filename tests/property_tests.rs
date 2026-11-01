@@ -198,7 +198,7 @@ proptest! {
         let promise = agent
             .call(lane, &cap, "echo", vec![Arg::text(payload)])
             .expect("queued");
-        agent.revoke(&cap);
+        agent.revoke(&cap).expect("revoke");
         let error = promise.value().expect_err("revoked call must fail");
         prop_assert_eq!(error.code(), "rpc/revoked");
     }
@@ -379,7 +379,7 @@ proptest! {
         let first = agent
             .call(lane, &cap, "echo", vec![Arg::text(payload)])
             .expect("first");
-        agent.revoke(&cap);
+        agent.revoke(&cap).expect("revoke");
         let second = agent.call(lane, &cap, "echo", vec![Arg::Promise(first.id())]);
         prop_assert!(second.is_err(), "a revoked capability queued a pipelined call");
         prop_assert_eq!(second.err().unwrap().code(), "rpc/revoked");

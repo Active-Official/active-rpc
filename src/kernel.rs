@@ -45,6 +45,13 @@ pub const MAX_LANES: usize = 4_096;
 /// unbounded allocation a peer could drive by asking for attenuations.
 pub const MAX_CAPS: usize = 65_536;
 
+/// Ceiling on tombstoned durable record ids.
+///
+/// A tombstone is authority metadata that must never be evicted (eviction is
+/// fail-open), so the set is bounded instead: past this point a new durable
+/// capability is refused rather than letting an operator lose a kill switch.
+pub const MAX_TOMBSTONES: usize = 65_536;
+
 /// Deepest capability chain attenuation may build.
 ///
 /// Each link copies its ancestors, so the memory of a chain grows with the
@@ -310,13 +317,20 @@ pub struct Kernel {
     channel_ceiling: usize,
     /// Drops whose provider was checked out for a call.
     deferred_drops: Vec<(ProviderId, u64, CapId)>,
+    /// Reverse index: for each capability, the capabilities derived from it.
+    ///
+    /// Maintained on attenuation and on drop so revocation walks the subtree
+    /// instead of rescanning every capability per doomed id.
+    children: BTreeMap<CapId, BTreeSet<CapId>>,
     /// Reference operations that arrived while the kernel was borrowed.
     ///
     /// Shared with the handle control, which cannot borrow the kernel from a
     /// `Drop` that runs inside a dispatch phase.
-    deferred_refops: Rc<std::cell::RefCell<Vec<(CapId, bool)>>>,
+    deferred_refops: Rc<std::cell::RefCell<VecDeque<(CapId, bool)>>>,
     /// True while a dispatch batch has its provider checked out.
     dispatching: bool,
+    /// Providers whose `on_drop` is running right now.
+    delivering: BTreeSet<ProviderId>,
     idempotency: BTreeMap<(CapId, String, String), PromiseId>,
     allow_durable: bool,
     idempotency_order: VecDeque<(CapId, String, String)>,
@@ -342,7 +356,7 @@ pub struct Kernel {
 pub(crate) struct HandleControl {
     cell: KernelCell,
     /// Reference operations that could not take the kernel borrow.
-    deferred_refops: Rc<std::cell::RefCell<Vec<(CapId, bool)>>>,
+    deferred_refops: Rc<std::cell::RefCell<VecDeque<(CapId, bool)>>>,
 }
 
 impl HandleControl {
@@ -367,28 +381,145 @@ impl HandleControl {
     }
 }
 
+impl HandleControl {
+    /// Apply now, or queue behind earlier operations.
+    ///
+    /// The kernel is borrowed by the dispatch phase that is running a provider;
+    /// losing an operation would leave a handle that is never matched by a
+    /// release (or a release that never balances a retain). Queueing behind a
+    /// non-empty queue also keeps FIFO order across the two paths: a retain
+    /// queued from `on_drop` must not be overtaken by a release that can take
+    /// the borrow immediately.
+    fn enqueue_or_apply(&self, id: CapId, retain: bool) {
+        if !self.deferred_refops.borrow().is_empty() {
+            self.deferred_refops.borrow_mut().push_back((id, retain));
+            return;
+        }
+        match self.cell.try_borrow_mut() {
+            Ok(mut kernel) => {
+                Self::apply(&mut kernel, id, retain);
+                drop(kernel);
+                // A release may have queued a provider notification; deliver it
+                // now, with the borrow released.
+                deliver_pending_drops(&self.cell);
+            }
+            Err(_) => self.deferred_refops.borrow_mut().push_back((id, retain)),
+        }
+    }
+}
+
 impl CapControl for HandleControl {
     fn retain(&self, id: CapId) {
-        match self.cell.try_borrow_mut() {
-            Ok(mut kernel) => Self::apply(&mut kernel, id, true),
-            // The kernel is borrowed by the dispatch phase that is running a
-            // provider. Losing the operation would leave a handle that is never
-            // matched by a release (or a release that never balances a
-            // retain), so it is queued and applied at the next borrow point.
-            Err(_) => self.deferred_refops.borrow_mut().push((id, true)),
-        }
+        self.enqueue_or_apply(id, true);
     }
 
     fn release(&self, id: CapId) {
-        match self.cell.try_borrow_mut() {
-            Ok(mut kernel) => Self::apply(&mut kernel, id, false),
-            Err(_) => self.deferred_refops.borrow_mut().push((id, false)),
-        }
+        self.enqueue_or_apply(id, false);
     }
 }
 
 /// Shared kernel cell.
 pub type KernelCell = Rc<RefCell<Kernel>>;
+
+/// Restores the kernel after one dispatch batch, on the normal path and on
+/// unwind.
+///
+/// A provider runs with no borrow held and may panic; without this guard a
+/// caught panic would leave `dispatching` set and the provider removed, so
+/// every later `run()` would be a no-op and queued work would never settle.
+fn deliver_pending_drops(cell: &KernelCell) {
+    for _ in 0..65_536 {
+        let pending: Vec<(ProviderId, u64, CapId)> = {
+            let Ok(mut kernel) = cell.try_borrow_mut() else {
+                return;
+            };
+            if kernel.dispatching {
+                // An outer dispatch owns the checked-out provider; its tail
+                // flushes when it is done.
+                return;
+            }
+            std::mem::take(&mut kernel.deferred_drops)
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let mut requeued = 0usize;
+        for (provider_id, object, cap) in pending {
+            let already_delivering = match cell.try_borrow_mut() {
+                Ok(mut kernel) => {
+                    if kernel.delivering.contains(&provider_id) {
+                        true
+                    } else {
+                        kernel.delivering.insert(provider_id);
+                        false
+                    }
+                }
+                Err(_) => return,
+            };
+            if already_delivering {
+                // A drop raised from inside this provider's own `on_drop`. The
+                // provider is not in the registry while its callback runs, so
+                // the entry waits for the outer delivery to finish.
+                if let Ok(mut kernel) = cell.try_borrow_mut() {
+                    kernel.deferred_drops.push((provider_id, object, cap));
+                }
+                requeued += 1;
+                continue;
+            }
+            let provider = match cell.try_borrow_mut() {
+                Ok(mut kernel) => kernel.providers.remove(&provider_id),
+                Err(_) => return,
+            };
+            let Some(mut provider) = provider else {
+                // The provider is gone: there is nobody to notify.
+                if let Ok(mut kernel) = cell.try_borrow_mut() {
+                    kernel.delivering.remove(&provider_id);
+                }
+                continue;
+            };
+            provider.on_drop(object, cap);
+            if let Ok(mut kernel) = cell.try_borrow_mut() {
+                kernel.providers.insert(provider_id, provider);
+                kernel.delivering.remove(&provider_id);
+                // The callback may have dropped handles, which queue more work.
+                kernel.apply_deferred_refops();
+            } else {
+                return;
+            }
+        }
+        if requeued > 0 {
+            // The outer delivery owns the rest; it runs again as soon as its
+            // own callback returns.
+            return;
+        }
+    }
+}
+
+struct DispatchGuard<'a> {
+    agent: &'a Agent,
+    provider_id: ProviderId,
+    provider: Option<Box<dyn Provider>>,
+}
+
+impl DispatchGuard<'_> {
+    fn provider_mut(&mut self) -> &mut Box<dyn Provider> {
+        self.provider
+            .as_mut()
+            .expect("the guard holds the provider")
+    }
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        let Ok(mut kernel) = self.agent.cell.try_borrow_mut() else {
+            return;
+        };
+        kernel.dispatching = false;
+        if let Some(provider) = self.provider.take() {
+            kernel.providers.insert(self.provider_id, provider);
+        }
+    }
+}
 
 /// One agent: an owner of lanes, channels, capabilities and promises.
 #[derive(Clone)]
@@ -417,7 +548,7 @@ impl Agent {
 
     /// Create an agent with a fixed secret (tests, deterministic replays).
     pub fn with_secret(secret: [u8; 32]) -> Self {
-        let deferred_refops = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let deferred_refops = Rc::new(std::cell::RefCell::new(VecDeque::new()));
         let kernel = Kernel {
             secret,
             providers: BTreeMap::new(),
@@ -444,6 +575,7 @@ impl Agent {
             channel_ceiling: crate::channel::MAX_QUEUED_PER_CHANNEL,
             deferred_drops: Vec::new(),
             dispatching: false,
+            delivering: BTreeSet::new(),
             idempotency: BTreeMap::new(),
             allow_durable: false,
             idempotency_order: VecDeque::new(),
@@ -456,6 +588,7 @@ impl Agent {
             next_receipt: 0,
             record_key: None,
             revoked_records: BTreeSet::new(),
+            children: BTreeMap::new(),
             deferred_refops: Rc::clone(&deferred_refops),
         };
         let cell: KernelCell = Rc::new(RefCell::new(kernel));
@@ -613,6 +746,14 @@ impl Agent {
         let key = kernel
             .record_key
             .ok_or_else(|| Error::persistence("no record seal key is configured"))?;
+        if record.attrs.bound_to.is_none() {
+            // A credential that names no peer would restore for anybody. The
+            // record's binding is a snapshot, so an earlier unbound export
+            // would also escape a later `introduce_to`.
+            return Err(Error::Identity(
+                "a durable record must name the peer it was bound to",
+            ));
+        }
         let mut record = crate::persistence::CapabilityRecord {
             provider: provider.name().to_string(),
             object: record.object,
@@ -625,7 +766,7 @@ impl Agent {
             tool_policy: record.attrs.tool_policy.clone(),
             bound_to: record.attrs.bound_to,
             expires_at: record.expires_at,
-            wall_clock: kernel.wall_clock,
+            wall_clock: record.wall_clock,
             record_id: record.record_id,
             seal: None,
         };
@@ -663,18 +804,29 @@ impl Agent {
                 "the record is not sealed by this deployment",
             ));
         }
-        if self
-            .cell
-            .borrow()
-            .revoked_records
-            .contains(&record.record_id)
         {
-            return Err(Error::Revoked(record_token(&record.record_id)));
+            let kernel = self.cell.borrow();
+            if kernel.revoked_records.contains(&record.record_id) {
+                return Err(Error::Revoked(record_token(&record.record_id)));
+            }
         }
+        // The binding is about the caller, so it is reported before any state
+        // of this kernel.
         if let Some(bound) = record.bound_to {
             if bound != peer.fingerprint() {
                 return Err(Error::Identity("the record is bound to a different peer"));
             }
+        }
+        // Restoring is a re-mint, so N restores of one credential would be N
+        // independent grants that a single revocation cannot reach.
+        if self
+            .cell
+            .borrow()
+            .caps
+            .values()
+            .any(|live| live.record_id == record.record_id && !live.revoked)
+        {
+            return Err(Error::persistence("the record is already live"));
         }
         let provider = {
             let kernel = self.cell.borrow();
@@ -774,12 +926,18 @@ impl Agent {
         if kernel.caps.len() >= MAX_CAPS {
             return Err(Error::BudgetExceeded("caps"));
         }
+        if attrs.persistence == crate::cap::CapPersistence::Durable
+            && kernel.revoked_records.len() >= MAX_TOMBSTONES
+        {
+            return Err(Error::BudgetExceeded("tombstones"));
+        }
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, None);
         let expires_at = attrs.ttl_ms.map(|ttl| kernel.now_ms.saturating_add(ttl));
         let mut record = CapRecord::new(id, provider, object, attrs.clone());
         record.expires_at = expires_at;
+        record.wall_clock = kernel.wall_clock;
         record.record_id = CapId::derive_record(&kernel.secret, serial, None);
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.caps.insert(id, record);
@@ -911,6 +1069,13 @@ impl Agent {
         if record.lineage.len() >= MAX_LINEAGE_DEPTH {
             return Err(Error::Escalation("capability chain is too deep"));
         }
+        if record.expires_at.is_some() && record.wall_clock != kernel.wall_clock {
+            // The parent's absolute deadline lives in another clock domain; the
+            // clamp below would mix the two.
+            return Err(Error::InvalidArgument(
+                "the parent's deadline is in another clock domain",
+            ));
+        }
         let attrs = record.attrs.attenuate(attrs)?;
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
@@ -930,6 +1095,16 @@ impl Agent {
             (None, Some(ttl)) => Some(kernel.now_ms.saturating_add(ttl)),
             (None, None) => None,
         };
+        child.wall_clock = record.wall_clock;
+        // Every ancestor now has a live descendant: its record and meter must
+        // survive the parent handle, or the subtree's budget is freed and each
+        // child spends the grant again.
+        for ancestor in &child.lineage {
+            if let Some(parent_record) = kernel.caps.get_mut(ancestor) {
+                parent_record.descendants = parent_record.descendants.saturating_add(1);
+            }
+            kernel.children.entry(*ancestor).or_default().insert(id);
+        }
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.caps.insert(id, child);
         kernel.push_event(Event::CapMinted {
@@ -955,37 +1130,45 @@ impl Agent {
     /// rescanning every capability per doomed id: revoking a wide tree is a
     /// linear walk. Each doomed record also tombstones its durable record id,
     /// so a record exported before the revocation cannot restore the authority.
-    pub fn revoke(&self, cap: &CapHandle) {
+    pub fn revoke(&self, cap: &CapHandle) -> Result<()> {
         let mut kernel = self.cell.borrow_mut();
-        // id -> the capabilities that name it as an ancestor. `lineage` holds
-        // every ancestor including the immediate parent, and survives the
-        // dropped intermediate that would break a `parent` walk.
-        let mut children: BTreeMap<CapId, Vec<CapId>> = BTreeMap::new();
-        for (child, record) in &kernel.caps {
-            for ancestor in &record.lineage {
-                children.entry(*ancestor).or_default().push(*child);
-            }
-            if let Some(parent) = record.parent {
-                if !record.lineage.contains(&parent) {
-                    children.entry(parent).or_default().push(*child);
-                }
-            }
+        let id = cap.id();
+        if !kernel.caps.contains_key(&id) {
+            return Err(Error::UnknownCapability(cap_token(id)));
         }
         let mut doomed = BTreeSet::new();
-        let mut stack = vec![cap.id()];
+        let mut stack = vec![id];
         while let Some(id) = stack.pop() {
             if !doomed.insert(id) {
                 continue;
             }
-            if let Some(descendants) = children.get(&id) {
+            if let Some(descendants) = kernel.children.get(&id) {
                 stack.extend(descendants.iter().copied());
+            }
+        }
+        // Every capability restored from the same record is revoked with it: a
+        // peer that restored twice before the kill switch must not keep a copy.
+        let record_ids: BTreeSet<[u8; 32]> = doomed
+            .iter()
+            .filter_map(|id| kernel.caps.get(id).map(|record| record.record_id))
+            .collect();
+        for (id, record) in &kernel.caps {
+            if record_ids.contains(&record.record_id) {
+                doomed.insert(*id);
             }
         }
         for id in doomed {
             let record_id = match kernel.caps.get_mut(&id) {
                 Some(record) => {
                     record.revoked = true;
-                    Some(record.record_id)
+                    // Only a durable record can ever be restored, so only its
+                    // id needs a tombstone; an ephemeral one would leak an
+                    // entry per mint/revoke cycle forever.
+                    if record.attrs.persistence == CapPersistence::Durable {
+                        Some(record.record_id)
+                    } else {
+                        None
+                    }
                 }
                 None => None,
             };
@@ -995,6 +1178,33 @@ impl Agent {
             kernel.push_event(Event::CapRevoked(id));
             kernel.metrics.revocations = kernel.metrics.revocations.saturating_add(1);
         }
+        Ok(())
+    }
+
+    /// Record a revocation tombstone from a deployment's persistent store.
+    ///
+    /// Tombstones live in memory, so process restarts would otherwise resurrect
+    /// every exported record. A deployment replays its kill list here at
+    /// startup; the ceiling is checked so the set can never grow without bound.
+    pub fn tombstone_record(&self, record_id: [u8; 32]) -> Result<()> {
+        let mut kernel = self.cell.borrow_mut();
+        if kernel.revoked_records.len() >= MAX_TOMBSTONES
+            && !kernel.revoked_records.contains(&record_id)
+        {
+            return Err(Error::BudgetExceeded("tombstones"));
+        }
+        kernel.revoked_records.insert(record_id);
+        Ok(())
+    }
+
+    /// Number of tombstoned durable record ids, for operators and tests.
+    pub fn record_tombstone_count(&self) -> usize {
+        self.cell.borrow().revoked_records.len()
+    }
+
+    /// True when a record id was tombstoned by a revocation.
+    pub fn record_is_tombstoned(&self, record_id: &[u8; 32]) -> bool {
+        self.cell.borrow().revoked_records.contains(record_id)
     }
 
     /// Create a lane.
@@ -1140,9 +1350,20 @@ impl Agent {
         caps: &[CapHandle],
     ) -> Result<u64> {
         let mut kernel = self.cell.borrow_mut();
-        let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
-        if lane_record.closed {
+        let (lane_closed, lane_budget, lane_bytes, lane_capacity) = {
+            let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+            (
+                lane_record.closed,
+                lane_record.budget,
+                lane_record.bytes,
+                lane_record.has_capacity(),
+            )
+        };
+        if lane_closed {
             return Err(Error::UnknownLane(lane.0));
+        }
+        if !lane_capacity {
+            return Err(Error::BudgetExceeded("lane call"));
         }
         let channel_record = kernel
             .channels
@@ -1186,11 +1407,28 @@ impl Agent {
             // holder drops it (see `channel.rs`).
             cap_ids.push(cap.id());
         }
+        // A message is lane traffic like a call: the lane's byte and call
+        // ceilings bound it, and every transferred id costs its wire size. A
+        // lane that spends nothing while filling a channel would let 4 096
+        // messages of 64 MiB sit in kernel memory it never paid for.
+        let bytes = payload
+            .wire_size()
+            .saturating_add((cap_ids.len() as u64).saturating_mul(16));
+        if bytes > lane_budget.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
+        }
+        if lane_bytes.saturating_add(bytes) > lane_budget.max_bytes {
+            return Err(Error::BudgetExceeded("lane byte"));
+        }
         let record = kernel
             .channels
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         let message = record.send(lane, payload, cap_ids.clone())?;
+        if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
+            lane_record.bytes = lane_record.bytes.saturating_add(bytes);
+            lane_record.completed = lane_record.completed.saturating_add(1);
+        }
         kernel.push_event(Event::ChannelSend {
             channel,
             sequence: message.sequence,
@@ -1534,7 +1772,9 @@ impl Agent {
         let provider = kernel
             .providers
             .get(&record.provider)
-            .ok_or(Error::InvalidArgument("provider disappeared"))?;
+            .ok_or(Error::Provider {
+                code: "rpc/provider".to_string(),
+            })?;
         if !provider.has_method(method) {
             return Err(Error::MethodNotGranted {
                 method: method.to_string(),
@@ -1699,6 +1939,7 @@ impl Agent {
 
     /// Run until no job is queued. Returns the number of provider round-trips.
     pub fn run(&self) -> u64 {
+        self.flush_drops();
         loop {
             let batch = {
                 let mut kernel = self.cell.borrow_mut();
@@ -1746,6 +1987,14 @@ impl Agent {
 
     /// Await a promise, running the kernel until it settles.
     pub fn await_promise(&self, promise: &PromiseHandle) -> Result<Value> {
+        if self.cell.borrow().dispatching {
+            // A provider is running and the kernel cannot make progress for it:
+            // the outer dispatch owns the queue. Spinning here would burn CPU
+            // with no error and no settlement.
+            return Err(Error::Provider {
+                code: "rpc/provider".to_string(),
+            });
+        }
         loop {
             {
                 let kernel = self.cell.borrow();
@@ -2204,7 +2453,7 @@ impl Agent {
             let provider = kernel.providers.remove(&provider_id);
             (provider_id, provider)
         };
-        let Some(mut provider) = provider else {
+        let Some(provider) = provider else {
             let mut kernel = self.cell.borrow_mut();
             kernel.dispatching = false;
             for job_id in batch {
@@ -2216,6 +2465,14 @@ impl Agent {
                 );
             }
             return;
+        };
+        // The guard restores `dispatching` and re-inserts the provider even if
+        // provider code unwinds: a panic must not leave the kernel wedged with
+        // no provider and a queue that never drains.
+        let mut guard = DispatchGuard {
+            agent: self,
+            provider_id,
+            provider: Some(provider),
         };
 
         for job_id in &batch {
@@ -2339,7 +2596,10 @@ impl Agent {
                         args,
                         ..job.call.clone()
                     };
-                    provider.invoke(object, &call).map(Response::into_value)
+                    guard
+                        .provider_mut()
+                        .invoke(object, &call)
+                        .map(Response::into_value)
                 }
             };
 
@@ -2393,19 +2653,21 @@ impl Agent {
             });
         }
 
-        let mut kernel = self.cell.borrow_mut();
-        kernel.dispatching = false;
-        // A drop that happened during the call saw no provider; deliver it now.
-        let deferred = std::mem::take(&mut kernel.deferred_drops);
-        for (id, object, cap) in deferred {
-            if id == provider_id {
-                provider.on_drop(object, cap);
-            } else {
-                // Another provider is still checked out by an outer dispatch.
-                kernel.deferred_drops.push((id, object, cap));
-            }
-        }
-        kernel.providers.insert(provider_id, provider);
+        // Restore the kernel, then deliver the drops that happened during the
+        // batch with no borrow held: `on_drop` is provider code and may call
+        // back into the agent.
+        drop(guard);
+        self.flush_drops();
+    }
+
+    /// Deliver queued provider notifications with no kernel borrow held.
+    ///
+    /// A drop can happen anywhere (a handle falling out of scope, a provider
+    /// dropping its own object), including inside a callback that already holds
+    /// a borrow. Delivery therefore always goes through the queue: take the
+    /// list under a short borrow, release it, then run provider code.
+    fn flush_drops(&self) {
+        deliver_pending_drops(&self.cell);
     }
 }
 
@@ -2436,24 +2698,55 @@ impl Kernel {
     /// The provider may be checked out for a call it is running; the drop is
     /// then queued and delivered when the batch finishes.
     fn drop_record(kernel: &mut Kernel, id: CapId) {
-        let Some(record) = kernel.caps.remove(&id) else {
-            return;
-        };
-        kernel.meters.remove(&id);
-        kernel.push_event(Event::CapDropped(id));
-        if let Some(provider) = kernel.providers.get_mut(&record.provider) {
-            provider.on_drop(record.object, id);
-        } else {
-            kernel
-                .deferred_drops
-                .push((record.provider, record.object, id));
+        let mut doomed = vec![id];
+        while let Some(id) = doomed.pop() {
+            let Some(record) = kernel.caps.get(&id) else {
+                continue;
+            };
+            // A descendant can still call through this capability, so the
+            // record, its meter and the provider's object stay alive.
+            if record.refs > 0 || record.descendants > 0 {
+                continue;
+            }
+            let Some(record) = kernel.caps.remove(&id) else {
+                continue;
+            };
+            kernel.meters.remove(&id);
+            kernel.push_event(Event::CapDropped(id));
+            kernel.queue_provider_drop(record.provider, record.object, id);
+            for ancestor in &record.lineage {
+                if let Some(parent) = kernel.caps.get_mut(ancestor) {
+                    parent.descendants = parent.descendants.saturating_sub(1);
+                    if parent.refs == 0 && parent.descendants == 0 {
+                        doomed.push(*ancestor);
+                    }
+                }
+                if let Some(children) = kernel.children.get_mut(ancestor) {
+                    children.remove(&id);
+                    if children.is_empty() {
+                        kernel.children.remove(ancestor);
+                    }
+                }
+            }
         }
     }
 
+    /// Queue a provider notification. Delivery happens with no kernel borrow
+    /// held (see [`Agent::flush_drops`]), because `on_drop` is provider code.
+    fn queue_provider_drop(&mut self, provider: ProviderId, object: u64, cap: CapId) {
+        self.deferred_drops.push((provider, object, cap));
+    }
+
     /// Apply reference operations that arrived while the kernel was borrowed.
+    ///
+    /// Drained in a loop because applying one operation can queue another (an
+    /// `on_drop` that clones a handle); the bound stops a pathological callback
+    /// from pinning the drain.
     fn apply_deferred_refops(&mut self) {
-        let ops: Vec<(CapId, bool)> = self.deferred_refops.borrow_mut().drain(..).collect();
-        for (id, retain) in ops {
+        for _ in 0..4096 {
+            let Some((id, retain)) = self.deferred_refops.borrow_mut().pop_front() else {
+                return;
+            };
             HandleControl::apply(self, id, retain);
         }
     }

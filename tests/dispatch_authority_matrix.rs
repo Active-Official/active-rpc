@@ -124,7 +124,7 @@ fn assert_code(result: active_rpc::Result<impl std::fmt::Debug>, expected: &str)
 fn call_refuses_a_revoked_capability() {
     let fixture = fixture(None);
     settle(&fixture.agent, fixture.lane, &fixture.cap, "echo").expect("live");
-    fixture.agent.revoke(&fixture.cap);
+    fixture.agent.revoke(&fixture.cap).expect("revoke");
     assert_code(
         settle(&fixture.agent, fixture.lane, &fixture.cap, "echo"),
         "rpc/revoked",
@@ -208,7 +208,7 @@ fn call_with_payload_shares_the_call_authority_rules() {
         .expect("live");
     fixture.agent.run();
     promise.value().expect("value");
-    fixture.agent.revoke(&fixture.cap);
+    fixture.agent.revoke(&fixture.cap).expect("revoke");
     assert_code(
         fixture
             .agent
@@ -230,7 +230,7 @@ fn publish_refuses_a_revoked_capability() {
             Value::text("a"),
         )
         .expect("live");
-    fixture.agent.revoke(&fixture.cap);
+    fixture.agent.revoke(&fixture.cap).expect("revoke");
     assert_code(
         fixture.agent.publish(
             fixture.lane,
@@ -328,7 +328,7 @@ fn send_refuses_a_revoked_capability() {
         .expect("live transfer");
     // A cap transferred, then revoked, is still refused for the sender's own
     // use and for a later transfer.
-    fixture.agent.revoke(&fixture.cap);
+    fixture.agent.revoke(&fixture.cap).expect("revoke");
     assert_code(
         fixture.agent.send(
             fixture.lane,
@@ -355,7 +355,7 @@ fn send_as_refuses_revoked_expired_and_bound_capabilities() {
     let revoked = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("revoked cap");
-    agent.revoke(&revoked);
+    agent.revoke(&revoked).expect("revoke");
     let owner = admitted(b"send-owner");
     let bound = agent
         .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]))
@@ -423,7 +423,7 @@ fn attenuate_refuses_a_revoked_or_expired_parent() {
         "rpc/revoked",
     );
 
-    live.agent.revoke(&live.cap);
+    live.agent.revoke(&live.cap).expect("revoke");
     assert_code(
         live.agent.attenuate(&live.cap, CapAttrs::new(&["echo"])),
         "rpc/revoked",
@@ -453,7 +453,7 @@ fn introduce_to_refuses_a_revoked_or_expired_capability() {
         "rpc/revoked",
     );
 
-    live.agent.revoke(&live.cap);
+    live.agent.revoke(&live.cap).expect("revoke");
     assert_code(live.agent.introduce_to(&live.cap, &owner), "rpc/revoked");
 }
 
@@ -493,7 +493,7 @@ fn revoking_a_parent_kills_its_descendants_at_every_entry_point() {
         .attenuate(&fixture.cap, CapAttrs::new(&["echo"]))
         .expect("child");
     settle(&fixture.agent, fixture.lane, &child, "echo").expect("child live");
-    fixture.agent.revoke(&fixture.cap);
+    fixture.agent.revoke(&fixture.cap).expect("revoke");
     assert_code(
         settle(&fixture.agent, fixture.lane, &child, "echo"),
         "rpc/revoked",

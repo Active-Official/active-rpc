@@ -1956,7 +1956,7 @@ impl PlaneCore {
         let queue_us = start.elapsed().as_secs_f64() * 1e6;
         self.stage("queue", "call queued before revoke", queue_us, true);
         let start = Instant::now();
-        self.agent.revoke(&cap);
+        self.agent.revoke(&cap).expect("revoke");
         let revoke_us = start.elapsed().as_secs_f64() * 1e6;
         self.stage("revoke", "capability revoked", revoke_us, true);
         let start = Instant::now();

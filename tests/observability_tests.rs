@@ -175,7 +175,7 @@ fn a_kernel_trace_has_monotonic_sequences_and_no_raw_ids() {
 
     // A refusal is an event too.
     let _ = agent.call(lane, &second, "missing-method", Vec::new());
-    agent.revoke(&second);
+    agent.revoke(&second).expect("revoke");
 
     let trace = agent.trace();
     assert!(!trace.is_empty());

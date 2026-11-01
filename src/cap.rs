@@ -504,6 +504,19 @@ pub struct CapRecord {
     pub revoked: bool,
     /// Absolute kernel time after which the capability is refused, in ms.
     pub expires_at: Option<u64>,
+    /// Clock mode `expires_at` was taken in: `true` for wall clock, `false`
+    /// for the virtual round-trip clock.
+    ///
+    /// The mode travels with the deadline. Reading one in the other domain
+    /// either extends a lease by decades or truncates it to nothing, so export
+    /// writes this field and restore refuses a mismatch.
+    pub wall_clock: bool,
+    /// Live capabilities that name this one in their lineage.
+    ///
+    /// An ancestor's record and meter stay alive while a descendant can still
+    /// call through it: otherwise dropping the parent handle would free the
+    /// subtree's budget and every child would spend the grant again.
+    pub descendants: u32,
     /// Stable identity of this capability's durable record.
     ///
     /// Derived from the kernel secret at mint time, so it is unforgeable and
@@ -526,6 +539,8 @@ impl CapRecord {
             refs: 1,
             revoked: false,
             expires_at: None,
+            wall_clock: false,
+            descendants: 0,
             record_id: [0u8; 32],
         }
     }

@@ -218,7 +218,7 @@ fn a_revoked_capability_cannot_publish() {
         .agent
         .create_channel("news", Direction::Both)
         .expect("channel");
-    fixture.agent.revoke(&cap);
+    fixture.agent.revoke(&cap).expect("revoke");
     let error = fixture
         .agent
         .publish(fixture.lane, channel, &cap, "a", Value::text("no"))
