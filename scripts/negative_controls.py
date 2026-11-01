@@ -98,6 +98,19 @@ CONTROLS = [
                 "find": "        meter.charge(call_bytes)?;\n",
                 "replace": "        meter.charge(0)?;\n",
             },
+            {
+                "file": "src/kernel.rs",
+                "find": "                meter.check(call_bytes)?;\n",
+                "replace": "                meter.check(0)?;\n",
+            },
+            {
+                # The dispatch-time re-check of a resolved argument list is the
+                # third guard: without it a mutated build still refuses the call
+                # and the control proves nothing.
+                "file": "src/kernel.rs",
+                "find": 'if failure.is_none() && resolved_bytes > job.call.budget.max_bytes {\n                            failure = Some(Error::BudgetExceeded("byte"));\n                        }\n',
+                "replace": 'if false {\n                            failure = Some(Error::BudgetExceeded("byte"));\n                        }\n',
+            },
         ],
         "suite": "redteam_tests",
         "test": "review_byte_budget_is_charged",
