@@ -91,6 +91,7 @@ fn every_event(cap: CapId) -> Vec<Event> {
             cap,
             dimension: "call".to_string(),
         },
+        Event::ReceiptsDropped { count: 1 },
         Event::ToolRefused {
             cap,
             reason: "tool not allowed".to_string(),

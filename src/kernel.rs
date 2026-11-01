@@ -761,11 +761,18 @@ impl Agent {
     ///
     /// A kernel that continues an existing log across a restart adopts the log's
     /// next sequence here. Sequences are otherwise monotonic from 1, and a log
-    /// refuses a receipt that does not follow its own order.
-    pub fn set_receipt_sequence(&self, next: u64) {
+    /// refuses a receipt that does not follow its own order. Zero is not a
+    /// sequence, and `u64::MAX` would be issued twice, so both are refused.
+    pub fn set_receipt_sequence(&self, next: u64) -> crate::Result<()> {
+        if next == 0 || next == u64::MAX {
+            return Err(Error::InvalidArgument(
+                "a receipt sequence must be 1..u64::MAX",
+            ));
+        }
         // `next_receipt` holds the last sequence issued, so the seal increments
         // before using it: storing `next - 1` makes the next receipt `next`.
-        self.cell.borrow_mut().next_receipt = next.saturating_sub(1);
+        self.cell.borrow_mut().next_receipt = next - 1;
+        Ok(())
     }
 
     /// Receipts the ring evicted, or that disabling cleared.
@@ -2517,6 +2524,9 @@ impl Agent {
             .find(|(id, job)| job.promise == promise.id && kernel.queue.contains(id))
             .map(|(id, _)| *id)
         {
+            // The caller answered before the kernel ran the call; the queued
+            // work is dropped, which is a refusal an audit must show.
+            kernel.record_queued_refusal(job_id, &Error::PromiseAlreadyResolved(promise.id.0));
             kernel.queue.retain(|queued| *queued != job_id);
             let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
             let deps = kernel
@@ -2786,6 +2796,7 @@ impl Agent {
             .find(|(id, job)| job.promise == promise.id && kernel.queue.contains(id))
             .map(|(id, _)| *id);
         if let Some(job_id) = queued {
+            kernel.record_queued_refusal(job_id, &Error::PromiseCancelled(promise.id.0));
             kernel.queue.retain(|id| *id != job_id);
             let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
             let deps = kernel
@@ -2866,6 +2877,7 @@ impl Agent {
             .map(|(id, job)| (*id, job.promise, job.lane.0))
             .collect();
         for (job_id, promise_id, lane) in queued {
+            kernel.record_queued_refusal(job_id, &Error::PromiseCancelled(promise_id.0));
             kernel.queue.retain(|queued_id| *queued_id != job_id);
             let deps = kernel
                 .jobs
@@ -3778,12 +3790,44 @@ impl Kernel {
         ordered
     }
 
+    /// Record a refusal for a queued job that is about to be dropped.
+    ///
+    /// A caller that cancels, resolves out of band or destroys a lane removes
+    /// work the kernel never dispatched. That is a decision the audit must show,
+    /// for the same reason `fail_job` records one.
+    fn record_queued_refusal(&mut self, job_id: u64, error: &Error) {
+        if !self.receipts_enabled {
+            return;
+        }
+        let Some(job) = self.jobs.get(&job_id).filter(|job| !job.receipted).cloned() else {
+            return;
+        };
+        self.seal_receipt(&job, Some(error));
+        if let Some(stored) = self.jobs.get_mut(&job_id) {
+            stored.receipted = true;
+        }
+    }
+
     /// Seal one receipt into the ring and update the ring's bookkeeping.
     ///
     /// Lives on `Kernel` so both the dispatch path (which borrows the cell) and
     /// `fail_job` (which is `&mut self`) record through the same code.
     fn seal_receipt(&mut self, job: &Job, refusal: Option<&Error>) {
-        self.next_receipt = self.next_receipt.saturating_add(1);
+        // A receipt records when the decision was taken. Only dispatch used to
+        // advance the virtual clock, so a kernel that continued a log across a
+        // restart and then refused a call before any dispatch sealed `at_ms = 0`
+        // and poisoned the whole export. Refresh from the wall clock here when
+        // the kernel follows it, and never move backwards.
+        if self.wall_clock {
+            self.now_ms = self.now_ms.max(wall_now_ms());
+        }
+        let Some(next) = self.next_receipt.checked_add(1) else {
+            // The sequence space is exhausted; a repeated sequence would make
+            // every later export fail, so the ring stops recording instead.
+            self.receipts_dropped = self.receipts_dropped.saturating_add(1);
+            return;
+        };
+        self.next_receipt = next;
         let decision = match refusal {
             Some(error) => crate::receipts::Decision::Refused(error.code().to_string()),
             None => crate::receipts::Decision::Admitted,
@@ -3818,17 +3862,7 @@ impl Kernel {
         // auditor can tell "no call" from "refused and undocumented". A job that
         // already has a receipt (admitted or refused at dispatch) is not
         // recorded twice.
-        let unrecorded = self
-            .jobs
-            .get(&job_id)
-            .filter(|job| !job.receipted && self.receipts_enabled)
-            .cloned();
-        if let Some(job) = unrecorded {
-            Kernel::seal_receipt(self, &job, Some(&error));
-            if let Some(stored) = self.jobs.get_mut(&job_id) {
-                stored.receipted = true;
-            }
-        }
+        self.record_queued_refusal(job_id, &error);
         let deps = self
             .jobs
             .get(&job_id)

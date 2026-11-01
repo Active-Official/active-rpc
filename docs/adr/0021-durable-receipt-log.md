@@ -49,8 +49,8 @@ record: len u32 LE | sequence u64 | at_ms u64
 - `head_hash()` returns the chain head so an operator can pin it out of band;
   without pinning, deleting a whole suffix leaves a shorter but self-consistent
   log, which `verify_against(expected_head)` detects.
-- The CLI drives it: `receipts dump`, `receipts verify [--secret-hex]
-  [--expect-head]`, `receipts show`.
+- The CLI drives it: `receipts dump`, `receipts verify (--receipt-key-file |
+  --expect-head | --chain-only)`, `receipts show`, `receipts repair`.
 
 ## Amendments (R-13, hostile review round 1)
 
@@ -63,7 +63,7 @@ v1 outright rather than carrying a second parser.
 |---|---|---|
 | F1 | `append_all` never checked sequence continuity, so a wrapped ring (after 1025 calls) wrote a log its own reader refused and left the file unusable | The writer computes the expected sequence from the header's `start` plus the record count; `create_starting_at` lets a wrapped ring export its retained window (test: `a_kernel_ring_that_wrapped_exports_cleanly`) |
 | F2 | A truncated prefix verified: dropping the last records leaves a shorter, self-consistent log | `verify_against(expected)` pins the head a verifier learned out of band; the CLI exposes it as `--expect-head` |
-| F3 | Append was unauthenticated and the CLI never checked MACs, so a writer without the secret could extend a log | `append_verified(secret, ..)` refuses a receipt this kernel did not seal; `receipts verify --secret-hex` checks MACs and says `chain-only (unauthenticated)` when it does not |
+| F3 | Append was unauthenticated and the CLI never checked MACs, so a writer without the key could extend a log | `append_verified(key, ..)` refuses a receipt this kernel did not seal; `receipts verify --receipt-key-file` checks MACs and says `chain-only (unauthenticated)` when it does not |
 | F4 | The receipt was sealed at queue time, so a call that dispatch refused (revoked, expired, identity mismatch) kept an "authorized" receipt | The seal happens at dispatch with the decision the kernel took; `Decision::{Admitted, Refused(code)}` is a record field, and the CLI prints it |
 | F5 | Concurrent appends could interleave and corrupt the chain | `LogLock` takes a `create_new` lock file with a bounded retry; a second writer refuses instead of writing |
 | F6 | Eviction and disable left no marker, so a short ring looked like a short history | `Agent::receipts_dropped()` counts evictions and clears; one `receipts.dropped` event marks the transition |

@@ -45,6 +45,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "channel.send",
     "channel.recv",
     "budget.exhausted",
+    "receipts.dropped",
     "tool.refused",
 ];
 

@@ -324,7 +324,9 @@ fn a_stale_lock_is_stolen_instead_of_blocking_forever() {
 fn create_honours_a_held_writer_lock() {
     let dir = sandbox("create-lock");
     let path = dir.join("receipts.arrl");
-    std::fs::write(path.with_extension("lock"), b"held").expect("lock");
+    // The lock name is the log name with `.lock` appended (not the extension
+    // replaced), so a log named `*.lock` cannot collide with its own lock.
+    std::fs::write(dir.join("receipts.arrl.lock"), b"held").expect("lock");
     let error = ReceiptLog::create(&path).expect_err("create must not truncate under a writer");
     assert_eq!(error.code(), "rpc/receipt");
     assert!(
@@ -394,7 +396,7 @@ fn a_second_session_continues_a_log() {
     let second = Agent::with_secret(SECRET);
     second.enable_receipts(true);
     second.use_wall_clock(true);
-    second.set_receipt_sequence(3);
+    second.set_receipt_sequence(3).expect("continue the log");
     session(&second, 2);
     let continued = second.receipts();
     assert_eq!(continued[0].sequence, 3);

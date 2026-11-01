@@ -26,7 +26,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
 | R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
-| R-13 | receipts | `src/receipts.rs` | round 1: 4 highs + 5 mediums + 4 lows; round 2: 3 highs + 6 mediums + 7 lows | 29 fixed / 0 rejected / 0 open | this commit |
+| R-13 | receipts | `src/receipts.rs` | rounds 1-3: 13 + 16 + 19 findings | 48 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | pending | — | — |
 | R-15 | observability | `src/observability.rs` | pending | — | — |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | pending | — | — |
@@ -194,6 +194,41 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-13 receipts - 2026-11-01 (round 3)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `67713dc`.
+Part A: all sixteen round-2 findings COMPLETELY FIXED. Part B: nineteen new
+findings, two high. All closed. It also caught a real CI failure before the run
+finished: the key file was written `0644`, so the unix permission check refused
+it (fixed with `set_permissions(0o600)` and verified in `rust:1.88`).
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N1 | high | the lock steal was check-then-unlink: two stealers could hand the lock to two writers, and a `Drop` then deleted a live lock | **fixed**: the steal is a `rename` (exactly one stealer moves that file) and `Drop` removes the lock only when the file's nonce is ours; `a_stale_lock_is_stolen_instead_of_blocking_forever`, `concurrent_writers_cannot_double_append` |
+| N2 | high | `repair` could cut an intact tail: a length field corrupted to another in-range value looks torn by declaration, so good records after it were discarded | **fixed**: `tail_holds_a_record` scans one record past the damage for any record that decodes and refuses the cut; `a_corrupted_length_field_is_not_cut_away` |
+| N3 | medium | a pre-dispatch refusal in a restarted session sealed `at_ms = 0`, which then poisoned the whole export | **fixed**: `seal_receipt` refreshes `now_ms` from the wall clock; `a_restarted_session_dates_its_first_refusal` |
+| N4 | medium | the CLI test was red on unix (key file `0644`) | **fixed**: `set_permissions(0o600)` under `cfg(unix)`, verified by running the CLI tests in the Linux image |
+| N5 | medium | `receipts.dropped` was outside the schema's closed set | **fixed**: `EVENT_NAMES`, a row in `docs/spec/observability.md`, and the variant in `every_event` |
+| N6 | medium | the lock path used `with_extension`, so a log named `*.lock` was its own lock and `a.arrl`/`a.json` shared one | **fixed**: `lock_path` appends `.lock` to the file name; `a_log_named_lock_keeps_its_own_lock_file` |
+| N7 | medium | readers took no lock, so a batch split across syscalls made a healthy live log look torn | **fixed**: `read_stable` re-reads once on a walk error, so a torn *read* clears and a torn *file* still fails |
+| N8 | low | the writer wait budget was ~1 s | **fixed**: backoff to 50 ms, about 3 s |
+| N9 | low | `set_receipt_sequence(u64::MAX)` repeated a sequence forever | **fixed**: the setter returns `Result` and refuses 0 and `u64::MAX`; the seal uses `checked_add`; `the_sequence_setter_refuses_zero_and_the_ceiling` |
+| N10 | low | "unchanged" was decided by size only, so a same-size replacement was trusted | **fixed**: the header's start sequence is compared too; the first version of this fix inverted the comparison and the new test caught it; `a_log_replaced_at_the_same_size_is_not_trusted` |
+| N11 | low | a failed `create` left an unrepairable file | **fixed**: the header is written to `<name>.writing` and renamed into place |
+| N12 | low | `repair` could return success for a log it did not fix | **fixed**: the surviving prefix must walk, and the tail scan refuses a ceiling failure |
+| N13 | low | `#[non_exhaustive]` is source-breaking, so 2.3.0 is not "additive" in the ADR-0006 sense | **fixed**: the CHANGELOG says so |
+| N14 | low | cancel and out-of-band resolve dropped queued work with no receipt | **fixed**: `record_queued_refusal` seals `rpc/promise-cancelled`/`rpc/promise-resolved`; `a_cancelled_call_is_recorded_as_a_refusal`, `an_out_of_band_resolve_is_recorded_as_a_refusal` |
+| N15 | low | `receipts repair` on a missing path exited 1 while every other command exits 2 | **fixed**: the same `exists()` check |
+| N16 | low | refusal messages dropped the path | **fixed**: every receipts message names the file |
+| N17 | low | `receipts dump` used `create` (start 1) and printed a re-read head | **fixed**: `create_starting_at(receipts[0].sequence)` and the snapshot's head |
+| N18 | low | test gaps: the snapshot MAC check was discarded, one test hard-coded 134, no coverage for a corrupted length, a `*.lock` log, the sequence ceiling or a restart | **fixed**: `tests/receipt_round3_tests.rs` (9) covers each; the MAC check is asserted |
+| N19 | low | stale docs still said receipts are sealed under "the kernel secret" | **fixed**: `receipts.rs` and ADR-0021 now say the derived receipt key |
+
+Gate (round 3): `cargo test --all-features` 572 passed, 0 failed across 65
+suites; `--no-default-features` 523 passed, 0 failed; clippy, fmt and
+`cargo doc -D warnings` clean on both feature sets; control plane 30 and CLI 17
+pass, and the CLI suite passes in `rust:1.88-bookworm`.
 
 ### R-13 receipts - 2026-11-01 (round 2)
 

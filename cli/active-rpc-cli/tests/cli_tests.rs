@@ -348,6 +348,13 @@ fn receipts_dump_verify_and_tamper_paths() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     std::fs::write(&key_path, format!("{key_hex}\n")).expect("write key");
+    // The reader refuses a key file other accounts can read (unix only).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod the key");
+    }
     let key_arg = key_path.to_str().expect("key path");
 
     // An unauthenticated check is not offered as "ok": it proves the chain and
@@ -407,6 +414,12 @@ fn receipts_dump_verify_and_tamper_paths() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     std::fs::write(&foreign_path, foreign_hex).expect("write key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&foreign_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod the key");
+    }
     let forged = run(&[
         "receipts",
         "verify",
@@ -424,6 +437,12 @@ fn receipts_dump_verify_and_tamper_paths() {
     // A non-ASCII key is a usage error, not a panic in the slicing code.
     let bad_key = dir.join("bad.key");
     std::fs::write(&bad_key, format!("a\u{20ac}{}", "0".repeat(60))).expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bad_key, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod the key");
+    }
     let panic_free = run(&[
         "receipts",
         "verify",
@@ -432,6 +451,11 @@ fn receipts_dump_verify_and_tamper_paths() {
         bad_key.to_str().unwrap(),
     ]);
     assert_eq!(panic_free.status.code(), Some(2), "{}", stderr(&panic_free));
+    assert!(
+        stderr(&panic_free).contains("64 hex characters"),
+        "the refusal names the format, not a slice panic: {}",
+        stderr(&panic_free)
+    );
 
     let show = run(&["receipts", "show", log_arg, "--limit", "2"]);
     assert!(show.status.success(), "{}", stderr(&show));

@@ -1099,14 +1099,20 @@ fn receipts_dump(flags: &BTreeMap<String, String>) -> CliResult {
         }
     }
     let receipts = agent.receipts();
-    let log = ReceiptLog::create(&output)
-        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+    let start = receipts.first().map_or(1, |receipt| receipt.sequence);
+    // A wrapped ring exports its retained window, not "sequence 1 onwards".
+    let log = ReceiptLog::create_starting_at(&output, start)
+        .map_err(|error| CliError::refused(format!("{}: {error} ({output:?})", error.code())))?;
     // The owner path: the writer proves it holds the receipt key, so the log
     // cannot be extended with fabricated records.
     log.append_verified(&agent.receipt_key(), &receipts)
-        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+        .map_err(|error| CliError::refused(format!("{}: {error} ({output:?})", error.code())))?;
     println!("wrote {} receipts to {:?}", receipts.len(), output);
-    println!("head {}", hex32(&log.head_hash().map_err(refusal)?));
+    // Print the head of the same read the append verified, not a second read.
+    let snapshot = log
+        .snapshot()
+        .map_err(|error| CliError::refused(format!("{}: {error} ({output:?})", error.code())))?;
+    println!("head {}", hex32(&snapshot.head()));
     Ok(())
 }
 
@@ -1140,16 +1146,16 @@ fn receipts_verify(path: &str, flags: &BTreeMap<String, String>) -> CliResult {
     // would then be one the MAC check never covered.
     let snapshot = log
         .snapshot()
-        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+        .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))?;
     if let Some(key) = key {
         snapshot
             .verify_macs(&key)
-            .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+            .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))?;
     }
     if let Some(expected) = expected {
         snapshot
             .verify_against(expected)
-            .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+            .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))?;
     }
     println!(
         "ok {} receipts, start {}, head {}{}",
@@ -1167,14 +1173,19 @@ fn receipts_verify(path: &str, flags: &BTreeMap<String, String>) -> CliResult {
 }
 
 fn receipts_repair(path: &str) -> CliResult {
+    // A missing path is a bad argument here too, so the exit class matches the
+    // other receipts commands.
+    if !std::path::Path::new(path).exists() {
+        return Err(CliError::usage(format!("no receipt log at {path:?}")));
+    }
     // Repair deliberately works without a valid handle: the file is damaged, so
     // `open` would refuse it.
     let discarded = ReceiptLog::repair(path)
-        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+        .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))?;
     let log = open_receipt_log(path)?;
     let snapshot = log
         .snapshot()
-        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+        .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))?;
     println!(
         "ok {} receipts kept, {} byte(s) of an interrupted write discarded, head {}",
         snapshot.len(),
@@ -1188,7 +1199,7 @@ fn receipts_show(path: &str, limit: usize) -> CliResult {
     let log = open_receipt_log(path)?;
     let snapshot = log
         .snapshot()
-        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+        .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))?;
     for receipt in snapshot.receipts().iter().take(limit) {
         // The method is quoted: it is stored text, and a raw newline would turn
         // one record into two lines of "evidence".

@@ -69,6 +69,7 @@ authority.
 | `channel.send` | `channel`, `channel_sequence` | a message was sent |
 | `channel.recv` | `channel`, `channel_sequence` | a message was received |
 | `budget.exhausted` | `cap`, `dimension` | a budget ceiling refused work |
+| `receipts.dropped` | `detail` | the receipt ring dropped records; `detail` carries the running total (evicted or cleared) |
 | `tool.refused` | `cap`, `detail` | a tool policy refused work |
 
 `tests/observability_tests.rs` fails if the code emits a name that is absent

@@ -2,8 +2,10 @@
 //!
 //! A receipt answers "was this call authorized, under which capability, and
 //! when" without carrying arguments, values or any secret material. Each
-//! receipt is authenticated with a keyed hash under the kernel secret, so a
-//! record cannot be edited or transplanted between kernels without detection.
+//! receipt is authenticated with a keyed hash under a key derived from the
+//! kernel secret ([`derive_receipt_key`]), so a record cannot be edited or
+//! transplanted between kernels without detection, and a verifier can be given
+//! the receipt key without the authority to mint capability ids.
 //!
 //! A receipt records the decision that *matters*: the one taken at dispatch,
 //! after the capability was re-checked for revocation, expiry and identity. A
@@ -291,6 +293,8 @@ impl Snapshot {
 /// Exclusive access to one log file, held for the length of an append.
 struct LogLock {
     path: std::path::PathBuf,
+    /// Written into the lock file: the only proof that this holder may remove it.
+    nonce: String,
 }
 
 /// Age after which a lock file is treated as abandoned.
@@ -302,15 +306,25 @@ struct LogLock {
 const LOCK_STALE_MS: u64 = 120_000;
 
 impl LogLock {
-    /// Take the log's lock, waiting briefly for a concurrent writer.
+    /// Take the log's lock, waiting for a concurrent writer.
     ///
     /// `create_new` is atomic on every supported platform: one writer wins. The
-    /// others retry for about a second, which covers a normal append, then
-    /// refuse rather than corrupt the chain. A lock older than `LOCK_STALE_MS`
-    /// is stolen: the process that made it is gone.
+    /// others retry with backoff, which covers a normal append (including a
+    /// large batch and its `sync_data`), then refuse rather than corrupt the
+    /// chain. A lock older than `LOCK_STALE_MS` is stolen atomically: the
+    /// stealer renames the file away, so two stealers cannot both proceed and a
+    /// steal cannot delete a lock that a live writer just created.
     fn acquire(log: &std::path::Path) -> Result<Self> {
-        let path = log.with_extension("lock");
-        for attempt in 0..200 {
+        let path = lock_path(log);
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        );
+        for attempt in 0..600u32 {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -318,27 +332,39 @@ impl LogLock {
             {
                 Ok(mut file) => {
                     use std::io::Write;
-                    // Diagnostics for the next writer: who holds it, and when.
+                    // The nonce proves ownership on drop; the pid and the start
+                    // time are diagnostics for an operator who finds a lock.
                     let _ = writeln!(
                         file,
-                        "pid {} started {}",
+                        "{nonce} pid {} started {}",
                         std::process::id(),
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|elapsed| elapsed.as_millis())
                             .unwrap_or(0)
                     );
-                    return Ok(Self { path });
+                    return Ok(Self { path, nonce });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     if attempt % 20 == 0 && stale(&path) {
-                        // Removing a stale lock races another stealer; losing
-                        // that race is harmless, because the retry just sees a
-                        // fresh lock or a free path.
-                        let _ = std::fs::remove_file(&path);
+                        // Rename is the steal: exactly one process moves *that*
+                        // file, so a stealer can never unlink a lock that a live
+                        // writer created after the staleness check.
+                        let stolen = path.with_file_name(format!(
+                            "{}.steal-{nonce}",
+                            path.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "receipt-lock".to_string())
+                        ));
+                        if std::fs::rename(&path, &stolen).is_ok() {
+                            let _ = std::fs::remove_file(&stolen);
+                        }
                         continue;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    // Backoff: 5 ms rising to 50 ms, about 3 s in total, so a
+                    // slow disk write is not mistaken for a dead writer.
+                    let step = u64::from(attempt.min(20));
+                    std::thread::sleep(std::time::Duration::from_millis(5 + step * 2));
                 }
                 Err(_) => return Err(Error::receipt("cannot lock the receipt log")),
             }
@@ -347,6 +373,19 @@ impl LogLock {
             "the receipt log is locked by another writer",
         ))
     }
+}
+
+/// Path of the lock that guards `log`.
+///
+/// Derived by appending `.lock` to the file name: `with_extension` would make a
+/// log that is itself named `*.lock` collide with its own lock, and would make
+/// `a.arrl` and `a.json` share one lock.
+fn lock_path(log: &std::path::Path) -> std::path::PathBuf {
+    let name = log
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "receipts".to_string());
+    log.with_file_name(format!("{name}.lock"))
 }
 
 /// True when a lock file is older than the stale ceiling.
@@ -365,7 +404,14 @@ fn stale(path: &std::path::Path) -> bool {
 
 impl Drop for LogLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only the owner removes the lock: a stealer replaces the file, and
+        // deleting a stolen lock would free a writer that is still appending.
+        let owned = std::fs::read_to_string(&self.path)
+            .map(|content| content.split_whitespace().next() == Some(self.nonce.as_str()))
+            .unwrap_or(false);
+        if owned {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -379,8 +425,9 @@ impl Drop for LogLock {
 ///
 /// The chain is **not** authenticated: a writer who can rewrite the file can
 /// also recompute the links. Authenticity comes from the receipt `mac`, which
-/// needs the kernel secret ([`ReceiptLog::verify_macs`]); truncation of the tail
-/// is caught by pinning the head ([`ReceiptLog::verify_against`]).
+/// needs the derived receipt key ([`derive_receipt_key`],
+/// [`ReceiptLog::verify_macs`]); truncation of the tail is caught by pinning the
+/// head ([`ReceiptLog::verify_against`]).
 ///
 /// The log holds correlation ids, method names, times and decisions: no
 /// arguments, values or secret material.
@@ -454,7 +501,7 @@ impl ReceiptLog {
             ));
         }
         let log = Self {
-            path,
+            path: path.clone(),
             state: std::sync::Arc::new(std::sync::Mutex::new(LogState {
                 bytes: LOG_HEADER_LEN as u64,
                 count: 0,
@@ -468,15 +515,28 @@ impl ReceiptLog {
         header.push(LOG_VERSION);
         header.extend_from_slice(&[0u8; 3]);
         header.extend_from_slice(&start_sequence.to_le_bytes());
+        // Write beside the target and rename: a crash mid-header must not leave
+        // a file that `open`, `repair` and `create` all refuse.
+        let staging = path.with_file_name(format!(
+            "{}.writing",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "receipts".to_string())
+        ));
         {
             use std::io::Write;
-            let mut file = std::fs::File::create(&log.path)
+            let mut file = std::fs::File::create(&staging)
                 .map_err(|_| Error::receipt("cannot create the receipt log"))?;
-            file.write_all(&header)
-                .map_err(|_| Error::receipt("cannot write the receipt log header"))?;
-            file.sync_all()
-                .map_err(|_| Error::receipt("cannot flush the receipt log header"))?;
+            let written = file.write_all(&header).and_then(|()| file.sync_all());
+            if written.is_err() {
+                let _ = std::fs::remove_file(&staging);
+                return Err(Error::receipt("cannot write the receipt log header"));
+            }
         }
+        std::fs::rename(&staging, &path).map_err(|_| {
+            let _ = std::fs::remove_file(&staging);
+            Error::receipt("cannot install the receipt log header")
+        })?;
         Ok(log)
     }
 
@@ -486,8 +546,7 @@ impl ReceiptLog {
     /// every read.
     pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self> {
         let path = path.into();
-        let bytes = read_capped(&path)?;
-        let (_, state) = walk_log(&bytes)?;
+        let (_, _, state) = read_stable(&path)?;
         Ok(Self {
             path,
             state: std::sync::Arc::new(std::sync::Mutex::new(state)),
@@ -550,7 +609,13 @@ impl ReceiptLog {
                 .state
                 .lock()
                 .map_err(|_| Error::receipt("the receipt log state is poisoned"))?;
-            if cached.bytes == observed {
+            // Size alone is not enough: a replacement that happens to have the
+            // same length (a fresh header of another start sequence, for
+            // instance) would let the append write a sequence the header does
+            // not number, producing a log nothing can walk.
+            let usable =
+                cached.bytes == observed && read_header_start(&self.path) == Some(cached.start);
+            if usable {
                 cached
             } else {
                 let bytes = read_capped(&self.path)?;
@@ -626,8 +691,7 @@ impl ReceiptLog {
 
     /// Every receipt in the log, in order, with the chain verified.
     pub fn records(&self) -> Result<Vec<Receipt>> {
-        let bytes = read_capped(&self.path)?;
-        walk_log(&bytes).map(|(receipts, _)| receipts)
+        read_stable(&self.path).map(|(_, receipts, _)| receipts)
     }
 
     /// One read of the whole log: records, start, head and last time.
@@ -637,8 +701,7 @@ impl ReceiptLog {
     /// writer appending in between would make the answers describe different
     /// bytes (a head the MAC check never covered, for instance).
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let bytes = read_capped(&self.path)?;
-        let (receipts, state) = walk_log(&bytes)?;
+        let (_, receipts, state) = read_stable(&self.path)?;
         Ok(Snapshot {
             receipts,
             start: state.start,
@@ -695,6 +758,13 @@ impl ReceiptLog {
     /// [`ReceiptLog::open`] refuses a damaged file, so a caller that wants to
     /// repair one needs an entry point that does not require a valid handle.
     /// Returns the number of bytes discarded.
+    ///
+    /// Only a genuinely interrupted write is cut: the tail must be a record
+    /// whose declared length runs past the end of the file *and* must not
+    /// contain a complete record at any offset. A length field corrupted to
+    /// another in-range value looks torn by its own declaration, but the records
+    /// after it still decode, so that case is refused rather than silently
+    /// discarded.
     pub fn repair(path: impl Into<std::path::PathBuf>) -> Result<u64> {
         let path = path.into();
         let _lock = LogLock::acquire(&path)?;
@@ -705,26 +775,22 @@ impl ReceiptLog {
         }
         verify_header(&bytes)?;
         let (_, good_end) = walk_prefix(&bytes);
-        // Distinguish a torn write from corruption: a torn write leaves the
-        // record's length field written but its body short, so the declared
-        // record runs past the end of the file. A record whose declared length
-        // fits inside the file failed for another reason (a hash or link
-        // mismatch), which is damage inside the log and must be reported rather
-        // than cut away.
         let tail = &bytes[good_end..];
-        let torn = if tail.len() < 4 {
+        let declared_past_end = if tail.len() < 4 {
             true
         } else {
             let length = u32::from_le_bytes(tail[..4].try_into().expect("4 bytes")) as usize;
             (MIN_LOG_RECORD..=MAX_LOG_RECORD).contains(&length)
                 && good_end + 4 + length > bytes.len()
         };
-        if !torn {
+        if !declared_past_end || tail_holds_a_record(tail) {
             return Err(Error::receipt(
                 "the log is damaged inside its records; repair cannot cut it",
             ));
         }
         let remaining = tail.len();
+        // The prefix must itself be a valid log, or the cut would keep damage.
+        let (_, state) = walk_log(&bytes[..good_end])?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -733,25 +799,23 @@ impl ReceiptLog {
             .map_err(|_| Error::receipt("cannot truncate the damaged tail"))?;
         file.sync_all()
             .map_err(|_| Error::receipt("cannot flush the repaired log"))?;
+        let _ = state;
         Ok(remaining as u64)
     }
 
     /// Hash of the last record (the chain head), or zeros for an empty log.
     pub fn head_hash(&self) -> Result<[u8; 32]> {
-        let bytes = read_capped(&self.path)?;
-        walk_log(&bytes).map(|(_, state)| state.head)
+        read_stable(&self.path).map(|(_, _, state)| state.head)
     }
 
     /// Sequence of the first record.
     pub fn start_sequence(&self) -> Result<u64> {
-        let bytes = read_capped(&self.path)?;
-        walk_log(&bytes).map(|(_, state)| state.start)
+        read_stable(&self.path).map(|(_, _, state)| state.start)
     }
 
     /// Number of records.
     pub fn len(&self) -> Result<u64> {
-        let bytes = read_capped(&self.path)?;
-        walk_log(&bytes).map(|(_, state)| state.count)
+        read_stable(&self.path).map(|(_, _, state)| state.count)
     }
 
     /// True when the log holds no records.
@@ -768,6 +832,23 @@ fn valid_correlation_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Read only the 16-byte header and return its start sequence.
+///
+/// Used to tell a cached state from a file that was replaced with the same
+/// length, which a size comparison cannot see.
+fn read_header_start(path: &std::path::Path) -> Option<u64> {
+    use std::io::Read;
+    let mut header = [0u8; LOG_HEADER_LEN];
+    let mut file = std::fs::File::open(path).ok()?;
+    file.read_exact(&mut header).ok()?;
+    if &header[..4] != LOG_MAGIC {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        header[8..16].try_into().expect("8 bytes"),
+    ))
+}
+
 /// Read a log file under the size ceiling, refusing a larger one without
 /// allocating it.
 fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
@@ -782,6 +863,27 @@ fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
         return Err(Error::receipt("the receipt log exceeds the size ceiling"));
     }
     Ok(bytes)
+}
+
+/// Read and walk a log, tolerating one read that lands mid-append.
+///
+/// A reader does not take the writer's lock, so on a file system where a large
+/// batch is written in more than one syscall it can see a partial trailing
+/// record. That is a torn read, not a torn file: reading again once the writer
+/// has finished settles it, and a file that is really damaged fails twice.
+fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogState)> {
+    let bytes = read_capped(path)?;
+    match walk_log(&bytes) {
+        Ok((receipts, state)) => Ok((bytes, receipts, state)),
+        Err(first) => {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let bytes = read_capped(path)?;
+            match walk_log(&bytes) {
+                Ok((receipts, state)) => Ok((bytes, receipts, state)),
+                Err(_) => Err(first),
+            }
+        }
+    }
 }
 
 /// Encode one record: `len u32 | sequence u64 | at_ms u64 | decision u8 |
@@ -1034,6 +1136,23 @@ fn walk_log(bytes: &[u8]) -> Result<(Vec<Receipt>, LogState)> {
         last_ms: last_time.unwrap_or(0),
     };
     Ok((receipts, state))
+}
+
+/// True when a tail that failed to walk still holds a complete record.
+///
+/// A corrupted length field can declare a record that runs past the end of the
+/// file while the records after it are intact; cutting there would discard good
+/// evidence. Scanning a bounded window (one record past the damage) for any
+/// record that decodes is the cheap discriminator: a genuinely torn write holds
+/// at most the bytes of one unfinished record, which decode to nothing.
+fn tail_holds_a_record(tail: &[u8]) -> bool {
+    let window = tail.len().min(MAX_LOG_RECORD);
+    for offset in 0..window {
+        if decode_record(&tail[..window], offset).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Walk the records that decode, stopping at the first one that does not.
