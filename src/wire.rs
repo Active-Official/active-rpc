@@ -154,6 +154,16 @@ impl CapTableDelta {
                 return Err(Error::CapabilityTable("zero capability id"));
             }
         }
+        // An added id that already exists in the *base* table is a replacement.
+        // Removing and re-adding an id would let a wider descriptor bypass the
+        // attenuation/import rules that adding a new id must satisfy.
+        for descriptor in &self.added {
+            if base.iter().any(|cap| cap.id == descriptor.id) {
+                return Err(Error::CapabilityTable(
+                    "delta replaces an existing capability",
+                ));
+            }
+        }
         let mut table = base.to_vec();
         for id in &self.removed {
             let Some(index) = table.iter().position(|cap| &cap.id == id) else {

@@ -39,6 +39,9 @@ use crate::value::{Arg, Call, Response, Value};
 /// agent and finite, so a hostile or buggy caller fails closed.
 pub const MAX_LANES: usize = 4_096;
 
+/// Largest idempotency key a caller may present.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
 /// Global ceiling on channels in one kernel.
 pub const MAX_CHANNELS: usize = 4_096;
 
@@ -529,6 +532,11 @@ impl Agent {
                 "only a durable capability can be exported",
             ));
         }
+        if !kernel.allow_durable {
+            return Err(Error::persistence(
+                "durable capabilities are not enabled for this agent",
+            ));
+        }
         if record.revoked {
             return Err(Error::Revoked(cap_token(cap.id())));
         }
@@ -683,6 +691,14 @@ impl Agent {
                 "cannot bind a capability to an unauthenticated peer",
             ));
         }
+        if attrs
+            .bound_to
+            .is_some_and(|bound| bound != peer.fingerprint())
+        {
+            return Err(Error::Identity(
+                "the capability is already bound to a different peer",
+            ));
+        }
         self.mint(provider, object, attrs.bound_to(peer.fingerprint()))
     }
 
@@ -766,12 +782,22 @@ impl Agent {
             return Err(Error::Revoked(cap_token(parent_id)));
         }
         attrs.budget.check()?;
+        if !kernel.allow_durable
+            && (record.attrs.persistence == CapPersistence::Durable
+                || attrs.persistence == CapPersistence::Durable)
+        {
+            return Err(Error::CapabilityTable(
+                "durable capability refused by policy",
+            ));
+        }
         let attrs = record.attrs.attenuate(attrs)?;
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, Some(&parent_id));
         let mut child = CapRecord::new(id, record.provider, record.object, attrs.clone());
         child.parent = Some(parent_id);
+        child.lineage = record.lineage.clone();
+        child.lineage.push(parent_id);
         // A derived capability never outlives its parent: keep the parent's
         // absolute expiry when the child asked for a longer (or no) lifetime.
         child.expires_at = match (record.expires_at, attrs.ttl_ms) {
@@ -811,7 +837,9 @@ impl Agent {
                 continue;
             }
             for (child, record) in &kernel.caps {
-                if record.parent == Some(id) {
+                // `parent` is enough while the intermediate lives; `lineage`
+                // keeps the subtree reachable after it is dropped.
+                if record.parent == Some(id) || record.lineage.contains(&id) {
                     stack.push(*child);
                 }
             }
@@ -930,11 +958,7 @@ impl Agent {
             .channels
             .get(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
-        if channel_record.queued() >= kernel.channel_ceiling {
-            kernel.metrics.backpressure_refusals =
-                kernel.metrics.backpressure_refusals.saturating_add(1);
-            return Err(Error::Backpressure("channel queue ceiling reached"));
-        }
+        let _ = channel_record;
         let record = kernel
             .channels
             .get_mut(&channel)
@@ -990,7 +1014,7 @@ impl Agent {
             let record = kernel
                 .caps
                 .get(&cap.id())
-                .ok_or(Error::InvalidArgument("unknown capability"))?;
+                .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
             if record.revoked {
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
@@ -1343,12 +1367,14 @@ impl Agent {
         if record.attrs.read_only && provider.mutating(method) {
             return Err(Error::ReadOnly);
         }
-        // Path scope is enforced here, before the provider sees the call.
+        // Path scope is enforced here, before the provider sees the call. The
+        // walk is recursive: a `Path` nested in a list or map is the same
+        // argument to a provider that flattens it.
         if let Some(scope) = &record.attrs.path_scope {
             for arg in &args {
-                if let Arg::Value(Value::Path(path)) = arg {
-                    if !crate::cap::is_path_prefix(scope, path) {
-                        return Err(Error::PathNotGranted(path.clone()));
+                if let Arg::Value(value) = arg {
+                    if let Some(path) = path_outside_scope(value, scope) {
+                        return Err(Error::PathNotGranted(path));
                     }
                 }
             }
@@ -1373,6 +1399,14 @@ impl Agent {
         let effective = record.attrs.budget.intersect(&lane_budget);
         if call_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
+        }
+        // Every dependency must exist before anything is charged, recorded or
+        // receipted: a refused call must leave no trace and cost nothing.
+        let deps: Vec<PromiseId> = args.iter().filter_map(|arg| arg.promise()).collect();
+        for dep in &deps {
+            if !kernel.promises.contains_key(dep) {
+                return Err(Error::UnknownPromise(dep.0));
+            }
         }
         // Registry ceilings are checked before charging: a refused call must
         // not consume budget, and the job/promise maps must stay finite even
@@ -1416,11 +1450,7 @@ impl Agent {
 
         let job_id = kernel.next_job;
         kernel.next_job += 1;
-        let deps: Vec<PromiseId> = args.iter().filter_map(|arg| arg.promise()).collect();
         for dep in &deps {
-            if !kernel.promises.contains_key(dep) {
-                return Err(Error::UnknownPromise(dep.0));
-            }
             if let Some(record) = kernel.promises.get_mut(dep) {
                 record.waiters += 1;
             }
@@ -1578,13 +1608,59 @@ impl Agent {
         args: Vec<Arg>,
         key: &str,
     ) -> Result<PromiseHandle> {
+        self.call_idempotent_as(None, lane, cap, method, args, key)
+    }
+
+    /// [`Agent::call_idempotent`] on behalf of the peer the transport
+    /// authenticated.
+    ///
+    /// A replay is a fresh exercise of the same authority: it re-checks that the
+    /// capability is live and, when it is bound, that the caller is the bound
+    /// peer. Caching the promise must not turn a revoked or rebound capability
+    /// back on.
+    pub fn call_idempotent_as(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        key: &str,
+    ) -> Result<PromiseHandle> {
         if key.is_empty() {
             return Err(Error::InvalidArgument("idempotency key is empty"));
+        }
+        if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            return Err(Error::InvalidArgument("idempotency key is too long"));
         }
         let map_key = (cap.id(), method.to_string(), key.to_string());
         {
             let mut kernel = self.cell.borrow_mut();
             if let Some(id) = kernel.idempotency.get(&map_key).copied() {
+                {
+                    let record = kernel
+                        .caps
+                        .get(&cap.id())
+                        .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+                    if record.revoked {
+                        return Err(Error::Revoked(cap_token(cap.id())));
+                    }
+                    if record
+                        .expires_at
+                        .is_some_and(|expires_at| kernel.now_ms >= expires_at)
+                    {
+                        kernel.push_event(Event::CapExpired(cap.id()));
+                        return Err(Error::Revoked(cap_token(cap.id())));
+                    }
+                    if let Some(bound) = record.attrs.bound_to {
+                        let presented = peer.map(|identity| identity.fingerprint());
+                        if presented != Some(bound) {
+                            return Err(Error::Identity(
+                                "capability is bound to a different peer identity",
+                            ));
+                        }
+                    }
+                }
                 let reusable = kernel
                     .promises
                     .get(&id)
@@ -1606,8 +1682,11 @@ impl Agent {
                 }
                 kernel.idempotency.remove(&map_key);
             }
+            // A stale entry leaves its key in the order deque; without this the
+            // deque grows with caller-controlled keys.
+            kernel.idempotency_order.retain(|queued| *queued != map_key);
         }
-        let promise = self.call(lane, cap, method, args)?;
+        let promise = self.call_as(peer, lane, cap, method, args)?;
         let id = promise.id();
         let mut kernel = self.cell.borrow_mut();
         kernel.idempotency.insert(map_key.clone(), id);
@@ -2290,4 +2369,24 @@ pub fn promise_state(agent: &Agent, id: PromiseId) -> Option<PromiseState> {
         .promises
         .get(&id)
         .map(|record| record.state.clone())
+}
+
+/// The first path in `value` (at any depth) that is outside `scope`.
+fn path_outside_scope(value: &Value, scope: &str) -> Option<String> {
+    match value {
+        Value::Path(path) => {
+            if crate::cap::is_path_prefix(scope, path) {
+                None
+            } else {
+                Some(path.clone())
+            }
+        }
+        Value::List(items) => items
+            .iter()
+            .find_map(|item| path_outside_scope(item, scope)),
+        Value::Map(map) => map
+            .values()
+            .find_map(|item| path_outside_scope(item, scope)),
+        _ => None,
+    }
 }

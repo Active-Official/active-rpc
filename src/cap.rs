@@ -445,6 +445,9 @@ pub struct CapRecord {
     pub attrs: CapAttrs,
     /// Parent capability, when this one was derived by attenuation.
     pub parent: Option<CapId>,
+    /// Every ancestor, root first. Kept on the record so revocation reaches a
+    /// whole subtree even after an intermediate record is dropped.
+    pub lineage: Vec<CapId>,
     /// Outstanding references (client handles plus transfers).
     pub refs: u32,
     /// Revoked capabilities are refused even if the id is known.
@@ -462,6 +465,7 @@ impl CapRecord {
             object,
             attrs,
             parent: None,
+            lineage: Vec::new(),
             refs: 1,
             revoked: false,
             expires_at: None,
