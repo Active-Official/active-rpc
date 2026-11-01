@@ -1078,7 +1078,13 @@ fn capability_wall_budget_caps_a_slow_tool() {
     let start = std::time::Instant::now();
     let error = tool.invoke(0, &call).expect_err("wall budget must bind");
     assert_eq!(error.code(), "rpc/timeout");
-    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    // The ceiling is 120 ms and the child would run for ~19 s. The margin
+    // covers ending the process tree (`taskkill /T`) after the deadline.
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "a 120 ms ceiling took {elapsed:?}"
+    );
 }
 
 #[test]

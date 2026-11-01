@@ -205,6 +205,40 @@ impl McpTransport for MemoryTransport {
     }
 }
 
+/// Longest HTTP status line accepted, in bytes.
+pub const MAX_HTTP_STATUS_LINE: usize = 1024;
+
+/// Longest single HTTP header line accepted, in bytes.
+pub const MAX_HTTP_HEADER_LINE: usize = 8 * 1024;
+
+/// Largest HTTP header block accepted, in bytes.
+pub const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+
+/// Largest number of HTTP header fields accepted.
+pub const MAX_HTTP_HEADER_FIELDS: usize = 128;
+
+/// Read one line under a cap, refusing a line that would exceed it.
+///
+/// `read_line` into a fresh `String` grows until the peer stops: a single
+/// unbounded header line ends in an allocator abort, which no `catch_unwind`
+/// catches.
+fn read_line_bounded<R: std::io::BufRead>(reader: &mut R, cap: usize) -> Result<String> {
+    let mut line = String::new();
+    let read = reader
+        .by_ref()
+        .take((cap + 1) as u64)
+        .read_line(&mut line)
+        .map_err(|error| Error::Provider {
+            code: format!("http/read:{error}"),
+        })?;
+    if read > cap {
+        return Err(Error::Provider {
+            code: "http/line-too-long".to_string(),
+        });
+    }
+    Ok(line)
+}
+
 /// A child-process MCP transport speaking JSON-RPC over stdin/stdout.
 pub struct StdioTransport {
     child: Child,
@@ -371,6 +405,7 @@ impl<T: McpTransport> McpSession<T> {
             });
         }
         let list = session.request("tools/list", json!({}))?;
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if let Some(items) = list
             .get("result")
             .and_then(|result| result.get("tools"))
@@ -404,6 +439,11 @@ impl<T: McpTransport> McpSession<T> {
                 let description = bounded_description(
                     item.get("description").and_then(Json::as_str).unwrap_or(""),
                 );
+                // A set: a 1 MiB tool list is ~50 000 entries, and a scan per
+                // entry made a handshake quadratic (12.7 s measured at 32 000).
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
                 session.tools.push(McpToolDef {
                     name: name.to_string(),
                     description,
@@ -436,7 +476,15 @@ impl<T: McpTransport> McpSession<T> {
             "method": method,
             "params": params,
         });
-        self.transport.send_line(&payload.to_string())?;
+        let line = payload.to_string();
+        if line.len() > MAX_MCP_LINE_BYTES {
+            // The peer refuses a line of this size; refuse it here instead of
+            // sending a frame that can only be a desync.
+            return Err(Error::InvalidArgument(
+                "the MCP request exceeds the line ceiling",
+            ));
+        }
+        self.transport.send_line(&line)?;
         let line = self.transport.recv_line_within(deadline)?;
         if line.len() > MAX_MCP_LINE_BYTES {
             return Err(Error::Provider {
@@ -644,12 +692,10 @@ impl HttpTool {
                 code: format!("http/write:{error}"),
             })?;
         let mut reader = BufReader::new(stream);
-        let mut status_line = String::new();
-        reader
-            .read_line(&mut status_line)
-            .map_err(|error| Error::Provider {
-                code: format!("http/read:{error}"),
-            })?;
+        // Every line is read under a cap, and the block has its own budget: a
+        // hostile endpoint that streams headers would otherwise grow a `String`
+        // until the allocator aborts the process (outside `catch_unwind`).
+        let mut status_line = read_line_bounded(&mut reader, MAX_HTTP_STATUS_LINE)?;
         let status: u16 = status_line
             .split_whitespace()
             .nth(1)
@@ -657,18 +703,42 @@ impl HttpTool {
             .ok_or(Error::Provider {
                 code: "http/status".to_string(),
             })?;
+        if !status_line.starts_with("HTTP/1.") {
+            return Err(Error::Provider {
+                code: "http/status".to_string(),
+            });
+        }
+        if (100..200).contains(&status) {
+            return Err(Error::Provider {
+                code: "http/interim".to_string(),
+            });
+        }
+        status_line.clear();
         let mut content_length: Option<usize> = None;
+        let mut header_bytes = 0usize;
+        let mut fields = 0usize;
         loop {
-            let mut line = String::new();
-            let read = reader
-                .read_line(&mut line)
-                .map_err(|error| Error::Provider {
-                    code: format!("http/read:{error}"),
-                })?;
-            if read == 0 || line.trim().is_empty() {
+            let line = read_line_bounded(&mut reader, MAX_HTTP_HEADER_LINE)?;
+            if line.trim().is_empty() {
                 break;
             }
+            header_bytes = header_bytes.saturating_add(line.len());
+            fields += 1;
+            if header_bytes > MAX_HTTP_HEADER_BYTES || fields > MAX_HTTP_HEADER_FIELDS {
+                return Err(Error::Provider {
+                    code: "http/headers".to_string(),
+                });
+            }
             if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("transfer-encoding")
+                    && !value.trim().eq_ignore_ascii_case("identity")
+                {
+                    // Chunked framing is not a body: returning it as payload
+                    // would hand the caller protocol bytes to parse.
+                    return Err(Error::Provider {
+                        code: "http/transfer-encoding".to_string(),
+                    });
+                }
                 if name.eq_ignore_ascii_case("content-length") {
                     content_length = value.trim().parse().ok();
                 }
@@ -877,12 +947,18 @@ impl Provider for LocalProcess {
         }
         let mut args = Vec::new();
         for arg in &call.args {
-            if let Arg::Value(Value::Text(text)) = arg {
-                if !self.permitted(text) {
-                    return Err(Error::ToolPolicy("argument is not allowed"));
-                }
-                args.push(text.clone());
+            // A process argument is text. Anything else would be executed as
+            // something the caller did not validate (a dropped operand turns
+            // `--target X` into the program's own default).
+            let Arg::Value(Value::Text(text)) = arg else {
+                return Err(Error::InvalidArgument(
+                    "a process argument must be a text value",
+                ));
+            };
+            if !self.permitted(text) {
+                return Err(Error::ToolPolicy("argument is not allowed"));
             }
+            args.push(text.clone());
         }
         // The policy in the capability must have granted process execution.
         if !call.tool_allows_process {
@@ -904,21 +980,40 @@ impl Provider for LocalProcess {
         // Drain both pipes on their own threads. A child that writes more than
         // the ceiling stops being drained, blocks on the pipe, and is killed at
         // the deadline instead of growing our memory.
+        // The readers report over a channel, so the *wait* is bounded too: a
+        // descendant that inherited the pipe keeps it open after the child
+        // exits, and joining a thread that is blocked in `read_to_end` would
+        // exceed the wall ceiling without any way to interrupt it.
         let ceiling = self.max_output as u64 + 1;
-        let stdout = child.stdout.take().map(|stream| {
-            std::thread::spawn(move || {
-                let mut buffer = Vec::new();
-                let _ = stream.take(ceiling).read_to_end(&mut buffer);
-                buffer
-            })
-        });
-        let stderr = child.stderr.take().map(|stream| {
-            std::thread::spawn(move || {
-                let mut buffer = Vec::new();
-                let _ = stream.take(ceiling).read_to_end(&mut buffer);
-                buffer
-            })
-        });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut readers = 0usize;
+        let mut drain =
+            |sender: std::sync::mpsc::Sender<Vec<u8>>,
+             mut stream: Option<Box<dyn std::io::Read + Send>>| {
+                if let Some(stream) = stream.take() {
+                    std::thread::spawn(move || {
+                        let mut buffer = Vec::new();
+                        let _ = stream.take(ceiling).read_to_end(&mut buffer);
+                        let _ = sender.send(buffer);
+                    });
+                    readers += 1;
+                }
+            };
+        drain(
+            sender.clone(),
+            child
+                .stdout
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn std::io::Read + Send>),
+        );
+        drain(
+            sender.clone(),
+            child
+                .stderr
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn std::io::Read + Send>),
+        );
+        let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(readers);
 
         // The capability's wall budget can be tighter than the adapter default;
         // the effective ceiling is the smaller of the two.
@@ -931,6 +1026,18 @@ impl Provider for LocalProcess {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
+                        // The direct child is always killed. On Windows the
+                        // tree goes with it; on Unix a detached descendant that
+                        // kept the pipe is documented, and the bounded output
+                        // wait above means it cannot extend the call.
+                        #[cfg(windows)]
+                        {
+                            let _ = Command::new("taskkill")
+                                .args(["/T", "/F", "/PID", &child.id().to_string()])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status();
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(Error::Timeout);
@@ -944,12 +1051,17 @@ impl Provider for LocalProcess {
                 }
             }
         };
-        let stdout = stdout
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default();
-        let stderr = stderr
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default();
+        while outputs.len() < readers {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Err(Error::Timeout);
+            };
+            match receiver.recv_timeout(left) {
+                Ok(buffer) => outputs.push(buffer),
+                Err(_) => return Err(Error::Timeout),
+            }
+        }
+        let stdout = outputs.first().cloned().unwrap_or_default();
+        let stderr = outputs.get(1).cloned().unwrap_or_default();
         if stdout.len() > self.max_output || stderr.len() > self.max_output {
             return Err(Error::ToolPolicy("output too large"));
         }
