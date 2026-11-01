@@ -112,6 +112,20 @@ pub const MAX_MCP_LINE_BYTES: usize = 1 << 20;
 /// session fails closed once the bound is passed.
 pub const MAX_MCP_NOTIFICATIONS: usize = 16;
 
+/// Most tools one session keeps.
+///
+/// A handshake reply is capped at one MiB, so this is not a memory fix so much
+/// as a deterministic bound on the method table every dispatch walks.
+pub const MAX_MCP_TOOLS: usize = 4_096;
+
+/// Default ceiling for the MCP handshake, in milliseconds.
+///
+/// `initialize` and `tools/list` are requests like any other, but they run
+/// before a capability has a budget, so they need their own bound: a server
+/// that accepts the connection and stays silent would otherwise hold the
+/// dispatch thread forever.
+pub const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+
 /// The longest tool name a session accepts, in bytes.
 pub const MAX_MCP_TOOL_NAME_BYTES: usize = 128;
 
@@ -182,6 +196,14 @@ fn is_invisible_or_reordering(character: char) -> bool {
             // Line and paragraph separators.
             | '\u{2028}'
             | '\u{2029}'
+            // Unicode tag characters: the standard invisible-ASCII smuggling
+            // channel, and invisible by design.
+            | '\u{E0000}'..='\u{E007F}'
+            // Invisible operators, the Mongolian vowel separator, and variation
+            // selectors, which change rendering without adding width.
+            | '\u{2061}'..='\u{2064}'
+            | '\u{180E}'
+            | '\u{FE00}'..='\u{FE0F}'
     )
 }
 
@@ -260,26 +282,95 @@ fn takes_request_body(method: &str) -> bool {
     matches!(method, "POST" | "PUT" | "PATCH")
 }
 
-/// Read one line under a cap, refusing a line that would exceed it.
+/// Time left before `deadline`, or `rpc/timeout` when it has passed.
+fn remaining_until(deadline: std::time::Instant) -> Result<std::time::Duration> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or(Error::Timeout)
+}
+
+/// A response reader whose every read is bounded by one wall deadline.
 ///
-/// `read_line` into a fresh `String` grows until the peer stops: a single
-/// unbounded header line ends in an allocator abort, which no `catch_unwind`
-/// catches.
-fn read_line_bounded<R: std::io::BufRead>(reader: &mut R, cap: usize) -> Result<String> {
-    let mut line = String::new();
-    let read = reader
-        .by_ref()
-        .take((cap + 1) as u64)
-        .read_line(&mut line)
-        .map_err(|error| Error::Provider {
-            code: format!("http/read:{error}"),
-        })?;
-    if read > cap {
-        return Err(Error::Provider {
-            code: "http/line-too-long".to_string(),
-        });
+/// `set_read_timeout` bounds a single `read` syscall, not the call: a server
+/// that drips one byte per timeout period would otherwise hold the dispatch
+/// thread for (bytes x timeout). Each read here gets only the time that is
+/// left, and the deadline is re-checked afterwards, so the ceiling is a
+/// ceiling.
+struct DeadlineReader {
+    reader: BufReader<TcpStream>,
+    deadline: std::time::Instant,
+}
+
+impl DeadlineReader {
+    fn new(stream: TcpStream, deadline: std::time::Instant) -> Self {
+        Self {
+            reader: BufReader::new(stream),
+            deadline,
+        }
     }
-    Ok(line)
+
+    /// Arm the socket with the time that is left.
+    fn arm(&self) -> Result<()> {
+        let left = remaining_until(self.deadline)?;
+        self.reader.get_ref().set_read_timeout(Some(left)).ok();
+        Ok(())
+    }
+
+    /// Read one line under a byte cap and the wall deadline.
+    fn line(&mut self, cap: usize) -> Result<String> {
+        self.arm()?;
+        let mut line = String::new();
+        let read = self
+            .reader
+            .by_ref()
+            .take((cap + 1) as u64)
+            .read_line(&mut line)
+            .map_err(map_http_read)?;
+        if read > cap {
+            return Err(Error::Provider {
+                code: "http/line-too-long".to_string(),
+            });
+        }
+        remaining_until(self.deadline)?;
+        Ok(line)
+    }
+
+    /// Read exactly `length` body bytes under the wall deadline.
+    fn body_exact(&mut self, length: usize) -> Result<Vec<u8>> {
+        self.arm()?;
+        let mut body = vec![0u8; length];
+        self.reader.read_exact(&mut body).map_err(map_http_read)?;
+        remaining_until(self.deadline)?;
+        Ok(body)
+    }
+
+    /// Read the rest of the body under a byte cap and the wall deadline.
+    fn body_rest(&mut self, cap: usize) -> Result<Vec<u8>> {
+        self.arm()?;
+        let mut rest = Vec::new();
+        self.reader
+            .by_ref()
+            .take(cap as u64 + 1)
+            .read_to_end(&mut rest)
+            .map_err(map_http_read)?;
+        remaining_until(self.deadline)?;
+        Ok(rest)
+    }
+}
+
+/// A socket read that hit its timeout is the call's ceiling, not an I/O fault.
+fn map_http_read(error: std::io::Error) -> Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        Error::Timeout
+    } else {
+        Error::Provider {
+            code: format!("http/read:{error}"),
+        }
+    }
 }
 
 /// A child-process MCP transport speaking JSON-RPC over stdin/stdout.
@@ -320,6 +411,13 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env_clear();
+        #[cfg(unix)]
+        {
+            // Its own group, so dropping the session can end helpers the server
+            // started; otherwise they keep the pipes and outlive the session.
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         for (key, value) in env {
             command.env(key, value);
         }
@@ -407,8 +505,7 @@ impl McpTransport for StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_process_tree(&mut self.child);
     }
 }
 
@@ -443,6 +540,20 @@ pub struct McpSession<T: McpTransport> {
 impl<T: McpTransport> McpSession<T> {
     /// Perform the MCP handshake and discover tools.
     pub fn handshake(transport: T) -> Result<Self> {
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(
+                DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS,
+            ))
+            .unwrap_or_else(std::time::Instant::now);
+        Self::handshake_within(transport, Some(deadline))
+    }
+
+    /// Perform the MCP handshake under an explicit deadline.
+    ///
+    /// The whole handshake (`initialize` and `tools/list`) shares one deadline:
+    /// a server that answers `initialize` and then stalls on the list is just
+    /// as stuck as one that never answers.
+    pub fn handshake_within(transport: T, deadline: Option<std::time::Instant>) -> Result<Self> {
         let mut session = McpSession {
             transport,
             tools: Vec::new(),
@@ -450,20 +561,21 @@ impl<T: McpTransport> McpSession<T> {
             poisoned: false,
             calls: 0,
         };
-        let initialize = session.request(
+        let initialize = session.request_within(
             "initialize",
             json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": { "name": "active-rpc", "version": env!("CARGO_PKG_VERSION") }
             }),
+            deadline,
         )?;
         if initialize.get("error").is_some() {
             return Err(Error::Provider {
                 code: "mcp/initialize".to_string(),
             });
         }
-        let list = session.request("tools/list", json!({}))?;
+        let list = session.request_within("tools/list", json!({}), deadline)?;
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         if let Some(items) = list
             .get("result")
@@ -484,11 +596,18 @@ impl<T: McpTransport> McpSession<T> {
                         code: "mcp/tool-name".to_string(),
                     });
                 }
-                if session.tools.iter().any(|tool| tool.name == name) {
-                    // Two entries with one name make the allow-list ambiguous:
-                    // the index selects one, the name selects the other.
+                // A set: a 1 MiB tool list is ~50 000 entries, and a scan per
+                // entry made a handshake quadratic (12.7 s measured at 32 000).
+                // Two entries with one name make the allow-list ambiguous: the
+                // index selects one entry and the name selects the other.
+                if !seen.insert(name.to_string()) {
                     return Err(Error::Provider {
                         code: "mcp/tool-name".to_string(),
+                    });
+                }
+                if session.tools.len() >= MAX_MCP_TOOLS {
+                    return Err(Error::Provider {
+                        code: "mcp/tool-count".to_string(),
                     });
                 }
                 // The description is free text shown to an operator. It is
@@ -498,11 +617,6 @@ impl<T: McpTransport> McpSession<T> {
                 let description = bounded_description(
                     item.get("description").and_then(Json::as_str).unwrap_or(""),
                 );
-                // A set: a 1 MiB tool list is ~50 000 entries, and a scan per
-                // entry made a handshake quadratic (12.7 s measured at 32 000).
-                if !seen.insert(name.to_string()) {
-                    continue;
-                }
                 session.tools.push(McpToolDef {
                     name: name.to_string(),
                     description,
@@ -510,10 +624,6 @@ impl<T: McpTransport> McpSession<T> {
             }
         }
         Ok(session)
-    }
-
-    fn request(&mut self, method: &str, params: Json) -> Result<Json> {
-        self.request_within(method, params, None)
     }
 
     fn request_within(
@@ -526,6 +636,13 @@ impl<T: McpTransport> McpSession<T> {
             return Err(Error::Provider {
                 code: "mcp/desync".to_string(),
             });
+        }
+        // Check the ceiling before the frame leaves: once it is sent, the call
+        // can no longer be refused without the server having acted on it.
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
         }
         // JSON-RPC ids wrap rather than panic in a long-lived session; id 0 is
         // skipped because it is the conventional "no id" notification value.
@@ -553,22 +670,33 @@ impl<T: McpTransport> McpSession<T> {
         loop {
             let line = self.transport.recv_line_within(deadline)?;
             if line.len() > MAX_MCP_LINE_BYTES {
+                self.poisoned = true;
                 return Err(Error::Provider {
                     code: "mcp/line-too-long".to_string(),
                 });
             }
-            let response: Json = serde_json::from_str(&line).map_err(|_| Error::Provider {
-                code: "mcp/bad-response".to_string(),
-            })?;
+            let response: Json = match serde_json::from_str(&line) {
+                Ok(response) => response,
+                Err(_) => {
+                    self.poisoned = true;
+                    return Err(Error::Provider {
+                        code: "mcp/bad-response".to_string(),
+                    });
+                }
+            };
             // A response must be an object and must answer *this* request. A
             // mismatched id means the peer is confused or hostile; do not accept
             // its payload as the answer to a different call.
-            let object = response.as_object().ok_or(Error::Provider {
-                code: "mcp/bad-response".to_string(),
-            })?;
+            let Some(object) = response.as_object() else {
+                self.poisoned = true;
+                return Err(Error::Provider {
+                    code: "mcp/bad-response".to_string(),
+                });
+            };
             match object.get("id") {
                 Some(value) if value.as_u64() == Some(id) => {
                     if object.get("result").is_none() && object.get("error").is_none() {
+                        self.poisoned = true;
                         return Err(Error::Provider {
                             code: "mcp/bad-response".to_string(),
                         });
@@ -597,9 +725,10 @@ impl<T: McpTransport> McpSession<T> {
                     });
                 }
                 None => {
+                    self.poisoned = true;
                     return Err(Error::Provider {
                         code: "mcp/bad-response".to_string(),
-                    })
+                    });
                 }
             }
         }
@@ -628,6 +757,15 @@ impl<T: McpTransport> Provider for McpSession<T> {
 
     fn methods(&self) -> Vec<String> {
         self.tools.iter().map(|tool| tool.name.clone()).collect()
+    }
+
+    /// Answer the membership question without building the method table.
+    ///
+    /// The default implementation calls [`Self::methods`], which clones every
+    /// name on every admitted call: with a few thousand tools that is about a
+    /// megabyte of allocation per dispatch.
+    fn has_method(&self, method: &str) -> bool {
+        self.tools.iter().any(|tool| tool.name == method)
     }
 
     fn mutating(&self, _method: &str) -> bool {
@@ -737,9 +875,20 @@ impl HttpTool {
             .strip_prefix("http://")
             .ok_or(Error::ToolPolicy("only http:// endpoints are supported"))?;
         // The adapter's fixed ten seconds and the capability's wall ceiling both
-        // bound the wait; the smaller one wins.
-        let ceiling = std::time::Duration::from_millis(ceiling_ms.max(1))
-            .min(std::time::Duration::from_secs(10));
+        // bound the wait; the smaller one wins. This is one deadline for the
+        // whole exchange, not a per-syscall timeout: a timeout bounds one
+        // `read`, so a server that drips one byte per period would otherwise
+        // hold the dispatch thread for (bytes x timeout).
+        let deadline = std::time::Instant::now()
+            .checked_add(
+                std::time::Duration::from_millis(ceiling_ms.max(1))
+                    .min(std::time::Duration::from_secs(10)),
+            )
+            .unwrap_or_else(std::time::Instant::now);
+        // Resolution is not peer-controlled: the base URL is the operator's
+        // endpoint, so the system resolver's own timeout applies here. The
+        // peer's part of the exchange (connect, write, read) is under
+        // `deadline`.
         let addresses: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(base)
             .map_err(|error| Error::Provider {
                 code: format!("http/resolve:{error}"),
@@ -747,7 +896,10 @@ impl HttpTool {
             .collect();
         let mut connected = None;
         for address in addresses {
-            match TcpStream::connect_timeout(&address, ceiling) {
+            // Every attempt gets only the time that is left, so a host with
+            // many addresses cannot multiply the ceiling.
+            let remaining = remaining_until(deadline)?;
+            match TcpStream::connect_timeout(&address, remaining) {
                 Ok(stream) => {
                     connected = Some(stream);
                     break;
@@ -762,8 +914,9 @@ impl HttpTool {
         let mut stream = connected.ok_or(Error::Provider {
             code: "http/connect".to_string(),
         })?;
-        stream.set_read_timeout(Some(ceiling)).ok();
-        stream.set_write_timeout(Some(ceiling)).ok();
+        stream
+            .set_write_timeout(Some(remaining_until(deadline)?))
+            .ok();
         let head = {
             // A method defined without content sends no `content-length` and no
             // body. A GET that carries one makes simple servers and
@@ -788,11 +941,11 @@ impl HttpTool {
             .map_err(|error| Error::Provider {
                 code: format!("http/write:{error}"),
             })?;
-        let mut reader = BufReader::new(stream);
+        let mut reader = DeadlineReader::new(stream, deadline);
         // Every line is read under a cap, and the block has its own budget: a
         // hostile endpoint that streams headers would otherwise grow a `String`
         // until the allocator aborts the process (outside `catch_unwind`).
-        let mut status_line = read_line_bounded(&mut reader, MAX_HTTP_STATUS_LINE)?;
+        let mut status_line = reader.line(MAX_HTTP_STATUS_LINE)?;
         let status: u16 = status_line
             .split_whitespace()
             .nth(1)
@@ -815,7 +968,7 @@ impl HttpTool {
         let mut header_bytes = 0usize;
         let mut fields = 0usize;
         loop {
-            let line = read_line_bounded(&mut reader, MAX_HTTP_HEADER_LINE)?;
+            let line = reader.line(MAX_HTTP_HEADER_LINE)?;
             if line.trim().is_empty() {
                 break;
             }
@@ -837,37 +990,41 @@ impl HttpTool {
                     });
                 }
                 if name.eq_ignore_ascii_case("content-length") {
-                    content_length = value.trim().parse().ok();
+                    // A repeated or unparsable length is a framing ambiguity:
+                    // silently switching to read-to-end would let the peer
+                    // choose how the message is delimited.
+                    let value: usize = value.trim().parse().map_err(|_| Error::Provider {
+                        code: "http/headers".to_string(),
+                    })?;
+                    if content_length.replace(value).is_some() {
+                        return Err(Error::Provider {
+                            code: "http/headers".to_string(),
+                        });
+                    }
                 }
             }
         }
-        let mut body = Vec::new();
-        match content_length {
+        // A HEAD reply, 204 and 304 carry no content even when the headers
+        // describe one: `content-length` there belongs to the representation,
+        // not to this message. Reading it would block until the ceiling.
+        if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
+            return Ok((status, Vec::new()));
+        }
+        let body = match content_length {
             Some(length) => {
                 if length > self.max_body {
                     return Err(Error::ToolPolicy("response too large"));
                 }
-                body.resize(length, 0);
-                reader
-                    .read_exact(&mut body)
-                    .map_err(|error| Error::Provider {
-                        code: format!("http/body:{error}"),
-                    })?;
+                reader.body_exact(length)?
             }
             None => {
-                let mut rest = Vec::new();
-                reader
-                    .take(self.max_body as u64 + 1)
-                    .read_to_end(&mut rest)
-                    .map_err(|error| Error::Provider {
-                        code: format!("http/body:{error}"),
-                    })?;
+                let rest = reader.body_rest(self.max_body)?;
                 if rest.len() > self.max_body {
                     return Err(Error::ToolPolicy("response too large"));
                 }
-                body = rest;
+                rest
             }
-        }
+        };
         Ok((status, body))
     }
 }
@@ -907,6 +1064,11 @@ impl Provider for HttpTool {
                 })
             }
         };
+        // The method text is interpolated into the request line, where only
+        // token characters are legal: anything else would split the request.
+        if !method.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            return Err(Error::ToolPolicy("the HTTP method is not a token"));
+        }
         // The path is a `Value::Path` and nothing else. Accepting a text
         // argument that starts with `/` would give a caller a second, invisible
         // route to the path: the kernel's path scope walks `Value::Path`, so a
@@ -919,6 +1081,14 @@ impl Provider for HttpTool {
                 _ => None,
             })
             .ok_or(Error::InvalidArgument("an HTTP path argument is required"))?;
+        // The path reaches the request line verbatim. The allowlist gates it,
+        // but a configuration entry that contains a control character would be
+        // request splitting, so refuse the bytes outright.
+        if path.bytes().any(|byte| byte < 0x21 || byte == 0x7f) {
+            return Err(Error::ToolPolicy(
+                "a path argument contains a control character",
+            ));
+        }
         if !self.allow.contains(&(method.to_string(), path.clone())) {
             return Err(Error::ToolPolicy("path is not on the allowlist"));
         }
@@ -957,6 +1127,58 @@ impl Provider for HttpTool {
             .unwrap_or(Value::Text(text));
         Ok(Response::Value(value))
     }
+}
+
+/// Characters that make a shell interpret an argument as syntax.
+///
+/// `cmd.exe` separates commands with `& | < > ^ ( )` and the quoted forms; a
+/// POSIX shell adds `;`, and both expand `$`, backticks and (for `cmd`) `%`.
+/// A newline or NUL ends the line outright.
+const SHELL_METACHARACTERS: &[char] = &[
+    '&', '|', '<', '>', '^', '(', ')', ';', '"', '\'', '$', '`', '%', '\n', '\r', '\u{0}',
+];
+
+/// End a child's whole process tree and reap the leader.
+///
+/// On Windows `taskkill /T` walks the tree, with the executable resolved from
+/// the system directory rather than `PATH` (the same ambient-authority argument
+/// as the program itself). On Unix the caller puts the child in its own process
+/// group, so one signal reaches every descendant it started. `/bin/kill` and
+/// `/usr/bin/kill` are tried because this crate forbids `unsafe` and std has no
+/// signal API; a platform with neither still loses the leader.
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+        let _ = Command::new(root.join("System32").join("taskkill.exe"))
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // The negative pid is the process group the callers create. The leader
+        // may have exited already; the group stays allocated while any member
+        // is alive, which is exactly the case this has to handle.
+        let group = format!("-{}", child.id());
+        for candidate in ["/bin/kill", "/usr/bin/kill"] {
+            let killed = Command::new(candidate)
+                .args(["-KILL", "--", group.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if killed {
+                break;
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1297,25 @@ impl LocalProcess {
             }
         })
     }
+
+    /// Whether any `*` rule would admit `arg`.
+    ///
+    /// A prefix rule is a *command-line* prefix, not an argument match: with a
+    /// shell as the program (`cmd /C`, `sh -c`) the rest of the line is code.
+    /// The adapter cannot make an arbitrary command line safe, so an argument
+    /// that only a prefix rule admits may not carry shell metacharacters.
+    fn permitted_by_prefix_only(&self, arg: &str) -> bool {
+        let exact = self
+            .allow_args
+            .iter()
+            .any(|allowed| !allowed.ends_with('*') && allowed == arg);
+        !exact
+            && self.allow_args.iter().any(|allowed| {
+                allowed
+                    .strip_suffix('*')
+                    .is_some_and(|prefix| arg.starts_with(prefix))
+            })
+    }
 }
 
 impl Provider for LocalProcess {
@@ -1109,6 +1350,17 @@ impl Provider for LocalProcess {
             };
             if !self.permitted(text) {
                 return Err(Error::ToolPolicy("argument is not allowed"));
+            }
+            if self.permitted_by_prefix_only(text)
+                && text
+                    .chars()
+                    .any(|character| SHELL_METACHARACTERS.contains(&character))
+            {
+                // `cmd /C` and `sh -c` treat these as syntax, so a prefix rule
+                // would otherwise be a grant to run an arbitrary command line.
+                return Err(Error::ToolPolicy(
+                    "a prefix-matched argument contains a shell metacharacter",
+                ));
             }
             args.push(text.clone());
         }
@@ -1146,22 +1398,27 @@ impl Provider for LocalProcess {
         // exits, and joining a thread that is blocked in `read_to_end` would
         // exceed the wall ceiling without any way to interrupt it.
         let ceiling = self.max_output as u64 + 1;
+        // `(stream, bytes)`: 1 is stdout and 2 is stderr. Two threads sharing
+        // one channel report in completion order, and a child that writes both
+        // pipes quickly would otherwise have its streams swapped.
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut readers = 0usize;
         let mut drain =
-            |sender: std::sync::mpsc::Sender<Vec<u8>>,
+            |sender: std::sync::mpsc::Sender<(u8, Vec<u8>)>,
+             tag: u8,
              mut stream: Option<Box<dyn std::io::Read + Send>>| {
                 if let Some(stream) = stream.take() {
                     std::thread::spawn(move || {
                         let mut buffer = Vec::new();
                         let _ = stream.take(ceiling).read_to_end(&mut buffer);
-                        let _ = sender.send(buffer);
+                        let _ = sender.send((tag, buffer));
                     });
                     readers += 1;
                 }
             };
         drain(
             sender.clone(),
+            1,
             child
                 .stdout
                 .take()
@@ -1169,12 +1426,15 @@ impl Provider for LocalProcess {
         );
         drain(
             sender.clone(),
+            2,
             child
                 .stderr
                 .take()
                 .map(|stream| Box::new(stream) as Box<dyn std::io::Read + Send>),
         );
-        let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(readers);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut received = 0usize;
 
         // The capability's wall budget can be tighter than the adapter default;
         // the effective ceiling is the smaller of the two.
@@ -1187,68 +1447,46 @@ impl Provider for LocalProcess {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
-                        // The whole tree is killed, not just the direct child.
-                        // On Windows `taskkill /T` walks the tree; on Unix the
-                        // child leads its own process group, so one signal
-                        // reaches every descendant it started.
-                        #[cfg(windows)]
-                        {
-                            // Resolve `taskkill` from the system directory, not
-                            // from `PATH`: the same ambient-authority argument
-                            // as the program itself.
-                            let root = std::env::var_os("SystemRoot")
-                                .map(PathBuf::from)
-                                .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
-                            let _ = Command::new(root.join("System32").join("taskkill.exe"))
-                                .args(["/T", "/F", "/PID", &child.id().to_string()])
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .status();
-                        }
-                        #[cfg(unix)]
-                        {
-                            // `kill` is std-only (this crate forbids unsafe).
-                            // Both absolute locations are tried; the negative
-                            // pid is the process group created above. A system
-                            // without either falls back to killing the leader.
-                            let group = format!("-{}", child.id());
-                            for candidate in ["/bin/kill", "/usr/bin/kill"] {
-                                let killed = Command::new(candidate)
-                                    .args(["-KILL", "--", group.as_str()])
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .status()
-                                    .map(|status| status.success())
-                                    .unwrap_or(false);
-                                if killed {
-                                    break;
-                                }
-                            }
-                        }
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        // The whole tree is killed, not just the direct child:
+                        // the leader may have exited already while a descendant
+                        // still holds the pipes.
+                        kill_process_tree(&mut child);
                         return Err(Error::Timeout);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(error) => {
+                    kill_process_tree(&mut child);
                     return Err(Error::Provider {
                         code: format!("process/wait:{error}"),
-                    })
+                    });
                 }
             }
         };
-        while outputs.len() < readers {
+        // The leader can exit while a descendant it started still holds the
+        // pipes. The readers are then still blocked, so the same deadline
+        // applies here, and it kills the tree too: a refunded call must not
+        // leave a background process acting on the capability's behalf.
+        while received < readers {
             let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                kill_process_tree(&mut child);
                 return Err(Error::Timeout);
             };
             match receiver.recv_timeout(left) {
-                Ok(buffer) => outputs.push(buffer),
-                Err(_) => return Err(Error::Timeout),
+                Ok((tag, buffer)) => {
+                    received += 1;
+                    if tag == 1 {
+                        stdout = buffer;
+                    } else {
+                        stderr = buffer;
+                    }
+                }
+                Err(_) => {
+                    kill_process_tree(&mut child);
+                    return Err(Error::Timeout);
+                }
             }
         }
-        let stdout = outputs.first().cloned().unwrap_or_default();
-        let stderr = outputs.get(1).cloned().unwrap_or_default();
         if stdout.len() > self.max_output || stderr.len() > self.max_output {
             return Err(Error::ToolPolicy("output too large"));
         }

@@ -82,7 +82,11 @@ that would violate one stops and needs an ADR.
 | A timed-out tool leaves descendants running | the child leads its own process group on Unix (`process_group(0)`, one group `SIGKILL`) and `taskkill /T` ends the tree on Windows, so a descendant cannot write after the grant was refunded | `LocalProcess::invoke` |
 | Request smuggling through the tool HTTP adapter | the adapter writes the request itself: no `content-length` or body on a method defined without content, `transfer-encoding` other than `identity` refused, 1xx and non-`HTTP/1.x` status lines refused, status and header lines capped | `tool::HttpTool::perform` |
 | An MCP notification desynchronizes a session | a frame without an `id` and with a `method` is a notification: skipped up to `MAX_MCP_NOTIFICATIONS`, then the session is poisoned; a server-initiated request or a stale answer poisons it at once, because the next line may answer a request already abandoned | `tool::McpSession::request_within` |
-| A tool description injects a log record | control characters, Unicode separators (U+2028/U+2029), bidi controls and zero-width format characters are replaced with spaces before the text is stored | `tool::bounded_description` |
+| A tool description injects a log record | control characters, Unicode separators (U+2028/U+2029), bidi controls, zero-width formatters, tag characters and variation selectors are replaced with spaces before the text is stored | `tool::bounded_description` |
+| The HTTP wall ceiling is per-read, not per-call | one deadline covers resolve, connect, write, every header line and the body, and a timed-out read reports `rpc/timeout`; a HEAD/204/304 reply is read as bodyless; a repeated or unparsable `content-length` is refused | `tool::DeadlineReader`, `HttpTool::perform` |
+| The MCP handshake hangs forever | `initialize` and `tools/list` share a 5 s deadline (`handshake_within` for an explicit one); an already-expired deadline refuses before the frame leaves | `tool::McpSession::handshake` |
+| A prefix allowlist rule is a command line | an argument admitted only by a `*` rule may not contain shell syntax; the adapter documents prefix rules as unconfined and refuses the common escape | `tool::LocalProcess::permitted_by_prefix_only` |
+| A tool's output streams are mislabelled | each reader thread tags its stream, so `stdout` and `stderr` cannot swap when both pipes fill | `LocalProcess::invoke` |
 
 ## 4. Non-goals
 

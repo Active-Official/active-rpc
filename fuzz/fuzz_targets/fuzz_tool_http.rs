@@ -74,10 +74,12 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // A path outside the adapter allow-list is refused when the promise is
-    // settled, before any network call.
+    // settled, before any network call. The path travels as `Value::Path`: a
+    // text argument never reaches the path allow-list, so a text-only target
+    // would exercise the argument-kind check and nothing else.
     if path != "/safe" {
         let promise = agent
-            .call(lane, &cap, "get", vec![Arg::text(path)])
+            .call(lane, &cap, "get", vec![Arg::Value(Value::path(path))])
             .expect("the call is queued");
         let error = promise
             .value()

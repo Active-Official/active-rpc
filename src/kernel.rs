@@ -2876,8 +2876,8 @@ impl Agent {
     /// Calls issued by `lane` that are still waiting to be dispatched.
     ///
     /// This is the part of [`Lane::pending`] the kernel has not handed to a
-    /// provider yet. Linear in the number of queued calls, so it is meant for
-    /// diagnostics and dashboards rather than a hot path.
+    /// provider yet. Linear in the number of queued calls; a caller that needs
+    /// every lane wants [`Agent::lane_queue_depths`] instead.
     pub fn lane_queue_depth(&self, lane: LaneId) -> Result<usize> {
         let kernel = self.cell.borrow();
         if !kernel.lanes.contains_key(&lane) {
@@ -2888,6 +2888,24 @@ impl Agent {
             .iter()
             .filter(|id| kernel.jobs.get(id).is_some_and(|job| job.lane == lane))
             .count())
+    }
+
+    /// Queued-call depth for every live lane, in one pass over the queue.
+    ///
+    /// A dashboard that asked per lane would walk the queue once per lane on
+    /// every snapshot, on the same thread that dispatches.
+    pub fn lane_queue_depths(&self) -> std::collections::BTreeMap<LaneId, usize> {
+        let kernel = self.cell.borrow();
+        let mut depths: std::collections::BTreeMap<LaneId, usize> =
+            kernel.lanes.keys().map(|lane| (*lane, 0)).collect();
+        for id in &kernel.queue {
+            if let Some(job) = kernel.jobs.get(id) {
+                if let Some(depth) = depths.get_mut(&job.lane) {
+                    *depth += 1;
+                }
+            }
+        }
+        depths
     }
 
     /// Channel statistics.

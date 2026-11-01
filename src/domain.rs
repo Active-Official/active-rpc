@@ -469,6 +469,12 @@ impl Provider for ModuleProvider {
         METHODS.iter().map(|method| method.to_string()).collect()
     }
 
+    /// Answer the membership question without building the method table: the
+    /// default clones every name on every admitted call.
+    fn has_method(&self, method: &str) -> bool {
+        METHODS.contains(&method)
+    }
+
     fn mutating(&self, method: &str) -> bool {
         method == "patch"
     }

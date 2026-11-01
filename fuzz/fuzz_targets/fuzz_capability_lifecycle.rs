@@ -72,7 +72,7 @@ fuzz_target!(|data: &[u8]| {
             3 => {
                 // Revoke the newest capability; every later call is refused.
                 if let Some(cap) = caps.pop() {
-                    agent.revoke(&cap);
+                    let _ = agent.revoke(&cap);
                     let error = agent
                         .call(lane, &cap, "ping", vec![])
                         .expect_err("a revoked capability must be refused");

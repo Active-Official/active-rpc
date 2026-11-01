@@ -371,3 +371,119 @@ fn a_notification_stream_poisons_the_session() {
     let result = session.invoke(0, &Call::new("read", Vec::new()));
     assert_eq!(code(result), "mcp/desync", "the session must stay poisoned");
 }
+
+/// The bound is inclusive: exactly `MAX_MCP_NOTIFICATIONS` notifications are
+/// skipped and the answer that follows is accepted.
+#[test]
+fn exactly_the_notification_ceiling_is_skipped() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let list = tool_list_response(r#"[{"name":"read"}]"#);
+    let note = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
+    let mut lines = vec![initialize.to_string(), list];
+    for _ in 0..active_rpc::tool::MAX_MCP_NOTIFICATIONS {
+        lines.push(note.to_string());
+    }
+    lines.push(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#.to_string());
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut session = McpSession::handshake(Scripted::new(&borrowed)).expect("handshake");
+    let response = session
+        .invoke(0, &Call::new("read", Vec::new()))
+        .expect("the answer after the ceiling is accepted");
+    assert!(matches!(response, Response::Value(Value::Map(_))));
+}
+
+/// A server-initiated request carries its own `id` and a `method`. It is not an
+/// answer to anything this session sent, and skipping it would leave the server
+/// waiting forever, so the session fails closed.
+#[test]
+fn a_server_request_poisons_the_session() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let list = tool_list_response(r#"[{"name":"read"}]"#);
+    let request = r#"{"jsonrpc":"2.0","id":5,"method":"sampling/createMessage","params":{}}"#;
+    let mut session =
+        McpSession::handshake(Scripted::new(&[initialize, &list, request])).expect("handshake");
+    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    assert_eq!(code(result), "mcp/id-mismatch");
+    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    assert_eq!(code(result), "mcp/desync", "the session must stay poisoned");
+}
+
+/// A framing fault poisons the session: the stream no longer lines up, so the
+/// next line may answer a request that was already abandoned.
+#[test]
+fn a_framing_fault_poisons_the_session() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let list = tool_list_response(r#"[{"name":"read"}]"#);
+    let garbage = "not a json line";
+    let mut session =
+        McpSession::handshake(Scripted::new(&[initialize, &list, garbage])).expect("handshake");
+    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    assert_eq!(code(result), "mcp/bad-response");
+    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    assert_eq!(code(result), "mcp/desync");
+}
+
+/// A transport that records what it was asked to send.
+struct Spy {
+    sent: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+impl McpTransport for Spy {
+    fn send_line(&mut self, line: &str) -> active_rpc::Result<()> {
+        self.sent.borrow_mut().push(line.to_string());
+        Ok(())
+    }
+
+    fn recv_line(&mut self) -> active_rpc::Result<String> {
+        Err(Error::Provider {
+            code: "spy/empty".to_string(),
+        })
+    }
+}
+
+/// An already-expired deadline must refuse the call before the frame leaves:
+/// once it is sent, the server can act and the refusal is a lie.
+#[test]
+fn an_expired_deadline_sends_no_frame() {
+    let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let transport = Spy { sent: sent.clone() };
+    let result = McpSession::handshake_within(transport, Some(std::time::Instant::now()));
+    assert_eq!(code(result), "rpc/timeout");
+    assert!(
+        sent.borrow().is_empty(),
+        "a frame was sent: {:?}",
+        sent.borrow()
+    );
+}
+
+/// `has_method` answers from the stored table instead of cloning every name on
+/// every admitted call.
+#[test]
+fn has_method_does_not_rebuild_the_method_table() {
+    use active_rpc::kernel::Provider;
+
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let count = active_rpc::tool::MAX_MCP_TOOLS;
+    let mut tools = String::from("[");
+    for index in 0..count {
+        if index > 0 {
+            tools.push(',');
+        }
+        tools.push_str(&format!(r#"{{"name":"tool{index}"}}"#));
+    }
+    tools.push(']');
+    let list = tool_list_response(&tools);
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    let last = format!("tool{}", count - 1);
+    let started = std::time::Instant::now();
+    for _ in 0..1_000 {
+        assert!(session.has_method(&last));
+        assert!(!session.has_method("missing"));
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(300),
+        "2 000 membership checks over {count} tools took {elapsed:?}"
+    );
+}

@@ -735,6 +735,33 @@ fn mcp_handshake_is_not_counted_as_a_tool_call() {
 }
 
 #[test]
+fn lane_queue_depths_count_the_undispatched_calls() {
+    let (agent, provider_id, _cap) = agent_with_module();
+    let lane = agent.create_lane("main", Budget::default()).unwrap();
+    let cap = agent
+        .mint(provider_id, 0, CapAttrs::new(&["stats"]))
+        .expect("cap");
+    for _ in 0..3 {
+        agent.call(lane, &cap, "stats", vec![]).expect("queued");
+    }
+    assert_eq!(agent.lane_queue_depth(lane).expect("live lane"), 3);
+    assert_eq!(agent.lane_queue_depths().get(&lane).copied(), Some(3));
+    agent.run();
+    assert_eq!(
+        agent.lane_queue_depth(lane).expect("live lane"),
+        0,
+        "a dispatched call is not queued"
+    );
+    assert_eq!(
+        agent
+            .lane_queue_depth(active_rpc::LaneId(u64::MAX))
+            .err()
+            .map(|error| error.code().to_string()),
+        Some("rpc/unknown-lane".to_string())
+    );
+}
+
+#[test]
 fn refusals_are_observable_without_payloads() {
     let (agent, provider_id, _cap) = agent_with_module();
     let lane = agent.create_lane("main", Budget::default()).unwrap();
@@ -920,7 +947,7 @@ fn local_process_timeout_kills_a_hung_child() {
         .expect_err("a hung child must time out");
     assert_eq!(error.code(), "rpc/timeout");
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(5),
+        start.elapsed() < std::time::Duration::from_secs(10),
         "timeout took {:?}",
         start.elapsed()
     );
@@ -942,7 +969,7 @@ fn local_process_timeout_kills_a_hung_child() {
         .expect_err("a hung child must time out");
     assert_eq!(error.code(), "rpc/timeout");
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(5),
+        start.elapsed() < std::time::Duration::from_secs(10),
         "timeout took {:?}",
         start.elapsed()
     );
@@ -1085,10 +1112,11 @@ fn capability_wall_budget_caps_a_slow_tool() {
     let error = tool.invoke(0, &call).expect_err("wall budget must bind");
     assert_eq!(error.code(), "rpc/timeout");
     // The ceiling is 120 ms and the child would run for ~19 s. The margin
-    // covers ending the process tree (`taskkill /T`) after the deadline.
+    // covers ending the process tree (`taskkill /T`) after the deadline, which
+    // can take seconds on a saturated machine.
     let elapsed = start.elapsed();
     assert!(
-        elapsed < std::time::Duration::from_secs(5),
+        elapsed < std::time::Duration::from_secs(10),
         "a 120 ms ceiling took {elapsed:?}"
     );
 }

@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried | 10 fixed / 0 rejected / 5 open (logged) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | pending | — | — |
 | R-10 | bulk | `src/bulk.rs` | pending | — | — |
 | R-11 | identity | `src/identity.rs` | pending | — | — |
@@ -195,8 +195,53 @@ worktree was being edited). Five highs, four mediums, six lows.
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
 
-### R-07 domain operations - 2026-11-01 (round 1, in progress)
+### R-08 tools / MCP - 2026-11-01 (round 2)
 
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `db3af5a`.
+It reproduced the gates itself and probed each carried fix. Verdicts: #11
+(HTTP framing) and #14 (notification skip) verified; #8, #9, #15 verified with
+caveats; three new highs and six mediums came out of the same pass, all fixed
+here. Every fix carries a test, and each test was shown to fail against the
+tree before it.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 8 | medium | a bare program name resolved from the ambient `PATH`, and `cwd` was inherited (carried from round 1) | **fixed**: `pin_program` refuses a non-absolute path and pins the canonical one; `LocalProcess::with_current_dir` pins the directory (refusing a relative one), `StdioTransport` pins it at spawn; `taskkill.exe` comes from `SystemRoot`; `a_bare_program_name_is_refused` |
+| 9 | medium | a timeout killed the direct child only; the readers were detached (carried) | **fixed**: the child leads its own process group on Unix and the group gets SIGKILL (`/bin/kill`, then `/usr/bin/kill`); Windows keeps `taskkill /T`; `a_timeout_kills_the_descendant_tree` (proved on Linux) |
+| 11 | low | a GET carried `content-length: 4` and a `"null"` body (carried) | **fixed**: only POST, PUT and PATCH send content; `a_get_request_has_no_body`, `a_post_carries_its_body_and_length` |
+| 14 | low | an MCP notification desynchronized the session (carried) | **fixed**: a frame without an `id` that has a `method` is skipped up to `MAX_MCP_NOTIFICATIONS` (16), then the session is poisoned; `a_notification_before_the_response_is_skipped`, `exactly_the_notification_ceiling_is_skipped` |
+| 15 | low | `bounded_description` missed U+2028/U+2029 and invisible formatters (carried) | **fixed**: separators, bidi controls, zero-width joiners, tag characters, invisible operators and variation selectors become spaces; `a_description_cannot_inject_a_line_separator` |
+| N1 | high | the reader-wait timeout returned `rpc/timeout` without killing the tree: a leader that exits at once leaves a descendant holding the pipes and acting after the grant was refunded | **fixed**: `kill_process_tree` runs on both timeout paths and on a wait error; `a_timeout_after_the_leader_exits_kills_the_tree` (the mutation that removes only this call makes it fail) |
+| N2 | high | the HTTP ceiling was a per-read socket timeout, not a wall deadline: a server dripping a byte per 35 ms held a 60 ms grant for 2.07 s and the call succeeded | **fixed**: one deadline for the exchange, threaded through `DeadlineReader` (connect, every read, body) and re-checked after each read; a timed-out read is `rpc/timeout`; `a_dripping_server_cannot_stretch_the_wall_ceiling` |
+| N3 | high | `McpSession::handshake` had no deadline at all: a silent server blocked the caller forever | **fixed**: `DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS` (5 s) covers `initialize` and `tools/list`; `handshake_within` takes an explicit one; `an_mcp_request_carries_a_deadline`, `an_expired_deadline_sends_no_frame` |
+| N4 | medium | the duplicate-name check was still a linear scan (round-1 #7's `seen` set was dead code): 8 000 tools took 1 007 ms | **fixed**: one `BTreeSet` insert decides duplicates, and `MAX_MCP_TOOLS` (4 096) bounds the table |
+| N5 | medium | stdout and stderr were labelled by channel arrival order (8 of 20 runs swapped) | **fixed**: each reader sends its tag; `stdout_and_stderr_are_not_swapped` (20 runs) |
+| N6 | medium | every dispatch rebuilt the MCP method table through the default `has_method` (1.19 ms and ~1 MB per call at 7 000 tools) | **fixed**: `McpSession` and `ModuleProvider` answer from their own tables; `has_method_does_not_rebuild_the_method_table` |
+| N7 | medium | HEAD, 204 and 304 responses were read as if they carried a body, so an allowlisted HEAD endpoint stalled until the ceiling | **fixed**: those replies return an empty body; `a_head_response_has_no_body` |
+| N8 | medium | a `*` allowlist rule is a command-line prefix: with `cmd /C` and `echo*`, `echo ok & del …` was arbitrary command execution | **fixed**: an argument admitted only by a prefix rule may not contain shell syntax (command separators, redirection, `^`, parentheses, quotes, `$`, backtick, `%`, newline, NUL); `a_prefix_argument_cannot_smuggle_a_command` |
+| N9 | low | tag characters, U+2061-U+2064, U+180E and variation selectors survived the description scrub | **fixed** with the carried #15 |
+| N10 | low | a repeated or unparsable `content-length` silently switched framing | **fixed**: `http/headers`; `a_repeated_content_length_is_refused` |
+| N11 | low | `Value::Path` and the `request` method text reached the request line unsanitised | **fixed**: a control character in either is `rpc/tool-policy`; `a_path_with_a_control_character_is_refused` |
+| N12 | low | the MCP deadline was checked after `send_line`, so an expired call still mutated the server | **fixed**: the check runs before the frame leaves; `an_expired_deadline_sends_no_frame` |
+| N13 | low | `StdioTransport` children had no process group and `Drop` killed the leader only | **fixed**: `process_group(0)` at spawn and `kill_process_tree` on drop |
+| N14 | low | test gaps: the notification boundary, a server-initiated request, a framing fault, and the fuzz target still passing a text path | **fixed**: four tests plus `fuzz_tool_http` now sends `Value::Path` |
+| N15 | low | `lane_queue_depth` walked the queue per lane on every dashboard snapshot | **fixed**: `Agent::lane_queue_depths` is one pass; the control plane uses it; `lane_queue_depths_count_the_undispatched_calls` |
+| N16 | low | two wall-ceiling tests flaked under a saturated parallel run (5 s bound) | **fixed**: the bound is 10 s, and the comment says why the margin exists |
+| N17 | low | the control plane is a separate workspace, so root `cargo test` never builds it (it did not compile at `fd64122`) | **fixed**: it was repaired and CI's `control-plane` job (format + tests) is green; the root workspace is unchanged on purpose, because the crate has its own dependency set |
+
+Residual risks recorded, not defects: the `poisoned` flag is provider-wide, so
+one desync ends every capability on that MCP provider; a transient MCP timeout
+poisons the session on the next call (the abandoned answer is an id mismatch);
+`SystemRoot` is trusted to locate `taskkill.exe`; a distroless image with
+neither `/bin/kill` nor `/usr/bin/kill` falls back to the leader only; Windows
+children inherit every inheritable handle (no `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`).
+
+Gate: `cargo test --all-features` 487 passed, 0 failed; `--no-default-features`
+441 passed; clippy and fmt clean in three configurations; control plane 30 and
+CLI 17 pass; the 11 tool tests and the fuzz crate build in
+`rust:1.88-bookworm`, where both process-group tests run.
+
+### R-07 domain operations - 2026-11-01 (round 1, in progress)
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `22c3d66`.
 
 | # | Sev | Finding | Disposition |

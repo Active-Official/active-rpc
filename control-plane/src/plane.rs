@@ -1389,18 +1389,19 @@ impl PlaneCore {
     }
 
     fn lane_stats(&self) -> Vec<LaneStat> {
+        // One pass over the queue for every lane, not one walk per lane on the
+        // thread that dispatches.
+        let depths = self.agent.lane_queue_depths();
         self.lanes
             .iter()
             .filter_map(|id| {
                 let lane = self.agent.lane(*id).ok()?;
-                // `pending` counts every outstanding call; `queue` is the part
-                // the kernel has not dispatched yet.
                 Some(LaneStat {
                     lane: lane.id.0,
                     name: lane.name,
                     pending: lane.pending,
                     completed: lane.completed,
-                    queue: self.agent.lane_queue_depth(*id).unwrap_or(0),
+                    queue: depths.get(id).copied().unwrap_or_default(),
                     closed: lane.closed,
                 })
             })

@@ -212,6 +212,7 @@ session:
 | `mcp/desync` | more than `MAX_MCP_NOTIFICATIONS` notification frames arrived for one request, or the session was already poisoned |
 | `mcp/initialize` | the server answered `initialize` with an error |
 | `mcp/tool-name` | an advertised tool name is not `[A-Za-z0-9_.-]{1,128}`, or two tools share a name |
+| `mcp/tool-count` | the server advertised more than `MAX_MCP_TOOLS` (4 096) tools |
 | `mcp/spawn:<err>` | the child process could not be started |
 | `mcp/cwd` | the working directory could not be pinned |
 | `mcp/read:<err>`, `mcp/write:<err>`, `mcp/stdin`, `mcp/stdout` | transport I/O failed |
@@ -227,7 +228,9 @@ A frame without an `id` and with a `method` is a **notification**
 skips a bounded number of them so a spec-compliant server keeps working, then
 poisons itself: an unbounded skip would let a server starve the caller with
 frames it never asked for. A poisoned session refuses every later call, because
-after a desync the next line may belong to a request already abandoned.
+after a desync the next line may belong to a request already abandoned. The
+handshake itself is bounded by `DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS` (5 s) unless
+the caller passes its own deadline to `handshake_within`.
 
 ### HTTP adapter codes (`HttpTool`)
 
@@ -239,7 +242,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/connect` | no address accepted the connection inside the ceiling |
 | `http/status` | the status line is not `HTTP/1.x` with a numeric code |
 | `http/interim` | a 1xx interim response arrived; the adapter does not follow it |
-| `http/headers` | the header block exceeded 64 KiB or 128 fields |
+| `http/headers` | the header block exceeded 64 KiB or 128 fields, or a `content-length` was repeated or unparsable |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>`, `http/body:<err>` | socket I/O failed |
@@ -249,7 +252,12 @@ The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `content-length` only for a method defined to carry content (`POST`, `PUT`,
 `PATCH`). A GET sends no body: the request is complete at the empty line, and
 extra bytes make simple servers and intermediaries reset the connection instead
-of answering.
+of answering. The `max_wall_ms` grant (clamped to 10 s) is **one deadline** for
+the whole exchange — resolve, connect, write, every header line and the body —
+so a server that drips a byte per timeout period cannot stretch it. A HEAD,
+204 or 304 reply is read as bodyless whatever its headers say. A path is
+refused if it contains a byte below `0x21` or `0x7f`, because it is
+interpolated into the request line.
 
 ### Process adapter codes (`LocalProcess`)
 
@@ -260,14 +268,16 @@ of answering.
 | `process/cwd` | the working directory could not be pinned at construction |
 | `rpc/timeout` | the call exceeded the effective wall ceiling; the whole process group was killed |
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
-| `rpc/tool-policy` | an argument is not allowlisted, the output exceeded `max_output`, or process execution was not granted |
+| `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, the output exceeded `max_output`, or process execution was not granted |
 
 `LocalProcess::new` requires an absolute program path. A bare name would be
 resolved from the parent's `PATH`, which is ambient authority: anything that can
 write an earlier `PATH` entry would choose the binary a capability runs. The
 canonical path is pinned at construction, and the working directory is pinned to
 the parent's directory at that moment, so a later `chdir` or symlink swap cannot
-redirect the child.
+redirect the child. A `*` allowlist rule admits a command-line prefix, so an
+argument that only a prefix rule admits may not contain shell syntax: with a
+shell as the program the rest of the line would be code.
 
 ### WASM guest tool codes (`wasm-tools`)
 

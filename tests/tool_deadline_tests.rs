@@ -29,7 +29,10 @@ impl McpTransport for Silent {
                 if deadline <= now {
                     return Err(active_rpc::Error::Timeout);
                 }
-                std::thread::sleep(deadline - now);
+                // Wait for a while, but never the whole five-second default:
+                // the point is that a future deadline arrived, and the suite
+                // does not need to pay for it in full.
+                std::thread::sleep((deadline - now).min(Duration::from_millis(250)));
                 Err(active_rpc::Error::Timeout)
             }
             None => Err(active_rpc::Error::Timeout),
