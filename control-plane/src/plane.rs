@@ -1153,6 +1153,14 @@ impl PlaneCore {
                 detail: format!("channel {} received {}", channel.0, sequence),
                 ..base
             },
+            // The receipt ring started dropping: the audit window is shorter
+            // than the session, which an operator must see.
+            Event::ReceiptsDropped { count } => UiEvent {
+                category: category_for("cap_lifecycle").into(),
+                kind: "receipts_dropped".into(),
+                detail: format!("{count} receipt(s) evicted from the ring"),
+                ..base
+            },
         }
     }
 

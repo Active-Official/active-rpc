@@ -1,6 +1,6 @@
-# ADR-0004 — Capability identity, attenuation and lifetime
+# ADR-0004 - Capability identity, attenuation and lifetime
 
-**Status:** accepted (2026-10-27)
+**Status:** accepted (2026-10-27).
 
 ## Context
 

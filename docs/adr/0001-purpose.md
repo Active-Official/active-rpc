@@ -1,6 +1,6 @@
-# ADR-0001 — Purpose of Active RPC
+# ADR-0001 - Purpose of Active RPC
 
-**Status:** accepted (2026-10-27)
+**Status:** accepted (2026-10-27).
 
 ## Context
 

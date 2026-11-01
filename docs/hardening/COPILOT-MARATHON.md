@@ -26,7 +26,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
 | R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
-| R-13 | receipts | `src/receipts.rs` | pending | — | — |
+| R-13 | receipts | `src/receipts.rs` | round 1: 4 highs + 5 mediums + 4 lows fixed | 13 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | pending | — | — |
 | R-15 | observability | `src/observability.rs` | pending | — | — |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | pending | — | — |
@@ -194,6 +194,49 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-13 receipts - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `8a6d901`,
+running probes against the real API. Four highs, five mediums, four lows; all
+thirteen were confirmed against the code, and the log format moved to `ARRL` v2.
+The pattern behind three of the four highs is the same: a writer that does not
+apply the reader's rules, and evidence that does not carry the decision it
+claims to record.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `append_all` never checked sequence continuity, so a wrapped ring (any session past 1024 calls) wrote a log its own reader refused and left the file unusable | **fixed**: the writer derives the expected sequence from the header's `start` plus the record count, and `create_starting_at(path, oldest)` exports a wrapped window honestly; `a_gap_in_the_sequence_is_refused_and_writes_nothing`, `a_kernel_ring_that_wrapped_exports_cleanly` |
+| F2 | high | a truncated prefix verified: dropping the last records leaves a shorter self-consistent log, so an operator could not tell a short session from a doctored file | **fixed**: `verify_against(expected_head)` pins the head a verifier learned out of band; the CLI exposes `--expect-head`; `a_truncated_prefix_is_refused_against_the_pinned_head` |
+| F3 | high | append was unauthenticated and the CLI never called `verify_macs`, so a log could be extended with fabricated records and still pass `receipts verify` | **fixed**: `append_verified(secret, ..)` refuses a receipt this kernel did not seal, `receipts verify --secret-hex` checks every MAC, and the unkeyed mode prints `chain-only (unauthenticated)`; `append_verified_refuses_a_forged_receipt` |
+| F4 | high | the receipt was sealed at queue time, so a call that dispatch refused (revoked, expired, identity mismatch) kept an "authorized" receipt | **fixed**: the seal happens at dispatch with `Decision::{Admitted, Refused(code)}` as a record field; `a_dispatch_refusal_is_recorded_as_a_refusal`, `a_refusal_round_trips_through_the_log` |
+| F5 | medium | concurrent appends could interleave between the walk and the write and corrupt the chain | **fixed**: `LogLock` takes a `create_new` lock file with a bounded retry and refuses instead of writing; `concurrent_writers_cannot_double_append` |
+| F6 | medium | eviction and disable left no marker, so a bounded ring read as a complete history | **fixed**: `Agent::receipts_dropped()` plus one `receipts.dropped` event at the transition (one per eviction would flood the bounded tape); `evictions_are_counted_and_reported_once`, `disabling_receipts_counts_what_it_clears` |
+| F7 | medium | the log was unbounded, every read pulled the whole file, and each append re-walked it (`O(n^2)`) | **fixed**: `MAX_LOG_BYTES`/`MAX_LOG_RECORDS` on read and write, reads through `take(ceiling + 1)`, and a cached `LogState` short-circuited by one `stat`; `an_oversized_log_is_refused_promptly`, `many_appends_stay_linear` |
+| F8 | medium | the kernel could seal a receipt its own log rejects (a granted method that is empty, over 1 KiB, or carries a control character) | **fixed**: `check_method_names` at mint, restore and attenuate, and `append` applies the reader's predicates; `a_granted_method_the_log_cannot_hold_is_refused_at_mint`, `a_long_granted_method_is_recorded_exactly` |
+| F9 | medium | a method name or code flowed into a log line and a terminal unescaped | **fixed**: `valid_method`/`valid_code` on encode and decode, and the CLI prints the method with `{:?}`; `a_receipt_the_reader_would_reject_is_refused_at_append` |
+| F10 | low | verification errors named a 0-based record index, so the operator could not map one to a receipt | **fixed**: errors name the receipt `sequence` |
+| F11 | low | a damaged header exited with the usage class, which a script cannot tell from a typo | **fixed**: a damaged log refuses (exit 1), a missing path is usage (exit 2) |
+| F12 | low | `create` truncated an existing log, destroying evidence on a mistyped path | **fixed**: `create` refuses a log that holds records and `truncate` is the explicit "start over"; `create_refuses_to_overwrite_evidence` |
+| F13 | low | records could be non-canonical: uppercase hex, arbitrary refusal codes, a reversed `at_ms` that only the reader rejected | **fixed**: one predicate per field shared by writer and reader, a non-decreasing time rule on both sides, and an unknown version refused; `time_that_runs_backwards_is_refused_on_both_sides`, `a_log_from_a_future_version_is_refused` |
+
+Two findings were design, not just code: **the chain is not authenticity**
+(a chain-only verify proves the file was not edited or reordered, and only
+`verify_macs` proves the kernel wrote it) and **a prefix is a valid log** (so
+truncation needs a pinned head). Both are now stated in ADR-0021 and
+`docs/spec/wire.md`, with the CLI wording matching.
+
+Also fixed while in the section: `Decision::Refused` carries an owned code, so
+the reader rebuilds any code the writer accepted instead of keeping a
+hand-maintained allowlist that a new `Error` code would break; `verify_header`
+returns only the start sequence; `append_inner` lost a dead parameter; and
+`fuzz_receipt_log` is new (3000 runs, 132 new units, 167 MB peak RSS, no crash),
+registered in all three workflow target lists.
+
+Gate: `cargo test --all-features` 549 passed, 0 failed across 63 suites;
+`--no-default-features` 500 passed, 0 failed across 63 suites; clippy, fmt and
+`cargo doc -D warnings` clean on both feature sets; control plane 30 and CLI 17
+pass; `rust:1.88-bookworm` runs the receipt suites green.
 
 ### R-12 replay - 2026-11-01 (round 1)
 

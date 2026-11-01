@@ -40,7 +40,7 @@ fn subset(mask: u8) -> Vec<&'static str> {
 fn granted(grants: &Option<Vec<&'static str>>, topic: &str) -> bool {
     match grants {
         None => true,
-        Some(allowed) => allowed.iter().any(|candidate| *candidate == topic),
+        Some(allowed) => allowed.contains(&topic),
     }
 }
 

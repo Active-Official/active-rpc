@@ -1,8 +1,8 @@
-# ADR-0014: An observability schema that carries no authority
+# ADR-0014 - An observability schema that carries no authority
 
-- Status: Accepted
-- Date: 2026-10-30
-- Context: Maturity Program C-6.4 (PROPOSAL §5.9)
+**Status:** accepted (2026-10-30).
+**Date:** 2026-10-30
+**Context:** Maturity Program C-6.4 (PROPOSAL §5.9)
 
 ## Problem
 

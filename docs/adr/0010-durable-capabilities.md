@@ -1,6 +1,6 @@
-# ADR 0010 — Durable versus ephemeral capabilities
+# ADR-0010 - Durable versus ephemeral capabilities
 
-Status: accepted for AIM-PROP-2026-10 C-5.5.
+**Status:** accepted (2026-10-30). Accepted under AIM-PROP-2026-10 C-5.5.
 
 ## Decision
 

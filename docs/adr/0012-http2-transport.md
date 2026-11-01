@@ -1,9 +1,9 @@
-# ADR-0012: A native HTTP/2 transport for ARP1
+# ADR-0012 - A native HTTP/2 transport for ARP1
 
-- Status: Accepted
-- Date: 2026-10-30
-- Context: Maturity Program C-6.2 (PROPOSAL §5.5)
-- Feature: `http2`
+**Status:** accepted (2026-10-30).
+**Date:** 2026-10-30
+**Context:** Maturity Program C-6.2 (PROPOSAL §5.5)
+**Feature:** `http2`
 
 ## Problem
 

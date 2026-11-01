@@ -70,7 +70,12 @@ fuzz_target!(|data: &[u8]| {
 
     // A known capability id travels in the message.
     assert!(agent
-        .send(lane, channel_id, Value::text("hello"), &[cap.clone()])
+        .send(
+            lane,
+            channel_id,
+            Value::text("hello"),
+            std::slice::from_ref(&cap)
+        )
         .is_ok());
     let message = agent.recv(channel_id).expect("channel").expect("message");
     assert_eq!(message.caps.len(), 1);

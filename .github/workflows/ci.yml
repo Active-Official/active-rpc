@@ -117,7 +117,8 @@ jobs:
             fuzz_transport_framing \
             fuzz_bulk_plan \
             fuzz_replay_package \
-            fuzz_topic_policy; do
+            fuzz_topic_policy \
+            fuzz_receipt_log; do
             echo "== $target =="
             cargo fuzz run "$target" -- -runs=2000
           done

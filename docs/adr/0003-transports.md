@@ -1,6 +1,6 @@
-# ADR-0003 — Transport choices
+# ADR-0003 - Transport choices
 
-**Status:** accepted (2026-10-27)
+**Status:** accepted (2026-10-27). The HTTP/2 part of this decision is superseded by [ADR-0012](0012-http2-transport.md): the bridge remains as the Connect/gRPC adapter, and the native HTTP/2 transport is the way to speak HTTP/2.
 
 ## Context
 

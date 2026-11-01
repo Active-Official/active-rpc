@@ -1,8 +1,8 @@
-# ADR-0011: Transport identity and capability binding
+# ADR-0011 - Transport identity and capability binding
 
-- Status: Accepted
-- Date: 2026-10-30
-- Context: Maturity Program C-6.1 (PROPOSAL §5.4)
+**Status:** accepted (2026-10-30).
+**Date:** 2026-10-30
+**Context:** Maturity Program C-6.1 (PROPOSAL §5.4)
 
 ## Problem
 

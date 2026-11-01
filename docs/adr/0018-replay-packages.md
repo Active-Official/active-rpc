@@ -1,4 +1,4 @@
-# ADR-0018 — Deterministic replay packages (`ARRP`)
+# ADR-0018 - Deterministic replay packages (`ARRP`)
 
 **Status:** accepted (2026-10-31). New artifact format; the ARP1 envelope is
 unchanged.

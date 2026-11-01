@@ -215,6 +215,11 @@ pub enum Event {
     },
     /// A promise settled.
     PromiseResolved(PromiseId),
+    /// A receipt left the bounded ring (evicted, or cleared by disabling).
+    ReceiptsDropped {
+        /// Total receipts dropped so far.
+        count: u64,
+    },
     /// A promise was rejected.
     PromiseRejected {
         /// Promise id.
@@ -382,6 +387,8 @@ pub struct Kernel {
     receipts: std::collections::VecDeque<crate::receipts::Receipt>,
     receipts_enabled: bool,
     next_receipt: u64,
+    /// Receipts evicted from the ring (or cleared when receipts were disabled).
+    receipts_dropped: u64,
     /// Deployment key that seals durable records. Without it a record cannot
     /// be exported or restored: an unverifiable credential is not accepted.
     record_key: Option<[u8; 32]>,
@@ -658,6 +665,7 @@ impl Agent {
             receipts: std::collections::VecDeque::new(),
             receipts_enabled: false,
             next_receipt: 0,
+            receipts_dropped: 0,
             record_key: None,
             revoked_records: BTreeSet::new(),
             consumed_records: BTreeSet::new(),
@@ -702,20 +710,36 @@ impl Agent {
 
     /// Enable or disable capability receipts.
     ///
-    /// When enabled, every admitted call appends a [`crate::Receipt`] to a
-    /// bounded ring. Disabling also clears the ring. Receipts carry the
-    /// capability's correlation id and the method, never arguments or secrets.
+    /// When enabled, every call that reaches dispatch appends a
+    /// [`crate::Receipt`] to a bounded ring, recording the decision taken there
+    /// (admitted, or refused with the code). Disabling also clears the ring;
+    /// [`Agent::receipts_dropped`] counts what was cleared or evicted, so an
+    /// exported window never pretends to be the whole history.
     pub fn enable_receipts(&self, enabled: bool) {
         let mut kernel = self.cell.borrow_mut();
         kernel.receipts_enabled = enabled;
         if !enabled {
+            let cleared = kernel.receipts.len() as u64;
             kernel.receipts.clear();
+            if cleared > 0 {
+                kernel.receipts_dropped = kernel.receipts_dropped.saturating_add(cleared);
+                kernel.push_event(Event::ReceiptsDropped { count: cleared });
+            }
         }
     }
 
     /// The receipts recorded so far, oldest first.
     pub fn receipts(&self) -> Vec<crate::Receipt> {
         self.cell.borrow().receipts.iter().cloned().collect()
+    }
+
+    /// Receipts the ring evicted, or that disabling cleared.
+    ///
+    /// An exported window starts at a sequence above 1 exactly when this is
+    /// non-zero; without the counter an auditor could not tell a short session
+    /// from a truncated record.
+    pub fn receipts_dropped(&self) -> u64 {
+        self.cell.borrow().receipts_dropped
     }
 
     /// Verify that a receipt came from this kernel and was not edited.
@@ -1107,6 +1131,7 @@ impl Agent {
         if attrs.methods.is_empty() {
             return Err(Error::InvalidArgument("capability grants no methods"));
         }
+        check_method_names(&attrs)?;
         let mut kernel = self.cell.borrow_mut();
         if !kernel.providers.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
@@ -1190,6 +1215,7 @@ impl Agent {
         if attrs.methods.is_empty() {
             return Err(Error::InvalidArgument("capability grants no methods"));
         }
+        check_method_names(&attrs)?;
         let mut kernel = self.cell.borrow_mut();
         if !kernel.providers.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
@@ -1336,6 +1362,7 @@ impl Agent {
         }
         let attrs = record.attrs.attenuate(attrs)?;
         check_binding(&attrs)?;
+        check_method_names(&attrs)?;
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, Some(&parent_id));
@@ -2276,21 +2303,9 @@ impl Agent {
             .promises
             .insert(promise_id, PromiseRecord::new(promise_id, lane.0));
 
-        // The call is authorized: record the decision before it is queued.
-        if kernel.receipts_enabled {
-            kernel.next_receipt = kernel.next_receipt.saturating_add(1);
-            let receipt = crate::receipts::Receipt::seal(
-                &kernel.secret,
-                kernel.next_receipt,
-                cap_id,
-                method,
-                kernel.now_ms,
-            );
-            kernel.receipts.push_back(receipt);
-            if kernel.receipts.len() > crate::receipts::MAX_RECEIPTS {
-                kernel.receipts.pop_front();
-            }
-        }
+        // The call is authorized at queue time, but the receipt is written at
+        // dispatch: that is where revocation, expiry and identity are re-checked,
+        // and a receipt must record the decision the kernel actually took.
 
         let job_id = kernel.next_job;
         kernel.next_job += 1;
@@ -3154,6 +3169,45 @@ impl Agent {
         Ok(())
     }
 
+    /// Record the dispatch decision for a job, when receipts are enabled.
+    ///
+    /// `refusal` is the error the kernel settled the job with, if any. The ring
+    /// is bounded; an eviction is counted and reported once, because a shorter
+    /// ring must not look like a shorter history and the event tape is bounded
+    /// too.
+    fn record_receipt(&self, job: &Job, refusal: Option<&Error>) {
+        let mut kernel = self.cell.borrow_mut();
+        if !kernel.receipts_enabled {
+            return;
+        }
+        kernel.next_receipt = kernel.next_receipt.saturating_add(1);
+        let decision = match refusal {
+            Some(error) => crate::receipts::Decision::Refused(error.code().to_string()),
+            None => crate::receipts::Decision::Admitted,
+        };
+        let receipt = crate::receipts::Receipt::seal(
+            &kernel.secret,
+            kernel.next_receipt,
+            job.cap,
+            &receipt_method(&job.call.method),
+            kernel.now_ms,
+            decision,
+        );
+        kernel.receipts.push_back(receipt);
+        if kernel.receipts.len() > crate::receipts::MAX_RECEIPTS {
+            kernel.receipts.pop_front();
+            kernel.receipts_dropped = kernel.receipts_dropped.saturating_add(1);
+            // One event when the ring starts dropping, not one per call: a call
+            // after the ring fills would otherwise push the useful history out
+            // of the tape one entry at a time. `receipts_dropped` carries the
+            // running total, and the oldest retained receipt's sequence says how
+            // much of the history is missing.
+            if kernel.receipts_dropped == 1 {
+                kernel.push_event(Event::ReceiptsDropped { count: 1 });
+            }
+        }
+    }
+
     fn dispatch(&self, batch: Vec<u64>) {
         // No kernel borrow is held while a provider runs: a provider may hold an
         // `Agent` and call back into the kernel, and a re-entrant borrow would
@@ -3324,6 +3378,12 @@ impl Agent {
                 Some(error) => Some(error),
                 None => self.charge_dispatch_delta(&job, extra).err(),
             };
+            // The decision is final here: the capability was re-checked at
+            // dispatch (revocation, expiry, identity, scope, tool policy and
+            // budget). Record it before provider code runs, with the outcome the
+            // kernel chose, so a refused call cannot leave an "authorized"
+            // receipt behind.
+            self.record_receipt(&job, failure.as_ref());
             // Phase 2: run provider code with no borrow held.
             let outcome = match failure {
                 Some(error) => Err(error),
@@ -3791,6 +3851,44 @@ fn method_event_label(method: &str) -> String {
         label.push_str(&format!("{byte:02x}"));
     }
     label
+}
+
+/// The method name a receipt records.
+///
+/// A granted method is already representable (`check_method_names`), so it is
+/// recorded exactly. A refused call can carry any caller-chosen name, including
+/// one the receipt format cannot hold: that name is escaped and bounded like an
+/// event label, so the refusal is still exportable and still distinguishes
+/// names that share a prefix.
+fn receipt_method(method: &str) -> String {
+    if crate::receipts::valid_method(method) {
+        return method.to_string();
+    }
+    let label = method_event_label(method);
+    if label.is_empty() {
+        "<empty>".to_string()
+    } else {
+        label
+    }
+}
+
+/// Refuse a granted method name the audit surfaces cannot represent.
+///
+/// A receipt stores the method in a `u16`-length field and must not carry a
+/// control character, and the event label has the same rule. A name that breaks
+/// either would be minted but never exportable, which turns one bad grant into
+/// an audit log that cannot be written at all.
+fn check_method_names(attrs: &CapAttrs) -> Result<()> {
+    if attrs
+        .methods
+        .iter()
+        .any(|method| !crate::receipts::valid_method(method))
+    {
+        return Err(Error::InvalidArgument(
+            "a method name must be 1..=1024 bytes without control characters",
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse a binding that names no real peer.

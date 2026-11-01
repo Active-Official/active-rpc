@@ -1,6 +1,6 @@
-# ADR-0002 — A deterministic kernel with transports as adapters
+# ADR-0002 - A deterministic kernel with transports as adapters
 
-**Status:** accepted (2026-10-27)
+**Status:** accepted (2026-10-27).
 
 ## Context
 

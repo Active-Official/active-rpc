@@ -765,6 +765,12 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             event: "promise.resolved".into(),
             cap: None,
         },
+        Event::ReceiptsDropped { .. } => Trace {
+            // Receipts are an audit side channel; their eviction does not change
+            // a decision, so the trace keeps the fact and not the count.
+            event: "receipts.dropped".into(),
+            cap: None,
+        },
         Event::PromiseRejected { code, .. } => Trace {
             event: format!("promise.rejected:{code}"),
             cap: None,

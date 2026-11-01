@@ -1,0 +1,184 @@
+#![no_main]
+
+//! Receipt logs (`ARRL` v2): a hostile file must be refused, never panic.
+//!
+//! Invariants under test:
+//!
+//! 1. `verify_bytes` is total over arbitrary bytes: it returns receipts or an
+//!    `rpc/receipt` error, never a panic, an allocation blow-up or an overflow.
+//! 2. A log it accepts satisfies the format's own invariants: contiguous
+//!    sequences from the header's start, non-decreasing times, lowercase
+//!    correlation ids, representable methods and refusal codes.
+//! 3. Every prefix that ends on a record boundary is itself a valid log holding
+//!    that prefix of the records; every other prefix is refused. That is why a
+//!    truncated tail is invisible to chain-only verification and needs a pinned
+//!    head, which the unit tests cover.
+//! 4. A log the shipped kernel exports round-trips: the records read back are
+//!    the receipts the kernel sealed, and their MACs verify under the secret.
+//!
+//! Run with `cargo +nightly fuzz run fuzz_receipt_log -- -runs=200000`.
+
+use std::path::PathBuf;
+
+use libfuzzer_sys::fuzz_target;
+
+use active_rpc::cap::CapAttrs;
+use active_rpc::kernel::Provider;
+use active_rpc::receipts::{ReceiptLog, LOG_HEADER_LEN};
+use active_rpc::value::{Call, Response, Value};
+use active_rpc::{Agent, Budget, Receipt};
+
+struct Echo;
+
+impl Provider for Echo {
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["echo".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::Text(call.method.clone())))
+    }
+}
+
+const SECRET: [u8; 32] = [0x5a; 32];
+
+/// One scratch path per fuzz process; each execution removes it first.
+fn scratch() -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "active-rpc-fuzz-receipt-log-{}",
+        std::process::id()
+    ));
+    path
+}
+
+/// The invariants a log the reader accepted must satisfy.
+fn check_invariants(receipts: &[Receipt], start: u64) {
+    let mut last_ms = 0u64;
+    for (index, receipt) in receipts.iter().enumerate() {
+        assert_eq!(
+            receipt.sequence,
+            start + index as u64,
+            "an accepted log must number its records from the header"
+        );
+        assert!(
+            receipt.fields_are_representable(),
+            "an accepted record must be representable"
+        );
+        assert!(
+            receipt.at_ms >= last_ms,
+            "an accepted log must not run backwards in time"
+        );
+        last_ms = receipt.at_ms;
+    }
+}
+
+/// The shipped path: a kernel session exported and read back.
+fn structured(data: &[u8]) {
+    let agent = Agent::with_secret(SECRET);
+    agent.enable_receipts(true);
+    let provider = agent.register(Box::new(Echo));
+    let cap = match agent.mint(provider, 0, CapAttrs::new(&["echo"])) {
+        Ok(cap) => cap,
+        Err(_) => return,
+    };
+    let lane = match agent.create_lane("fuzz", Budget::default()) {
+        Ok(lane) => lane,
+        Err(_) => return,
+    };
+    for action in data.iter().take(8) {
+        match action % 4 {
+            0 => {
+                if let Ok(promise) = agent.call(lane, &cap, "echo", Vec::new()) {
+                    agent.run();
+                    let _ = promise.value();
+                }
+            }
+            1 => {
+                // Queue while live, revoke, then run: a dispatch refusal.
+                if let Ok(promise) = agent.call(lane, &cap, "echo", Vec::new()) {
+                    let _ = agent.revoke(&cap);
+                    agent.run();
+                    let _ = promise.value();
+                }
+            }
+            2 => {
+                let _ = agent.call(lane, &cap, "not-granted", Vec::new());
+            }
+            _ => {
+                agent.enable_receipts(false);
+                agent.enable_receipts(true);
+            }
+        }
+    }
+
+    let receipts = agent.receipts();
+    let path = scratch();
+    let _ = std::fs::remove_file(&path);
+    let start = receipts.first().map_or(1, |receipt| receipt.sequence);
+    let log = ReceiptLog::create_starting_at(&path, start).expect("create");
+    log.append_verified(&SECRET, &receipts)
+        .expect("the kernel's own receipts must export");
+    let read = log.records().expect("records");
+    assert_eq!(read, receipts, "the log lost or reordered a receipt");
+    log.verify_macs(&SECRET).expect("the kernel's MACs");
+
+    // Every record boundary is a shorter valid log; any other cut is refused.
+    let bytes = std::fs::read(&path).expect("read");
+    let mut cursor = LOG_HEADER_LEN;
+    let mut index = 0usize;
+    while cursor < bytes.len() {
+        let finite = cursor + 4;
+        assert!(finite <= bytes.len(), "a record must start inside the file");
+        let length =
+            u32::from_le_bytes(bytes[cursor..finite].try_into().expect("4 bytes")) as usize;
+        let end = finite + length;
+        let prefix = if end <= bytes.len() {
+            &bytes[..end]
+        } else {
+            &bytes[..]
+        };
+        match ReceiptLog::verify_bytes(prefix) {
+            Ok(records) => {
+                index += 1;
+                assert_eq!(records.len(), index, "a boundary prefix holds its records");
+                assert_eq!(records[..], read[..index], "a prefix is the same records");
+            }
+            Err(error) => {
+                assert_eq!(error.code(), "rpc/receipt");
+                break;
+            }
+        }
+        if end >= bytes.len() {
+            break;
+        }
+        cursor = end;
+    }
+    assert_eq!(index, read.len(), "every record boundary verifies");
+    let _ = std::fs::remove_file(&path);
+}
+
+fuzz_target!(|data: &[u8]| {
+    match ReceiptLog::verify_bytes(data) {
+        Ok(receipts) => {
+            let start = u64::from_le_bytes(data[8..16].try_into().expect("header start"));
+            check_invariants(&receipts, start);
+        }
+        Err(error) => assert_eq!(
+            error.code(),
+            "rpc/receipt",
+            "verify_bytes refused with an unexpected code: {error}"
+        ),
+    }
+    if !data.is_empty() {
+        structured(data);
+    }
+});

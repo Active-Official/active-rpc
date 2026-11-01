@@ -200,6 +200,18 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
   because it is the result the caller just awaited.
 - **Coverage floors are floors.** 68% line coverage means untested error paths
   remain; the mapped invariants are covered, not every branch.
+- **Durable objects have no durable identity.** A `Durable` capability survives
+  export and restore (ADR-0010), and its `object` id is a `u64` that the
+  provider that registered it assigns. On restore, the id is carried verbatim,
+  so it is meaningful only if the same provider registers the same object at the
+  same id in the new kernel. Nothing binds an object id to durable provider
+  state, so a restarted provider that renumbers its objects silently points a
+  restored capability at a different object. A record carries the provider
+  *name*, which the restored kernel must already have registered, and that is
+  the whole of the guarantee. Closing this needs an object-identity field in the
+  record (a provider-supplied stable key) and a resolver on restore; it is
+  additive to the record format and is tracked as RPC-10 in the program
+  residuals register.
 - **Timing.** Tool adapters and transports do real I/O and are outside the
   constant-time claim; the kernel itself has no secret-dependent comparison.
 

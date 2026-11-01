@@ -1,4 +1,4 @@
-# ADR-0022 — Clock policy: virtual by default, wall clock on request
+# ADR-0022 - Clock policy: virtual by default, wall clock on request
 
 **Status:** accepted (2026-10-31). No wire change.
 

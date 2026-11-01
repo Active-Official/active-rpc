@@ -24,6 +24,7 @@ jobs:
           - fuzz_bulk_plan
           - fuzz_replay_package
           - fuzz_topic_policy
+          - fuzz_receipt_log
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

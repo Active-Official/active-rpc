@@ -333,7 +333,7 @@ fn receipts_dump_verify_and_tamper_paths() {
     let dump = run(&["receipts", "dump", "--output", log_arg]);
     assert!(dump.status.success(), "{}", stderr(&dump));
     assert!(
-        stdout(&dump).contains("wrote 3 receipts"),
+        stdout(&dump).contains("wrote 4 receipts"),
         "{}",
         stdout(&dump)
     );
@@ -342,13 +342,52 @@ fn receipts_dump_verify_and_tamper_paths() {
     let verify = run(&["receipts", "verify", log_arg]);
     assert!(verify.status.success(), "{}", stderr(&verify));
     let text = stdout(&verify);
-    assert!(text.starts_with("ok 3 receipts"), "{text}");
+    assert!(text.starts_with("ok 4 receipts"), "{text}");
+    assert!(
+        text.contains("chain-only (unauthenticated)"),
+        "an unkeyed verify must say what it did not check: {text}"
+    );
     let head = text
         .split_whitespace()
-        .last()
+        .skip_while(|token| *token != "head")
+        .nth(1)
         .expect("head hash")
+        .trim_end_matches(',')
         .to_string();
     assert_eq!(head.len(), 64);
+
+    // The owner path: with the kernel secret the MACs are checked too.
+    let secret = "5e".repeat(32);
+    let authed = run(&["receipts", "verify", log_arg, "--secret-hex", &secret]);
+    assert!(authed.status.success(), "{}", stderr(&authed));
+    assert!(
+        stdout(&authed).contains("macs verified"),
+        "{}",
+        stdout(&authed)
+    );
+
+    // The pinned head detects a truncated tail that chain-only verification
+    // cannot see.
+    let pinned = run(&["receipts", "verify", log_arg, "--expect-head", &head]);
+    assert!(pinned.status.success(), "{}", stderr(&pinned));
+    let wrong = "00".repeat(32);
+    let mismatch = run(&["receipts", "verify", log_arg, "--expect-head", &wrong]);
+    assert_eq!(mismatch.status.code(), Some(1));
+    assert!(
+        stderr(&mismatch).contains("rpc/receipt"),
+        "{}",
+        stderr(&mismatch)
+    );
+
+    // A wrong secret is a refusal, not a pass.
+    let foreign = "6d".repeat(32);
+    let forged = run(&["receipts", "verify", log_arg, "--secret-hex", &foreign]);
+    assert_eq!(forged.status.code(), Some(1));
+    assert!(
+        stderr(&forged).contains("not produced by this kernel"),
+        "{}",
+        stderr(&forged)
+    );
 
     let show = run(&["receipts", "show", log_arg, "--limit", "2"]);
     assert!(show.status.success(), "{}", stderr(&show));
@@ -357,6 +396,13 @@ fn receipts_dump_verify_and_tamper_paths() {
     assert_eq!(lines.len(), 2, "{shown}");
     assert!(lines[0].starts_with("1 "), "{}", lines[0]);
     assert!(lines[1].starts_with("2 "), "{}", lines[1]);
+
+    // The demo ends with a dispatch refusal, and the log says so.
+    let last = run(&["receipts", "show", log_arg, "--limit", "4"]);
+    let shown = stdout(&last);
+    let tail = shown.lines().last().expect("last record");
+    assert!(tail.contains("refused"), "{tail}");
+    assert!(tail.contains("rpc/revoked"), "{tail}");
 
     // A tampered record fails verification with the receipt class.
     let mut bytes = std::fs::read(&log).expect("read log");

@@ -1,10 +1,10 @@
-# ADR-0023: No io_uring backend for TCP and QUIC I/O
+# ADR-0023 - No io_uring backend for TCP and QUIC I/O
 
-- **Status:** Accepted
-- **Date:** 2026-10-31
-- **Phase:** Absolute Max program, M-4.2
-- **Supersedes:** nothing
-- **Related:** ADR-0003 (transports), ADR-0008 (bakeoff methodology), ADR-0013
+**Status:** accepted (2026-10-31).
+**Date:** 2026-10-31
+**Phase:** Absolute Max program, M-4.2
+**Supersedes:** nothing
+**Related:** ADR-0003 (transports), ADR-0008 (bakeoff methodology), ADR-0013
   (bulk transfer), `docs/spec/performance.md`
 
 ## Context

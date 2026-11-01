@@ -1,6 +1,6 @@
-# ADR 0008 — Bakeoff methodology
+# ADR-0008 - Bakeoff methodology
 
-Status: accepted for AIM-PROP-2026-10 C-2.3.
+**Status:** accepted (2026-10-30). Accepted under AIM-PROP-2026-10 C-2.3.
 
 ## Decision
 

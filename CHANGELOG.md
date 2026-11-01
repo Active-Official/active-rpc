@@ -2,8 +2,43 @@
 
 ## Unreleased
 
-Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity) and R-12
-(replay) audit rounds.
+Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
+(replay) and R-13 (receipts) audit rounds.
+
+### Receipts
+
+- **The log is `ARRL` v2.** The header carries the sequence it starts at and
+  every record carries the decision the kernel took at dispatch, so a wrapped
+  ring exports its own window and a refused call is recorded as a refusal. v1
+  files are refused: no deployment produced one.
+- **The decision is sealed at dispatch.** A call queued under a live capability
+  and revoked before the kernel ran it used to keep an "authorized" receipt; it
+  is now recorded as `Refused("rpc/revoked")`.
+- **Sequence continuity is enforced by the writer.** A wrapped ring (after 1025
+  calls) used to write a log its own reader refused and wedge the file;
+  `ReceiptLog::create_starting_at` records where the retained window begins.
+- **A truncated tail is detectable.** Any record-boundary prefix is a valid
+  shorter log, so `verify_against(head)` pins the head an operator learned out of
+  band; `receipts verify --expect-head` exposes it.
+- **Appends are authenticated.** `append_verified(secret, ..)` refuses a receipt
+  this kernel did not seal; `receipts verify --secret-hex` checks every MAC and
+  the unkeyed mode prints `chain-only (unauthenticated)`.
+- **Concurrent writers cannot interleave.** A `create_new` lock file with a
+  bounded retry serialises appends; a second writer refuses instead of corrupting
+  the chain.
+- **The log is bounded and append is linear.** 64 MiB and 100 000 records are
+  ceilings enforced on read (`take(ceiling + 1)`) and on write, and a cached
+  state short-circuits the re-walk with one `stat`.
+- **Writer and reader share every predicate.** Correlation ids are lowercase
+  hex, method names are 1..=1024 bytes without control characters, refusal codes
+  are `[a-z0-9/-_.]` up to 64 bytes, and `at_ms` may not run backwards; a granted
+  method that breaks a rule is refused at mint, attenuation and record restore.
+- `create` refuses to overwrite a log that holds records; `truncate` is the
+  explicit "start over". Errors name the receipt `sequence`, and a damaged log
+  exits as a refusal while a missing path exits as usage.
+- New `fuzz_receipt_log` target: `verify_bytes` is total, an accepted log is
+  canonical, every record boundary is a valid shorter log, and a kernel export
+  round-trips.
 
 ### Replay
 

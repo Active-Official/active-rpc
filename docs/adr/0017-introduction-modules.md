@@ -1,4 +1,4 @@
-# ADR-0017 — Peer introduction modules
+# ADR-0017 - Peer introduction modules
 
 **Status:** accepted (2026-10-31). Additive: no wire change.
 

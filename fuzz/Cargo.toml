@@ -94,3 +94,10 @@ path = "fuzz_targets/fuzz_topic_policy.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_receipt_log"
+path = "fuzz_targets/fuzz_receipt_log.rs"
+test = false
+doc = false
+bench = false

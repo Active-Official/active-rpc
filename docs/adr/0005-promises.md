@@ -1,6 +1,6 @@
-# ADR-0005 — Promises, batching and what "pipelined" measures
+# ADR-0005 - Promises, batching and what "pipelined" measures
 
-**Status:** accepted (2026-10-27)
+**Status:** accepted (2026-10-27).
 
 ## Context
 

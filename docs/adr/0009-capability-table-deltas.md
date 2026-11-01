@@ -1,6 +1,6 @@
-# ADR 0009 — Capability-table deltas
+# ADR-0009 - Capability-table deltas
 
-Status: accepted for AIM-PROP-2026-10 C-5.1.
+**Status:** accepted (2026-10-30). Accepted under AIM-PROP-2026-10 C-5.1.
 
 ## Decision
 

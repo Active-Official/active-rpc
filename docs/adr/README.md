@@ -25,3 +25,19 @@
 | [0021](0021-durable-receipt-log.md) | Durable receipt log (`ARRL`) |
 | [0022](0022-clock-policy.md) | Clock policy: virtual default, wall clock on request |
 | [0023](0023-no-io-uring-backend.md) | No io_uring backend for TCP and QUIC I/O |
+
+## Reading order and supersessions
+
+- **Transports:** 0003 is the original story (shared memory, QUIC, and the
+  Connect bridge that carried HTTP/2 framing). 0012 is the **native** HTTP/2
+  transport and supersedes the bridge as the way to speak HTTP/2; the bridge
+  remains as the Connect/gRPC-compatible adapter. Read 0012 for the current
+  design, 0003 for why the transports were chosen, and 0023 for the io_uring
+  decision.
+- **MSRV:** 0007 is the source of truth and supersedes point 4 of 0006. A change
+  to the minimum supported Rust version is a change to 0007.
+- **Receipts:** 0016 defines the in-memory receipt and the decision it records;
+  0021 defines the durable log that carries those receipts off the process.
+- Every ADR states one `**Status:**` line naming the date it was accepted. An ADR
+  is never rewritten to change a decision: a later ADR supersedes it and says
+  so in its status line.

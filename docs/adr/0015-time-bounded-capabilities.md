@@ -1,4 +1,4 @@
-# ADR-0015 — Time-bounded capabilities
+# ADR-0015 - Time-bounded capabilities
 
 **Status:** accepted (2026-10-31). Additive: no wire change.
 

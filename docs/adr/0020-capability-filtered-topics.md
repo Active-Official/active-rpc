@@ -1,4 +1,4 @@
-# ADR-0020 — Capability-filtered pub/sub topics
+# ADR-0020 - Capability-filtered pub/sub topics
 
 **Status:** accepted (2026-10-31). Additive; ARP1 unchanged.
 

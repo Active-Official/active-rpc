@@ -1,8 +1,8 @@
-# ADR-0013: Bulk (carousel) transfer with per-chunk hashes
+# ADR-0013 - Bulk (carousel) transfer with per-chunk hashes
 
-- Status: Accepted
-- Date: 2026-10-30
-- Context: Maturity Program C-6.3 (PROPOSAL §5.7)
+**Status:** accepted (2026-10-30).
+**Date:** 2026-10-30
+**Context:** Maturity Program C-6.3 (PROPOSAL §5.7)
 
 ## Problem
 

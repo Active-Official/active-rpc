@@ -87,7 +87,8 @@ fn an_exported_log_round_trips_and_verifies() {
         sequence: 4,
         cap: receipts[0].cap.clone(),
         method: "echo".to_string(),
-        at_ms: 1,
+        at_ms: receipts[2].at_ms + 1,
+        decision: active_rpc::receipts::Decision::Admitted,
         mac: receipts[0].mac,
     };
     log.append(&extra).expect("append one");
@@ -151,7 +152,7 @@ fn a_reordered_log_is_refused() {
 
     // Split at record boundaries and swap the first two records.
     let bytes = std::fs::read(&path).expect("read");
-    let mut cursor = 8usize;
+    let mut cursor = active_rpc::receipts::LOG_HEADER_LEN;
     let mut boundaries = Vec::new();
     while cursor < bytes.len() {
         let length =
@@ -160,7 +161,7 @@ fn a_reordered_log_is_refused() {
         cursor += 4 + length;
     }
     assert_eq!(boundaries.len(), 3);
-    let mut reordered = bytes[..8].to_vec();
+    let mut reordered = bytes[..active_rpc::receipts::LOG_HEADER_LEN].to_vec();
     reordered.extend_from_slice(&bytes[boundaries[1].0..boundaries[1].1]);
     reordered.extend_from_slice(&bytes[boundaries[0].0..boundaries[0].1]);
     reordered.extend_from_slice(&bytes[boundaries[2].0..boundaries[2].1]);
@@ -196,6 +197,7 @@ fn an_invalid_receipt_is_refused_at_append() {
         cap: "not-hex".to_string(),
         method: "echo".to_string(),
         at_ms: 0,
+        decision: active_rpc::receipts::Decision::Admitted,
         mac: [0u8; 32],
     };
     let error = log.append(&receipt).expect_err("bad correlation id");

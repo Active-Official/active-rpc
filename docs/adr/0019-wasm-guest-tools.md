@@ -1,4 +1,4 @@
-# ADR-0019 — Fuel-metered WebAssembly guest tools
+# ADR-0019 - Fuel-metered WebAssembly guest tools
 
 **Status:** accepted (2026-10-31). Feature `wasm-tools`; no wire change.
 

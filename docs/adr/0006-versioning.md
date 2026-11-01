@@ -1,6 +1,6 @@
-# ADR-0006 — Versioning and publishing
+# ADR-0006 - Versioning and publishing
 
-**Status:** accepted (2026-10-27)
+**Status:** accepted (2026-10-27). Point 4 (MSRV) is superseded by [ADR-0007](0007-msrv.md), which is the source of truth for the minimum supported Rust version.
 
 ## Context
 
