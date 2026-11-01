@@ -1105,7 +1105,9 @@ impl PlaneCore {
                 category: category_for("call_refused").into(),
                 kind: "call_refused".into(),
                 lane: Some(format!("lane {}", lane.0)),
-                capability: Some(cap.correlation_id()),
+                // A refusal that names no capability shows none: the zero id
+                // would look like a real one in the console.
+                capability: cap.map(|cap| cap.correlation_id()),
                 code: Some(code.clone()),
                 detail: "call refused".into(),
                 ..base
@@ -1113,7 +1115,7 @@ impl PlaneCore {
             Event::BudgetExhausted { cap, dimension } => UiEvent {
                 category: category_for("budget").into(),
                 kind: "budget".into(),
-                capability: Some(cap.correlation_id()),
+                capability: cap.map(|cap| cap.correlation_id()),
                 code: Some("rpc/budget-exceeded".into()),
                 detail: format!("{dimension} budget exhausted"),
                 ..base

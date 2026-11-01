@@ -208,8 +208,12 @@ pub enum Event {
         provider: ProviderId,
         /// Number of jobs in the batch.
         jobs: usize,
-        /// Lanes represented in the batch.
-        lanes: BTreeSet<u64>,
+        /// Number of distinct lanes represented in the batch.
+        ///
+        /// A count, not the set: the tape is bounded in records, and one batch
+        /// can span every lane (`MAX_LANES`), so a retained `BTreeSet` per
+        /// record could hold orders of magnitude more memory than the events.
+        lane_count: usize,
     },
     /// A job completed.
     JobCompleted {
@@ -257,15 +261,20 @@ pub enum Event {
     CallRefused {
         /// Issuing lane.
         lane: LaneId,
-        /// Target capability.
-        cap: CapId,
+        /// Target capability, when the refusal names one.
+        ///
+        /// `None` is a refusal that happened before a capability was selected
+        /// (a send with no capability, an unknown lane). It used to be reported
+        /// as the all-zero id, whose correlation hash is the same in every
+        /// deployment and indistinguishable from a real capability.
+        cap: Option<CapId>,
         /// Stable error code (`rpc/...`).
         code: String,
     },
     /// A budget ceiling refused work.
     BudgetExhausted {
-        /// Capability whose budget (or lane ceiling) fired.
-        cap: CapId,
+        /// Capability whose budget (or lane ceiling) fired, when there is one.
+        cap: Option<CapId>,
         /// Dimension: `call`, `byte`, `lane call`, `promises`, ...
         dimension: String,
     },
@@ -308,6 +317,21 @@ pub struct Metrics {
     pub backpressure_refusals: u64,
     /// Calls refused because the peer's identity did not match the capability.
     pub identity_refusals: u64,
+    /// Events this kernel has ever recorded (a total, not the tape length).
+    ///
+    /// A decrease means a *different* kernel: the tape is bounded, so
+    /// `events_retained` can shrink legitimately while `events_total` cannot.
+    pub events_total: u64,
+    /// Events currently on the bounded tape.
+    pub events_retained: u64,
+    /// Events the bounded tape discarded to stay bounded.
+    pub events_evicted: u64,
+    /// Receipts the ring evicted, or that disabling cleared.
+    pub receipts_dropped: u64,
+    /// Promise records that are still pending.
+    pub promises_pending: u64,
+    /// Promise records retained (pending plus settled-but-readable).
+    pub promises_retained: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,11 +378,12 @@ pub struct Kernel {
     events: VecDeque<Event>,
     /// Monotonic count of events ever appended, including evicted ones.
     events_total: u64,
+    /// Events the bounded tape discarded.
+    events_evicted: u64,
     /// Settled promises in settlement order, with the retained value size.
     settled: VecDeque<(PromiseId, usize)>,
     settled_bytes: usize,
     metrics: Metrics,
-    round_trips: u64,
     next_promise: u64,
     next_job: u64,
     next_lane: u64,
@@ -393,7 +418,6 @@ pub struct Kernel {
     /// When true, dispatch advances the clock to wall time instead of by one
     /// simulated round trip. The clock never decreases in either mode.
     wall_clock: bool,
-    transfers: u64,
     receipts: std::collections::VecDeque<crate::receipts::Receipt>,
     receipts_enabled: bool,
     next_receipt: u64,
@@ -650,10 +674,10 @@ impl Agent {
             queue: VecDeque::new(),
             events: VecDeque::new(),
             events_total: 0,
+            events_evicted: 0,
             settled: VecDeque::new(),
             settled_bytes: 0,
             metrics: Metrics::default(),
-            round_trips: 0,
             next_promise: 0,
             next_job: 0,
             next_lane: 0,
@@ -672,7 +696,7 @@ impl Agent {
             now_ms: 0,
             latency_ms: 1,
             wall_clock: false,
-            transfers: 0,
+
             receipts: std::collections::VecDeque::new(),
             receipts_enabled: false,
             next_receipt: 0,
@@ -1687,6 +1711,12 @@ impl Agent {
     }
 
     /// Count and log a refused send or publish, exactly as a refused call is.
+    /// Record a refusal once, with the metrics and the event that describe it.
+    ///
+    /// One function so every refusing entry point (`call`, `send`, `send_as`,
+    /// `publish`, `publish_as`) reports the same counters and the same event:
+    /// the transport-facing `*_as` variants used to bypass this entirely, so a
+    /// peer-initiated refusal produced no metric and no event.
     fn note_refusal(&self, lane: LaneId, cap: Option<CapId>, result: Result<u64>) -> Result<u64> {
         if let Err(error) = &result {
             let mut kernel = self.cell.borrow_mut();
@@ -1694,10 +1724,18 @@ impl Agent {
             if matches!(error, Error::BudgetExceeded(_)) {
                 kernel.metrics.budget_exhaustions =
                     kernel.metrics.budget_exhaustions.saturating_add(1);
+                kernel.push_event(Event::BudgetExhausted {
+                    cap,
+                    dimension: budget_dimension(error).to_string(),
+                });
+            }
+            if matches!(error, Error::Identity(_)) {
+                kernel.metrics.identity_refusals =
+                    kernel.metrics.identity_refusals.saturating_add(1);
             }
             kernel.push_event(Event::CallRefused {
                 lane,
-                cap: cap.unwrap_or(CapId([0u8; 16])),
+                cap,
                 code: error.code().to_string(),
             });
         }
@@ -1712,8 +1750,7 @@ impl Agent {
         payload: Value,
         caps: &[CapHandle],
     ) -> Result<u64> {
-        let result = self.send_as(None, lane, channel, payload, caps);
-        self.note_refusal(lane, caps.first().map(CapHandle::id), result)
+        self.send_as(None, lane, channel, payload, caps)
     }
 
     /// Send a message on behalf of the peer the transport authenticated.
@@ -1722,7 +1759,23 @@ impl Agent {
     /// capability cannot be transferred at all: a channel cannot prove who will
     /// read the message, so delegation across an identity boundary must use
     /// [`Agent::introduce_to`] explicitly.
+    ///
+    /// A refusal is recorded here, not only in [`Agent::send`]: a transport
+    /// calls this variant directly, and its refusals used to produce no metric
+    /// and no event.
     pub fn send_as(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        channel: ChannelId,
+        payload: Value,
+        caps: &[CapHandle],
+    ) -> Result<u64> {
+        let result = self.send_inner(peer, lane, channel, payload, caps);
+        self.note_refusal(lane, caps.first().map(CapHandle::id), result)
+    }
+
+    fn send_inner(
         &self,
         peer: Option<&PeerIdentity>,
         lane: LaneId,
@@ -1829,7 +1882,7 @@ impl Agent {
         }
         kernel.push_event(Event::ChannelSend { channel, sequence });
         for id in cap_ids {
-            kernel.transfers += 1;
+            kernel.metrics.transfers += 1;
             kernel.push_event(Event::CapTransferred { cap: id, channel });
         }
         Ok(sequence)
@@ -1853,12 +1906,26 @@ impl Agent {
         topic: &str,
         payload: Value,
     ) -> Result<u64> {
-        let result = self.publish_as(None, lane, channel, cap, topic, payload);
-        self.note_refusal(lane, Some(cap.id()), result)
+        self.publish_as(None, lane, channel, cap, topic, payload)
     }
 
     /// [`Agent::publish`] on behalf of the peer the transport authenticated.
+    ///
+    /// A refusal is recorded here, not only in [`Agent::publish`].
     pub fn publish_as(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        channel: ChannelId,
+        cap: &CapHandle,
+        topic: &str,
+        payload: Value,
+    ) -> Result<u64> {
+        let result = self.publish_inner(peer, lane, channel, cap, topic, payload);
+        self.note_refusal(lane, Some(cap.id()), result)
+    }
+
+    fn publish_inner(
         &self,
         peer: Option<&PeerIdentity>,
         lane: LaneId,
@@ -2154,7 +2221,7 @@ impl Agent {
             kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
             kernel.push_event(Event::CallRefused {
                 lane,
-                cap: cap_id,
+                cap: Some(cap_id),
                 code: error.code().to_string(),
             });
             match error {
@@ -2162,7 +2229,7 @@ impl Agent {
                     kernel.metrics.budget_exhaustions =
                         kernel.metrics.budget_exhaustions.saturating_add(1);
                     kernel.push_event(Event::BudgetExhausted {
-                        cap: cap_id,
+                        cap: Some(cap_id),
                         dimension: (*dimension).to_string(),
                     });
                 }
@@ -2425,12 +2492,12 @@ impl Agent {
                     // A provider called back into `run`. Its own provider is
                     // checked out, so a nested batch could not run and must not
                     // fail the queued work; the outer dispatch continues.
-                    return kernel.round_trips;
+                    return kernel.metrics.round_trips;
                 }
                 if kernel.queue.is_empty() {
                     kernel.apply_deferred_refops();
                     kernel.trim_settled();
-                    return kernel.round_trips;
+                    return kernel.metrics.round_trips;
                 }
                 // Reference operations that arrived during a provider call are
                 // applied before the next batch is chosen.
@@ -2441,7 +2508,7 @@ impl Agent {
                         // nothing may be trimmed: a queued consumer may still
                         // need its producer's record.
                         kernel.apply_deferred_refops();
-                        return kernel.round_trips;
+                        return kernel.metrics.round_trips;
                     }
                     Ok(batch) => batch,
                     Err(stuck) => {
@@ -2467,7 +2534,7 @@ impl Agent {
 
     /// Round-trips observed so far.
     pub fn round_trips(&self) -> u64 {
-        self.cell.borrow().round_trips
+        self.cell.borrow().metrics.round_trips
     }
 
     /// Await a promise, running the kernel until it settles.
@@ -2992,7 +3059,14 @@ impl Agent {
         let kernel = self.cell.borrow();
         let total = kernel.events_total;
         let retained = kernel.events.len() as u64;
-        let missed = total.saturating_sub(seen_total);
+        // A `seen_total` above this kernel's total is a *different* kernel (a
+        // restart reuses the number space from zero). Returning an empty delta
+        // would tell a recorder it saw a silent stretch when in fact it must
+        // fail: `saturating_sub` would make the miss look like zero.
+        if seen_total > total {
+            return None;
+        }
+        let missed = total - seen_total;
         if missed > retained {
             return None;
         }
@@ -3003,11 +3077,21 @@ impl Agent {
     /// Point-in-time counters. Contains no capability ids or payloads.
     pub fn metrics(&self) -> Metrics {
         let kernel = self.cell.borrow();
-        Metrics {
-            round_trips: kernel.round_trips,
-            transfers: kernel.transfers,
-            ..kernel.metrics
-        }
+        let mut metrics = kernel.metrics;
+        // Gauges that live on the kernel rather than in the counter struct are
+        // copied here, so `metrics_json` can report them without a second
+        // source that could drift.
+        metrics.events_total = kernel.events_total;
+        metrics.events_retained = kernel.events.len() as u64;
+        metrics.events_evicted = kernel.events_evicted;
+        metrics.receipts_dropped = kernel.receipts_dropped;
+        metrics.promises_retained = kernel.promises.len() as u64;
+        metrics.promises_pending = kernel
+            .promises
+            .values()
+            .filter(|record| record.state == PromiseState::Pending)
+            .count() as u64;
+        metrics
     }
 
     /// Number of live promise records (pending plus retained settled).
@@ -3243,7 +3327,7 @@ impl Agent {
         // Each phase takes a short borrow and returns owned data.
         let (provider_id, provider, now_ms) = {
             let mut kernel = self.cell.borrow_mut();
-            kernel.round_trips += 1;
+            kernel.metrics.round_trips += 1;
             kernel.now_ms = if kernel.wall_clock {
                 kernel.now_ms.max(wall_now_ms())
             } else {
@@ -3257,14 +3341,15 @@ impl Agent {
                 .get(&first.cap)
                 .map(|record| record.provider)
                 .unwrap_or(ProviderId(u64::MAX));
-            let lanes: BTreeSet<u64> = batch
+            let lane_count: usize = batch
                 .iter()
                 .filter_map(|id| kernel.jobs.get(id).map(|job| job.lane.0))
-                .collect();
+                .collect::<BTreeSet<u64>>()
+                .len();
             kernel.push_event(Event::BatchDispatched {
                 provider: provider_id,
                 jobs: batch.len(),
-                lanes,
+                lane_count,
             });
             kernel.dispatching = true;
             let provider = kernel.providers.remove(&provider_id);
@@ -3556,6 +3641,9 @@ impl Kernel {
     fn push_event(&mut self, event: Event) {
         if self.events.len() >= MAX_EVENTS {
             self.events.pop_front();
+            // A bounded tape must say what it dropped: without this an operator
+            // cannot tell a quiet kernel from one whose history was overwritten.
+            self.events_evicted = self.events_evicted.saturating_add(1);
         }
         self.events.push_back(event);
         self.events_total = self.events_total.saturating_add(1);
@@ -3853,13 +3941,12 @@ impl Kernel {
         if self.receipts.len() > crate::receipts::MAX_RECEIPTS {
             self.receipts.pop_front();
             self.receipts_dropped = self.receipts_dropped.saturating_add(1);
-            // One event when the ring starts dropping, not one per call: a call
-            // after the ring fills would otherwise push the useful history out
-            // of the tape one entry at a time. The event carries the running
-            // total (the same number `receipts_dropped` reports), so a reader
-            // that sees only the event is not told "1" after a thousand drops.
-            if self.receipts_dropped == 1 {
-                let total = self.receipts_dropped;
+            // Report at 1, 2, 4, 8 … evictions, always with the running total.
+            // One event per eviction would flush the useful history out of the
+            // bounded tape; one event ever would leave a reader with "1" after a
+            // thousand drops. The power-of-two ladder bounds both.
+            let total = self.receipts_dropped;
+            if total.is_power_of_two() {
                 self.push_event(Event::ReceiptsDropped { count: total });
             }
         }
@@ -3895,9 +3982,12 @@ impl Kernel {
             if let Some(lane_record) = self.lanes.get_mut(&lane) {
                 lane_record.complete();
             }
-            self.push_event(Event::PromiseRejected { promise, code });
-            self.metrics.promises_rejected = self.metrics.promises_rejected.saturating_add(1);
             if settled_now {
+                // Only a settlement that happened is a rejection: a record that
+                // was already settled (cancelled, resolved out of band) must not
+                // appear as both settled and rejected.
+                self.push_event(Event::PromiseRejected { promise, code });
+                self.metrics.promises_rejected = self.metrics.promises_rejected.saturating_add(1);
                 self.record_settled(promise);
             }
             self.jobs.remove(&job_id);
@@ -3912,6 +4002,31 @@ fn wall_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The budget dimension a refusal names, for the event that records it.
+fn budget_dimension(error: &Error) -> &'static str {
+    match error {
+        Error::BudgetExceeded(dimension) => match &dimension[..] {
+            "call" => "call",
+            "byte" => "byte",
+            "lane call" => "lane call",
+            "lane byte" => "lane byte",
+            "promises" => "promises",
+            "jobs" => "jobs",
+            "caps" => "caps",
+            "lanes" => "lanes",
+            "channels" => "channels",
+            "subscriptions" => "subscriptions",
+            "records" => "records",
+            "tombstones" => "tombstones",
+            "nodes" => "nodes",
+            "wall" => "wall",
+            "channel queue" => "channel queue",
+            _ => "other",
+        },
+        _ => "other",
+    }
 }
 
 fn pad128(id: CapId) -> [u8; 16] {

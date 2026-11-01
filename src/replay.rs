@@ -789,11 +789,11 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
         },
         Event::CallRefused { cap, code, .. } => Trace {
             event: format!("call.refused:{code}"),
-            cap: ordinal(*cap),
+            cap: cap.and_then(&mut ordinal),
         },
         Event::BudgetExhausted { cap, dimension } => Trace {
             event: format!("budget.exhausted:{dimension}"),
-            cap: ordinal(*cap),
+            cap: cap.and_then(&mut ordinal),
         },
         Event::ToolRefused { cap, reason } => Trace {
             event: format!("tool.refused:{reason}"),

@@ -42,7 +42,7 @@ authority.
 | `channel` | u64 | the event names a channel |
 | `channel_sequence` | u64 | a channel send or receive |
 | `code` | string | a refusal or rejection with a stable `rpc/...` code |
-| `dimension` | string | a budget exhaustion (`call`, `byte`, `lane call`, `promises`, `jobs`) |
+| `dimension` | string | a budget exhaustion or ceiling: `call`, `byte`, `lane call`, `lane byte`, `promises`, `jobs`, `caps`, `lanes`, `channels`, `subscriptions`, `records`, `tombstones`, `nodes`, `wall`, `channel queue` |
 | `identity` | string | a capability introduction; the peer fingerprint (a public label) |
 | `detail` | string | a short, value-free explanation (`"3 jobs in 2 lanes"`) |
 
@@ -70,6 +70,7 @@ authority.
 | `channel.recv` | `channel`, `channel_sequence` | a message was received |
 | `budget.exhausted` | `cap`, `dimension` | a budget ceiling refused work |
 | `receipts.dropped` | `detail` | the receipt ring dropped records; `detail` carries the running total (evicted or cleared) |
+| `provider.panicked` | `provider`, `detail` | a provider panicked; `detail` names the phase, and the panic message never enters a trace |
 | `tool.refused` | `cap`, `detail` | a tool policy refused work |
 
 `tests/observability_tests.rs` fails if the code emits a name that is absent
@@ -90,13 +91,27 @@ that need every event export on a cadence shorter than the tape wrap.
              "tool_refusals":0,"revocations":0,"promises_resolved":11,
              "promises_rejected":0,"round_trips":3,"transfers":0,
              "promises_double_settled":0,"backpressure_refusals":0,
-             "identity_refusals":0},
- "gauges":{"promises":4,"jobs":0,"lanes":1,"channels":0}}
+             "identity_refusals":0,"receipts_dropped":0,"events_total":57,
+             "events_evicted":0},
+ "gauges":{"promises":4,"promises_kept":4,"promises_pending":0,
+           "events_retained":57,"jobs":0,"lanes":1,"channels":0}}
 ```
 
 Counters never decrease; gauges are point-in-time. A dashboard that reads a
 counter keeps working when a new counter appears, which is why the object is a
 map rather than a tuple.
+
+`promises` is the number of retained promise records (the gauge the schema
+always had); `promises_kept` is the same number named honestly, and
+`promises_pending` is the outstanding work an operator watches. `events_total`
+is monotonic; `events_retained` is the bounded tape and `events_evicted` is what
+the tape dropped, so a quiet kernel is distinguishable from one whose history
+was overwritten.
+
+A **decrease** in `events_total` means a different kernel (or a restart): the
+tape is bounded, so `events_retained` may fall while `events_total` cannot. A
+collector must treat a decrease as a new epoch and must not merge the two
+number spaces.
 
 ## Exporting
 

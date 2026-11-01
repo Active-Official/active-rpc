@@ -87,12 +87,14 @@ fn lanes_interleave_in_one_batch() {
     let batch = events
         .iter()
         .find_map(|event| match event {
-            Event::BatchDispatched { jobs, lanes, .. } => Some((*jobs, lanes.clone())),
+            Event::BatchDispatched {
+                jobs, lane_count, ..
+            } => Some((*jobs, *lane_count)),
             _ => None,
         })
         .expect("a batch was dispatched");
     assert_eq!(batch.0, 4, "all four jobs dispatched together");
-    assert_eq!(batch.1.len(), 4, "four distinct lanes in the batch");
+    assert_eq!(batch.1, 4, "four distinct lanes in the batch");
     for lane in lanes {
         assert_eq!(agent.lane(lane).unwrap().completed, 1);
     }

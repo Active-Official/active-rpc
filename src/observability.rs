@@ -46,6 +46,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "channel.recv",
     "budget.exhausted",
     "receipts.dropped",
+    "provider.panicked",
     "tool.refused",
 ];
 
@@ -194,7 +195,7 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
         Event::ProviderPanicked { provider, phase } => {
             trace.event = "provider.panicked";
             trace.provider = Some(provider.0);
-            trace.detail = Some(phase.clone());
+            trace.detail = Some(label(phase));
         }
         Event::LaneCreated(lane) => {
             trace.event = "lane.created";
@@ -213,17 +214,19 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
         Event::CallRefused { lane, cap, code } => {
             trace.event = "call.refused";
             trace.lane = Some(lane.0);
-            trace.cap = Some(cap.correlation_id());
-            trace.code = Some(code.clone());
+            // A refusal with no capability reports no capability: a synthetic
+            // zero id would be indistinguishable from a real one.
+            trace.cap = cap.map(|cap| cap.correlation_id());
+            trace.code = Some(label(code));
         }
         Event::BatchDispatched {
             provider,
             jobs,
-            lanes,
+            lane_count,
         } => {
             trace.event = "batch.dispatched";
             trace.provider = Some(provider.0);
-            trace.detail = Some(format!("{jobs} jobs in {} lanes", lanes.len()));
+            trace.detail = Some(format!("{jobs} jobs in {lane_count} lanes"));
         }
         Event::JobCompleted { job, lane } => {
             trace.event = "job.completed";
@@ -234,14 +237,10 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.event = "promise.resolved";
             trace.promise = Some(promise.0);
         }
-        Event::ReceiptsDropped { count } => {
-            trace.event = "receipts.dropped";
-            trace.detail = Some(format!("{count} dropped in total"));
-        }
         Event::PromiseRejected { promise, code } => {
             trace.event = "promise.rejected";
             trace.promise = Some(promise.0);
-            trace.code = Some(code.clone());
+            trace.code = Some(label(code));
         }
         Event::ChannelSend { channel, sequence } => {
             trace.event = "channel.send";
@@ -260,13 +259,17 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
         }
         Event::BudgetExhausted { cap, dimension } => {
             trace.event = "budget.exhausted";
-            trace.cap = Some(cap.correlation_id());
-            trace.dimension = Some(dimension.clone());
+            trace.cap = cap.map(|cap| cap.correlation_id());
+            trace.dimension = Some(label(dimension));
         }
         Event::ToolRefused { cap, reason } => {
             trace.event = "tool.refused";
             trace.cap = Some(cap.correlation_id());
-            trace.detail = Some(reason.clone());
+            trace.detail = Some(label(reason));
+        }
+        Event::ReceiptsDropped { count } => {
+            trace.event = "receipts.dropped";
+            trace.detail = Some(format!("{count} dropped in total"));
         }
     }
     trace
@@ -332,8 +335,35 @@ pub fn metrics_json(
         "identity_refusals".to_string(),
         Value::from(metrics.identity_refusals),
     );
+    counters.insert(
+        "receipts_dropped".to_string(),
+        Value::from(metrics.receipts_dropped),
+    );
+    counters.insert(
+        "events_total".to_string(),
+        Value::from(metrics.events_total),
+    );
+    counters.insert(
+        "events_evicted".to_string(),
+        Value::from(metrics.events_evicted),
+    );
     let mut gauges = Map::new();
+    // `promises` is retained records (pending plus settled-but-readable), which
+    // is what the old gauge meant; `promises_pending` is the outstanding work an
+    // operator actually watches.
     gauges.insert("promises".to_string(), Value::from(promises as u64));
+    gauges.insert(
+        "promises_kept".to_string(),
+        Value::from(metrics.promises_retained),
+    );
+    gauges.insert(
+        "promises_pending".to_string(),
+        Value::from(metrics.promises_pending),
+    );
+    gauges.insert(
+        "events_retained".to_string(),
+        Value::from(metrics.events_retained),
+    );
     gauges.insert("jobs".to_string(), Value::from(jobs as u64));
     gauges.insert("lanes".to_string(), Value::from(lanes as u64));
     gauges.insert("channels".to_string(), Value::from(channels as u64));
@@ -348,6 +378,32 @@ fn hex(bytes: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Longest label a trace carries, in bytes.
+pub const MAX_LABEL_BYTES: usize = 128;
+
+/// Bound and escape a free-form label before it enters a trace.
+///
+/// The fields that carry a label (`code`, `dimension`, `detail`, a provider
+/// phase) are meant to be closed sets, but a provider-controlled code reaches
+/// one of them, and a trace is text that a collector may write into a line log
+/// or a terminal. Escaping and truncating here is the fail-closed boundary,
+/// independent of what each producer does.
+pub fn label(text: &str) -> String {
+    if text.len() <= MAX_LABEL_BYTES && !text.chars().any(char::is_control) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(MAX_LABEL_BYTES + 4);
+    for ch in text.chars() {
+        let piece: String = ch.escape_debug().collect();
+        if out.len() + piece.len() > MAX_LABEL_BYTES {
+            out.push('…');
+            break;
+        }
+        out.push_str(&piece);
     }
     out
 }

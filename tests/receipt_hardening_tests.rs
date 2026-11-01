@@ -374,12 +374,23 @@ fn evictions_are_counted_and_reported_once() {
     assert_eq!(agent.receipts().len(), MAX_RECEIPTS);
     assert_eq!(agent.receipts_dropped(), 3);
     assert_eq!(agent.receipts()[0].sequence, 4);
-    let dropped = agent
+    // The marker ladder is 1, 2, 4, 8 … so three evictions produce two events,
+    // each carrying the running total, and the tape is not flooded one entry per
+    // evicted receipt.
+    let markers: Vec<u64> = agent
         .events()
-        .iter()
-        .filter(|event| matches!(event, active_rpc::Event::ReceiptsDropped { .. }))
-        .count();
-    assert_eq!(dropped, 1, "one marker, not one per evicted receipt");
+        .into_iter()
+        .filter_map(|event| match event {
+            active_rpc::Event::ReceiptsDropped { count } => Some(count),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(markers, vec![1, 2], "a bounded marker ladder");
+    assert_eq!(
+        agent.receipts_dropped(),
+        3,
+        "the counter is the authority for the exact total"
+    );
 }
 
 #[test]

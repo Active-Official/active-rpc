@@ -28,7 +28,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-3: 13 + 16 + 19 findings | 48 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | round 1: 1 critical + 3 highs + 5 mediums + 6 lows fixed | 15 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
-| R-15 | observability | `src/observability.rs` | pending | — | — |
+| R-15 | observability | `src/observability.rs` | round 1: 4 highs + 9 mediums + 6 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | pending | — | — |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | pending | — | — |
 | R-18 | CLI | `cli/active-rpc-cli/**` | pending | — | — |
@@ -194,6 +194,40 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-15 observability - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `b686836`,
+with probes. No critical: no authority or secret reaches a trace. Four highs,
+nine mediums, six lows. The theme is *the schema was closed on paper only*: a
+projected name was missing from the set, a restarted kernel was indistinguishable
+from a quiet one, and three counters disagreed with the tape.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| H1 | high | `provider.panicked` was projected but absent from `EVENT_NAMES` and the spec, and the "closed set" test could not see it (its fixture omitted the variant) | **fixed**: the name is in the set, the spec and the fixture, and the fixture/count assertion now fails when they drift (`project` is the compile-time guard, the size check the runtime one) |
+| H2 | high | `events_since(old_total)` on a *restarted* kernel returned `Some([])` — a recorder silently truncated its history instead of failing | **fixed**: `seen_total > total` returns `None` before the subtraction |
+| H3 | high | `receipts.dropped` always carried `1` and then never fired again, contradicting the spec and the comment | **fixed**: the marker ladder is 1, 2, 4, 8 … with the running total, and `receipts_dropped` is exported as a counter |
+| H4 | high | nothing identified the kernel, so a restart looked like a continuation and a collector merged two number spaces | **fixed**: `metrics_json` exports `events_total`/`events_retained`/`events_evicted` and the spec states that a decrease is a new epoch a collector must not merge |
+| M1 | medium | `fail_job` pushed `promise.rejected` and counted it even when the record was already settled | **fixed**: both are gated on the settlement that actually happened |
+| M2 | medium | `note_refusal` published the all-zero correlation id as the capability, so "no capability" looked like a real one | **fixed**: `CallRefused.cap`/`BudgetExhausted.cap` are `Option`, and the console renders none |
+| M3 | medium | counters and tape disagreed by path: `budget_exhaustions` had no event, `identity_refusals` missed `Error::Identity` in `note_refusal`, and `send_as`/`publish_as` bypassed both | **fixed**: one `note_refusal` used by `call`, `send`, `send_as`, `publish`, `publish_as`, emitting the same event and counter set, with `budget_dimension` naming the ceiling |
+| M4 | medium | the bounded tape dropped events with no counter, no event and no metric | **fixed**: `events_evicted`, exported with the gauges |
+| M5 | medium | the `promises` gauge meant "retained records" and read as outstanding work | **fixed**: `promises_pending` and `promises_kept` are exported too |
+| M6 | medium | the budget `dimension` set was documented as five values while the kernel emits fifteen | **fixed**: the full set is in the spec |
+| M7 | medium | closed-label fields are `String` and were copied into `detail` unclamped, so a provider-controlled code reached telemetry raw | **fixed**: `observability::label` escapes and bounds every label at 128 bytes |
+| M8 | medium | `BatchDispatched` retained a `BTreeSet` of lanes per record (up to 4 096 per batch) to report a count | **fixed**: the event carries `lane_count` |
+| M9 | medium | the metrics test compared the projection with its own source: a counter that was never exported still passed | **fixed**: `counters_agree_with_the_tape` reconstructs each counter from the events |
+| L1 | low | `TraceEvent.event` defaulted to an undocumented `"unknown"` | **fixed**: `project` is exhaustive, and the fixture/size check catches a missing arm |
+| L2 | low | `round_trips`/`transfers` incremented without saturation | **fixed**: saturating adds |
+| L3 | low | `round_trips`/`transfers` were stored twice, so the `Metrics` copy was permanently zero for an embedder that built one | **fixed**: one source (`Metrics`) |
+| L4 | low | `cap.expired` repeats on every refused touch of an expired capability | documented: it is the touch that is reported, and the tape is bounded |
+| L5 | low | the doc check was substring-only | the table row plus the projection test now pin the name |
+| L6 | low | the demo peer returns a capability id in its reply | deliberate transfer; the CLI prints `round_trips` next to it |
+
+Gate: `cargo test --all-features` 584 passed, 0 failed across 66 suites;
+`--no-default-features` 524 passed, 0 failed; clippy, fmt and
+`cargo doc -D warnings` clean on both feature sets; control plane 30, CLI 17.
 
 ### R-14 wasm tools - 2026-11-01 (round 1)
 

@@ -65,13 +65,13 @@ fn every_event(cap: CapId) -> Vec<Event> {
         },
         Event::CallRefused {
             lane,
-            cap,
+            cap: Some(cap),
             code: "rpc/method-not-granted".to_string(),
         },
         Event::BatchDispatched {
             provider: ProviderId(1),
             jobs: 2,
-            lanes: [3u64].into_iter().collect(),
+            lane_count: 1,
         },
         Event::JobCompleted { job: 9, lane },
         Event::PromiseResolved(PromiseId(5)),
@@ -88,10 +88,14 @@ fn every_event(cap: CapId) -> Vec<Event> {
             sequence: 1,
         },
         Event::BudgetExhausted {
-            cap,
+            cap: Some(cap),
             dimension: "call".to_string(),
         },
         Event::ReceiptsDropped { count: 1 },
+        Event::ProviderPanicked {
+            provider: ProviderId(1),
+            phase: "invoke".to_string(),
+        },
         Event::ToolRefused {
             cap,
             reason: "tool not allowed".to_string(),
@@ -99,11 +103,20 @@ fn every_event(cap: CapId) -> Vec<Event> {
     ]
 }
 
+/// `project` in the library is the compile-time guard: it matches every
+/// `Event` variant with no wildcard, so a new variant does not build until it
+/// has a name and a projection. This test is the runtime half: the fixture and
+/// the closed set must have the same size, which is how `provider.panicked`
+/// went missing (it was projected but never listed).
 #[test]
 fn every_event_name_is_documented_and_projected() {
     let cap = CapId([0xab; 16]);
     let events = every_event(cap);
-    assert_eq!(events.len(), EVENT_NAMES.len());
+    assert_eq!(
+        events.len(),
+        EVENT_NAMES.len(),
+        "add the new variant to every_event and to EVENT_NAMES"
+    );
 
     let mut seen = Vec::new();
     for (index, event) in events.iter().enumerate() {
@@ -301,4 +314,57 @@ fn loopback_policy_and_identity_kind_stay_out_of_trace_records() {
     );
     let agent = Agent::with_secret([0x65; 32]);
     assert!(agent.trace().is_empty());
+}
+
+/// Counters must agree with the tape they summarize.
+///
+/// The old test compared `metrics_json` with `agent.metrics()` — the same source
+/// twice — so a counter that was never exported, or an event that was never
+/// counted, passed. This one reconstructs each counter from the events.
+#[test]
+fn counters_agree_with_the_tape() {
+    let agent = Agent::with_secret([0x5c; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("mint");
+    let lane = agent
+        .create_lane("counters", Budget::default())
+        .expect("lane");
+    for _ in 0..3 {
+        let promise = agent.call(lane, &cap, "echo", Vec::new()).expect("call");
+        agent.run();
+        promise.value().expect("value");
+    }
+    // A refusal the kernel records: a method the capability never granted.
+    let _ = agent.call(lane, &cap, "mutate", Vec::new());
+    agent.revoke(&cap).expect("revoke");
+
+    let metrics = agent.metrics();
+    let events: Vec<String> = agent
+        .events()
+        .iter()
+        .map(|event| project(event, 0).event().to_string())
+        .collect();
+    let count = |name: &str| events.iter().filter(|seen| *seen == name).count() as u64;
+
+    assert_eq!(metrics.calls_queued, count("call.queued"), "queued");
+    assert_eq!(metrics.calls_refused, count("call.refused"), "refused");
+    assert_eq!(metrics.revocations, count("cap.revoked"), "revoked");
+    assert_eq!(
+        metrics.promises_resolved,
+        count("promise.resolved"),
+        "resolved"
+    );
+    assert_eq!(metrics.round_trips, count("batch.dispatched"), "batches");
+    assert_eq!(
+        metrics.events_total,
+        events.len() as u64 + metrics.events_evicted,
+        "every event is either retained or evicted"
+    );
+    assert_eq!(
+        metrics.events_retained,
+        events.len() as u64,
+        "the gauge is the tape length"
+    );
 }
