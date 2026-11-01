@@ -15,8 +15,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | ID | Section | Paths | State | Findings (fixed / rejected / open) | Commits |
 |----|---------|-------|-------|------------------------------------|---------|
 | R-01 | wire ARP1 | `src/wire.rs` | CLEAN | 6 fixed, 2 rejected, 0 open | this commit |
-| R-02 | kernel dispatch | `src/kernel.rs` | round 1: 9 fixed, 9 open | 9 fixed / 0 rejected / 9 open | this commit |
-| R-03 | capabilities | `src/cap.rs` | pending | — | — |
+| R-02 | kernel dispatch | `src/kernel.rs` | round 2: CLEAN for critical/high/medium | 16 fixed / 2 rejected / 2 low open (contract) | this commit |
+| R-03 | capabilities | `src/cap.rs` | round 1 in progress | — | — |
 | R-04 | promises / pipeline | `src/promise.rs` | pending | — | — |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | pending | — | — |
 | R-06 | budget | `src/budget.rs` | pending | — | — |
@@ -49,6 +49,35 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-02 kernel dispatch - 2026-11-01 (round 2)
+
+Reviewer: same DeepSeek V4.1 Flash channel, `xhigh`, repository tool access.
+Tests: `tests/marathon_kernel_round2_tests.rs` (9); eight of them fail against
+the pre-fix tree (the ninth is a guard that must pass on both trees). The
+pre-fix run also exposed the livelock the round-1 note called a "cycle": the old
+selector returned an empty batch for a blocked head provider and the queue never
+advanced, so the test binary spun for 17 minutes of CPU before it was killed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 4 | medium | cross-provider pipeline failed as a cycle | **fixed**: `next_batch` scans providers in queue order and dispatches the first one with a runnable job; `order_candidates` only returns jobs whose dependencies are settled or produced earlier in the same batch; `a_cross_provider_pipeline_settles` |
+| 6 | medium | a wall-clock record restored into a virtual kernel kept a deadline from another clock domain | **fixed**: `CapabilityRecord.wall_clock` travels in the JSON and `restore_capability` refuses a mismatch with `rpc/persistence`; `a_record_carries_its_clock_mode`, `a_wall_clock_record_does_not_restore_unbounded_in_virtual_mode` |
+| 8 | medium | `publish` ignored `read_only` | **fixed**: a read-only grant cannot publish (`rpc/read-only`); `a_read_only_capability_cannot_publish` |
+| 9 | medium | lane byte ceilings were per call and `publish` skipped the lane call budget | **fixed**: `Lane.bytes` accumulates both, and `publish` consumes lane calls and bytes; `a_lane_byte_budget_is_cumulative`, `publish_counts_against_the_lane_budget` |
+| 10 | medium | `on_drop` was lost when the last reference died during dispatch | **fixed**: `Kernel.deferred_drops` holds the notification until the provider is re-inserted, then delivers it; `on_drop_is_delivered_when_a_provider_releases_during_its_own_call` |
+| 11 | low | a nested `run()` inside a provider failed unrelated queued work | **fixed**: `Kernel.dispatching` makes the nested call return the current round-trip count while the outer dispatch continues |
+| 18 | low | `restore_capability` took the first provider whose name matched | **fixed**: exactly one match is required (`rpc/persistence`); `restore_refuses_an_ambiguous_provider_name` |
+
+Gate: `cargo test --all-features` 384 passed, 0 failed; clippy clean on the
+default and all-features sets; fmt clean.
+
+Carried (contract decisions, logged rather than half-fixed):
+
+| # | Sev | Reason |
+|---|-----|--------|
+| 8b | low | `topics: None` means "any topic" and a grant with no publish method can publish; channel authority is ambient by design, so changing it needs an ADR |
+| 17 | low | `recv`/`recv_topic` ignore lane subscription; subscription is advisory today and the contract needs an ADR |
 
 ### R-01 wire ARP1 — 2026-10-31
 

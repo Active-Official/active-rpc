@@ -39,3 +39,14 @@ Rules:
   it to the `caps` category.
 - A future wall-clock policy (for example, TTL from a signed timestamp) needs a
   new ADR; this one deliberately uses kernel time only.
+
+## Amendment — clock domains in durable records (2026-11-01)
+
+`CapabilityRecord` gained `wall_clock: bool` next to `expires_at`. A record
+exported by a kernel that reads the wall clock cannot be restored into a kernel
+that uses the virtual clock (or the reverse): the absolute deadline belongs to
+the exporting clock domain, and reading it in another domain either extends or
+truncates the grant by an arbitrary amount. `restore_capability` refuses the
+mismatch with `rpc/persistence`; the exporting deployment re-exports from the
+target domain, or restores the record with its TTL and lets the target resolve
+it. The field is additive: an older record without it is read as virtual time.

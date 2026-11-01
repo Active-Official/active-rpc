@@ -53,6 +53,10 @@ pub struct CapabilityRecord {
     pub bound_to: Option<[u8; 32]>,
     /// Absolute deadline in kernel milliseconds, if bounded.
     pub expires_at: Option<u64>,
+    /// Clock mode the deadline was taken in: `true` for wall clock, `false`
+    /// for the virtual round-trip clock. A bounded record is only meaningful in
+    /// its own domain.
+    pub wall_clock: bool,
 }
 
 impl CapabilityRecord {
@@ -117,6 +121,7 @@ impl CapabilityRecord {
                 None => Json::Null,
             },
         );
+        map.insert("wall_clock".into(), self.wall_clock.into());
         Json::Object(map).to_string()
     }
 
@@ -221,6 +226,10 @@ impl CapabilityRecord {
                     .ok_or_else(|| Error::persistence("deadline is malformed"))?,
             ),
         };
+        let wall_clock = value
+            .get("wall_clock")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         Ok(Self {
             provider: provider.to_string(),
             object,
@@ -233,6 +242,7 @@ impl CapabilityRecord {
             tool_policy,
             bound_to,
             expires_at,
+            wall_clock,
         })
     }
 

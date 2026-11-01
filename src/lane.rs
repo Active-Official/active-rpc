@@ -33,6 +33,8 @@ pub struct Lane {
     pub pending: u32,
     /// Completed calls.
     pub completed: u64,
+    /// Bytes moved through this lane (calls and publishes).
+    pub bytes: u64,
     /// Channels this lane is subscribed to.
     pub channels: BTreeSet<u64>,
     /// Capabilities minted for this lane.
@@ -52,6 +54,7 @@ impl Lane {
             budget,
             pending: 0,
             completed: 0,
+            bytes: 0,
             channels: BTreeSet::new(),
             caps: BTreeSet::new(),
             closed: false,

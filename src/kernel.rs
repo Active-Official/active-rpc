@@ -292,6 +292,10 @@ pub struct Kernel {
     next_provider: u64,
     queue_ceiling: usize,
     channel_ceiling: usize,
+    /// Drops whose provider was checked out for a call.
+    deferred_drops: Vec<(ProviderId, u64, CapId)>,
+    /// True while a dispatch batch has its provider checked out.
+    dispatching: bool,
     idempotency: BTreeMap<(CapId, String, String), PromiseId>,
     allow_durable: bool,
     idempotency_order: VecDeque<(CapId, String, String)>,
@@ -353,6 +357,12 @@ impl CapControl for HandleControl {
         kernel.push_event(Event::CapDropped(id));
         if let Some(provider) = kernel.providers.get_mut(&record.provider) {
             provider.on_drop(record.object, id);
+        } else {
+            // The provider is checked out for a call it is currently running;
+            // the drop is delivered when that batch finishes.
+            kernel
+                .deferred_drops
+                .push((record.provider, record.object, id));
         }
     }
 }
@@ -411,6 +421,8 @@ impl Agent {
             next_provider: 0,
             queue_ceiling: MAX_PROMISES,
             channel_ceiling: crate::channel::MAX_QUEUED_PER_CHANNEL,
+            deferred_drops: Vec::new(),
+            dispatching: false,
             idempotency: BTreeMap::new(),
             allow_durable: false,
             idempotency_order: VecDeque::new(),
@@ -561,6 +573,7 @@ impl Agent {
             tool_policy: record.attrs.tool_policy.clone(),
             bound_to: record.attrs.bound_to,
             expires_at: record.expires_at,
+            wall_clock: kernel.wall_clock,
         })
     }
 
@@ -589,13 +602,29 @@ impl Agent {
         }
         let provider = {
             let kernel = self.cell.borrow();
-            kernel
+            let mut matches = kernel
                 .providers
                 .iter()
-                .find(|(_, provider)| provider.name() == record.provider)
-                .map(|(id, _)| *id)
-                .ok_or_else(|| Error::persistence("the record names an unknown provider"))?
+                .filter(|(_, provider)| provider.name() == record.provider)
+                .map(|(id, _)| *id);
+            let first = matches
+                .next()
+                .ok_or_else(|| Error::persistence("the record names an unknown provider"))?;
+            if matches.next().is_some() {
+                return Err(Error::persistence(
+                    "the record's provider name is ambiguous",
+                ));
+            }
+            first
         };
+        // A bounded deadline is expressed in the exporting kernel's clock
+        // domain; interpreting it in the other mode turns a short lease into
+        // an effectively unbounded one.
+        if record.expires_at.is_some() && record.wall_clock != self.uses_wall_clock() {
+            return Err(Error::persistence(
+                "the record's clock mode differs from this kernel's",
+            ));
+        }
         let now = self.cell.borrow().now_ms;
         let ttl_ms = match record.expires_at {
             Some(expires_at) if expires_at <= now => {
@@ -1090,12 +1119,20 @@ impl Agent {
         payload: Value,
     ) -> Result<u64> {
         let mut kernel = self.cell.borrow_mut();
-        let (lane_closed, lane_budget) = {
+        let (lane_closed, lane_budget, lane_bytes, lane_capacity) = {
             let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
-            (lane_record.closed, lane_record.budget)
+            (
+                lane_record.closed,
+                lane_record.budget,
+                lane_record.bytes,
+                lane_record.has_capacity(),
+            )
         };
         if lane_closed {
             return Err(Error::UnknownLane(lane.0));
+        }
+        if !lane_capacity {
+            return Err(Error::BudgetExceeded("lane call"));
         }
         let record = kernel
             .caps
@@ -1119,6 +1156,10 @@ impl Agent {
                     "capability is bound to a different peer identity",
                 ));
             }
+        }
+        if record.attrs.read_only {
+            // Publishing writes to a channel; a read-only grant cannot mutate.
+            return Err(Error::ReadOnly);
         }
         if let Some(topics) = &record.attrs.topics {
             if !topics.contains(topic) {
@@ -1148,6 +1189,9 @@ impl Agent {
         if bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
+        if lane_bytes.saturating_add(bytes) > lane_budget.max_bytes {
+            return Err(Error::BudgetExceeded("lane byte"));
+        }
         let meter = kernel
             .meters
             .get_mut(&cap.id())
@@ -1158,6 +1202,10 @@ impl Agent {
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         let message = record.send_topic(lane, Some(topic), payload, Vec::new())?;
+        if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
+            lane_record.bytes = lane_record.bytes.saturating_add(bytes);
+            lane_record.completed = lane_record.completed.saturating_add(1);
+        }
         kernel.push_event(Event::ChannelSend {
             channel,
             sequence: message.sequence,
@@ -1336,12 +1384,13 @@ impl Agent {
                 ));
             }
         }
-        let (lane_closed, lane_capacity, lane_budget) = {
+        let (lane_closed, lane_capacity, lane_budget, lane_bytes) = {
             let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
             (
                 lane_record.closed,
                 lane_record.has_capacity(),
                 lane_record.budget,
+                lane_record.bytes,
             )
         };
         if lane_closed {
@@ -1400,6 +1449,11 @@ impl Agent {
         if call_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
+        // A lane's byte ceiling is cumulative, not a per-call limit: otherwise
+        // any number of calls each just under it would pass.
+        if lane_bytes.saturating_add(call_bytes) > lane_budget.max_bytes {
+            return Err(Error::BudgetExceeded("lane byte"));
+        }
         // Every dependency must exist before anything is charged, recorded or
         // receipted: a refused call must leave no trace and cost nothing.
         let deps: Vec<PromiseId> = args.iter().filter_map(|arg| arg.promise()).collect();
@@ -1425,6 +1479,9 @@ impl Agent {
             .get_mut(&cap_id)
             .ok_or(Error::InvalidArgument("capability has no meter"))?;
         meter.charge(call_bytes)?;
+        if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
+            lane_record.bytes = lane_record.bytes.saturating_add(call_bytes);
+        }
 
         let promise_id = PromiseId(kernel.next_promise);
         kernel.next_promise += 1;
@@ -1510,6 +1567,12 @@ impl Agent {
         loop {
             let batch = {
                 let mut kernel = self.cell.borrow_mut();
+                if kernel.dispatching {
+                    // A provider called back into `run`. Its own provider is
+                    // checked out, so a nested batch could not run and must not
+                    // fail the queued work; the outer dispatch continues.
+                    return kernel.round_trips;
+                }
                 if kernel.queue.is_empty() {
                     kernel.trim_settled();
                     return kernel.round_trips;
@@ -1520,11 +1583,13 @@ impl Agent {
                         // Only the jobs that cannot be ordered are failed; work
                         // for other providers stays queued.
                         for job_id in stuck {
-                            let error = kernel
-                                .jobs
-                                .get(&job_id)
-                                .map(|job| Error::UnknownCapability(cap_token(job.cap)))
-                                .unwrap_or(Error::PipelinedCycle);
+                            let error = match kernel.jobs.get(&job_id) {
+                                Some(job) if kernel.caps.contains_key(&job.cap) => {
+                                    Error::PipelinedCycle
+                                }
+                                Some(job) => Error::UnknownCapability(cap_token(job.cap)),
+                                None => Error::PipelinedCycle,
+                            };
                             kernel.fail_job(job_id, error);
                         }
                         continue;
@@ -1958,11 +2023,13 @@ impl Agent {
                 jobs: batch.len(),
                 lanes,
             });
+            kernel.dispatching = true;
             let provider = kernel.providers.remove(&provider_id);
             (provider_id, provider)
         };
         let Some(mut provider) = provider else {
             let mut kernel = self.cell.borrow_mut();
+            kernel.dispatching = false;
             for job_id in batch {
                 kernel.fail_job(
                     job_id,
@@ -2109,10 +2176,19 @@ impl Agent {
             });
         }
 
-        self.cell
-            .borrow_mut()
-            .providers
-            .insert(provider_id, provider);
+        let mut kernel = self.cell.borrow_mut();
+        kernel.dispatching = false;
+        // A drop that happened during the call saw no provider; deliver it now.
+        let deferred = std::mem::take(&mut kernel.deferred_drops);
+        for (id, object, cap) in deferred {
+            if id == provider_id {
+                provider.on_drop(object, cap);
+            } else {
+                // Another provider is still checked out by an outer dispatch.
+                kernel.deferred_drops.push((id, object, cap));
+            }
+        }
+        kernel.providers.insert(provider_id, provider);
     }
 }
 
@@ -2171,51 +2247,95 @@ impl Kernel {
         }
     }
 
-    /// Build the next dispatch batch: all queued jobs for the head job's
-    /// provider, ordered so promise producers precede consumers.
+    /// Build the next dispatch batch.
+    ///
+    /// A batch holds the runnable jobs of one provider, ordered so promise
+    /// producers precede consumers. The provider is the first one in queue
+    /// order with a runnable job: in a cross-provider pipeline the head job's
+    /// provider can be blocked while the producer's provider has work, and
+    /// pinning the batch to the head would livelock the kernel.
     fn next_batch(&mut self) -> std::result::Result<Vec<u64>, Vec<u64>> {
-        let Some(head) = self.queue.front().copied() else {
-            return Ok(Vec::new());
-        };
-        let Some(head_job) = self.jobs.get(&head) else {
-            self.queue.pop_front();
-            return Ok(Vec::new());
-        };
-        let Some(provider) = self.caps.get(&head_job.cap).map(|record| record.provider) else {
-            // The capability vanished; fail this job and let the caller retry.
-            self.queue.pop_front();
-            return Err(vec![head]);
-        };
-        let mut candidates: Vec<u64> = self
+        // A job whose record or capability vanished can never run.
+        let orphans: Vec<u64> = self
             .queue
             .iter()
             .copied()
             .filter(|id| {
-                self.jobs
+                !self
+                    .jobs
                     .get(id)
-                    .and_then(|job| self.caps.get(&job.cap))
-                    .map(|record| record.provider == provider)
+                    .map(|job| self.caps.contains_key(&job.cap))
                     .unwrap_or(false)
             })
             .collect();
-        // Producers first: order by promise dependencies inside the batch.
+        if !orphans.is_empty() {
+            let doomed: std::collections::HashSet<u64> = orphans.iter().copied().collect();
+            self.queue.retain(|id| !doomed.contains(id));
+            return Err(orphans);
+        }
+
+        // Providers in queue order, then the first that can run a job now.
+        let mut providers: Vec<ProviderId> = Vec::new();
+        for id in self.queue.iter() {
+            if let Some(provider) = self
+                .jobs
+                .get(id)
+                .and_then(|job| self.caps.get(&job.cap))
+                .map(|record| record.provider)
+            {
+                if !providers.contains(&provider) {
+                    providers.push(provider);
+                }
+            }
+        }
+        for provider in providers {
+            let candidates: Vec<u64> = self
+                .queue
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.jobs
+                        .get(id)
+                        .and_then(|job| self.caps.get(&job.cap))
+                        .map(|record| record.provider == provider)
+                        .unwrap_or(false)
+                })
+                .collect();
+            let ordered = self.order_candidates(&candidates);
+            if !ordered.is_empty() {
+                let taken: std::collections::HashSet<u64> = ordered.iter().copied().collect();
+                self.queue.retain(|id| !taken.contains(id));
+                return Ok(ordered);
+            }
+        }
+
+        // Nothing can run: every queued job waits on a promise that no queued
+        // job will settle.
+        Err(self.queue.drain(..).collect())
+    }
+
+    /// Order one provider's queued jobs so producers precede consumers.
+    ///
+    /// Only jobs whose dependencies are settled or produced earlier in the
+    /// same batch are returned; the rest stay queued for a later batch (their
+    /// producer may be queued on another provider).
+    fn order_candidates(&self, candidates: &[u64]) -> Vec<u64> {
         let mut ordered: Vec<u64> = Vec::new();
-        let mut pending = candidates.clone();
+        let mut pending: Vec<u64> = candidates.to_vec();
         let mut progress = true;
         while progress && !pending.is_empty() {
             progress = false;
             let mut index = 0;
             while index < pending.len() {
                 let id = pending[index];
-                let job = self.jobs.get(&id).cloned();
-                let ready = match &job {
+                let ready = match self.jobs.get(&id) {
                     Some(job) => job.deps.iter().all(|dep| {
                         // Resolved already, or produced by an ordered job.
                         match self.promises.get(dep) {
                             Some(record) if record.state.is_settled() => true,
-                            _ => ordered
-                                .iter()
-                                .any(|other| self.jobs.get(other).map(|j| j.promise) == Some(*dep)),
+                            _ => ordered.iter().any(|other| {
+                                self.jobs.get(other).map(|job| job.promise) == Some(*dep)
+                            }),
                         }
                     }),
                     None => true,
@@ -2229,16 +2349,7 @@ impl Kernel {
                 }
             }
         }
-        if !pending.is_empty() {
-            // Unorderable: the remaining jobs form (or depend on) a cycle.
-            for id in &pending {
-                self.queue.retain(|queued| queued != id);
-            }
-            return Err(pending);
-        }
-        candidates.clear();
-        self.queue.retain(|id| !ordered.contains(id));
-        Ok(ordered)
+        ordered
     }
 
     fn fail_job(&mut self, job_id: u64, error: Error) {
