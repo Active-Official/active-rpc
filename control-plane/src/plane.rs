@@ -1027,6 +1027,13 @@ impl PlaneCore {
                 detail: "capability lifetime elapsed".into(),
                 ..base
             },
+            Event::ProviderPanicked { provider, phase } => UiEvent {
+                category: category_for("provider_panic").into(),
+                kind: "provider_panic".into(),
+                capability: None,
+                detail: format!("provider {} panicked in {}", provider.0, phase),
+                ..base
+            },
             Event::CapIntroduced { cap, fingerprint } => UiEvent {
                 category: category_for("cap_introduce").into(),
                 kind: "cap_introduce".into(),

@@ -74,7 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cap {}", cap.id().hex());
     std::io::stdout().flush()?;
 
-    for _ in 0..64 {
+    // One connection per request. The matrix runs three calls per client, so
+    // the budget must cover every client in the polyglot row (24 today).
+    for _ in 0..512 {
         let (stream, _) = match listener.accept() {
             Ok(pair) => pair,
             Err(_) => break,
