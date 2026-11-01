@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
-| R-07 | domain ops | `src/domain.rs` | pending | — | — |
+| R-07 | domain ops | `src/domain.rs` | round 1: critical fixed, 11 open | 1 fixed / 0 rejected / 11 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | pending | — | — |
 | R-09 | transports | `src/transport/**` | pending | — | — |
 | R-10 | bulk | `src/bulk.rs` | pending | — | — |
@@ -142,6 +142,24 @@ refuses.
 
 Gate: `cargo test --all-features` 452 passed, 0 failed; `cargo test
 --no-default-features` 0 failed; clippy clean on both feature sets; fmt clean.
+
+### R-07 domain operations - 2026-11-01 (round 1, in progress)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `22c3d66`.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| D-1 | critical | `Call.path_scope` was never enforced by the domain provider: a capability confined to `app` returned the whole module (pathless `evaluate`, `patch` outside the scope, `stats`/`annotations`/`provenance`/`content_hash`, and dependents labels) | **fixed**: `ModuleProvider::serve` refuses a path outside the scope and refuses a pathless form under a scope (`rpc/path-not-granted`); `tests/domain_scope_tests.rs` (4) |
+| D-2 | high | metadata queries ignore `Budget` and are O(n²): `why`/`impact` took 2.5 s at 3 000 nodes and 10.7 s at 6 000 | open: charge the query against `max_nodes`/`max_wall_ms` and index the cone |
+| D-3 | high | an unchecked index, a quadratic cone and a panicking call destroy the module object | open: bounds-check the index, make the cone linear, and catch the panic before re-inserting |
+| D-4 | high | `restrict`/`subgraph` drop annotations, so a scoped `evaluate` skips `@constraint` and the output loses `@ai_immutable` | open: copy annotations and their edges into the cone |
+| D-5 | medium | `patch` ignores `@ai_immutable` and wipes module provenance | open |
+| D-6 | medium | provenance/annotation text is not redacted against secret literals in the provider | open |
+| D-7 | medium | a scoped `patch` changes values outside the scope through shared bindings | open |
+| D-8..D-12 | low | redacting `stats` discloses the secret count; `rpc/payload` for lowering faults; unbounded `drops`; `timestamp_ms as i64`; refused calls counted as served | open |
+
+Gate: `cargo test --all-features` 456 passed, 0 failed; clippy clean on both
+feature sets; fmt clean.
 
 ### R-05 lanes / channels - 2026-11-01 (round 1)
 
