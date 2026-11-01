@@ -398,10 +398,15 @@ fn h2_12_tool() -> std::result::Result<(), String> {
         return Err(format!("unexpected HTTP escape code {}", error.code()));
     }
 
-    let process = agent.register(Box::new(LocalProcess::new(
-        "/nonexistent-active-fuzz-binary",
-        &["ok"],
-    )));
+    // The program must be absolute on this platform; it never executes because
+    // the argument is refused first.
+    #[cfg(windows)]
+    let missing_program = "C:\\nonexistent-active-fuzz-binary.exe";
+    #[cfg(not(windows))]
+    let missing_program = "/nonexistent-active-fuzz-binary";
+    let process = agent.register(Box::new(
+        LocalProcess::new(missing_program, &["ok"]).expect("an absolute program"),
+    ));
     let process_cap = agent
         .mint(
             process,

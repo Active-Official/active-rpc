@@ -903,7 +903,9 @@ fn capability_lifecycle_matches_the_bounded_model() {
 fn local_process_timeout_kills_a_hung_child() {
     use active_rpc::tool::LocalProcess;
 
-    let mut tool = LocalProcess::new("cmd.exe", &["/C", "*"]).with_timeout(150);
+    let mut tool = LocalProcess::new("C:\\Windows\\System32\\cmd.exe", &["/C", "*"])
+        .expect("an absolute program")
+        .with_timeout(150);
     let mut call = Call::new(
         "run",
         vec![
@@ -929,7 +931,9 @@ fn local_process_timeout_kills_a_hung_child() {
 fn local_process_timeout_kills_a_hung_child() {
     use active_rpc::tool::LocalProcess;
 
-    let mut tool = LocalProcess::new("sh", &["-c", "*"]).with_timeout(150);
+    let mut tool = LocalProcess::new("/bin/sh", &["-c", "*"])
+        .expect("an absolute program")
+        .with_timeout(150);
     let mut call = Call::new("run", vec![Arg::text("-c"), Arg::text("sleep 5")]);
     call.tool_allows_process = true;
     let start = std::time::Instant::now();
@@ -1065,7 +1069,9 @@ fn double_settlement_is_counted_not_hidden() {
 fn capability_wall_budget_caps_a_slow_tool() {
     use active_rpc::tool::LocalProcess;
 
-    let mut tool = LocalProcess::new("cmd.exe", &["/C", "*"]).with_timeout(10_000);
+    let mut tool = LocalProcess::new("C:\\Windows\\System32\\cmd.exe", &["/C", "*"])
+        .expect("an absolute program")
+        .with_timeout(10_000);
     let mut call = Call::new(
         "run",
         vec![

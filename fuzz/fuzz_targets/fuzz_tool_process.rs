@@ -34,7 +34,8 @@ fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
-    let tool = LocalProcess::new("/nonexistent-active-fuzz-binary", &["ok"]);
+    let tool =
+        LocalProcess::new("/nonexistent-active-fuzz-binary", &["ok"]).expect("an absolute program");
     assert!(policy().is_attenuation_of(&tool.policy()));
 
     let agent = common::agent(data);

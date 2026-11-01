@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use serde_json::{json, Value as Json};
@@ -101,6 +102,16 @@ pub trait McpTransport {
 /// buffering an unbounded line.
 pub const MAX_MCP_LINE_BYTES: usize = 1 << 20;
 
+/// How many notification frames one request may skip before the session is
+/// poisoned.
+///
+/// MCP servers send notifications (`notifications/progress`,
+/// `notifications/message`) that are not answers to any request. Skipping a
+/// bounded number keeps a spec-compliant server usable; an unbounded skip would
+/// let a server starve the caller with frames it never asked for, so the
+/// session fails closed once the bound is passed.
+pub const MAX_MCP_NOTIFICATIONS: usize = 16;
+
 /// The longest tool name a session accepts, in bytes.
 pub const MAX_MCP_TOOL_NAME_BYTES: usize = 128;
 
@@ -121,11 +132,14 @@ fn valid_tool_name(name: &str) -> bool {
 /// The longest tool description a session keeps, in bytes.
 pub const MAX_MCP_DESCRIPTION_BYTES: usize = 4 << 10;
 
-/// Cap a description and replace control characters with spaces.
+/// Cap a description and replace control characters and invisible formatting
+/// with spaces.
 ///
 /// The text is still untrusted: a renderer must escape it for its own output
-/// context. Replacing control characters here means a description can never
-/// carry a terminal escape or a bidi override into a log line.
+/// context. Replacing these characters here means a description can never carry
+/// a terminal escape, reorder rendered text, or start a new line in a log.
+/// `char::is_control` covers C0 and C1, but not the Unicode separators (Zl/Zp)
+/// or the format characters that render as nothing.
 fn bounded_description(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_MCP_DESCRIPTION_BYTES));
     for character in text.chars() {
@@ -135,7 +149,7 @@ fn bounded_description(text: &str) -> String {
         if out.len() + character.len_utf8() > MAX_MCP_DESCRIPTION_BYTES {
             break;
         }
-        if character.is_control() || is_bidi_override(character) {
+        if character.is_control() || is_invisible_or_reordering(character) {
             out.push(' ');
         } else {
             out.push(character);
@@ -144,11 +158,30 @@ fn bounded_description(text: &str) -> String {
     out
 }
 
-/// Bidi control characters that can reorder rendered text.
-fn is_bidi_override(character: char) -> bool {
+/// Characters that reorder rendered text or render as nothing.
+///
+/// A log line splits on `\n` and `\r`, never on U+2028/U+2029, so an unscrubbed
+/// line separator makes one description render as two log records. The format
+/// characters have no width, so they can hide text or join two words into one.
+fn is_invisible_or_reordering(character: char) -> bool {
     matches!(
         character,
-        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+        // Bidi embeddings, overrides, isolates, LRM/RLM, and the Arabic letter
+        // mark.
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            // Zero-width space, non-joiner, joiner, and word joiner.
+            | '\u{200B}'..='\u{200D}'
+            | '\u{2060}'
+            // Byte order mark / zero-width no-break space, and soft hyphen.
+            | '\u{FEFF}'
+            | '\u{00AD}'
+            // Line and paragraph separators.
+            | '\u{2028}'
+            | '\u{2029}'
     )
 }
 
@@ -217,6 +250,16 @@ pub const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 /// Largest number of HTTP header fields accepted.
 pub const MAX_HTTP_HEADER_FIELDS: usize = 128;
 
+/// Whether a request method is defined to carry content.
+///
+/// Only these get a body and a `content-length` header. A request that carries
+/// content anyway (RFC 9110 permits it for GET) makes simple servers and
+/// intermediaries reset the connection instead of answering, so the adapter
+/// sends none.
+fn takes_request_body(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH")
+}
+
 /// Read one line under a cap, refusing a line that would exceed it.
 ///
 /// `read_line` into a fresh `String` grows until the peer stops: a single
@@ -259,10 +302,20 @@ impl StdioTransport {
     /// it exits at once, and the session sees `mcp/eof` before its first line.
     /// Reads happen on a thread, so [`McpTransport::recv_line_within`] can
     /// abandon a server that stays silent.
+    ///
+    /// `program` must be an absolute path, for the same reason as
+    /// [`LocalProcess::new`]: a bare name is resolved from the parent's `PATH`.
+    /// The working directory is pinned to this process's current directory
+    /// instead of being inherited when the child is spawned.
     pub fn spawn(program: &str, args: &[&str], env: &BTreeMap<String, String>) -> Result<Self> {
-        let mut command = Command::new(program);
+        let program = pin_program(program, "an MCP server")?;
+        let workdir = std::env::current_dir().map_err(|_| Error::Provider {
+            code: "mcp/cwd".to_string(),
+        })?;
+        let mut command = Command::new(&program);
         command
             .args(args)
+            .current_dir(&workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -377,6 +430,11 @@ pub struct McpSession<T: McpTransport> {
     transport: T,
     tools: Vec<McpToolDef>,
     next_id: u64,
+    /// Set when a frame broke the request/response stream. A poisoned session
+    /// refuses every later call: after a desync the next line may be the answer
+    /// to a request already abandoned, so accepting it would attribute one
+    /// call's result to another.
+    poisoned: bool,
     /// Tool invocations issued through this session (the handshake is not
     /// counted).
     pub calls: u64,
@@ -389,6 +447,7 @@ impl<T: McpTransport> McpSession<T> {
             transport,
             tools: Vec::new(),
             next_id: 0,
+            poisoned: false,
             calls: 0,
         };
         let initialize = session.request(
@@ -463,6 +522,11 @@ impl<T: McpTransport> McpSession<T> {
         params: Json,
         deadline: Option<std::time::Instant>,
     ) -> Result<Json> {
+        if self.poisoned {
+            return Err(Error::Provider {
+                code: "mcp/desync".to_string(),
+            });
+        }
         // JSON-RPC ids wrap rather than panic in a long-lived session; id 0 is
         // skipped because it is the conventional "no id" notification value.
         self.next_id = self.next_id.wrapping_add(1);
@@ -485,40 +549,60 @@ impl<T: McpTransport> McpSession<T> {
             ));
         }
         self.transport.send_line(&line)?;
-        let line = self.transport.recv_line_within(deadline)?;
-        if line.len() > MAX_MCP_LINE_BYTES {
-            return Err(Error::Provider {
-                code: "mcp/line-too-long".to_string(),
-            });
-        }
-        let response: Json = serde_json::from_str(&line).map_err(|_| Error::Provider {
-            code: "mcp/bad-response".to_string(),
-        })?;
-        // A response must be an object and must answer *this* request. A
-        // mismatched id means the peer is confused or hostile; do not accept
-        // its payload as the answer to a different call.
-        let object = response.as_object().ok_or(Error::Provider {
-            code: "mcp/bad-response".to_string(),
-        })?;
-        match object.get("id") {
-            Some(value) if value.as_u64() == Some(id) => {}
-            Some(_) => {
+        let mut skipped = 0usize;
+        loop {
+            let line = self.transport.recv_line_within(deadline)?;
+            if line.len() > MAX_MCP_LINE_BYTES {
                 return Err(Error::Provider {
-                    code: "mcp/id-mismatch".to_string(),
-                })
+                    code: "mcp/line-too-long".to_string(),
+                });
             }
-            None => {
-                return Err(Error::Provider {
-                    code: "mcp/bad-response".to_string(),
-                })
-            }
-        }
-        if object.get("result").is_none() && object.get("error").is_none() {
-            return Err(Error::Provider {
+            let response: Json = serde_json::from_str(&line).map_err(|_| Error::Provider {
                 code: "mcp/bad-response".to_string(),
-            });
+            })?;
+            // A response must be an object and must answer *this* request. A
+            // mismatched id means the peer is confused or hostile; do not accept
+            // its payload as the answer to a different call.
+            let object = response.as_object().ok_or(Error::Provider {
+                code: "mcp/bad-response".to_string(),
+            })?;
+            match object.get("id") {
+                Some(value) if value.as_u64() == Some(id) => {
+                    if object.get("result").is_none() && object.get("error").is_none() {
+                        return Err(Error::Provider {
+                            code: "mcp/bad-response".to_string(),
+                        });
+                    }
+                    return Ok(response);
+                }
+                // A notification has no `id` and is not an answer to this
+                // request. Skip a bounded number so progress and log
+                // notifications do not break a spec-compliant server.
+                None if object.contains_key("method") => {
+                    skipped += 1;
+                    if skipped > MAX_MCP_NOTIFICATIONS {
+                        self.poisoned = true;
+                        return Err(Error::Provider {
+                            code: "mcp/desync".to_string(),
+                        });
+                    }
+                }
+                Some(_) => {
+                    // A server-initiated request (its own id) or a stale
+                    // answer. Either way the stream no longer lines up with
+                    // the requests this session sent.
+                    self.poisoned = true;
+                    return Err(Error::Provider {
+                        code: "mcp/id-mismatch".to_string(),
+                    });
+                }
+                None => {
+                    return Err(Error::Provider {
+                        code: "mcp/bad-response".to_string(),
+                    })
+                }
+            }
         }
-        Ok(response)
     }
 
     /// Discovered tools.
@@ -645,7 +729,7 @@ impl HttpTool {
         &self,
         method: &str,
         path: &str,
-        body: &[u8],
+        body: Option<&[u8]>,
         ceiling_ms: u64,
     ) -> Result<(u16, Vec<u8>)> {
         let base = self
@@ -680,13 +764,26 @@ impl HttpTool {
         })?;
         stream.set_read_timeout(Some(ceiling)).ok();
         stream.set_write_timeout(Some(ceiling)).ok();
-        let head = format!(
-            "{method} {path} HTTP/1.1\r\nhost: {base}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        );
+        let head = {
+            // A method defined without content sends no `content-length` and no
+            // body. A GET that carries one makes simple servers and
+            // intermediaries reset the connection instead of answering: the
+            // request is already complete at the empty line, so the extra bytes
+            // are unread data.
+            let mut head =
+                format!("{method} {path} HTTP/1.1\r\nhost: {base}\r\nconnection: close\r\n");
+            if let Some(body) = body {
+                head.push_str(&format!("content-length: {}\r\n", body.len()));
+            }
+            head.push_str("\r\n");
+            head
+        };
         stream
             .write_all(head.as_bytes())
-            .and_then(|_| stream.write_all(body))
+            .and_then(|_| match body {
+                Some(body) => stream.write_all(body),
+                None => Ok(()),
+            })
             .and_then(|_| stream.flush())
             .map_err(|error| Error::Provider {
                 code: format!("http/write:{error}"),
@@ -825,24 +922,30 @@ impl Provider for HttpTool {
         if !self.allow.contains(&(method.to_string(), path.clone())) {
             return Err(Error::ToolPolicy("path is not on the allowlist"));
         }
-        let body = serde_json::to_vec(
-            &call
-                .args
-                .iter()
-                .filter_map(|arg| match arg {
-                    Arg::Value(Value::Map(entries)) => {
-                        Some(value_to_json(&Value::Map(entries.clone())))
-                    }
-                    _ => None,
-                })
-                .next()
-                .unwrap_or(Json::Null),
-        )
-        .unwrap_or_default();
-        if body.len() > self.max_request {
-            return Err(Error::ToolPolicy("request too large"));
-        }
-        let (status, response) = self.perform(&method, &path, &body, call.budget.max_wall_ms)?;
+        let body = if takes_request_body(&method) {
+            let body = serde_json::to_vec(
+                &call
+                    .args
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        Arg::Value(Value::Map(entries)) => {
+                            Some(value_to_json(&Value::Map(entries.clone())))
+                        }
+                        _ => None,
+                    })
+                    .next()
+                    .unwrap_or(Json::Null),
+            )
+            .unwrap_or_default();
+            if body.len() > self.max_request {
+                return Err(Error::ToolPolicy("request too large"));
+            }
+            Some(body)
+        } else {
+            None
+        };
+        let (status, response) =
+            self.perform(&method, &path, body.as_deref(), call.budget.max_wall_ms)?;
         if status >= 400 {
             return Err(Error::Provider {
                 code: format!("http/{status}"),
@@ -860,20 +963,39 @@ impl Provider for HttpTool {
 // Local process
 // ---------------------------------------------------------------------------
 
+/// Resolve and pin a program path for an adapter.
+///
+/// A bare or relative name would be resolved from the parent's `PATH` or its
+/// working directory, which is ambient authority: anything that can write an
+/// earlier `PATH` entry picks the binary a capability runs. The canonical path
+/// is pinned so a symlink swapped in after construction cannot redirect the
+/// exec. A path that does not exist yet keeps its absolute form and fails at
+/// spawn with the operating system's own error.
+fn pin_program(program: &str, refusal: &'static str) -> Result<PathBuf> {
+    if !Path::new(program).is_absolute() {
+        return Err(Error::InvalidArgument(refusal));
+    }
+    Ok(std::fs::canonicalize(program).unwrap_or_else(|_| PathBuf::from(program)))
+}
+
 /// A sandboxed local process tool.
 ///
 /// The allowlist is the program plus its permitted argument prefixes. The child
-/// gets a scrubbed environment (only what the caller allows), no shell, and a
-/// byte-bounded stdout. Anything else is `rpc/tool-policy`.
+/// gets a scrubbed environment (only what the caller allows), no shell, a pinned
+/// working directory and a byte-bounded stdout. Anything else is
+/// `rpc/tool-policy`.
 #[derive(Debug)]
 pub struct LocalProcess {
-    /// Absolute program path or allowlisted name.
+    /// Absolute program path as given to [`LocalProcess::new`].
     pub program: String,
     /// Arguments the caller may pass (each must be an exact match or a prefix
     /// when it ends with `*`).
     pub allow_args: Vec<String>,
     /// Environment variables the child inherits.
     pub env: BTreeMap<String, String>,
+    /// Directory the child runs in. Pinned at construction and never inherited
+    /// at spawn time, so a later `chdir` in this process cannot move the child.
+    pub workdir: PathBuf,
     /// Maximum output bytes.
     pub max_output: usize,
     /// Maximum wall-clock time one invocation may take before the child is
@@ -882,19 +1004,49 @@ pub struct LocalProcess {
     pub timeout_ms: u64,
     /// Calls served.
     pub calls: u64,
+    /// Canonical program path pinned at construction.
+    resolved: PathBuf,
 }
 
 impl LocalProcess {
-    /// Build a tool for `program` with an argument allowlist.
-    pub fn new(program: impl Into<String>, allow_args: &[&str]) -> Self {
-        Self {
-            program: program.into(),
+    /// Build a tool for an absolute `program` path with an argument allowlist.
+    ///
+    /// The program must be an absolute path: a bare name is resolved from the
+    /// parent's `PATH`, so anything that can write an earlier `PATH` entry
+    /// would choose the binary the capability runs. The canonical path is
+    /// pinned here, and the working directory is pinned to this process's
+    /// current directory (see [`LocalProcess::with_current_dir`]).
+    pub fn new(program: impl Into<String>, allow_args: &[&str]) -> Result<Self> {
+        let program = program.into();
+        let resolved = pin_program(&program, "a local process program must be an absolute path")?;
+        let workdir = std::env::current_dir().map_err(|_| Error::Provider {
+            code: "process/cwd".to_string(),
+        })?;
+        Ok(Self {
+            program,
             allow_args: allow_args.iter().map(|arg| arg.to_string()).collect(),
             env: BTreeMap::new(),
+            workdir,
             max_output: 1 << 20,
             timeout_ms: 10_000,
             calls: 0,
+            resolved,
+        })
+    }
+
+    /// Pin the child's working directory.
+    ///
+    /// The directory must be absolute; a relative one would resolve against
+    /// whatever the parent's working directory happens to be at spawn time.
+    pub fn with_current_dir(mut self, directory: impl Into<PathBuf>) -> Result<Self> {
+        let directory = directory.into();
+        if !directory.is_absolute() {
+            return Err(Error::InvalidArgument(
+                "a process working directory must be absolute",
+            ));
         }
+        self.workdir = directory;
+        Ok(self)
     }
 
     /// Set the per-invocation wall-clock ceiling.
@@ -964,13 +1116,22 @@ impl Provider for LocalProcess {
         if !call.tool_allows_process {
             return Err(Error::ToolPolicy("process execution not granted"));
         }
-        let mut command = Command::new(&self.program);
+        let mut command = Command::new(&self.resolved);
         command
             .args(&args)
+            .current_dir(&self.workdir)
             .env_clear()
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .stdout(Stdio::piped());
+        #[cfg(unix)]
+        {
+            // Its own process group, so a timeout can signal the whole tree.
+            // Without this a shell's background descendants outlive the direct
+            // child and keep running after the capability was refunded.
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         for (key, value) in &self.env {
             command.env(key, value);
         }
@@ -1026,17 +1187,43 @@ impl Provider for LocalProcess {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
-                        // The direct child is always killed. On Windows the
-                        // tree goes with it; on Unix a detached descendant that
-                        // kept the pipe is documented, and the bounded output
-                        // wait above means it cannot extend the call.
+                        // The whole tree is killed, not just the direct child.
+                        // On Windows `taskkill /T` walks the tree; on Unix the
+                        // child leads its own process group, so one signal
+                        // reaches every descendant it started.
                         #[cfg(windows)]
                         {
-                            let _ = Command::new("taskkill")
+                            // Resolve `taskkill` from the system directory, not
+                            // from `PATH`: the same ambient-authority argument
+                            // as the program itself.
+                            let root = std::env::var_os("SystemRoot")
+                                .map(PathBuf::from)
+                                .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+                            let _ = Command::new(root.join("System32").join("taskkill.exe"))
                                 .args(["/T", "/F", "/PID", &child.id().to_string()])
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
                                 .status();
+                        }
+                        #[cfg(unix)]
+                        {
+                            // `kill` is std-only (this crate forbids unsafe).
+                            // Both absolute locations are tried; the negative
+                            // pid is the process group created above. A system
+                            // without either falls back to killing the leader.
+                            let group = format!("-{}", child.id());
+                            for candidate in ["/bin/kill", "/usr/bin/kill"] {
+                                let killed = Command::new(candidate)
+                                    .args(["-KILL", "--", group.as_str()])
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status()
+                                    .map(|status| status.success())
+                                    .unwrap_or(false);
+                                if killed {
+                                    break;
+                                }
+                            }
                         }
                         let _ = child.kill();
                         let _ = child.wait();

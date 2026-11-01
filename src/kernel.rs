@@ -2873,6 +2873,23 @@ impl Agent {
             .ok_or(Error::UnknownLane(lane.0))
     }
 
+    /// Calls issued by `lane` that are still waiting to be dispatched.
+    ///
+    /// This is the part of [`Lane::pending`] the kernel has not handed to a
+    /// provider yet. Linear in the number of queued calls, so it is meant for
+    /// diagnostics and dashboards rather than a hot path.
+    pub fn lane_queue_depth(&self, lane: LaneId) -> Result<usize> {
+        let kernel = self.cell.borrow();
+        if !kernel.lanes.contains_key(&lane) {
+            return Err(Error::UnknownLane(lane.0));
+        }
+        Ok(kernel
+            .queue
+            .iter()
+            .filter(|id| kernel.jobs.get(id).is_some_and(|job| job.lane == lane))
+            .count())
+    }
+
     /// Channel statistics.
     pub fn channel(&self, channel: ChannelId) -> Result<Channel> {
         self.cell

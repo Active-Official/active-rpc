@@ -308,3 +308,66 @@ fn a_multibyte_character_cannot_straddle_the_description_ceiling() {
     );
     assert!(description.is_char_boundary(description.len()));
 }
+
+/// U+2028/U+2029 are separators, not control characters, and a log line splits
+/// on `\n`/`\r` only: an unscrubbed one renders as two records.
+#[test]
+fn a_description_cannot_inject_a_line_separator() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"read","description":"ok\u2028fake record\u2029\u061C\u200B\uFEFF\u00AD"}]"#,
+    );
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    let description = &session.tools()[0].description;
+    for separator in [
+        '\u{2028}', '\u{2029}', '\u{061C}', '\u{200B}', '\u{FEFF}', '\u{00AD}',
+    ] {
+        assert!(
+            !description.contains(separator),
+            "U+{:04X} survived: {description:?}",
+            separator as u32
+        );
+    }
+    assert!(
+        description.starts_with("ok fake record "),
+        "the visible text is kept: {description:?}"
+    );
+}
+
+/// A spec-compliant server sends notifications (`notifications/progress`,
+/// `notifications/message`) between the request and its answer. Those frames
+/// have no `id` and are not answers, so the session skips them.
+#[test]
+fn a_notification_before_the_response_is_skipped() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let list = tool_list_response(r#"[{"name":"read"}]"#);
+    let note = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}"#;
+    let session = McpSession::handshake(Scripted::new(&[note, initialize, note, note, &list]))
+        .expect("a notification is not a desync");
+    assert_eq!(session.tools().len(), 1);
+}
+
+/// An unbounded stream of notifications is not an answer: the session fails
+/// closed and stays poisoned, so a later answer cannot be attributed to a call
+/// that was already abandoned.
+#[test]
+fn a_notification_stream_poisons_the_session() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let list = tool_list_response(r#"[{"name":"read"}]"#);
+    let note = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
+    let mut lines = vec![initialize.to_string(), list];
+    for _ in 0..=active_rpc::tool::MAX_MCP_NOTIFICATIONS {
+        lines.push(note.to_string());
+    }
+    // A well-formed answer that must never be read: after a desync the next
+    // line may belong to a request already abandoned.
+    lines.push(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#.to_string());
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut session = McpSession::handshake(Scripted::new(&borrowed)).expect("handshake");
+
+    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    assert_eq!(code(result), "mcp/desync");
+    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    assert_eq!(code(result), "mcp/desync", "the session must stay poisoned");
+}

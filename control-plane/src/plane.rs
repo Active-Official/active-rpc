@@ -644,7 +644,9 @@ impl PlaneCore {
         let agent = Agent::with_secret([0x51; 32]);
         let echo_provider = agent.register(Box::new(Echo));
         let mut module_provider = ModuleProvider::new();
-        let object = module_provider.install(fixture_module())?;
+        let object = module_provider
+            .install(fixture_module())
+            .expect("the fixture module installs");
         let module_provider = agent.register(Box::new(module_provider));
 
         let lane = agent
@@ -747,11 +749,15 @@ impl PlaneCore {
             )
             .expect("http cap");
 
+        // An absolute program path: a bare name would be resolved from the
+        // control plane's own `PATH`, which is ambient authority.
         #[cfg(windows)]
-        let (program, flag) = ("cmd", "/C");
+        let (program, flag) = ("C:\\Windows\\System32\\cmd.exe", "/C");
         #[cfg(not(windows))]
-        let (program, flag) = ("sh", "-c");
-        let process = LocalProcess::new(program, &[flag, "echo*"]).with_timeout(3_000);
+        let (program, flag) = ("/bin/sh", "-c");
+        let process = LocalProcess::new(program, &[flag, "echo*"])
+            .expect("an absolute program")
+            .with_timeout(3_000);
         let process_policy = process.policy();
         let process_provider = agent.register(Box::new(process));
         let process_allowed = agent
@@ -1385,14 +1391,18 @@ impl PlaneCore {
     fn lane_stats(&self) -> Vec<LaneStat> {
         self.lanes
             .iter()
-            .filter_map(|id| self.agent.lane(*id).ok())
-            .map(|lane| LaneStat {
-                lane: lane.id.0,
-                name: lane.name,
-                pending: lane.pending,
-                completed: lane.completed,
-                queue: lane.ready.len(),
-                closed: lane.closed,
+            .filter_map(|id| {
+                let lane = self.agent.lane(*id).ok()?;
+                // `pending` counts every outstanding call; `queue` is the part
+                // the kernel has not dispatched yet.
+                Some(LaneStat {
+                    lane: lane.id.0,
+                    name: lane.name,
+                    pending: lane.pending,
+                    completed: lane.completed,
+                    queue: self.agent.lane_queue_depth(*id).unwrap_or(0),
+                    closed: lane.closed,
+                })
             })
             .collect()
     }

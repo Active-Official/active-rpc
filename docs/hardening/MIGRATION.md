@@ -19,6 +19,20 @@ New conveniences are additive: `Metrics` and `Agent::metrics`, the refusal
 events, `destroy_channel`, `promise_count`/`job_count`, `decode_capability_table_with`,
 `LocalProcess::with_timeout`, and the `MAX_*` ceilings.
 
+`LocalProcess::new` and `StdioTransport::spawn` now take authority over the
+program identity rather than trusting the environment:
+
+- `LocalProcess::new(program, args)` returns `Result<Self>` and refuses a
+  relative or bare `program`. Pass `"C:\\Windows\\System32\\cmd.exe"` or
+  `"/bin/sh"`, never `"cmd.exe"`: a bare name is resolved from the parent's
+  `PATH`, so anything that can write an earlier entry would choose the binary
+  the capability runs. The canonical path is pinned at construction, and
+  `with_current_dir` pins the working directory (it also returns `Result` and
+  refuses a relative directory).
+- `StdioTransport::spawn` refuses a non-absolute `program` for the same reason.
+- A Unix timeout now signals the child's whole process group, and a Windows
+  timeout still uses `taskkill /T`, so descendants do not outlive the call.
+
 Promises are retained while a `PromiseHandle` is alive. Dropping the handle makes
 the settled record eligible for trimming after the next drain; a handle never
 loses a result it can still read.

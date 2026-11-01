@@ -78,6 +78,11 @@ that would violate one stops and needs an ADR.
 | Body amplification across streams | one connection may accumulate at most `MAX_INFLIGHT_BODY` of request body; a stream that would exceed it is answered `429` before buffering | `transport::http2::MAX_INFLIGHT_BODY`, `Reservation` |
 | QUIC stream-count and window flooding | 256 bidirectional streams, no unidirectional streams, 1 MiB stream / 8 MiB connection receive windows | `transport::quic::transport_config` |
 | HTTP/3 QPACK amplification | not reachable: this transport carries ARP1 on raw QUIC streams, with no QPACK or HTTP/3 header layer | ADR-0012 addendum, ADR-0023 |
+| Ambient `PATH` or working directory picks a tool's binary | a process or MCP program must be an absolute path, the canonical path is pinned at construction, and the child's working directory is pinned too; a bare name would be resolved from the parent's environment, where anything that can write an earlier `PATH` entry chooses the binary the capability runs | `tool::LocalProcess::new`, `tool::StdioTransport::spawn` |
+| A timed-out tool leaves descendants running | the child leads its own process group on Unix (`process_group(0)`, one group `SIGKILL`) and `taskkill /T` ends the tree on Windows, so a descendant cannot write after the grant was refunded | `LocalProcess::invoke` |
+| Request smuggling through the tool HTTP adapter | the adapter writes the request itself: no `content-length` or body on a method defined without content, `transfer-encoding` other than `identity` refused, 1xx and non-`HTTP/1.x` status lines refused, status and header lines capped | `tool::HttpTool::perform` |
+| An MCP notification desynchronizes a session | a frame without an `id` and with a `method` is a notification: skipped up to `MAX_MCP_NOTIFICATIONS`, then the session is poisoned; a server-initiated request or a stale answer poisons it at once, because the next line may answer a request already abandoned | `tool::McpSession::request_within` |
+| A tool description injects a log record | control characters, Unicode separators (U+2028/U+2029), bidi controls and zero-width format characters are replaced with spaces before the text is stored | `tool::bounded_description` |
 
 ## 4. Non-goals
 
