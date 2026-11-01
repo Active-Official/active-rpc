@@ -190,6 +190,11 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.cap = Some(cap.correlation_id());
             trace.identity = Some(hex(fingerprint));
         }
+        Event::ProviderPanicked { provider, phase } => {
+            trace.event = "provider.panicked";
+            trace.provider = Some(provider.0);
+            trace.detail = Some(phase.clone());
+        }
         Event::LaneCreated(lane) => {
             trace.event = "lane.created";
             trace.lane = Some(lane.0);

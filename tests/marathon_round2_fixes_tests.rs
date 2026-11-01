@@ -413,15 +413,81 @@ fn a_panicking_provider_does_not_wedge_the_kernel() {
     let promise = agent.call(lane, &cap, "once", Vec::new()).expect("call");
     let unwound = catch_unwind(AssertUnwindSafe(|| agent.run()));
     assert!(unwound.is_err(), "the panic must reach the caller");
-    // The promise was settled as a provider fault or is still pending; either
-    // way the kernel must dispatch again.
+    // The promise is settled as a provider fault, so nothing is left pending.
+    let error = promise.value().expect_err("the job settles as a fault");
+    assert_eq!(error.code(), "rpc/provider", "{error}");
     let next = agent
         .call(lane, &cap, "once", Vec::new())
         .expect("second call");
     agent.run();
     next.value().expect("the kernel recovered");
     assert_eq!(calls.get(), 2);
-    let _ = promise;
+    assert!(agent
+        .events()
+        .iter()
+        .any(|event| matches!(event, active_rpc::Event::ProviderPanicked { .. })));
+}
+
+/// A panic inside `on_drop` must not remove the provider from the registry or
+/// leave its id in the delivery set: the notification is best-effort and the
+/// kernel recovers.
+#[test]
+fn a_panicking_on_drop_keeps_the_provider() {
+    struct PanicOnce {
+        armed: Rc<Cell<u64>>,
+    }
+
+    impl Provider for PanicOnce {
+        fn name(&self) -> &'static str {
+            "panic-on-drop"
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["hold".to_string()]
+        }
+
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Ok(Response::Value(Value::text("ok")))
+        }
+
+        fn on_drop(&mut self, object: u64, _cap: active_rpc::CapId) {
+            if object == self.armed.get() {
+                self.armed.set(u64::MAX);
+                panic!("on_drop unwound");
+            }
+        }
+    }
+
+    let armed = Rc::new(Cell::new(1));
+    let agent = Agent::with_secret([0x48; 32]);
+    let provider = agent.register(Box::new(PanicOnce {
+        armed: Rc::clone(&armed),
+    }));
+    let doomed = agent
+        .mint(provider, 1, CapAttrs::new(&["hold"]))
+        .expect("doomed");
+    let survivor = agent
+        .mint(provider, 2, CapAttrs::new(&["hold"]))
+        .expect("survivor");
+    let lane = agent
+        .create_lane("panic-drop", Budget::default())
+        .expect("lane");
+    // The notification panics, and the kernel absorbs it: a panic here usually
+    // runs inside a `Drop`, where a second one aborts the process.
+    drop(doomed);
+    let promise = agent
+        .call(lane, &survivor, "hold", Vec::new())
+        .expect("the provider is still registered");
+    agent.run();
+    promise.value().expect("the surviving object still works");
+    assert!(agent
+        .events()
+        .iter()
+        .any(|event| matches!(event, active_rpc::Event::ProviderPanicked { .. })));
 }
 
 /// A channel message is lane traffic: it consumes the lane's byte and call

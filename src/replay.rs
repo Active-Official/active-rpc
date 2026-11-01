@@ -584,6 +584,10 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             event: "cap.introduced".into(),
             cap: ordinal(*cap),
         },
+        Event::ProviderPanicked { .. } => Trace {
+            event: "provider.panicked".into(),
+            cap: None,
+        },
         Event::LaneCreated(_) => Trace {
             event: "lane.created".into(),
             cap: None,

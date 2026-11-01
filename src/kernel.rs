@@ -138,6 +138,13 @@ pub enum Event {
     CapDropped(CapId),
     /// A capability was revoked.
     CapRevoked(CapId),
+    /// Provider code panicked; the kernel recovered and the panic continues.
+    ProviderPanicked {
+        /// Provider whose callback unwound.
+        provider: ProviderId,
+        /// Which callback: `invoke` or `on_drop`.
+        phase: String,
+    },
     /// A capability's lifetime elapsed; it is refused exactly like a revocation.
     CapExpired(CapId),
     /// A capability was introduced to an authenticated peer and bound to it.
@@ -477,10 +484,22 @@ fn deliver_pending_drops(cell: &KernelCell) {
                 }
                 continue;
             };
-            provider.on_drop(object, cap);
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                provider.on_drop(object, cap);
+            }))
+            .is_err();
             if let Ok(mut kernel) = cell.try_borrow_mut() {
                 kernel.providers.insert(provider_id, provider);
                 kernel.delivering.remove(&provider_id);
+                if unwound {
+                    // `on_drop` often runs from a `Drop`; letting this panic
+                    // escape would abort the process on the second one, and the
+                    // provider would stay out of the registry.
+                    kernel.push_event(Event::ProviderPanicked {
+                        provider: provider_id,
+                        phase: "on_drop".to_string(),
+                    });
+                }
                 // The callback may have dropped handles, which queue more work.
                 kernel.apply_deferred_refops();
             } else {
@@ -2474,6 +2493,7 @@ impl Agent {
             provider_id,
             provider: Some(provider),
         };
+        let mut first_panic: Option<Box<dyn std::any::Any + Send>> = None;
 
         for job_id in &batch {
             // Phase 1: decide, under a read borrow.
@@ -2596,10 +2616,27 @@ impl Agent {
                         args,
                         ..job.call.clone()
                     };
-                    guard
-                        .provider_mut()
-                        .invoke(object, &call)
-                        .map(Response::into_value)
+                    // A provider panic settles this job as a provider fault and
+                    // is resumed after the batch: a leaked job would leave its
+                    // promise pending forever, and the host still sees the
+                    // panic.
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        guard.provider_mut().invoke(object, &call)
+                    })) {
+                        Ok(result) => result.map(Response::into_value),
+                        Err(payload) => {
+                            self.cell.borrow_mut().push_event(Event::ProviderPanicked {
+                                provider: provider_id,
+                                phase: "invoke".to_string(),
+                            });
+                            if first_panic.is_none() {
+                                first_panic = Some(payload);
+                            }
+                            Err(Error::Provider {
+                                code: "rpc/provider".to_string(),
+                            })
+                        }
+                    }
                 }
             };
 
@@ -2658,6 +2695,11 @@ impl Agent {
         // back into the agent.
         drop(guard);
         self.flush_drops();
+        if let Some(payload) = first_panic {
+            // Every job in the batch is settled before the caller sees the
+            // panic again.
+            std::panic::resume_unwind(payload);
+        }
     }
 
     /// Deliver queued provider notifications with no kernel borrow held.
