@@ -338,9 +338,9 @@ pub struct Kernel {
     dispatching: bool,
     /// Providers whose `on_drop` is running right now.
     delivering: BTreeSet<ProviderId>,
-    idempotency: BTreeMap<(CapId, String, String), PromiseId>,
+    idempotency: BTreeMap<(CapId, LaneId, String, String), PromiseId>,
     allow_durable: bool,
-    idempotency_order: VecDeque<(CapId, String, String)>,
+    idempotency_order: VecDeque<(CapId, LaneId, String, String)>,
     now_ms: u64,
     latency_ms: u64,
     /// When true, dispatch advances the clock to wall time instead of by one
@@ -461,7 +461,12 @@ fn deliver_pending_drops(cell: &KernelCell) {
                         false
                     }
                 }
-                Err(_) => return,
+                Err(_) => {
+                    if let Ok(mut kernel) = cell.try_borrow_mut() {
+                        kernel.deferred_drops.push((provider_id, object, cap));
+                    }
+                    return;
+                }
             };
             if already_delivering {
                 // A drop raised from inside this provider's own `on_drop`. The
@@ -475,7 +480,14 @@ fn deliver_pending_drops(cell: &KernelCell) {
             }
             let provider = match cell.try_borrow_mut() {
                 Ok(mut kernel) => kernel.providers.remove(&provider_id),
-                Err(_) => return,
+                Err(_) => {
+                    // Put the entry back: it was already taken out of the
+                    // queue, and losing it would strand the notification.
+                    if let Ok(mut kernel) = cell.try_borrow_mut() {
+                        kernel.deferred_drops.push((provider_id, object, cap));
+                    }
+                    return;
+                }
             };
             let Some(mut provider) = provider else {
                 // The provider is gone: there is nobody to notify.
@@ -545,6 +557,8 @@ impl Drop for DispatchGuard<'_> {
 pub struct Agent {
     cell: KernelCell,
     control: Rc<dyn CapControl>,
+    /// Promise reference operations that could not take the kernel borrow.
+    promise_ops: Rc<std::cell::RefCell<VecDeque<(PromiseId, bool)>>>,
 }
 
 impl Default for Agent {
@@ -615,7 +629,11 @@ impl Agent {
             cell: Rc::clone(&cell),
             deferred_refops,
         });
-        Agent { cell, control }
+        Agent {
+            cell,
+            control,
+            promise_ops: Rc::new(std::cell::RefCell::new(VecDeque::new())),
+        }
     }
 
     /// Describe this agent's surface as a canonical Active Infinity module.
@@ -773,11 +791,36 @@ impl Agent {
                 "a durable record must name the peer it was bound to",
             ));
         }
+        // A record describes what is left, not what was granted: a durable
+        // credential must not be a way to refill a spent grant.
+        let meter = kernel
+            .meters
+            .get(&record.id)
+            .ok_or_else(|| Error::persistence("the capability has no meter"))?;
+        let remaining_calls = meter.remaining_calls();
+        let remaining_bytes = record.attrs.budget.max_bytes.saturating_sub(meter.bytes());
+        if remaining_calls == 0 || remaining_bytes == 0 {
+            return Err(Error::persistence("the capability's grant is spent"));
+        }
+        if record
+            .attrs
+            .path_scope
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            // `from_json` refuses an empty scope, so such a record could never
+            // be restored: refuse it at the source instead of writing it.
+            return Err(Error::persistence("an empty path scope is not a scope"));
+        }
         let mut record = crate::persistence::CapabilityRecord {
             provider: provider.name().to_string(),
             object: record.object,
             methods: record.attrs.methods.clone(),
-            budget: record.attrs.budget,
+            budget: crate::budget::Budget {
+                max_calls: remaining_calls,
+                max_bytes: remaining_bytes,
+                ..record.attrs.budget
+            },
             read_only: record.attrs.read_only,
             redact: record.attrs.redact,
             path_scope: record.attrs.path_scope.clone(),
@@ -786,6 +829,9 @@ impl Agent {
             bound_to: record.attrs.bound_to,
             expires_at: record.expires_at,
             wall_clock: record.wall_clock,
+            lease_ms: record
+                .expires_at
+                .map(|expires_at| expires_at.saturating_sub(kernel.now_ms)),
             record_id: record.record_id,
             seal: None,
         };
@@ -830,11 +876,12 @@ impl Agent {
             }
         }
         // The binding is about the caller, so it is reported before any state
-        // of this kernel.
-        if let Some(bound) = record.bound_to {
-            if bound != peer.fingerprint() {
-                return Err(Error::Identity("the record is bound to a different peer"));
-            }
+        // of this kernel. A record that names no peer would restore for anyone.
+        let Some(bound) = record.bound_to else {
+            return Err(Error::Identity("the record names no peer"));
+        };
+        if bound != peer.fingerprint() {
+            return Err(Error::Identity("the record is bound to a different peer"));
         }
         // Restoring is a re-mint, so N restores of one credential would be N
         // independent grants that a single revocation cannot reach.
@@ -877,11 +924,19 @@ impl Agent {
             Some(expires_at) if expires_at <= now => {
                 return Err(Error::persistence("the record's deadline has passed"))
             }
-            Some(expires_at) => Some(expires_at - now),
+            Some(expires_at) => {
+                // Two virtual clocks have unrelated epochs: the absolute
+                // deadline alone would stretch the lease across a restart, so
+                // the sealed remaining lifetime is the ceiling.
+                let Some(lease) = record.lease_ms else {
+                    return Err(Error::persistence("a bounded record carries no lease"));
+                };
+                Some((expires_at - now).min(lease))
+            }
             None => None,
         };
         let attrs = record.attrs(ttl_ms);
-        let restored = self.mint_bound(peer, provider, record.object, attrs)?;
+        let restored = self.mint_restored(peer, provider, record.object, attrs)?;
         // Keep the record identity: a revocation that reaches this capability
         // must tombstone the same record id the credential carries.
         if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {
@@ -946,7 +1001,7 @@ impl Agent {
             return Err(Error::BudgetExceeded("caps"));
         }
         if attrs.persistence == crate::cap::CapPersistence::Durable
-            && kernel.revoked_records.len() >= MAX_TOMBSTONES
+            && durable_ceiling_reached(&kernel)
         {
             return Err(Error::BudgetExceeded("tombstones"));
         }
@@ -992,6 +1047,48 @@ impl Agent {
             ));
         }
         self.mint(provider, object, attrs.bound_to(peer.fingerprint()))
+    }
+
+    /// Mint a restored capability, bypassing the tombstone ceiling.
+    ///
+    /// A restore adds no tombstone and consumes no new record id, so a full
+    /// kill list must not turn a valid credential into a budget error.
+    fn mint_restored(
+        &self,
+        peer: &AdmittedIdentity,
+        provider: ProviderId,
+        object: u64,
+        attrs: CapAttrs,
+    ) -> Result<CapHandle> {
+        if !peer.can_bind() {
+            return Err(Error::Identity(
+                "cannot bind a capability to an unauthenticated peer",
+            ));
+        }
+        let attrs = attrs.bound_to(peer.fingerprint());
+        attrs.budget.check()?;
+        if attrs.methods.is_empty() {
+            return Err(Error::InvalidArgument("capability grants no methods"));
+        }
+        let mut kernel = self.cell.borrow_mut();
+        if !kernel.providers.contains_key(&provider) {
+            return Err(Error::InvalidArgument("unknown provider"));
+        }
+        if kernel.caps.len() >= MAX_CAPS {
+            return Err(Error::BudgetExceeded("caps"));
+        }
+        let serial = kernel.next_serial;
+        kernel.next_serial += 1;
+        let id = CapId::derive(&kernel.secret, serial, None);
+        let expires_at = attrs.ttl_ms.map(|ttl| kernel.now_ms.saturating_add(ttl));
+        let mut record = CapRecord::new(id, provider, object, attrs.clone());
+        record.expires_at = expires_at;
+        record.wall_clock = kernel.wall_clock;
+        record.record_id = CapId::derive_record(&kernel.secret, serial, None);
+        kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
+        kernel.caps.insert(id, record);
+        kernel.push_event(Event::CapMinted { cap: id, provider });
+        Ok(CapHandle::new(Rc::clone(&self.control), id))
     }
 
     /// Introduce an existing capability to an admitted peer.
@@ -1082,6 +1179,9 @@ impl Agent {
                 "durable capabilities are not enabled for this agent",
             ));
         }
+        if attrs.persistence == CapPersistence::Durable && durable_ceiling_reached(&kernel) {
+            return Err(Error::BudgetExceeded("tombstones"));
+        }
         if kernel.caps.len() >= MAX_CAPS {
             return Err(Error::BudgetExceeded("caps"));
         }
@@ -1114,7 +1214,7 @@ impl Agent {
             (None, Some(ttl)) => Some(kernel.now_ms.saturating_add(ttl)),
             (None, None) => None,
         };
-        child.wall_clock = record.wall_clock;
+        child.wall_clock = kernel.wall_clock;
         // Every ancestor now has a live descendant: its record and meter must
         // survive the parent handle, or the subtree's budget is freed and each
         // child spends the grant again.
@@ -1280,6 +1380,13 @@ impl Agent {
         // a caller that holds a handle must still see the settled value (or a
         // rejected one) rather than an unrelated `unknown-promise`. The promise
         // ceiling bounds them; the kernel itself is the lifetime.
+        let orphaned: Vec<PromiseId> = kernel
+            .jobs
+            .values()
+            .filter(|job| job.lane == lane)
+            .flat_map(|job| job.deps.clone())
+            .collect();
+        Kernel::release_waiters(&mut kernel, &orphaned);
         kernel.jobs.retain(|_, job| job.lane != lane);
         for channel in kernel.channels.values_mut() {
             channel.subscribers.remove(&lane.0);
@@ -1840,8 +1947,12 @@ impl Agent {
         // receipted: a refused call must leave no trace and cost nothing.
         let deps: Vec<PromiseId> = args.iter().filter_map(|arg| arg.promise()).collect();
         for dep in &deps {
-            if !kernel.promises.contains_key(dep) {
-                return Err(Error::UnknownPromise(dep.0));
+            // A promise is the private result of one lane. Accepting an id from
+            // another lane would deliver that lane's value to this caller and
+            // turn the id space into a membership oracle.
+            match kernel.promises.get(dep) {
+                Some(record) if record.lane == lane.0 => {}
+                _ => return Err(Error::UnknownPromise(dep.0)),
             }
         }
         // Registry ceilings are checked before charging: a refused call must
@@ -1958,6 +2069,7 @@ impl Agent {
 
     /// Run until no job is queued. Returns the number of provider round-trips.
     pub fn run(&self) -> u64 {
+        self.flush_promise_refops();
         self.flush_drops();
         loop {
             let batch = {
@@ -1977,6 +2089,11 @@ impl Agent {
                 // applied before the next batch is chosen.
                 kernel.apply_deferred_refops();
                 match kernel.next_batch() {
+                    Ok(batch) if batch.is_empty() => {
+                        kernel.apply_deferred_refops();
+                        kernel.trim_settled();
+                        return kernel.round_trips;
+                    }
                     Ok(batch) => batch,
                     Err(stuck) => {
                         // Only the jobs that cannot be ordered are failed; work
@@ -2009,10 +2126,9 @@ impl Agent {
         if self.cell.borrow().dispatching {
             // A provider is running and the kernel cannot make progress for it:
             // the outer dispatch owns the queue. Spinning here would burn CPU
-            // with no error and no settlement.
-            return Err(Error::Provider {
-                code: "rpc/provider".to_string(),
-            });
+            // with no error and no settlement, and `rpc/provider` would invite
+            // a retry of work that never ran.
+            return Err(Error::UnresolvablePromise(promise.id.0));
         }
         loop {
             {
@@ -2035,16 +2151,41 @@ impl Agent {
     /// Resolve a pending promise manually (used by peers that answer out of band).
     pub fn resolve(&self, promise: &PromiseHandle, value: Value) -> Result<()> {
         let mut kernel = self.cell.borrow_mut();
-        let record = kernel
-            .promises
-            .get_mut(&promise.id)
-            .ok_or(Error::UnknownPromise(promise.id.0))?;
-        let settled = record.resolve(value);
+        let settled = {
+            let record = kernel
+                .promises
+                .get_mut(&promise.id)
+                .ok_or(Error::UnknownPromise(promise.id.0))?;
+            record.resolve(value)
+        };
         if settled.is_err() {
             kernel.metrics.promises_double_settled =
                 kernel.metrics.promises_double_settled.saturating_add(1);
         }
         settled?;
+        // A promise answered out of band must not still run its provider: the
+        // side effect would happen after the caller already has the answer.
+        if let Some(job_id) = kernel
+            .jobs
+            .iter()
+            .find(|(id, job)| job.promise == promise.id && kernel.queue.contains(id))
+            .map(|(id, _)| *id)
+        {
+            kernel.queue.retain(|queued| *queued != job_id);
+            let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
+            let deps = kernel
+                .jobs
+                .get(&job_id)
+                .map(|job| job.deps.clone())
+                .unwrap_or_default();
+            Kernel::release_waiters(&mut kernel, &deps);
+            kernel.jobs.remove(&job_id);
+            if let Some(lane) = lane {
+                if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
+                    lane_record.complete();
+                }
+            }
+        }
         kernel.push_event(Event::PromiseResolved(promise.id));
         kernel.metrics.promises_resolved = kernel.metrics.promises_resolved.saturating_add(1);
         kernel.record_settled(promise.id);
@@ -2063,6 +2204,37 @@ impl Agent {
     /// Current local queue ceiling.
     pub fn queue_ceiling(&self) -> usize {
         self.cell.borrow().queue_ceiling
+    }
+
+    /// Issue the call an envelope describes, from a transport.
+    ///
+    /// An envelope is peer input, so its arguments cannot carry authority: a
+    /// promise id would name a result this kernel computed for someone else,
+    /// and a capability id in an argument is opaque data, not a grant. Both are
+    /// refused as `rpc/wire`, and the envelope payload is charged like any
+    /// other call.
+    pub fn call_from_envelope(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        envelope: &crate::wire::Envelope,
+    ) -> Result<PromiseHandle> {
+        for arg in &envelope.args {
+            if matches!(arg, Arg::Promise(_) | Arg::Cap(_)) {
+                return Err(Error::Wire(
+                    "an envelope cannot carry a promise or capability argument",
+                ));
+            }
+        }
+        self.call_as_with_payload(
+            peer,
+            lane,
+            cap,
+            &envelope.method,
+            envelope.args.clone(),
+            envelope.payload.len() as u64,
+        )
     }
 
     /// Issue a call with an idempotency key.
@@ -2105,7 +2277,20 @@ impl Agent {
         if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
             return Err(Error::InvalidArgument("idempotency key is too long"));
         }
-        let map_key = (cap.id(), method.to_string(), key.to_string());
+        // A replay is an exercise of authority in one lane: the key is scoped
+        // to it, and the lane must still exist and have capacity, exactly as a
+        // fresh call requires.
+        {
+            let kernel = self.cell.borrow();
+            let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+            if lane_record.closed {
+                return Err(Error::UnknownLane(lane.0));
+            }
+            if !lane_record.has_capacity() {
+                return Err(Error::BudgetExceeded("lane call"));
+            }
+        }
+        let map_key = (cap.id(), lane, method.to_string(), key.to_string());
         {
             let mut kernel = self.cell.borrow_mut();
             if let Some(id) = kernel.idempotency.get(&map_key).copied() {
@@ -2188,14 +2373,23 @@ impl Agent {
                 .ok_or(Error::UnknownPromise(promise.id.0))?;
             record.cancel()?;
         }
+        // A job in the current dispatch batch is no longer in the queue, so it
+        // cannot be stopped and must not be completed here: its settlement path
+        // owns the lane accounting.
         let queued: Option<u64> = kernel
             .jobs
             .iter()
-            .find(|(_, job)| job.promise == promise.id && job.state == JobState::Queued)
+            .find(|(id, job)| job.promise == promise.id && kernel.queue.contains(id))
             .map(|(id, _)| *id);
         if let Some(job_id) = queued {
             kernel.queue.retain(|id| *id != job_id);
             let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
+            let deps = kernel
+                .jobs
+                .get(&job_id)
+                .map(|job| job.deps.clone())
+                .unwrap_or_default();
+            Kernel::release_waiters(&mut kernel, &deps);
             kernel.jobs.remove(&job_id);
             kernel.record_settled(promise.id);
             if let Some(lane) = lane {
@@ -2225,7 +2419,17 @@ impl Agent {
             return Err(Error::PromiseAlreadyResolved(promise.id.0));
         }
 
+        // One reverse index instead of a scan per target: a deep chain is the
+        // normal shape of a pipeline, and a scan per link is quadratic.
+        let mut dependents_of: BTreeMap<PromiseId, Vec<PromiseId>> = BTreeMap::new();
+        for job in kernel.jobs.values() {
+            for dep in &job.deps {
+                dependents_of.entry(*dep).or_default().push(job.promise);
+            }
+        }
         let mut targets = vec![promise.id];
+        let mut seen: BTreeSet<PromiseId> = BTreeSet::new();
+        seen.insert(promise.id);
         let mut index = 0;
         while index < targets.len() {
             let id = targets[index];
@@ -2234,28 +2438,31 @@ impl Agent {
                     record.cancel()?;
                 }
             }
-            let dependents: Vec<PromiseId> = kernel
-                .jobs
-                .values()
-                .filter(|job| job.deps.contains(&id))
-                .map(|job| job.promise)
-                .collect();
-            for dependent in dependents {
-                if !targets.contains(&dependent) {
-                    targets.push(dependent);
+            if let Some(dependents) = dependents_of.get(&id) {
+                for dependent in dependents {
+                    if seen.insert(*dependent) {
+                        targets.push(*dependent);
+                    }
                 }
             }
             index += 1;
         }
 
+        let targets_set: BTreeSet<PromiseId> = seen;
         let queued: Vec<(u64, PromiseId, u64)> = kernel
             .jobs
             .iter()
-            .filter(|(_, job)| job.state == JobState::Queued && targets.contains(&job.promise))
+            .filter(|(id, job)| kernel.queue.contains(id) && targets_set.contains(&job.promise))
             .map(|(id, job)| (*id, job.promise, job.lane.0))
             .collect();
         for (job_id, promise_id, lane) in queued {
             kernel.queue.retain(|queued_id| *queued_id != job_id);
+            let deps = kernel
+                .jobs
+                .get(&job_id)
+                .map(|job| job.deps.clone())
+                .unwrap_or_default();
+            Kernel::release_waiters(&mut kernel, &deps);
             kernel.jobs.remove(&job_id);
             kernel.record_settled(promise_id);
             if let Some(lane_record) = kernel.lanes.get_mut(&LaneId(lane)) {
@@ -2266,20 +2473,53 @@ impl Agent {
     }
 
     /// Reference a promise record from a handle.
+    ///
+    /// A handle cloned while the kernel is borrowed must not lose the
+    /// operation: the count would fall to zero with a live handle and the record
+    /// would be evicted underneath it (`rpc/unknown-promise` for a promise that
+    /// settled). The operation is queued and applied at the next borrow point,
+    /// exactly like a capability reference.
     fn retain_promise(&self, id: PromiseId) {
-        if let Ok(mut kernel) = self.cell.try_borrow_mut() {
-            if let Some(record) = kernel.promises.get_mut(&id) {
-                record.handles = record.handles.saturating_add(1);
-            }
-        }
+        self.promise_refop(id, true);
     }
 
     /// Drop a handle's reference to a promise record.
     fn release_promise(&self, id: PromiseId) {
-        if let Ok(mut kernel) = self.cell.try_borrow_mut() {
-            if let Some(record) = kernel.promises.get_mut(&id) {
-                record.handles = record.handles.saturating_sub(1);
-            }
+        self.promise_refop(id, false);
+    }
+
+    fn promise_refop(&self, id: PromiseId, retain: bool) {
+        if !self.promise_ops.borrow().is_empty() {
+            self.promise_ops.borrow_mut().push_back((id, retain));
+            return;
+        }
+        match self.cell.try_borrow_mut() {
+            Ok(mut kernel) => Self::apply_promise_refop(&mut kernel, id, retain),
+            Err(_) => self.promise_ops.borrow_mut().push_back((id, retain)),
+        }
+    }
+
+    fn apply_promise_refop(kernel: &mut Kernel, id: PromiseId, retain: bool) {
+        if let Some(record) = kernel.promises.get_mut(&id) {
+            record.handles = if retain {
+                record.handles.saturating_add(1)
+            } else {
+                record.handles.saturating_sub(1)
+            };
+        }
+    }
+
+    /// Apply promise reference operations queued behind a borrow.
+    fn flush_promise_refops(&self) {
+        for _ in 0..4096 {
+            let Some((id, retain)) = self.promise_ops.borrow_mut().pop_front() else {
+                return;
+            };
+            let Ok(mut kernel) = self.cell.try_borrow_mut() else {
+                self.promise_ops.borrow_mut().push_front((id, retain));
+                return;
+            };
+            Self::apply_promise_refop(&mut kernel, id, retain);
         }
     }
 
@@ -2291,6 +2531,16 @@ impl Agent {
             .get_mut(&provider)
             .map(|provider| provider.take_drop_notifications())
             .unwrap_or_default()
+    }
+
+    /// Live dependents of a promise, for operators and tests.
+    pub fn promise_waiters(&self, promise: &PromiseHandle) -> u32 {
+        self.cell
+            .borrow()
+            .promises
+            .get(&promise.id)
+            .map(|record| record.waiters)
+            .unwrap_or(0)
     }
 
     /// The event log.
@@ -2680,6 +2930,7 @@ impl Agent {
             // A completed job no longer needs its Call or arguments. Removing it
             // here is what makes the jobs ceiling a transient bound rather than
             // a lifetime quota.
+            Kernel::release_waiters(&mut kernel, &job.deps);
             kernel.jobs.remove(job_id);
             if let Some(lane_record) = kernel.lanes.get_mut(&job.lane) {
                 lane_record.complete();
@@ -2723,14 +2974,24 @@ impl Kernel {
         self.events_total = self.events_total.saturating_add(1);
     }
 
+    /// Release the waiter count of every promise a removed job depended on.
+    fn release_waiters(kernel: &mut Kernel, deps: &[PromiseId]) {
+        for dep in deps {
+            if let Some(record) = kernel.promises.get_mut(dep) {
+                record.waiters = record.waiters.saturating_sub(1);
+            }
+        }
+    }
+
     /// Remember a settled promise for bounded retention.
     fn record_settled(&mut self, id: PromiseId) {
-        let size = self
-            .promises
-            .get(&id)
-            .and_then(|record| record.value().ok())
-            .map(|value| value.wire_size() as usize)
-            .unwrap_or(0);
+        let size = match self.promises.get(&id).map(|record| &record.state) {
+            Some(PromiseState::Resolved(value)) => value.wire_size() as usize,
+            // Provider-controlled error text is bounded only by the record
+            // count otherwise; charge it like a value.
+            Some(PromiseState::Rejected(error)) => error.to_string().len(),
+            _ => 0,
+        };
         self.settled.push_back((id, size));
         self.settled_bytes = self.settled_bytes.saturating_add(size);
     }
@@ -2809,7 +3070,10 @@ impl Kernel {
                     .promises
                     .get(id)
                     .map(|record| record.handles > 0)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    // An idempotency key that still names this promise must keep
+                    // it: replaying the key has to return the original result.
+                    || self.idempotency.values().any(|mapped| mapped == id);
                 if !pinned {
                     victim = Some(index);
                     break;
@@ -2867,7 +3131,14 @@ impl Kernel {
                 }
             }
         }
+        let mut skipped_for_delivery = false;
         for provider in providers {
+            if self.delivering.contains(&provider) {
+                // The provider is running its own `on_drop`; its jobs wait for
+                // the next run rather than being failed as a missing provider.
+                skipped_for_delivery = true;
+                continue;
+            }
             let candidates: Vec<u64> = self
                 .queue
                 .iter()
@@ -2888,6 +3159,11 @@ impl Kernel {
             }
         }
 
+        if skipped_for_delivery {
+            // Every queued job belongs to a provider that is being notified.
+            // This is not a cycle: the outer pass resumes the queue.
+            return Ok(Vec::new());
+        }
         // Nothing can run: every queued job waits on a promise that no queued
         // job will settle.
         Err(self.queue.drain(..).collect())
@@ -2932,6 +3208,12 @@ impl Kernel {
     }
 
     fn fail_job(&mut self, job_id: u64, error: Error) {
+        let deps = self
+            .jobs
+            .get(&job_id)
+            .map(|job| job.deps.clone())
+            .unwrap_or_default();
+        Kernel::release_waiters(self, &deps);
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.state = JobState::Done;
             let promise = job.promise;
@@ -2970,6 +3252,17 @@ fn wall_now_ms() -> u64 {
 
 fn pad128(id: CapId) -> [u8; 16] {
     id.0
+}
+
+/// True when the durable grant budget is used up: every tombstone plus every
+/// live durable capability would exceed the set the kernel can tombstone.
+fn durable_ceiling_reached(kernel: &Kernel) -> bool {
+    let live = kernel
+        .caps
+        .values()
+        .filter(|record| record.attrs.persistence == CapPersistence::Durable)
+        .count();
+    kernel.revoked_records.len().saturating_add(live) >= MAX_TOMBSTONES
 }
 
 fn cap_token(id: CapId) -> crate::cap::CapToken {
@@ -3025,14 +3318,20 @@ impl PromiseHandle {
     }
 
     /// The settled value without running the kernel.
+    ///
+    /// A promise that is still pending is `rpc/invalid-argument`: it may still
+    /// settle, so it is not `rpc/unresolvable-promise` (which means "can never
+    /// settle").
     pub fn peek(&self) -> Result<Value> {
-        self.agent
-            .cell
-            .borrow()
+        let kernel = self.agent.cell.borrow();
+        let record = kernel
             .promises
             .get(&self.id)
-            .ok_or(Error::UnknownPromise(self.id.0))?
-            .value()
+            .ok_or(Error::UnknownPromise(self.id.0))?;
+        if record.state == PromiseState::Pending {
+            return Err(Error::InvalidArgument("the promise is still pending"));
+        }
+        record.value()
     }
 
     /// Whether the promise has settled.

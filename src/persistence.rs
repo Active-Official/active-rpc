@@ -57,6 +57,13 @@ pub struct CapabilityRecord {
     /// for the virtual round-trip clock. A bounded record is only meaningful in
     /// its own domain.
     pub wall_clock: bool,
+    /// Remaining lifetime at export time, in milliseconds.
+    ///
+    /// An absolute deadline only means something inside the kernel that minted
+    /// it: two virtual clocks have unrelated epochs, so `expires_at` alone would
+    /// stretch a lease across a restart. The lease is the ground truth, sealed
+    /// with the rest of the record, and restore takes the smaller of the two.
+    pub lease_ms: Option<u64>,
     /// Stable identity of the exported capability.
     ///
     /// A record is accepted only if its id was never tombstoned by a
@@ -135,6 +142,13 @@ impl CapabilityRecord {
             },
         );
         map.insert("wall_clock".into(), self.wall_clock.into());
+        map.insert(
+            "lease_ms".into(),
+            match self.lease_ms {
+                Some(lease) => lease.into(),
+                None => Json::Null,
+            },
+        );
         map.insert("record_id".into(), hex(&self.record_id).into());
         map
     }
@@ -288,6 +302,14 @@ impl CapabilityRecord {
             .get("wall_clock")
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let lease_ms = match value.get("lease_ms") {
+            None | Some(Json::Null) => None,
+            Some(number) => Some(
+                number
+                    .as_u64()
+                    .ok_or_else(|| Error::persistence("lease is malformed"))?,
+            ),
+        };
         let record_id = match value.get("record_id") {
             Some(Json::String(text)) => parse_hex32(text)?,
             _ => return Err(Error::persistence("missing record id")),
@@ -313,6 +335,7 @@ impl CapabilityRecord {
             bound_to,
             expires_at,
             wall_clock,
+            lease_ms,
             record_id,
             seal,
         })

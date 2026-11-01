@@ -367,7 +367,12 @@ fn a_provider_awaiting_its_own_call_is_refused() {
     agent.run();
     promise.value().expect("the provider answered");
     let recorded = outcome.borrow().clone().unwrap_or_default();
-    assert_eq!(recorded, "rpc/provider", "unexpected outcome: {recorded}");
+    // A provider awaiting inside its own call cannot make progress; the answer
+    // is "unresolvable", not a provider fault that invites a retry.
+    assert_eq!(
+        recorded, "rpc/unresolvable-promise",
+        "unexpected outcome: {recorded}"
+    );
 }
 
 /// A panicking provider must not wedge the kernel: the guard restores the

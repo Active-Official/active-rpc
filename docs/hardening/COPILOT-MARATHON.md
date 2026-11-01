@@ -16,8 +16,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 |----|---------|-------|-------|------------------------------------|---------|
 | R-01 | wire ARP1 | `src/wire.rs` | CLEAN | 6 fixed, 2 rejected, 0 open | this commit |
 | R-02 | kernel dispatch | `src/kernel.rs` | CLEAN (rounds 1-3) | 24 fixed / 2 rejected / 2 low open (contract) | this commit |
-| R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-2) | 29 fixed / 0 rejected / 0 open | this commit |
-| R-04 | promises / pipeline | `src/promise.rs` | pending | — | — |
+| R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
+| R-04 | promises / pipeline | `src/promise.rs` | round 1: 14 fixed | 14 fixed / 0 rejected / 0 open | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | pending | — | — |
 | R-06 | budget | `src/budget.rs` | pending | — | — |
 | R-07 | domain ops | `src/domain.rs` | pending | — | — |
@@ -69,6 +69,46 @@ API and not for the defect.
 | M-6 | medium | revoking one restored copy left its siblings alive | **fixed**: restore refuses a second live copy of a credential and revoke dooms every live capability carrying a tombstoned record id; `restoring_the_same_record_twice_is_refused` |
 | M-7 | medium | `send` charged nothing and needed no capability | **fixed**: a send charges the lane's bytes (payload plus one id per transfer) and one lane call, and a channel has a queued-byte ceiling; `a_send_consumes_the_lane_byte_budget`, `a_channel_accounts_for_queued_bytes` |
 | L-8 | low | a vanished provider was `rpc/invalid-argument` at call time and `rpc/provider` at dispatch | **fixed**: both are `rpc/provider` |
+
+### R-04 promises / pipeline - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`. Tests:
+`tests/promise_tests.rs` (15), the file the section map named and that did not
+exist; fourteen of them fail on the pre-fix tree. The fifteenth covers the
+phase-3 settlement gating, which this scenario cannot reach, so it is coverage
+and not proof.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | promise ids were accepted from any lane and from envelopes: cross-tenant disclosure plus a membership oracle | **fixed**: a dependency must have been minted on the calling lane, and `Agent::call_from_envelope` refuses promise and capability arguments for transports (used by `peer.rs` and `thin_peer`); `promise_from_another_lane_is_refused`, `an_envelope_cannot_carry_authority_arguments` |
+| 2 | high | the idempotency key outlived its promise, so a replay silently re-executed a mutating call | **fixed**: `trim_settled` pins a record an idempotency key still names; `an_idempotent_replay_survives_the_retention_window` |
+| 3 | medium | an idempotent replay skipped lane existence, closure and capacity and was not lane-scoped | **fixed**: the lane is validated before the cache lookup and the key includes it; `an_idempotent_replay_needs_a_live_lane`, `an_idempotent_key_is_lane_scoped` |
+| 4 | medium | cancelling a promise in the current batch completed its lane twice and logged a settlement that never happened | **fixed**: only a job still in the queue is dequeued, and phase 3 emits the event and the metric only when the transition succeeded; `cancelling_inside_dispatch_counts_once` |
+| 5 | medium | `resolve` left the producing job queued: the provider ran anyway and the settlement was counted twice | **fixed**: a successful out-of-band resolve dequeues its job; `resolving_a_queued_promise_prevents_the_provider_call` |
+| 6 | medium | a promise retain/release was dropped when the kernel was borrowed, so a live handle lost its record | **fixed**: promise reference operations queue in FIFO order and are drained by `run`; `a_clone_under_a_borrow_keeps_the_handle` |
+| 7 | medium | `cancel_tree` was O(targets × jobs): a 4 000-link chain blocked the kernel for 3.1 s (measured) | **fixed**: one reverse index and a `BTreeSet` of targets |
+| 8 | medium | `run`/`await_promise` from `on_drop` failed that provider's queued work as `rpc/provider` | **fixed**: `next_batch` skips a provider that is being notified and `run` returns when nothing is runnable; `run_from_on_drop_does_not_kill_queued_jobs` |
+| 9 | low | a re-entrant `run` silently succeeded while a re-entrant await returned `rpc/provider` | **fixed**: both are now "no progress"; the await reports `rpc/unresolvable-promise`, which does not invite a retry |
+| 10 | low | `PromiseRecord.waiters` was incremented and never released | **fixed**: every job removal releases its dependencies; `waiters_return_to_zero` |
+| 11 | low | `Arg::Cap` from an envelope was forwarded unvalidated | **fixed** with finding 1 |
+| 12 | low | rejected error text did not count toward the retention ceiling | **fixed**: `record_settled` charges the error text |
+| 13 | low | `peek` on a pending promise returned the terminal `rpc/unresolvable-promise` | **fixed**: a pending peek is `rpc/invalid-argument`; `peek_on_a_pending_promise_is_not_unresolvable` |
+| 14 | low | the section's test file did not exist | **fixed**: `tests/promise_tests.rs` |
+
+### R-03 capabilities - 2026-11-01 (round 3)
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| H-1 | high | a virtual deadline is not comparable across kernels (unrelated epochs), and attenuation stamped a child with the parent's domain | **fixed**: a child is stamped with the clock that produced its deadline, attenuation refuses a bounded parent from the other domain, and the record carries a sealed `lease_ms` that restore uses as the ceiling; `a_child_after_a_clock_switch_is_stamped_with_the_new_domain`, `a_virtual_deadline_does_not_inflate_across_a_restart` |
+| M-3 | medium | export wrote the grant, not the remainder, so export/drop/restore refilled a spent budget | **fixed**: the record carries the remaining calls and bytes, and a spent grant is refused; `a_restored_copy_cannot_refill_a_spent_grant` |
+| L-1 | low | restore accepted an unbound record and bound it to any admitted peer | **fixed**: `rpc/identity`; `an_unbound_record_is_refused_by_restore` |
+| L-2 | low | the tombstone ceiling was soft | **fixed**: the ceiling counts live durable grants as well, so revoke cannot pass it |
+| L-3 | low | a full tombstone set turned a valid restore into `rpc/budget-exceeded` | **fixed**: `mint_restored` bypasses the tombstone ceiling |
+| L-4 | low | export emitted `path_scope: ""`, which `from_json` refuses | **fixed**: an empty scope is refused at export |
+| L-5 | low | a borrow failure mid-delivery discarded already-taken notifications | **fixed**: entries are pushed back before returning |
+
+Gate: `cargo test --all-features` 430 passed, 0 failed; clippy clean on both
+feature sets; fmt clean; the nine negative controls pass.
 
 ### R-03 capabilities - 2026-11-01 (round 2)
 

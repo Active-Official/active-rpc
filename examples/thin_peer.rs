@@ -58,13 +58,7 @@ fn dispatch(agent: &Agent, lane: active_rpc::LaneId, envelope: &Envelope) -> Res
         .first()
         .ok_or(Error::UnknownCapability(CapToken(0)))?;
     let cap = agent.import(descriptor.id);
-    let promise = agent.call_with_payload(
-        lane,
-        &cap,
-        &envelope.method,
-        envelope.args.clone(),
-        envelope.payload.len() as u64,
-    )?;
+    let promise = agent.call_from_envelope(None, lane, &cap, envelope)?;
     let _ = agent.run();
     promise.value()
 }

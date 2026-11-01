@@ -191,13 +191,7 @@ fn dispatch(
         _ => {
             // Charge the envelope payload against the capability's byte budget,
             // exactly as the thin-client peers do.
-            let promise = agent.call_with_payload(
-                lane,
-                module_cap,
-                &envelope.method,
-                envelope.args.clone(),
-                envelope.payload.len() as u64,
-            )?;
+            let promise = agent.call_from_envelope(None, lane, module_cap, envelope)?;
             promise.value()
         }
     }
