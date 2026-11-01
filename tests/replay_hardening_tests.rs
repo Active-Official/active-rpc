@@ -178,3 +178,17 @@ fn replaying_thousands_of_calls_is_linear() {
         "10 000 calls replayed in {elapsed:?}"
     );
 }
+
+/// The header is the *initial* latency. A session that changes its rate used to
+/// write the final rate into the header, and replay then started at the wrong
+/// clock.
+#[test]
+fn a_session_that_changes_its_latency_replays() {
+    let mut recorder = Recorder::new(3).expect("recorder");
+    recorder.set_latency(7).expect("latency");
+    let cap = recorder.mint(&["echo"], None).expect("mint");
+    recorder.call(cap, "echo", 0).expect("call");
+    let package = recorder.package().expect("package");
+    assert_eq!(package.latency_ms, 3, "the header is the initial rate");
+    package.replay().expect("a latency change replays");
+}

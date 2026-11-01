@@ -233,3 +233,21 @@ fn the_log_carries_no_argument_or_secret_material() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A record length shorter than its own trailer used to underflow the split and
+/// panic: a log file is untrusted input.
+#[test]
+fn a_record_length_shorter_than_its_trailer_is_refused() {
+    let dir = sandbox("short-record");
+    let path = dir.join("short.arrl");
+    let log = ReceiptLog::create(&path).expect("create");
+    let mut bytes = std::fs::read(&path).expect("read");
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(0);
+    std::fs::write(&path, &bytes).expect("write");
+    let error = log
+        .records()
+        .expect_err("a length that cannot hold the trailer is refused");
+    assert_eq!(error.code(), "rpc/receipt");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -238,12 +238,19 @@ fn encode_record(receipt: &Receipt, previous: &[u8; 32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Smallest record body a log can carry.
+///
+/// `sequence u64 | at_ms u64 | cap_len u16 | method_len u16 | mac [32]` plus the
+/// chain link in the trailer: a shorter record cannot be well formed, and
+/// subtracting its trailer from the length used to underflow.
+pub const MIN_LOG_RECORD: usize = 8 + 8 + 2 + 2 + 32 + 32;
+
 fn decode_record(bytes: &[u8], cursor: usize) -> Result<(Receipt, [u8; 32], [u8; 32], usize)> {
     let header = bytes
         .get(cursor..cursor + 4)
         .ok_or_else(|| Error::receipt("truncated record length"))?;
     let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    if length == 0 || length > MAX_LOG_RECORD {
+    if !(MIN_LOG_RECORD..=MAX_LOG_RECORD).contains(&length) {
         return Err(Error::receipt("record length is out of range"));
     }
     let start = cursor + 4;

@@ -404,6 +404,11 @@ pub struct Recorder {
     /// Events ever captured, including ones the bounded tape has evicted.
     seen_total: u64,
     latency_ms: u64,
+    /// The rate the session started at. The package header carries this, not the
+    /// current rate: replay needs the initial clock to reproduce the first
+    /// expiry boundary, and the recorded `SetLatency` operations move it from
+    /// there.
+    initial_latency_ms: u64,
     /// Set when a capture failed. The op list and the trace no longer line up,
     /// so the recorder refuses to produce a package rather than emit one that
     /// cannot replay.
@@ -427,6 +432,7 @@ impl Recorder {
             trace: Vec::new(),
             seen_total: 0,
             latency_ms,
+            initial_latency_ms: latency_ms,
             poisoned: false,
         };
         recorder.capture()?;
@@ -642,7 +648,9 @@ impl Recorder {
             ));
         }
         Ok(ReplayPackage {
-            latency_ms: self.latency_ms,
+            // The header is the initial rate; each `SetLatency` op moves it from
+            // there, so replay starts where the recording did.
+            latency_ms: self.initial_latency_ms,
             ops: self.ops.clone(),
             trace: self.trace.clone(),
         })
