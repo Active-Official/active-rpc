@@ -15,7 +15,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | ID | Section | Paths | State | Findings (fixed / rejected / open) | Commits |
 |----|---------|-------|-------|------------------------------------|---------|
 | R-01 | wire ARP1 | `src/wire.rs` | CLEAN | 6 fixed, 2 rejected, 0 open | this commit |
-| R-02 | kernel dispatch | `src/kernel.rs` | pending | — | — |
+| R-02 | kernel dispatch | `src/kernel.rs` | round 1: 9 fixed, 9 open | 9 fixed / 0 rejected / 9 open | this commit |
 | R-03 | capabilities | `src/cap.rs` | pending | — | — |
 | R-04 | promises / pipeline | `src/promise.rs` | pending | — | — |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | pending | — | — |
@@ -67,3 +67,39 @@ Reviewer: Copilot CLI → Muse proxy, `xhigh`, repo tool access. Tests:
 | 8 | low | `CapTableDelta::apply_to` skipped the budget check the wire path applies | **fixed**: added descriptors are checked for a disabling budget; `a_delta_addition_with_a_zero_budget_is_refused` |
 
 Gate: clippy clean; `cargo test --all-features` 365 passed, 0 failed.
+
+### R-02 kernel dispatch - 2026-11-01 (round 1)
+
+Reviewer: Copilot CLI routed to CommandCode DeepSeek V4.1 Flash, `xhigh`, with
+repository tool access. Tests: `tests/marathon_kernel_tests.rs` (10); all ten
+fail against the pre-fix tree (verified by stashing `kernel.rs`/`cap.rs`/
+`wire.rs`).
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | revocation missed descendants of a dropped intermediate (the record removal broke the parent chain) | **fixed**: `CapRecord::lineage` records every ancestor; `revoke` marks any record whose lineage contains the target; `revocation_reaches_a_grandchild_through_a_dropped_intermediate` |
+| 2 | high | a call with an unknown promise dependency charged the meter, inserted a promise and sealed a receipt before refusing | **fixed**: dependencies are validated before any ceiling, charge, receipt or record; waiters increment only after a successful charge; `a_refused_promise_dependency_charges_nothing_and_leaves_no_record` |
+| 3 | high | an idempotent cache hit returned a stored promise without re-checking revoke, expiry or the identity binding | **fixed**: `call_idempotent_as` re-checks liveness and binding on a hit; `an_idempotent_replay_is_refused_after_revoke` |
+| 5 | medium | durable policy was bypassable through attenuation and export | **fixed**: both check `allow_durable`; `disabling_durable_refuses_attenuation_and_export` |
+| 7 | medium | path scope only inspected top-level `Value::Path`; a nested list/map path escaped | **fixed**: the scope walk is recursive; `a_nested_path_argument_is_outside_the_scope` |
+| 12 | low | a cap-table delta could remove an id and re-add it with wider authority | **fixed**: an added id that exists in the base table is refused; `a_delta_cannot_replace_an_id_with_a_wider_descriptor` |
+| 13 | low | `send_as` reported `rpc/invalid-argument` for an unknown capability | **fixed**: `rpc/unknown-capability`; `send_reports_an_unknown_capability` |
+| 15 | low | `mint_bound` silently overwrote a caller-supplied `bound_to` | **fixed**: a conflicting binding is `rpc/identity`; `mint_bound_refuses_a_conflicting_binding` |
+| 16 | low | `subscribe` was refused with `rpc/backpressure` when the queue was full although it enqueues nothing | **fixed**: the check is gone; `subscribe_is_not_refused_by_a_full_queue` |
+| 14 | low | idempotency keys were unbounded and the order deque grew on stale keys | **partly fixed**: keys are capped at `MAX_IDEMPOTENCY_KEY_BYTES` (256) and stale keys are removed from the deque; `an_oversized_idempotency_key_is_refused` |
+
+Carried to round 2 (triaged, not yet fixed):
+
+| # | Sev | Reason |
+|---|-----|--------|
+| 4 | medium | cross-provider pipeline: `next_batch` fails jobs whose producer is queued on another provider and mislabels the code as `rpc/unknown-capability`; needs a rework of the batch selector plus a scheduler test |
+| 6 | medium | durable restore treats a wall-clock absolute deadline as the importing kernel's domain; needs a clock-mode field on `CapabilityRecord` (format change) and an ADR note |
+| 8 | medium | `publish` is authorized by possession alone (no method grant, `read_only` ignored, `topics: None` means any topic); the design intent needs a decision before changing the contract |
+| 9 | medium | lane byte budgets are per-call, and `publish` does not consume the lane call budget; needs a lane meter shared by call and publish |
+| 10 | medium | `on_drop` is lost when the last reference dies during dispatch (the provider is removed for the call); needs a deferred-drop queue |
+| 11 | low | a nested `run()` inside a provider fails unrelated work with `rpc/provider` |
+| 17 | low | `recv`/`recv_topic` ignore lane subscription; subscription is currently advisory and the contract needs a decision |
+| 18 | low | `restore_capability` resolves a provider by `name()`, first match wins when two share a name |
+
+Gate: `cargo test --all-features` 375 passed, 0 failed; clippy clean on the
+default and all-features sets; fmt clean.
