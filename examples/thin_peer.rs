@@ -1,7 +1,7 @@
 //! A real-kernel peer for the polyglot thin-client suite.
 //!
 //! It mints a capability for an `echo` provider, prints the bound address and
-//! the capability id, then serves up to 64 TCP connections (one request each):
+//! the capability id, then serves up to 512 TCP connections (one request each):
 //!
 //! ```text
 //! 127.0.0.1:54321
@@ -23,6 +23,10 @@ use active_rpc::transport::{bind_loopback, TcpTransport, Transport};
 use active_rpc::value::{Arg, Value};
 use active_rpc::wire::Envelope;
 use active_rpc::{Agent, Budget, Call, CapToken, Error, Response};
+
+/// Consecutive `accept` failures with no connection served before the peer
+/// gives up. One aborted connection is transient; a broken listener is not.
+const MAX_ACCEPT_FAILURES: u32 = 64;
 
 struct Echo;
 
@@ -76,13 +80,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // One connection per request. The matrix runs three calls per client, so
     // the budget must cover every client in the polyglot row (24 today).
+    //
+    // A transient `accept` error must not end the peer: the client matrix is
+    // long-lived and a single aborted connection (ECONNABORTED) would otherwise
+    // silently close the listener, and every later client would see
+    // ECONNREFUSED. Only a run of failures with no progress ends the loop, and
+    // that path says why on stderr.
+    let mut served = 0u64;
+    let mut failures = 0u32;
     for _ in 0..512 {
         let (stream, _) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(_) => break,
+            Ok(pair) => {
+                failures = 0;
+                pair
+            }
+            Err(error) => {
+                failures += 1;
+                eprintln!("thin_peer: accept failed ({failures}): {error}");
+                if failures >= MAX_ACCEPT_FAILURES {
+                    eprintln!("thin_peer: giving up after {served} connections");
+                    return Err(error.into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
         };
-        let mut transport = TcpTransport::new(stream)?;
+        // A client that connects and never sends would block the loop forever.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let Ok(mut transport) = TcpTransport::new(stream) else {
+            continue;
+        };
         if let Ok(Some(envelope)) = transport.recv() {
+            served += 1;
+            // A progress line every so often makes a CI log show how far the
+            // matrix got, and how many connections it really used.
+            if served.is_multiple_of(64) {
+                eprintln!("thin_peer: served {served} connections");
+            }
             let request_id = envelope.request_id;
             let payload = envelope.payload.clone();
             let response = match dispatch(&agent, lane, &envelope) {
@@ -92,5 +126,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = transport.send(&response);
         }
     }
+    eprintln!("thin_peer: served {served} connections");
     Ok(())
 }
