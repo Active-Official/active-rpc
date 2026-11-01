@@ -39,6 +39,13 @@ pub const MAX_BODY: usize = 64 << 20;
 /// Largest request head (request line plus headers).
 pub const MAX_HEAD: usize = 16 << 10;
 
+/// How long one connection may take to deliver its head and body.
+///
+/// The bridge accepts one connection at a time, so a peer that sends `POST …`
+/// and stops would otherwise hold every later peer forever. A local head is
+/// small and immediate; two seconds is generous and bounds the stall.
+pub const CONNECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Frame one message with the gRPC 5-byte prefix.
 pub fn grpc_frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + payload.len());
@@ -112,50 +119,75 @@ impl BridgeServer {
                 .listener
                 .accept()
                 .map_err(|error| Error::Transport(format!("accept: {error}")))?;
-            served += self.handle(stream, &mut handler)?;
+            served += self.handle(stream, &mut handler);
         }
         Ok(served)
     }
 
-    fn handle<H>(&self, mut stream: TcpStream, handler: &mut H) -> Result<u64>
+    /// One connection.
+    ///
+    /// Every failure here belongs to this connection, never to the server: a
+    /// truncated head, a stalled peer, a bad frame or a dead socket answers a
+    /// `4xx` when it can and returns. `serve` keeps accepting.
+    fn handle<H>(&self, mut stream: TcpStream, handler: &mut H) -> u64
     where
         H: FnMut(Envelope) -> Envelope,
     {
-        stream
-            .set_nodelay(true)
-            .map_err(|error| Error::Transport(error.to_string()))?;
-        let mut reader = BufReader::new(
-            stream
-                .try_clone()
-                .map_err(|error| Error::Transport(error.to_string()))?,
-        );
-        let Some(head) = read_head(&mut reader, MAX_HEAD)? else {
-            return Ok(0);
+        let _ = stream.set_nodelay(true);
+        // A stalled peer is bounded, not fatal: the next connection waits at
+        // most this long rather than forever.
+        let _ = stream.set_read_timeout(Some(CONNECTION_WAIT));
+        let _ = stream.set_write_timeout(Some(CONNECTION_WAIT));
+        let Ok(clone) = stream.try_clone() else {
+            return 0;
+        };
+        let mut reader = BufReader::new(clone);
+        let head = match read_head(&mut reader, MAX_HEAD) {
+            Ok(Some(head)) => head,
+            Ok(None) => return 0,
+            Err(_) => {
+                let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                return 0;
+            }
         };
         let request_line = head.first().cloned().unwrap_or_default();
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or_default();
         let target = parts.next().unwrap_or_default();
         if method != "POST" || target != PATH {
-            write_http_response(&mut stream, 404, b"rpc/not-found")?;
-            return Ok(0);
+            let _ = write_http_response(&mut stream, 404, b"rpc/not-found");
+            return 0;
         }
-        let Some(content_length) = head.iter().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            if name.eq_ignore_ascii_case("content-length") {
-                value.trim().parse::<usize>().ok()
-            } else {
-                None
+        // Content-Length must be unambiguous and Transfer-Encoding absent: a
+        // front proxy that resolves a conflict differently would let a second
+        // request ride in front of this one.
+        let mut lengths: Vec<usize> = Vec::new();
+        let mut transfer_encoding = false;
+        for line in &head {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                transfer_encoding = true;
             }
-        }) else {
-            // A malformed request is a 400 for that connection, not a server
-            // failure: `serve` must keep accepting.
-            write_http_response(&mut stream, 400, b"rpc/wire")?;
-            return Ok(1);
-        };
+            if name.eq_ignore_ascii_case("content-length") {
+                match value.trim().parse::<usize>() {
+                    Ok(length) => lengths.push(length),
+                    Err(_) => {
+                        let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                        return 0;
+                    }
+                }
+            }
+        }
+        if transfer_encoding || lengths.len() != 1 {
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            return 0;
+        }
+        let content_length = lengths[0];
         if content_length > MAX_BODY {
-            write_http_response(&mut stream, 413, b"rpc/wire")?;
-            return Ok(0);
+            let _ = write_http_response(&mut stream, 413, b"rpc/wire");
+            return 0;
         }
         let content_type = head
             .iter()
@@ -169,8 +201,8 @@ impl BridgeServer {
             })
             .unwrap_or_default();
         if content_type != CONNECT_TYPE && content_type != GRPC_TYPE {
-            write_http_response(&mut stream, 415, b"rpc/wire")?;
-            return Ok(0);
+            let _ = write_http_response(&mut stream, 415, b"rpc/wire");
+            return 0;
         }
         let mut body = Vec::with_capacity(content_length.min(64 * 1024));
         let read = reader
@@ -183,47 +215,65 @@ impl BridgeServer {
             // buffer with the bytes that arrive means a header that announces
             // 64 MiB and sends ten bytes costs 64 KiB, not 64 MiB.
             let _ = write_http_response(&mut stream, 400, b"rpc/wire");
-            return Ok(0);
+            return 0;
         }
         let (message, rest) = match grpc_unframe(&body) {
             Ok(parts) => parts,
             Err(error) => {
-                write_http_response(&mut stream, 400, error.code().as_bytes())?;
-                return Ok(1);
+                let _ = write_http_response(&mut stream, 400, error.code().as_bytes());
+                return 0;
             }
         };
         if !rest.is_empty() {
-            write_http_response(&mut stream, 400, b"rpc/wire")?;
-            return Ok(1);
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            return 0;
         }
         let envelope = match Envelope::decode_with(message, self.limits) {
             Ok(envelope) => envelope,
             Err(error) => {
-                write_http_response(&mut stream, 400, error.code().as_bytes())?;
-                return Ok(1);
+                let _ = write_http_response(&mut stream, 400, error.code().as_bytes());
+                return 0;
             }
         };
+        // A response or error envelope is not a call. Refusing it here keeps the
+        // kind contract at the transport boundary, where a relay would otherwise
+        // be able to smuggle one in.
+        if envelope.kind != crate::wire::Kind::Request {
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            return 0;
+        }
         let response = handler(envelope);
         let bytes = match response.encode() {
             Ok(bytes) => bytes,
             Err(error) => {
-                write_http_response(&mut stream, 500, error.code().as_bytes())?;
-                return Ok(1);
+                let _ = write_http_response(&mut stream, 500, error.code().as_bytes());
+                return 0;
             }
         };
         let framed = grpc_frame(&bytes);
-        write_http_response(&mut stream, 200, &framed)?;
-        Ok(1)
+        let _ = write_http_response(&mut stream, 200, &framed);
+        1
     }
 }
 
+/// Read one head line under the remaining budget.
+///
+/// `read_line` into a `String` grows until the peer sends a newline, so the
+/// ceiling was only checked after the allocation. This reads bytes into a
+/// fixed buffer bounded by what is left of the budget, and a line that does not
+/// fit is refused without growing. Bytes are decoded lossily: a header value is
+/// not required to be UTF-8, and a non-UTF-8 byte must not be able to end the
+/// server.
 fn read_head<R: BufRead>(reader: &mut R, max: usize) -> Result<Option<Vec<String>>> {
     let mut head = Vec::new();
     let mut total = 0usize;
     loop {
-        let mut line = String::new();
+        let remaining = max.saturating_sub(total);
+        let mut raw = Vec::new();
         let read = reader
-            .read_line(&mut line)
+            .by_ref()
+            .take(remaining as u64 + 1)
+            .read_until(b'\n', &mut raw)
             .map_err(|error| Error::Transport(format!("head: {error}")))?;
         if read == 0 {
             if head.is_empty() {
@@ -235,11 +285,12 @@ fn read_head<R: BufRead>(reader: &mut R, max: usize) -> Result<Option<Vec<String
         if total > max {
             return Err(Error::Wire("request head exceeds the ceiling"));
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+        let line = String::from_utf8_lossy(&raw);
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
-        head.push(trimmed);
+        head.push(trimmed.to_string());
     }
     Ok(Some(head))
 }
@@ -293,13 +344,9 @@ impl ConnectClient {
         let framed = grpc_frame(&body);
         let (status, response) = self.post(&framed, CONNECT_TYPE)?;
         if status != 200 {
-            let code = String::from_utf8_lossy(&response).trim().to_string();
-            return Err(match code.as_str() {
-                "rpc/wire" => Error::Wire("bridge rejected the frame"),
-                other => Error::Provider {
-                    code: other.to_string(),
-                },
-            });
+            // The body is peer text; `refusal` keeps a short stable token and
+            // refuses to carry the rest.
+            return Err(crate::transport::refusal(&response));
         }
         let (message, rest) = grpc_unframe(&response)?;
         if !rest.is_empty() {

@@ -16,9 +16,10 @@ frame. Each choice has a cost in dependencies, portability and security surface.
 2. **TCP**: a 4-byte length prefix and an envelope. Cross-process, portable, and
    the transport the peer binary and the cross-process test use.
 3. **Shared memory**: a byte ring behind a `Mutex`. It keeps
-   `#![forbid(unsafe_code)]` and still gives a true zero-copy read through
-   `with_frame` — the consumer inspects the payload inside the segment under the
-   lock instead of copying it out. A `memmap2`-backed cross-process segment is a
+   `#![forbid(unsafe_code)]` and exposes a borrowed read through `with_frame` —
+   the consumer inspects the frame inside the segment under the lock instead of
+   copying it out. A decoded envelope still owns its payload, so this removes
+   one copy, not all of them. A `memmap2`-backed cross-process segment is a
    drop-in replacement for the storage strategy; the layout is unchanged.
 4. **QUIC**: real QUIC (quinn + rustls) with a self-signed certificate on
    loopback, one bidirectional stream per call. Internet-scale concerns (public

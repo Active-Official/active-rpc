@@ -49,6 +49,9 @@ pub struct QuicServer {
     runtime: tokio::runtime::Runtime,
     endpoint: quinn::Endpoint,
     task: tokio::task::JoinHandle<()>,
+    /// Wire limits for a decoded call. Shared with the serve task so
+    /// [`QuicServer::with_limits`] applies to the next stream.
+    limits: Arc<std::sync::RwLock<WireLimits>>,
 }
 
 impl std::fmt::Debug for QuicServer {
@@ -139,8 +142,10 @@ impl QuicServer {
             .to_string();
         let handler = Arc::new(Mutex::new(handler));
         let endpoint_for_task = endpoint.clone();
+        let limits = Arc::new(std::sync::RwLock::new(WireLimits::default()));
+        let limits_for_task = Arc::clone(&limits);
         let task = runtime.spawn(async move {
-            serve(endpoint_for_task, handler, max_calls).await;
+            serve(endpoint_for_task, handler, max_calls, limits_for_task).await;
         });
         Ok(QuicServer {
             address: bound,
@@ -151,6 +156,7 @@ impl QuicServer {
             runtime,
             endpoint,
             task,
+            limits,
         })
     }
 }
@@ -228,8 +234,10 @@ impl QuicServer {
             .to_string();
         let handler = Arc::new(Mutex::new(handler));
         let endpoint_for_task = endpoint.clone();
+        let limits = Arc::new(std::sync::RwLock::new(WireLimits::default()));
+        let limits_for_task = Arc::clone(&limits);
         let task = runtime.spawn(async move {
-            serve(endpoint_for_task, handler, max_calls).await;
+            serve(endpoint_for_task, handler, max_calls, limits_for_task).await;
         });
         Ok(QuicServer {
             address: bound,
@@ -240,7 +248,20 @@ impl QuicServer {
             runtime,
             endpoint,
             task,
+            limits,
         })
+    }
+
+    /// Tighten the wire limits applied to a decoded call.
+    ///
+    /// The serve task reads this through a lock per stream, so a value set here
+    /// applies to every later call on the server.
+    pub fn with_limits(self, limits: WireLimits) -> Self {
+        *self
+            .limits
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = limits;
+        self
     }
 
     /// The bound address (`host:port`).
@@ -409,6 +430,35 @@ fn mutual_tls_material() -> Result<MutualMaterial> {
 /// handshakes costs one task each up to this bound and nothing beyond it.
 const MAX_CONNECTIONS: usize = 256;
 
+/// How long a handshake may hold a slot before it is abandoned.
+///
+/// Without it a peer that opens the handshake and stops holds one of
+/// `MAX_CONNECTIONS` slots forever, and a few hundred such peers lock every
+/// later one out.
+pub const HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one stream may take to deliver its frame.
+///
+/// The transport reads a stream before accepting the next one on a connection,
+/// so a peer that sends four bytes and stops would otherwise park that
+/// connection's traffic forever.
+pub const STREAM_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait for a FIN after the frame, to notice trailing bytes.
+///
+/// A client that sends one frame closes the stream at once, so this is short. A
+/// peer that sends a frame and keeps the stream open is treated as having sent
+/// no trailing bytes; the alternative is waiting `STREAM_WAIT` on every call.
+pub const STREAM_TAIL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Body bytes every live stream may hold at once.
+///
+/// The stream and connection windows bound what a peer can pin *before* we read
+/// it; this bounds what the server itself buffers after reading, across every
+/// connection. 64 MiB per stream times 256 connections would be 16 GiB of
+/// memory an unauthenticated peer could ask for.
+pub const MAX_INFLIGHT_BODY: usize = 256 << 20;
+
 /// Concurrent bidirectional streams (calls) one QUIC connection may carry.
 pub const MAX_CONCURRENT_STREAMS: u32 = 256;
 /// Receive window for one stream: bounded buffering per call.
@@ -416,94 +466,218 @@ pub const STREAM_RECEIVE_WINDOW: u32 = 1 << 20;
 /// Receive window for one connection: the real cap on buffered bytes.
 pub const CONNECTION_RECEIVE_WINDOW: u32 = 8 << 20;
 
-async fn serve<H>(endpoint: quinn::Endpoint, handler: Arc<Mutex<H>>, max_calls: usize)
-where
+async fn serve<H>(
+    endpoint: quinn::Endpoint,
+    handler: Arc<Mutex<H>>,
+    max_calls: usize,
+    limits: Arc<std::sync::RwLock<WireLimits>>,
+) where
     H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
 {
     let served = Arc::new(AtomicUsize::new(0));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    // Body bytes every live stream holds, across every connection.
+    let inflight = Arc::new(AtomicUsize::new(0));
     while let Some(incoming) = endpoint.accept().await {
         // Each connection is driven in its own task. `incoming.await` is where
         // an abandoned or refused handshake parks for its timeout; awaiting it
         // inline would hold the accept loop and stall every other peer.
-        let permit = match Arc::clone(&slots).try_acquire_owned() {
-            Ok(permit) => permit,
-            // At the cap: dropping `incoming` closes the connection.
-            Err(_) => continue,
-        };
+        //
+        // A full slot table waits briefly rather than dropping the peer: a
+        // handshake that outlives `HANDSHAKE_WAIT` is abandoned and its slot is
+        // released, so a flood of half-open connections cannot lock everyone
+        // out permanently.
+        let permit =
+            match tokio::time::timeout(HANDSHAKE_WAIT, Arc::clone(&slots).acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                // Timed out, or the semaphore is closed: drop this connection.
+                _ => continue,
+            };
         let handler = Arc::clone(&handler);
         let served = Arc::clone(&served);
         let endpoint = endpoint.clone();
+        let limits = Arc::clone(&limits);
+        let inflight = Arc::clone(&inflight);
         tokio::spawn(async move {
             let _permit = permit;
-            let connection = match incoming.await {
+            let Ok(connection) = tokio::time::timeout(HANDSHAKE_WAIT, incoming).await else {
+                return;
+            };
+            let connection = match connection {
                 Ok(connection) => connection,
                 Err(_) => return,
             };
-            serve_connection(&endpoint, &handler, &served, max_calls, connection).await;
+            serve_connection(
+                &endpoint, &handler, &served, max_calls, &limits, &inflight, connection,
+            )
+            .await;
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection<H>(
     endpoint: &quinn::Endpoint,
     handler: &Arc<Mutex<H>>,
-    served: &AtomicUsize,
+    served: &Arc<AtomicUsize>,
     max_calls: usize,
+    limits: &Arc<std::sync::RwLock<WireLimits>>,
+    inflight: &Arc<AtomicUsize>,
     connection: quinn::Connection,
 ) where
-    H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope,
+    H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
 {
     let peer = peer_identity(&connection);
+    // Streams are independent: a peer that opens one and never finishes it must
+    // not park the calls on the other streams. Each runs on its own task with
+    // its own read deadline.
+    let mut streams = tokio::task::JoinSet::new();
     loop {
-        let (mut send, mut recv) = match connection.accept_bi().await {
+        let (send, recv) = match connection.accept_bi().await {
             Ok(stream) => stream,
-            Err(_) => return,
+            Err(_) => break,
         };
-        let request = match recv.read_to_end(MAX_FRAME_BYTES).await {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                // The stream failed mid-frame. Answering with an error
-                // envelope is best-effort (the peer may be gone), but it
-                // gives a live peer a stable code instead of silence.
-                let response = Envelope::error(0, &Error::Wire("stream read failed"));
-                let _ = send_envelope(&mut send, &response).await;
-                let _ = send.finish();
-                return;
-            }
-        };
-        let envelope = match decode_call(&request) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                let response = Envelope::error(0, &error);
-                let _ = send_envelope(&mut send, &response).await;
-                let _ = send.finish();
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped())
-                    .await;
-                if exhausted(served, max_calls) {
-                    endpoint.close(0u32.into(), b"served");
-                    return;
-                }
-                continue;
-            }
-        };
-        let response = {
-            let mut handler = match handler.lock() {
-                Ok(handler) => handler,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            handler(envelope, peer.clone())
-        };
+        let handler = Arc::clone(handler);
+        let served = Arc::clone(served);
+        let limits = Arc::clone(limits);
+        let inflight = Arc::clone(inflight);
+        let peer = peer.clone();
+        let endpoint = endpoint.clone();
+        streams.spawn(async move {
+            serve_stream(
+                &endpoint, handler, served, max_calls, limits, inflight, send, recv, peer,
+            )
+            .await;
+        });
+    }
+    // Every stream carries its own deadline, so this drain is bounded.
+    while streams.join_next().await.is_some() {}
+}
+
+/// One call on one bidirectional stream.
+#[allow(clippy::too_many_arguments)]
+async fn serve_stream<H>(
+    endpoint: &quinn::Endpoint,
+    handler: Arc<Mutex<H>>,
+    served: Arc<AtomicUsize>,
+    max_calls: usize,
+    limits: Arc<std::sync::RwLock<WireLimits>>,
+    inflight: Arc<AtomicUsize>,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    peer: Option<PeerIdentity>,
+) where
+    H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
+{
+    let wire = *limits
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Read the length prefix first: the announced size decides whether the body
+    // is worth reserving, and nothing is buffered on the strength of four
+    // unverified bytes beyond that decision.
+    let mut header = [0u8; 4];
+    let read = tokio::time::timeout(STREAM_WAIT, recv.read_exact(&mut header)).await;
+    if !matches!(read, Ok(Ok(()))) {
+        let error = Error::Wire("stream did not deliver a frame prefix");
+        let response = Envelope::error(0, &error);
         let _ = send_envelope(&mut send, &response).await;
         let _ = send.finish();
-        if exhausted(served, max_calls) {
-            // Give the peer a moment to drain the stream before the endpoint
-            // closes; closing first would abort the response.
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped()).await;
-            endpoint.close(0u32.into(), b"served");
+        return;
+    }
+    let len = u32::from_le_bytes(header) as usize;
+    let ceiling = wire.max_bytes.min(MAX_FRAME_BYTES);
+    if len > ceiling {
+        let error = Error::Wire("frame exceeds the size ceiling");
+        let response = Envelope::error(0, &error);
+        let _ = send_envelope(&mut send, &response).await;
+        let _ = send.finish();
+        return;
+    }
+    // Aggregate budget: a peer cannot make the server buffer more than
+    // `MAX_INFLIGHT_BODY` across every stream and connection.
+    if inflight.fetch_add(len, Ordering::SeqCst) + len > MAX_INFLIGHT_BODY {
+        inflight.fetch_sub(len, Ordering::SeqCst);
+        let error = Error::Backpressure("the server's QUIC body budget");
+        let response = Envelope::error(0, &error);
+        let _ = send_envelope(&mut send, &response).await;
+        let _ = send.finish();
+        return;
+    }
+    let body = tokio::time::timeout(STREAM_WAIT, recv.read_to_end(len)).await;
+    inflight.fetch_sub(len, Ordering::SeqCst);
+    let body = match body {
+        Ok(Ok(body)) if body.len() == len => body,
+        Ok(Ok(_)) => {
+            let error = Error::Wire("truncated QUIC frame");
+            let response = Envelope::error(0, &error);
+            let _ = send_envelope(&mut send, &response).await;
+            let _ = send.finish();
             return;
         }
+        Ok(Err(_)) => {
+            // quinn reports `TooLong` when the peer sends more than the frame
+            // announced: one stream carries one frame.
+            let error = Error::Wire("stream read failed");
+            let response = Envelope::error(0, &error);
+            let _ = send_envelope(&mut send, &response).await;
+            let _ = send.finish();
+            return;
+        }
+        Err(_) => {
+            // The stream stalled past its deadline. Answering is best-effort
+            // (the peer may be gone), but a live peer gets a stable code
+            // instead of silence.
+            let error = Error::Wire("stream read timed out");
+            let response = Envelope::error(0, &error);
+            let _ = send_envelope(&mut send, &response).await;
+            let _ = send.finish();
+            return;
+        }
+    };
+    let envelope = match Envelope::decode_with(&body, wire) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            let response = Envelope::error(0, &error);
+            let _ = send_envelope(&mut send, &response).await;
+            let _ = send.finish();
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped()).await;
+            return;
+        }
+    };
+    // A response or error envelope is not a call.
+    if envelope.kind != crate::wire::Kind::Request {
+        let error = Error::Wire("a server only serves requests");
+        let response = Envelope::error(envelope.request_id, &error);
+        let _ = send_envelope(&mut send, &response).await;
+        let _ = send.finish();
+        return;
+    }
+    // One stream is one frame. A frame followed by more bytes would be a second
+    // message the decoder never sees, so it is refused rather than ignored.
+    if let Ok(Ok(trailing)) = tokio::time::timeout(STREAM_TAIL_WAIT, recv.read_to_end(1)).await {
+        if !trailing.is_empty() {
+            let error = Error::Wire("trailing bytes after the QUIC frame");
+            let response = Envelope::error(envelope.request_id, &error);
+            let _ = send_envelope(&mut send, &response).await;
+            let _ = send.finish();
+            return;
+        }
+    }
+    let response = {
+        let mut handler = match handler.lock() {
+            Ok(handler) => handler,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        handler(envelope, peer)
+    };
+    let _ = send_envelope(&mut send, &response).await;
+    let _ = send.finish();
+    if exhausted(&served, max_calls) {
+        // Give the peer a moment to drain the stream before the endpoint
+        // closes; closing first would abort the response.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped()).await;
+        endpoint.close(0u32.into(), b"served");
     }
 }
 
@@ -525,13 +699,6 @@ pub fn peer_identity(connection: &quinn::Connection) -> Option<PeerIdentity> {
     Some(PeerIdentity::from_certificate(leaf.as_ref()))
 }
 
-fn decode_call(bytes: &[u8]) -> Result<Envelope> {
-    let mut cursor = std::io::Cursor::new(bytes);
-    let body =
-        read_frame(&mut cursor, &WireLimits::default())?.ok_or(Error::Wire("empty QUIC call"))?;
-    Envelope::decode_with(&body, WireLimits::default())
-}
-
 async fn send_envelope(send: &mut quinn::SendStream, envelope: &Envelope) -> Result<()> {
     let bytes = envelope.encode()?;
     let mut payload = Vec::with_capacity(bytes.len() + 4);
@@ -543,16 +710,32 @@ async fn send_envelope(send: &mut quinn::SendStream, envelope: &Envelope) -> Res
 }
 
 /// A client that speaks the QUIC transport.
+/// The client trusts `certificate` for `server_name` and decodes responses
+/// under `WireLimits::default()`.
 pub struct QuicClient {
     runtime: tokio::runtime::Runtime,
     endpoint: quinn::Endpoint,
     address: SocketAddr,
     server_name: String,
+    limits: WireLimits,
 }
 
 impl QuicClient {
     /// Connect, trusting `certificate` for `localhost`.
     pub fn connect(address: &str, certificate: &CertificateDer<'static>) -> Result<Self> {
+        Self::connect_with_name(address, certificate, "localhost")
+    }
+
+    /// Connect, trusting `certificate` for `server_name`.
+    ///
+    /// The name is the SNI the client sends and the name the certificate must
+    /// cover: a deployment whose certificate names `rpc.internal` could never
+    /// verify with the hardcoded `localhost`.
+    pub fn connect_with_name(
+        address: &str,
+        certificate: &CertificateDer<'static>,
+        server_name: &str,
+    ) -> Result<Self> {
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(certificate.clone())
@@ -560,7 +743,7 @@ impl QuicClient {
         let mut client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots))
             .map_err(|error| Error::Transport(format!("client config: {error}")))?;
         client_config.transport_config(Arc::new(transport_config()));
-        Self::from_config(address, client_config)
+        Self::from_config(address, client_config, server_name)
     }
 
     /// Connect with mutual TLS: trust `ca`, present `certificate` and `key`.
@@ -586,10 +769,14 @@ impl QuicClient {
             .map_err(|error| Error::Transport(format!("client quic config: {error}")))?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
         client_config.transport_config(Arc::new(transport_config()));
-        Self::from_config(address, client_config)
+        Self::from_config(address, client_config, "localhost")
     }
 
-    fn from_config(address: &str, client_config: quinn::ClientConfig) -> Result<Self> {
+    fn from_config(
+        address: &str,
+        client_config: quinn::ClientConfig,
+        server_name: &str,
+    ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -605,8 +792,15 @@ impl QuicClient {
             runtime,
             endpoint,
             address,
-            server_name: "localhost".to_string(),
+            server_name: server_name.to_string(),
+            limits: WireLimits::default(),
         })
+    }
+
+    /// Use tighter wire limits for a decoded response.
+    pub fn with_limits(mut self, limits: WireLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Send one call and read the response.
@@ -617,9 +811,14 @@ impl QuicClient {
         payload.extend_from_slice(&bytes);
         let response = self.exchange(&payload)?;
         let mut cursor = std::io::Cursor::new(&response);
-        let body = read_frame(&mut cursor, &WireLimits::default())?
-            .ok_or(Error::Wire("empty QUIC response"))?;
-        Envelope::decode_with(&body, WireLimits::default())
+        let body =
+            read_frame(&mut cursor, &self.limits)?.ok_or(Error::Wire("empty QUIC response"))?;
+        // One stream is one frame: trailing bytes would let a peer smuggle a
+        // second message past the decoder.
+        if cursor.position() != response.len() as u64 {
+            return Err(Error::Wire("trailing bytes after the QUIC frame"));
+        }
+        Envelope::decode_with(&body, self.limits)
     }
 
     /// Send raw bytes (for malformed-frame tests) and return the raw response.
@@ -664,7 +863,10 @@ impl QuicClient {
 /// because this transport never uses one.
 fn transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
-    config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    // No keep-alive: a peer that holds a connection open without traffic keeps a
+    // slot busy forever, and there are only `MAX_CONNECTIONS` of them. The idle
+    // timeout then frees the slot after 30 s of silence. A caller that needs
+    // NAT keep-alive can configure it on its own endpoint.
     config.max_idle_timeout(Some(
         std::time::Duration::from_secs(30)
             .try_into()

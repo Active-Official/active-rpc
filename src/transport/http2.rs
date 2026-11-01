@@ -59,6 +59,9 @@ pub const MAX_BODY: usize = 64 << 20;
 pub const MAX_HEADER_LIST: u32 = 32 << 10;
 /// Largest number of header fields in one request.
 pub const MAX_HEADER_FIELDS: usize = 64;
+
+/// Consecutive `accept` failures before the listener is considered broken.
+pub const MAX_ACCEPT_FAILURES: u32 = 64;
 /// Largest frame either side will emit or accept (RFC 9113 minimum).
 pub const MAX_FRAME: u32 = 16 << 10;
 /// Concurrent streams one connection may carry.
@@ -169,11 +172,25 @@ impl Http2Server {
             // not stall the listener or take other connections down. Each one
             // runs to completion on the runtime.
             let mut active = tokio::task::JoinSet::new();
+            let mut refused = 0u32;
             while accepted < connection_budget {
-                let (stream, _) = listener
-                    .accept()
-                    .await
-                    .map_err(|error| Error::Transport(format!("accept: {error}")))?;
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => {
+                        refused = 0;
+                        pair
+                    }
+                    Err(error) => {
+                        // A transient accept error (a connection reset before it
+                        // was accepted, a temporary descriptor shortage) belongs
+                        // to that connection. Only a listener that keeps failing
+                        // is fatal.
+                        refused += 1;
+                        if refused > MAX_ACCEPT_FAILURES {
+                            return Err(Error::Transport(format!("accept: {error}")));
+                        }
+                        continue;
+                    }
+                };
                 accepted += 1;
                 stream
                     .set_nodelay(true)
@@ -340,6 +357,11 @@ where
             );
         }
     };
+    // A response or error envelope is not a call; a relay must not be able to
+    // forward one as a request.
+    if envelope.kind != crate::wire::Kind::Request {
+        return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
+    }
     let response = {
         // A kernel handler is single-threaded and may block on the kernel
         // loop; `block_in_place` moves the runtime worker aside instead of
@@ -408,6 +430,15 @@ impl Drop for Reservation {
             self.budget.fetch_sub(self.held, Ordering::Relaxed);
         }
     }
+}
+
+/// Map a refusal body to the matching error.
+///
+/// Shared with the bridge client: only a short `rpc/...` token is read, so an
+/// error cannot carry the peer's prose and a caller can still branch on the
+/// class through [`Error::provider_code`].
+fn refusal(body: &[u8]) -> Error {
+    crate::transport::refusal(body)
 }
 
 fn respond_status(
@@ -505,13 +536,7 @@ impl Http2Client {
         let body = envelope.encode()?;
         let (status, response) = self.request(PATH, CONTENT_TYPE, &[], &body)?;
         if status != StatusCode::OK {
-            let code = String::from_utf8_lossy(&response).trim().to_string();
-            return Err(match code.as_str() {
-                "rpc/wire" => Error::Wire("HTTP/2 peer rejected the frame"),
-                other => Error::Provider {
-                    code: other.to_string(),
-                },
-            });
+            return Err(refusal(&response));
         }
         Envelope::decode_with(&response, self.limits)
     }
@@ -555,13 +580,7 @@ impl Http2Client {
                     .await
                     .map_err(|error| Error::Transport(format!("stream task: {error}")))??;
                 if status != StatusCode::OK {
-                    let code = String::from_utf8_lossy(&body).trim().to_string();
-                    out.push(Err(match code.as_str() {
-                        "rpc/wire" => Error::Wire("HTTP/2 peer rejected the frame"),
-                        other => Error::Provider {
-                            code: other.to_string(),
-                        },
-                    }));
+                    out.push(Err(refusal(&body)));
                 } else {
                     out.push(Envelope::decode_with(&body, limits));
                 }

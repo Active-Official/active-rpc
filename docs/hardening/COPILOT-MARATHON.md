@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
-| R-09 | transports | `src/transport/**` | pending | — | — |
+| R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
 | R-10 | bulk | `src/bulk.rs` | pending | — | — |
 | R-11 | identity | `src/identity.rs` | pending | — | — |
 | R-12 | replay | `src/replay.rs` | pending | — | — |
@@ -194,6 +194,49 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-09 transports - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `c89cf3b`.
+No critical. Four highs, eleven mediums and three lows; it proved the highs with
+temporary probes and deleted them, leaving the tree clean. Every finding below is
+fixed here with a test; the two frame oracles were shown to fail pre-fix with a
+targeted mutation (`read_frame` reserved **67 109 933 bytes** from a four-byte
+header, and `serve_connection` returned `Err` after a bad frame).
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a non-UTF-8 request head killed the bridge: `read_line` returns `InvalidData` and `serve` propagated it, so one packet ended `active-rpc peer --transport connect` | **fixed**: the head is read as bytes under the remaining budget and decoded lossily; a head fault answers `400 rpc/wire` for that connection; `a_non_utf8_request_head_is_a_400_and_the_bridge_keeps_serving` |
+| 2 | high | the bridge had no read deadline and accepts serially: one `POST …` without a newline blocked every later peer indefinitely | **fixed**: `CONNECTION_WAIT` (2 s) on every accepted stream, and a stalled connection answers 400 and returns; `a_stalled_head_does_not_block_the_next_connection` |
+| 3 | high | `serve_connection` returned the peer's error after replying, and `peer.rs` plus the CLI use `?`, so one bad frame ended the process | **fixed**: a frame error ends the connection and returns `Ok(served)`; the mutation that restores `Err` makes the test fail; `a_malformed_frame_ends_the_connection_not_the_server` |
+| 4 | high | QUIC read streams serially with no deadline: a stream that sent four bytes and stopped parked every later stream forever | **fixed**: each stream runs on its own task with `STREAM_WAIT` (10 s), so a stalled stream cannot block the others; `a_stalled_stream_does_not_block_another_stream` |
+| 5 | medium | `read_frame` allocated the announced body immediately: a four-byte header forged a 64 MiB zeroed buffer per connection | **fixed**: the body grows with the bytes that arrive (`take(len).read_to_end`), verified against the announced length; `a_maximum_length_header_does_not_reserve_the_body` (tracking allocator, measured) |
+| 6 | medium | QUIC `read_to_end(64 MiB)` per stream meant 256 connections could pin 16 GiB, and the window constants did not bound it | **fixed**: the frame prefix is read and validated first, the body is read to exactly that length, and a server-wide `MAX_INFLIGHT_BODY` (256 MiB) budget refuses the excess with `rpc/backpressure` |
+| 7 | medium | QUIC ignored bytes after the frame, while the bridge refused them | **fixed**: the stream is read to exactly the announced length, and quinn reports `TooLong` for a longer stream (`rpc/wire`); `trailing_bytes_after_a_quic_frame_are_refused` |
+| 8 | medium | QUIC hardcoded `WireLimits::default()`, so a server could not apply `strict()` | **fixed**: `QuicServer::with_limits` writes through a shared lock that the serve task reads per stream, and the client has `with_limits`; `quic_applies_the_server_wire_limits` |
+| 9 | medium | 256 QUIC slots with a 5 s keep-alive: keep-alive defeats the idle timeout, and a full table dropped newcomers | **fixed**: keep-alive is gone (the 30 s idle timeout frees slots), a full table waits up to `HANDSHAKE_WAIT` for a slot, and a handshake that outlives it is abandoned |
+| 10 | medium | a one-to-three-byte header at end of stream was reported as a clean close | **fixed**: a partial header is `rpc/transport`; `a_partial_header_at_end_of_stream_is_refused` |
+| 11 | medium | `SharedSegment::advance(len)` trusted its argument: a wrong length left `tail` inside a payload, and `advance(usize::MAX)` overflowed | **fixed**: `advance()` reads the length from the frame header, bounds-checks it and returns `Result`; `shared_memory_write_is_total_after_a_desynchronised_advance` |
+| 12 | medium | the "zero-copy" claim was false: the frame is borrowed but the decoded envelope owns a copy of the payload | **fixed**: the claim is corrected in the module docs, ADR-0003 and `wire.md`, and `recv_zero_copy` is renamed `recv_in_segment` with the cost stated |
+| 13 | medium | a duplicate `content-length` or any `transfer-encoding` was accepted by the bridge (request smuggling behind a proxy) | **fixed**: exactly one length, no transfer coding; `conflicting_framing_headers_are_refused` |
+| 14 | medium | `MAX_HEAD` was checked only after `read_line` had buffered the whole line | **fixed** with the byte-bounded head read; `a_head_line_without_a_newline_is_refused_at_the_ceiling` |
+| 15 | medium | an HTTP/2 peer's `rpc/...` refusal collapsed to `rpc/provider` and its body could be carried into the error | **fixed**: `Error::provider_code` exposes the class, the body is read as a bounded token and anything else becomes `rpc/provider`; `the_client_preserves_a_peer_refusal_code` |
+| 16 | medium | one HTTP/2 `accept` error aborted the server | **fixed**: transient accept errors are retried, and only `MAX_ACCEPT_FAILURES` in a row is fatal |
+| 17 | medium | HTTP/2 has no identity parameter, although `docs/deployment/identity.md` told deployers to pass one | **fixed**: the deployment doc now states that the shipped HTTP/2 transport is plaintext, carries no identity, and that a bound capability needs QUIC mutual TLS. Documented residual: there is no identity channel on this transport |
+| 18 | medium | no transport checked `Envelope::kind`, so a response envelope carrying a capability and a method was dispatched | **fixed** on TCP, the bridge, HTTP/2, QUIC and the CLI dispatcher; `a_response_envelope_is_refused_on_the_framed_and_bridge_transports` |
+| 19 | medium | the bridge's served-count assertion in `tests/integration_tests.rs` was swallowed by a mangled comment (`\n` escapes) | **fixed**: the assertion is restored, with the count corrected to mean "calls that reached the handler" |
+| 20 | low | the QUIC client hardcoded SNI `localhost`, so a certificate for `rpc.internal` could never verify | **fixed**: `QuicClient::connect_with_name` |
+| 21 | low | `MAX_FRAME_BYTES` was documented as the transport ceiling but `read_frame` honoured only `WireLimits`; a partially written frame left the TCP stream reusable | **fixed**: the ceiling is `min(limits.max_bytes, MAX_FRAME_BYTES)`, and a failed write poisons the connection |
+| 22 | low | shared-memory counters went backwards on drain, compaction allocated a full copy, and the inspection closure ran under the lock | **fixed**: lifetime byte and frame totals, `copy_within` for a contiguous unread region, and the re-entrancy contract documented |
+
+Also updated: `docs/spec/wire.md` (transport table, error-class note) and
+`docs/adr/0003-transports.md` (the borrowed-read claim).
+
+Gate: `cargo test --all-features` 500 passed, 0 failed; `--no-default-features`
+451 passed; clippy and fmt clean in three configurations; control plane 30 and
+CLI 17 pass; the 10 transport tests, 3 frame tests and 11 tool tests pass in
+`rust:1.88-bookworm`. `tests/transport_hardening_tests.rs` and
+`tests/transport_frame_tests.rs` are new.
 
 ### R-08 tools / MCP - 2026-11-01 (round 2)
 

@@ -319,7 +319,7 @@ transport must preserve when it forwards one:
 |-----------|---------|-------|
 | in-process | none | envelopes move by value; `bytes_written() == 0` |
 | TCP | `u32` length + envelope | cross-process, `MAX_FRAME_BYTES` = 64 MiB |
-| shared memory | `u32` length + envelope in a ring | zero-copy reads via `with_frame` |
+| shared memory | `u32` length + envelope in a ring | borrowed frame reads via `with_frame` (the decoded envelope owns its payload) |
 | QUIC | `u32` length + envelope on one bi-directional stream, one stream per call | TLS with a self-signed certificate on loopback; `start_mutual_tls` verifies a client certificate and exposes the authenticated peer identity |
 | HTTP/2 | `POST /active.rpc.v1.Agent/Call`, body is the bare envelope, content type `application/arp1` | feature `http2`; one connection, concurrent streams; a non-200 answer carries an `rpc/...` body |
 | Connect/gRPC | HTTP/1.1 `POST /active.rpc.v1.Agent/Call`, body framed as `[0][len u32 BE][envelope]`, content type `application/connect+active-infinity` or `application/grpc+active-infinity` | a malformed frame is a `400` with an `rpc/...` body; HTTP/1.1, one request per connection |

@@ -87,9 +87,13 @@ client that presents none fails it as well.
 
 ## HTTP/2 and Connect
 
-- **HTTP/2** carries ARP1 over a stream and has no identity of its own. Terminate
-  TLS in front of it (a reverse proxy or a service mesh) and pass the verified
-  peer to the dispatcher; do not accept a header that claims an identity.
+- **HTTP/2** carries ARP1 over a stream and has no identity of its own: the
+  shipped transport is plaintext, and its handler signature has no identity to
+  pass. Terminate TLS in front of it (a reverse proxy or a service mesh) and
+  have *that* terminator refuse or bind capabilities; do not accept a header
+  that claims an identity, and do not bind a capability to a peer when the
+  connection is HTTP/2, because the kernel cannot tell two peers apart there.
+  Use QUIC with mutual TLS when a bound capability has to be enforced.
 - **Connect/gRPC** is interop only and presents no peer identity in this build,
   so a bound capability is refused through the bridge. That is intentional: the
   gateway authenticates, and the kernel still refuses anything it cannot bind.

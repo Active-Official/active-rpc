@@ -300,13 +300,13 @@ fn in_process_transport_moves_envelopes_without_bytes() {
 }
 
 #[test]
-fn shared_memory_transport_is_zero_copy_and_rejects_malformed_frames() {
+fn shared_memory_transport_borrows_the_frame_and_rejects_malformed_frames() {
     let segment = SharedSegment::new(1 << 20);
     let mut transport = SharedMemoryTransport::new(segment.clone());
     let envelope = sample_envelope();
     transport.send(&envelope).expect("send");
 
-    // Zero copy: the borrowed frame points inside the segment's buffer.
+    // The borrowed frame points inside the segment's buffer.
     let inside = segment
         .with_frame(|frame| {
             let first = frame.as_ptr() as usize;
@@ -316,7 +316,10 @@ fn shared_memory_transport_is_zero_copy_and_rejects_malformed_frames() {
         .expect("borrowed");
     assert!(inside);
 
-    let received = transport.recv_zero_copy().expect("recv").expect("envelope");
+    let received = transport
+        .recv_in_segment()
+        .expect("recv")
+        .expect("envelope");
     assert_eq!(received, envelope);
     assert_eq!(segment.available(), 0);
 
@@ -359,8 +362,11 @@ fn connect_bridge_moves_a_module_and_rejects_bad_frames() {
     let (status, _body) = client.post_typed(&[0u8; 8], "text/plain").expect("post");
     assert_eq!(status, 415);
 
-    let _served = handle.join().expect("join");
-    // The well-formed call and the malformed frame are both "served" (the\n    // malformed one with an error); the bad content type is rejected before\n    // dispatch and does not count.\n    assert_eq!(served, 2, "served calls");
+    let served = handle.join().expect("join");
+    // Only the well-formed call reached the handler. A malformed frame and a
+    // wrong content type are refusals for one connection, not served calls, and
+    // the server keeps accepting afterwards.
+    assert_eq!(served, 1, "served calls");
 }
 
 #[cfg(feature = "quic")]
@@ -543,7 +549,7 @@ fn connect_bridge_survives_a_request_without_content_length() {
         .expect("call after the malformed request");
     assert_eq!(response.first_value(), Some(&Value::text("ok")));
     let served = handle.join().expect("join");
-    assert_eq!(served, 2);
+    assert_eq!(served, 1, "the 400 is a refusal, not a served call");
 }
 
 #[test]

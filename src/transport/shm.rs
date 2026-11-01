@@ -3,9 +3,10 @@
 //! A segment holds length-prefixed frames in a ring. The producer appends a
 //! frame and publishes it; the consumer either copies it out
 //! ([`SharedSegment::read`]) or borrows it in place
-//! ([`SharedSegment::with_frame`]) — the latter is the zero-copy path a large
-//! Infinity module takes, and the test asserts the borrowed slice points inside
-//! the segment.
+//! ([`SharedSegment::with_frame`]) — the latter avoids copying the frame out of
+//! the ring, and the test asserts the borrowed slice points inside the segment.
+//! A decoded [`Envelope`] still owns its payload: this is one copy fewer, not a
+//! borrowed envelope.
 //!
 //! The layout is what a memory-mapped segment needs for cross-process use; only
 //! the storage strategy changes (ADR-0003 in this crate).
@@ -31,6 +32,14 @@ struct SegmentState {
     head: u64,
     tail: u64,
     capacity: usize,
+    /// Lifetime byte totals. `head` and `tail` return to zero when the ring
+    /// drains, so they cannot serve as counters: a consumer that watched them
+    /// saw the totals jump backwards.
+    produced_total: u64,
+    consumed_total: u64,
+    /// Frames produced and consumed over the life of the segment.
+    frames_produced: u64,
+    frames_consumed: u64,
 }
 
 /// A shared segment: a byte ring shared by producer and consumer.
@@ -49,6 +58,10 @@ impl SharedSegment {
                 head: 0,
                 tail: 0,
                 capacity,
+                produced_total: 0,
+                consumed_total: 0,
+                frames_produced: 0,
+                frames_consumed: 0,
             }),
         })
     }
@@ -64,14 +77,24 @@ impl SharedSegment {
         state.head.saturating_sub(state.tail) as usize
     }
 
-    /// Total bytes written into the ring.
+    /// Total bytes written into the ring, since the segment was created.
     pub fn produced(&self) -> u64 {
-        self.state.lock().expect("segment lock").head
+        self.state.lock().expect("segment lock").produced_total
     }
 
-    /// Total bytes consumed from the ring.
+    /// Total bytes consumed from the ring, since the segment was created.
     pub fn consumed(&self) -> u64 {
-        self.state.lock().expect("segment lock").tail
+        self.state.lock().expect("segment lock").consumed_total
+    }
+
+    /// Frames written into the ring, since the segment was created.
+    pub fn frames_produced(&self) -> u64 {
+        self.state.lock().expect("segment lock").frames_produced
+    }
+
+    /// Frames consumed from the ring, since the segment was created.
+    pub fn frames_consumed(&self) -> u64 {
+        self.state.lock().expect("segment lock").frames_consumed
     }
 
     /// Write a frame. Fails when the ring cannot take it.
@@ -100,22 +123,21 @@ impl SharedSegment {
         let start = state.head as usize % state.capacity;
         if start + needed > state.capacity {
             // Compact instead of fragmenting the frame: move the unread bytes
-            // from the *tail* to the front. The unread region can wrap and the
-            // two source pieces can overlap their destinations, so copy through
-            // a temporary buffer. Compaction is rare (once per ring wrap) and
-            // bounded by the segment size.
+            // from the *tail* to the front. A contiguous unread region moves in
+            // place; a wrapped one is copied through a temporary because its two
+            // pieces can overlap the destination.
             let unread = used;
             let tail_start = state.tail as usize % state.capacity;
             let capacity = state.capacity;
-            let mut compacted = Vec::with_capacity(unread);
             if tail_start + unread <= capacity {
-                compacted.extend_from_slice(&state.data[tail_start..tail_start + unread]);
+                state.data.copy_within(tail_start..tail_start + unread, 0);
             } else {
                 let first = capacity - tail_start;
+                let mut compacted = Vec::with_capacity(unread);
                 compacted.extend_from_slice(&state.data[tail_start..capacity]);
                 compacted.extend_from_slice(&state.data[0..unread - first]);
+                state.data[..unread].copy_from_slice(&compacted);
             }
-            state.data[..unread].copy_from_slice(&compacted);
             state.head = unread as u64;
             state.tail = 0;
         }
@@ -123,6 +145,8 @@ impl SharedSegment {
         state.data[start..start + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         state.data[start + 4..start + 4 + payload.len()].copy_from_slice(payload);
         state.head += needed as u64;
+        state.produced_total = state.produced_total.saturating_add(needed as u64);
+        state.frames_produced = state.frames_produced.saturating_add(1);
         Ok(())
     }
 
@@ -133,16 +157,17 @@ impl SharedSegment {
             return Ok(None);
         };
         let frame = state.data[start..start + len].to_vec();
-        state.tail += len as u64 + 4;
+        consume(&mut state, len);
         Ok(Some(frame))
     }
 
-    /// Borrow the oldest frame in place (zero copy) without releasing it.
+    /// Borrow the oldest frame in place without releasing it.
     ///
     /// The closure runs under the segment lock, so the bytes cannot move while
-    /// it looks at them. For a single consumer this is safe; a consumer that
-    /// decodes and consumes should use [`SharedSegment::pop_frame`], which
-    /// advances under the same lock so two consumers cannot double-advance.
+    /// it looks at them. It must not call back into this segment: the lock is
+    /// not re-entrant and a nested call would deadlock. Decoding under the lock
+    /// is what [`SharedMemoryTransport::recv_in_segment`] does, at the cost of
+    /// holding the segment for one decode.
     pub fn with_frame<R>(&self, inspect: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
         let state = self.state.lock().expect("segment lock");
         let Some((start, len)) = frame_bounds(&state)? else {
@@ -151,29 +176,32 @@ impl SharedSegment {
         Ok(Some(inspect(&state.data[start..start + len])))
     }
 
-    /// Inspect and consume the oldest frame atomically (zero copy).
+    /// Inspect and consume the oldest frame atomically.
+    ///
+    /// The same re-entrancy contract as [`SharedSegment::with_frame`] applies.
     pub fn pop_frame<R>(&self, inspect: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
         let mut state = self.state.lock().expect("segment lock");
         let Some((start, len)) = frame_bounds(&state)? else {
             return Ok(None);
         };
         let result = inspect(&state.data[start..start + len]);
-        state.tail += len as u64 + 4;
-        if state.tail >= state.head {
-            state.tail = 0;
-            state.head = 0;
-        }
+        consume(&mut state, len);
         Ok(Some(result))
     }
 
     /// Release the oldest frame.
-    pub fn advance(&self, len: usize) {
+    ///
+    /// The length comes from the frame header, so the ring can never be advanced
+    /// to a point that is not a frame boundary: a caller-supplied length used to
+    /// leave `tail` inside a payload, whose first four bytes then read as the
+    /// next length and bricked the ring.
+    pub fn advance(&self) -> Result<()> {
         let mut state = self.state.lock().expect("segment lock");
-        state.tail += len as u64 + 4;
-        if state.tail >= state.head {
-            state.tail = 0;
-            state.head = 0;
-        }
+        let Some((_start, len)) = frame_bounds(&state)? else {
+            return Ok(());
+        };
+        consume(&mut state, len);
+        Ok(())
     }
 
     /// Reset the indices.
@@ -181,6 +209,17 @@ impl SharedSegment {
         let mut state = self.state.lock().expect("segment lock");
         state.head = 0;
         state.tail = 0;
+    }
+}
+
+/// Advance past a frame of `len` payload bytes and account for it.
+fn consume(state: &mut SegmentState, len: usize) {
+    state.tail += len as u64 + 4;
+    state.consumed_total = state.consumed_total.saturating_add(len as u64 + 4);
+    state.frames_consumed = state.frames_consumed.saturating_add(1);
+    if state.tail >= state.head {
+        state.tail = 0;
+        state.head = 0;
     }
 }
 
@@ -234,8 +273,13 @@ impl SharedMemoryTransport {
         &self.segment
     }
 
-    /// Decode the next frame in place, without copying it out of the segment.
-    pub fn recv_zero_copy(&mut self) -> Result<Option<Envelope>> {
+    /// Decode the next frame while the segment's lock is held.
+    ///
+    /// The *frame bytes* are borrowed from the ring, so the transport does not
+    /// copy them out first. The decoded [`Envelope`] owns its payload, so this
+    /// is one copy fewer than [`Transport::recv`], not a borrowed envelope. It
+    /// costs the segment lock for the duration of one decode.
+    pub fn recv_in_segment(&mut self) -> Result<Option<Envelope>> {
         let limits = self.limits;
         self.segment
             .pop_frame(|frame| Envelope::decode_with(frame, limits))?

@@ -86,6 +86,19 @@ pub enum Error {
 }
 
 impl Error {
+    /// The provider-side stable code, when the failure came from a provider or
+    /// a remote peer.
+    ///
+    /// [`Error::code`] reports the envelope class (`rpc/provider`); this reports
+    /// the refusal the other side chose (for example `rpc/identity`), so a
+    /// caller can branch on it without parsing the message.
+    pub fn provider_code(&self) -> Option<&str> {
+        match self {
+            Error::Provider { code } => Some(code.as_str()),
+            _ => None,
+        }
+    }
+
     /// Permanent machine-readable code.
     pub const fn code(&self) -> &'static str {
         match self {

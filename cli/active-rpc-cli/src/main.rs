@@ -164,6 +164,14 @@ fn kernel(methods: &[String]) -> Result<Kernel, CliError> {
 }
 
 fn dispatch(kernel: &Agent, lane: LaneId, request: &Envelope) -> Envelope {
+    // Only a request is a call. A relay that forwards a response or an error
+    // envelope must not be able to make this dispatcher execute it.
+    if request.kind != Kind::Request {
+        return Envelope::error(
+            request.request_id,
+            &Error::Wire("a server only serves requests"),
+        );
+    }
     let Some(descriptor) = request.caps.first() else {
         return Envelope::error(request.request_id, &Error::UnknownCapability(CapToken(0)));
     };

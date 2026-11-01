@@ -679,7 +679,7 @@ fn shared_memory_write_is_total_after_a_desynchronised_advance() {
     segment.write(&frame).expect("frame");
     // A consumer that advances without a frame is misuse, but a safe public
     // API must return an error rather than panic or corrupt the ring.
-    segment.advance(0);
+    segment.advance().expect("advance past the first frame");
     let _ = segment.write(&frame);
     let _ = segment.read();
     let _ = segment.with_frame(|bytes| bytes.len());
