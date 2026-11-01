@@ -2,8 +2,26 @@
 
 ## Unreleased
 
-Hardening from the R-09 (transports), R-10 (bulk) and R-11 (identity) audit
-rounds.
+Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity) and R-12
+(replay) audit rounds.
+
+### Replay
+
+- **A package can no longer be edited into a different call.** The decision
+  trace now records the method and the charged argument size of a queued call
+  (`call.queued:<method>:<bytes>`), so changing either is a trace mismatch. No
+  argument *value* is recorded.
+- **The recorder refuses what the decoder would reject.** `MAX_OPS`, the trace
+  ceiling, the method count and each method length are enforced while recording;
+  `Recorder::package` and `ReplayPackage::encode` return `Result`; a capture that
+  lost events poisons the recorder.
+- **Refusals are captured.** A refused mint, attenuation or revoke records the
+  events it emitted, including `cap.expired` and handle churn.
+- **Replay is linear.** `Agent::events_since` returns only the events a capture
+  missed instead of cloning the bounded tape per operation (a 2.1 MB package took
+  85.9 s in release and now runs in well under a second).
+- A mismatch message is bounded and escaped; the trace distinguishes a panic
+  phase and an introduction peer; a package must begin with its header latency.
 
 ### Identity
 

@@ -203,7 +203,7 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.event = "lane.destroyed";
             trace.lane = Some(lane.0);
         }
-        Event::CallQueued { job, lane, cap } => {
+        Event::CallQueued { job, lane, cap, .. } => {
             trace.event = "call.queued";
             trace.job = Some(*job);
             trace.lane = Some(lane.0);

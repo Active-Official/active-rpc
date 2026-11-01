@@ -930,7 +930,8 @@ fn replay(args: &[String]) -> CliResult {
                 .filter(|value| !value.is_empty())
                 .cloned()
                 .unwrap_or_else(|| "session.arrp".to_string());
-            std::fs::write(&path, package.encode())
+            let encoded = package.encode().map_err(refusal)?;
+            std::fs::write(&path, encoded)
                 .map_err(|error| CliError::transport(format!("cannot write {path}: {error}")))?;
             println!(
                 "wrote {path} ops={} trace={}",
@@ -981,7 +982,7 @@ fn demo_package() -> Result<ReplayPackage, CliError> {
     }
     recorder.revoke(echo).map_err(refusal)?;
     recorder.call(echo, "echo", 0).map_err(refusal)?;
-    Ok(recorder.package())
+    recorder.package().map_err(refusal)
 }
 
 fn refusal(error: active_rpc::Error) -> CliError {

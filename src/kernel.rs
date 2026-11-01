@@ -187,6 +187,15 @@ pub enum Event {
         lane: LaneId,
         /// Target capability.
         cap: CapId,
+        /// Method name, truncated to `MAX_METHOD_EVENT_BYTES`.
+        ///
+        /// The decision trace needs the method: no other record names what a
+        /// queued call asked for, so a replay package that carried only the
+        /// capability could be edited from one granted method to another and
+        /// still compare equal.
+        method: String,
+        /// Argument bytes the call was charged for.
+        args_bytes: u64,
     },
     /// A batch of jobs was dispatched to a provider (one round-trip).
     BatchDispatched {
@@ -2324,6 +2333,8 @@ impl Agent {
             job: job_id,
             lane,
             cap: cap_id,
+            method: method_event_label(method),
+            args_bytes,
         });
         kernel.metrics.calls_queued = kernel.metrics.calls_queued.saturating_add(1);
         // Budgets are charged here, before the call is queued. Dispatch
@@ -2902,6 +2913,25 @@ impl Agent {
     /// suffix into a delta once the bounded tape has wrapped.
     pub fn total_events(&self) -> u64 {
         self.cell.borrow().events_total
+    }
+
+    /// The events the bounded tape gained since `seen_total`.
+    ///
+    /// `None` means the tape wrapped: some of the delta was evicted before it
+    /// could be read, and a caller that needs every event (a recorder) must fail
+    /// rather than pretend it saw a shorter history. Only the delta is cloned,
+    /// so a consumer that captures per operation stays linear instead of
+    /// copying the whole tape each time.
+    pub fn events_since(&self, seen_total: u64) -> Option<Vec<Event>> {
+        let kernel = self.cell.borrow();
+        let total = kernel.events_total;
+        let retained = kernel.events.len() as u64;
+        let missed = total.saturating_sub(seen_total);
+        if missed > retained {
+            return None;
+        }
+        let skip = (retained - missed) as usize;
+        Some(kernel.events.iter().skip(skip).cloned().collect())
     }
 
     /// Point-in-time counters. Contains no capability ids or payloads.
@@ -3738,6 +3768,31 @@ fn durable_ceiling_reached(kernel: &Kernel) -> bool {
 ///
 /// One walk, shared by `revoke` and `tombstone_record`, so a kill switch cannot
 /// reach a capability that a revocation would have reached.
+/// Longest method label a queued-call event carries.
+///
+/// The trace needs the method to pin what a queued call asked for; a method
+/// longer than this is represented by an escaped prefix plus a digest tail, so
+/// two long names that share a prefix still differ.
+pub const MAX_METHOD_EVENT_BYTES: usize = 64;
+
+/// A log-safe, bounded label for a method name.
+fn method_event_label(method: &str) -> String {
+    if method.len() <= MAX_METHOD_EVENT_BYTES && !method.chars().any(char::is_control) {
+        return method.to_string();
+    }
+    let mut label: String = method
+        .chars()
+        .take(MAX_METHOD_EVENT_BYTES)
+        .flat_map(char::escape_debug)
+        .collect();
+    let digest = blake3::hash(method.as_bytes());
+    label.push('#');
+    for byte in &digest.as_bytes()[..4] {
+        label.push_str(&format!("{byte:02x}"));
+    }
+    label
+}
+
 /// Refuse a binding that names no real peer.
 ///
 /// The all-zero fingerprint is the anonymous constant and the loopback

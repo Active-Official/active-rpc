@@ -64,6 +64,27 @@ Semantics:
    is a debug artifact, not a signed attestation. Signing belongs with the
    receipt/release work and would be a new ADR.
 
+## Amendments (R-12 round 1, 2026-11-01)
+
+- **The trace pins what a call asked for.** `Event::CallQueued` carries the method
+  (bounded to 64 bytes, escaped, with a digest tail when truncated) and the
+  charged argument size, and the trace renders `call.queued:<method>:<bytes>`.
+  Without it a package could be edited from one granted method to another and
+  still compare equal; no argument *value* is recorded.
+- **The recorder enforces the decoder's ceilings.** `MAX_OPS`, the trace ceiling,
+  the method count (64) and each method length (`u16`, 64 KiB) are checked while
+  recording, `Recorder::package` and `ReplayPackage::encode` return `Result`, and
+  a capture that lost events poisons the recorder. A refused mint, attenuation or
+  revoke captures the events it emitted before returning.
+- **A package begins with its header latency**, and replay refuses one that does
+  not: the header is the initial rate, not only a summary of the last one.
+- **Replay is linear in the operations.** `Agent::events_since` returns only the
+  delta a capture missed instead of cloning the bounded tape per operation; the
+  previous shape cost 85.9 s (release) for a 2.1 MB package of 100 000 calls.
+- **A recorder is not an observer.** It drives its own kernel, so a package
+  describes a synthetic demo session: the method and the argument *size* are
+  faithful inputs, the argument shape is not.
+
 ## Consequences
 
 - `active_rpc::replay` exposes `Recorder`, `ReplayPackage`, `Op` and `Trace`.

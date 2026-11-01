@@ -56,7 +56,13 @@ fn every_event(cap: CapId) -> Vec<Event> {
         Event::CapTransferred { cap, channel },
         Event::LaneCreated(lane),
         Event::LaneDestroyed(lane),
-        Event::CallQueued { job: 9, lane, cap },
+        Event::CallQueued {
+            job: 9,
+            lane,
+            cap,
+            method: "echo".to_string(),
+            args_bytes: 4,
+        },
         Event::CallRefused {
             lane,
             cap,

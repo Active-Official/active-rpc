@@ -25,7 +25,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
-| R-12 | replay | `src/replay.rs` | pending | — | — |
+| R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | pending | — | — |
 | R-14 | wasm tools | `src/wasm_tool.rs` | pending | — | — |
 | R-15 | observability | `src/observability.rs` | pending | — | — |
@@ -194,6 +194,40 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-12 replay - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `2361b7d`.
+No critical and no high: decoding was already total and fail-closed, no value can
+enter a package, and there is no reachable nondeterminism. Five mediums and four
+lows, all fixed; one measured cost was the headline (a 2.1 MB package pinned a
+core for **85.9 s** in release).
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | medium | a `Call` op could be edited to another granted method or size and `replay()` still passed: no event carried the method or the charged size | **fixed at the decision layer**: `Event::CallQueued` now carries the method (bounded, escaped, with a digest tail when truncated) and the charged argument bytes, and the trace renders `call.queued:<method>:<bytes>`; `replay` also compares the rebuilt op list. Proven by mutation: with the method removed from the trace, an edited package replays clean; `changing_a_recorded_call_method_is_refused`, `changing_a_recorded_arg_size_is_refused` |
+| F2 | medium | a refused `mint`/`attenuate`/`revoke` skipped `capture`, so a session ending on one lost `cap.retained`/`cap.released`/`cap.expired` and still replayed | **fixed**: every refusal captures before returning; `a_trailing_refused_attenuation_keeps_its_events` |
+| F3 | medium | `encode` truncated a method length to `u16`, so a ≥64 KiB name re-framed the rest of the op stream (the kernel accepts such a name) | **fixed**: method names and counts are checked at record time and the encoder is fallible with checked conversions; `a_method_name_over_64k_is_refused_at_record_time` |
+| F4 | medium | the recorder emitted packages its own decoder rejected (op count, method count) | **fixed**: `MAX_OPS`/`MAX_TRACES`/method count are enforced while recording, `package()` and `encode()` return `Result`; `a_session_past_the_op_ceiling_is_refused_at_record_time`, `the_encoder_refuses_a_package_over_a_ceiling` |
+| F5 | medium | replay cost was O(ops × tape): `capture` cloned the whole bounded tape per operation (85.9 s release / 226 s debug for 100 000 calls) | **fixed**: `Agent::events_since(seen_total)` returns only the delta (or `None` on a wrap), so recording and replay are linear; `replaying_thousands_of_calls_is_linear` |
+| F6 | low | the header latency is the *final* latency, used as the *initial* one on replay | **fixed**: a package whose first op is not `SetLatency(latency_ms)` is refused; `a_package_that_does_not_begin_with_its_latency_is_refused` |
+| F7 | low | the trace dropped discriminators (panic phase, introduction peer) | **fixed**: `provider.panicked:<phase>` and `cap.introduced:<fingerprint prefix>`; the raw identity is never recorded |
+| F8 | low | a package-controlled event name flowed raw into the mismatch message (newlines, ANSI) | **fixed**: at most 64 characters, `escape_debug`-rendered; `a_mismatch_message_is_bounded_and_escaped` |
+| F9 | low | a failed `capture` left the recorder poisoned while `package()` still produced a short trace | **fixed**: the recorder latches `poisoned` and `package()`/`encode()` refuse |
+
+Spec and docs: ADR-0018 now says the recorder drives its own kernel (a package
+describes a synthetic session carrying sizes, not argument fidelity), names the
+`u16` method limit, and states that the checksum detects corruption rather than
+authentication. The reviewer's note that `wire.md` had no ARRP section is
+recorded here rather than adding a wire format the CLI already documents.
+
+Also: the CLI's `replay dump`/`run` propagate the new fallible `package()`/
+`encode()`, and `fuzz_replay_package` follows the fallible `set_latency`.
+
+Gate: `cargo test --all-features` 527 passed, 0 failed; `--no-default-features`
+478 passed; clippy, fmt and `cargo doc -D warnings` clean in three
+configurations; control plane 30 and CLI 17 pass; the replay suites pass in
+`rust:1.88-bookworm`. `tests/replay_hardening_tests.rs` (9) is new.
 
 ### R-11 identity - 2026-11-01 (round 1)
 

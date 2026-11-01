@@ -64,12 +64,14 @@ fn structured(data: &[u8]) {
                 let cap = u32::from((action / 6) % 8);
                 let _ = recorder.revoke(cap);
             }
-            _ => recorder.set_latency(argument % 50),
+            _ => {
+                let _ = recorder.set_latency(argument % 50);
+            }
         }
     }
 
-    let package = recorder.package();
-    let encoded = package.encode();
+    let package = recorder.package().expect("package");
+    let encoded = package.encode().expect("encode");
     let decoded =
         ReplayPackage::decode(&encoded).expect("a package the recorder produced must decode");
     assert_eq!(decoded, package, "re-encode did not preserve the package");
@@ -97,12 +99,12 @@ fuzz_target!(|data: &[u8]| {
             if package.ops.len() > REPLAY_OP_CEILING {
                 return;
             }
-            let encoded = package.encode();
+            let encoded = package.encode().expect("encode");
             let again =
                 ReplayPackage::decode(&encoded).expect("a freshly encoded package must decode");
             assert_eq!(again, package, "re-encode changed the package");
             assert_eq!(
-                again.encode(),
+                again.encode().expect("encode"),
                 encoded,
                 "encoding the same package twice differs"
             );
