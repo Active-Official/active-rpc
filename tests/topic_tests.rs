@@ -388,7 +388,13 @@ fn a_publish_charges_the_capability_byte_budget() {
     let small = self::cap(&fixture, small_attrs);
     let error = fixture
         .agent
-        .publish(fixture.lane, channel, &small, "a-long-topic-name", Value::text("x"))
+        .publish(
+            fixture.lane,
+            channel,
+            &small,
+            "a-long-topic-name",
+            Value::text("x"),
+        )
         .expect_err("the topic name is charged");
     assert_eq!(error.code(), "rpc/budget-exceeded");
 
