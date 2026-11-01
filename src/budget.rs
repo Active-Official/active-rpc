@@ -154,6 +154,42 @@ impl BudgetMeter {
         &self.budget
     }
 
+    /// Remaining byte allowance.
+    pub fn remaining_bytes(&self) -> u64 {
+        self.budget.max_bytes.saturating_sub(self.bytes)
+    }
+
+    /// Refuse unless `calls` and `bytes` more fit under both ceilings.
+    ///
+    /// Used by an export, which transfers a grant out of the meters that hold it
+    /// rather than charging a call.
+    pub fn check_reserve(&self, calls: u64, bytes: u64) -> Result<()> {
+        let total_calls = self
+            .calls
+            .checked_add(calls)
+            .ok_or(Error::BudgetExceeded("call"))?;
+        if total_calls > self.budget.max_calls {
+            return Err(Error::BudgetExceeded("call"));
+        }
+        let total_bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(Error::BudgetExceeded("byte"))?;
+        if total_bytes > self.budget.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
+        }
+        Ok(())
+    }
+
+    /// Reserve `calls` and `bytes` without consuming the current call counter's
+    /// meaning: the grant has moved out, it was not spent here.
+    pub fn reserve(&mut self, calls: u64, bytes: u64) -> Result<()> {
+        self.check_reserve(calls, bytes)?;
+        self.calls = self.calls.saturating_add(calls);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
     /// Calls charged so far.
     pub fn calls(&self) -> u64 {
         self.calls

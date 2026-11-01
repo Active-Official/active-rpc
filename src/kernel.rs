@@ -369,6 +369,10 @@ pub struct Kernel {
     record_key: Option<[u8; 32]>,
     /// Record ids tombstoned by a revocation.
     revoked_records: BTreeSet<[u8; 32]>,
+    /// Record ids already exported (consumed) by this kernel.
+    consumed_records: BTreeSet<[u8; 32]>,
+    /// Record ids already restored by this kernel.
+    restored_records: BTreeSet<[u8; 32]>,
 }
 
 /// Control half of a capability handle: reference counting and provider
@@ -636,6 +640,8 @@ impl Agent {
             next_receipt: 0,
             record_key: None,
             revoked_records: BTreeSet::new(),
+            consumed_records: BTreeSet::new(),
+            restored_records: BTreeSet::new(),
             children: BTreeMap::new(),
             deferred_refops: Rc::clone(&deferred_refops),
         };
@@ -768,10 +774,13 @@ impl Agent {
                 "an imported handle cannot export authority",
             ));
         }
-        let kernel = self.cell.borrow();
+        let mut kernel = self.cell.borrow_mut();
+        // A clone: the export reserves the budget on the meters, which needs a
+        // mutable borrow.
         let record = kernel
             .caps
             .get(&cap.id())
+            .cloned()
             .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
         if record.attrs.persistence != CapPersistence::Durable {
             return Err(Error::persistence(
@@ -791,9 +800,10 @@ impl Agent {
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
         }
-        let provider = kernel
+        let provider_name = kernel
             .providers
             .get(&record.provider)
+            .map(|provider| provider.name().to_string())
             .ok_or_else(|| Error::persistence("the provider is no longer registered"))?;
         let key = kernel
             .record_key
@@ -806,17 +816,49 @@ impl Agent {
                 "a durable record must name the peer it was bound to",
             ));
         }
-        // A record describes what is left, not what was granted: a durable
-        // credential must not be a way to refill a spent grant.
+        // A record describes what is left, not what was granted, and the
+        // transfer is real: what the record carries is reserved on this
+        // capability *and* on every ancestor, so restoring it cannot create a
+        // second copy of a grant the subtree already spent.
+        if kernel.consumed_records.contains(&record.record_id) {
+            return Err(Error::persistence(
+                "the record was already exported and consumed",
+            ));
+        }
         let meter = kernel
             .meters
             .get(&record.id)
             .ok_or_else(|| Error::persistence("the capability has no meter"))?;
-        let remaining_calls = meter.remaining_calls();
-        let remaining_bytes = record.attrs.budget.max_bytes.saturating_sub(meter.bytes());
+        let own_calls = meter.remaining_calls();
+        let own_bytes = meter.remaining_bytes();
+        let mut remaining_calls = own_calls;
+        let mut remaining_bytes = own_bytes;
+        for ancestor in &record.lineage {
+            if let Some(parent_meter) = kernel.meters.get(ancestor) {
+                remaining_calls = remaining_calls.min(parent_meter.remaining_calls());
+                remaining_bytes = remaining_bytes.min(parent_meter.remaining_bytes());
+            }
+        }
         if remaining_calls == 0 || remaining_bytes == 0 {
             return Err(Error::persistence("the capability's grant is spent"));
         }
+        let mut chain: Vec<CapId> = record.lineage.clone();
+        chain.push(record.id);
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get(id) {
+                meter
+                    .check_reserve(remaining_calls, remaining_bytes)
+                    .map_err(|_| Error::persistence("the grant is already committed"))?;
+            }
+        }
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get_mut(id) {
+                meter
+                    .reserve(remaining_calls, remaining_bytes)
+                    .map_err(|_| Error::persistence("the grant is already committed"))?;
+            }
+        }
+        kernel.consumed_records.insert(record.record_id);
         if record
             .attrs
             .path_scope
@@ -828,7 +870,7 @@ impl Agent {
             return Err(Error::persistence("an empty path scope is not a scope"));
         }
         let mut record = crate::persistence::CapabilityRecord {
-            provider: provider.name().to_string(),
+            provider: provider_name,
             object: record.object,
             methods: record.attrs.methods.clone(),
             budget: crate::budget::Budget {
@@ -898,16 +940,23 @@ impl Agent {
         if bound != peer.fingerprint() {
             return Err(Error::Identity("the record is bound to a different peer"));
         }
-        // Restoring is a re-mint, so N restores of one credential would be N
-        // independent grants that a single revocation cannot reach.
-        if self
-            .cell
-            .borrow()
-            .caps
-            .values()
-            .any(|live| live.record_id == record.record_id && !live.revoked)
         {
-            return Err(Error::persistence("the record is already live"));
+            let kernel = self.cell.borrow();
+            // Restoring is a re-mint, so N restores of one credential would be N
+            // independent grants that a single revocation cannot reach.
+            if kernel
+                .caps
+                .values()
+                .any(|live| live.record_id == record.record_id && !live.revoked)
+            {
+                return Err(Error::persistence("the record is already live"));
+            }
+            // A credential is restored once: the budgets inside it were
+            // reserved at export, and restoring them again would mint a second
+            // grant from the same record.
+            if kernel.restored_records.contains(&record.record_id) {
+                return Err(Error::persistence("the record was already restored"));
+            }
         }
         let provider = {
             let kernel = self.cell.borrow();
@@ -952,6 +1001,10 @@ impl Agent {
         };
         let attrs = record.attrs(ttl_ms);
         let restored = self.mint_restored(peer, provider, record.object, attrs)?;
+        self.cell
+            .borrow_mut()
+            .restored_records
+            .insert(record.record_id);
         // Keep the record identity: a revocation that reaches this capability
         // must tombstone the same record id the credential carries.
         if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {

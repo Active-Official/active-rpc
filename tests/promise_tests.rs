@@ -549,12 +549,13 @@ fn a_restored_copy_cannot_refill_a_spent_grant() {
     );
     drop(record);
 
-    // The second call spends it; nothing is left to persist.
-    let promise = agent
+    // The export transferred the remaining call: the local capability cannot
+    // spend what the record now holds.
+    let error = agent
         .call_as(Some(&owner), lane, &narrow, "echo", Vec::new())
-        .expect("call");
-    agent.run();
-    promise.value().expect("value");
+        .expect_err("the grant moved into the record");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    // Nothing is left to export a second time.
     let error = agent
         .export_capability(&narrow)
         .expect_err("a spent grant cannot be exported");
@@ -725,4 +726,70 @@ fn a_provider_value_deeper_than_the_wire_limit_is_refused() {
     agent.run();
     let error = promise.value().expect_err("too deep is a provider fault");
     assert_eq!(error.code(), "rpc/provider", "{error}");
+}
+
+/// A record is restored once per kernel: the budgets inside it were reserved at
+/// export, so a second restore would mint a second copy of one grant.
+#[test]
+fn a_record_restores_once_per_kernel() {
+    let (agent, provider) = durable_agent();
+    let cap = bound_durable(&agent, provider, None);
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+    let owner = admitted(b"owner");
+    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    drop(restored);
+    let error = agent
+        .restore_capability(&record, &owner)
+        .expect_err("the record was already restored");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+}
+
+/// An exported record is consumed: the same capability cannot export twice.
+#[test]
+fn an_exported_record_is_consumed() {
+    let (agent, provider) = durable_agent();
+    let cap = bound_durable(&agent, provider, None);
+    agent.export_capability(&cap).expect("export");
+    let error = agent
+        .export_capability(&cap)
+        .expect_err("the grant moved out with the first record");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+}
+
+/// A restored child cannot outspend the ancestor it was derived from: the
+/// export reserves the lineage, not only the capability.
+#[test]
+fn a_restored_child_cannot_outspend_its_parent() {
+    let (agent, provider) = durable_agent();
+    let parent = bound_durable(&agent, provider, None);
+    let narrow_parent = agent
+        .attenuate(
+            &parent,
+            CapAttrs::new(&["echo"])
+                .with_budget(Budget::calls(1))
+                .durable(),
+        )
+        .expect("narrow parent");
+    let child = agent
+        .attenuate(
+            &narrow_parent,
+            CapAttrs::new(&["echo"])
+                .with_budget(Budget::calls(1))
+                .durable(),
+        )
+        .expect("child");
+    let owner = PeerIdentity::from_certificate(b"owner");
+    let lane = agent.create_lane("spend", Budget::default()).expect("lane");
+    let promise = agent
+        .call_as(Some(&owner), lane, &narrow_parent, "echo", Vec::new())
+        .expect("the parent's only call");
+    agent.run();
+    promise.value().expect("value");
+    // The parent has nothing left, so the child cannot export a grant it could
+    // then restore and spend.
+    let error = agent
+        .export_capability(&child)
+        .expect_err("the ancestor's grant is spent");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
 }

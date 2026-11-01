@@ -159,9 +159,10 @@ fn restoring_the_same_record_twice_is_refused() {
         .expect_err("the credential is already live");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
     drop(first);
-    agent
+    let error = agent
         .restore_capability(&record, &owner)
-        .expect("a released copy frees the credential");
+        .expect_err("a record is consumed once it has been restored");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
 }
 
 /// Tombstones only track durable records: an ephemeral mint/revoke cycle must
