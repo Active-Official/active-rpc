@@ -85,8 +85,9 @@ fn benches(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("kernel");
     group.bench_function("call-and-run", |bencher| {
         let mut provider = ModuleProvider::new();
-        let object =
-            provider.install(active_rpc::domain::module_from_source(SOURCE, "bench").unwrap());
+        let object = provider
+            .install(active_rpc::domain::module_from_source(SOURCE, "bench").unwrap())
+            .expect("install");
         let agent = Agent::new();
         let provider_id = agent.register(Box::new(provider));
         // A benchmark spends millions of calls; give the capability and the lane
@@ -139,7 +140,9 @@ fn benches(criterion: &mut Criterion) {
 
 fn kernel_fixture() -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
     let mut provider = ModuleProvider::new();
-    let object = provider.install(active_rpc::domain::module_from_source(SOURCE, "bench").unwrap());
+    let object = provider
+        .install(active_rpc::domain::module_from_source(SOURCE, "bench").unwrap())
+        .expect("install");
     let agent = Agent::new();
     let provider_id = agent.register(Box::new(provider));
     let wide = Budget {

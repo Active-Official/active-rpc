@@ -49,8 +49,9 @@ impl Provider for Echo {
 
 fn module_agent() -> (Agent, active_rpc::CapHandle) {
     let mut provider = ModuleProvider::new();
-    let object =
-        provider.install(active_rpc::domain::module_from_source(SOURCE, "c.active").unwrap());
+    let object = provider
+        .install(active_rpc::domain::module_from_source(SOURCE, "c.active").unwrap())
+        .expect("install");
     let agent = Agent::with_secret([31u8; 32]);
     let provider_id = agent.register(Box::new(provider));
     let cap = agent
@@ -149,7 +150,9 @@ fn concurrent_tool_calls_across_providers() {
     let echo_one = agent.register(Box::new(Echo));
     let echo_two = agent.register(Box::new(Echo));
     let mut provider = ModuleProvider::new();
-    let object = provider.install(active_rpc::domain::module_from_source(SOURCE, "d").unwrap());
+    let object = provider
+        .install(active_rpc::domain::module_from_source(SOURCE, "d").unwrap())
+        .expect("install");
     let modules = agent.register(Box::new(provider));
 
     let cap_a = agent.mint(echo_one, 0, CapAttrs::new(&["echo"])).unwrap();

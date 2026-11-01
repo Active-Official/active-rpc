@@ -644,7 +644,7 @@ impl PlaneCore {
         let agent = Agent::with_secret([0x51; 32]);
         let echo_provider = agent.register(Box::new(Echo));
         let mut module_provider = ModuleProvider::new();
-        let object = module_provider.install(fixture_module());
+        let object = module_provider.install(fixture_module())?;
         let module_provider = agent.register(Box::new(module_provider));
 
         let lane = agent

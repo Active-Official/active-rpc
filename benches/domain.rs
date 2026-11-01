@@ -51,7 +51,7 @@ fn fixture() -> (ModuleProvider, u64, active_infinity::InfinityModule) {
     let module =
         active_rpc::domain::module_from_source(SOURCE, "bench.active").expect("fixture module");
     let mut provider = ModuleProvider::new();
-    let object = provider.install(module.clone());
+    let object = provider.install(module.clone()).expect("install");
     (provider, object, module)
 }
 

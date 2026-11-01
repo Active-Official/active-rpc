@@ -22,7 +22,7 @@ fn fixture() -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x71; 32]);
     let mut provider = ModuleProvider::new();
     let module = active_rpc::domain::module_from_source(SOURCE, "scope.active").expect("module");
-    let object = provider.install(module);
+    let object = provider.install(module).expect("install");
     let id = agent.register(Box::new(provider));
     let mut attrs = CapAttrs::new(&["evaluate", "patch", "stats"]);
     attrs.path_scope = Some("app".to_string());
@@ -74,7 +74,7 @@ fn a_scoped_patch_cannot_reach_outside_the_scope() {
     let agent = Agent::with_secret([0x72; 32]);
     let mut provider = ModuleProvider::new();
     let module = active_rpc::domain::module_from_source(SOURCE, "scope.active").expect("module");
-    let object = provider.install(module);
+    let object = provider.install(module).expect("install");
     let id = agent.register(Box::new(provider));
     let mut attrs = CapAttrs::new(&["patch"]);
     attrs.path_scope = Some("app".to_string());

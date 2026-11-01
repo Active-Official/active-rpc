@@ -54,7 +54,8 @@ impl Provider for Echo {
 fn agent_with_module() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle) {
     let mut provider = ModuleProvider::new();
     let object = provider
-        .install(active_rpc::domain::module_from_source(SOURCE, "unit.active").expect("module"));
+        .install(active_rpc::domain::module_from_source(SOURCE, "unit.active").expect("module"))
+        .expect("install");
     let agent = Agent::with_secret([7u8; 32]);
     let provider_id = agent.register(Box::new(provider));
     let cap = agent
@@ -107,8 +108,9 @@ fn capability_ids_are_unforgeable() {
     // A capability minted by a different agent is unknown here too. The two
     // agents use different secrets, so their ids cannot collide.
     let mut provider = ModuleProvider::new();
-    let object =
-        provider.install(active_rpc::domain::module_from_source(SOURCE, "other.active").unwrap());
+    let object = provider
+        .install(active_rpc::domain::module_from_source(SOURCE, "other.active").unwrap())
+        .expect("install");
     let other_agent = Agent::new();
     let other_provider = other_agent.register(Box::new(provider));
     let other_cap = other_agent

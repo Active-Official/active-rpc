@@ -464,7 +464,7 @@ fn secret_module(literal: &str) -> active_infinity::InfinityModule {
 
 fn module_provider(agent: &Agent, literal: &str) -> (ProviderId, u64) {
     let mut provider = ModuleProvider::new();
-    let object = provider.install(secret_module(literal));
+    let object = provider.install(secret_module(literal)).expect("install");
     (agent.register(Box::new(provider)), object)
 }
 

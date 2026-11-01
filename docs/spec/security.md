@@ -52,9 +52,10 @@ that would violate one stops and needs an ADR.
 | Capability-table lie on the wire | descriptors are informational; only the registry grants | `wire`, `Kernel::call` |
 | Budget bypass | capability budget ∩ lane budget; charged per call; domain ops map the budget into the Active evaluator | `Budget`, `BudgetMeter`, `domain` |
 | Read-only bypass | mutating methods refused before the provider sees the call | `Kernel::call` |
-| Path escape | path arguments checked against the capability scope before dispatch | `Kernel::call` |
+| Path escape | path arguments checked against the capability scope before dispatch, and a module provider refuses a path outside the scope as well as a pathless form under one (it would return the whole module) | `Kernel::call`, `ModuleProvider::serve` |
 | Confused deputy across providers | a capability names one provider and one object; method sets do not travel between them | `CapRecord`, `Provider` |
-| Secret leakage | values carry `Value::Secret` markers; evaluation, annotations and provenance never carry secret bytes; envelope has no secret-bytes tag | `security`, `wire`, `domain` |
+| Secret leakage | values carry `Value::Secret` markers; evaluation, annotations and provenance never carry secret bytes (provider text is redacted through the library's own rule); envelope has no secret-bytes tag | `security`, `wire`, `domain` |
+| Agent-immutable node rewritten | a patch refuses a target under `@ai_immutable: true`, and a scoped patch refuses a write whose named dependents leave the scope | `ModuleProvider::serve` |
 | Revoked capability still usable | revocation marks the record and every descendant; the check runs at queue time **and again at dispatch** | `Agent::revoke`, `Kernel::dispatch` |
 | Cancelled / destroyed work still runs | a queued job is removed on cancel or lane destruction | `Agent::cancel`, `Agent::destroy_lane` |
 | Secret bytes in a module result | `subgraph`/`patch` return a **redacted** module: every secret node becomes the marker before encoding | `domain::redacted_module_bytes` |

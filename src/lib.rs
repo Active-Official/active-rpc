@@ -32,7 +32,7 @@
 //! let object = provider.install(active_rpc::domain::module_from_source(
 //!     "port = 8080\n",
 //!     "demo.active",
-//! )?);
+//! )?)?;
 //! let agent = Agent::new();
 //! let provider_id = agent.register(Box::new(provider));
 //! let cap = agent.mint(provider_id, object, CapAttrs::new(&["stats"]))?;

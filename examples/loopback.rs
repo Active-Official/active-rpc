@@ -15,7 +15,7 @@ fn main() -> Result<(), active_rpc::Error> {
     let object = provider.install(module_from_source(
         "port = 8080\nname = \"loopback\"\n",
         "loopback.active",
-    )?);
+    )?)?;
     let agent = Agent::new();
     let provider_id = agent.register(Box::new(provider));
 

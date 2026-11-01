@@ -43,7 +43,7 @@ fn setup() -> (
     active_rpc::LaneId,
 ) {
     let mut provider = ModuleProvider::new();
-    let object = provider.install(module());
+    let object = provider.install(module()).expect("install");
     let agent = Agent::with_secret([21u8; 32]);
     let provider_id = agent.register(Box::new(provider));
     let cap = agent

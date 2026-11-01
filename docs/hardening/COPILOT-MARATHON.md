@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
-| R-07 | domain ops | `src/domain.rs` | round 1: critical fixed, 11 open | 1 fixed / 0 rejected / 11 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | pending | — | — |
 | R-09 | transports | `src/transport/**` | pending | — | — |
 | R-10 | bulk | `src/bulk.rs` | pending | — | — |
@@ -164,8 +164,9 @@ refuse; a hostile record cannot insert into either set). Two new highs:
 The reviewer applied its fixes directly to the working tree; they are in commit
 `da59ba9` together with the R-07 D-1 fix and the removal of the scratch probes.
 
-Gate: `cargo test --all-features` 456 passed, 0 failed; clippy clean on both
-feature sets; fmt clean.
+Gate after the D-2..D-12 work: `cargo test --all-features` 466 passed, 0 failed
+(and the `--no-default-features` suite green); clippy clean on both feature sets;
+fmt clean.
 
 ### R-07 domain operations - 2026-11-01 (round 1, in progress)
 
@@ -174,16 +175,17 @@ Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `22c3d66`.
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
 | D-1 | critical | `Call.path_scope` was never enforced by the domain provider: a capability confined to `app` returned the whole module (pathless `evaluate`, `patch` outside the scope, `stats`/`annotations`/`provenance`/`content_hash`, and dependents labels) | **fixed**: `ModuleProvider::serve` refuses a path outside the scope and refuses a pathless form under a scope (`rpc/path-not-granted`); `tests/domain_scope_tests.rs` (4) |
-| D-2 | high | metadata queries ignore `Budget` and are O(n²): `why`/`impact` took 2.5 s at 3 000 nodes and 10.7 s at 6 000 | open: charge the query against `max_nodes`/`max_wall_ms` and index the cone |
-| D-3 | high | an unchecked index, a quadratic cone and a panicking call destroy the module object | open: bounds-check the index, make the cone linear, and catch the panic before re-inserting |
-| D-4 | high | `restrict`/`subgraph` drop annotations, so a scoped `evaluate` skips `@constraint` and the output loses `@ai_immutable` | open: copy annotations and their edges into the cone |
-| D-5 | medium | `patch` ignores `@ai_immutable` and wipes module provenance | open |
-| D-6 | medium | provenance/annotation text is not redacted against secret literals in the provider | open |
-| D-7 | medium | a scoped `patch` changes values outside the scope through shared bindings | open |
-| D-8..D-12 | low | redacting `stats` discloses the secret count; `rpc/payload` for lowering faults; unbounded `drops`; `timestamp_ms as i64`; refused calls counted as served | open |
+| D-2 | high | metadata queries ignore `Budget` and are quadratic: `why`/`impact` took 2.5 s at 3 000 nodes and 10.7 s at 6 000 (measured) | **fixed**: one adjacency and one path map per call, `max_nodes` refused as `rpc/budget-exceeded`, and a walk past `max_wall_ms` refused; `why_is_linear_in_module_size`, `metadata_queries_respect_max_nodes` |
+| D-3 | high | an unchecked index in the taint walk, a quadratic taint fixpoint, and a panicking call that destroyed the module object | **fixed**: one Kahn pass over a checked adjacency, `invoke` re-inserts the slot through `catch_unwind` and resumes the unwind, and `install` validates a module as canonical before storing it; `a_deep_chain_redacts_quickly` (4 000 links, 4.9 s measured before), `install_refuses_a_dangling_locator` |
+| D-4 | high | `restrict`/`subgraph` dropped annotations, so a projection lost `@ai_immutable` and a constraint whose expression was outside the cone | **fixed**: the cone grows to include every in-cone constraint expression, annotations are remapped, and bindings plus provenance travel with it; `subgraph_preserves_annotations` |
+| D-5 | medium | `patch` ignored `@ai_immutable` and replaced the provenance with an empty one | **fixed**: a target or ancestor under `@ai_immutable` is `rpc/read-only`, and the new provenance keeps the producer chain with the old content address as `parent`; `patch_refuses_an_ai_immutable_node`, `patch_preserves_the_parent_provenance` |
+| D-6 | medium | provenance/annotation text left a copy of a secret literal as ordinary text | **fixed**: the provenance map is built from `interop::provenance_lines` (a copy becomes the marker), and `install` refuses a non-canonical arena that could carry one; `provenance_redacts_secret_literals` |
+| D-7 | medium | a scoped `patch` changed a value outside the scope through a shared node | **fixed**: a scoped write is refused (`rpc/path-not-granted`) when any named dependent of the target lies outside the scope; `a_scoped_patch_cannot_change_a_value_outside_its_scope` |
+| D-8..D-12 | low | redacting `stats` disclosed the secret count and hidden annotations their node id; lowering faults used `rpc/payload`; the drop log was unbounded; `timestamp_ms as i64` wrapped; a refused call counted as served | **fixed**: the count is omitted under `redact`, a hidden annotation names no node, encode/lower faults are `rpc/domain` (`active/lower`), `MAX_DROP_LOG` bounds the log, `i64::try_from` clamps, and `calls` advances only after the slot is taken |
 
-Gate: `cargo test --all-features` 456 passed, 0 failed; clippy clean on both
-feature sets; fmt clean.
+Gate after the D-2..D-12 work: `cargo test --all-features` 466 passed, 0 failed
+(and the `--no-default-features` suite green); clippy clean on both feature sets;
+fmt clean.
 
 ### R-05 lanes / channels - 2026-11-01 (round 1)
 

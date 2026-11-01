@@ -44,7 +44,7 @@ fn fixture() -> (ModuleProvider, u64) {
     let mut provider = ModuleProvider::new();
     let module = active_rpc::domain::module_from_source(SOURCE, "hotpath.active")
         .expect("fixture module parses and lowers");
-    let object = provider.install(module);
+    let object = provider.install(module).expect("install");
     (provider, object)
 }
 
@@ -62,10 +62,17 @@ fn text(response: Response) -> String {
 #[test]
 fn content_hash_is_computed_once_and_cached() {
     let (mut provider, object) = fixture();
+    // `install` validates the module as canonical before it stores it, so the
+    // hash of that validated image is already known.
+    let seeded = provider
+        .cached_hash(object)
+        .expect("install() seeds the canonical hash it validated");
+    let encoded =
+        active_infinity::encode(provider.module(object).expect("module")).expect("encode");
     assert_eq!(
-        provider.cached_hash(object),
-        None,
-        "install() starts with no cached hash"
+        seeded,
+        active_infinity::content_hash(&encoded).expect("hash"),
+        "the seeded hash is the module's canonical hash"
     );
 
     let first = text(invoke(
@@ -158,11 +165,13 @@ fn patch_clears_the_cached_hash_and_advances_the_module() {
     ));
     assert!(provider.cached_hash(object).is_some());
 
+    // `app` is marked `# @ai_immutable: true` in the fixture, and that marker is
+    // now enforced: the write targets a mutable path.
     let patch = Call::new(
         "patch",
         vec![
-            Arg::Value(Value::Path("app.name".to_string())),
-            Arg::Value(Value::text("renamed")),
+            Arg::Value(Value::Path("server.port".to_string())),
+            Arg::Value(Value::Int(9090)),
         ],
     );
     let response = invoke(&mut provider, object, &patch);
@@ -172,10 +181,10 @@ fn patch_clears_the_cached_hash_and_advances_the_module() {
     // The returned image is the redacted projection; the stored module keeps
     // its secret and must show the replacement at the target path.
     let stored = provider.module(object).expect("module");
-    let node = active_rpc::domain::resolve_path(stored, "app.name").expect("path resolves");
+    let node = active_rpc::domain::resolve_path(stored, "server.port").expect("path resolves");
     assert_eq!(
         stored.get(node).expect("node"),
-        &active_infinity::Inode::Str("renamed".to_string())
+        &active_infinity::Inode::Int(9090)
     );
     let projected = active_infinity::decode(&bytes).expect("patched image decodes");
     // The projection replaces the secret with a marker, so it is canonical and
@@ -372,7 +381,7 @@ fn cap_attrs_still_gate_the_refactor() {
     let mut read_only = Call::new(
         "patch",
         vec![
-            Arg::Value(Value::Path("app.name".to_string())),
+            Arg::Value(Value::Path("server.port".to_string())),
             Arg::Value(Value::text("x")),
         ],
     );
@@ -385,8 +394,8 @@ fn cap_attrs_still_gate_the_refactor() {
     let patch = Call::new(
         "patch",
         vec![
-            Arg::Value(Value::Path("app.name".to_string())),
-            Arg::Value(Value::text("x")),
+            Arg::Value(Value::Path("server.port".to_string())),
+            Arg::Value(Value::Int(1)),
         ],
     );
     // The provider reports `patch` as mutating; the dispatcher uses this to

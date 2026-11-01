@@ -94,7 +94,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let module = active_rpc::domain::module_from_source(SOURCE, "peer.active")?;
     let mut module_provider = ModuleProvider::new();
-    let module_object = module_provider.install(module);
+    let module_object = module_provider.install(module)?;
 
     let agent = Agent::new();
     let module_provider_id = agent.register(Box::new(module_provider));
