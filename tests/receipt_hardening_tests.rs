@@ -37,6 +37,11 @@ impl Provider for Echo {
 
 const SECRET: [u8; 32] = [0x6d; 32];
 
+/// The key that seals receipts, derived from the kernel secret.
+fn receipt_key() -> [u8; 32] {
+    active_rpc::receipts::derive_receipt_key(&SECRET)
+}
+
 /// A provider whose single method name is chosen by the test, so a grant can sit
 /// exactly at the receipt ceiling.
 struct LongEcho {
@@ -179,10 +184,10 @@ fn a_kernel_ring_that_wrapped_exports_cleanly() {
     );
 
     let log = ReceiptLog::create_starting_at(&path, receipts[0].sequence).expect("create");
-    log.append_verified(&SECRET, &receipts)
+    log.append_verified(&receipt_key(), &receipts)
         .expect("a wrapped ring exports its own window");
     assert_eq!(log.records().expect("records"), receipts);
-    log.verify_macs(&SECRET).expect("macs");
+    log.verify_macs(&receipt_key()).expect("macs");
     assert_eq!(log.start_sequence().expect("start"), 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -246,7 +251,8 @@ fn a_truncated_prefix_is_refused_against_the_pinned_head() {
     let path = dir.join("receipts.arrl");
     let (_, receipts) = session(3);
     let log = ReceiptLog::create(&path).expect("create");
-    log.append_verified(&SECRET, &receipts).expect("append");
+    log.append_verified(&receipt_key(), &receipts)
+        .expect("append");
     let head = log.head_hash().expect("head");
     log.verify_against(head).expect("the whole log");
 
@@ -277,14 +283,14 @@ fn append_verified_refuses_a_forged_receipt() {
     let path = dir.join("receipts.arrl");
     let (_, receipts) = session(1);
     let log = ReceiptLog::create(&path).expect("create");
-    log.append_verified(&SECRET, &receipts)
+    log.append_verified(&receipt_key(), &receipts)
         .expect("the real one");
     let before = std::fs::read(&path).expect("read");
 
     let mut forged = receipt(2, receipts[0].at_ms + 1);
     forged.mac = [0x11; 32];
     let error = log
-        .append_verified(&SECRET, &[forged.clone()])
+        .append_verified(&receipt_key(), &[forged.clone()])
         .expect_err("a receipt this kernel did not produce");
     assert_eq!(error.code(), "rpc/receipt");
     assert_eq!(std::fs::read(&path).expect("read"), before);
@@ -293,7 +299,7 @@ fn append_verified_refuses_a_forged_receipt() {
     // whose MAC is wrong when asked to authenticate it.
     log.append(&forged).expect("append without authentication");
     let error = log
-        .verify_macs(&SECRET)
+        .verify_macs(&receipt_key())
         .expect_err("the forged record is named");
     assert_eq!(error.code(), "rpc/receipt");
     assert!(
@@ -506,7 +512,8 @@ fn create_refuses_to_overwrite_evidence() {
     let path = dir.join("receipts.arrl");
     let (_, receipts) = session(2);
     let log = ReceiptLog::create(&path).expect("create");
-    log.append_verified(&SECRET, &receipts).expect("append");
+    log.append_verified(&receipt_key(), &receipts)
+        .expect("append");
     let error = ReceiptLog::create(&path).expect_err("records already exist");
     assert_eq!(error.code(), "rpc/receipt");
     assert_eq!(log.records().expect("records").len(), 2, "nothing was lost");
@@ -554,14 +561,15 @@ fn a_refusal_round_trips_through_the_log() {
     assert_eq!(receipts.len(), 1);
 
     let log = ReceiptLog::create(&path).expect("create");
-    log.append_verified(&SECRET, &receipts).expect("append");
+    log.append_verified(&receipt_key(), &receipts)
+        .expect("append");
     let read = log.records().expect("records");
     assert_eq!(read, receipts);
     assert_eq!(
         read[0].decision,
         Decision::Refused("rpc/revoked".to_string())
     );
-    log.verify_macs(&SECRET).expect("macs");
+    log.verify_macs(&receipt_key()).expect("macs");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -591,9 +599,10 @@ fn a_long_granted_method_is_recorded_exactly() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].method, method, "no truncation, no label");
     let log = ReceiptLog::create(&path).expect("create");
-    log.append_verified(&SECRET, &receipts).expect("append");
+    log.append_verified(&receipt_key(), &receipts)
+        .expect("append");
     assert_eq!(log.records().expect("records"), receipts);
-    log.verify_macs(&SECRET).expect("macs");
+    log.verify_macs(&receipt_key()).expect("macs");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

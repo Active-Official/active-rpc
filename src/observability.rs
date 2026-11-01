@@ -235,7 +235,7 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
         }
         Event::ReceiptsDropped { count } => {
             trace.event = "receipts.dropped";
-            trace.detail = Some(format!("{count} dropped"));
+            trace.detail = Some(format!("{count} dropped in total"));
         }
         Event::PromiseRejected { promise, code } => {
             trace.event = "promise.rejected";

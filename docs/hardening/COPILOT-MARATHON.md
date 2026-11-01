@@ -26,7 +26,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
 | R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
-| R-13 | receipts | `src/receipts.rs` | round 1: 4 highs + 5 mediums + 4 lows fixed | 13 fixed / 0 rejected / 0 open | this commit |
+| R-13 | receipts | `src/receipts.rs` | round 1: 4 highs + 5 mediums + 4 lows; round 2: 3 highs + 6 mediums + 7 lows | 29 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | pending | — | — |
 | R-15 | observability | `src/observability.rs` | pending | — | — |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | pending | — | — |
@@ -194,6 +194,42 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-13 receipts - 2026-11-01 (round 2)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `6150e72`.
+Part A verified all thirteen round-1 findings against the code (twelve
+COMPLETELY FIXED, F8 NOT FIXED); Part B found sixteen more, each reproduced with
+a probe. Three highs, six mediums, seven lows, all closed here. The repeated
+theme: a writer that does not apply the reader's rules, and a key that was the
+authority token itself.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| B1 | high | `--secret-hex` put the master kernel secret (which mints capability ids) on the command line, and both the CLI and the library sealed with it | **fixed**: receipts are sealed with `derive_receipt_key(secret)` (`active-rpc/receipt-key/v1`), exposed as `Agent::receipt_key`; the CLI takes `--receipt-key-file` (0600 on unix) and refuses the secret; `a_receipt_is_sealed_with_a_derived_key_not_the_kernel_secret` |
+| B2 | high | a job failed before dispatch (unorderable pipeline, vanished provider, destroyed lane) settled with no receipt, so "no call" looked like "refused and undocumented" | **fixed**: `Job::receipted` plus one seal point (`Kernel::seal_receipt`) used by dispatch and `fail_job`; `a_refusal_before_dispatch_is_recorded`, `a_destroyed_lane_records_the_calls_it_drops` |
+| B3 | high | the writer still accepted two records the reader rejects: `Refused("")`, and a start near `u64::MAX` where the writer used `saturating_add` and the reader `checked_add` | **fixed**: `encode_record` calls `fields_are_representable` (the reader's predicate), the writer uses `checked_add`, and a start within `MAX_LOG_RECORDS` of the ceiling is refused; `a_refused_code_the_reader_rejects_is_refused_by_the_writer`, `a_start_too_close_to_the_sequence_ceiling_is_refused` |
+| B4 | medium | a 64-*byte* non-ASCII key made the CLI slice inside a character and panic (exit 101) | **fixed**: `parse_hex32` checks the alphabet first; CLI test covers it |
+| B5 | medium | `receipts verify` read and walked the log six times and could print a head no MAC check covered | **fixed**: `ReceiptLog::snapshot` reads once (`Snapshot` carries records, start, head, last time); the CLI verifies and prints from it |
+| B6 | medium | a crash mid-`write_all` left the log unreadable and unappendable, with total loss (`truncate`) as the only exit | **fixed**: `ReceiptLog::repair` cuts back to the last complete record only when the tail is genuinely torn (declared length past EOF) and refuses damage inside; `receipts repair`; `a_torn_tail_is_repaired_and_the_surviving_chain_verifies`, `repair_keeps_a_damaged_record_inside_the_log` |
+| B7 | medium | a stale `.lock` blocked appends forever and cost 1.18 s per attempt | **fixed**: the lock records pid and start time, and one older than 120 s is stolen; `a_stale_lock_is_stolen_instead_of_blocking_forever` |
+| B8 | medium | `create`/`truncate` bypassed the writer lock, so a create racing an append left the fresh log corrupt | **fixed**: `create_locked` takes the same lock first; `create_honours_a_held_writer_lock` |
+| B9 | medium | the default `receipts verify` exited 0 with `ok` for a forged and truncated log | **fixed**: one of `--receipt-key-file`, `--expect-head`, `--chain-only` is required (exit 2 otherwise) |
+| B11 | low | `create` overwrote any existing file of ≤ 16 bytes | **fixed**: any existing content is refused; `create_refuses_any_existing_content` |
+| B12 | low | the append encoded a whole batch before applying the size ceilings | **fixed**: both ceilings are checked as they are crossed |
+| B13 | low | a broken link named a 1-based index, not the sequence | **fixed**: errors name the sequence |
+| B14 | low | a second session could not append to an existing log (sequence restarted at 1, virtual clock at 0) | **fixed**: `Agent::set_receipt_sequence(next)` plus the documented wall-clock requirement; `a_second_session_continues_a_log` |
+| B15 | low | human-readable lines printed caller-supplied paths unquoted | **fixed**: `{:?}` |
+| B16 | low | `Event` grew a variant without `#[non_exhaustive]`, a breaking change for a downstream match | **fixed**: `#[non_exhaustive]`, and the crate moves to 2.3.0 (ADR-0006: additive API is a minor bump) |
+
+Test gap closed from the same review: `fuzz_receipt_log` now fuzzes the *writer*
+as well (`append` → `records` over arbitrary fields), because a writer-side hole
+is invisible to a reader-only campaign. 4000 runs, no crash, 167 MB peak RSS.
+
+Gate (round 2): `cargo test --all-features` 563 passed, 0 failed across 64
+suites; `--no-default-features` 514 passed, 0 failed across 64 suites; clippy,
+fmt and `cargo doc -D warnings` clean on both feature sets; control plane 30 and
+CLI 17 pass; `tests/receipt_round2_tests.rs` (14) is new.
 
 ### R-13 receipts - 2026-11-01 (round 1)
 

@@ -84,6 +84,34 @@ Two consequences follow from the review and are worth stating:
   construction. Pinning the head is the operation that detects it, so an export
   should always publish its head next to the file.
 
+## Amendments (R-13, hostile review round 2)
+
+A second review verified all thirteen round-1 findings against the code and
+found sixteen more. Ten were fixed here; the rest were absorbed into the design
+below.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| B1 | high | `--secret-hex` put the *master* kernel secret (which mints capability ids) on the process command line, and the CLI and library both sealed with it | Receipts are sealed with a purpose-derived key: `derive_receipt_key(secret) = blake3::derive_key("active-rpc/receipt-key/v1", secret)`, exposed as `Agent::receipt_key`. The CLI takes `--receipt-key-file PATH` (unix: mode must be 0600) and never accepts the secret |
+| B2 | high | a job failed before dispatch (unorderable pipeline, vanished provider, destroyed lane) settled with no receipt, so "no call" and "refused and undocumented" looked alike | `Job` carries `receipted`; `Kernel::seal_receipt` is the single seal point, called from dispatch and from `fail_job` when the job has none yet |
+| B3 | high | the writer still accepted two records the reader rejects: `Decision::Refused("")` and a start near `u64::MAX` (which `saturating_add` let through while the reader used `checked_add`) | `encode_record` now calls `fields_are_representable` (the reader's own predicate), `append_inner` uses `checked_add`, and `create_starting_at` refuses a start within `MAX_LOG_RECORDS` of the ceiling |
+| B4 | medium | a 64-*byte* non-ASCII key made the CLI slice inside a character and panic (exit 101) | `parse_hex32` checks the alphabet before slicing |
+| B5 | medium | `receipts verify` read and walked the whole log six times, and could print a head no MAC check covered | `ReceiptLog::snapshot` reads once; the CLI verifies and prints from that |
+| B6 | medium | a crash mid-`write_all` left the log unreadable *and* unappendable, with `truncate` (total loss) as the only exit | `ReceiptLog::repair` cuts back to the last complete record, and only when the tail is a genuinely torn record (its declared length runs past the end); damage inside the log is refused. CLI: `receipts repair` |
+| B7 | medium | a stale `.lock` after a crash blocked appends forever and cost 1.18 s per attempt | The lock records pid and start time, and a lock older than `LOCK_STALE_MS` (120 s) is stolen |
+| B8 | medium | `create`/`truncate` bypassed the writer lock, so a create racing an append left the fresh log corrupt | `create_locked` takes the same lock before `File::create` |
+| B9 | medium | the default `receipts verify` exited 0 with `ok` for a forged *and* truncated log | One of `--receipt-key-file`, `--expect-head` or `--chain-only` is required; the unauthenticated mode is opt-in |
+| B11 | low | `create` overwrote any existing file of ≤ 16 bytes | Any existing content is refused |
+| B12 | low | the append encoded a whole batch before applying the size ceilings | Both ceilings are checked as they are crossed |
+| B13 | low | a broken link named a 1-based index, not the sequence | Errors name `sequence` |
+| B14 | low | a second session could not append to an existing log (the sequence restarted at 1; a virtual clock restarted at 0) | `Agent::set_receipt_sequence(next)`; documented with the wall-clock requirement, and tested |
+| B15 | low | human-readable lines printed caller-supplied paths unquoted | Paths are printed with `{:?}` |
+| B16 | low | `Event` grew a variant without `#[non_exhaustive]`, which is a breaking change for a downstream `match` | `Event` is `#[non_exhaustive]`, and the crate moves to 2.3.0 (ADR-0006: additive API is a minor bump) |
+
+After round 2: the writer cannot produce a record its reader rejects, a refusal
+always leaves a receipt, the key that proves a log is not the key that mints
+authority, and a crash costs at most one record.
+
 ## Consequences
 
 - The log holds correlation ids, method names, times and the decision. It never

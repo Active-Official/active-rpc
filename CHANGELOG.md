@@ -1,6 +1,11 @@
 # Changelog - Active RPC
 
-## Unreleased
+## Unreleased - 2.3.0
+
+Additive API (minor bump per ADR-0006): `Event::ReceiptsDropped` and
+`#[non_exhaustive]` on `Event`, the `ARRL` v2 log, a purpose-separate receipt
+key, `ReceiptLog::snapshot`/`repair_tail`, `Snapshot`, `derive_receipt_key`,
+`Agent::receipt_key`/`set_receipt_sequence`, and `Receipt::fields_are_representable`.
 
 Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
 (replay) and R-13 (receipts) audit rounds.
@@ -39,6 +44,17 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
 - New `fuzz_receipt_log` target: `verify_bytes` is total, an accepted log is
   canonical, every record boundary is a valid shorter log, and a kernel export
   round-trips.
+- **Round 2 of the same section** (16 more findings, all closed): receipts are
+  sealed with a purpose-derived key (`derive_receipt_key`, `Agent::receipt_key`)
+  so a verifier is never handed the secret that mints ids; a job refused before
+  dispatch still records `Refused`; the writer applies the reader's own
+  predicate, so an empty refusal code or a start near `u64::MAX` cannot be
+  written and then unreadable; `receipts verify` reads one `snapshot()` instead of
+  six and requires `--receipt-key-file`, `--expect-head` or `--chain-only`;
+  `ReceiptLog::repair`/`receipts repair` cut a torn trailing write back to the
+  last complete record; a stale lock is stolen after 120 s and `create` honours
+  the lock; `set_receipt_sequence` lets a restart continue a log; `Event` is
+  `#[non_exhaustive]` (2.3.0); paths and keys are validated without panicking.
 
 ### Replay
 

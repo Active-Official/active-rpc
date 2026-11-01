@@ -1154,11 +1154,21 @@ impl PlaneCore {
                 ..base
             },
             // The receipt ring started dropping: the audit window is shorter
-            // than the session, which an operator must see.
+            // than the session, which an operator must see. `count` is the
+            // running total, not one eviction.
             Event::ReceiptsDropped { count } => UiEvent {
                 category: category_for("cap_lifecycle").into(),
                 kind: "receipts_dropped".into(),
-                detail: format!("{count} receipt(s) evicted from the ring"),
+                detail: format!("{count} receipt(s) dropped in total (evicted or cleared)"),
+                ..base
+            },
+            // `Event` is `#[non_exhaustive]`: a variant this build does not know
+            // about still shows up as a generic system event instead of failing
+            // to compile against a newer kernel.
+            _ => UiEvent {
+                category: "system".into(),
+                kind: "event".into(),
+                detail: "unrecognised kernel event".into(),
                 ..base
             },
         }

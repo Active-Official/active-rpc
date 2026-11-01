@@ -339,13 +339,34 @@ fn receipts_dump_verify_and_tamper_paths() {
     );
     assert!(log.is_file());
 
-    let verify = run(&["receipts", "verify", log_arg]);
-    assert!(verify.status.success(), "{}", stderr(&verify));
-    let text = stdout(&verify);
+    // The demo's kernel is fixed, so the test can derive the same receipt key
+    // the CLI sealed with: `receipts::derive_receipt_key(&[0x5e; 32])`.
+    let receipt_key = active_rpc::receipts::derive_receipt_key(&[0x5e; 32]);
+    let key_path = dir.join("receipt.key");
+    let key_hex: String = receipt_key
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    std::fs::write(&key_path, format!("{key_hex}\n")).expect("write key");
+    let key_arg = key_path.to_str().expect("key path");
+
+    // An unauthenticated check is not offered as "ok": it proves the chain and
+    // nothing about who wrote it, so the operator has to ask for it.
+    let unauth = run(&["receipts", "verify", log_arg]);
+    assert_eq!(unauth.status.code(), Some(2), "{}", stderr(&unauth));
+    assert!(
+        stderr(&unauth).contains("--receipt-key-file"),
+        "{}",
+        stderr(&unauth)
+    );
+
+    let chain_only = run(&["receipts", "verify", log_arg, "--chain-only"]);
+    assert!(chain_only.status.success(), "{}", stderr(&chain_only));
+    let text = stdout(&chain_only);
     assert!(text.starts_with("ok 4 receipts"), "{text}");
     assert!(
         text.contains("chain-only (unauthenticated)"),
-        "an unkeyed verify must say what it did not check: {text}"
+        "a chain-only verify must say what it did not check: {text}"
     );
     let head = text
         .split_whitespace()
@@ -356,9 +377,8 @@ fn receipts_dump_verify_and_tamper_paths() {
         .to_string();
     assert_eq!(head.len(), 64);
 
-    // The owner path: with the kernel secret the MACs are checked too.
-    let secret = "5e".repeat(32);
-    let authed = run(&["receipts", "verify", log_arg, "--secret-hex", &secret]);
+    // The owner path: the receipt key checks every MAC.
+    let authed = run(&["receipts", "verify", log_arg, "--receipt-key-file", key_arg]);
     assert!(authed.status.success(), "{}", stderr(&authed));
     assert!(
         stdout(&authed).contains("macs verified"),
@@ -379,15 +399,39 @@ fn receipts_dump_verify_and_tamper_paths() {
         stderr(&mismatch)
     );
 
-    // A wrong secret is a refusal, not a pass.
-    let foreign = "6d".repeat(32);
-    let forged = run(&["receipts", "verify", log_arg, "--secret-hex", &foreign]);
+    // A wrong key is a refusal, not a pass.
+    let foreign_path = dir.join("foreign.key");
+    let foreign_key = active_rpc::receipts::derive_receipt_key(&[0x6d; 32]);
+    let foreign_hex: String = foreign_key
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    std::fs::write(&foreign_path, foreign_hex).expect("write key");
+    let forged = run(&[
+        "receipts",
+        "verify",
+        log_arg,
+        "--receipt-key-file",
+        foreign_path.to_str().unwrap(),
+    ]);
     assert_eq!(forged.status.code(), Some(1));
     assert!(
         stderr(&forged).contains("not produced by this kernel"),
         "{}",
         stderr(&forged)
     );
+
+    // A non-ASCII key is a usage error, not a panic in the slicing code.
+    let bad_key = dir.join("bad.key");
+    std::fs::write(&bad_key, format!("a\u{20ac}{}", "0".repeat(60))).expect("write");
+    let panic_free = run(&[
+        "receipts",
+        "verify",
+        log_arg,
+        "--receipt-key-file",
+        bad_key.to_str().unwrap(),
+    ]);
+    assert_eq!(panic_free.status.code(), Some(2), "{}", stderr(&panic_free));
 
     let show = run(&["receipts", "show", log_arg, "--limit", "2"]);
     assert!(show.status.success(), "{}", stderr(&show));
@@ -409,13 +453,32 @@ fn receipts_dump_verify_and_tamper_paths() {
     let middle = bytes.len() / 2;
     bytes[middle] ^= 0x01;
     std::fs::write(&log, &bytes).expect("tamper");
-    let refused = run(&["receipts", "verify", log_arg]);
+    let refused = run(&["receipts", "verify", log_arg, "--chain-only"]);
     assert_eq!(refused.status.code(), Some(1));
     assert!(
         stderr(&refused).contains("rpc/receipt"),
         "{}",
         stderr(&refused)
     );
+
+    // A torn trailing write is repairable: the CLI cuts it and keeps the chain.
+    let dir2 = sandbox("receipts-repair");
+    let torn = dir2.join("torn.arrl");
+    let torn_arg = torn.to_str().expect("path");
+    let dump = run(&["receipts", "dump", "--output", torn_arg]);
+    assert!(dump.status.success(), "{}", stderr(&dump));
+    let mut bytes = std::fs::read(&torn).expect("read");
+    bytes.truncate(bytes.len() - 5);
+    std::fs::write(&torn, &bytes).expect("tear");
+    let repaired = run(&["receipts", "repair", torn_arg]);
+    assert!(repaired.status.success(), "{}", stderr(&repaired));
+    assert!(
+        stdout(&repaired).contains("3 receipts kept"),
+        "{}",
+        stdout(&repaired)
+    );
+    let after = run(&["receipts", "verify", torn_arg, "--chain-only"]);
+    assert!(after.status.success(), "{}", stderr(&after));
 
     // A missing log is a usage error, not a panic.
     let missing = run(&[

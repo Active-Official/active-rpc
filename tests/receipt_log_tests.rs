@@ -32,6 +32,12 @@ impl Provider for Echo {
 
 const SECRET: [u8; 32] = [0x6d; 32];
 
+/// The key that seals receipts: derived from the kernel secret, so a verifier
+/// never needs the secret that mints capability ids.
+fn receipt_key() -> [u8; 32] {
+    active_rpc::receipts::derive_receipt_key(&SECRET)
+}
+
 /// A kernel with receipts enabled and three admitted calls (plus one refusal,
 /// which is not a receipt).
 fn session() -> (Agent, Vec<Receipt>) {
@@ -79,7 +85,7 @@ fn an_exported_log_round_trips_and_verifies() {
     let read = log.records().expect("records");
     assert_eq!(read, receipts);
     log.verify_chain().expect("chain");
-    log.verify_macs(&SECRET).expect("macs");
+    log.verify_macs(&receipt_key()).expect("macs");
     assert_ne!(log.head_hash().expect("head"), [0u8; 32]);
 
     // Appending after a read continues the chain.
@@ -102,7 +108,7 @@ fn an_empty_log_verifies() {
     let log = ReceiptLog::create(dir.join("empty.arrl")).expect("create");
     assert!(log.records().expect("records").is_empty());
     log.verify_chain().expect("chain");
-    log.verify_macs(&SECRET).expect("macs");
+    log.verify_macs(&receipt_key()).expect("macs");
     assert_eq!(log.head_hash().expect("head"), [0u8; 32]);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -182,7 +188,7 @@ fn a_foreign_secret_does_not_verify_the_macs() {
     log.verify_chain().expect("chain");
     // The receipts themselves are keyed.
     let error = log
-        .verify_macs(&[0x6e; 32])
+        .verify_macs(&active_rpc::receipts::derive_receipt_key(&[0x6e; 32]))
         .expect_err("another kernel's secret must not verify");
     assert_eq!(error.code(), "rpc/receipt");
     let _ = std::fs::remove_dir_all(&dir);

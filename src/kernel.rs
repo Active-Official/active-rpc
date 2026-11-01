@@ -142,7 +142,12 @@ pub trait Provider {
 }
 
 /// Observable kernel events. Tests and operators assert on these.
+///
+/// `#[non_exhaustive]`: the enum grows as the kernel gains observable work (this
+/// is how `ReceiptsDropped` arrived), and a downstream crate should match with a
+/// wildcard arm rather than break on a minor release.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
     /// A capability was minted.
     CapMinted {
@@ -313,7 +318,6 @@ enum JobState {
 
 #[derive(Debug, Clone)]
 struct Job {
-    #[allow(dead_code)]
     id: u64,
     lane: LaneId,
     cap: CapId,
@@ -325,6 +329,9 @@ struct Job {
     /// at their placeholder size. Dispatch charges the difference once the
     /// promises resolve.
     args_bytes: u64,
+    /// True once a receipt records this job's decision, so a later failure path
+    /// does not record a second one.
+    receipted: bool,
 }
 
 /// The deterministic kernel: providers, capabilities, budgets and promises.
@@ -333,6 +340,9 @@ struct Job {
 /// results back. Holding the kernel is the only way to reach a provider.
 pub struct Kernel {
     secret: [u8; 32],
+    /// Key that seals receipts, derived from `secret` so a verifier can be given
+    /// the receipt key without being handed the authority that mints ids.
+    receipt_key: [u8; 32],
     providers: BTreeMap<ProviderId, Box<dyn Provider>>,
     caps: BTreeMap<CapId, CapRecord>,
     meters: BTreeMap<CapId, BudgetMeter>,
@@ -629,6 +639,7 @@ impl Agent {
         let deferred_refops = Rc::new(std::cell::RefCell::new(VecDeque::new()));
         let kernel = Kernel {
             secret,
+            receipt_key: crate::receipts::derive_receipt_key(&secret),
             providers: BTreeMap::new(),
             caps: BTreeMap::new(),
             meters: BTreeMap::new(),
@@ -712,7 +723,10 @@ impl Agent {
     ///
     /// When enabled, every call that reaches dispatch appends a
     /// [`crate::Receipt`] to a bounded ring, recording the decision taken there
-    /// (admitted, or refused with the code). Disabling also clears the ring;
+    /// (admitted, or refused with the code). A call that never reaches dispatch
+    /// because the kernel refused it first (an unorderable pipeline, a provider
+    /// that vanished, a destroyed lane) is recorded when it is failed, so a
+    /// refusal never leaves the ring silent. Disabling also clears the ring;
     /// [`Agent::receipts_dropped`] counts what was cleared or evicted, so an
     /// exported window never pretends to be the whole history.
     pub fn enable_receipts(&self, enabled: bool) {
@@ -723,7 +737,8 @@ impl Agent {
             kernel.receipts.clear();
             if cleared > 0 {
                 kernel.receipts_dropped = kernel.receipts_dropped.saturating_add(cleared);
-                kernel.push_event(Event::ReceiptsDropped { count: cleared });
+                let total = kernel.receipts_dropped;
+                kernel.push_event(Event::ReceiptsDropped { count: total });
             }
         }
     }
@@ -731,6 +746,26 @@ impl Agent {
     /// The receipts recorded so far, oldest first.
     pub fn receipts(&self) -> Vec<crate::Receipt> {
         self.cell.borrow().receipts.iter().cloned().collect()
+    }
+
+    /// The key that seals receipts, derived from the kernel secret.
+    ///
+    /// Hand this to a verifier ([`crate::ReceiptLog::verify_macs`]) instead of
+    /// the kernel secret: the secret mints capability ids, and a verifier that
+    /// only needs to check an audit log must not be able to create authority.
+    pub fn receipt_key(&self) -> [u8; 32] {
+        self.cell.borrow().receipt_key
+    }
+
+    /// Set the sequence the next receipt will carry.
+    ///
+    /// A kernel that continues an existing log across a restart adopts the log's
+    /// next sequence here. Sequences are otherwise monotonic from 1, and a log
+    /// refuses a receipt that does not follow its own order.
+    pub fn set_receipt_sequence(&self, next: u64) {
+        // `next_receipt` holds the last sequence issued, so the seal increments
+        // before using it: storing `next - 1` makes the next receipt `next`.
+        self.cell.borrow_mut().next_receipt = next.saturating_sub(1);
     }
 
     /// Receipts the ring evicted, or that disabling cleared.
@@ -744,8 +779,8 @@ impl Agent {
 
     /// Verify that a receipt came from this kernel and was not edited.
     pub fn verify_receipt(&self, receipt: &crate::Receipt) -> bool {
-        let secret = self.cell.borrow().secret;
-        receipt.verify(&secret)
+        let key = self.cell.borrow().receipt_key;
+        receipt.verify(&key)
     }
 
     /// The shared cell, for transports and adapters that need direct access.
@@ -2338,6 +2373,7 @@ impl Agent {
             promise: promise_id,
             state: JobState::Queued,
             args_bytes,
+            receipted: false,
         };
         kernel.jobs.insert(job_id, job);
         kernel.queue.push_back(job_id);
@@ -3171,40 +3207,17 @@ impl Agent {
 
     /// Record the dispatch decision for a job, when receipts are enabled.
     ///
-    /// `refusal` is the error the kernel settled the job with, if any. The ring
-    /// is bounded; an eviction is counted and reported once, because a shorter
-    /// ring must not look like a shorter history and the event tape is bounded
-    /// too.
+    /// `refusal` is the error the kernel settled the job with, if any. Marks the
+    /// job as receipted so a later `fail_job` does not record the same decision
+    /// twice.
     fn record_receipt(&self, job: &Job, refusal: Option<&Error>) {
         let mut kernel = self.cell.borrow_mut();
         if !kernel.receipts_enabled {
             return;
         }
-        kernel.next_receipt = kernel.next_receipt.saturating_add(1);
-        let decision = match refusal {
-            Some(error) => crate::receipts::Decision::Refused(error.code().to_string()),
-            None => crate::receipts::Decision::Admitted,
-        };
-        let receipt = crate::receipts::Receipt::seal(
-            &kernel.secret,
-            kernel.next_receipt,
-            job.cap,
-            &receipt_method(&job.call.method),
-            kernel.now_ms,
-            decision,
-        );
-        kernel.receipts.push_back(receipt);
-        if kernel.receipts.len() > crate::receipts::MAX_RECEIPTS {
-            kernel.receipts.pop_front();
-            kernel.receipts_dropped = kernel.receipts_dropped.saturating_add(1);
-            // One event when the ring starts dropping, not one per call: a call
-            // after the ring fills would otherwise push the useful history out
-            // of the tape one entry at a time. `receipts_dropped` carries the
-            // running total, and the oldest retained receipt's sequence says how
-            // much of the history is missing.
-            if kernel.receipts_dropped == 1 {
-                kernel.push_event(Event::ReceiptsDropped { count: 1 });
-            }
+        kernel.seal_receipt(job, refusal);
+        if let Some(stored) = kernel.jobs.get_mut(&job.id) {
+            stored.receipted = true;
         }
     }
 
@@ -3765,7 +3778,57 @@ impl Kernel {
         ordered
     }
 
+    /// Seal one receipt into the ring and update the ring's bookkeeping.
+    ///
+    /// Lives on `Kernel` so both the dispatch path (which borrows the cell) and
+    /// `fail_job` (which is `&mut self`) record through the same code.
+    fn seal_receipt(&mut self, job: &Job, refusal: Option<&Error>) {
+        self.next_receipt = self.next_receipt.saturating_add(1);
+        let decision = match refusal {
+            Some(error) => crate::receipts::Decision::Refused(error.code().to_string()),
+            None => crate::receipts::Decision::Admitted,
+        };
+        let receipt = crate::receipts::Receipt::seal(
+            &self.receipt_key,
+            self.next_receipt,
+            job.cap,
+            &receipt_method(&job.call.method),
+            self.now_ms,
+            decision,
+        );
+        self.receipts.push_back(receipt);
+        if self.receipts.len() > crate::receipts::MAX_RECEIPTS {
+            self.receipts.pop_front();
+            self.receipts_dropped = self.receipts_dropped.saturating_add(1);
+            // One event when the ring starts dropping, not one per call: a call
+            // after the ring fills would otherwise push the useful history out
+            // of the tape one entry at a time. The event carries the running
+            // total (the same number `receipts_dropped` reports), so a reader
+            // that sees only the event is not told "1" after a thousand drops.
+            if self.receipts_dropped == 1 {
+                let total = self.receipts_dropped;
+                self.push_event(Event::ReceiptsDropped { count: total });
+            }
+        }
+    }
+
     fn fail_job(&mut self, job_id: u64, error: Error) {
+        // A job failed before dispatch (an unorderable pipeline, a provider that
+        // vanished, a destroyed lane) still took a decision: record it, so an
+        // auditor can tell "no call" from "refused and undocumented". A job that
+        // already has a receipt (admitted or refused at dispatch) is not
+        // recorded twice.
+        let unrecorded = self
+            .jobs
+            .get(&job_id)
+            .filter(|job| !job.receipted && self.receipts_enabled)
+            .cloned();
+        if let Some(job) = unrecorded {
+            Kernel::seal_receipt(self, &job, Some(&error));
+            if let Some(stored) = self.jobs.get_mut(&job_id) {
+                stored.receipted = true;
+            }
+        }
         let deps = self
             .jobs
             .get(&job_id)

@@ -24,7 +24,7 @@ use libfuzzer_sys::fuzz_target;
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::kernel::Provider;
-use active_rpc::receipts::{ReceiptLog, LOG_HEADER_LEN};
+use active_rpc::receipts::{Decision, ReceiptLog, LOG_HEADER_LEN};
 use active_rpc::value::{Call, Response, Value};
 use active_rpc::{Agent, Budget, Receipt};
 
@@ -121,15 +121,16 @@ fn structured(data: &[u8]) {
     }
 
     let receipts = agent.receipts();
+    let key = agent.receipt_key();
     let path = scratch();
     let _ = std::fs::remove_file(&path);
     let start = receipts.first().map_or(1, |receipt| receipt.sequence);
     let log = ReceiptLog::create_starting_at(&path, start).expect("create");
-    log.append_verified(&SECRET, &receipts)
+    log.append_verified(&key, &receipts)
         .expect("the kernel's own receipts must export");
     let read = log.records().expect("records");
     assert_eq!(read, receipts, "the log lost or reordered a receipt");
-    log.verify_macs(&SECRET).expect("the kernel's MACs");
+    log.verify_macs(&key).expect("the kernel's MACs");
 
     // Every record boundary is a shorter valid log; any other cut is refused.
     let bytes = std::fs::read(&path).expect("read");
@@ -166,6 +167,74 @@ fn structured(data: &[u8]) {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The writer half: arbitrary receipt fields either append and read back, or are
+/// refused and leave the log readable. A writer that accepts a record its own
+/// reader rejects would make the log permanently unreadable, so this is the
+/// invariant the reader fuzz cannot see.
+fn writer(data: &[u8]) {
+    let path = scratch();
+    let _ = std::fs::remove_file(&path);
+    let log = match ReceiptLog::create(&path) {
+        Ok(log) => log,
+        Err(_) => return,
+    };
+    let field = |index: usize, fallback: u8| data.get(index).copied().unwrap_or(fallback);
+    let cap: String = (0..16)
+        .map(|index| {
+            let nibble = field(index * 7, 0x2a) % 16;
+            std::char::from_digit(u32::from(nibble), 16).unwrap_or('0')
+        })
+        .collect();
+    let method_len = usize::from(field(400, 3)) % 64;
+    let method: String = (0..method_len)
+        .map(|index| {
+            let byte = field(index * 3 + 500, b'a');
+            // Feed control characters and non-ASCII bytes on purpose: the writer
+            // must refuse what the reader would reject.
+            char::from(byte)
+        })
+        .collect();
+    let decision = if field(3, 0) % 2 == 0 {
+        Decision::Admitted
+    } else {
+        let code_len = usize::from(field(4, 0)) % 8;
+        let code: String = (0..code_len)
+            .map(|index| char::from(field(index + 600, b'x')))
+            .collect();
+        Decision::Refused(code)
+    };
+    let candidate = Receipt {
+        sequence: u64::from(field(5, 1)) % 4 + 1,
+        cap,
+        method,
+        at_ms: u64::from(field(6, 0)),
+        decision,
+        mac: [field(7, 0); 32],
+    };
+    match log.append(&candidate) {
+        Ok(()) => {
+            let records = log
+                .records()
+                .expect("a record the writer accepted must be readable");
+            assert_eq!(
+                records.last(),
+                Some(&candidate),
+                "the writer stored something other than the receipt"
+            );
+            assert!(
+                candidate.fields_are_representable(),
+                "an accepted receipt is representable by definition"
+            );
+        }
+        Err(error) => {
+            assert_eq!(error.code(), "rpc/receipt");
+            log.records()
+                .expect("a refused append must leave the log readable");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 fuzz_target!(|data: &[u8]| {
     match ReceiptLog::verify_bytes(data) {
         Ok(receipts) => {
@@ -179,6 +248,7 @@ fuzz_target!(|data: &[u8]| {
         ),
     }
     if !data.is_empty() {
+        writer(data);
         structured(data);
     }
 });

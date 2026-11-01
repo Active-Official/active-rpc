@@ -1008,13 +1008,15 @@ fn read_bounded(path: &str, ceiling: u64) -> Result<Vec<u8>, CliError> {
 // receipts
 // ---------------------------------------------------------------------------
 
-/// Secret of the demo kernel `receipts dump` records, so a test can verify the
-/// exported log's MACs without the CLI printing key material.
+/// Secret of the demo kernel `receipts dump` records. The receipt key is derived
+/// from it, so a test can verify the exported log without the CLI printing key
+/// material; [`active_rpc::receipts::derive_receipt_key`] derives the same key.
 const DEMO_SECRET: [u8; 32] = [0x5e; 32];
 
 const RECEIPTS_USAGE: &str = "usage: receipts dump [--output PATH]\n       \
-receipts verify <log> [--secret-hex HEX] [--expect-head HEX]\n       \
-receipts show <log> [--limit N]";
+receipts verify <log> (--receipt-key-file PATH | --expect-head HEX | --chain-only)\n       \
+receipts show <log> [--limit N]\n       \
+receipts repair <log>";
 
 fn receipts(args: &[String]) -> CliResult {
     let (positional, flags) = split_args(&args[1..]);
@@ -1037,6 +1039,12 @@ fn receipts(args: &[String]) -> CliResult {
                 None => usize::MAX,
             };
             receipts_show(path, limit)
+        }
+        Some("repair") => {
+            let path = positional
+                .get(1)
+                .ok_or_else(|| CliError::usage(RECEIPTS_USAGE.to_string()))?;
+            receipts_repair(path)
         }
         _ => Err(CliError::usage(RECEIPTS_USAGE.to_string())),
     }
@@ -1074,62 +1082,114 @@ fn receipts_dump(flags: &BTreeMap<String, String>) -> CliResult {
         .map_err(refusal)?;
     agent.revoke(&cap).map_err(refusal)?;
     agent.run();
-    let error = refused.value().expect_err("a revoked capability refuses");
-    assert_eq!(error.code(), "rpc/revoked");
+    match refused.value() {
+        Err(error) if error.code() == "rpc/revoked" => {}
+        // A shipped binary reports; it does not assert. A behaviour change here
+        // must be a refusal with a message, not a panic and exit 101.
+        Err(error) => {
+            return Err(CliError::refused(format!(
+                "the demo refusal settled as {} instead of rpc/revoked",
+                error.code()
+            )))
+        }
+        Ok(_) => {
+            return Err(CliError::refused(
+                "the demo refusal was admitted".to_string(),
+            ))
+        }
+    }
     let receipts = agent.receipts();
     let log = ReceiptLog::create(&output)
         .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
-    // The owner path: the writer proves it holds the kernel secret, so the log
+    // The owner path: the writer proves it holds the receipt key, so the log
     // cannot be extended with fabricated records.
-    log.append_verified(&DEMO_SECRET, &receipts)
+    log.append_verified(&agent.receipt_key(), &receipts)
         .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
-    println!("wrote {} receipts to {output}", receipts.len());
+    println!("wrote {} receipts to {:?}", receipts.len(), output);
     println!("head {}", hex32(&log.head_hash().map_err(refusal)?));
     Ok(())
 }
 
 fn receipts_verify(path: &str, flags: &BTreeMap<String, String>) -> CliResult {
     let log = open_receipt_log(path)?;
-    let records = log
-        .records()
-        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
-    // Chain-only by default: the chain detects corruption and reordering, not a
-    // forged record. Authenticity needs the kernel secret.
-    let secret = match flags.get("--secret-hex").filter(|value| !value.is_empty()) {
-        Some(text) => Some(parse_secret(text)?),
+    let key = match flags
+        .get("--receipt-key-file")
+        .filter(|value| !value.is_empty())
+    {
+        Some(file) => Some(read_receipt_key(file)?),
         None => None,
     };
-    if let Some(secret) = secret {
-        log.verify_macs(&secret)
+    let expected = match flags.get("--expect-head").filter(|value| !value.is_empty()) {
+        Some(text) => Some(parse_hex32(text).ok_or_else(|| {
+            CliError::usage("--expect-head expects 64 hex characters".to_string())
+        })?),
+        None => None,
+    };
+    let chain_only = flags.contains_key("--chain-only");
+    // An unauthenticated check cannot detect a forged record or a missing tail,
+    // so `ok … exit 0` would mislead an operator or a CI gate. Opting into it is
+    // explicit.
+    if key.is_none() && expected.is_none() && !chain_only {
+        return Err(CliError::usage(format!(
+            "an unauthenticated check proves only the chain: pass --receipt-key-file \
+             to verify authenticity, --expect-head to detect a truncated tail, or \
+             --chain-only to accept the weaker check\n{RECEIPTS_USAGE}"
+        )));
+    }
+    // One read: a second read could see a different file, and the printed head
+    // would then be one the MAC check never covered.
+    let snapshot = log
+        .snapshot()
+        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+    if let Some(key) = key {
+        snapshot
+            .verify_macs(&key)
             .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
     }
-    if let Some(expected) = flags.get("--expect-head").filter(|value| !value.is_empty()) {
-        let expected = parse_hex32(expected).ok_or_else(|| {
-            CliError::usage("--expect-head expects 64 hex characters".to_string())
-        })?;
-        log.verify_against(expected)
+    if let Some(expected) = expected {
+        snapshot
+            .verify_against(expected)
             .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
     }
     println!(
         "ok {} receipts, start {}, head {}{}",
-        records.len(),
-        log.start_sequence().map_err(refusal)?,
-        hex32(&log.head_hash().map_err(refusal)?),
-        if secret.is_some() {
-            ", macs verified"
-        } else {
-            ", chain-only (unauthenticated)"
+        snapshot.len(),
+        snapshot.start_sequence(),
+        hex32(&snapshot.head()),
+        match (key.is_some(), expected.is_some()) {
+            (true, true) => ", macs verified, head pinned",
+            (true, false) => ", macs verified",
+            (false, true) => ", chain-only, head pinned",
+            (false, false) => ", chain-only (unauthenticated)",
         }
+    );
+    Ok(())
+}
+
+fn receipts_repair(path: &str) -> CliResult {
+    // Repair deliberately works without a valid handle: the file is damaged, so
+    // `open` would refuse it.
+    let discarded = ReceiptLog::repair(path)
+        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+    let log = open_receipt_log(path)?;
+    let snapshot = log
+        .snapshot()
+        .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
+    println!(
+        "ok {} receipts kept, {} byte(s) of an interrupted write discarded, head {}",
+        snapshot.len(),
+        discarded,
+        hex32(&snapshot.head())
     );
     Ok(())
 }
 
 fn receipts_show(path: &str, limit: usize) -> CliResult {
     let log = open_receipt_log(path)?;
-    let records = log
-        .records()
+    let snapshot = log
+        .snapshot()
         .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
-    for receipt in records.iter().take(limit) {
+    for receipt in snapshot.receipts().iter().take(limit) {
         // The method is quoted: it is stored text, and a raw newline would turn
         // one record into two lines of "evidence".
         println!(
@@ -1148,13 +1208,39 @@ fn receipts_show(path: &str, limit: usize) -> CliResult {
     Ok(())
 }
 
-fn parse_secret(text: &str) -> Result<[u8; 32], CliError> {
-    parse_hex32(text)
-        .ok_or_else(|| CliError::usage("--secret-hex expects 64 hex characters".to_string()))
+/// Read a receipt key from a file: 64 hex characters, one line.
+///
+/// A file on a shared or world-readable path is refused on unix (mode `0o077`
+/// must be clear): the key proves an audit log, and a leaked key lets a stranger
+/// forge one. Windows ACLs are the deployment's responsibility, so the check is
+/// unix-only and documented.
+fn read_receipt_key(path: &str) -> Result<[u8; 32], CliError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| CliError::usage(format!("cannot read {path:?}: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|error| CliError::usage(format!("cannot stat {path:?}: {error}")))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(CliError::usage(format!(
+                "{path:?} is readable by other accounts (mode {mode:o}); chmod 600 it"
+            )));
+        }
+    }
+    parse_hex32(text.trim()).ok_or_else(|| {
+        CliError::usage(format!(
+            "{path:?} must hold 64 hex characters (the kernel's receipt key)"
+        ))
+    })
 }
 
 fn parse_hex32(text: &str) -> Option<[u8; 32]> {
-    if text.len() != 64 {
+    // A 64-*byte* non-ASCII string would make the two-byte slice below land
+    // inside a character and panic; check the alphabet first.
+    if text.len() != 64 || !text.is_ascii() {
         return None;
     }
     let mut bytes = [0u8; 32];
@@ -1168,10 +1254,10 @@ fn open_receipt_log(path: &str) -> Result<ReceiptLog, CliError> {
     // A path that does not exist is a bad argument, not a damaged log; saying so
     // keeps the exit class meaningful for a script.
     if !std::path::Path::new(path).exists() {
-        return Err(CliError::usage(format!("no receipt log at {path}")));
+        return Err(CliError::usage(format!("no receipt log at {path:?}")));
     }
     ReceiptLog::open(path)
-        .map_err(|error| CliError::refused(format!("{}: {error} ({path})", error.code())))
+        .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -1239,11 +1325,16 @@ usage: active-rpc-cli <command> [options]
   receipts dump [--output PATH]
       Record a demo session with receipts enabled into an append-only ARRL log
       (correlation ids, methods and times only; no arguments or secrets).
-  receipts verify <log> [--secret-hex HEX] [--expect-head HEX]
-      Verify the log's record hashes and chain links. The chain needs no key and
-      detects corruption and reordering; --secret-hex also verifies every
-      receipt MAC (authenticity); --expect-head pins the head a verifier learned
-      out of band, which detects a truncated tail.
+  receipts verify <log> (--receipt-key-file PATH | --expect-head HEX | --chain-only)
+      Verify the log's record hashes and chain links. --receipt-key-file holds the
+      kernel's 64-hex receipt key (Agent::receipt_key; 0600) and verifies every
+      receipt MAC; --expect-head pins the head a verifier learned out of band,
+      which detects a truncated tail; --chain-only accepts the weaker check that
+      proves only integrity. One of the three is required, because an
+      unauthenticated \"ok\" would mislead a gate.
+  receipts repair <log>
+      Cut an interrupted trailing write back to the last complete record, keeping
+      the chain of the records that survived.
   receipts show <log> [--limit N]
       Print sequence, time, correlation id and method per record.
   help

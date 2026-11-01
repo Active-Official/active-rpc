@@ -74,10 +74,25 @@ pub struct Receipt {
     pub mac: [u8; 32],
 }
 
+/// Domain of the derived receipt key.
+const RECEIPT_KEY_DOMAIN: &str = "active-rpc/receipt-key/v1";
+
+/// Derive the key that seals receipts from a kernel secret.
+///
+/// The kernel secret mints capability ids, so it is the authority token itself
+/// and must never leave the kernel. Receipts are sealed with a key derived from
+/// it instead: a verifier needs that key and learns nothing that can mint a
+/// capability. [`crate::Agent::receipt_key`] returns the derived key.
+pub fn derive_receipt_key(secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(RECEIPT_KEY_DOMAIN, secret)
+}
+
 impl Receipt {
     /// Build and seal a receipt for a decision.
+    ///
+    /// `key` is the derived receipt key, not the kernel secret.
     pub(crate) fn seal(
-        secret: &[u8; 32],
+        key: &[u8; 32],
         sequence: u64,
         cap: CapId,
         method: &str,
@@ -92,14 +107,14 @@ impl Receipt {
             decision,
             mac: [0u8; 32],
         };
-        receipt.mac = receipt.compute(secret);
+        receipt.mac = receipt.compute(key);
         receipt
     }
 
-    /// True when the receipt was produced by the kernel that owns `secret` and
-    /// its fields were not edited.
-    pub fn verify(&self, secret: &[u8; 32]) -> bool {
-        let expected = self.compute(secret);
+    /// True when the receipt was produced by the kernel that owns `key` and its
+    /// fields were not edited. `key` is the derived receipt key.
+    pub fn verify(&self, key: &[u8; 32]) -> bool {
+        let expected = self.compute(key);
         // Constant-time comparison; the mac is public, so this is hygiene.
         let mut difference = 0u8;
         for (left, right) in expected.iter().zip(self.mac.iter()) {
@@ -121,8 +136,8 @@ impl Receipt {
             }
     }
 
-    fn compute(&self, secret: &[u8; 32]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_keyed(secret);
+    fn compute(&self, key: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_keyed(key);
         hasher.update(b"active-rpc/receipt/v2");
         hasher.update(&self.sequence.to_le_bytes());
         hasher.update(&(self.cap.len() as u32).to_le_bytes());
@@ -207,29 +222,122 @@ struct LogState {
     last_ms: u64,
 }
 
+/// One read of a log: the records and the tail they end at.
+///
+/// A verifier that needs several of those (records, start, head, length) takes
+/// one snapshot rather than reading the file once per question, and the answers
+/// are then guaranteed to describe the same bytes even while a writer appends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    receipts: Vec<Receipt>,
+    start: u64,
+    head: [u8; 32],
+    last_ms: u64,
+}
+
+impl Snapshot {
+    /// Every record, oldest first.
+    pub fn receipts(&self) -> &[Receipt] {
+        &self.receipts
+    }
+
+    /// Sequence of the first record.
+    pub fn start_sequence(&self) -> u64 {
+        self.start
+    }
+
+    /// Number of records.
+    pub fn len(&self) -> u64 {
+        self.receipts.len() as u64
+    }
+
+    /// True when the snapshot holds no records.
+    pub fn is_empty(&self) -> bool {
+        self.receipts.is_empty()
+    }
+
+    /// Hash of the last record, or zeros for an empty log.
+    pub fn head(&self) -> [u8; 32] {
+        self.head
+    }
+
+    /// `at_ms` of the last record, or 0 for an empty log.
+    pub fn last_ms(&self) -> u64 {
+        self.last_ms
+    }
+
+    /// Verify every receipt's `mac` under the log's receipt key.
+    pub fn verify_macs(&self, key: &[u8; 32]) -> Result<()> {
+        for receipt in &self.receipts {
+            if !receipt.verify(key) {
+                return Err(Error::receipt(format!(
+                    "receipt {} was not produced by this kernel",
+                    receipt.sequence
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse the snapshot unless it ends at the pinned head.
+    pub fn verify_against(&self, expected: [u8; 32]) -> Result<()> {
+        if self.head != expected {
+            return Err(Error::receipt("the log does not end at the pinned head"));
+        }
+        Ok(())
+    }
+}
+
 /// Exclusive access to one log file, held for the length of an append.
 struct LogLock {
     path: std::path::PathBuf,
 }
+
+/// Age after which a lock file is treated as abandoned.
+///
+/// A writer holds the lock for one append (a `write_all` plus `sync_data`), so a
+/// lock older than this cannot belong to a live writer. Without the ceiling a
+/// crash leaves the log unappendable for good, and any local user who creates
+/// that file stops the evidence pipeline.
+const LOCK_STALE_MS: u64 = 120_000;
 
 impl LogLock {
     /// Take the log's lock, waiting briefly for a concurrent writer.
     ///
     /// `create_new` is atomic on every supported platform: one writer wins. The
     /// others retry for about a second, which covers a normal append, then
-    /// refuse rather than corrupt the chain. A lock left behind by a crashed
-    /// process is reported by the append and can be removed by hand; the log
-    /// itself is still readable.
+    /// refuse rather than corrupt the chain. A lock older than `LOCK_STALE_MS`
+    /// is stolen: the process that made it is gone.
     fn acquire(log: &std::path::Path) -> Result<Self> {
         let path = log.with_extension("lock");
-        for _ in 0..200 {
+        for attempt in 0..200 {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(Self { path }),
+                Ok(mut file) => {
+                    use std::io::Write;
+                    // Diagnostics for the next writer: who holds it, and when.
+                    let _ = writeln!(
+                        file,
+                        "pid {} started {}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|elapsed| elapsed.as_millis())
+                            .unwrap_or(0)
+                    );
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if attempt % 20 == 0 && stale(&path) {
+                        // Removing a stale lock races another stealer; losing
+                        // that race is harmless, because the retry just sees a
+                        // fresh lock or a free path.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(_) => return Err(Error::receipt("cannot lock the receipt log")),
@@ -239,6 +347,20 @@ impl LogLock {
             "the receipt log is locked by another writer",
         ))
     }
+}
+
+/// True when a lock file is older than the stale ceiling.
+fn stale(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified
+        .elapsed()
+        .map(|age| age.as_millis() as u64 > LOCK_STALE_MS)
+        .unwrap_or(false)
 }
 
 impl Drop for LogLock {
@@ -287,13 +409,45 @@ impl ReceiptLog {
         path: impl Into<std::path::PathBuf>,
         start_sequence: u64,
     ) -> Result<Self> {
-        let path = path.into();
+        Self::create_locked(path.into(), start_sequence, false)
+    }
+
+    /// Create or truncate a log, discarding any existing evidence.
+    ///
+    /// This is the explicit "start over" entry point; [`ReceiptLog::create`]
+    /// refuses to overwrite.
+    pub fn truncate(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::create_locked(path.into(), 1, true)
+    }
+
+    /// Create a log while holding the writer lock.
+    ///
+    /// The lock matters: `File::create` truncates, so a create that raced an
+    /// append in another process would leave the appender writing into a fresh
+    /// header and the log born corrupt.
+    fn create_locked(
+        path: std::path::PathBuf,
+        start_sequence: u64,
+        replacing: bool,
+    ) -> Result<Self> {
         if start_sequence == 0 {
             return Err(Error::receipt("a log cannot start at sequence 0"));
         }
-        if std::fs::metadata(&path)
-            .map(|metadata| metadata.len() > LOG_HEADER_LEN as u64)
-            .unwrap_or(false)
+        // A start this close to the ceiling could not be numbered to the record
+        // limit, and `walk_log` would refuse the result of its own writer.
+        if start_sequence > u64::MAX - MAX_LOG_RECORDS {
+            return Err(Error::receipt(
+                "a log cannot start that close to the sequence ceiling",
+            ));
+        }
+        let _lock = LogLock::acquire(&path)?;
+        // Any existing content is refused, not just content that looks like
+        // records: a truncated file is still evidence, and silently replacing it
+        // is exactly what `truncate` exists for.
+        if !replacing
+            && std::fs::metadata(&path)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
         {
             return Err(Error::receipt(
                 "the receipt log already holds records; truncate it explicitly",
@@ -324,16 +478,6 @@ impl ReceiptLog {
                 .map_err(|_| Error::receipt("cannot flush the receipt log header"))?;
         }
         Ok(log)
-    }
-
-    /// Create or truncate a log, discarding any existing evidence.
-    ///
-    /// This is the explicit "start over" entry point; [`ReceiptLog::create`]
-    /// refuses to overwrite.
-    pub fn truncate(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        let path = path.into();
-        std::fs::write(&path, []).map_err(|_| Error::receipt("cannot create the receipt log"))?;
-        Self::create_starting_at(path, 1)
     }
 
     /// Open an existing log without creating or truncating it.
@@ -375,14 +519,16 @@ impl ReceiptLog {
         self.append_inner(receipts)
     }
 
-    /// Append a batch after checking every receipt `mac` under `secret`.
+    /// Append a batch after checking every receipt `mac` under `key`.
     ///
-    /// This is the owner path: the writer proves it is the kernel that produced
-    /// the receipts, so the log cannot be extended with fabricated records by a
-    /// party that has write access but not the secret.
-    pub fn append_verified(&self, secret: &[u8; 32], receipts: &[Receipt]) -> Result<()> {
+    /// `key` is the kernel's receipt key ([`derive_receipt_key`],
+    /// [`crate::Agent::receipt_key`]), not the kernel secret. This is the owner
+    /// path: the writer proves it is the kernel that produced the receipts, so
+    /// the log cannot be extended with fabricated records by a party that has
+    /// write access but not the key.
+    pub fn append_verified(&self, key: &[u8; 32], receipts: &[Receipt]) -> Result<()> {
         for receipt in receipts {
-            if !receipt.verify(secret) {
+            if !receipt.verify(key) {
                 return Err(Error::receipt("a receipt was not produced by this kernel"));
             }
         }
@@ -412,12 +558,20 @@ impl ReceiptLog {
                 walked
             }
         };
+        if state.count >= MAX_LOG_RECORDS {
+            return Err(Error::receipt("the receipt log exceeds the record ceiling"));
+        }
         let mut out = Vec::new();
         let mut previous = state.head;
         let mut count = state.count;
         let mut last_ms = state.last_ms;
         for receipt in receipts {
-            let expected = state.start.saturating_add(count);
+            // `checked_add`, like the reader: a sequence this close to the
+            // ceiling must be refused here rather than written and unreadable.
+            let expected = state
+                .start
+                .checked_add(count)
+                .ok_or_else(|| Error::receipt("receipt sequence overflows"))?;
             if receipt.sequence != expected {
                 return Err(Error::receipt(
                     "receipt sequence does not follow the log order",
@@ -431,16 +585,21 @@ impl ReceiptLog {
             out.extend_from_slice(&record);
             last_ms = receipt.at_ms;
             count += 1;
+            // Apply both ceilings as they are crossed, so an oversized batch is
+            // refused before the rest of it is encoded and allocated.
+            let total = observed
+                .checked_add(out.len() as u64)
+                .ok_or_else(|| Error::receipt("the receipt log is too large"))?;
+            if total > MAX_LOG_BYTES {
+                return Err(Error::receipt("the receipt log exceeds the size ceiling"));
+            }
+            if count > MAX_LOG_RECORDS {
+                return Err(Error::receipt("the receipt log exceeds the record ceiling"));
+            }
         }
         let total = observed
             .checked_add(out.len() as u64)
             .ok_or_else(|| Error::receipt("the receipt log is too large"))?;
-        if total > MAX_LOG_BYTES {
-            return Err(Error::receipt("the receipt log exceeds the size ceiling"));
-        }
-        if count > MAX_LOG_RECORDS {
-            return Err(Error::receipt("the receipt log exceeds the record ceiling"));
-        }
         self.write_all(&out)?;
         state.bytes = total;
         state.count = count;
@@ -471,6 +630,23 @@ impl ReceiptLog {
         walk_log(&bytes).map(|(receipts, _)| receipts)
     }
 
+    /// One read of the whole log: records, start, head and last time.
+    ///
+    /// A verifier that needs more than one of those should use this rather than
+    /// call four accessors: each accessor reads and walks the file again, and a
+    /// writer appending in between would make the answers describe different
+    /// bytes (a head the MAC check never covered, for instance).
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        let bytes = read_capped(&self.path)?;
+        let (receipts, state) = walk_log(&bytes)?;
+        Ok(Snapshot {
+            receipts,
+            start: state.start,
+            head: state.head,
+            last_ms: state.last_ms,
+        })
+    }
+
     /// Verify the chain only (no key needed).
     ///
     /// This detects corruption and reordering. It does **not** prove the log was
@@ -479,18 +655,9 @@ impl ReceiptLog {
         self.records().map(|_| ())
     }
 
-    /// Verify the chain and every receipt's `mac` under the kernel secret.
-    pub fn verify_macs(&self, secret: &[u8; 32]) -> Result<()> {
-        let records = self.records()?;
-        for receipt in &records {
-            if !receipt.verify(secret) {
-                return Err(Error::receipt(format!(
-                    "receipt {} was not produced by this kernel",
-                    receipt.sequence
-                )));
-            }
-        }
-        Ok(())
+    /// Verify the chain and every receipt's `mac` under the receipt key.
+    pub fn verify_macs(&self, key: &[u8; 32]) -> Result<()> {
+        self.snapshot()?.verify_macs(key)
     }
 
     /// Verify the chain and that the head is the pinned one.
@@ -498,11 +665,75 @@ impl ReceiptLog {
     /// A verifier that learned the head out of band detects a truncated tail,
     /// which the per-record links alone cannot.
     pub fn verify_against(&self, expected: [u8; 32]) -> Result<()> {
-        let head = self.head_hash()?;
-        if head != expected {
-            return Err(Error::receipt("the log does not end at the pinned head"));
+        self.snapshot()?.verify_against(expected)
+    }
+
+    /// Repair a log whose last write was interrupted.
+    ///
+    /// A crash between the `write_all` and the `sync_data`, or a full disk,
+    /// can leave a partial trailing record. The reader refuses it (correctly:
+    /// the file is damaged), and every later append fails because the state
+    /// cannot be walked, which would turn one crash into a permanent stop in the
+    /// audit trail. This truncates the file back to the last complete record and
+    /// reports how many bytes were discarded; the chain of the surviving records
+    /// is verified before anything is cut, so a damaged record *inside* the log
+    /// is refused rather than trimmed.
+    pub fn repair_tail(&self) -> Result<u64> {
+        let discarded = Self::repair(&self.path)?;
+        if let Ok(bytes) = read_capped(&self.path) {
+            if let Ok((_, state)) = walk_log(&bytes) {
+                if let Ok(mut cached) = self.state.lock() {
+                    *cached = state;
+                }
+            }
         }
-        Ok(())
+        Ok(discarded)
+    }
+
+    /// Repair a damaged log file without opening it first.
+    ///
+    /// [`ReceiptLog::open`] refuses a damaged file, so a caller that wants to
+    /// repair one needs an entry point that does not require a valid handle.
+    /// Returns the number of bytes discarded.
+    pub fn repair(path: impl Into<std::path::PathBuf>) -> Result<u64> {
+        let path = path.into();
+        let _lock = LogLock::acquire(&path)?;
+        let bytes = read_capped(&path)?;
+        // A log that already walks is intact: repair has nothing to do.
+        if walk_log(&bytes).is_ok() {
+            return Ok(0);
+        }
+        verify_header(&bytes)?;
+        let (_, good_end) = walk_prefix(&bytes);
+        // Distinguish a torn write from corruption: a torn write leaves the
+        // record's length field written but its body short, so the declared
+        // record runs past the end of the file. A record whose declared length
+        // fits inside the file failed for another reason (a hash or link
+        // mismatch), which is damage inside the log and must be reported rather
+        // than cut away.
+        let tail = &bytes[good_end..];
+        let torn = if tail.len() < 4 {
+            true
+        } else {
+            let length = u32::from_le_bytes(tail[..4].try_into().expect("4 bytes")) as usize;
+            (MIN_LOG_RECORD..=MAX_LOG_RECORD).contains(&length)
+                && good_end + 4 + length > bytes.len()
+        };
+        if !torn {
+            return Err(Error::receipt(
+                "the log is damaged inside its records; repair cannot cut it",
+            ));
+        }
+        let remaining = tail.len();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|_| Error::receipt("cannot open the receipt log to repair it"))?;
+        file.set_len(good_end as u64)
+            .map_err(|_| Error::receipt("cannot truncate the damaged tail"))?;
+        file.sync_all()
+            .map_err(|_| Error::receipt("cannot flush the repaired log"))?;
+        Ok(remaining as u64)
     }
 
     /// Hash of the last record (the chain head), or zeros for an empty log.
@@ -557,22 +788,13 @@ fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
 /// code_len u16 | code | cap_len u16 | cap | method_len u16 | method | mac [32]
 /// | prev [32] | record_hash [32]`.
 fn encode_record(receipt: &Receipt, previous: &[u8; 32]) -> Result<Vec<u8>> {
-    // The writer applies the reader's rules. A record the writer accepts and the
-    // reader rejects would make the whole log unreadable, so the checks here and
-    // in `decode_record` are the same predicates.
-    if !valid_correlation_id(&receipt.cap) {
+    // The writer applies the reader's rules, and it applies *all* of them: a
+    // record this accepts and the reader rejects would make the whole log
+    // unreadable, and nothing could be appended after it. `fields_are_
+    // representable` is the reader's own predicate, so the two cannot drift.
+    if !receipt.fields_are_representable() {
         return Err(Error::receipt(
-            "a receipt correlation id must be 16 lowercase hex characters",
-        ));
-    }
-    if !valid_method(&receipt.method) {
-        return Err(Error::receipt(
-            "a receipt method must be 1..=1024 bytes without control characters",
-        ));
-    }
-    if !valid_code(receipt.decision.code()) && receipt.decision.code() != "" {
-        return Err(Error::receipt(
-            "a decision code must be 1..=64 characters from [a-z0-9/-_.]",
+            "a receipt is not representable in a log record",
         ));
     }
     let code = receipt.decision.code().as_bytes();
@@ -778,9 +1000,11 @@ fn walk_log(bytes: &[u8]) -> Result<(Vec<Receipt>, LogState)> {
         }
         let (receipt, previous, record_hash, next) = decode_record(bytes, cursor)?;
         if previous != expected_previous {
+            // Name the sequence, not the index: an exported window can start
+            // anywhere, so "record 2" is ambiguous evidence.
             return Err(Error::receipt(format!(
-                "record {} does not link to the previous one",
-                receipts.len() + 1
+                "sequence {} does not link to the previous one",
+                receipt.sequence
             )));
         }
         let expected = start
@@ -810,6 +1034,40 @@ fn walk_log(bytes: &[u8]) -> Result<(Vec<Receipt>, LogState)> {
         last_ms: last_time.unwrap_or(0),
     };
     Ok((receipts, state))
+}
+
+/// Walk the records that decode, stopping at the first one that does not.
+///
+/// Returns the records and the offset just past the last good one, which is the
+/// cut `repair_tail` uses. A caller that needs to know *why* the walk stopped
+/// should use [`walk_log`], which reports the error.
+fn walk_prefix(bytes: &[u8]) -> (Vec<Receipt>, usize) {
+    let Ok(start) = verify_header(bytes) else {
+        return (Vec::new(), 0);
+    };
+    let mut receipts: Vec<Receipt> = Vec::new();
+    let mut cursor = LOG_HEADER_LEN;
+    let mut expected_previous = [0u8; 32];
+    let mut last_time = 0u64;
+    while cursor < bytes.len() {
+        let Ok((receipt, previous, record_hash, next)) = decode_record(bytes, cursor) else {
+            break;
+        };
+        if previous != expected_previous {
+            break;
+        }
+        if start.checked_add(receipts.len() as u64) != Some(receipt.sequence) {
+            break;
+        }
+        if receipt.at_ms < last_time {
+            break;
+        }
+        last_time = receipt.at_ms;
+        expected_previous = record_hash;
+        receipts.push(receipt);
+        cursor = next;
+    }
+    (receipts, cursor)
 }
 
 /// What a decision looks like in a log line.
