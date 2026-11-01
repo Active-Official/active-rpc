@@ -49,10 +49,13 @@ fuzz_target!(|data: &[u8]| {
     let _ = segment.pop_frame(|frame| frame.len());
 
     // 3. Arbitrary advance/reset sequences never panic and never move past the
-    // produced head by an unbounded amount.
+    // produced head. `advance` takes no length: it reads the frame header, so a
+    // caller cannot leave the ring mid-frame.
     for byte in data.iter().take(16) {
         match byte % 4 {
-            0 => segment.advance((*byte as usize) % (capacity + 8)),
+            0 => {
+                let _ = segment.advance();
+            }
             1 => {
                 let _ = segment.read();
             }
