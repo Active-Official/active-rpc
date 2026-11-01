@@ -61,6 +61,18 @@ pub const MAX_LINEAGE_DEPTH: usize = 64;
 /// Largest idempotency key a caller may present.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 
+/// Aggregate payload bytes every channel in one kernel may hold.
+///
+/// The per-channel ceiling alone is not a memory bound: 4 096 channels of 64 MiB
+/// is 256 GiB. This counter is what a sender actually pays for.
+pub const MAX_QUEUED_CHANNEL_BYTES: u64 = 256 << 20;
+
+/// Largest lane or channel name accepted, in bytes.
+pub const MAX_OBJECT_NAME_BYTES: usize = 256;
+
+/// Channels one lane may subscribe to.
+pub const MAX_CHANNELS_PER_LANE: usize = 1_024;
+
 /// Global ceiling on channels in one kernel.
 pub const MAX_CHANNELS: usize = 4_096;
 
@@ -338,6 +350,8 @@ pub struct Kernel {
     dispatching: bool,
     /// Providers whose `on_drop` is running right now.
     delivering: BTreeSet<ProviderId>,
+    /// Payload bytes queued across every channel.
+    queued_channel_bytes: u64,
     idempotency: BTreeMap<(CapId, LaneId, String, String), PromiseId>,
     allow_durable: bool,
     idempotency_order: VecDeque<(CapId, LaneId, String, String)>,
@@ -609,6 +623,7 @@ impl Agent {
             deferred_drops: Vec::new(),
             dispatching: false,
             delivering: BTreeSet::new(),
+            queued_channel_bytes: 0,
             idempotency: BTreeMap::new(),
             allow_durable: false,
             idempotency_order: VecDeque::new(),
@@ -1329,6 +1344,10 @@ impl Agent {
     /// Create a lane.
     pub fn create_lane(&self, name: impl Into<String>, budget: Budget) -> Result<LaneId> {
         budget.check()?;
+        let name = name.into();
+        if name.len() > MAX_OBJECT_NAME_BYTES {
+            return Err(Error::InvalidArgument("lane name is too long"));
+        }
         let mut kernel = self.cell.borrow_mut();
         let open = kernel.lanes.values().filter(|lane| !lane.closed).count();
         if open >= MAX_LANES {
@@ -1366,7 +1385,9 @@ impl Agent {
                 .ok_or(Error::UnknownLane(lane.0))?;
             record.destroy();
         }
-        let doomed: Vec<u64> = kernel
+        // A set: `doomed.contains` inside `retain` is quadratic, and a full
+        // lane (100 000 queued jobs) is exactly the case that matters.
+        let doomed: BTreeSet<u64> = kernel
             .jobs
             .iter()
             .filter(|(_, job)| job.lane == lane && job.state == JobState::Queued)
@@ -1399,10 +1420,13 @@ impl Agent {
     /// Destroy a channel and remove it from every lane's subscription set.
     pub fn destroy_channel(&self, channel: ChannelId) -> Result<()> {
         let mut kernel = self.cell.borrow_mut();
-        kernel
+        let removed = kernel
             .channels
             .remove(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
+        kernel.queued_channel_bytes = kernel
+            .queued_channel_bytes
+            .saturating_sub(removed.queued_bytes());
         for lane in kernel.lanes.values_mut() {
             lane.channels.remove(&channel.0);
         }
@@ -1415,6 +1439,10 @@ impl Agent {
         name: impl Into<String>,
         direction: Direction,
     ) -> Result<ChannelId> {
+        let name = name.into();
+        if name.len() > MAX_OBJECT_NAME_BYTES {
+            return Err(Error::InvalidArgument("channel name is too long"));
+        }
         let mut kernel = self.cell.borrow_mut();
         if kernel.channels.len() >= MAX_CHANNELS {
             return Err(Error::BudgetExceeded("channels"));
@@ -1427,6 +1455,21 @@ impl Agent {
         Ok(id)
     }
 
+    /// Close a channel: further sends are refused, queued messages stay
+    /// receivable.
+    ///
+    /// [`Agent::channel`] returns a snapshot, so closing the snapshot would
+    /// leave the kernel's channel live.
+    pub fn close_channel(&self, channel: ChannelId) -> Result<()> {
+        let mut kernel = self.cell.borrow_mut();
+        let record = kernel
+            .channels
+            .get_mut(&channel)
+            .ok_or(Error::UnknownChannel(channel.0))?;
+        record.close();
+        Ok(())
+    }
+
     /// Subscribe a lane to a channel.
     pub fn subscribe(&self, lane: LaneId, channel: ChannelId) -> Result<()> {
         let mut kernel = self.cell.borrow_mut();
@@ -1434,20 +1477,40 @@ impl Agent {
         if lane_record.closed {
             return Err(Error::UnknownLane(lane.0));
         }
-        let channel_record = kernel
+        kernel
             .channels
             .get(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
-        let _ = channel_record;
+        if let Some(lane) = kernel.lanes.get_mut(&lane) {
+            if lane.channels.len() >= MAX_CHANNELS_PER_LANE && !lane.channels.contains(&channel.0) {
+                return Err(Error::BudgetExceeded("subscriptions"));
+            }
+            lane.channels.insert(channel.0);
+        }
         let record = kernel
             .channels
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         record.subscribers.insert(lane.0);
-        if let Some(lane) = kernel.lanes.get_mut(&lane) {
-            lane.channels.insert(channel.0);
-        }
         Ok(())
+    }
+
+    /// Count and log a refused send or publish, exactly as a refused call is.
+    fn note_refusal(&self, lane: LaneId, cap: Option<CapId>, result: Result<u64>) -> Result<u64> {
+        if let Err(error) = &result {
+            let mut kernel = self.cell.borrow_mut();
+            kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
+            if matches!(error, Error::BudgetExceeded(_)) {
+                kernel.metrics.budget_exhaustions =
+                    kernel.metrics.budget_exhaustions.saturating_add(1);
+            }
+            kernel.push_event(Event::CallRefused {
+                lane,
+                cap: cap.unwrap_or(CapId([0u8; 16])),
+                code: error.code().to_string(),
+            });
+        }
+        result
     }
 
     /// Send a message, transferring capabilities with it.
@@ -1458,7 +1521,8 @@ impl Agent {
         payload: Value,
         caps: &[CapHandle],
     ) -> Result<u64> {
-        self.send_as(None, lane, channel, payload, caps)
+        let result = self.send_as(None, lane, channel, payload, caps);
+        self.note_refusal(lane, caps.first().map(CapHandle::id), result)
     }
 
     /// Send a message on behalf of the peer the transport authenticated.
@@ -1502,6 +1566,11 @@ impl Agent {
         }
         let mut cap_ids = Vec::with_capacity(caps.len());
         for cap in caps {
+            if cap_ids.contains(&cap.id()) {
+                return Err(Error::InvalidArgument(
+                    "a message cannot transfer the same capability twice",
+                ));
+            }
             let record = kernel
                 .caps
                 .get(&cap.id())
@@ -1546,24 +1615,34 @@ impl Agent {
         if lane_bytes.saturating_add(bytes) > lane_budget.max_bytes {
             return Err(Error::BudgetExceeded("lane byte"));
         }
+        // Channel capacity is checked before the lane and the meters are
+        // charged: a refused send must not spend the sender's grant.
+        if !channel_record.has_room_for(bytes) {
+            kernel.metrics.backpressure_refusals =
+                kernel.metrics.backpressure_refusals.saturating_add(1);
+            return Err(Error::Backpressure("channel byte ceiling reached"));
+        }
+        if kernel.queued_channel_bytes.saturating_add(bytes) > MAX_QUEUED_CHANNEL_BYTES {
+            kernel.metrics.backpressure_refusals =
+                kernel.metrics.backpressure_refusals.saturating_add(1);
+            return Err(Error::Backpressure("the kernel's channel byte ceiling"));
+        }
         let record = kernel
             .channels
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
-        let message = record.send(lane, payload, cap_ids.clone())?;
+        let sequence = record.send_sequence(lane, payload, cap_ids.clone())?;
+        kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(bytes);
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
             lane_record.bytes = lane_record.bytes.saturating_add(bytes);
             lane_record.completed = lane_record.completed.saturating_add(1);
         }
-        kernel.push_event(Event::ChannelSend {
-            channel,
-            sequence: message.sequence,
-        });
+        kernel.push_event(Event::ChannelSend { channel, sequence });
         for id in cap_ids {
             kernel.transfers += 1;
             kernel.push_event(Event::CapTransferred { cap: id, channel });
         }
-        Ok(message.sequence)
+        Ok(sequence)
     }
 
     /// Publish a message on a topic under a capability.
@@ -1584,7 +1663,8 @@ impl Agent {
         topic: &str,
         payload: Value,
     ) -> Result<u64> {
-        self.publish_as(None, lane, channel, cap, topic, payload)
+        let result = self.publish_as(None, lane, channel, cap, topic, payload);
+        self.note_refusal(lane, Some(cap.id()), result)
     }
 
     /// [`Agent::publish`] on behalf of the peer the transport authenticated.
@@ -1667,6 +1747,24 @@ impl Agent {
         // payload as far as the grant is concerned: charging only the value let
         // a 1 KiB topic ride through a 32-byte budget.
         let bytes = payload.wire_size().saturating_add(topic.len() as u64);
+        // Channel capacity comes before the charge: a publish the channel would
+        // refuse must not spend the grant or queue nothing silently.
+        {
+            let channel_record = kernel
+                .channels
+                .get(&channel)
+                .ok_or(Error::UnknownChannel(channel.0))?;
+            if !channel_record.has_room_for(bytes) {
+                kernel.metrics.backpressure_refusals =
+                    kernel.metrics.backpressure_refusals.saturating_add(1);
+                return Err(Error::Backpressure("channel byte ceiling reached"));
+            }
+        }
+        if kernel.queued_channel_bytes.saturating_add(bytes) > MAX_QUEUED_CHANNEL_BYTES {
+            kernel.metrics.backpressure_refusals =
+                kernel.metrics.backpressure_refusals.saturating_add(1);
+            return Err(Error::Backpressure("the kernel's channel byte ceiling"));
+        }
         let effective = record.attrs.budget.intersect(&lane_budget);
         if bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
@@ -1693,6 +1791,7 @@ impl Agent {
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         let message = record.send_topic(lane, Some(topic), payload, Vec::new())?;
+        kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(bytes);
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
             lane_record.bytes = lane_record.bytes.saturating_add(bytes);
             lane_record.completed = lane_record.completed.saturating_add(1);
@@ -1713,6 +1812,9 @@ impl Agent {
             .ok_or(Error::UnknownChannel(channel.0))?;
         let message = record.recv_topic(topic)?;
         if let Some(message) = &message {
+            let bytes =
+                Channel::message_bytes(&message.payload, &message.caps, message.topic.as_deref());
+            kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_sub(bytes);
             kernel.push_event(Event::ChannelRecv {
                 channel,
                 sequence: message.sequence,
@@ -1730,6 +1832,9 @@ impl Agent {
             .ok_or(Error::UnknownChannel(channel.0))?;
         let message = record.recv()?;
         if let Some(message) = &message {
+            let bytes =
+                Channel::message_bytes(&message.payload, &message.caps, message.topic.as_deref());
+            kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_sub(bytes);
             kernel.push_event(Event::ChannelRecv {
                 channel,
                 sequence: message.sequence,

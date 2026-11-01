@@ -155,6 +155,38 @@ impl Channel {
         payload: Value,
         caps: Vec<CapId>,
     ) -> Result<Message> {
+        let bytes = queued_size(&payload, &caps, topic);
+        self.push(from, topic, payload, caps, bytes)
+    }
+
+    /// Queue a message and return only its sequence.
+    ///
+    /// A caller that needs the sequence does not need the payload back: the
+    /// clone in [`Channel::send_topic`] costs a full copy of the value (64 MiB
+    /// at the frame ceiling).
+    pub fn send_sequence(&mut self, from: LaneId, payload: Value, caps: Vec<CapId>) -> Result<u64> {
+        let bytes = queued_size(&payload, &caps, None);
+        Ok(self.push(from, None, payload, caps, bytes)?.sequence)
+    }
+
+    /// Whether the channel could hold `bytes` more.
+    pub fn has_room_for(&self, bytes: u64) -> bool {
+        self.queued_bytes.saturating_add(bytes) <= MAX_QUEUED_BYTES
+    }
+
+    /// Payload bytes a message with this shape would occupy.
+    pub fn message_bytes(payload: &Value, caps: &[CapId], topic: Option<&str>) -> u64 {
+        queued_size(payload, caps, topic)
+    }
+
+    fn push(
+        &mut self,
+        from: LaneId,
+        topic: Option<&str>,
+        payload: Value,
+        caps: Vec<CapId>,
+        bytes: u64,
+    ) -> Result<Message> {
         if self.closed {
             return Err(Error::InvalidArgument("channel is closed"));
         }
@@ -164,9 +196,10 @@ impl Channel {
         if self.queue.len() >= MAX_QUEUED_PER_CHANNEL {
             return Err(Error::BudgetExceeded("channel queue"));
         }
-        let bytes = queued_size(&payload, &caps, topic);
-        if self.queued_bytes.saturating_add(bytes) > MAX_QUEUED_BYTES {
-            return Err(Error::BudgetExceeded("channel bytes"));
+        if !self.has_room_for(bytes) {
+            // A full channel is backpressure, not a spent budget: the sender's
+            // grant is untouched and the same call can be retried later.
+            return Err(Error::Backpressure("channel byte ceiling reached"));
         }
         let message = Message {
             from,

@@ -18,7 +18,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-02 | kernel dispatch | `src/kernel.rs` | CLEAN (rounds 1-3) | 24 fixed / 2 rejected / 2 low open (contract) | this commit |
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | round 1: 14 fixed | 14 fixed / 0 rejected / 0 open | this commit |
-| R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | pending | — | — |
+| R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | pending | — | — |
 | R-07 | domain ops | `src/domain.rs` | pending | — | — |
 | R-08 | tools / MCP | `src/tool.rs` | pending | — | — |
@@ -69,6 +69,30 @@ API and not for the defect.
 | M-6 | medium | revoking one restored copy left its siblings alive | **fixed**: restore refuses a second live copy of a credential and revoke dooms every live capability carrying a tombstoned record id; `restoring_the_same_record_twice_is_refused` |
 | M-7 | medium | `send` charged nothing and needed no capability | **fixed**: a send charges the lane's bytes (payload plus one id per transfer) and one lane call, and a channel has a queued-byte ceiling; `a_send_consumes_the_lane_byte_budget`, `a_channel_accounts_for_queued_bytes` |
 | L-8 | low | a vanished provider was `rpc/invalid-argument` at call time and `rpc/provider` at dispatch | **fixed**: both are `rpc/provider` |
+
+### R-05 lanes / channels - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`. Tests:
+`tests/lane_tests.rs` (10, the file the section map named); six fail on the
+pre-fix tree, four are coverage of behaviour that already worked (the lane
+charge from R-02 round 2, per-channel byte accounting, and the documented
+"a lane is not an authority boundary").
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `destroy_lane` scrubbed the queue with a linear `Vec::contains` per job: 40 000 jobs blocked the kernel for 10.6 s (measured) | **fixed**: a `BTreeSet` of doomed ids; `destroying_a_full_lane_does_not_block_the_kernel` asserts a 5 s ceiling on 40 000 jobs |
+| 2 | medium | a publish checked the message count but not the channel's byte ceiling, charged every meter, and then the channel refused: the grant was gone and nothing was queued | **fixed**: capacity is checked before any charge and answers `rpc/backpressure`; `a_publish_refused_on_a_full_channel_charges_nothing` |
+| 3 | medium | no aggregate queued-byte ceiling: 4 096 channels × 64 MiB is 256 GiB | **fixed**: `MAX_QUEUED_CHANNEL_BYTES` (256 MiB) is tracked by the kernel and released on receive and on channel destroy |
+| 4 | medium | `Channel::close()` was unreachable: `Agent::channel` returns a snapshot | **fixed**: `Agent::close_channel`; `closing_a_channel_stops_sends` |
+| 5 | low | `Lane.caps` and `Lane.ready` were never written and the module doc described a scheduler that does not exist | **fixed**: both fields and the stale doc are gone; the module now states that a lane is a budget and lifecycle scope, not an authority boundary; `a_lane_is_not_an_authority_boundary` |
+| 6 | low | send/publish refusals were not counted and a duplicated capability id double-counted a transfer | **fixed**: `note_refusal` counts and logs them, and a duplicate id is `rpc/invalid-argument`; `refusals_are_counted`, `a_message_cannot_transfer_the_same_capability_twice` |
+| 7 | low | `attenuate_lane` does not invalidate work already reserved under the old ceiling | **documented**: reservations are final (the call was charged against the old grant); the doc now says so |
+| 8 | low | names were unbounded and subscriptions had no per-lane cap | **fixed**: `MAX_OBJECT_NAME_BYTES` (256) and `MAX_CHANNELS_PER_LANE` (1 024); `names_and_subscriptions_are_bounded` |
+| 9 | low | every send cloned the payload although only the sequence was used | **fixed**: `Channel::send_sequence`; the kernel uses it |
+| 10 | low | `recv` is ambient: a provider holding the agent can drain any channel | **carried**: this is the documented residual (R-02 #8b/#17) and needs an ADR for subscription-based receive |
+
+Gate: `cargo test --all-features` 440 passed, 0 failed; clippy clean on both
+feature sets; fmt clean.
 
 ### R-04 promises / pipeline - 2026-11-01 (round 1)
 

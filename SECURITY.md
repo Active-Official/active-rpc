@@ -61,6 +61,12 @@ capability id at rest (it is a bearer token).
   still call through it.
 - Provider callbacks (`on_drop`) and provider code (`invoke`) run with no kernel
   borrow held, and a provider panic cannot wedge the kernel.
+- A lane is a budget and lifecycle scope, not an authority boundary: any lane may
+  call any live capability, and a destroyed lane neither revokes nor invalidates
+  them. Authority lives on the capability.
+- Channel capacity (per channel and in aggregate) is checked before a send or a
+  publish is charged, so a refused message spends nothing; a full channel is
+  `rpc/backpressure`, not a budget fault.
 - Secret material is represented by `Value::Secret`, never by bytes.
 - Every frame is bounded and rejected at the boundary; the capability registry,
   the attenuation chain depth and a negotiated capability table have ceilings.

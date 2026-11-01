@@ -1,11 +1,16 @@
 //! Lanes: independent concurrent execution contexts inside one agent.
 //!
-//! A lane owns a budget and a set of channels and capabilities. The kernel
-//! schedules lanes cooperatively: each step credits one ready job to one lane,
-//! round-robin, so two lanes interleave deterministically and a lane that
-//! exhausts its budget cannot starve another.
+//! A lane is a **budget and lifecycle scope**, not an authority boundary: any
+//! lane may call any live capability (authority lives on the capability), and a
+//! lane cannot gate another lane's work. What a lane owns is its call and byte
+//! ceiling, its pending/completed counters and its channel subscriptions (which
+//! are advisory).
+//!
+//! Scheduling is per provider, not per lane: a batch holds the runnable jobs of
+//! one provider in queue order, and two lanes interleave because their jobs are
+//! queued in the order they were issued.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 use crate::budget::Budget;
 use crate::error::{Error, Result};
@@ -36,13 +41,11 @@ pub struct Lane {
     /// Bytes moved through this lane (calls and publishes).
     pub bytes: u64,
     /// Channels this lane is subscribed to.
+    ///
+    /// Subscription is advisory: the kernel does not use it to gate receives.
     pub channels: BTreeSet<u64>,
-    /// Capabilities minted for this lane.
-    pub caps: BTreeSet<u128>,
     /// True once the lane has been destroyed; further calls are refused.
     pub closed: bool,
-    /// Per-lane ready queue of job ids.
-    pub ready: VecDeque<u64>,
 }
 
 impl Lane {
@@ -56,9 +59,7 @@ impl Lane {
             completed: 0,
             bytes: 0,
             channels: BTreeSet::new(),
-            caps: BTreeSet::new(),
             closed: false,
-            ready: VecDeque::new(),
         }
     }
 
@@ -80,7 +81,6 @@ impl Lane {
     /// Close the lane.
     pub fn destroy(&mut self) {
         self.closed = true;
-        self.ready.clear();
         self.pending = 0;
     }
 
