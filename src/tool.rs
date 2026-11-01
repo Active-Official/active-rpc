@@ -81,6 +81,17 @@ pub trait McpTransport {
     fn send_line(&mut self, line: &str) -> Result<()>;
     /// Read one JSON line (blocking).
     fn recv_line(&mut self) -> Result<String>;
+
+    /// Read one JSON line, giving up at `deadline`.
+    ///
+    /// The default ignores the deadline: an in-memory transport answers at
+    /// once. A transport that blocks on another process overrides this, so the
+    /// capability's wall ceiling reaches the wait instead of only measuring it
+    /// after the call returns.
+    fn recv_line_within(&mut self, deadline: Option<std::time::Instant>) -> Result<String> {
+        let _ = deadline;
+        self.recv_line()
+    }
 }
 
 /// Largest JSON-RPC line a session accepts, in bytes.
@@ -198,12 +209,22 @@ impl McpTransport for MemoryTransport {
 pub struct StdioTransport {
     child: Child,
     stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    /// Lines read by the reader thread. Reading on a thread is what makes a
+    /// deadline possible: a child pipe has no portable read timeout, and a
+    /// silent server would otherwise block the single-threaded kernel for as
+    /// long as it stays quiet.
+    lines: std::sync::mpsc::Receiver<Result<String>>,
 }
 
 impl StdioTransport {
     /// Spawn an MCP server process (no shell, no inherited environment beyond
     /// what the caller passes).
+    ///
+    /// The environment is cleared, so the caller supplies everything the server
+    /// needs. On Windows that includes `SystemRoot`: a process started without
+    /// it exits at once, and the session sees `mcp/eof` before its first line.
+    /// Reads happen on a thread, so [`McpTransport::recv_line_within`] can
+    /// abandon a server that stays silent.
     pub fn spawn(program: &str, args: &[&str], env: &BTreeMap<String, String>) -> Result<Self> {
         let mut command = Command::new(program);
         command
@@ -224,10 +245,42 @@ impl StdioTransport {
         let stdout = child.stdout.take().ok_or(Error::Provider {
             code: "mcp/stdout".to_string(),
         })?;
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("active-rpc-mcp-stdio".to_string())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    let read = reader
+                        .by_ref()
+                        .take((MAX_MCP_LINE_BYTES + 1) as u64)
+                        .read_line(&mut line);
+                    let outcome = match read {
+                        Ok(0) => Err(Error::Provider {
+                            code: "mcp/eof".to_string(),
+                        }),
+                        Ok(read) if read > MAX_MCP_LINE_BYTES => Err(Error::Provider {
+                            code: "mcp/line-too-long".to_string(),
+                        }),
+                        Ok(_) => Ok(line.trim_end().to_string()),
+                        Err(error) => Err(Error::Provider {
+                            code: format!("mcp/read:{error}"),
+                        }),
+                    };
+                    let finished = outcome.is_err();
+                    if sender.send(outcome).is_err() || finished {
+                        return;
+                    }
+                }
+            })
+            .map_err(|error| Error::Provider {
+                code: format!("mcp/thread:{error}"),
+            })?;
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            lines,
         })
     }
 }
@@ -244,28 +297,24 @@ impl McpTransport for StdioTransport {
     }
 
     fn recv_line(&mut self) -> Result<String> {
-        let mut line = String::new();
-        // A hostile server can emit an unbounded line; cap the read so it
-        // cannot exhaust memory before the session sees it.
-        let read = self
-            .stdout
-            .by_ref()
-            .take((MAX_MCP_LINE_BYTES + 1) as u64)
-            .read_line(&mut line)
-            .map_err(|error| Error::Provider {
-                code: format!("mcp/read:{error}"),
-            })?;
-        if read == 0 {
-            return Err(Error::Provider {
+        self.recv_line_within(None)
+    }
+
+    fn recv_line_within(&mut self, deadline: Option<std::time::Instant>) -> Result<String> {
+        let Some(deadline) = deadline else {
+            return self.lines.recv().map_err(|_| Error::Provider {
                 code: "mcp/eof".to_string(),
-            });
-        }
-        if read > MAX_MCP_LINE_BYTES {
-            return Err(Error::Provider {
-                code: "mcp/line-too-long".to_string(),
-            });
-        }
-        Ok(line.trim_end().to_string())
+            })?;
+        };
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err(Error::Timeout);
+        };
+        self.lines.recv_timeout(left).map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
+            std::sync::mpsc::RecvTimeoutError::Disconnected => Error::Provider {
+                code: "mcp/eof".to_string(),
+            },
+        })?
     }
 }
 
@@ -365,6 +414,15 @@ impl<T: McpTransport> McpSession<T> {
     }
 
     fn request(&mut self, method: &str, params: Json) -> Result<Json> {
+        self.request_within(method, params, None)
+    }
+
+    fn request_within(
+        &mut self,
+        method: &str,
+        params: Json,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Json> {
         // JSON-RPC ids wrap rather than panic in a long-lived session; id 0 is
         // skipped because it is the conventional "no id" notification value.
         self.next_id = self.next_id.wrapping_add(1);
@@ -379,7 +437,7 @@ impl<T: McpTransport> McpSession<T> {
             "params": params,
         });
         self.transport.send_line(&payload.to_string())?;
-        let line = self.transport.recv_line()?;
+        let line = self.transport.recv_line_within(deadline)?;
         if line.len() > MAX_MCP_LINE_BYTES {
             return Err(Error::Provider {
                 code: "mcp/line-too-long".to_string(),
@@ -461,9 +519,16 @@ impl<T: McpTransport> Provider for McpSession<T> {
                 arguments.insert(format!("arg{index}"), value_to_json(value));
             }
         }
-        let response = self.request(
+        // The capability's wall ceiling bounds the wait, not only the total: a
+        // silent server must not hold the kernel for its own timeout.
+        let ceiling = std::time::Duration::from_millis(call.budget.max_wall_ms.max(1));
+        let deadline = std::time::Instant::now()
+            .checked_add(ceiling)
+            .unwrap_or_else(std::time::Instant::now);
+        let response = self.request_within(
             "tools/call",
             json!({ "name": tool.name, "arguments": Json::Object(arguments) }),
+            Some(deadline),
         )?;
         if let Some(error) = response.get("error") {
             return Err(Error::Provider {
@@ -528,17 +593,45 @@ impl HttpTool {
         }
     }
 
-    fn perform(&self, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)> {
+    fn perform(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        ceiling_ms: u64,
+    ) -> Result<(u16, Vec<u8>)> {
         let base = self
             .base
             .strip_prefix("http://")
             .ok_or(Error::ToolPolicy("only http:// endpoints are supported"))?;
-        let mut stream = TcpStream::connect(base).map_err(|error| Error::Provider {
-            code: format!("http/connect:{error}"),
+        // The adapter's fixed ten seconds and the capability's wall ceiling both
+        // bound the wait; the smaller one wins.
+        let ceiling = std::time::Duration::from_millis(ceiling_ms.max(1))
+            .min(std::time::Duration::from_secs(10));
+        let addresses: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(base)
+            .map_err(|error| Error::Provider {
+                code: format!("http/resolve:{error}"),
+            })?
+            .collect();
+        let mut connected = None;
+        for address in addresses {
+            match TcpStream::connect_timeout(&address, ceiling) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(error) if connected.is_none() => {
+                    connected = None;
+                    let _ = error;
+                }
+                Err(_) => {}
+            }
+        }
+        let mut stream = connected.ok_or(Error::Provider {
+            code: "http/connect".to_string(),
         })?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .ok();
+        stream.set_read_timeout(Some(ceiling)).ok();
+        stream.set_write_timeout(Some(ceiling)).ok();
         let head = format!(
             "{method} {path} HTTP/1.1\r\nhost: {base}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -679,7 +772,7 @@ impl Provider for HttpTool {
         if body.len() > self.max_request {
             return Err(Error::ToolPolicy("request too large"));
         }
-        let (status, response) = self.perform(&method, &path, &body)?;
+        let (status, response) = self.perform(&method, &path, &body, call.budget.max_wall_ms)?;
         if status >= 400 {
             return Err(Error::Provider {
                 code: format!("http/{status}"),
