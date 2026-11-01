@@ -165,7 +165,7 @@ let _ = second.value()?;
 | Tools | MCP, HTTP, LocalProcess adapters; `wasm-tools` runs fuel-metered WASM guests with no host imports |
 | Wire (ARP1) | Envelope + capability table |
 | Transports | In-process, shm, TCP, QUIC (mutual TLS), HTTP/2 (`http2`), interop bridge |
-| Bulk | `ARBL`/`ARBC` chunked transfer with per-chunk hashes and resume |
+| Bulk | `ARBL`/`ARBC` chunked transfer with per-chunk hashes, resume and a capability-granted receiver that charges the budget |
 | Observability | `active-rpc/observability/1` events and `active-rpc/metrics/1` counters, correlation ids only |
 
 Specifications: [`docs/spec/wire.md`](docs/spec/wire.md) (ARP1, bulk frames,

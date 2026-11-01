@@ -181,6 +181,14 @@ fn dispatch(kernel: &Agent, lane: LaneId, request: &Envelope) -> Envelope {
             let _ = kernel.run();
             match promise.value() {
                 Ok(value) => {
+                    // The echoed payload is egress: it is charged like the
+                    // inbound one, so `max_bytes` bounds the round trip rather
+                    // than one direction of it.
+                    if let Err(error) =
+                        kernel.charge_egress_bytes(lane, &cap, request.payload.len() as u64)
+                    {
+                        return Envelope::error(request.request_id, &error);
+                    }
                     let mut response = Envelope::response(request.request_id, value);
                     // Echo the payload: thin clients verify the round trip.
                     response.payload = request.payload.clone();

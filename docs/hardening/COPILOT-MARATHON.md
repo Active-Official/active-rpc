@@ -23,7 +23,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
-| R-10 | bulk | `src/bulk.rs` | pending | — | — |
+| R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | pending | — | — |
 | R-12 | replay | `src/replay.rs` | pending | — | — |
 | R-13 | receipts | `src/receipts.rs` | pending | — | — |
@@ -194,6 +194,46 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-10 bulk transfer - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `dd50c0d`.
+No critical. The chunk codec was fail-closed (nothing stored before length and
+hash validation), but the section was a library with no consumer, and the two
+properties that make a transfer safe — charging the budget and binding the plan
+to the authority that opened it — were absent from the API. Three highs, four
+mediums, five lows; all fixed here.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | bulk bytes were never charged: a 1 GiB receiver ceiling against a 64 MiB grant, with no meter anywhere | **fixed**: `BulkReceiver::with_budget` charges every accepted frame's wire size before it is stored (`rpc/budget-exceeded`, nothing retained), `accept_charged` takes a caller callback, and the ceiling defaults to the grant; the provider path is charged by the kernel on ingress. `a_receiver_charges_every_chunk_and_stores_nothing_refused`, `the_kernel_grant_and_byte_budget_bound_a_bulk_transfer` |
+| 2 | high | a plan was self-authenticating only: no binding to the envelope, capability, peer or an expected root, so plan substitution and whole-transfer replay were accepted | **fixed**: the root now folds a transfer context (request id + capability id), `BulkPlan::new_with_context`/`decode_with_context` implement it, and `BulkReceiver::with_expected_root` plus `BulkProvider::with_expected_root` refuse a substituted plan; `a_substituted_plan_is_refused_by_the_pinned_root`, `a_plan_is_bound_to_its_transfer_context` |
+| 3 | high | `frames_for` materialised an unbounded, duplicate-laden peer list (25 GiB from a 100 000-index request) | **fixed**: deduplicated, bounded by the plan, one frame at a time via `frame_at`, and `frames_from` refuses a resume point past the plan; `a_resume_request_is_deduplicated_and_bounded` |
+| 4 | medium | the response envelope payload was never charged on egress; `max_bytes` ("both directions") was bypassed by the reference dispatcher's echo | **fixed**: `Agent::charge_egress_bytes`, called by the CLI dispatcher before attaching the echoed payload; `egress_payload_bytes_are_charged` |
+| 5 | medium | no consumer of `ARBL`/`ARBC`, no encoding for the missing list or the finish marker, no credit window; `frames()` re-materialised the body and `encode` re-hashed | **fixed**: `BulkProvider` (`plan`, `put`, `missing`, `finish`) receives the frames as ARP1 envelope payloads through a capability, so authority and the ingress charge apply; `ARBM`/`ARBF` complete the protocol; `frame_at` streams, and a chunk frame carries the hash it was built with. `a_bulk_transfer_through_the_kernel_assembles_the_body`, `a_request_frame_round_trips_and_refuses_an_off_plan_index`, `a_finish_marker_names_the_transfer` |
+| 6 | medium | `finish` peaked at 2-3x the advertised ceiling and hashed every byte three times | **fixed**: chunks are removed from the map as they are appended (peak = body + one chunk) and the accept path uses the hash `decode` already verified, so a byte is hashed twice (decode + final verify) |
+| 7 | medium | `decode` accepted a 16 TiB claim from a 64 MiB frame and allocated the hash vector before any ceiling check | **fixed**: the declared total and the chunk count (65 536) are checked before `Vec::with_capacity`; `a_plan_counts_are_bounded_before_allocation` |
+| 8 | low | the idempotent call path had no payload parameter, a free-payload path for any future dispatcher | **fixed**: `call_idempotent_as_with_payload` charges the payload and includes its size in the fingerprint; `an_idempotent_call_with_a_payload_is_charged_and_fingerprinted` |
+| 9 | low | `BulkPlan::new` truncated the chunk count to `u32` instead of using `expected_chunks` | **fixed**: `new` goes through `expected_chunks` (which now also enforces `MAX_CHUNKS`), with a `debug_assert` on the hash count |
+| 10 | low | `BulkChunk::new` accepted >8 MiB and `encode` truncated the length to `u32` | **fixed**: `BulkChunk::try_new` refuses an oversized chunk and a zero chunk size; `a_chunk_cannot_exceed_the_frame_ceiling` |
+| 11 | low | `frames_from` silently accepted an impossible resume point (a stall) while `frames_for` errored | **fixed**: `frames_from` returns `Result` and refuses `from > chunks` |
+| 12 | low | `Debug` dumped raw body bytes (log exfiltration, log bomb) | **fixed**: manual `Debug` for plan, chunk, sender, receiver and provider prints shape only; `debug_does_not_print_the_body` |
+
+Also fixed while triaging: `Call` gained `payload` (the kernel now hands the
+envelope payload to a provider instead of discarding it after the charge), and
+the fuzz target `fuzz_bulk_plan` now drives `BulkReceiver`/`finish`/`BulkRequest`
+instead of only the decoders.
+
+Spec corrections: `docs/spec/wire.md` §9 (frames travel as envelope payloads,
+`ARBM`/`ARBF`, bounded counts, the context in the root, the 1 MiB strict-profile
+note) and ADR-0013 (the root is integrity, not authority; `finish` verifies the
+body against the plan rather than "recomputing the root"; the ceiling language).
+`tests/doc_gate.rs` now lists `rpc/bulk`.
+
+Gate: `cargo test --all-features` 514 passed, 0 failed; `--no-default-features`
+465 passed; clippy and fmt clean in three configurations; control plane 30 and
+CLI 17 pass; the bulk, transport and frame suites pass in `rust:1.88-bookworm`.
+`tests/bulk_hardening_tests.rs` (14) is new.
 
 ### R-09 transports - 2026-11-01 (round 1)
 

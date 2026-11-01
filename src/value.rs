@@ -164,6 +164,12 @@ pub struct Call {
     pub tool_allows_process: bool,
     /// Effective budget (capability ∩ lane) for this call.
     pub budget: crate::budget::Budget,
+    /// The envelope payload this call carried, if any.
+    ///
+    /// A provider that moves large bodies (bulk transfer, blob upload) reads it
+    /// here. The bytes were charged against the caller's grant on ingress, so a
+    /// provider must not charge them again.
+    pub payload: Vec<u8>,
 }
 
 impl Call {
@@ -177,12 +183,19 @@ impl Call {
             read_only: false,
             tool_allows_process: false,
             budget: crate::budget::Budget::default(),
+            payload: Vec::new(),
         }
     }
 
     /// The first argument, when present.
     pub fn first(&self) -> Option<&Arg> {
         self.args.first()
+    }
+
+    /// Attach the envelope payload this call carries.
+    pub fn with_payload(mut self, payload: Vec<u8>) -> Self {
+        self.payload = payload;
+        self
     }
 }
 

@@ -1,5 +1,61 @@
 # Changelog - Active RPC
 
+## Unreleased
+
+Hardening from the R-09 (transports) and R-10 (bulk) audit rounds.
+
+### Bulk transfer
+
+- **The transfer is bound to the exchange that opened it.** `BulkPlan` folds a
+  transfer context (request id and capability id) into the root
+  (`new_with_context`, `decode_with_context`), and `BulkReceiver::with_expected_root`
+  refuses a plan whose root differs from the pinned one. A substituted plan and a
+  replayed plan are both refused; the root proves integrity, and the pinned root
+  proves which transfer it belongs to.
+- **Bytes are charged.** `BulkReceiver::with_budget` charges every accepted frame
+  against a `Budget` before it is stored, and `accept_charged` takes a caller
+  charge callback. The ceiling defaults to the grant instead of a constant.
+- **The wire format has a consumer and its missing messages.** `BulkProvider`
+  (`plan`, `put`, `missing`, `finish`) receives a body through ordinary calls
+  whose payload is the frame, so the capability grant and the ingress byte charge
+  apply. `ARBM` (resume request) and `ARBF` (finish marker) complete the protocol,
+  and `BulkTransfer` drives a sender.
+- **Bounded peer input.** `frames_for` deduplicates and refuses a list longer than
+  the plan; `frames_from` refuses a resume point past the plan; `decode` refuses
+  a declared total above the ceiling or more than 65 536 chunks before
+  allocating the hash list; `BulkChunk::try_new` refuses an oversized chunk.
+- **Peak memory and CPU.** `finish` moves chunks out of the map instead of holding
+  two copies, and a chunk frame carries the hash it was built with, so a
+  retransmission does not re-hash the body.
+- **No body bytes in `Debug`.** `BulkPlan`, `BulkChunk`, `BulkSender`,
+  `BulkReceiver` and `BulkProvider` print shape only.
+
+### Kernel
+
+- `Call::payload` carries the envelope payload to a provider, so a provider that
+  moves bodies (bulk, blob upload) can read it. The bytes were charged on ingress.
+- `Agent::charge_egress_bytes` charges an outbound payload; the CLI dispatcher
+  charges the payload it echoes, so `max_bytes` bounds the round trip.
+- `Agent::call_idempotent_as_with_payload` makes the payload size part of the
+  idempotency fingerprint and charges it.
+
+### Transports
+
+- A frame error or a broken socket ends one connection, not the server;
+  `serve_connection` returns the count served.
+- `read_frame` never reserves an announced body: it grows with the bytes that
+  arrive, and a partial header is an error rather than a clean close.
+- The Connect bridge bounds each head line, refuses ambiguous framing
+  (duplicate `content-length`, any `transfer-encoding`), answers a non-UTF-8 head
+  with 400, and times out a stalled connection.
+- QUIC handles streams concurrently with a read deadline, validates the frame
+  prefix before buffering, enforces a server-wide body budget, applies
+  `WireLimits` and abandons a handshake that outlives its slot.
+- `QuicClient::connect_with_name` for a certificate that is not for `localhost`.
+- Every transport refuses a non-`Request` envelope at the frame boundary.
+- `SharedSegment::advance()` takes no length, counters are monotone, and
+  contiguous compaction moves in place.
+
 ## CLI 0.3.1 - 2026-10-31
 
 - `version` (also `--version`, `-V`) prints the CLI and kernel versions, and

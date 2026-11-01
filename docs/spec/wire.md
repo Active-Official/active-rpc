@@ -356,8 +356,12 @@ guesses or forwards a partially decoded envelope.
 ## 9. Bulk transfer frames
 
 A body larger than one frame travels as a plan plus chunk frames (ADR-0013).
-Both are ordinary transport frames; the layouts below are little-endian unless
-stated.
+Each frame is the **payload of an ordinary ARP1 call** to a bulk provider:
+`plan` opens the transfer, `put` carries one chunk, `missing` asks for the gaps
+and `finish` closes it. That is what binds the transfer to authority and to the
+byte budget: the kernel charges an envelope payload on ingress, and a capability
+that does not grant `put` cannot push a chunk. The layouts below are
+little-endian unless stated.
 
 **Plan** (`ARBL`):
 
@@ -366,8 +370,12 @@ stated.
        | chunk_hash [32] * chunk_count
 ```
 
-`root = Blake3("active-rpc/bulk-root/v1\0", version, chunk_size, total, count, hashes)`.
-A decoder recomputes the root and refuses a plan that does not match it.
+`root = Blake3("active-rpc/bulk-root/v1\0", version, chunk_size, total, count,
+hashes, len(context), context)`. The context (normally the request id and
+capability id of the opening envelope) is **not transmitted**: both sides derive
+it, and a decoder recomputes the root and refuses a plan that does not match. A
+decoder also refuses a declared `total` above its ceiling and a
+`chunk_count` above 65 536 before allocating the hash list.
 
 **Chunk** (`ARBC`):
 
@@ -377,8 +385,33 @@ A decoder recomputes the root and refuses a plan that does not match it.
 
 `offset` must equal `index * chunk_size`, `length` must match the plan, and
 `hash = Blake3("active-rpc/bulk-chunk/v1\0", bytes)`. A duplicate chunk with
-identical bytes is idempotent; conflicting bytes are `rpc/bulk`. A receiver
-assembles only after every index is present and the root verifies.
+identical bytes is idempotent; conflicting bytes are `rpc/bulk`. `length` is at
+most 8 MiB; a body decoded under `WireLimits::strict()` caps an envelope payload
+at 1 MiB, so the sender selects a chunk size under that profile.
+
+**Resume request** (`ARBM`):
+
+```text
+"ARBM" | version u8 | count u32 | index u32 * count
+```
+
+Indexes are unique and below `chunk_count`; a request that names more indexes
+than the plan has, or one outside it, is `rpc/bulk`.
+
+**Finish** (`ARBF`):
+
+```text
+"ARBF" | version u8 | total u64 | root [32]
+```
+
+The marker names the transfer the sender believes it completed; a marker whose
+root or total differs from the plan is `rpc/bulk`, so a body from another
+transfer cannot settle this one.
+
+A receiver assembles only after every index is present and the body verifies
+against the plan. The root proves the body matches the plan, not who chose the
+plan: a caller that must not accept a substituted plan pins the root it expects
+(`with_expected_root`, or the `context` above).
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

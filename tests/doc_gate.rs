@@ -36,6 +36,7 @@ const ERROR_CODES: &[&str] = &[
     "rpc/timeout",
     "rpc/pipelined-cycle",
     "rpc/invalid-argument",
+    "rpc/bulk",
 ];
 
 #[test]

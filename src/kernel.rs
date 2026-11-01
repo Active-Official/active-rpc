@@ -1998,6 +1998,35 @@ impl Agent {
         payload_bytes: u64,
         from_peer: bool,
     ) -> Result<PromiseHandle> {
+        self.call_with_origin_payload(
+            peer,
+            lane,
+            cap,
+            method,
+            args,
+            payload_bytes,
+            Vec::new(),
+            from_peer,
+        )
+    }
+
+    /// One call with an explicit origin and the payload bytes it carried.
+    ///
+    /// The payload is what a bulk or blob provider reads; it was already charged
+    /// as `payload_bytes`, so it travels to the provider instead of being
+    /// discarded after the charge.
+    #[allow(clippy::too_many_arguments)]
+    fn call_with_origin_payload(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        payload_bytes: u64,
+        payload: Vec<u8>,
+        from_peer: bool,
+    ) -> Result<PromiseHandle> {
         if from_peer
             && args
                 .iter()
@@ -2008,7 +2037,7 @@ impl Agent {
             ));
         }
         let cap_id = cap.id();
-        let result = self.call_inner(peer, lane, cap, method, args, payload_bytes);
+        let result = self.call_inner_payload(peer, lane, cap, method, args, payload_bytes, payload);
         if let Err(error) = &result {
             let mut kernel = self.cell.borrow_mut();
             kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
@@ -2047,7 +2076,8 @@ impl Agent {
         result
     }
 
-    fn call_inner(
+    #[allow(clippy::too_many_arguments)]
+    fn call_inner_payload(
         &self,
         peer: Option<&PeerIdentity>,
         lane: LaneId,
@@ -2055,6 +2085,7 @@ impl Agent {
         method: &str,
         args: Vec<Arg>,
         payload_bytes: u64,
+        payload: Vec<u8>,
     ) -> Result<PromiseHandle> {
         let mut kernel = self.cell.borrow_mut();
         let cap_id = cap.id();
@@ -2240,6 +2271,7 @@ impl Agent {
                 .map(|policy| policy.allow_process)
                 .unwrap_or(false),
             budget: effective,
+            payload,
         };
         let job = Job {
             id: job_id,
@@ -2447,13 +2479,15 @@ impl Agent {
                 ));
             }
         }
-        self.call_as_with_payload(
+        self.call_with_origin_payload(
             peer,
             lane,
             cap,
             &envelope.method,
             envelope.args.clone(),
             envelope.payload.len() as u64,
+            envelope.payload.clone(),
+            false,
         )
     }
 
@@ -2491,13 +2525,32 @@ impl Agent {
         args: Vec<Arg>,
         key: &str,
     ) -> Result<PromiseHandle> {
+        self.call_idempotent_as_with_payload(peer, lane, cap, method, args, 0, key)
+    }
+
+    /// [`Agent::call_idempotent_as`] for a call that carries `payload_bytes`.
+    ///
+    /// The payload size is part of the fingerprint: replaying a key with a
+    /// different body is a different call and is refused, and the bytes are
+    /// charged exactly as a non-idempotent call would charge them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_idempotent_as_with_payload(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        payload_bytes: u64,
+        key: &str,
+    ) -> Result<PromiseHandle> {
         if key.is_empty() {
             return Err(Error::InvalidArgument("idempotency key is empty"));
         }
         if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
             return Err(Error::InvalidArgument("idempotency key is too long"));
         }
-        let fingerprint = args_fingerprint(&args);
+        let fingerprint = fingerprint_with_payload(&args, payload_bytes);
         // A replay is an exercise of authority in one lane: the key is scoped
         // to it, and the lane must still exist and have capacity, exactly as a
         // fresh call requires.
@@ -2578,7 +2631,7 @@ impl Agent {
         {
             return Err(Error::BudgetExceeded("lane call"));
         }
-        let promise = self.call_as(peer, lane, cap, method, args)?;
+        let promise = self.call_as_with_payload(peer, lane, cap, method, args, payload_bytes)?;
         let id = promise.id();
         let mut kernel = self.cell.borrow_mut();
         kernel
@@ -2974,21 +3027,35 @@ impl Agent {
     /// egress bound: a response that does not fit settles as
     /// `rpc/budget-exceeded` instead of leaving the kernel for free.
     fn charge_egress(&self, job: &Job, bytes: u64) -> Result<()> {
+        self.charge_egress_for(job.lane, job.cap, bytes)
+    }
+
+    /// Charge `bytes` of egress on behalf of a capability and lane.
+    ///
+    /// [`Agent::call_from_envelope`] charges the *inbound* payload; a dispatcher
+    /// that attaches a payload to the response envelope must charge that too,
+    /// otherwise `max_bytes` ("both directions") only bounds one of them. The
+    /// chain is checked in full before anything is charged.
+    pub fn charge_egress_bytes(&self, lane: LaneId, cap: &CapHandle, bytes: u64) -> Result<()> {
+        self.charge_egress_for(lane, cap.id(), bytes)
+    }
+
+    fn charge_egress_for(&self, lane: LaneId, cap: CapId, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
         let mut kernel = self.cell.borrow_mut();
-        if let Some(lane_record) = kernel.lanes.get(&job.lane) {
+        if let Some(lane_record) = kernel.lanes.get(&lane) {
             if lane_record.bytes.saturating_add(bytes) > lane_record.budget.max_bytes {
                 return Err(Error::BudgetExceeded("lane byte"));
             }
         }
         let mut chain: Vec<CapId> = kernel
             .caps
-            .get(&job.cap)
+            .get(&cap)
             .map(|record| record.lineage.clone())
             .unwrap_or_default();
-        chain.push(job.cap);
+        chain.push(cap);
         for id in &chain {
             if let Some(meter) = kernel.meters.get(id) {
                 meter.check_bytes(bytes)?;
@@ -2999,7 +3066,7 @@ impl Agent {
                 meter.charge_bytes(bytes)?;
             }
         }
-        if let Some(lane_record) = kernel.lanes.get_mut(&job.lane) {
+        if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
             lane_record.bytes = lane_record.bytes.saturating_add(bytes);
         }
         Ok(())
@@ -3669,6 +3736,14 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
 /// An idempotency key must not answer a *different* request, so the cache
 /// compares this before returning the stored promise. A secret contributes its
 /// marker and size only: hashing its content would be an oracle.
+fn fingerprint_with_payload(args: &[Arg], payload_bytes: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"active-rpc/idempotency-payload/v1\0");
+    hasher.update(&args_fingerprint(args));
+    hasher.update(&payload_bytes.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 fn args_fingerprint(args: &[Arg]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(args.len() as u64).to_le_bytes());

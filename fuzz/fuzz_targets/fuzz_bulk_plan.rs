@@ -5,7 +5,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use active_rpc::bulk::{BulkChunk, BulkPlan};
+use active_rpc::bulk::{BulkChunk, BulkPlan, BulkReceiver, BulkRequest, BulkSender};
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(plan) = BulkPlan::decode(data) {
@@ -40,10 +40,37 @@ fuzz_target!(|data: &[u8]| {
             let decoded = BulkPlan::decode(&encoded).expect("a plan must decode");
             assert_eq!(decoded.root(), plan.root());
             assert_eq!(decoded.total(), plan.total());
+            assert_eq!(decoded.chunk_count() as usize, plan.chunk_count() as usize);
             assert!(
                 plan.verify(data).is_ok(),
                 "a plan must verify its own bytes"
             );
+
+            // The receive state machine: duplicate, conflicting and off-plan
+            // chunks must each take a defined path, never a panic.
+            if let Ok(sender) = BulkSender::new(data.to_vec(), plan.chunk_size()) {
+                let frames = sender.frames();
+                let mut receiver = BulkReceiver::new(decoded.clone()).expect("admitted plan");
+                for (index, frame) in frames.iter().enumerate() {
+                    match receiver.accept(frame) {
+                        Ok(accepted) => assert_eq!(accepted as usize, index),
+                        Err(error) => assert_eq!(error.code(), "rpc/bulk"),
+                    }
+                    // Replay is idempotent.
+                    if let Ok(repeated) = receiver.accept(frame) {
+                        assert_eq!(repeated as usize, index);
+                    }
+                }
+                if receiver.is_complete() {
+                    let assembled = receiver.finish().expect("a complete body verifies");
+                    assert_eq!(assembled, data);
+                }
+                // A resume request round-trips for every admitted plan.
+                let request = BulkRequest::new(&[0, 0]);
+                if let Ok(decoded_request) = BulkRequest::decode(&request.encode(), &decoded) {
+                    assert!(decoded_request.missing().len() <= 1);
+                }
+            }
         }
     }
 });
