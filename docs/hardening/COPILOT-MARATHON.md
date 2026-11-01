@@ -143,6 +143,30 @@ refuses.
 Gate: `cargo test --all-features` 456 passed, 0 failed; `cargo test
 --no-default-features` 0 failed; clippy clean on both feature sets; fmt clean.
 
+### R-06 budgets - 2026-11-01 (round 2)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`. All five round-1
+claims were verified with fresh probes (lineage clamp = capability ∩ every
+ancestor and the same grant reserved on that chain; a three-kernel
+export→restore→re-export→restore carries 3 calls in, 3 out, 0 left behind; a
+child attenuated *after* an export cannot spend the reserved grant; a failed
+`mint_restored` does not mark the record; spent/revoked/expired exports still
+refuse; a hostile record cannot insert into either set). Two new highs:
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a *refused* export burned the grant and marked the record consumed: the empty-path-scope check ran after `reserve` and the consumed insert, so one mistyped field destroyed a durable credential | **fixed**: every "the record cannot be built" refusal now happens before the reserve; `a_refused_export_keeps_the_grant_and_the_record` |
+| 2 | high | `tombstone_record` filled the set but never reached a live capability: a record restored before the kill list was replayed (or tombstoned at runtime) kept spending for its whole lease | **fixed**: `tombstone_record` revokes every live capability carrying the id through a shared `revoke_subtree`; `a_tombstone_revokes_the_live_capability_it_names` |
+| 3 | medium | the consumed/restored mark sets had no ceiling | **fixed**: `MAX_RECORD_IDS` (65 536) with `set_record_id_ceiling`, refused as `rpc/budget-exceeded`; `the_record_id_sets_are_bounded` |
+| 4 | low | a record with a zero budget answered `rpc/invalid-argument` | **fixed**: restore maps it to `rpc/persistence` |
+| 5-8 | low | export/restore emit no event; the clamp is fail-open on a missing ancestor meter; `object` is a provider-local id; provider error text is delivered unbilled | carried in the reviewer's table with reasons |
+
+The reviewer applied its fixes directly to the working tree; they are in commit
+`da59ba9` together with the R-07 D-1 fix and the removal of the scratch probes.
+
+Gate: `cargo test --all-features` 456 passed, 0 failed; clippy clean on both
+feature sets; fmt clean.
+
 ### R-07 domain operations - 2026-11-01 (round 1, in progress)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `22c3d66`.
