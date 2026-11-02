@@ -56,9 +56,7 @@ fuzz_target!(|data: &[u8]| {
     let channel = agent
         .create_channel("news", Direction::Both)
         .expect("the fuzz harness creates a valid channel");
-    agent
-        .subscribe(lane, channel)
-        .expect("the lane subscribes");
+    agent.subscribe(lane, channel).expect("the lane subscribes");
 
     // Bit 7 set means "unrestricted"; otherwise the low bits pick the topics.
     let grants: Option<Vec<&'static str>> = if data[0] & 0x80 != 0 {
@@ -69,6 +67,10 @@ fuzz_target!(|data: &[u8]| {
     let mut attrs = CapAttrs::new(&["echo"]);
     if let Some(allowed) = &grants {
         attrs = attrs.restrict_topics(allowed);
+    } else {
+        // The unrestricted case is about topics, not about the publish grant:
+        // grant it so every refusal below is a topic refusal.
+        attrs = attrs.allow_publish();
     }
     let cap = agent
         .mint(provider, 0, attrs)
