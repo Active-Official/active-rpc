@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-3: 12 + 8 + 9 findings (D-1, D-2, D-5, D-8..D-12 partial; N1-N3/N5/N7 partial) | 29 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-4: 12 + 8 + 9 + 8 findings | 37 fixed / 0 rejected / 0 open (1 residual: binding names in `value_paths`) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,30 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-07 domain operations - 2026-11-02 (round 4, closing round 3's verification)
+
+The round-3 verification found five of nine dispositions partial and eight
+demonstrable escapes. All are closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| T1 | high | a **pathless** value node in the closure was treated as in scope (`None => false`), so a floating `Str` referenced by a constraint leaked | **fixed**: a pathless node in a closure is out of scope (`None => true`); labels still drop them; `a_scoped_answer_cannot_reach_a_pathless_expression` |
+| T2 | high | the constraint-chain fixpoint was capped at 8 iterations, so a 10-deep chain was accepted | **fixed**: the loop runs until the closure stops growing; `a_deep_constraint_chain_is_followed` |
+| T3 | high | annotation `intent`/`source` text is copied by `restrict`, so an allowed cone carried an outside source marker | **fixed**: a scoped `subgraph`/`patch` cone clears annotations as well as provenance; `a_scoped_cone_reply_carries_no_annotation_text` |
+| T4 | medium | `why`/`impact` still emitted `Kind[index]` labels under a scope | **fixed**: both use `scoped_labels`; `scoped_labels_never_name_a_node_index` |
+| T5 | medium | the scoped `patch` reply carried the module's provenance and parent hash | **fixed**: the patch cone clears provenance and annotations under a scope; `a_scoped_patch_reply_carries_no_provenance` |
+| T6 | medium | `patch` had no wall ceiling | **fixed**: `check_wall_budget` before the reply |
+| T7 | low | `impact` used the dependency closure check, missing `Env` and constraint expressions | **fixed**: `impact` uses `scope_closure` |
+| T8 | low | `immutable_node` built adjacency twice per patch | **fixed**: one pair per call |
+
+Verified: an interpolated node, a parameter default holding `Env`, a two-deep
+constraint chain, and an unscoped `subgraph` (provenance kept) behave correctly.
+
+Residual: `value_paths` returns the binding name for a bound node, so an outside
+alias makes an in-scope read refuse (fail-closed, installer-controlled).
+
+Gate: `scripts/local_gate.sh` green; all-features 716.
 
 ### R-07 domain operations - 2026-11-02 (round 3, fix verification)
 

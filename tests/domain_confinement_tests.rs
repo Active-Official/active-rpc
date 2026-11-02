@@ -410,3 +410,219 @@ fn evaluate_respects_the_node_budget() {
         "{result:?}"
     );
 }
+
+/// A floating value (no path) still travels in the cone: a scope refuses a
+/// closure that contains one.
+#[test]
+fn a_scoped_answer_cannot_reach_a_pathless_expression() {
+    let mut module = InfinityModule::new();
+    let floating = module.push(Inode::Str(OUTSIDE.to_string()));
+    let inside = module.push(Inode::Str("in".to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("y".to_string(), inside)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+    module.annotate(
+        app,
+        AnnotationKind::Constraint {
+            source: "floating".to_string(),
+            expr: floating,
+        },
+    );
+
+    let agent = Agent::with_secret([0x81; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["evaluate", "subgraph"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("floating", Budget::default())
+        .expect("lane");
+    let fixture = Fixture { agent };
+
+    for method in ["evaluate", "subgraph"] {
+        let result = call(&fixture, lane, &cap, method, vec![path("app")]);
+        assert_eq!(
+            result.as_ref().err().map(active_rpc::Error::code),
+            Some("rpc/path-not-granted"),
+            "{method}: {result:?}"
+        );
+    }
+}
+
+/// A constraint chain of ten annotations still has to be followed to its end.
+#[test]
+fn a_deep_constraint_chain_is_followed() {
+    let mut module = InfinityModule::new();
+    let outside = module.push(Inode::Str(OUTSIDE.to_string()));
+    let inside = module.push(Inode::Str("in".to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("y".to_string(), inside)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+    // app -> E1 -> E2 -> ... -> outside, ten links deep.
+    let mut chain = Vec::new();
+    for _ in 0..10 {
+        chain.push(module.push(Inode::Str("link".to_string())));
+    }
+    module.annotate(
+        app,
+        AnnotationKind::Constraint {
+            source: "e1".to_string(),
+            expr: chain[0],
+        },
+    );
+    for index in 0..9 {
+        module.annotate(
+            chain[index],
+            AnnotationKind::Constraint {
+                source: "next".to_string(),
+                expr: chain[index + 1],
+            },
+        );
+    }
+    module.annotate(
+        chain[9],
+        AnnotationKind::Constraint {
+            source: "tail".to_string(),
+            expr: outside,
+        },
+    );
+
+    let agent = Agent::with_secret([0x82; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["subgraph"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("chain", Budget::default()).expect("lane");
+    let fixture = Fixture { agent };
+
+    let result = call(&fixture, lane, &cap, "subgraph", vec![path("app")]);
+    assert_eq!(
+        result.as_ref().err().map(active_rpc::Error::code),
+        Some("rpc/path-not-granted"),
+        "{result:?}"
+    );
+}
+
+/// A scoped cone reply carries values only: annotation text (an intent or a
+/// constraint source can name outside paths) is not part of it.
+#[test]
+fn a_scoped_cone_reply_carries_no_annotation_text() {
+    let mut module = hostile_module();
+    let app = active_infinity::interop::resolve_path(&module, "app").expect("app");
+    module.annotate(
+        app,
+        AnnotationKind::Constraint {
+            source: "OUTSIDE-SOURCE-MARKER".to_string(),
+            expr: app,
+        },
+    );
+
+    let agent = Agent::with_secret([0x83; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["subgraph"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("text", Budget::default()).expect("lane");
+
+    let promise = agent
+        .call(lane, &cap, "subgraph", vec![path("app.y")])
+        .expect("queued");
+    agent.run();
+    let bytes = match promise.value().expect("subgraph") {
+        Value::Module(bytes) => bytes,
+        other => panic!("expected module bytes, got {other:?}"),
+    };
+    let rendered = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(!rendered.contains("OUTSIDE-SOURCE-MARKER"), "{rendered}");
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    assert!(
+        decoded.annotations().is_empty(),
+        "the cone carried annotations"
+    );
+}
+
+/// Under a scope, labels never name a node by its index: a `Kind[index]` label
+/// is a node-id oracle over the hidden module.
+#[test]
+fn scoped_labels_never_name_a_node_index() {
+    let (fixture, cap, lane) = fixture(&["why", "impact", "dependents"], Some("app"));
+    for method in ["why", "impact", "dependents"] {
+        let result = call(&fixture, lane, &cap, method, vec![path("app.y")]);
+        if let Ok(Value::List(labels)) = result {
+            for label in &labels {
+                if let Value::Text(text) = label {
+                    assert!(!text.contains('['), "{method} leaked a node id: {text}");
+                }
+            }
+        }
+    }
+}
+
+/// A scoped patch reply is a cone: it carries no provenance (producer or parent
+/// content address) of the whole module.
+#[test]
+fn a_scoped_patch_reply_carries_no_provenance() {
+    // No sharing here: `app.y` has no dependent outside the scope, so the write
+    // itself is allowed and the reply is what this test inspects.
+    let mut module = InfinityModule::new();
+    let inside = module.push(Inode::Str("in".to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("y".to_string(), inside)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+    module.set_provenance(Some(active_infinity::Provenance {
+        producer: Some("OUTSIDE-PRODUCER".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: Some([0x11; 32]),
+        entries: Vec::new(),
+    }));
+
+    let agent = Agent::with_secret([0x84; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["patch"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("patchcone", Budget::default())
+        .expect("lane");
+
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "patch",
+            vec![path("app.y"), Arg::Value(Value::text("changed"))],
+        )
+        .expect("queued");
+    agent.run();
+    let bytes = match promise.value().expect("patch") {
+        Value::Module(bytes) => bytes,
+        other => panic!("expected module bytes, got {other:?}"),
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    assert!(
+        decoded.provenance().is_none(),
+        "the scoped patch reply carried provenance"
+    );
+}

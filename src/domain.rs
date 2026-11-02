@@ -243,7 +243,7 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels = labels_for(&slot.module, dependencies);
+                let labels = scoped_labels(&slot.module, dependencies, call.path_scope.as_deref());
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -257,11 +257,12 @@ impl ModuleProvider {
                 let (path, node) = self.resolve(&slot.module, call)?;
                 let dependents = transitive(&slot.module, node, false);
                 if let Some(scope) = &call.path_scope {
-                    if !nodes_within_scope(&slot.module, &dependents, scope) {
+                    let (outside, environment) = scope_closure(&slot.module, node, scope);
+                    if outside || environment {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels = labels_for(&slot.module, dependents);
+                let labels = scoped_labels(&slot.module, dependents, call.path_scope.as_deref());
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -285,8 +286,11 @@ impl ModuleProvider {
                 if scoped {
                     // A cone reply is the subtree's data. Provenance (producer,
                     // entries and the parent content address) describes the whole
-                    // module and is not part of it.
+                    // module, and an annotation's intent or constraint source is
+                    // free text that may name outside paths; neither is part of
+                    // the subtree.
                     sub.set_provenance(None);
+                    sub.clear_annotations();
                 }
                 let bytes = redacted_module_bytes(&sub)?;
                 check_wall_budget(started, call)?;
@@ -359,7 +363,13 @@ impl ModuleProvider {
                     // The reply is the cone at the target, not the whole arena:
                     // a scoped writer must not receive the rest of the module
                     // back, and the bytes stay bounded by the write.
-                    let cone = restrict(&patched, node)?;
+                    let mut cone = restrict(&patched, node)?;
+                    if call.path_scope.is_some() {
+                        // The same rule as `subgraph`: a scoped cone reply is the
+                        // subtree's data, not the module's history.
+                        cone.set_provenance(None);
+                        cone.clear_annotations();
+                    }
                     let bytes = redacted_module_bytes(&cone)?;
                     (patched, bytes)
                 };
@@ -369,6 +379,7 @@ impl ModuleProvider {
                 // provider-side mint hook. Mint a fresh capability when
                 // isolation is required. The cached hash no longer describes
                 // the module, so it is cleared.
+                check_wall_budget(started, call)?;
                 slot.module = patched;
                 slot.hash = None;
                 Ok(Response::Module(bytes))
@@ -799,31 +810,29 @@ fn immutable_node(module: &InfinityModule, node: NodeId) -> bool {
     if immutable.contains(&node) {
         return true;
     }
-    let (dependencies, _) = adjacency(module);
-    // One reachability pass from the target over dependencies, and one over its
-    // dependents: a marked node either above or below the target is protected.
-    let reachable = |walk: &dyn Fn(NodeId) -> Vec<NodeId>| {
+    let (dependencies, dependents) = adjacency(module);
+    // One reachability pass each way: a marked node above (an ancestor replace
+    // deletes) or below (an alias of a marked value) protects the target.
+    let reachable = |graph: &[Vec<NodeId>]| {
         let mut seen = BTreeSet::new();
         let mut stack = vec![node];
         while let Some(current) = stack.pop() {
-            for id in walk(current) {
-                if seen.insert(id) {
-                    stack.push(id);
+            if let Some(next) = graph.get(current.index()) {
+                for id in next {
+                    if seen.insert(*id) {
+                        stack.push(*id);
+                    }
                 }
             }
         }
         seen
     };
-    let below = reachable(&|id| dependencies.get(id.index()).cloned().unwrap_or_default());
-    if below.iter().any(|id| immutable.contains(id)) {
-        return true;
-    }
-    let dependents: Vec<Vec<NodeId>> = {
-        let (_, dependents) = adjacency(module);
-        dependents
-    };
-    let above = reachable(&|id| dependents.get(id.index()).cloned().unwrap_or_default());
-    above.iter().any(|id| immutable.contains(id))
+    reachable(&dependencies)
+        .iter()
+        .any(|id| immutable.contains(id))
+        || reachable(&dependents)
+            .iter()
+            .any(|id| immutable.contains(id))
 }
 
 /// True when every node in `ids` is named by a path inside `scope`.
@@ -848,7 +857,9 @@ fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &s
 fn scope_closure(module: &InfinityModule, node: NodeId, scope: &str) -> (bool, bool) {
     let mut closure = transitive(module, node, true);
     closure.insert(node);
-    for _ in 0..8 {
+    // A constraint chain can be arbitrarily deep, so iterate until nothing new
+    // arrives; the closure is bounded by the node count.
+    loop {
         let before = closure.len();
         let subjects = closure.clone();
         for annotation in module.annotations() {
@@ -869,7 +880,9 @@ fn scope_closure(module: &InfinityModule, node: NodeId, scope: &str) -> (bool, b
     let paths = active_infinity::interop::value_paths(module);
     let outside = closure.iter().any(|id| match paths.get(id) {
         Some(path) => !crate::cap::is_path_prefix(scope, path),
-        None => false,
+        // A node no name reaches still travels in the cone: a floating value is
+        // out of scope by construction.
+        None => true,
     });
     (outside, environment)
 }
