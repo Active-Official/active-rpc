@@ -62,6 +62,13 @@ pub const MAX_HEADER_FIELDS: usize = 64;
 
 /// Consecutive `accept` failures before the listener is considered broken.
 pub const MAX_ACCEPT_FAILURES: u32 = 64;
+
+/// How long one connection may stay open without completing.
+///
+/// A client that connects and then says nothing (no preface, no HEADERS) holds
+/// its task in the join set, and `serve` waits for every task: the peer's
+/// `--limit` became unreachable. The deadline abandons such a connection.
+pub const DEFAULT_CONNECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 /// Largest frame either side will emit or accept (RFC 9113 minimum).
 pub const MAX_FRAME: u32 = 16 << 10;
 /// Concurrent streams one connection may carry.
@@ -89,6 +96,7 @@ pub struct Http2Server {
     address: String,
     limits: WireLimits,
     inflight_budget: usize,
+    connection_deadline: std::time::Duration,
 }
 
 impl std::fmt::Debug for Http2Server {
@@ -121,6 +129,7 @@ impl Http2Server {
             address,
             limits: WireLimits::default(),
             inflight_budget: MAX_INFLIGHT_BODY,
+            connection_deadline: DEFAULT_CONNECTION_DEADLINE,
         })
     }
 
@@ -147,6 +156,15 @@ impl Http2Server {
         self
     }
 
+    /// Abandon a connection that has not completed within `deadline`.
+    ///
+    /// `serve` waits for every connection task, so a client that connects and
+    /// then goes silent held the server past its `--limit`.
+    pub fn with_connection_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.connection_deadline = deadline.max(std::time::Duration::from_millis(1));
+        self
+    }
+
     /// Accept `connections` HTTP/2 connections and return the calls served.
     ///
     /// Streams within one connection are handled concurrently. The call returns
@@ -161,6 +179,7 @@ impl Http2Server {
             .ok_or(Error::Transport("server was already served".to_string()))?;
         let limits = self.limits;
         let inflight_budget = self.inflight_budget;
+        let connection_deadline = self.connection_deadline;
         let handler = Arc::new(Mutex::new(handler));
         let served = Arc::new(AtomicU64::new(0));
         self.runtime.block_on(async move {
@@ -195,13 +214,17 @@ impl Http2Server {
                 stream
                     .set_nodelay(true)
                     .map_err(|error| Error::Transport(format!("nodelay: {error}")))?;
-                active.spawn(serve_connection(
-                    stream,
-                    Arc::clone(&handler),
-                    Arc::clone(&served),
-                    limits,
-                    inflight_budget,
-                ));
+                let handler = Arc::clone(&handler);
+                let served_for_task = Arc::clone(&served);
+                active.spawn(async move {
+                    // A connection that never completes is abandoned at the
+                    // deadline instead of holding the join set.
+                    let _ = tokio::time::timeout(
+                        connection_deadline,
+                        serve_connection(stream, handler, served_for_task, limits, inflight_budget),
+                    )
+                    .await;
+                });
             }
             while let Some(joined) = active.join_next().await {
                 // A connection error is that peer's problem; the served count

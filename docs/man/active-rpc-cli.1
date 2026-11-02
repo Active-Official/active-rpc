@@ -71,7 +71,7 @@ Usage error.
 Transport or codec failure: connect, handshake or frame.
 .SH EXAMPLES
 .nf
-active-rpc-cli peer --limit 4 > peer.txt
+active-rpc-cli peer --limit 4 --emit-cap-hex > peer.txt
 ADDR=$(awk -F= '/^addr=/{print $2}' peer.txt)
 CAP=$(awk -F= '/^cap=/{print $2}' peer.txt)
 active-rpc-cli call --addr "$ADDR" --cap "$CAP" --method echo --text hello
@@ -82,8 +82,11 @@ active-rpc-cli replay dump --output session.arrp
 active-rpc-cli replay run session.arrp
 fi
 .SH NOTES
-Capabilities print as opaque ids; the CLI never prints authority bits or secret
-material. The quic peer uses the self-signed demo mode and exits after
+The peer prints a correlation id by default. B\-\-emit-cap-hexR prints the
+caller id, which is bearer authority: keep the file private, and prefer
+B\-\-cap-fileR over B\-\-capR so the id does not appear in the process
+table or in shell history. B\-\-certR and B\-\-cert-outR are refused on
+every transport but quic. The quic peer uses the self-signed demo mode and exits after
 .B --limit
 calls; the library's own QUIC tests cover mutual TLS and identity binding.
 .SH SEE ALSO

@@ -32,7 +32,9 @@ cargo install --path cli/active-rpc-cli   # from this checkout
 
 ```text
 active-rpc-cli doctor
-active-rpc-cli peer --limit 4 > peer.txt
+# --emit-cap-hex prints the caller id, which is bearer authority: keep the file
+# private (chmod 600) and prefer --cap-file over --cap in argv.
+active-rpc-cli peer --limit 4 --emit-cap-hex > peer.txt
 ADDR=$(awk -F= '/^addr=/{print $2}' peer.txt)
 CAP=$(awk -F= '/^cap=/{print $2}' peer.txt)
 active-rpc-cli call --addr "$ADDR" --cap "$CAP" --method echo --text hello
