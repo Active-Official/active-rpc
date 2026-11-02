@@ -222,23 +222,16 @@ fn the_sequence_setter_refuses_a_rewind_and_an_impossible_start() {
     assert_eq!(agent.receipts_dropped(), before + 6);
 }
 
-#[cfg(unix)]
+/// Set a file's modification time on every platform.
+///
+/// `FileTimes::set_modified` and `File::set_times` are stable in 1.75, so the
+/// test stays inside the 1.88 floor; `FileTimesExt` (unix only) is a later
+/// addition and must not be imported.
 fn filetime_set(path: &std::path::Path, when: std::time::SystemTime) {
-    use std::os::unix::fs::FileTimesExt;
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .expect("open");
     file.set_times(std::fs::FileTimes::new().set_modified(when))
         .expect("times");
-}
-
-#[cfg(windows)]
-fn filetime_set(path: &std::path::Path, when: std::time::SystemTime) {
-    // `File::set_modified` is stable on Windows too.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("open");
-    file.set_modified(when).expect("times");
 }

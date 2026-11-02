@@ -21,17 +21,32 @@ the per-release review requirement in H9.4.
 ## 2. Gates
 
 ```bash
+bash scripts/local_gate.sh
+```
+
+That script is the CI job set in one command (format, both clippy sets, both test
+sets, docs with `-D warnings`, the bench build, the fuzz and control-plane and
+CLI manifests, the hardening matrix, the negative controls, and the 1.88 MSRV
+checks). It refuses nothing the workflow also runs, so a green local gate and a
+green CI run mean the same thing. Run the steps by hand only when one of them
+fails:
+
+```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo clippy --locked --all-targets --no-default-features -- -D warnings
 cargo test --locked --all-features
 cargo test --locked --no-default-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+cargo +1.88.0 check --locked --all-targets --all-features
 cargo audit
 cargo deny check
 python scripts/hardening_status.py --check
 python scripts/negative_controls.py --check
 ```
+
+The `1.88.0` checks matter: a newer-than-floor API in a `#[cfg(unix)]` block
+passes on Windows and fails the `msrv` job.
 
 Fuzz every target for the release budget (20k runs per target in Docker or on
 Linux). A crash blocks the release.
