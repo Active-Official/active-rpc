@@ -307,7 +307,11 @@ pub enum Event {
 pub struct Metrics {
     /// Calls accepted into the queue.
     pub calls_queued: u64,
-    /// Calls refused before dispatch.
+    /// Calls, sends and publishes refused before dispatch.
+    ///
+    /// Named for calls because that is the common case, but a refused send or
+    /// publish is the same kind of event and lands here; a dashboard that
+    /// divides it by `calls_queued` must not read it as a call-only rate.
     pub calls_refused: u64,
     /// Refusals caused by a budget ceiling.
     pub budget_exhaustions: u64,
@@ -1038,14 +1042,6 @@ impl Agent {
                     .map_err(|_| Error::persistence("the grant is already committed"))?;
             }
         }
-        for id in &chain {
-            if let Some(meter) = kernel.meters.get_mut(id) {
-                meter
-                    .reserve(remaining_calls, remaining_bytes)
-                    .map_err(|_| Error::persistence("the grant is already committed"))?;
-            }
-        }
-        kernel.consumed_records.insert(record.record_id);
         let mut record = crate::persistence::CapabilityRecord {
             provider: provider_name,
             object: record.object,
@@ -1071,12 +1067,20 @@ impl Agent {
             seal: None,
         };
         record.seal_with(&key);
-        // The record must be one this crate can read back. Exporting something
-        // the parser refuses would burn the grant (reserved below) and the
-        // record id for an artifact that cannot be restored, so the round trip
-        // happens before either: an unexportable capability fails here with its
-        // authority intact.
+        // The record must be one this crate can read back, and that is checked
+        // *before* anything is reserved or consumed: exporting an artifact the
+        // parser refuses used to burn the grant and the record id, so the caller
+        // got `rpc/persistence` and a dead capability. An unexportable
+        // capability now fails with its authority intact.
         crate::persistence::CapabilityRecord::from_json(&record.to_json())?;
+        for id in &chain {
+            if let Some(meter) = kernel.meters.get_mut(id) {
+                meter
+                    .reserve(remaining_calls, remaining_bytes)
+                    .map_err(|_| Error::persistence("the grant is already committed"))?;
+            }
+        }
+        kernel.consumed_records.insert(record.record_id);
         Ok(record)
     }
 
@@ -1116,13 +1120,9 @@ impl Agent {
         peer: &crate::identity::AdmittedIdentity,
         store: Option<&mut dyn crate::persistence::RecordStore>,
     ) -> Result<CapHandle> {
-        if let Some(store) = store.as_deref() {
-            if store.is_restored(&record.record_id) {
-                return Err(Error::persistence(
-                    "the record was already restored by this deployment",
-                ));
-            }
-        }
+        // The store is consulted *after* the seal and the binding, not before:
+        // an unsealed record must not be able to probe the deployment's restore
+        // set.
         if !self.durable_capabilities_allowed() {
             return Err(Error::persistence(
                 "durable capabilities are not enabled for this agent",
@@ -1206,14 +1206,20 @@ impl Agent {
             refresh_clock(&mut kernel);
             kernel.now_ms
         };
+        // The absolute deadline is compared in its own domain only, and a
+        // virtual clock has a different epoch in every kernel. Refusing a record
+        // whose deadline already passed therefore denies a live credential when
+        // the restorer's virtual clock is ahead; restoring it on the lease alone
+        // would instead hand a *fresh* lease to a record that expired in its own
+        // domain. Refusing is the safe side, and `persistence.md` records it.
         let ttl_ms = match record.expires_at {
             Some(expires_at) if expires_at <= now => {
                 return Err(Error::persistence("the record's deadline has passed"))
             }
             Some(expires_at) => {
-                // Two virtual clocks have unrelated epochs: the absolute
-                // deadline alone would stretch the lease across a restart, so
-                // the sealed remaining lifetime is the ceiling.
+                // Two wall clocks share an epoch, but the absolute deadline
+                // alone would still stretch the lease across a restart, so the
+                // sealed remaining lifetime is the ceiling.
                 let Some(lease) = record.lease_ms else {
                     return Err(Error::persistence("a bounded record carries no lease"));
                 };
@@ -1227,6 +1233,14 @@ impl Agent {
             .budget
             .check()
             .map_err(|_| Error::persistence("the record's budget disables a ceiling"))?;
+        // Claim the record *before* minting. `claim` is atomic where the store
+        // can make it so: a check-then-mark pair let two processes restore one
+        // record into two grants, and the second grant's budget was a second
+        // copy that no revocation reached. A claim left behind by a failed mint
+        // is fail-closed: the record is spent, not duplicated.
+        if let Some(store) = store {
+            store.claim(&record.record_id)?;
+        }
         let attrs = record.attrs(ttl_ms);
         let restored = self.mint_restored(peer, provider, record.object, attrs)?;
         self.cell
@@ -1237,14 +1251,6 @@ impl Agent {
         // must tombstone the same record id the credential carries.
         if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {
             live.record_id = record.record_id;
-        }
-        if let Some(store) = store {
-            if let Err(error) = store.mark_restored(&record.record_id) {
-                // The store could not remember the restore, so the grant must
-                // not outlive the refusal: revoke it and report.
-                let _ = self.revoke(&restored);
-                return Err(error);
-            }
         }
         Ok(restored)
     }
@@ -1836,27 +1842,40 @@ impl Agent {
     /// peer-initiated refusal produced no metric and no event.
     fn note_refusal(&self, lane: LaneId, cap: Option<CapId>, result: Result<u64>) -> Result<u64> {
         if let Err(error) = &result {
-            let mut kernel = self.cell.borrow_mut();
-            kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
-            if matches!(error, Error::BudgetExceeded(_)) {
-                kernel.metrics.budget_exhaustions =
-                    kernel.metrics.budget_exhaustions.saturating_add(1);
-                kernel.push_event(Event::BudgetExhausted {
-                    cap,
-                    dimension: budget_dimension(error).to_string(),
-                });
-            }
-            if matches!(error, Error::Identity(_)) {
-                kernel.metrics.identity_refusals =
-                    kernel.metrics.identity_refusals.saturating_add(1);
-            }
-            kernel.push_event(Event::CallRefused {
-                lane,
-                cap,
-                code: error.code().to_string(),
-            });
+            self.record_refusal(lane, cap, error);
         }
         result
+    }
+
+    /// Record one refusal: the counter, the dimension when it is a budget, and
+    /// the trace event.
+    ///
+    /// Every refusing entry point goes through here. The idempotent path used to
+    /// return early without it, so the highest-value replay denials (`rpc/revoked`
+    /// on a cache hit, a key reused with different arguments) were invisible.
+    fn record_refusal(&self, lane: LaneId, cap: Option<CapId>, error: &Error) {
+        let mut kernel = self.cell.borrow_mut();
+        Self::record_refusal_in(&mut kernel, lane, cap, error);
+    }
+
+    /// [`Agent::record_refusal`] for a caller that already holds the kernel.
+    fn record_refusal_in(kernel: &mut Kernel, lane: LaneId, cap: Option<CapId>, error: &Error) {
+        kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
+        if matches!(error, Error::BudgetExceeded(_)) {
+            kernel.metrics.budget_exhaustions = kernel.metrics.budget_exhaustions.saturating_add(1);
+            kernel.push_event(Event::BudgetExhausted {
+                cap,
+                dimension: budget_dimension(error).to_string(),
+            });
+        }
+        if matches!(error, Error::Identity(_)) {
+            kernel.metrics.identity_refusals = kernel.metrics.identity_refusals.saturating_add(1);
+        }
+        kernel.push_event(Event::CallRefused {
+            lane,
+            cap,
+            code: error.code().to_string(),
+        });
     }
 
     /// Send a message, transferring capabilities with it.
@@ -2910,10 +2929,14 @@ impl Agent {
         key: &str,
     ) -> Result<PromiseHandle> {
         if key.is_empty() {
-            return Err(Error::InvalidArgument("idempotency key is empty"));
+            let error = Error::InvalidArgument("idempotency key is empty");
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
         }
         if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
-            return Err(Error::InvalidArgument("idempotency key is too long"));
+            let error = Error::InvalidArgument("idempotency key is too long");
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
         }
         let fingerprint = fingerprint_with_payload(&args, payload_bytes);
         // A replay is an exercise of authority in one lane: the key is scoped
@@ -2921,9 +2944,13 @@ impl Agent {
         // fresh call requires.
         {
             let kernel = self.cell.borrow();
-            let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
-            if lane_record.closed {
-                return Err(Error::UnknownLane(lane.0));
+            let unknown = !kernel.lanes.contains_key(&lane)
+                || kernel.lanes.get(&lane).is_some_and(|record| record.closed);
+            drop(kernel);
+            if unknown {
+                let error = Error::UnknownLane(lane.0);
+                self.record_refusal(lane, Some(cap.id()), &error);
+                return Err(error);
             }
             // Capacity is checked on the miss path only: a cached replay makes
             // no call, and refusing it at the ceiling would defeat the retry
@@ -2934,9 +2961,11 @@ impl Agent {
             let mut kernel = self.cell.borrow_mut();
             if let Some((id, stored_args)) = kernel.idempotency.get(&map_key).copied() {
                 if stored_args != fingerprint {
-                    return Err(Error::InvalidArgument(
+                    let error = Error::InvalidArgument(
                         "the idempotency key was used with different arguments",
-                    ));
+                    );
+                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    return Err(error);
                 }
                 {
                     let record = kernel
@@ -2944,23 +2973,28 @@ impl Agent {
                         .get(&cap.id())
                         .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
                     if record.revoked {
-                        return Err(Error::Revoked(cap_token(cap.id())));
+                        let error = Error::Revoked(cap_token(cap.id()));
+                        Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                        return Err(error);
                     }
                     if record
                         .expires_at
                         .is_some_and(|expires_at| kernel.now_ms >= expires_at)
                     {
                         kernel.push_event(Event::CapExpired(cap.id()));
-                        return Err(Error::Revoked(cap_token(cap.id())));
+                        let error = Error::Revoked(cap_token(cap.id()));
+                        Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                        return Err(error);
                     }
                     if let Some(bound) = record.attrs.bound_to {
                         if !crate::identity::matches(
                             crate::identity::presented_fingerprint(peer),
                             bound,
                         ) {
-                            return Err(Error::Identity(
-                                "capability is bound to a different peer identity",
-                            ));
+                            let error =
+                                Error::Identity("capability is bound to a different peer identity");
+                            Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                            return Err(error);
                         }
                     }
                 }
@@ -2996,7 +3030,9 @@ impl Agent {
             .get(&lane)
             .is_some_and(|record| record.has_capacity())
         {
-            return Err(Error::BudgetExceeded("lane call"));
+            let error = Error::BudgetExceeded("lane call");
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
         }
         let promise = self.call_as_with_payload(peer, lane, cap, method, args, payload_bytes)?;
         let id = promise.id();
@@ -3742,14 +3778,26 @@ impl Agent {
             // remaining grant never leaves the kernel.
             let outcome = match outcome {
                 Ok(value) => {
-                    // The grant bounds what comes back as much as what went in:
-                    // a provider returning a list far wider than the grant's
-                    // `max_array_len` would otherwise be admitted whole.
-                    match shape_refusal(&value, &job.call.budget) {
-                        Some(error) => Err(error),
-                        None => match self.charge_egress(&job, value.wire_size()) {
-                            Ok(()) => Ok(value),
-                            Err(error) => Err(error),
+                    // The redaction policy is enforced here, not left to the
+                    // provider: a redacting call gets a redacted value, and a
+                    // call that did not ask for redaction must not receive a
+                    // module that still carries structural secrets.
+                    let checked = if job.call.redact {
+                        Ok(crate::security::redact_value(value))
+                    } else {
+                        crate::security::assert_no_structural_secrets(&value).map(|()| value)
+                    };
+                    match checked {
+                        Err(error) => Err(error),
+                        // The grant bounds what comes back as much as what went
+                        // in: a provider returning a list far wider than the
+                        // grant's `max_array_len` would otherwise be admitted.
+                        Ok(value) => match shape_refusal(&value, &job.call.budget) {
+                            Some(error) => Err(error),
+                            None => match self.charge_egress(&job, value.wire_size()) {
+                                Ok(()) => Ok(value),
+                                Err(error) => Err(error),
+                            },
                         },
                     }
                 }
@@ -3791,6 +3839,31 @@ impl Agent {
                         });
                         kernel.metrics.promises_rejected =
                             kernel.metrics.promises_rejected.saturating_add(1);
+                        // The dispatch re-checks (a promise's resolved bytes, a
+                        // shape ceiling, a tool ceiling, the egress charge) are
+                        // budget and tool refusals too. They used to settle as a
+                        // bare rejection, so a dashboard read "no budget
+                        // exhaustions" while calls were being refused for a
+                        // budget, and the dimension was lost.
+                        match error {
+                            Error::BudgetExceeded(_) => {
+                                kernel.metrics.budget_exhaustions =
+                                    kernel.metrics.budget_exhaustions.saturating_add(1);
+                                kernel.push_event(Event::BudgetExhausted {
+                                    cap: Some(job.cap),
+                                    dimension: budget_dimension(error).to_string(),
+                                });
+                            }
+                            Error::ToolPolicy(_) => {
+                                kernel.metrics.tool_refusals =
+                                    kernel.metrics.tool_refusals.saturating_add(1);
+                                kernel.push_event(Event::ToolRefused {
+                                    cap: job.cap,
+                                    reason: error.to_string(),
+                                });
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -4305,6 +4378,7 @@ fn budget_dimension(error: &Error) -> &'static str {
             "depth" => "depth",
             "array_len" => "array_len",
             "value_size" => "value_size",
+            "caps per message" => "caps per message",
             "channel queue" => "channel queue",
             _ => "other",
         },
@@ -4460,8 +4534,10 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         }
     }
     for id in doomed {
+        let mut was_revoked = false;
         let record_id = match kernel.caps.get_mut(&id) {
             Some(record) => {
+                was_revoked = record.revoked;
                 record.revoked = true;
                 // Only a durable record can ever be restored, so only its id
                 // needs a tombstone; an ephemeral one would leak an entry per
@@ -4477,8 +4553,13 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         if let Some(record_id) = record_id {
             kernel.revoked_records.insert(record_id);
         }
-        kernel.push_event(Event::CapRevoked(id));
-        kernel.metrics.revocations = kernel.metrics.revocations.saturating_add(1);
+        // A second revoke of the same capability is authority-correct but is
+        // not a second revocation: counting it let a retry loop over-report the
+        // kill switch and flush the tape the incident review needs.
+        if !was_revoked {
+            kernel.push_event(Event::CapRevoked(id));
+            kernel.metrics.revocations = kernel.metrics.revocations.saturating_add(1);
+        }
     }
 }
 

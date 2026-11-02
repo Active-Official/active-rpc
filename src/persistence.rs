@@ -33,10 +33,32 @@ use crate::{Error, Result};
 /// error, because the restore is then refused and the minted grant revoked.
 pub trait RecordStore {
     /// True when this record id was restored by any kernel sharing the store.
+    ///
+    /// A read error must answer `true`: the caller treats `false` as "not yet
+    /// restored" and would mint a second grant.
     fn is_restored(&self, record_id: &[u8; 32]) -> bool;
 
     /// Remember a restore, or refuse when the store cannot.
+    ///
+    /// A store whose backend accepts duplicates (an upsert) must detect the
+    /// conflict and return an error: two restores of one record are two copies
+    /// of its budget, and a revocation reaches only the one it knows.
     fn mark_restored(&mut self, record_id: &[u8; 32]) -> Result<()>;
+
+    /// Atomically take ownership of a record id.
+    ///
+    /// The default is check-then-mark, which races between two processes. A
+    /// store with an atomic insert-if-absent (a unique key, a conditional
+    /// write) overrides this, and the kernel calls it after the seal and the
+    /// binding are verified and before the grant is minted.
+    fn claim(&mut self, record_id: &[u8; 32]) -> Result<()> {
+        if self.is_restored(record_id) {
+            return Err(Error::persistence(
+                "the record was already restored by this deployment",
+            ));
+        }
+        self.mark_restored(record_id)
+    }
 }
 
 /// An in-memory [`RecordStore`], for tests and single-process deployments.
@@ -71,8 +93,15 @@ impl RecordStore for MemoryRecordStore {
     }
 
     fn mark_restored(&mut self, record_id: &[u8; 32]) -> Result<()> {
-        self.ids.insert(*record_id);
-        Ok(())
+        // The set is the store: a second insert of the same id is a conflict,
+        // and accepting it would hand out a second copy of the budget.
+        if self.ids.insert(*record_id) {
+            Ok(())
+        } else {
+            Err(Error::persistence(
+                "the record was already restored by this deployment",
+            ))
+        }
     }
 }
 
@@ -84,6 +113,48 @@ pub const RECORD_FORMAT: &str = "active-rpc/capability-record/1";
 /// A record is a fixed set of scalar fields and short lists; anything beyond
 /// this is hostile input.
 pub const MAX_RECORD_BYTES: usize = 64 << 10;
+
+/// The fields a record may carry. Anything else is refused.
+const RECORD_KEYS: &[&str] = &[
+    "format",
+    "provider",
+    "object",
+    "methods",
+    "budget",
+    "read_only",
+    "redact",
+    "path_scope",
+    "topics",
+    "publish",
+    "tool_policy",
+    "bound_to",
+    "expires_at",
+    "wall_clock",
+    "lease_ms",
+    "record_id",
+    "seal",
+];
+
+/// Refuse a record whose text is not the canonical rendering of its value.
+///
+/// The seal is computed over the parsed value, so the *text* must have exactly
+/// one meaning. `serde_json` keeps the last of two equal keys, so
+/// `{"provider":"evil",…,"provider":"echo"}` parsed to `echo` and sealed while a
+/// first-wins consumer of the same text read `evil`. Re-rendering the parsed
+/// value gives the one form this crate produces (`to_json`), and any other text —
+/// a repeated key, different whitespace, a different key order — is refused.
+fn refuse_non_canonical(text: &str, value: &Json) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        return Err(Error::persistence("record is not an object"));
+    };
+    let rendered = Json::Object(object.clone()).to_string();
+    if rendered != text {
+        return Err(Error::persistence(
+            "record text is not the canonical rendering of its value",
+        ));
+    }
+    Ok(())
+}
 
 /// A durable capability's authority, without its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,8 +285,15 @@ impl CapabilityRecord {
     }
 
     /// The bytes a seal covers: every field, canonically ordered, no seal.
+    ///
+    /// A purpose prefix separates this MAC from any other keyed hash a
+    /// deployment might compute with the same 32-byte key: without it, a MAC
+    /// from another protocol could be presented as a seal.
     pub fn seal_material(&self) -> Vec<u8> {
-        Json::Object(self.fields()).to_string().into_bytes()
+        let mut material = Vec::with_capacity(64);
+        material.extend_from_slice(b"active-rpc/capability-record-seal/v1\0");
+        material.extend_from_slice(Json::Object(self.fields()).to_string().as_bytes());
+        material
     }
 
     /// Seal the record with a deployment key.
@@ -267,10 +345,22 @@ impl CapabilityRecord {
         if value.get("format").and_then(Json::as_str) != Some(RECORD_FORMAT) {
             return Err(Error::persistence("unknown record format"));
         }
+        // The seal covers the parsed value, so the text must have one meaning:
+        // a duplicate key, different whitespace or an unknown field would let two
+        // consumers of the same stored text disagree.
+        refuse_non_canonical(text, &value)?;
+        let Some(object) = value.as_object() else {
+            return Err(Error::persistence("record is not an object"));
+        };
+        for key in object.keys() {
+            if !RECORD_KEYS.contains(&key.as_str()) {
+                return Err(Error::persistence("record has an unknown field"));
+            }
+        }
         let provider = value
             .get("provider")
             .and_then(Json::as_str)
-            .filter(|name| !name.is_empty() && name.len() <= 128)
+            .filter(|name| crate::security::valid_text(name, 128))
             .ok_or_else(|| Error::persistence("provider name is missing or out of range"))?;
         let object = value
             .get("object")
@@ -280,6 +370,15 @@ impl CapabilityRecord {
             string_set(&value, "methods")?.ok_or_else(|| Error::persistence("missing methods"))?;
         if methods.is_empty() {
             return Err(Error::persistence("a record grants no methods"));
+        }
+        // The parser validates every text field it accepts: a record with an
+        // empty or control-character method used to parse here and then fail in
+        // the mint as `rpc/invalid-argument`, so the durable surface reported two
+        // classes for one fault.
+        for method in &methods {
+            if !crate::receipts::valid_method(method) {
+                return Err(Error::persistence("a record grants a malformed method"));
+            }
         }
         let budget = value
             .get("budget")
@@ -322,6 +421,13 @@ impl CapabilityRecord {
             Some(_) => return Err(Error::persistence("path scope is malformed")),
         };
         let topics = string_set(&value, "topics")?;
+        if let Some(topics) = &topics {
+            for topic in topics {
+                if !crate::kernel::valid_topic(topic) {
+                    return Err(Error::persistence("a record names a malformed topic"));
+                }
+            }
+        }
         // A record written before the grant existed carries no field. The
         // default narrows authority (no publishing) rather than widening it, and
         // a record that names topics implies the grant.
@@ -392,6 +498,14 @@ impl CapabilityRecord {
                     .ok_or_else(|| Error::persistence("lease is malformed"))?,
             ),
         };
+        // A lease with no deadline would restore with no deadline at all: the
+        // restorer takes its TTL from `expires_at`, so the lease would be
+        // silently widened to "forever".
+        if lease_ms.is_some() && expires_at.is_none() {
+            return Err(Error::persistence(
+                "a record carries a lease without a deadline",
+            ));
+        }
         let record_id = match value.get("record_id") {
             Some(Json::String(text)) => parse_hex32(text)?,
             _ => return Err(Error::persistence("missing record id")),

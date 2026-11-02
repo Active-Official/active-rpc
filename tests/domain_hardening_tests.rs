@@ -363,3 +363,50 @@ fn the_fixture_source_parses() {
     assert!(source_available());
     let _ = Error::ReadOnly;
 }
+
+/// A redacting capability gets the hash of the redacted image.
+///
+/// `content_hash` covers the secret heap, so the canonical hash is an equality
+/// oracle over secret material for a capability that may not read the module:
+/// compare one guess, or brute-force a short value. The redacted hash still
+/// proves structural identity, and the two differ exactly when the module has a
+/// secret.
+#[test]
+fn a_redacting_capability_hashes_the_redacted_image() {
+    let mut provider = ModuleProvider::new();
+    let object = install_source(
+        &mut provider,
+        "[app]\ntoken = secret(\"canary-value\")\nport = 8080\n",
+    );
+    let mut redacting = Call::new("content_hash", vec![]);
+    redacting.redact = true;
+    let redacted_hash = text_response(provider.invoke(object, &redacting).expect("redacted"));
+    let full_hash = text_response(
+        provider
+            .invoke(object, &Call::new("content_hash", vec![]))
+            .expect("full"),
+    );
+    assert_ne!(
+        redacted_hash, full_hash,
+        "a redacting capability must not learn the hash of the secret heap"
+    );
+
+    // The redacted answer is the hash of the redacted image, so it is stable and
+    // does not change when the secret changes... unless the structure does.
+    let bytes = active_infinity::encode(provider.module(object).expect("module")).expect("encode");
+    let expected = active_infinity::content_hash(
+        &active_rpc::security::redact_module(&bytes).expect("redact"),
+    )
+    .expect("hash");
+    assert_eq!(
+        redacted_hash,
+        format!("blake3:{}", active_infinity::ir::hash_hex(&expected))
+    );
+}
+
+fn text_response(response: Response) -> String {
+    match response {
+        Response::Value(Value::Text(text)) => text,
+        other => panic!("expected text, got {other:?}"),
+    }
+}

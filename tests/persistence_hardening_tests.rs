@@ -80,16 +80,58 @@ fn a_store_that_cannot_remember_refuses_and_revokes_the_grant() {
         .restore_capability_with(&record, &admitted(b"owner"), Some(&mut Broken))
         .expect_err("a store that cannot remember refuses the restore");
     assert_eq!(error.code(), "rpc/persistence");
-    // Nothing usable was left behind: the record cannot be restored again, and
-    // the in-memory set remembers the id.
-    // The revoke that failed the restore also tombstones the record id, so a
-    // second attempt is refused either way: what matters is that no grant lives.
-    assert!(
-        agent
-            .restore_capability(&record, &admitted(b"owner"))
-            .is_err(),
-        "a restore that could not be remembered must not leave a usable grant"
+    // The claim happens *before* the mint, so a store that cannot claim leaves
+    // no grant behind at all (the old order minted one and then revoked it).
+    assert_eq!(
+        agent.metrics().promises_pending,
+        0,
+        "a refused claim leaves nothing to run"
     );
+    // The record was not consumed: a working deployment can still restore it.
+    let mut store = MemoryRecordStore::new();
+    let restored = agent
+        .restore_capability_with(&record, &admitted(b"owner"), Some(&mut store))
+        .expect("the record is intact after a failed claim");
+    drop(restored);
+    assert_eq!(store.len(), 1);
+}
+
+/// A store that detects the conflict (rather than a write error) also leaves
+/// exactly one grant.
+#[test]
+fn a_store_that_detects_a_conflict_leaves_one_grant() {
+    struct Conflict(bool);
+    impl RecordStore for Conflict {
+        fn is_restored(&self, _id: &[u8; 32]) -> bool {
+            false
+        }
+        fn mark_restored(&mut self, _id: &[u8; 32]) -> active_rpc::Result<()> {
+            if self.0 {
+                return Err(Error::persistence("duplicate"));
+            }
+            self.0 = true;
+            Ok(())
+        }
+        fn claim(&mut self, _id: &[u8; 32]) -> active_rpc::Result<()> {
+            self.mark_restored(_id)
+        }
+    }
+
+    let (first, provider) = durable_agent();
+    let cap = durable_cap(&first, provider);
+    let record = first.export_capability(&cap).expect("export");
+    drop(cap);
+    let mut store = Conflict(false);
+    let restored = first
+        .restore_capability_with(&record, &admitted(b"owner"), Some(&mut store))
+        .expect("the first restore claims the record");
+    drop(restored);
+
+    let (second, _provider) = durable_agent();
+    let error = second
+        .restore_capability_with(&record, &admitted(b"owner"), Some(&mut store))
+        .expect_err("the second restore is a conflict");
+    assert_eq!(error.code(), "rpc/persistence");
 }
 
 // ---------------------------------------------------------------------------

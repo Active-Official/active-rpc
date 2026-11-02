@@ -357,6 +357,22 @@ impl ModuleProvider {
                 )))
             }
             "content_hash" => {
+                // A redacting capability gets the hash of the *redacted* image:
+                // the canonical hash covers the secret heap, so handing it to a
+                // caller that may not read the module is an equality oracle over
+                // secret material (compare one guess, or brute-force a short
+                // value). The redacted hash still proves structural identity.
+                if call.redact {
+                    let bytes = encode(&slot.module)
+                        .map_err(|error| Error::Payload(error.code().to_string()))?;
+                    let redacted = crate::security::redact_module(&bytes)?;
+                    let hash = active_infinity::content_hash(&redacted)
+                        .map_err(|error| Error::Payload(error.code().to_string()))?;
+                    return Ok(Response::Value(Value::Text(format!(
+                        "blake3:{}",
+                        hex32(&hash)
+                    ))));
+                }
                 let hash = match slot.hash {
                     Some(hash) => hash,
                     None => {

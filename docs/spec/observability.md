@@ -41,8 +41,8 @@ authority.
 | `promise` | u64 | the event names a promise |
 | `channel` | u64 | the event names a channel |
 | `channel_sequence` | u64 | a channel send or receive |
-| `code` | string | a refusal or rejection with a stable `rpc/...` code |
-| `dimension` | string | a budget exhaustion or ceiling: `call`, `byte`, `lane call`, `lane byte`, `promises`, `jobs`, `caps`, `lanes`, `channels`, `subscriptions`, `records`, `tombstones`, `nodes`, `wall`, `depth`, `array_len`, `value_size`, `channel queue` |
+| `code` | string | a refusal or rejection with a stable `rpc/...` code, projected from `Error::code` (a provider-authored code is always `rpc/provider`, never the provider's own text) |
+| `dimension` | string | a budget exhaustion or ceiling: `call`, `byte`, `lane call`, `lane byte`, `promises`, `jobs`, `caps`, `caps per message`, `lanes`, `channels`, `subscriptions`, `records`, `tombstones`, `nodes`, `wall`, `depth`, `array_len`, `value_size`, `channel queue`, or `other` for a ceiling added without a label |
 | `identity` | string | a capability introduction; the peer fingerprint (a public label) |
 | `detail` | string | a short, value-free explanation (`"3 jobs in 2 lanes"`) |
 
@@ -79,8 +79,11 @@ from this table, so the table cannot drift.
 ## Retention and paging
 
 The kernel keeps a bounded tape (`MAX_EVENTS`, 16 384 records). `sequence` is
-monotonic over the whole life of the kernel, including evicted records, so a
-collector pages with `last_sequence + 1` and never repeats a record. Consumers
+monotonic over the whole life of one kernel, including evicted records, so a
+collector pages with `last_sequence + 1` and never repeats a record within that
+kernel. A restarted kernel starts at zero again and the record carries no epoch:
+a collector must read `metrics_json` and reset its cursor when `events_total`
+decreases, or it will discard every event below its last seen sequence. Consumers
 that need every event export on a cadence shorter than the tape wrap.
 
 ## Metrics record

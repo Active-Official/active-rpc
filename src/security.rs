@@ -72,21 +72,37 @@ pub fn redact_value(value: Value) -> Value {
     match value {
         Value::Secret => Value::Secret,
         Value::List(items) => Value::List(items.into_iter().map(redact_value).collect()),
+        // A key is text too: a provider that puts a secret copy or the marker
+        // in a `Value::Map` key would otherwise pass through untouched. The
+        // whole map collapses to the marker, because renaming a key could
+        // collide with another entry.
+        Value::Map(entries) if entries.keys().any(|key| key.contains(SECRET_MARKER)) => {
+            Value::Secret
+        }
         Value::Map(entries) => Value::Map(
             entries
                 .into_iter()
                 .map(|(key, value)| (key, redact_value(value)))
                 .collect(),
         ),
-        Value::Text(text) if text.contains(SECRET_MARKER) => Value::Secret,
+        // A text that *is* the marker (or that embeds it) stays text: the marker
+        // is content-free, and a provider that already redacted its answer
+        // returns it as a label. Collapsing it here turned `["***SECRET***"]`
+        // into `[Secret]` and made redaction destroy its own output. Secret
+        // *bytes* in plain text are the provider's fault and are what the
+        // codec's fragment checks refuse on encode.
+        Value::Text(_) => value,
         // A module is the only variant that carries arbitrary bytes, so it is
         // the only one that can smuggle a secret node. Rewriting beats passing
         // it through: a redacting caller must not receive the original bytes.
+        // A module is either an Infinity image or opaque bytes a provider
+        // produced (a WASM tool's binary output). Only an image has secret
+        // structure; refusing an opaque blob here turned every binary tool
+        // result into a marker.
         Value::Module(bytes) => match redact_module(&bytes) {
             Ok(redacted) => Value::Module(redacted),
-            // A module that cannot be decoded has no structure to redact, and
-            // handing the bytes back would be the leak this function exists to
-            // prevent.
+            Err(_) if !is_infinity_image(&bytes) => Value::Module(bytes),
+            // An image that cannot be redacted is not safe to hand back.
             Err(_) => Value::Secret,
         },
         other => other,
@@ -98,8 +114,22 @@ pub fn redact_value(value: Value) -> Value {
 /// One implementation for [`redact_value`] and the domain provider: two would
 /// drift, and the one that drifted would be the leak.
 pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut module =
-        active_infinity::decode(bytes).map_err(|error| Error::Payload(error.code().to_string()))?;
+    // The canonical encode runs *first*, while the secret nodes are still in the
+    // module. That is the only moment the codec can refuse free text (an
+    // annotation, provenance, a binding name) that carries a secret literal:
+    // replacing the nodes first empties the secret heap, so the same metadata
+    // would pass and be written into the output verbatim.
+    //
+    // A module the codec refuses here cannot be redacted safely, so the caller
+    // gets an error and [`redact_value`] collapses the whole value to the
+    // marker rather than handing the bytes back.
+    let canonical = active_infinity::encode(
+        &active_infinity::decode(bytes)
+            .map_err(|error| Error::Payload(error.code().to_string()))?,
+    )
+    .map_err(|error| Error::Payload(error.code().to_string()))?;
+    let mut module = active_infinity::decode(&canonical)
+        .map_err(|error| Error::Payload(error.code().to_string()))?;
     for index in 0..module.node_count() {
         let id = active_infinity::NodeId(index as u32);
         let is_secret = module.get(id).map(|node| node.is_secret()).unwrap_or(false);
@@ -118,14 +148,24 @@ pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
 
 /// True when a module holds a node marked secret.
 fn module_has_secret(bytes: &[u8]) -> Result<bool> {
-    let module =
-        active_infinity::decode(bytes).map_err(|error| Error::Payload(error.code().to_string()))?;
+    // Opaque bytes are not an Infinity image and carry no secret structure.
+    let Ok(module) = active_infinity::decode(bytes) else {
+        return Ok(false);
+    };
     Ok((0..module.node_count()).any(|index| {
         module
             .get(active_infinity::NodeId(index as u32))
             .map(|node| node.is_secret())
             .unwrap_or(false)
     }))
+}
+
+/// True when the bytes are an Active Infinity image.
+///
+/// `Value::Module` also carries opaque provider output (a WASM tool's binary
+/// result), which has no secret structure to redact.
+pub fn is_infinity_image(bytes: &[u8]) -> bool {
+    active_infinity::decode(bytes).is_ok()
 }
 
 /// Validate an outgoing module payload before it is handed to a transport or a
@@ -136,13 +176,35 @@ pub fn check_module_payload(bytes: &[u8]) -> Result<()> {
         .map_err(|error| Error::Payload(error.code().to_string()))
 }
 
-/// Ensure a response carries no secret material.
+/// Refuse a value that carries *structural* secrets.
 ///
-/// The RPC value model cannot represent secret bytes, but a provider might hand
-/// back text that contains a marker or a module that a caller does not expect to
-/// be secret-bearing. Modules are checked for structural secrets before they go
-/// out; a module with secrets is allowed only inside a redacting capability,
-/// which the provider already enforces.
+/// The egress gate for a non-redacting capability: a [`Value::Secret`] marker is
+/// content-free and is the whole point of the value model, but a module with
+/// secret nodes is the original bytes and must not cross. The distinction is why
+/// this is not [`assert_no_secret_material`], which refuses the marker too.
+pub fn assert_no_structural_secrets(value: &Value) -> Result<()> {
+    match value {
+        Value::Secret => Ok(()),
+        Value::List(items) => items.iter().try_for_each(assert_no_structural_secrets),
+        Value::Map(entries) => entries.values().try_for_each(assert_no_structural_secrets),
+        Value::Module(bytes) => {
+            if module_has_secret(bytes)? {
+                return Err(Error::Provider {
+                    code: "rpc/secret-material".to_string(),
+                });
+            }
+            Ok(())
+        }
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Text(_)
+        | Value::Path(_) => Ok(()),
+    }
+}
+
+/// Ensure a response carries no secret material.
 pub fn assert_no_secret_material(value: &Value) -> Result<()> {
     match value {
         Value::Secret => Err(Error::Provider {
@@ -208,6 +270,30 @@ pub fn is_invisible_or_reordering(character: char) -> bool {
             | '\u{2061}'..='\u{2064}'
             | '\u{180E}'
             | '\u{FE00}'..='\u{FE0F}'
+            // Deprecated format characters and the interlinear annotation set.
+            | '\u{206A}'..='\u{206F}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            // Prepend characters that render as nothing in most fonts.
+            | '\u{0600}'..='\u{0605}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            // Egyptian hieroglyph format controls, Shorthand Format Controls and
+            // musical symbol controls.
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            // The variation selectors supplement.
+            | '\u{E0100}'..='\u{E01EF}'
+            // Invisible fillers: Hangul fillers, the Hangul filler letter, the
+            // halfwidth Hangul filler, and the braille blank.
+            | '\u{115F}'..='\u{1160}'
+            | '\u{3164}'
+            | '\u{FFA0}'
+            | '\u{2800}'
     )
 }
 
