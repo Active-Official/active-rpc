@@ -603,3 +603,45 @@ fn a_wildcard_peer_still_serves_a_local_client() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// The peer serves one connection at a time, so a client that connects and says
+/// nothing must not hold every later peer. The connection carries a deadline.
+#[test]
+fn a_silent_client_does_not_block_the_peer() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_active-rpc-peer"))
+        .args(["--listen", "127.0.0.1:0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn peer");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read listen line");
+    let address = line
+        .trim()
+        .strip_prefix("listening ")
+        .expect("peer announces its address")
+        .to_string();
+
+    // Connect and send nothing. The OS accepts it into the backlog; the peer
+    // must not wait on it forever.
+    let silent = std::net::TcpStream::connect(&address).expect("silent connect");
+    let started = std::time::Instant::now();
+    let mut transport =
+        TcpTransport::connect_with_timeout(&address, std::time::Duration::from_secs(20))
+            .expect("connect");
+    let ping = Envelope::request(1, "ping", vec![]);
+    transport.send(&ping).expect("send ping");
+    let response = transport.recv().expect("recv").expect("response");
+    assert_eq!(response.first_value(), Some(&Value::text("pong")));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "a silent client held the peer for {:?}",
+        started.elapsed()
+    );
+
+    drop(silent);
+    let _ = child.kill();
+    let _ = child.wait();
+}

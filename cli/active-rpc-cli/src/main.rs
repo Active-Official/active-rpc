@@ -695,10 +695,25 @@ fn peer_tcp(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
         bind_loopback().map_err(|error| CliError::transport(error.to_string()))?;
     announce("tcp", &address, kernel.cap.id(), None, emit_hex)?;
     let mut served = 0usize;
+    let mut accept_failures = 0u32;
     while limit == 0 || served < limit {
-        let (stream, _) = listener
-            .accept()
-            .map_err(|error| CliError::transport(format!("accept: {error}")))?;
+        let (stream, _) = match listener.accept() {
+            Ok(accepted) => {
+                accept_failures = 0;
+                accepted
+            }
+            // A peer that vanished between the SYN and the accept is that peer's
+            // problem. A run of failures backs off instead of spinning or
+            // ending the server.
+            Err(_) if accept_failures < 64 => {
+                accept_failures += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            Err(error) => {
+                return Err(CliError::transport(format!("accept: {error}")));
+            }
+        };
         // A client that connects and says nothing must not hold the only
         // serving thread: without a deadline `--limit` is unreachable and the
         // second caller waits forever.

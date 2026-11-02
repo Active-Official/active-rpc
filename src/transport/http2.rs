@@ -182,6 +182,10 @@ impl Http2Server {
         let connection_deadline = self.connection_deadline;
         let handler = Arc::new(Mutex::new(handler));
         let served = Arc::new(AtomicU64::new(0));
+        // One budget for the whole server. A per-connection budget let N
+        // connections pin N x 128 MiB, which is not a bound an operator can
+        // reason about.
+        let inflight = Arc::new(AtomicUsize::new(0));
         self.runtime.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener)
                 .map_err(|error| Error::Transport(format!("listener: {error}")))?;
@@ -207,6 +211,12 @@ impl Http2Server {
                         if refused > MAX_ACCEPT_FAILURES {
                             return Err(Error::Transport(format!("accept: {error}")));
                         }
+                        // Back off: 64 immediate retries against EMFILE burn
+                        // the runtime and exit just as fast as one.
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            5 * u64::from(refused.min(20)),
+                        ))
+                        .await;
                         continue;
                     }
                 };
@@ -216,12 +226,20 @@ impl Http2Server {
                     .map_err(|error| Error::Transport(format!("nodelay: {error}")))?;
                 let handler = Arc::clone(&handler);
                 let served_for_task = Arc::clone(&served);
+                let inflight = Arc::clone(&inflight);
                 active.spawn(async move {
                     // A connection that never completes is abandoned at the
                     // deadline instead of holding the join set.
                     let _ = tokio::time::timeout(
                         connection_deadline,
-                        serve_connection(stream, handler, served_for_task, limits, inflight_budget),
+                        serve_connection(
+                            stream,
+                            handler,
+                            served_for_task,
+                            limits,
+                            inflight,
+                            inflight_budget,
+                        ),
                     )
                     .await;
                 });
@@ -241,6 +259,7 @@ async fn serve_connection<S, H>(
     handler: Arc<Mutex<H>>,
     served: Arc<AtomicU64>,
     limits: WireLimits,
+    inflight: Arc<AtomicUsize>,
     inflight_budget: usize,
 ) -> Result<()>
 where
@@ -258,8 +277,6 @@ where
         .handshake(io)
         .await
         .map_err(|error| Error::Transport(format!("h2 handshake: {error}")))?;
-    // Body bytes this connection is accumulating across live streams.
-    let inflight = Arc::new(AtomicUsize::new(0));
     // Streams are handled concurrently; the join set keeps the connection alive
     // until every response has been written.
     let mut streams = tokio::task::JoinSet::new();
@@ -490,6 +507,8 @@ pub struct Http2Client {
     task: tokio::task::JoinHandle<()>,
     address: String,
     limits: WireLimits,
+    /// Wall deadline for one request, when the caller sets one.
+    deadline: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for Http2Client {
@@ -540,12 +559,24 @@ impl Http2Client {
             task,
             address: address.to_string(),
             limits: WireLimits::default(),
+            deadline: None,
         })
     }
 
     /// Use tighter wire limits.
     pub fn with_limits(mut self, limits: WireLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Bound one request in wall time.
+    ///
+    /// The library has no internal deadline: a peer that accepts the connection
+    /// and then stalls (or dribbles a response) would otherwise park the caller
+    /// forever. Nothing is set by default, so existing callers see the old
+    /// behaviour.
+    pub fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -658,16 +689,25 @@ impl Http2Client {
             .map_err(|error| Error::Transport(format!("request: {error}")))?;
         let payload = Bytes::copy_from_slice(body);
         let limits = self.limits;
+        let deadline = self.deadline;
         self.runtime.block_on(async move {
-            let (response, mut send) = sender
-                .send_request(request, false)
-                .map_err(|error| Error::Transport(format!("send header: {error}")))?;
-            send.send_data(payload, true)
-                .map_err(|error| Error::Transport(format!("send body: {error}")))?;
-            let response = response
-                .await
-                .map_err(|error| Error::Transport(format!("response: {error}")))?;
-            read_response(response, limits.max_bytes.min(MAX_BODY)).await
+            let exchange = async move {
+                let (response, mut send) = sender
+                    .send_request(request, false)
+                    .map_err(|error| Error::Transport(format!("send header: {error}")))?;
+                send.send_data(payload, true)
+                    .map_err(|error| Error::Transport(format!("send body: {error}")))?;
+                let response = response
+                    .await
+                    .map_err(|error| Error::Transport(format!("response: {error}")))?;
+                read_response(response, limits.max_bytes.min(MAX_BODY)).await
+            };
+            match deadline {
+                Some(limit) => tokio::time::timeout(limit, exchange)
+                    .await
+                    .map_err(|_| Error::Transport("HTTP/2 request timed out".to_string()))?,
+                None => exchange.await,
+            }
         })
     }
 }

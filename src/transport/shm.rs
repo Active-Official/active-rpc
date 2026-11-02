@@ -68,38 +68,59 @@ impl SharedSegment {
 
     /// Usable frame bytes.
     pub fn capacity(&self) -> usize {
-        self.state.lock().expect("segment lock").capacity
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capacity
     }
 
     /// Bytes published and not yet consumed.
     pub fn available(&self) -> usize {
-        let state = self.state.lock().expect("segment lock");
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.head.saturating_sub(state.tail) as usize
     }
 
     /// Total bytes written into the ring, since the segment was created.
     pub fn produced(&self) -> u64 {
-        self.state.lock().expect("segment lock").produced_total
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .produced_total
     }
 
     /// Total bytes consumed from the ring, since the segment was created.
     pub fn consumed(&self) -> u64 {
-        self.state.lock().expect("segment lock").consumed_total
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .consumed_total
     }
 
     /// Frames written into the ring, since the segment was created.
     pub fn frames_produced(&self) -> u64 {
-        self.state.lock().expect("segment lock").frames_produced
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .frames_produced
     }
 
     /// Frames consumed from the ring, since the segment was created.
     pub fn frames_consumed(&self) -> u64 {
-        self.state.lock().expect("segment lock").frames_consumed
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .frames_consumed
     }
 
     /// Write a frame. Fails when the ring cannot take it.
     pub fn write(&self, payload: &[u8]) -> Result<()> {
-        let mut state = self.state.lock().expect("segment lock");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let used = state.head.saturating_sub(state.tail) as usize;
         let needed = payload.len() + 4;
         if needed > state.capacity {
@@ -152,7 +173,10 @@ impl SharedSegment {
 
     /// Consume one frame, returning a copy.
     pub fn read(&self) -> Result<Option<Vec<u8>>> {
-        let mut state = self.state.lock().expect("segment lock");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some((start, len)) = frame_bounds(&state)? else {
             return Ok(None);
         };
@@ -169,7 +193,10 @@ impl SharedSegment {
     /// is what [`SharedMemoryTransport::recv_in_segment`] does, at the cost of
     /// holding the segment for one decode.
     pub fn with_frame<R>(&self, inspect: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
-        let state = self.state.lock().expect("segment lock");
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some((start, len)) = frame_bounds(&state)? else {
             return Ok(None);
         };
@@ -180,7 +207,10 @@ impl SharedSegment {
     ///
     /// The same re-entrancy contract as [`SharedSegment::with_frame`] applies.
     pub fn pop_frame<R>(&self, inspect: impl FnOnce(&[u8]) -> R) -> Result<Option<R>> {
-        let mut state = self.state.lock().expect("segment lock");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some((start, len)) = frame_bounds(&state)? else {
             return Ok(None);
         };
@@ -196,7 +226,10 @@ impl SharedSegment {
     /// leave `tail` inside a payload, whose first four bytes then read as the
     /// next length and bricked the ring.
     pub fn advance(&self) -> Result<()> {
-        let mut state = self.state.lock().expect("segment lock");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some((_start, len)) = frame_bounds(&state)? else {
             return Ok(());
         };
@@ -206,7 +239,10 @@ impl SharedSegment {
 
     /// Reset the indices.
     pub fn reset(&self) {
-        let mut state = self.state.lock().expect("segment lock");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.head = 0;
         state.tail = 0;
     }

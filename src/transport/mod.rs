@@ -326,7 +326,22 @@ where
                     let _ = transport.send(&reply);
                     return Ok(served);
                 }
-                let response = handler(envelope);
+                // A provider panic is hostile-input reachable. On this
+                // transport the handler runs on the serving thread, so without a
+                // catch it would take the whole server down; the panic becomes a
+                // refusal for this call, and the connection continues.
+                let request_id = envelope.request_id;
+                let response = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler(envelope)
+                })) {
+                    Ok(response) => response,
+                    Err(_) => Envelope::error(
+                        request_id,
+                        &Error::Provider {
+                            code: "rpc/provider".to_string(),
+                        },
+                    ),
+                };
                 if transport.send(&response).is_err() {
                     // The peer is gone; the connection is over, the server is
                     // not.

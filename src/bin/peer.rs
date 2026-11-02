@@ -76,6 +76,15 @@ impl Provider for EchoProvider {
     }
 }
 
+/// How long one connection may stall before it is given up on.
+///
+/// The peer serves one connection at a time; without this a client that connects
+/// and sends nothing holds every later peer in the accept backlog.
+const CONNECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Accept failures tolerated in a row before the peer gives up.
+const MAX_ACCEPT_FAILURES: u32 = 64;
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut address = "127.0.0.1:0".to_string();
     let mut max_calls: usize = 0;
@@ -119,8 +128,23 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     std::io::stdout().flush()?;
 
     let mut served = 0usize;
+    let mut accept_failures = 0u32;
     for stream in listener.incoming() {
-        let stream = stream?;
+        let stream = match stream {
+            Ok(stream) => {
+                accept_failures = 0;
+                stream
+            }
+            // A peer that went away between the SYN and the accept is not the
+            // server's failure, and a run of failures must back off instead of
+            // spinning or exiting.
+            Err(_) if accept_failures < MAX_ACCEPT_FAILURES => {
+                accept_failures += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         // The flag describes this connection, not the listener: a wildcard bind
         // must still treat a remote client as remote, and must still serve a
         // genuinely local one.
@@ -128,7 +152,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .peer_addr()
             .map(|peer| peer.ip().is_loopback())
             .unwrap_or(false);
-        let transport = TcpTransport::new(stream)?;
+        // A silent client must not hold this serial loop forever: the socket
+        // carries a read and write deadline, so a stalled connection ends and the
+        // next peer is accepted.
+        let transport = TcpTransport::with_timeout(stream, CONNECTION_WAIT)?;
         let handled = serve_connection(transport, |envelope| {
             handle(
                 &agent,

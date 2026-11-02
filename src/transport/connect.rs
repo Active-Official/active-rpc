@@ -81,6 +81,59 @@ pub struct BridgeServer {
     limits: WireLimits,
 }
 
+/// Accept failures tolerated in a row before `serve` gives up.
+const MAX_ACCEPT_FAILURES: u32 = 64;
+
+/// True for the accept errors that are the peer's, not the listener's.
+fn is_transient_accept(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+/// Set the socket timeout to the time left before `deadline`.
+///
+/// Returns false when the deadline has already passed, so a caller answers a
+/// timeout instead of blocking.
+fn arm_deadline(stream: &TcpStream, deadline: std::time::Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    stream.set_read_timeout(Some(remaining)).is_ok()
+        && stream.set_write_timeout(Some(remaining)).is_ok()
+}
+
+/// Read exactly `length` bytes before `deadline`.
+///
+/// A drip that stays inside a per-read timeout is still bounded by the
+/// connection deadline; the timeout is recomputed from the remaining time before
+/// every read.
+fn read_body_by_deadline(
+    reader: &mut BufReader<TcpStream>,
+    stream: &TcpStream,
+    length: usize,
+    deadline: std::time::Instant,
+    body: &mut Vec<u8>,
+) -> bool {
+    use std::io::Read;
+    let mut chunk = [0u8; 16 * 1024];
+    while body.len() < length {
+        if !arm_deadline(stream, deadline) {
+            return false;
+        }
+        let want = (length - body.len()).min(chunk.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => return false,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    body.len() == length
+}
+
 impl BridgeServer {
     /// Bind an ephemeral loopback port.
     pub fn bind_loopback() -> Result<Self> {
@@ -114,11 +167,32 @@ impl BridgeServer {
         H: FnMut(Envelope) -> Envelope,
     {
         let mut served = 0u64;
+        let mut failures = 0u32;
         for _ in 0..requests {
-            let (stream, _) = self
-                .listener
-                .accept()
-                .map_err(|error| Error::Transport(format!("accept: {error}")))?;
+            let (stream, _) = match self.listener.accept() {
+                Ok(accepted) => {
+                    failures = 0;
+                    accepted
+                }
+                // A transient accept failure (EINTR, ECONNABORTED) belongs to the
+                // peer that went away; a persistent one (EMFILE) must not spin
+                // or exit, so it backs off and gives the server a chance to
+                // shed work.
+                Err(error) if failures < MAX_ACCEPT_FAILURES => {
+                    failures += 1;
+                    if is_transient_accept(&error) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            5 * u64::from(failures),
+                        ));
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(Error::Transport(format!("accept: {error}")));
+                }
+            };
             served += self.handle(stream, &mut handler);
         }
         Ok(served)
@@ -134,14 +208,19 @@ impl BridgeServer {
         H: FnMut(Envelope) -> Envelope,
     {
         let _ = stream.set_nodelay(true);
-        // A stalled peer is bounded, not fatal: the next connection waits at
-        // most this long rather than forever.
-        let _ = stream.set_read_timeout(Some(CONNECTION_WAIT));
-        let _ = stream.set_write_timeout(Some(CONNECTION_WAIT));
+        // One deadline for the whole connection, recomputed into the socket
+        // timeout before every read. A per-read timeout let a peer send one byte
+        // just inside it forever, holding the (serial) bridge's only accept slot
+        // while every later peer waited.
+        let deadline = std::time::Instant::now() + CONNECTION_WAIT;
         let Ok(clone) = stream.try_clone() else {
             return 0;
         };
         let mut reader = BufReader::new(clone);
+        if !arm_deadline(&stream, deadline) || !arm_deadline(reader.get_ref(), deadline) {
+            let _ = write_http_response(&mut stream, 408, b"rpc/transport");
+            return 0;
+        }
         let head = match read_head(&mut reader, MAX_HEAD) {
             Ok(Some(head)) => head,
             Ok(None) => return 0,
@@ -171,7 +250,18 @@ impl BridgeServer {
                 transfer_encoding = true;
             }
             if name.eq_ignore_ascii_case("content-length") {
-                match value.trim().parse::<usize>() {
+                // Plain decimal digits only: RFC 9112 has no sign or whitespace,
+                // and `+25` is the kind of value a front proxy may resolve
+                // differently from this server.
+                let trimmed = value.trim();
+                if trimmed.is_empty()
+                    || trimmed.len() > 20
+                    || !trimmed.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                    return 0;
+                }
+                match trimmed.parse::<usize>() {
                     Ok(length) => lengths.push(length),
                     Err(_) => {
                         let _ = write_http_response(&mut stream, 400, b"rpc/wire");
@@ -185,7 +275,10 @@ impl BridgeServer {
             return 0;
         }
         let content_length = lengths[0];
-        if content_length > MAX_BODY {
+        // The body ceiling is the wire limit, not only the protocol maximum: a
+        // strict server must not read 64 MiB to discover it refuses the frame.
+        let body_ceiling = MAX_BODY.min(self.limits.max_bytes);
+        if content_length > body_ceiling {
             let _ = write_http_response(&mut stream, 413, b"rpc/wire");
             return 0;
         }
@@ -205,11 +298,9 @@ impl BridgeServer {
             return 0;
         }
         let mut body = Vec::with_capacity(content_length.min(64 * 1024));
-        let read = reader
-            .by_ref()
-            .take(content_length as u64)
-            .read_to_end(&mut body);
-        if read.is_err() || body.len() != content_length {
+        let complete =
+            read_body_by_deadline(&mut reader, &stream, content_length, deadline, &mut body);
+        if !complete {
             // A truncated body is one bad connection, not a server failure:
             // answer 400 for it and keep accepting the next one. Growing the
             // buffer with the bytes that arrive means a header that announces
@@ -242,7 +333,19 @@ impl BridgeServer {
             let _ = write_http_response(&mut stream, 400, b"rpc/wire");
             return 0;
         }
-        let response = handler(envelope);
+        // A provider panic on hostile input must not take the bridge down: the
+        // handler runs on the serving thread, so the panic becomes a refusal.
+        let request_id = envelope.request_id;
+        let response =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(envelope))) {
+                Ok(response) => response,
+                Err(_) => Envelope::error(
+                    request_id,
+                    &Error::Provider {
+                        code: "rpc/provider".to_string(),
+                    },
+                ),
+            };
         let bytes = match response.encode() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -279,18 +382,29 @@ fn read_head<R: BufRead>(reader: &mut R, max: usize) -> Result<Option<Vec<String
             if head.is_empty() {
                 return Ok(None);
             }
-            break;
+            // EOF before the blank line: the head is incomplete, and a proxy
+            // that waits for the rest would disagree about where it ends.
+            return Err(Error::Wire("request head ended before its blank line"));
         }
         total += read;
         if total > max {
             return Err(Error::Wire("request head exceeds the ceiling"));
         }
-        let line = String::from_utf8_lossy(&raw);
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
+        // RFC 9112: every line ends CRLF, and a bare CR inside a field is not a
+        // value character. A proxy with different line splitting would otherwise
+        // see different header boundaries than this server.
+        let Some(body) = raw.strip_suffix(b"\r\n") else {
+            return Err(Error::Wire("request head line is not CRLF-terminated"));
+        };
+        if body.contains(&b'\r') {
+            return Err(Error::Wire(
+                "request head line carries a bare carriage return",
+            ));
+        }
+        if body.is_empty() {
             break;
         }
-        head.push(trimmed.to_string());
+        head.push(String::from_utf8_lossy(body).into_owned());
     }
     Ok(Some(head))
 }
@@ -319,6 +433,8 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Resu
 pub struct ConnectClient {
     address: String,
     limits: WireLimits,
+    /// Wall deadline for one request, when the caller sets one.
+    deadline: Option<std::time::Duration>,
 }
 
 impl ConnectClient {
@@ -329,12 +445,22 @@ impl ConnectClient {
         Ok(Self {
             address: address.to_string(),
             limits: WireLimits::default(),
+            deadline: None,
         })
     }
 
     /// Use tighter limits.
     pub fn with_limits(mut self, limits: WireLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Bound one request in wall time.
+    ///
+    /// The client dials per request and both the connect and the read can block
+    /// forever against a peer that accepts and says nothing.
+    pub fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -372,6 +498,12 @@ impl ConnectClient {
         );
         let mut stream = TcpStream::connect(&self.address)
             .map_err(|error| Error::Transport(format!("connect: {error}")))?;
+        if let Some(deadline) = self.deadline {
+            stream
+                .set_read_timeout(Some(deadline))
+                .and_then(|()| stream.set_write_timeout(Some(deadline)))
+                .map_err(|error| Error::Transport(error.to_string()))?;
+        }
         stream
             .write_all(head.as_bytes())
             .and_then(|_| stream.write_all(body))

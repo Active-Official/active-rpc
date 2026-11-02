@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
-| R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-2: 22 + 16 findings (7 round-1 dispositions partial) | 38 fixed / 0 rejected / 0 open | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,41 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-09 transports - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `05ec397`.
+It re-ran the seven transport suites (43 tests) and drove its own probes against
+real sockets. Round 1: 15 fixed, 7 partial, 0 not fixed. New: two highs, eight
+mediums, six lows. Tests: `tests/transport_round2_tests.rs` (6), plus QUIC cases
+in `transport_hardening_tests` and the peer/CLI accept paths.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N1 | high | the QUIC global body budget was charged from the **announced** length, so four idle streams that sent a 4-byte header reserved 256 MiB and answered `rpc/backpressure` to every peer (proven) | **fixed**: `BodyBudget` reserves in 64 KiB steps as bytes arrive and releases when the body is dropped; `an_idle_announcement_does_not_consume_the_quic_body_budget` |
+| N2 | high | `active-rpc-peer` had no socket deadline and accepted serially: one silent client blocked every later peer forever (proven) | **fixed**: `TcpTransport::with_timeout` on the accepted socket with a 5 s deadline, and bounded accept retries; `a_silent_client_does_not_block_the_peer` |
+| N3 | high | the Connect bridge set a per-read timeout, so a body drip held its only accept slot indefinitely (proven) | **fixed**: one wall deadline per connection, recomputed into the socket timeout before every read (`arm_deadline`, `read_body_by_deadline`), 408 on expiry; `a_dripping_body_cannot_stretch_the_bridge_connection` |
+| N4 | high | the QUIC accept loop awaited a full slot table for `HANDSHAKE_WAIT`, so ~256 cheap connections could stall the listener | **fixed**: `try_acquire_owned` and drop the incoming when the table is full |
+| N5 | medium | a complete QUIC frame was not answered until the peer FINished its send half (proven), and the tail check was unreachable | **fixed**: read exactly the announced length (`read_frame_body`) and probe for trailing bytes with `read_chunk`, not `read_to_end`; `a_complete_frame_without_fin_is_answered` |
+| N6 | medium | QUIC response writes had no deadline: a peer that withholds receive credit parked the task forever | **fixed**: the write and `finish` run under `STREAM_WAIT`, then the stream is reset |
+| N7 | medium | the mutual-TLS client hardcoded SNI `localhost`, so a deployment certificate for `rpc.internal` could never verify | **fixed**: `connect_mutual_tls_with_name`; the old entry point delegates with `localhost` |
+| N8 | medium | the HTTP/2 body budget was per connection, so N connections pinned N × 128 MiB | **fixed**: one `Arc<AtomicUsize>` budget is shared by every connection of a `serve` call |
+| N9 | medium | one accept error killed the bridge, the CLI and the peer, and the HTTP/2 server spun 64 times with no backoff before exiting | **fixed**: bounded retry with backoff everywhere; `Interrupted`/`ConnectionAborted` are transient, a persistent failure backs off before giving up |
+| N10 | medium | a handler panic was fatal on the synchronous transports (the kernel runs on the serving thread) | **fixed**: `catch_unwind` around the handler on TCP/shm and in the bridge, answered as `rpc/provider`, and the connection continues; `a_panicking_handler_does_not_kill_the_connection` |
+| N11 | low | `content-length: +N` was accepted | **fixed**: 1..=20 ASCII digits after trimming; `a_signed_content_length_is_refused` |
+| N12 | low | a strict bridge still read up to 64 MiB before refusing | **fixed**: the body ceiling is `min(MAX_BODY, limits.max_bytes)`; `a_strict_bridge_answers_413_without_reading_the_body` |
+| N13 | low | QUIC reported a stall as `rpc/wire` | **fixed**: a read timeout is `rpc/transport`; `TooLong`/truncation stay `rpc/wire` |
+| N14 | low | the three non-TCP clients had no internal deadline | **fixed**: `with_deadline` on `ConnectClient`, `Http2Client` and `QuicClient` wraps one request (the CLI's helper thread is no longer the only bound) |
+| N15 | low | bare-LF and EOF-terminated heads were accepted | **fixed**: CRLF is required, a bare CR in a field is refused, and EOF before the blank line is an incomplete head; `a_bare_lf_head_is_refused`, `a_head_that_ends_at_eof_is_refused` |
+| N16 | low | a panic while holding the shared-memory lock poisoned the segment permanently | **fixed**: every lock recovers the guard with `PoisonError::into_inner` |
+
+Also verified by the reviewer and unchanged: no malformed frame, stream, header
+or ring state can kill or panic a server; no transport can smuggle a second
+logical message in one frame.
+
+Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
+QUIC idle timeout is peer-resettable so slot count is the real connection cap,
+and the shm straddle/truncated branches remain fuzzer-only.
 
 ### R-10 bulk transfer - 2026-11-02 (round 2, confirmation)
 
