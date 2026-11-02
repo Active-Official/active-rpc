@@ -1,0 +1,218 @@
+//! R-07 round 2: a scoped capability is confined to its subtree in every
+//! direction — dependencies, dependents, metadata, hashes and shared nodes.
+//!
+//! The module is built directly so the DAG is exactly the hostile shape: a
+//! reference into another subtree and one node shared by two names.
+
+use active_infinity::{AnnotationKind, InfinityModule, Inode};
+use active_rpc::cap::CapAttrs;
+use active_rpc::domain::ModuleProvider;
+use active_rpc::value::{Arg, Value};
+use active_rpc::{Agent, Budget, CapHandle, LaneId};
+
+const OUTSIDE: &str = "OUTSIDE-CANARY";
+
+/// `app.x` is a reference into `ops`, and `app.y` and `admin.internal` are the
+/// same node, so both the read side and the write side have an outside edge.
+fn hostile_module() -> InfinityModule {
+    let mut module = InfinityModule::new();
+    let canary = module.push(Inode::Str(OUTSIDE.to_string()));
+    let shared = module.push(Inode::Str("in".to_string()));
+    let reference = module.push(Inode::Ref(canary));
+    let app = module.push(Inode::Table {
+        fields: vec![("x".to_string(), reference), ("y".to_string(), shared)],
+    });
+    let ops = module.push(Inode::Table {
+        fields: vec![("secret".to_string(), canary)],
+    });
+    let admin = module.push(Inode::Table {
+        fields: vec![("internal".to_string(), shared)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![
+            ("admin".to_string(), admin),
+            ("app".to_string(), app),
+            ("ops".to_string(), ops),
+        ],
+    });
+    module.set_root(Some(root));
+    module
+}
+
+struct Fixture {
+    agent: Agent,
+}
+
+fn fixture(methods: &[&str], scope: Option<&str>) -> (Fixture, CapHandle, LaneId) {
+    let agent = Agent::with_secret([0x77; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(hostile_module()).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(methods);
+    attrs.path_scope = scope.map(str::to_string);
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("scope", Budget::default()).expect("lane");
+    (Fixture { agent }, cap, lane)
+}
+
+fn call(
+    fixture: &Fixture,
+    lane: LaneId,
+    cap: &CapHandle,
+    method: &str,
+    args: Vec<Arg>,
+) -> active_rpc::Result<Value> {
+    let promise = fixture.agent.call(lane, cap, method, args)?;
+    fixture.agent.run();
+    promise.value()
+}
+
+fn path(value: &str) -> Arg {
+    Arg::Value(Value::path(value))
+}
+
+/// `evaluate` follows a reference; a scoped capability may not read through it.
+#[test]
+fn a_scoped_evaluate_cannot_follow_a_reference_outside_the_scope() {
+    let (fixture, cap, lane) = fixture(&["evaluate"], Some("app"));
+    let error = call(&fixture, lane, &cap, "evaluate", vec![path("app.x")])
+        .expect_err("app.x references ops.secret");
+    assert_eq!(error.code(), "rpc/path-not-granted", "{error}");
+
+    // The in-scope value without a reference still answers.
+    let value = call(&fixture, lane, &cap, "evaluate", vec![path("app.y")]).expect("in scope");
+    assert_eq!(value, Value::text("in"));
+}
+
+/// `why` labels a node's dependencies; an out-of-scope dependency would leak it.
+#[test]
+fn a_scoped_why_cannot_name_an_outside_dependency() {
+    let (fixture, cap, lane) = fixture(&["why"], Some("app"));
+    let error = call(&fixture, lane, &cap, "why", vec![path("app.x")])
+        .expect_err("the label set names ops.secret");
+    assert_eq!(error.code(), "rpc/path-not-granted", "{error}");
+}
+
+/// `impact` walks dependents; a shared leaf has dependents outside the scope.
+#[test]
+fn a_scoped_impact_cannot_name_an_outside_dependent() {
+    let (fixture, cap, lane) = fixture(&["impact"], Some("admin"));
+    let error = call(&fixture, lane, &cap, "impact", vec![path("admin.internal")])
+        .expect_err("the dependent set names app");
+    assert_eq!(error.code(), "rpc/path-not-granted", "{error}");
+}
+
+/// The whole-module queries are global answers: a scope refuses them.
+#[test]
+fn a_scoped_capability_cannot_read_global_metadata() {
+    let (fixture, cap, lane) = fixture(
+        &[
+            "stats",
+            "annotations",
+            "provenance",
+            "content_hash",
+            "subgraph",
+        ],
+        Some("app"),
+    );
+    for method in ["stats", "annotations", "provenance", "content_hash"] {
+        for args in [vec![path("app")], Vec::new()] {
+            let result = call(&fixture, lane, &cap, method, args);
+            assert_eq!(
+                result.as_ref().err().map(active_rpc::Error::code),
+                Some("rpc/path-not-granted"),
+                "{method}: {result:?}"
+            );
+        }
+    }
+    // A subgraph of `app` would carry the referenced `ops.secret`, so it is
+    // refused; a leaf with no outside edge answers.
+    let subgraph = call(&fixture, lane, &cap, "subgraph", vec![path("app")]);
+    assert_eq!(
+        subgraph.as_ref().err().map(active_rpc::Error::code),
+        Some("rpc/path-not-granted"),
+        "{subgraph:?}"
+    );
+    let leaf = call(&fixture, lane, &cap, "subgraph", vec![path("app.y")]);
+    assert!(leaf.is_ok(), "{leaf:?}");
+}
+
+/// `subgraph` and `content_hash` are metadata work like `why`: they honour the
+/// node ceiling.
+#[test]
+fn subgraph_and_content_hash_respect_the_node_budget() {
+    let agent = Agent::with_secret([0x79; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(hostile_module()).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut tight_attrs = CapAttrs::new(&["subgraph", "content_hash"]);
+    tight_attrs.budget = Budget {
+        max_nodes: 1,
+        ..Budget::default()
+    };
+    let tight = agent.mint(id, object, tight_attrs).expect("tight cap");
+    let lane = agent.create_lane("tight", Budget::default()).expect("lane");
+    let fixture = Fixture { agent };
+
+    for method in ["subgraph", "content_hash"] {
+        let result = call(&fixture, lane, &tight, method, vec![path("app")]);
+        assert_eq!(
+            result.as_ref().err().map(active_rpc::Error::code),
+            Some("rpc/budget-exceeded"),
+            "{method}: {result:?}"
+        );
+    }
+}
+
+/// A shared node under an immutable subtree cannot be rewritten through an alias.
+#[test]
+fn an_alias_cannot_bypass_ai_immutable() {
+    let mut module = InfinityModule::new();
+    let value = module.push(Inode::Str("original".to_string()));
+    let protected = module.push(Inode::Table {
+        fields: vec![("value".to_string(), value)],
+    });
+    let other = module.push(Inode::Table {
+        fields: vec![("alias".to_string(), value)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![
+            ("other".to_string(), other),
+            ("protected".to_string(), protected),
+        ],
+    });
+    module.set_root(Some(root));
+    module.annotate(protected, AnnotationKind::AiImmutable(true));
+
+    let agent = Agent::with_secret([0x78; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let cap = agent
+        .mint(id, object, CapAttrs::new(&["patch", "evaluate"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("immutable", Budget::default())
+        .expect("lane");
+
+    // The refusal is decided at dispatch, so it surfaces on the promise.
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "patch",
+            vec![path("other.alias"), Arg::Value(Value::text("hacked"))],
+        )
+        .expect("queued");
+    agent.run();
+    let error = promise
+        .value()
+        .expect_err("the shared node is under an immutable subtree");
+    assert_eq!(error.code(), "rpc/read-only", "{error}");
+
+    let promise = agent
+        .call(lane, &cap, "evaluate", vec![path("protected.value")])
+        .expect("call");
+    agent.run();
+    assert_eq!(promise.value().expect("value"), Value::text("original"));
+}

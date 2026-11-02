@@ -207,6 +207,15 @@ impl ModuleProvider {
                     Some(path) => {
                         let node = active_infinity::interop::resolve_path(&slot.module, &path)
                             .ok_or(Error::InvalidArgument("path does not resolve"))?;
+                        // Evaluation follows references: a scoped capability
+                        // must not read a value that is built from data outside
+                        // its subtree.
+                        if let Some(scope) = &call.path_scope {
+                            let dependencies = transitive(&slot.module, node, true);
+                            if !nodes_within_scope(&slot.module, &dependencies, scope) {
+                                return Err(Error::PathNotGranted(path));
+                            }
+                        }
                         let sub = restrict(&slot.module, node)?;
                         active_infinity::interop::evaluate(&sub, budget)
                     }
@@ -222,8 +231,17 @@ impl ModuleProvider {
             }
             "why" => {
                 check_node_budget(&slot.module, call)?;
-                let (_path, node) = self.resolve(&slot.module, call)?;
-                let labels = labels_for(&slot.module, transitive(&slot.module, node, true));
+                let (path, node) = self.resolve(&slot.module, call)?;
+                let dependencies = transitive(&slot.module, node, true);
+                // A scoped answer describes the scope. Following a reference to
+                // out-of-scope data would return it under the labels of a walk
+                // the capability was never granted.
+                if let Some(scope) = &call.path_scope {
+                    if !nodes_within_scope(&slot.module, &dependencies, scope) {
+                        return Err(Error::PathNotGranted(path));
+                    }
+                }
+                let labels = labels_for(&slot.module, dependencies);
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -234,8 +252,14 @@ impl ModuleProvider {
             }
             "impact" => {
                 check_node_budget(&slot.module, call)?;
-                let (_path, node) = self.resolve(&slot.module, call)?;
-                let labels = labels_for(&slot.module, transitive(&slot.module, node, false));
+                let (path, node) = self.resolve(&slot.module, call)?;
+                let dependents = transitive(&slot.module, node, false);
+                if let Some(scope) = &call.path_scope {
+                    if !nodes_within_scope(&slot.module, &dependents, scope) {
+                        return Err(Error::PathNotGranted(path));
+                    }
+                }
+                let labels = labels_for(&slot.module, dependents);
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -245,9 +269,18 @@ impl ModuleProvider {
                 )))
             }
             "subgraph" => {
-                let (_path, node) = self.resolve(&slot.module, call)?;
+                check_node_budget(&slot.module, call)?;
+                let (path, node) = self.resolve(&slot.module, call)?;
+                if let Some(scope) = &call.path_scope {
+                    let dependencies = transitive(&slot.module, node, true);
+                    if !nodes_within_scope(&slot.module, &dependencies, scope) {
+                        return Err(Error::PathNotGranted(path));
+                    }
+                }
                 let sub = restrict(&slot.module, node)?;
-                Ok(Response::Module(redacted_module_bytes(&sub)?))
+                let bytes = redacted_module_bytes(&sub)?;
+                check_wall_budget(started, call)?;
+                Ok(Response::Module(bytes))
             }
             "patch" => {
                 if call.read_only {
@@ -271,9 +304,11 @@ impl ModuleProvider {
                 let (patched, bytes) = {
                     let module = &slot.module;
                     let (path, node) = self.resolve(module, call)?;
-                    if immutable_target(module, &path) {
+                    if immutable_target(module, &path) || immutable_node(module, node) {
                         // `@ai_immutable: true` is the format's marker for a
-                        // node no agent may rewrite.
+                        // node no agent may rewrite. A shared DAG means the same
+                        // node can be named by an alias outside the marked
+                        // subtree, so the check is on the node too.
                         return Err(Error::ReadOnly);
                     }
                     if let Some(scope) = &call.path_scope {
@@ -330,9 +365,19 @@ impl ModuleProvider {
             }
             "dependents" => {
                 check_node_budget(&slot.module, call)?;
-                let (_path, node) = self.resolve(&slot.module, call)?;
+                let (path, node) = self.resolve(&slot.module, call)?;
                 let (_, dependents) = adjacency(&slot.module);
-                let ids = dependents.get(node.index()).cloned().unwrap_or_default();
+                let ids: BTreeSet<NodeId> = dependents
+                    .get(node.index())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                if let Some(scope) = &call.path_scope {
+                    if !nodes_within_scope(&slot.module, &ids, scope) {
+                        return Err(Error::PathNotGranted(path));
+                    }
+                }
                 let labels = labels_for(&slot.module, ids);
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
@@ -344,9 +389,19 @@ impl ModuleProvider {
             }
             "dependencies" => {
                 check_node_budget(&slot.module, call)?;
-                let (_path, node) = self.resolve(&slot.module, call)?;
+                let (path, node) = self.resolve(&slot.module, call)?;
                 let (dependencies, _) = adjacency(&slot.module);
-                let ids = dependencies.get(node.index()).cloned().unwrap_or_default();
+                let ids: BTreeSet<NodeId> = dependencies
+                    .get(node.index())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                if let Some(scope) = &call.path_scope {
+                    if !nodes_within_scope(&slot.module, &ids, scope) {
+                        return Err(Error::PathNotGranted(path));
+                    }
+                }
                 let labels = labels_for(&slot.module, ids);
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
@@ -357,6 +412,14 @@ impl ModuleProvider {
                 )))
             }
             "content_hash" => {
+                check_node_budget(&slot.module, call)?;
+                // A hash names the whole module: under a scope it would answer a
+                // question about data the capability was never granted, and it
+                // is an equality oracle for the parts outside the scope.
+                if let Some(scope) = &call.path_scope {
+                    return Err(Error::PathNotGranted(scope.clone()));
+                }
+                check_wall_budget(started, call)?;
                 // A redacting capability gets the hash of the *redacted* image:
                 // the canonical hash covers the secret heap, so handing it to a
                 // caller that may not read the module is an equality oracle over
@@ -389,8 +452,17 @@ impl ModuleProvider {
                     hex32(&hash)
                 ))))
             }
+            "stats" | "annotations" | "provenance" if call.path_scope.is_some() => {
+                // These describe the whole module. A scoped capability asking
+                // with an in-scope path still learns global counts, node ids and
+                // provenance, so the answer is refused rather than filtered.
+                Err(Error::PathNotGranted(
+                    call.path_scope.clone().unwrap_or_default(),
+                ))
+            }
             "stats" => {
                 check_node_budget(&slot.module, call)?;
+                check_wall_budget(started, call)?;
                 let module = &slot.module;
                 let mut map = BTreeMap::new();
                 map.insert("nodes".to_string(), Value::Int(module.node_count() as i64));
@@ -417,6 +489,7 @@ impl ModuleProvider {
             }
             "annotations" => {
                 check_node_budget(&slot.module, call)?;
+                check_wall_budget(started, call)?;
                 let module = &slot.module;
                 // The taint walk is only needed when the capability redacts.
                 let tainted_ids = if call.redact {
@@ -455,6 +528,7 @@ impl ModuleProvider {
             }
             "provenance" => {
                 check_node_budget(&slot.module, call)?;
+                check_wall_budget(started, call)?;
                 Ok(match slot.module.provenance() {
                     None => Response::Value(Value::Null),
                     Some(prov) => {
@@ -497,13 +571,16 @@ impl Provider for ModuleProvider {
 
     fn invoke(&mut self, object: u64, call: &Call) -> Result<Response> {
         let mut slot = self.take(object)?;
-        // A refused call is not a served call.
-        self.calls = self.calls.saturating_add(1);
         // Re-insert on every path, including a panic: the slot was taken out of
         // the map, so an unwind that skipped this line would destroy the module.
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.serve(&mut slot, call)));
         self.modules.insert(object, slot);
+        // Only an answered call counts: a refusal decided after the slot was
+        // taken is not a served call.
+        if outcome.as_ref().is_ok_and(|result| result.is_ok()) {
+            self.calls = self.calls.saturating_add(1);
+        }
         match outcome {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
@@ -667,12 +744,62 @@ fn immutable_target(module: &InfinityModule, path: &str) -> bool {
 /// if the write changes a value another path can read. A dependent with no
 /// value path of its own is a structural node, not a value the scope names.
 fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> bool {
-    let dependents = transitive(module, node, false);
-    if dependents.is_empty() {
+    let mut affected = transitive(module, node, false);
+    affected.insert(node);
+    // A constraint's expression is part of the validation of its subject: a
+    // scoped write may not change the meaning of a rule that watches data
+    // outside the scope.
+    for annotation in module.annotations() {
+        if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
+            if affected.contains(&annotation.node) {
+                affected.insert(*expr);
+            }
+        }
+    }
+    let paths = active_infinity::interop::value_paths(module);
+    if !affected.iter().all(|id| match paths.get(id) {
+        Some(path) => crate::cap::is_path_prefix(scope, path),
+        // A node reachable by no name cannot be read outside the scope, but a
+        // binding gives it one.
+        None => true,
+    }) {
+        return false;
+    }
+    // A binding is a name for a node: if a dependent is bound outside the
+    // scope, changing the node changes what that name resolves to.
+    module
+        .bindings()
+        .iter()
+        .all(|(name, id)| !affected.contains(id) || crate::cap::is_path_prefix(scope, name))
+}
+
+/// True when `node` is marked immutable, or is reachable from an immutable node.
+///
+/// `@ai_immutable` protects a subtree. A shared DAG lets the same node be named
+/// by an alias outside the marked path, so a per-path check is not enough: the
+/// node and its dependencies are what a write changes.
+fn immutable_node(module: &InfinityModule, node: NodeId) -> bool {
+    let immutable: BTreeSet<NodeId> = active_infinity::interop::immutable_nodes(module)
+        .into_iter()
+        .collect();
+    if immutable.is_empty() {
+        return false;
+    }
+    if immutable.contains(&node) {
+        return true;
+    }
+    immutable
+        .iter()
+        .any(|root| transitive(module, *root, true).contains(&node))
+}
+
+/// True when every node in `ids` is named by a path inside `scope`.
+fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &str) -> bool {
+    if ids.is_empty() {
         return true;
     }
     let paths = active_infinity::interop::value_paths(module);
-    dependents.iter().all(|id| match paths.get(id) {
+    ids.iter().all(|id| match paths.get(id) {
         Some(path) => crate::cap::is_path_prefix(scope, path),
         None => true,
     })

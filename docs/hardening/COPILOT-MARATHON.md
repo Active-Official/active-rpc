@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
-| R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-2: 12 + 8 findings (D-1, D-2, D-5, D-8..D-12 partial) | 20 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,31 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-07 domain operations - 2026-11-02 (round 2, confirmation)
+
+Reviewer: Muse (the DeepSeek proxy was returning 403), at `07968a0`. It verified
+D-1..D-12 and found four partial dispositions plus eight new defects, one of them
+critical: the scope check covered the *argument*, not the answer. Tests:
+`tests/domain_confinement_tests.rs` (6), all driving a shared-DAG module built
+directly so the hostile shape is exact.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N1 | critical | a scoped `evaluate`/`why`/`subgraph` followed references out of the scope: `app.x = Ref(ops.secret)` returned `OUTSIDE-CANARY` and the `subgraph` bytes carried it | **fixed**: each of the three checks the transitive dependency closure against the scope and refuses with `rpc/path-not-granted`; `a_scoped_evaluate_cannot_follow_a_reference_outside_the_scope`, `a_scoped_why_cannot_name_an_outside_dependency` |
+| N2 | high | scoped `impact`/`dependents`/`dependencies` named labels outside the scope through a shared node | **fixed**: the dependent/dependency sets are checked against the scope; `a_scoped_impact_cannot_name_an_outside_dependent` |
+| N3 | high | `stats`/`annotations`/`provenance`/`content_hash` answered globally under a scope, with the path argument ignored (counts and a content hash are oracles over the hidden part) | **fixed**: all four are refused under a scope (`rpc/path-not-granted`); `a_scoped_capability_cannot_read_global_metadata` |
+| N4 | high | `subgraph` and `content_hash` ignored `max_nodes` (500 nodes under a ceiling of 8 succeeded) | **fixed**: both run `check_node_budget` and `check_wall_budget`; `subgraph_and_content_hash_respect_the_node_budget` |
+| N5 | high | `@ai_immutable` was checked per path, so a shared node rewritten through an alias outside the marked subtree succeeded | **fixed**: `immutable_node` refuses a target that is, or is a dependency of, an immutable node; `an_alias_cannot_bypass_ai_immutable` |
+| N6 | medium | the scoped-write effect closure ignored constraint expressions and binding-only dependents | **fixed**: constraint expressions watched by an affected node join the closure, and a binding that names an affected node must be in scope |
+| N7 | medium | only four methods had a wall check; `subgraph`, `stats`, `annotations`, `provenance` and `content_hash` had none | **fixed**: every arm checks the wall ceiling |
+| N8 | low | `calls` advanced before `serve`, so a refusal after the slot was taken counted as served | **fixed**: it advances only on an answered call; `refused_call_does_not_advance_calls` (round 1) now holds |
+
+Verification notes: `evaluate` of an in-scope value with no reference still
+answers; a `subgraph` of a leaf with no outside edge answers; the scope refusal
+is fail-closed for a subtree that references outside data.
+
+Gate: `scripts/local_gate.sh` green; all-features 706.
 
 ### R-09 transports - 2026-11-02 (round 7, closing round 6's verification)
 
