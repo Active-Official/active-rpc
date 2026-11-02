@@ -50,6 +50,24 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 
 Entries are appended per section: date, reviewer path, findings, disposition.
 
+### Fuzz nightly red - 2026-11-02 (run 41437025560, `fuzz_arp1_frame`)
+
+The nightly fuzz job failed once on `08e49a5` with `libFuzzer: deadly signal` at
+`fuzz_targets/fuzz_arp1_frame.rs:28`. The artifact was downloaded and reproduced:
+the codec is fine, the **oracle** was not.
+
+- The input decodes to a request carrying `Float(NaN)`. Re-encoding produces the
+  same 52 bytes, but the harness asserted `Envelope` equality, and
+  `f64::NAN != f64::NAN`, so a byte-stable encoding was reported as a lost fixed
+  point.
+- Fix: the fixed-point assertion compares the re-encoded **bytes**.
+  `tests/marathon_wire_tests.rs::a_nan_argument_re_encodes_to_the_same_bytes`
+  pins the artifact as a regression, and the crash input is committed as a corpus
+  seed (`fuzz/corpus/fuzz_arp1_frame/nan-fixed-point`) so a future nightly starts
+  from it.
+- No wire change: a NaN argument was already round-tripping to the same bytes;
+  the wire format permits the bit pattern and the decoder is total over it.
+
 ### R-07 domain operations - 2026-11-02 (round 6, closing round 5's verification)
 
 The round-5 verification confirmed the read-side binding fix (and proved it

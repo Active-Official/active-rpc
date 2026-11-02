@@ -115,3 +115,32 @@ fn a_delta_addition_with_a_zero_budget_is_refused() {
         .expect_err("a budget that disables a ceiling is invalid");
     assert_eq!(error.code(), "rpc/capability-table", "{error:?}");
 }
+
+/// A decoded `Float(NaN)` re-encodes to exactly the same bytes.
+///
+/// The nightly fuzz target crashed on this input (run 41437025560) because the
+/// harness asserted `Envelope` equality, and `f64::NAN != f64::NAN`: the encoding
+/// was stable, the oracle was not. The fixed-point oracle is the encoded bytes.
+#[test]
+fn a_nan_argument_re_encodes_to_the_same_bytes() {
+    // The minimized crash input: a request with `Null, Null, Null, Float(NaN)`
+    // and a four-byte payload.
+    let input: [u8; 52] = [
+        0x41, 0x52, 0x50, 0x31, 0x01, 0x01, 0x00, 0x00, 0x01, 0x69, 0x67, 0x00, 0x00, 0x6e, 0x00,
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x03, 0x02, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0x04, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let envelope = active_rpc::wire::Envelope::decode(&input).expect("the crash input decodes");
+    assert!(
+        envelope
+            .args
+            .iter()
+            .any(|arg| matches!(arg, active_rpc::Arg::Value(active_rpc::Value::Float(value)) if value.is_nan())),
+        "{envelope:?}"
+    );
+    let bytes = envelope.encode().expect("encode");
+    assert_eq!(bytes, input, "the encoding is not a byte fixed point");
+    let again = active_rpc::wire::Envelope::decode(&bytes).expect("re-decode");
+    assert_eq!(again.encode().expect("re-encode"), bytes);
+}

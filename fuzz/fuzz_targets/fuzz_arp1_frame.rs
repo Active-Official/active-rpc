@@ -25,7 +25,15 @@ fuzz_target!(|data: &[u8]| {
         assert!(envelope.caps.len() <= WireLimits::default().max_caps as usize);
         if let Ok(bytes) = envelope.encode() {
             let again = Envelope::decode(&bytes).expect("re-encoded envelope must decode");
-            assert_eq!(again, envelope, "envelope is not a fixed point");
+            // Byte equality is the fixed-point oracle, not `Envelope` equality: a
+            // decoded `Float(NaN)` is not equal to itself, so `assert_eq!` on the
+            // values fails for a perfectly stable encoding (nightly run
+            // 41437025560, crash-86b29c5d).
+            assert_eq!(
+                again.encode().expect("re-encoded envelope must encode"),
+                bytes,
+                "envelope is not a fixed point"
+            );
         }
     }
 
