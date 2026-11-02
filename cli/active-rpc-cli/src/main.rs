@@ -231,7 +231,9 @@ fn describe_response(envelope: &Envelope) -> String {
     };
     let mut parts = vec![format!("kind={kind} id={}", envelope.request_id)];
     if !envelope.method.is_empty() {
-        parts.push(format!("method={}", envelope.method));
+        // The method is wire text from the peer: a raw newline or an ANSI escape
+        // forges a line in a terminal or a CI log, and this is an exit-0 path.
+        parts.push(format!("method={:?}", envelope.method));
     }
     parts.push(format!("payload={}", envelope.payload.len()));
     for arg in &envelope.args {
@@ -263,7 +265,10 @@ fn request(id: u64, method: &str, args: Vec<Arg>, payload: &[u8], cap: Option<Ca
 }
 
 fn parse_cap(text: &str) -> Result<CapId, CliError> {
-    if text.len() != 32 {
+    // `len()` is bytes: a 32-byte string holding a multi-byte character would
+    // make the slice below land inside a code point and panic (exit 101, outside
+    // the documented 0/1/2/3 contract). The peer is the source of `--cap`.
+    if text.len() != 32 || !text.is_ascii() {
         return Err(CliError::usage(
             "--cap must be 32 hex characters (the peer prints it)",
         ));
@@ -344,6 +349,14 @@ fn split_args(args: &[String]) -> (Vec<String>, BTreeMap<String, String>) {
     while index < args.len() {
         let arg = &args[index];
         if let Some(name) = arg.strip_prefix("--") {
+            // `--name=value` is the form an operator writes and a script emits;
+            // accepting only `--name value` silently dropped it (a transport
+            // downgrade or an empty payload with exit 0).
+            if let Some((name, value)) = name.split_once('=') {
+                flags.insert(format!("--{name}"), value.to_string());
+                index += 1;
+                continue;
+            }
             let key = format!("--{name}");
             if let Some(value) = args.get(index + 1) {
                 if !value.starts_with("--") {
@@ -361,12 +374,70 @@ fn split_args(args: &[String]) -> (Vec<String>, BTreeMap<String, String>) {
     (positional, flags)
 }
 
-fn transport_name(flags: &BTreeMap<String, String>) -> String {
-    flags
+/// Refuse any flag a command does not know.
+///
+/// An unknown flag used to be stored and ignored, so a typo (`--paylod`) or a
+/// `=`-form the parser did not understand (`--transport=quic`) silently changed
+/// the operation instead of failing: the operator believed they were exercising
+/// QUIC and got plaintext TCP, or sent no payload at all and saw exit 0.
+fn reject_unknown(flags: &BTreeMap<String, String>, allowed: &[&str]) -> CliResult {
+    for name in flags.keys() {
+        if !allowed.contains(&name.as_str()) {
+            return Err(CliError::usage(format!(
+                "unknown option {name}; expected one of {}",
+                allowed.join(", ")
+            )));
+        }
+    }
+    for (name, value) in flags {
+        if value.is_empty() && !matches!(name.as_str(), "--chain-only" | "--emit-cap-hex") {
+            return Err(CliError::usage(format!("{name} needs a value")));
+        }
+    }
+    Ok(())
+}
+
+
+/// Largest certificate file the CLI will read.
+const MAX_CERT_BYTES: u64 = 1 << 20;
+
+/// Largest number of loadgen threads the CLI will spawn.
+const MAX_CONCURRENCY: usize = 1_024;
+
+/// Default deadline for a client exchange, in milliseconds.
+const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
+/// Deadline for one served connection: a client that connects and then stalls
+/// must not hold the server's only accepting thread forever.
+const SERVER_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The read and write deadline for an exchange with a peer.
+///
+/// A peer that accepts a connection and then says nothing blocks a blocking
+/// read forever: the operator sees a hung tool instead of an error, and a server
+/// serving one connection at a time never reaches its `--limit`.
+fn timeout(flags: &BTreeMap<String, String>) -> Result<Duration, CliError> {
+    let ms = flag_number(flags, "--timeout-ms", DEFAULT_TIMEOUT_MS as usize)?;
+    if ms == 0 || ms > 3_600_000 {
+        return Err(CliError::usage(
+            "--timeout-ms must be 1..=3600000 (one hour)".to_string(),
+        ));
+    }
+    Ok(Duration::from_millis(ms as u64))
+}
+
+fn transport_name(flags: &BTreeMap<String, String>) -> Result<String, CliError> {
+    let name = flags
         .get("--transport")
         .filter(|value| !value.is_empty())
         .cloned()
-        .unwrap_or_else(|| "tcp".to_string())
+        .unwrap_or_else(|| "tcp".to_string());
+    match name.as_str() {
+        "tcp" | "connect" | "http2" | "quic" => Ok(name),
+        other => Err(CliError::usage(format!(
+            "unknown transport {other}; use tcp, http2, connect or quic"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -400,12 +471,32 @@ fn doctor(_args: &[String]) -> CliResult {
 // peer
 // ---------------------------------------------------------------------------
 
-fn announce(transport: &str, address: &str, cap: CapId, cert: Option<&str>) -> CliResult {
+/// Announce a listening peer.
+///
+/// `--emit-cap-hex` prints the raw bearer id, which is the transfer form and
+/// must be handled as a secret: possession is authority while the kernel lives.
+/// The default is the non-reversible correlation id, because stdout of a server
+/// command lands in terminals, CI logs and files.
+fn announce(
+    transport: &str,
+    address: &str,
+    cap: CapId,
+    cert: Option<&str>,
+    emit_cap_hex: bool,
+) -> CliResult {
     let mut out = io::stdout();
     writeln!(out, "transport={transport}")
         .map_err(|error| CliError::transport(error.to_string()))?;
     writeln!(out, "addr={address}").map_err(|error| CliError::transport(error.to_string()))?;
-    writeln!(out, "cap={}", cap.hex()).map_err(|error| CliError::transport(error.to_string()))?;
+    if emit_cap_hex {
+        writeln!(out, "cap={}", cap.hex())
+            .map_err(|error| CliError::transport(error.to_string()))?;
+    } else {
+        writeln!(out, "cap_correlation={}", cap.correlation_id())
+            .map_err(|error| CliError::transport(error.to_string()))?;
+        writeln!(out, "cap=<pass --emit-cap-hex to print the caller id>")
+            .map_err(|error| CliError::transport(error.to_string()))?;
+    }
     if let Some(path) = cert {
         writeln!(out, "cert={path}").map_err(|error| CliError::transport(error.to_string()))?;
     }
@@ -415,8 +506,11 @@ fn announce(transport: &str, address: &str, cap: CapId, cert: Option<&str>) -> C
 
 fn peer(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
-    let transport = transport_name(&flags);
+    reject_unknown(&flags, &["--transport", "--limit", "--methods", "--cert-out", "--emit-cap-hex"])?;
+    let transport = transport_name(&flags)?;
     let limit = flag_number(&flags, "--limit", 1)?;
+    // Printing the raw capability id is a transfer of authority, so it is opt-in.
+    let emit_hex = flags.contains_key("--emit-cap-hex");
     let methods = flags
         .get("--methods")
         .filter(|value| !value.is_empty())
@@ -431,27 +525,30 @@ fn peer(args: &[String]) -> CliResult {
         .unwrap_or_else(|| vec!["echo".to_string(), "sum".to_string()]);
     let kernel = kernel(&methods)?;
     match transport.as_str() {
-        "tcp" => peer_tcp(kernel, limit),
-        "http2" => peer_http2(kernel, limit),
-        "connect" => peer_connect(kernel, limit),
-        "quic" => peer_quic(kernel, limit, &flags),
+        "tcp" => peer_tcp(kernel, limit, emit_hex),
+        "http2" => peer_http2(kernel, limit, emit_hex),
+        "connect" => peer_connect(kernel, limit, emit_hex),
+        "quic" => peer_quic(kernel, limit, &flags, emit_hex),
         other => Err(CliError::usage(format!(
             "unknown transport {other}; use tcp, http2, connect or quic"
         ))),
     }
 }
 
-fn peer_tcp(kernel: Kernel, limit: usize) -> CliResult {
+fn peer_tcp(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
     let (listener, address) =
         bind_loopback().map_err(|error| CliError::transport(error.to_string()))?;
-    announce("tcp", &address, kernel.cap.id(), None)?;
+    announce("tcp", &address, kernel.cap.id(), None, emit_hex)?;
     let mut served = 0usize;
     while limit == 0 || served < limit {
         let (stream, _) = listener
             .accept()
             .map_err(|error| CliError::transport(format!("accept: {error}")))?;
-        let transport =
-            TcpTransport::new(stream).map_err(|error| CliError::transport(error.to_string()))?;
+        // A client that connects and says nothing must not hold the only
+        // serving thread: without a deadline `--limit` is unreachable and the
+        // second caller waits forever.
+        let transport = TcpTransport::with_timeout(stream, SERVER_DEADLINE)
+            .map_err(|error| CliError::transport(error.to_string()))?;
         let Kernel { agent, lane, .. } = &kernel;
         serve_connection(transport, |envelope| dispatch(agent, *lane, &envelope))
             .map_err(|error| CliError::transport(error.to_string()))?;
@@ -460,11 +557,11 @@ fn peer_tcp(kernel: Kernel, limit: usize) -> CliResult {
     Ok(())
 }
 
-fn peer_http2(kernel: Kernel, limit: usize) -> CliResult {
+fn peer_http2(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
     let server =
         Http2Server::bind_loopback().map_err(|error| CliError::transport(error.to_string()))?;
     let address = server.address().to_string();
-    announce("http2", &address, kernel.cap.id(), None)?;
+    announce("http2", &address, kernel.cap.id(), None, emit_hex)?;
     let (tx, rx) = mpsc::channel::<(Envelope, mpsc::Sender<Envelope>)>();
     let server_thread = std::thread::spawn(move || {
         server.serve(limit.max(1), move |envelope| {
@@ -488,11 +585,11 @@ fn peer_http2(kernel: Kernel, limit: usize) -> CliResult {
     Ok(())
 }
 
-fn peer_connect(kernel: Kernel, limit: usize) -> CliResult {
+fn peer_connect(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
     let server =
         BridgeServer::bind_loopback().map_err(|error| CliError::transport(error.to_string()))?;
     let address = server.address().to_string();
-    announce("connect", &address, kernel.cap.id(), None)?;
+    announce("connect", &address, kernel.cap.id(), None, emit_hex)?;
     let (tx, rx) = mpsc::channel::<(Envelope, mpsc::Sender<Envelope>)>();
     let server_thread = std::thread::spawn(move || {
         server.serve(limit.max(1), move |envelope| {
@@ -516,7 +613,12 @@ fn peer_connect(kernel: Kernel, limit: usize) -> CliResult {
     Ok(())
 }
 
-fn peer_quic(kernel: Kernel, limit: usize, flags: &BTreeMap<String, String>) -> CliResult {
+fn peer_quic(
+    kernel: Kernel,
+    limit: usize,
+    flags: &BTreeMap<String, String>,
+    emit_hex: bool,
+) -> CliResult {
     if limit == 0 {
         return Err(CliError::usage(
             "quic needs --limit N (the server stops after N calls)",
@@ -541,7 +643,13 @@ fn peer_quic(kernel: Kernel, limit: usize, flags: &BTreeMap<String, String>) -> 
         .unwrap_or_else(|| "active-rpc.cert".to_string());
     std::fs::write(&cert_path, &certificate)
         .map_err(|error| CliError::transport(format!("cannot write {cert_path}: {error}")))?;
-    announce("quic", server.address(), kernel.cap.id(), Some(&cert_path))?;
+    announce(
+        "quic",
+        server.address(),
+        kernel.cap.id(),
+        Some(&cert_path),
+        emit_hex,
+    )?;
 
     let mut served = 0usize;
     for (envelope, reply) in rx {
@@ -564,7 +672,8 @@ fn peer_quic(kernel: Kernel, limit: usize, flags: &BTreeMap<String, String>) -> 
 
 fn call(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
-    let transport = transport_name(&flags);
+    reject_unknown(&flags, &["--addr", "--transport", "--cap", "--method", "--payload", "--text", "--cert", "--timeout-ms"])?;
+    let transport = transport_name(&flags)?;
     let address = endpoint(&flags)?;
     let cap = flags
         .get("--cap")
@@ -572,12 +681,13 @@ fn call(args: &[String]) -> CliResult {
         .map(|value| parse_cap(value))
         .transpose()?;
     let method = method(&flags);
+    let deadline = timeout(&flags)?;
     let payload = payload(&flags)?;
     let envelope = request(42, &method, Vec::new(), &payload, cap);
 
     let response = match transport.as_str() {
         "tcp" => {
-            let mut transport = TcpTransport::connect(&address)
+            let mut transport = TcpTransport::connect_with_timeout(&address, deadline)
                 .map_err(|error| CliError::transport(error.to_string()))?;
             transport
                 .send(&envelope)
@@ -600,8 +710,9 @@ fn call(args: &[String]) -> CliResult {
                 .get("--cert")
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| CliError::usage("quic needs --cert <file> from the peer"))?;
-            let bytes = std::fs::read(cert_path)
-                .map_err(|error| CliError::usage(format!("cannot read {cert_path}: {error}")))?;
+            // A certificate is an untrusted file, like every other input to
+            // this command; it is read under the same ceiling.
+            let bytes = read_bounded(cert_path, MAX_CERT_BYTES)?;
             let certificate = rustls_pki_types::CertificateDer::from(bytes);
             QuicClient::connect(&address, &certificate)
                 .map_err(|error| CliError::transport(error.to_string()))?
@@ -616,10 +727,19 @@ fn call(args: &[String]) -> CliResult {
     };
 
     println!("{}", describe_response(&response));
-    if response.kind == Kind::Error {
+    // Only `Response` is a reply. `Hello`, `Request` and an error are not, and
+    // treating them as success inverted the documented exit contract in front of
+    // a hostile peer.
+    if response.kind != Kind::Response {
         return Err(CliError::refused(format!(
-            "peer refused: {}",
-            response.method
+            "the peer did not answer the call: {}",
+            describe_response(&response)
+        )));
+    }
+    if response.request_id != 42 {
+        return Err(CliError::refused(format!(
+            "the peer answered request {} instead of 42",
+            response.request_id
         )));
     }
     Ok(())
@@ -631,6 +751,7 @@ fn call(args: &[String]) -> CliResult {
 
 fn pipeline(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
+    reject_unknown(&flags, &["--addr", "--cap", "--calls", "--method", "--payload", "--text", "--timeout-ms"])?;
     let address = endpoint(&flags)?;
     let cap = parse_cap(
         flags
@@ -640,9 +761,10 @@ fn pipeline(args: &[String]) -> CliResult {
     )?;
     let calls = flag_number(&flags, "--calls", 8)?;
     let method = method(&flags);
+    let deadline = timeout(&flags)?;
     let payload = payload(&flags)?;
-    let mut transport =
-        TcpTransport::connect(&address).map_err(|error| CliError::transport(error.to_string()))?;
+    let mut transport = TcpTransport::connect_with_timeout(&address, deadline)
+        .map_err(|error| CliError::transport(error.to_string()))?;
     let started = Instant::now();
     for id in 0..calls as u64 {
         let envelope = request(id + 1, &method, Vec::new(), &payload, Some(cap));
@@ -661,15 +783,17 @@ fn pipeline(args: &[String]) -> CliResult {
     let elapsed = started.elapsed();
     let refusals = responses
         .iter()
-        .filter(|response| response.kind == Kind::Error)
+        .filter(|response| response.kind != Kind::Response)
         .count();
     println!(
         "calls={calls} round_trips=1 responses={} refusals={refusals} elapsed_ms={:.3}",
-        responses.len(),
+        responses.len() - refusals,
         elapsed.as_secs_f64() * 1_000.0
     );
     if refusals > 0 {
-        return Err(CliError::refused(format!("{refusals} calls were refused")));
+        return Err(CliError::refused(format!(
+            "{refusals} calls were not answered with a response"
+        )));
     }
     Ok(())
 }
@@ -680,6 +804,7 @@ fn pipeline(args: &[String]) -> CliResult {
 
 fn loadgen(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
+    reject_unknown(&flags, &["--addr", "--cap", "--requests", "--concurrency", "--method", "--payload", "--text"])?;
     let address = endpoint(&flags)?;
     let cap = parse_cap(
         flags
@@ -691,7 +816,21 @@ fn loadgen(args: &[String]) -> CliResult {
     let concurrency = flag_number(&flags, "--concurrency", 4)?.max(1);
     let method = method(&flags);
     let payload = payload(&flags)?;
-    let total = requests.max(concurrency);
+    // `requests.max(concurrency)` used to turn `--requests 2 --concurrency 4`
+    // into four requests and print `requests=4 ok=4`: the operator's number was
+    // silently rewritten. Threads are bounded too, or a spawn panics at the OS
+    // limit (exit 101).
+    if requests < concurrency {
+        return Err(CliError::usage(format!(
+            "--requests {requests} is below --concurrency {concurrency}"
+        )));
+    }
+    if concurrency > MAX_CONCURRENCY {
+        return Err(CliError::usage(format!(
+            "--concurrency is capped at {MAX_CONCURRENCY}"
+        )));
+    }
+    let total = requests;
     let started = Instant::now();
     let next_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let mut handles = Vec::new();
@@ -768,15 +907,24 @@ fn loadgen(args: &[String]) -> CliResult {
 
 fn bridge(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
+    reject_unknown(&flags, &["--limit", "--emit-cap-hex"])?;
     let limit = flag_number(&flags, "--limit", 1)?;
+    let emit_hex = flags.contains_key("--emit-cap-hex");
     let kernel = kernel(&["echo".to_string()])?;
     let server =
         BridgeServer::bind_loopback().map_err(|error| CliError::transport(error.to_string()))?;
     let address = server.address().to_string();
-    println!(
-        "transport=connect\naddr={address}\ncap={}",
-        kernel.cap.id().hex()
-    );
+    if emit_hex {
+        println!(
+            "transport=connect\naddr={address}\ncap={}",
+            kernel.cap.id().hex()
+        );
+    } else {
+        println!(
+            "transport=connect\naddr={address}\ncap_correlation={}\ncap=<pass --emit-cap-hex to print the caller id>",
+            kernel.cap.id().correlation_id()
+        );
+    }
     io::stdout()
         .flush()
         .map_err(|error| CliError::transport(error.to_string()))?;
@@ -809,6 +957,7 @@ fn bridge(args: &[String]) -> CliResult {
 
 fn events(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
+    reject_unknown(&flags, &["--plane", "--after", "--follow", "--interval-ms"])?;
     let plane = flags
         .get("--plane")
         .filter(|value| !value.is_empty())
@@ -873,7 +1022,12 @@ fn http_get(url: &str) -> Result<String, CliError> {
         .ok_or_else(|| CliError::transport("malformed HTTP response"))?;
     let head = String::from_utf8_lossy(&response[..split]).to_ascii_lowercase();
     if let Some(status) = head.lines().next() {
-        if !status.contains(" 200 ") {
+        // "HTTP/1.1 200" with no reason phrase is a valid status line.
+        let ok = status
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|code| code == "200");
+        if !ok {
             return Err(CliError::refused(format!(
                 "control plane answered {}",
                 head.lines().next().unwrap_or_default()
@@ -898,17 +1052,30 @@ fn dechunk(body: &[u8]) -> Result<String, CliError> {
             break;
         };
         let size_text = String::from_utf8_lossy(&body[cursor..cursor + line_end]);
+        // A chunk size is attacker-controlled: `cursor + size` used to overflow,
+        // and on a 64-bit build the wrapped value passed the bounds check and
+        // panicked on an inverted range (exit 101 from a hostile server).
         let size = usize::from_str_radix(size_text.trim(), 16)
             .map_err(|_| CliError::transport("bad chunk size"))?;
-        cursor += line_end + 2;
+        if size as u64 > MAX_EVENT_BODY_BYTES {
+            return Err(CliError::transport("chunk over the body ceiling"));
+        }
+        cursor = cursor
+            .checked_add(line_end + 2)
+            .ok_or_else(|| CliError::transport("chunk framing overflows"))?;
         if size == 0 {
             break;
         }
-        if cursor + size > body.len() {
+        let end = cursor
+            .checked_add(size)
+            .ok_or_else(|| CliError::transport("chunk length overflows"))?;
+        if end > body.len() {
             return Err(CliError::transport("truncated chunk"));
         }
-        out.extend_from_slice(&body[cursor..cursor + size]);
-        cursor += size + 2;
+        out.extend_from_slice(&body[cursor..end]);
+        cursor = end
+            .checked_add(2)
+            .ok_or_else(|| CliError::transport("chunk framing overflows"))?;
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
@@ -1107,7 +1274,11 @@ fn receipts_dump(flags: &BTreeMap<String, String>) -> CliResult {
     // cannot be extended with fabricated records.
     log.append_verified(&agent.receipt_key(), &receipts)
         .map_err(|error| CliError::refused(format!("{}: {error} ({output:?})", error.code())))?;
-    println!("wrote {} receipts to {:?}", receipts.len(), output);
+    println!(
+        "wrote {} receipts to {:?} (demo key is public: this log proves the format, not a real kernel)",
+        receipts.len(),
+        output
+    );
     // Print the head of the same read the append verified, not a second read.
     let snapshot = log
         .snapshot()
@@ -1187,7 +1358,8 @@ fn receipts_repair(path: &str) -> CliResult {
         .snapshot()
         .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))?;
     println!(
-        "ok {} receipts kept, {} byte(s) of an interrupted write discarded, head {}",
+        "ok {} receipts kept, {} byte(s) of an interrupted write discarded, head {} \
+         (structure only; pass a receipt key to verify authenticity)",
         snapshot.len(),
         discarded,
         hex32(&snapshot.head())
@@ -1196,10 +1368,21 @@ fn receipts_repair(path: &str) -> CliResult {
 }
 
 fn receipts_show(path: &str, limit: usize) -> CliResult {
+    if limit == 0 {
+        return Err(CliError::usage(
+            "--limit must be at least 1 (0 printed nothing and exited 0)".to_string(),
+        ));
+    }
     let log = open_receipt_log(path)?;
     let snapshot = log
         .snapshot()
         .map_err(|error| CliError::refused(format!("{}: {error} ({path:?})", error.code())))?;
+    // The records are unverified structure: `verify` is the command that proves
+    // who wrote them, and a reader must not mistake this listing for evidence.
+    println!(
+        "# {} record(s), structure unverified; run `receipts verify` for authenticity",
+        snapshot.len()
+    );
     for receipt in snapshot.receipts().iter().take(limit) {
         // The method is quoted: it is stored text, and a raw newline would turn
         // one record into two lines of "evidence".
@@ -1226,8 +1409,8 @@ fn receipts_show(path: &str, limit: usize) -> CliResult {
 /// forge one. Windows ACLs are the deployment's responsibility, so the check is
 /// unix-only and documented.
 fn read_receipt_key(path: &str) -> Result<[u8; 32], CliError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| CliError::usage(format!("cannot read {path:?}: {error}")))?;
+    let text = String::from_utf8(read_bounded(path, 65)?)
+        .map_err(|_| CliError::usage(format!("{path:?} is not text")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1309,15 +1492,17 @@ usage: active-rpc-cli <command> [options]
   doctor
       Version, transports, features, budget defaults and exit codes.
   peer [--transport tcp|http2|connect|quic] [--limit N] [--methods echo,sum]
-       [--cert-out PATH]
+       [--cert-out PATH] [--emit-cap-hex]
       Start a demo peer with a real kernel and a minted capability. Prints
-      transport, addr, cap (and cert for quic). --limit is connections for
-      tcp/http2, requests for connect, calls for quic; 0 serves until Ctrl-C on
-      tcp.
+      transport, addr, cap_correlation (and cert for quic); --emit-cap-hex prints
+      the raw caller id instead, which is bearer authority. --limit is
+      connections for tcp/http2, requests for connect, calls for quic; 0 serves
+      until Ctrl-C on tcp.
   call --addr HOST:PORT [--transport ...] [--cap HEX] [--method M]
-       [--payload FILE | --text TEXT] [--cert FILE]
+       [--payload FILE | --text TEXT] [--cert FILE] [--timeout-ms N]
       Issue one call and print kind, id, payload length and value.
   pipeline --addr HOST:PORT --cap HEX [--calls N] [--method M] [--payload FILE]
+           [--timeout-ms N]
       Send N calls on one connection before reading any response; prints the
       round-trip count.
   loadgen --addr HOST:PORT --cap HEX [--requests N] [--concurrency C]
@@ -1357,7 +1542,8 @@ Exit codes: 0 success, 1 refusal or failed request, 2 usage, 3 transport or
 codec failure.
 
 Examples:
-  active-rpc-cli peer --limit 4 > peer.txt
+  active-rpc-cli peer --limit 4
+  active-rpc-cli peer --limit 4 --emit-cap-hex > peer.txt   # bearer id: keep it private
   active-rpc-cli call --addr 127.0.0.1:5000 --cap 00112233445566778899aabbccddeeff
   active-rpc-cli pipeline --addr 127.0.0.1:5000 --cap <hex> --calls 16
   active-rpc-cli loadgen --addr 127.0.0.1:5000 --cap <hex> --requests 200 --concurrency 8
@@ -1365,7 +1551,9 @@ Examples:
   active-rpc-cli replay dump --output session.arrp
   active-rpc-cli replay run session.arrp
 
-Capabilities are printed as opaque ids; the CLI never prints authority bits.",
+A capability id printed with --emit-cap-hex is bearer authority: anyone who
+reads it can call the peer while its kernel lives. Keep it out of shell history,
+shared files and CI logs; the default output is the non-reversible correlation id.",
         env!("CARGO_PKG_VERSION")
     )
 }

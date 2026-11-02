@@ -31,7 +31,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-15 | observability | `src/observability.rs` | round 1: 4 highs + 9 mediums + 6 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | round 1: 2 mediums + 2 lows fixed | 4 fixed / 0 rejected / 0 open (1 documented residual: no store wired by default) | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | round 1: 2 highs + 6 mediums + 3 lows fixed | 11 fixed / 0 rejected / 0 open (1 recorded: publisher identity) | this commit |
-| R-18 | CLI | `cli/active-rpc-cli/**` | pending | — | — |
+| R-18 | CLI | `cli/active-rpc-cli/**` | round 1: 4 highs + 8 mediums + 7 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
 | R-19 | control-plane | `control-plane/**` | pending | — | — |
 | R-20 | fuzz | `fuzz/**` | pending | — | — |
 
@@ -194,6 +194,40 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-18 CLI - 2026-11-02 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `026c122`,
+driving the built binary against scripted hostile peers. No critical; four
+highs, eight mediums, seven lows. The pattern was "the binary tells the operator
+what it decided, not what happened": a non-response read as success, an ignored
+flag that silently downgraded a transport, a raw bearer id on stdout.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| C1 | high | `call`/`pipeline` treated every kind except `Error` as success, so a `Hello` or `Request` reply exited 0 | **fixed**: only `Kind::Response` is an answer, the request id must match, and every non-response counts as a failure in `pipeline`; `a_reply_that_is_not_a_response_is_a_refusal`, `a_reply_for_another_request_is_a_refusal` |
+| C2 | high | the peer printed the raw capability id (bearer authority) while help claimed it printed none | **fixed**: the default announcement prints the correlation id; `--emit-cap-hex` is the transfer form and the help says it is authority; tests pass the flag |
+| C3 | high | unknown flags were ignored and `--flag=value` unparsable, so `--transport=quic` ran plaintext TCP and `--paylod` sent nothing with exit 0 | **fixed**: `--name=value` parses, every command has an allowlist (`reject_unknown`), a transport outside the four names is a usage error; `flags_accept_the_equals_form_and_unknown_options_are_refused` |
+| C4 | high | no read or write deadlines: a silent peer hung `call`/`pipeline`, and `peer --limit` could not be reached | **fixed**: `TcpTransport::connect_with_timeout`/`with_timeout`, `--timeout-ms` on the client commands, a 10 s deadline on a served connection |
+| C5 | medium | `parse_cap` sliced a 32-*byte* non-ASCII `--cap` and panicked (exit 101) | **fixed**: `is_ascii` check; `a_non_ascii_capability_is_a_usage_error` |
+| C6 | medium | a peer-supplied method was printed raw, so a newline or an ANSI escape forged a line on an exit-0 path | **fixed**: `{:?}` in the description and the refusal |
+| C7 | medium | `dechunk`'s `cursor + size` overflowed and panicked on a hostile chunk size | **fixed**: checked adds plus a body ceiling; `a_hostile_chunk_size_is_a_transport_error` |
+| C8 | medium | the certificate and the receipt key were read unbounded | **fixed**: both go through `read_bounded` (65 bytes for a key) |
+| C9 | medium | `loadgen` silently raised `--requests` to `--concurrency`, and threads were uncapped | **fixed**: a usage error when requests < concurrency, concurrency capped at 1 024 |
+| C10 | medium | the demo receipt key is a source constant, so "macs verified" proves nothing about a real kernel | **fixed in the output**: `receipts dump` says the key is public and the log proves the format |
+| C11 | medium | `receipts show` printed a possibly forged log as plain evidence, and `--limit 0` exited 0 with no output | **fixed**: a header says the listing is unverified structure, and `--limit 0` is a usage error |
+| C12 | medium | `receipts repair` printed a bare `ok` while proving only framing | **fixed**: it says "structure only; pass a receipt key" |
+| C13 | low | no request-id correlation | **fixed** with C1 |
+| C14 | low | `doctor` prints compile-time facts and cannot fail | noted: it reports the build, and the exit code is the build's |
+| C15 | low | `--limit 0` means "forever" on tcp and 1 on the other transports | documented in the help |
+| C16 | low | a reason-phraseless `200` was rejected | **fixed**: the status code is parsed, not substring-matched |
+| C17 | low | empty flag values silently fell back | **fixed**: `reject_unknown` refuses an empty value |
+| C18 | low | the key-file permission check is unix-only | documented: Windows ACLs are the deployment's |
+| C19 | low | vacuous tests (help list, a literal `round_trips=1`) and no hostile cases | **fixed**: the help list covers every command, and `tests/hostile_input_tests.rs` (5) drives the four hostile paths |
+
+Gate: `cargo test --all-features` 597 passed, 0 failed across 68 suites;
+`--no-default-features` 537 passed, 0 failed; CLI 17 + 5 hostile tests; clippy,
+fmt and `cargo doc -D warnings` clean on both feature sets.
 
 ### R-17 introduction and topics - 2026-11-01 (round 1)
 

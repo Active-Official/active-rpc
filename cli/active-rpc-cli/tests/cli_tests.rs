@@ -43,8 +43,13 @@ impl Drop for Peer {
 }
 
 fn start_peer(args: &[&str]) -> Peer {
+    // The default announcement prints the correlation id, not the caller id: the
+    // raw id is bearer authority and is opt-in. A test that drives the peer
+    // needs the caller form.
+    let mut full: Vec<&str> = args.to_vec();
+    full.push("--emit-cap-hex");
     let mut child = cli()
-        .args(args)
+        .args(&full)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -86,12 +91,20 @@ fn help_lists_every_command() {
     let output = run(&["help"]);
     assert!(output.status.success());
     let text = stdout(&output);
+    // Every command the dispatcher knows: the list used to stop at `events`, so
+    // "every command" was never verified for `replay`, `receipts` or `version`.
     for command in [
-        "doctor", "peer", "call", "pipeline", "loadgen", "bridge", "events",
+        "doctor", "peer", "call", "pipeline", "loadgen", "bridge", "events", "replay", "receipts",
+        "version",
     ] {
         assert!(text.contains(command), "help is missing {command}");
     }
     assert!(text.contains("Examples:"));
+    // The raw caller id is bearer authority and must be described as such.
+    assert!(
+        text.contains("bearer authority"),
+        "help must warn about the id"
+    );
 }
 
 #[test]
@@ -461,9 +474,20 @@ fn receipts_dump_verify_and_tamper_paths() {
     assert!(show.status.success(), "{}", stderr(&show));
     let shown = stdout(&show);
     let lines: Vec<&str> = shown.lines().collect();
-    assert_eq!(lines.len(), 2, "{shown}");
-    assert!(lines[0].starts_with("1 "), "{}", lines[0]);
-    assert!(lines[1].starts_with("2 "), "{}", lines[1]);
+    // The first line says the listing is unverified structure, so a reader
+    // cannot mistake it for the authenticated report `verify` produces.
+    assert!(
+        lines[0].starts_with("# 4 record(s), structure unverified"),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(lines.len(), 3, "{shown}");
+    assert!(lines[1].starts_with("1 "), "{}", lines[1]);
+    assert!(lines[2].starts_with("2 "), "{}", lines[2]);
+
+    // `--limit 0` used to print nothing and exit 0, which reads as success.
+    let zero = run(&["receipts", "show", log_arg, "--limit", "0"]);
+    assert_eq!(zero.status.code(), Some(2), "{}", stderr(&zero));
 
     // The demo ends with a dispatch refusal, and the log says so.
     let last = run(&["receipts", "show", log_arg, "--limit", "4"]);

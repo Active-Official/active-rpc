@@ -230,6 +230,27 @@ impl TcpTransport {
             .map_err(|error| Error::Transport(format!("connect: {error}")))?;
         Self::new(stream)
     }
+
+    /// Connect with a read and write deadline.
+    ///
+    /// A peer that accepts and then sends nothing blocks a blocking `read`
+    /// forever. An operator tool that talks to an untrusted peer needs a
+    /// deadline, and a server that serves one connection at a time needs one on
+    /// the accepted socket or its `--limit` is unreachable.
+    pub fn connect_with_timeout(address: &str, timeout: std::time::Duration) -> Result<Self> {
+        let stream = TcpStream::connect(address)
+            .map_err(|error| Error::Transport(format!("connect: {error}")))?;
+        Self::with_timeout(stream, timeout)
+    }
+
+    /// Wrap an accepted or connected stream with a read and write deadline.
+    pub fn with_timeout(stream: TcpStream, timeout: std::time::Duration) -> Result<Self> {
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| stream.set_write_timeout(Some(timeout)))
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        Self::new(stream)
+    }
 }
 
 impl Transport for TcpTransport {
