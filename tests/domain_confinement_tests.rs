@@ -671,3 +671,89 @@ fn a_binding_cannot_launder_an_outside_node_into_the_scope() {
         );
     }
 }
+
+/// `impact` answers the dependent closure, so a dependent outside the scope must
+/// refuse even when every dependency is inside it (a Ref alias is the usual way
+/// this arises).
+#[test]
+fn a_scoped_impact_cannot_answer_through_a_reference_alias() {
+    let mut module = InfinityModule::new();
+    let inside = module.push(Inode::Str("in".to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("y".to_string(), inside)],
+    });
+    // `ops.r` references the in-scope value, so its dependent set reaches into
+    // the scope while the alias itself is outside.
+    let alias = module.push(Inode::Ref(inside));
+    let ops = module.push(Inode::Table {
+        fields: vec![("r".to_string(), alias)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app), ("ops".to_string(), ops)],
+    });
+    module.set_root(Some(root));
+
+    let agent = Agent::with_secret([0x86; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["impact"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("alias", Budget::default()).expect("lane");
+    let fixture = Fixture { agent };
+
+    let result = call(&fixture, lane, &cap, "impact", vec![path("app.y")]);
+    assert_eq!(
+        result.as_ref().err().map(active_rpc::Error::code),
+        Some("rpc/path-not-granted"),
+        "{result:?}"
+    );
+}
+
+/// A scoped cone keeps `@ai_immutable`: the guard travels with the subtree so the
+/// recipient cannot rewrite what the marker protects.
+#[test]
+fn a_scoped_cone_keeps_the_immutability_guard() {
+    let mut module = InfinityModule::new();
+    let value = module.push(Inode::Str("original".to_string()));
+    let inner = module.push(Inode::Table {
+        fields: vec![("value".to_string(), value)],
+    });
+    let app = module.push(Inode::Table {
+        fields: vec![("inner".to_string(), inner)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+    module.annotate(inner, AnnotationKind::AiImmutable(true));
+
+    let agent = Agent::with_secret([0x87; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["subgraph"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("guard", Budget::default()).expect("lane");
+
+    let promise = agent
+        .call(lane, &cap, "subgraph", vec![path("app")])
+        .expect("queued");
+    agent.run();
+    let bytes = match promise.value().expect("subgraph") {
+        Value::Module(bytes) => bytes,
+        other => panic!("expected module bytes, got {other:?}"),
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    assert_eq!(
+        decoded.annotations().len(),
+        1,
+        "the cone dropped the @ai_immutable guard"
+    );
+    assert!(matches!(
+        decoded.annotations()[0].kind,
+        AnnotationKind::AiImmutable(true)
+    ));
+}

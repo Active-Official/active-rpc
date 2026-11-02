@@ -257,8 +257,12 @@ impl ModuleProvider {
                 let (path, node) = self.resolve(&slot.module, call)?;
                 let dependents = transitive(&slot.module, node, false);
                 if let Some(scope) = &call.path_scope {
-                    let (outside, environment) = scope_closure(&slot.module, node, scope);
-                    if outside || environment {
+                    // The answer is the dependent closure: that is what has to
+                    // be inside the scope (the dependency closure says nothing
+                    // about who can see the value).
+                    let mut affected = dependents.clone();
+                    affected.insert(node);
+                    if !nodes_within_scope(&slot.module, &affected, scope) {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
@@ -288,8 +292,8 @@ impl ModuleProvider {
                     // free text that may name outside paths; neither is part of
                     // the subtree.
                     sub.set_provenance(None);
-                    sub.clear_annotations();
-                    keep_scoped_bindings(&mut sub, node, scope);
+                    keep_immutable_annotations(&mut sub);
+                    keep_scoped_bindings(&mut sub, scope);
                 }
                 let bytes = redacted_module_bytes(&sub)?;
                 check_wall_budget(started, call)?;
@@ -367,8 +371,8 @@ impl ModuleProvider {
                         // The same rule as `subgraph`: a scoped cone reply is the
                         // subtree's data, not the module's history.
                         cone.set_provenance(None);
-                        cone.clear_annotations();
-                        keep_scoped_bindings(&mut cone, node, scope);
+                        keep_immutable_annotations(&mut cone);
+                        keep_scoped_bindings(&mut cone, scope);
                     }
                     let bytes = redacted_module_bytes(&cone)?;
                     (patched, bytes)
@@ -778,11 +782,13 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
         }
     }
     let paths = active_infinity::interop::value_paths(module);
+    let root = module.root();
     if !affected.iter().all(|id| match paths.get(id) {
-        Some(path) => crate::cap::is_path_prefix(scope, path),
-        // A node reachable by no name cannot be read outside the scope, but a
-        // binding gives it one.
-        None => true,
+        Some(path) => in_scope_path(module, *id, path, scope),
+        // The module root is pathless by construction. Any other pathless node is
+        // a floating value or an expression: it still travels in a cone and can be
+        // named by a binding, so an affected one makes the write unconfined.
+        None => Some(*id) == root,
     }) {
         return false;
     }
@@ -835,20 +841,37 @@ fn immutable_node(module: &InfinityModule, node: NodeId) -> bool {
             .any(|id| immutable.contains(id))
 }
 
-/// Drop bindings whose name or value is outside the scope.
+/// Reduce a cone's annotations to the immutability guards.
+///
+/// An annotation's intent or constraint source is free text that may name outside
+/// paths, so it leaves with the scope. `@ai_immutable` is different: it is the
+/// guard that stops the next agent from rewriting the subtree, and dropping it
+/// would hand the recipient a cone it may change.
+fn keep_immutable_annotations(module: &mut InfinityModule) {
+    let guards: Vec<(NodeId, AnnotationKind)> = module
+        .annotations()
+        .iter()
+        .filter(|annotation| matches!(annotation.kind, AnnotationKind::AiImmutable(_)))
+        .map(|annotation| (annotation.node, annotation.kind.clone()))
+        .collect();
+    module.clear_annotations();
+    for (node, kind) in guards {
+        module.annotate(node, kind);
+    }
+}
+
+/// Drop bindings whose name is outside the scope.
 ///
 /// A binding is a second name for a node. A cone that carries one lets the
 /// receiver address data by a name the scope never granted, and `value_paths`
 /// would then report that name for the node.
-fn keep_scoped_bindings(module: &mut InfinityModule, node: NodeId, scope: &str) {
-    let inside: BTreeSet<NodeId> = transitive(module, node, true)
-        .into_iter()
-        .chain(std::iter::once(node))
-        .collect();
+fn keep_scoped_bindings(module: &mut InfinityModule, scope: &str) {
+    // `restrict` only copies bindings whose node it kept, so the ids are already
+    // the cone's: the name is what can still be outside the scope.
     let bindings: Vec<(String, NodeId)> = module
         .bindings()
         .iter()
-        .filter(|(name, id)| inside.contains(id) && crate::cap::is_path_prefix(scope, name))
+        .filter(|(name, _)| crate::cap::is_path_prefix(scope, name))
         .cloned()
         .collect();
     module.clear_bindings();

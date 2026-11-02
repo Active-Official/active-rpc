@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-5: 12 + 8 + 9 + 8 + 1 findings | 38 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-6: 12 + 8 + 9 + 8 + 1 + 4 findings | 42 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,25 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-07 domain operations - 2026-11-02 (round 6, closing round 5's verification)
+
+The round-5 verification confirmed the read-side binding fix (and proved it
+fails without it) but found the write side untouched and three smaller issues.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| V1 | high | `impact` checked the *dependency* closure and answered the *dependent* closure, so a Ref alias outside the scope appeared in the answer | **fixed**: the affected set (node + dependents) is checked with the resolve-back rule; `a_scoped_impact_cannot_answer_through_a_reference_alias` |
+| V2 | high | `effects_within_scope` used prefix matching without resolve-back and treated a pathless node as in scope, so a scoped write escaped while the reads refused | **fixed**: the same `in_scope_path`, and the only pathless node allowed is the module root (every other pathless node is a floating value or an expression the cone can carry) |
+| V3 | medium | `keep_scoped_bindings` computed the cone's inside set with the pre-remap id | **fixed**: `restrict` already copies only in-cone bindings, so only the name is filtered |
+| V4 | low | a scoped cone stripped `@ai_immutable`, handing the recipient a subtree it may rewrite | **fixed**: `keep_immutable_annotations` keeps the guards (they carry no free text); `a_scoped_cone_keeps_the_immutability_guard` |
+| V5 | low | any binding on a read-closure node makes scoped reads refuse | **accepted residual**: fail-closed, and the operator controls bindings |
+
+Verified clean: a path resolution that does not round-trip is refused, a scoped
+patch reply carries neither provenance nor intent text, and a Ref alias in the
+dependency direction refuses.
+
+Gate: `scripts/local_gate.sh` green; all-features 719.
 
 ### R-07 domain operations - 2026-11-02 (round 5, closing round 4's verification)
 
