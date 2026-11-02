@@ -17,35 +17,36 @@ fn echo(envelope: Envelope) -> Envelope {
     Envelope::response(envelope.request_id, Value::text("ok"))
 }
 
-/// A head that dribbles one byte at a time is still bounded by the connection
-/// deadline: before the fix the per-read socket timeout was re-armed by every
-/// byte, and a head drip held the serial accept slot for hours.
+/// One head line, no newline, one byte at a time: `BufRead::read_until` loops
+/// inside a single call, so a per-line deadline was not enough. The clock starts
+/// before the drip, and the next connection must still be served.
 #[test]
-fn a_dripping_head_cannot_stretch_the_bridge_connection() {
+fn a_single_line_head_drip_cannot_stretch_the_bridge_connection() {
     let server = BridgeServer::bind_loopback().expect("bind");
     let address = server.address().to_string();
     let handle = std::thread::spawn(move || server.serve(2, echo).expect("serve"));
 
     let mut drip = TcpStream::connect(&address).expect("connect");
-    let head = b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost:";
-    for byte in head.iter() {
+    let started = Instant::now();
+    let line = b"POST /active.rpc.v1.Agent/Call HTTP/1.1";
+    for byte in line.iter() {
         if drip.write_all(&[*byte]).is_err() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(100));
     }
-    // Keep the socket open with no empty line; the deadline must end it.
+    // No newline, no empty line, socket still open: the connection deadline is
+    // the only thing that can end it.
 
-    let started = Instant::now();
     let mut client = active_rpc::transport::connect::ConnectClient::connect(&address)
         .expect("the bridge keeps serving")
-        .with_deadline(Duration::from_secs(15));
+        .with_deadline(Duration::from_secs(20));
     client
         .call(&Envelope::request(1, "ping", vec![]))
         .expect("the next connection is served");
     assert!(
-        started.elapsed() < CONNECTION_WAIT + Duration::from_secs(5),
-        "the head drip held the bridge for {:?}",
+        started.elapsed() < CONNECTION_WAIT + Duration::from_secs(6),
+        "the single-line head drip held the bridge for {:?}",
         started.elapsed()
     );
     drop(drip);

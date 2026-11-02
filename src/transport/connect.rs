@@ -105,6 +105,45 @@ fn arm_deadline(stream: &TcpStream, deadline: std::time::Instant) -> bool {
         && stream.set_write_timeout(Some(remaining)).is_ok()
 }
 
+/// Read one line, re-arming the connection deadline before every fill.
+///
+/// `BufRead::read_until` loops `fill_buf` internally, so a single call gets one
+/// socket timeout for the whole line: a peer that sends one byte every second
+/// keeps a 16 KiB line alive for hours. Reading a chunk at a time puts the
+/// deadline back in charge.
+fn read_line_before<R: BufRead>(
+    reader: &mut R,
+    max: usize,
+    guard: Option<(&TcpStream, std::time::Instant)>,
+) -> Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        if let Some((stream, deadline)) = guard {
+            if !arm_deadline(stream, deadline) {
+                return Err(Error::Transport("request head timed out".to_string()));
+            }
+        }
+        let available = reader
+            .fill_buf()
+            .map_err(|error| Error::Transport(format!("head: {error}")))?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() { None } else { Some(line) });
+        }
+        let (take, done) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (index + 1, true),
+            None => (available.len(), false),
+        };
+        if line.len() + take > max {
+            return Err(Error::Wire("request head exceeds the ceiling"));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if done {
+            return Ok(Some(line));
+        }
+    }
+}
+
 /// Read exactly `length` bytes before `deadline`.
 ///
 /// A drip that stays inside a per-read timeout is still bounded by the
@@ -366,6 +405,9 @@ impl BridgeServer {
             }
         };
         let framed = grpc_frame(&bytes);
+        // The read deadline's remainder may be milliseconds after a body that
+        // landed just in time; give the response its own budget.
+        let _ = stream.set_write_timeout(Some(CONNECTION_WAIT));
         let _ = write_http_response(&mut stream, 200, &framed);
         1
     }
@@ -396,12 +438,8 @@ fn read_head<R: BufRead>(
             }
         }
         let remaining = max.saturating_sub(total);
-        let mut raw = Vec::new();
-        let read = reader
-            .by_ref()
-            .take(remaining as u64 + 1)
-            .read_until(b'\n', &mut raw)
-            .map_err(|error| Error::Transport(format!("head: {error}")))?;
+        let raw: Vec<u8> = read_line_before(reader, remaining + 1, guard)?.unwrap_or_default();
+        let read = raw.len();
         if read == 0 {
             if head.is_empty() {
                 return Ok(None);

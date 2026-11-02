@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-3: 22 + 16 + 13 findings | 51 fixed / 0 rejected / 0 open | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-5: 22 + 16 + 13 + 6 + 6 findings | 63 fixed / 0 rejected / 0 open | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,77 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-09 transports - 2026-11-02 (round 5, closing the round-4 findings)
+
+The round-4 verification named two highs and four smaller issues; all six are
+fixed here, each with a test that drives the hostile shape rather than a code
+path.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| R1 | high | an HTTP/2 stream that sent a byte and never ended its body was read with no deadline, pinning its reservation for the life of the process and keeping `serve` from joining (measured: one stalled byte made a valid call on another connection answer 429, and `serve` was still running past a 300 ms deadline) | **fixed**: each `body.data()` await is bounded by the connection deadline as an *inactivity* bound, answering 408 so the `Reservation` drops and the task ends; `a_stalled_stream_releases_the_budget_and_the_connection` |
+| R2 | high | `read_until` loops `fill_buf` inside one call, so a single head line without a newline held the serial bridge past its deadline (measured 5.87 s against 2 s) | **fixed**: `read_line_before` re-arms the deadline before every `fill_buf`; the test now drips one line and starts its clock before the drip |
+| R3 | medium | the response used whatever remained of the read deadline; a body landing at the edge left milliseconds and the write failure was discarded | **fixed**: the response gets a fresh `CONNECTION_WAIT` write budget |
+| R4 | low | `read_frame_before`'s doc claimed the deadline ends a drip, but a blocked read cannot be interrupted without a socket timeout | **fixed**: `TcpTransport::recv` re-arms the socket timeout to the time left before every read, and the doc says a socket caller must do the same |
+| R5 | low | no per-frame write deadline: a reader that stops holds a serial server for bytes × timeout | **fixed**: `send` arms a fresh write budget per frame |
+| R6 | low | `call_many` detached its tasks on a timeout (dropped `JoinHandle`s keep running with a sender clone) | **fixed**: a `JoinSet` aborts them, and results are re-ordered by index so the documented request order holds |
+
+Verified in the same pass: Q1 (4096 idle streams parked in 603 ms, a real call
+answered in 1.6 ms) and Q3 (a 4 KiB drip ended the connection at 2.105 s against
+a 2 s deadline) are closed with measurements.
+
+Residual risks (recorded): quinn buffers up to the flow-control window before the
+frame reader sees it, so the real QUIC buffering ceiling is 256 connections ×
+8 MiB; the QUIC idle timeout is peer-resettable; the bridge answers 4xx with
+unread body bytes.
+
+### R-09 transports - 2026-11-02 (round 4, fix verification at `1ce655a`)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`. It re-read every
+path named in round 3, re-ran the transport suites, and drove ten temporary
+probes (removed) against real sockets. Verdict: Q1 and Q3 are closed **with a
+measurement**; Q2, Q4, Q9 and Q12 are partial; the other seven hold.
+
+| # | Sev | Claim checked | Verdict |
+|---|-----|---------------|---------|
+| Q1 | high | budget follows arrived bytes | **fixed, measured**: 4096 idle streams that sent a 4-byte header each (16 connections, 64 MiB announced) were parked in 603 ms and a real call on a 17th connection was answered in **1.6 ms**. The named test (`quic_round2_tests.rs:20`, four streams) cannot fail without the fix: four streams reserve four 64 KiB steps, 256 KiB of a 256 MiB budget |
+| Q2 | high | head drip bounded by the connection deadline | **partial**: `read_head` re-arms per *line* (`connect.rs:393`), but `read_until` (`connect.rs:403`) loops over `fill_buf` inside one line with the timeout armed once. Measured: **5.87 s** of hold for one 40-byte line at 100 ms/byte against `CONNECTION_WAIT` 2 s; the ceiling is `MAX_HEAD` 16 KiB × the interval (≈8.6 h at 1.9 s/byte) |
+| Q3 | high | one wall deadline per TCP frame | **fixed, measured**: a 4 KiB body dripped at 300 ms/byte with a 2 s `with_timeout` ended the connection at **2.105 s** (served 0); the timeout did not poison the next connection |
+| Q4 | medium | HTTP/2 deadline is inactivity-only | **partial**: it now wraps `connection.accept()` only, but on expiry the loop breaks, stops polling the `Connection`, and the in-flight response is lost. Measured: an 800 ms handler under a 200 ms deadline → the client got `response: stream closed because of a broken pipe` |
+| Q5 | medium | every QUIC reply is bounded | fixed in code (all six early paths call `reply`); no test stalls a receive window |
+| Q6 | medium | `call_many` honours the deadline | fixed in code; untested |
+| Q7 | medium | panic isolation | fixed: CLI loops + QUIC/HTTP/2 `catch_unwind`; `peer.rs` is covered by `serve_connection`'s own catch. No poisoned kernel: `DispatchGuard` restores `dispatching` and the provider during `resume_unwind`, after every job is settled |
+| Q8 | medium | no anonymous off-host QUIC bind | fixed in code; **untested** — the refusal string only exists in `src` |
+| Q9 | low | socket-option failure drops one connection | **partial**: the CLI (`main.rs:738`) and the bridge recover, but `src/bin/peer.rs:158` still ends the process with `?` |
+| Q10 | low | only documented refusal classes | fixed; `the_client_preserves_a_peer_refusal_code` drives it |
+| Q11 | low | tail window documented | fixed (`wire.md:345`) |
+| Q12 | low | budget doc says server-wide | **partial**: `with_inflight_budget` was reworded, `MAX_INFLIGHT_BODY` (`http2.rs:80`) still says "one connection"; no test exercises a shared budget across connections |
+| Q13 | low | exact reservation | fixed: 64 KiB steps keep `Vec` capacity exact |
+
+Remaining defects (round 4):
+
+| # | Sev | Finding | File:line | Missing test |
+|---|-----|---------|-----------|--------------|
+| R1 | high | an HTTP/2 stream that sends one byte and never ends its body is never read with a deadline, so its `Reservation` is held for the life of the process and `serve` can never join it. Measured with `with_inflight_budget(1)`: one stalled 1-byte stream made a valid call **on another connection** answer `rpc/wire` (429) immediately and again 2 s later; `serve()` had not returned after 3 s against a 300 ms deadline. At the default budget two 64 MiB streams on one connection pin the whole 128 MiB server-wide, permanently | `http2.rs:372`, `:311`, `:246` | `a_stalled_stream_releases_the_budget_and_the_connection` |
+| R2 | high | the bridge head drip of Q2, one line, no newline (above) | `connect.rs:393`, `:403` | a single-line drip with the clock started *before* the drip |
+| R3 | medium | the bridge arms its response write with whatever remained of the *read* deadline (`arm_deadline` inside the body loop); a body that lands at 1.99 s of a 2 s deadline leaves milliseconds to write a large 200, and the failure is discarded (`let _ =`) | `connect.rs:314`, `:369` | a body delivered near the deadline still returns a complete 200 |
+| R4 | low | `read_frame_before`'s doc claims the deadline ends a drip; it only observes the deadline *between* reads. Measured: a 200 ms deadline with no socket timeout was still blocked after 2 s. In-tree callers co-arm the socket timeout, so the bound holds, but the API contract is false for a library caller | `mod.rs:403` | a deadline with no socket timeout fails closed |
+| R5 | low | the write side has no per-frame deadline (`write_vectored` loops under a per-call timeout). On this host an idle reader accepted a 62 MiB frame in 705 ms (loopback buffers it), so no stall was demonstrable; on a host with small loopback buffers the hold is `bytes × write_timeout` | `mod.rs:464` | a slow reader cannot keep a serial server past N × the deadline |
+| R6 | low | `call_many` detaches its per-request tasks when the deadline fires (dropped `JoinHandle`s keep running with a sender clone) | `http2.rs:633`, `:652` | the task set is empty after a timed-out `call_many` |
+
+Verified clean this round: h2 reclaims the connection window when a stream that
+was refused before its body is reset (40 × 64 KiB refusals, then a valid call on
+the same connection); the QUIC reservation is proportional to delivered bytes
+and released on every path; no second logical message on any transport.
+
+Residual risks (updated): quinn buffers received data up to the flow-control
+window before `read_frame_before` sees it, so the real QUIC ceiling is
+`MAX_CONNECTIONS` 256 × `CONNECTION_RECEIVE_WINDOW` 8 MiB = 2 GiB and not
+`MAX_INFLIGHT_BODY` 256 MiB (`quic.rs:468` vs `:997`); reaching it costs the peer
+one byte of traffic per byte buffered. The QUIC idle timeout remains
+peer-resettable, the bridge answers 4xx with unread body bytes, and the shm
+straddle/truncated branches remain fuzzer-only.
 
 ### R-09 transports - 2026-11-02 (round 3, fix verification)
 

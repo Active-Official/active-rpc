@@ -155,7 +155,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // A silent client must not hold this serial loop forever: the socket
         // carries a read and write deadline, so a stalled connection ends and the
         // next peer is accepted.
-        let transport = TcpTransport::with_timeout(stream, CONNECTION_WAIT)?;
+        // A socket that was reset between accept and here is this connection;
+        // the peer keeps serving.
+        let transport = match TcpTransport::with_timeout(stream, CONNECTION_WAIT) {
+            Ok(transport) => transport,
+            Err(_) => continue,
+        };
         let handled = serve_connection(transport, |envelope| {
             handle(
                 &agent,

@@ -273,6 +273,11 @@ impl Transport for TcpTransport {
             ));
         }
         let bytes = envelope.encode()?;
+        // A reader that stops must not hold a serial server for the whole
+        // message: each frame gets a fresh write budget.
+        if let Some(wait) = self.frame_deadline {
+            let _ = self.stream.get_ref().set_write_timeout(Some(wait));
+        }
         if let Err(error) = write_frame(self.stream.get_mut(), &bytes) {
             // The header or the body (or part of either) may be on the wire, so
             // the peer's read position no longer matches a frame boundary.
@@ -292,12 +297,18 @@ impl Transport for TcpTransport {
         if let Some(envelope) = self.inbox.pop_front() {
             return Ok(Some(envelope));
         }
-        // One deadline for the whole frame: the socket timeout only bounds a
-        // single read, so a peer that sends a byte just inside it would keep a
-        // frame alive forever.
+        // One deadline for the whole frame, and the socket timeout is re-armed
+        // to the time left before each read: a blocked `read` would otherwise
+        // outlive the deadline by its own timeout.
         let deadline = self
             .frame_deadline
             .map(|wait| std::time::Instant::now() + wait);
+        if let Some(deadline) = deadline {
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(std::time::Duration::from_millis(1));
+            let _ = self.stream.get_ref().set_read_timeout(Some(remaining));
+        }
         let Some(body) = read_frame_before(&mut self.stream, &self.limits, deadline)? else {
             return Ok(None);
         };
@@ -399,7 +410,9 @@ pub fn read_frame<R: Read>(reader: &mut R, limits: &WireLimits) -> Result<Option
 ///
 /// A per-read socket timeout is not a frame bound: a peer that sends one byte
 /// just inside it keeps the read alive forever. The deadline is checked between
-/// reads, so a drip ends on schedule.
+/// reads, so a drip ends on schedule as long as no read is already blocked; a
+/// caller reading from a socket must also arm the socket timeout to the time
+/// left, which TcpTransport does.
 pub fn read_frame_before<R: Read>(
     reader: &mut R,
     limits: &WireLimits,

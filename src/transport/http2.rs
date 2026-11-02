@@ -300,8 +300,16 @@ where
         let served = Arc::clone(&served);
         let inflight = Arc::clone(&inflight);
         streams.spawn(async move {
-            let handled =
-                handle_stream(request, respond, handler, limits, inflight, inflight_budget).await?;
+            let handled = handle_stream(
+                request,
+                respond,
+                handler,
+                limits,
+                inflight,
+                inflight_budget,
+                connection_deadline,
+            )
+            .await?;
             if handled {
                 served.fetch_add(1, Ordering::Relaxed);
             }
@@ -323,6 +331,7 @@ async fn handle_stream<H>(
     limits: WireLimits,
     inflight: Arc<AtomicUsize>,
     inflight_budget: usize,
+    connection_deadline: std::time::Duration,
 ) -> Result<bool>
 where
     H: FnMut(Envelope) -> Envelope,
@@ -369,7 +378,16 @@ where
     // The caller's wire ceiling bounds the body; `MAX_BODY` is the hard cap.
     let ceiling = limits.max_bytes.min(MAX_BODY);
     loop {
-        match body.data().await {
+        // Inactivity bound per chunk: a peer that sends steadily is never cut
+        // off, while one that stops leaves its reservation (and this connection
+        // task) pinned forever.
+        let next = match tokio::time::timeout(connection_deadline, body.data()).await {
+            Ok(next) => next,
+            Err(_) => {
+                return respond_status(&mut respond, StatusCode::REQUEST_TIMEOUT, b"rpc/transport")
+            }
+        };
+        match next {
             Some(Ok(chunk)) => {
                 if bytes.len() + chunk.len() > ceiling {
                     return respond_status(
@@ -625,41 +643,62 @@ impl Http2Client {
         let sender = self.sender.clone();
         let limits = self.limits;
         let deadline = self.deadline;
+        let count = payloads.len();
         let responses = self.runtime.block_on(async move {
             let exchange = async move {
-                let mut tasks = Vec::with_capacity(payloads.len());
-                for body in payloads {
+                // A `JoinSet` aborts its tasks when it is dropped, so a deadline
+                // does not leave streams running behind the caller. Completion
+                // order is not request order, so each task carries its index.
+                let mut tasks = tokio::task::JoinSet::new();
+                for (index, body) in payloads.into_iter().enumerate() {
                     let mut sender = sender.clone();
-                    tasks.push(tokio::spawn(async move {
-                        let request = Request::builder()
-                            .method(Method::POST)
-                            .uri(PATH)
-                            .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
-                            .body(())
-                            .map_err(|error| Error::Transport(format!("request: {error}")))?;
-                        let (response, mut send) = sender
-                            .send_request(request, false)
-                            .map_err(|error| Error::Transport(format!("send header: {error}")))?;
-                        send.send_data(Bytes::from(body), true)
-                            .map_err(|error| Error::Transport(format!("send body: {error}")))?;
-                        let response = response
-                            .await
-                            .map_err(|error| Error::Transport(format!("response: {error}")))?;
-                        read_response(response, limits.max_bytes.min(MAX_BODY)).await
-                    }));
+                    tasks.spawn(async move {
+                        let decoded = async {
+                            let request = Request::builder()
+                                .method(Method::POST)
+                                .uri(PATH)
+                                .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
+                                .body(())
+                                .map_err(|error| Error::Transport(format!("request: {error}")))?;
+                            let (response, mut send) =
+                                sender.send_request(request, false).map_err(|error| {
+                                    Error::Transport(format!("send header: {error}"))
+                                })?;
+                            send.send_data(Bytes::from(body), true)
+                                .map_err(|error| Error::Transport(format!("send body: {error}")))?;
+                            let response = response
+                                .await
+                                .map_err(|error| Error::Transport(format!("response: {error}")))?;
+                            let (status, body) =
+                                read_response(response, limits.max_bytes.min(MAX_BODY)).await?;
+                            if status != StatusCode::OK {
+                                Err(refusal(&body))
+                            } else {
+                                Envelope::decode_with(&body, limits)
+                            }
+                        };
+                        (index, decoded.await)
+                    });
                 }
-                let mut out = Vec::with_capacity(tasks.len());
-                for task in tasks {
-                    let (status, body) = task
-                        .await
-                        .map_err(|error| Error::Transport(format!("stream task: {error}")))??;
-                    if status != StatusCode::OK {
-                        out.push(Err(refusal(&body)));
-                    } else {
-                        out.push(Envelope::decode_with(&body, limits));
+                let mut out: Vec<Option<Result<Envelope>>> = (0..count).map(|_| None).collect();
+                while let Some(task) = tasks.join_next().await {
+                    let (index, decoded) =
+                        task.map_err(|error| Error::Transport(format!("stream task: {error}")))?;
+                    if let Some(slot) = out.get_mut(index) {
+                        *slot = Some(decoded);
                     }
                 }
-                Ok::<_, Error>(out)
+                Ok::<_, Error>(
+                    out.into_iter()
+                        .map(|slot| {
+                            slot.unwrap_or_else(|| {
+                                Err(Error::Transport(
+                                    "a stream produced no response".to_string(),
+                                ))
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
             };
             match deadline {
                 Some(limit) => tokio::time::timeout(limit, exchange)
