@@ -79,8 +79,53 @@ pub fn redact_value(value: Value) -> Value {
                 .collect(),
         ),
         Value::Text(text) if text.contains(SECRET_MARKER) => Value::Secret,
+        // A module is the only variant that carries arbitrary bytes, so it is
+        // the only one that can smuggle a secret node. Rewriting beats passing
+        // it through: a redacting caller must not receive the original bytes.
+        Value::Module(bytes) => match redact_module(&bytes) {
+            Ok(redacted) => Value::Module(redacted),
+            // A module that cannot be decoded has no structure to redact, and
+            // handing the bytes back would be the leak this function exists to
+            // prevent.
+            Err(_) => Value::Secret,
+        },
         other => other,
     }
+}
+
+/// Rewrite every secret node of an Active Infinity module to the marker.
+///
+/// One implementation for [`redact_value`] and the domain provider: two would
+/// drift, and the one that drifted would be the leak.
+pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut module =
+        active_infinity::decode(bytes).map_err(|error| Error::Payload(error.code().to_string()))?;
+    for index in 0..module.node_count() {
+        let id = active_infinity::NodeId(index as u32);
+        let is_secret = module.get(id).map(|node| node.is_secret()).unwrap_or(false);
+        if is_secret {
+            *module
+                .node_mut(id)
+                .map_err(|error| Error::Payload(error.code().to_string()))? =
+                active_infinity::Inode::Str(SECRET_MARKER.to_string());
+        }
+    }
+    let redacted = active_infinity::encode(&module)
+        .map_err(|error| Error::Payload(error.code().to_string()))?;
+    check_module_payload(&redacted)?;
+    Ok(redacted)
+}
+
+/// True when a module holds a node marked secret.
+fn module_has_secret(bytes: &[u8]) -> Result<bool> {
+    let module =
+        active_infinity::decode(bytes).map_err(|error| Error::Payload(error.code().to_string()))?;
+    Ok((0..module.node_count()).any(|index| {
+        module
+            .get(active_infinity::NodeId(index as u32))
+            .map(|node| node.is_secret())
+            .unwrap_or(false)
+    }))
 }
 
 /// Validate an outgoing module payload before it is handed to a transport or a
@@ -105,6 +150,24 @@ pub fn assert_no_secret_material(value: &Value) -> Result<()> {
         }),
         Value::List(items) => items.iter().try_for_each(assert_no_secret_material),
         Value::Map(entries) => entries.values().try_for_each(assert_no_secret_material),
-        _ => Ok(()),
+        // A module is bytes: it is the one variant that can carry a secret
+        // without the value model noticing, so it is decoded and inspected.
+        Value::Module(bytes) => {
+            if module_has_secret(bytes)? {
+                return Err(Error::Provider {
+                    code: "rpc/secret-material".to_string(),
+                });
+            }
+            Ok(())
+        }
+        // Every other variant is a scalar or a label with no room for secret
+        // bytes, and a new variant has to be considered here rather than
+        // inheriting this arm silently.
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Text(_)
+        | Value::Path(_) => Ok(()),
     }
 }

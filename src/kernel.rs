@@ -1016,6 +1016,12 @@ impl Agent {
             seal: None,
         };
         record.seal_with(&key);
+        // The record must be one this crate can read back. Exporting something
+        // the parser refuses would burn the grant (reserved below) and the
+        // record id for an artifact that cannot be restored, so the round trip
+        // happens before either: an unexportable capability fails here with its
+        // authority intact.
+        crate::persistence::CapabilityRecord::from_json(&record.to_json())?;
         Ok(record)
     }
 
@@ -1034,6 +1040,34 @@ impl Agent {
         record: &crate::persistence::CapabilityRecord,
         peer: &crate::identity::AdmittedIdentity,
     ) -> Result<CapHandle> {
+        self.restore_capability_with(record, peer, None)
+    }
+
+    /// Restore a durable capability, checking a durable "already restored" set.
+    ///
+    /// [`Agent::restore_capability`] remembers restored record ids *in this
+    /// process*: a restart, or a second kernel in the same deployment, would
+    /// restore the same sealed record again and mint a fresh grant for the full
+    /// recorded budget. A deployment that stores records passes a
+    /// [`crate::persistence::RecordStore`] here, so the record is single-use
+    /// across kernels and restarts.
+    ///
+    /// The store is marked only after the mint succeeds; if marking fails the
+    /// minted capability is revoked and the refusal returned, so a store that
+    /// cannot remember never leaves a usable grant behind.
+    pub fn restore_capability_with(
+        &self,
+        record: &crate::persistence::CapabilityRecord,
+        peer: &crate::identity::AdmittedIdentity,
+        store: Option<&mut dyn crate::persistence::RecordStore>,
+    ) -> Result<CapHandle> {
+        if let Some(store) = store.as_deref() {
+            if store.is_restored(&record.record_id) {
+                return Err(Error::persistence(
+                    "the record was already restored by this deployment",
+                ));
+            }
+        }
         if !self.durable_capabilities_allowed() {
             return Err(Error::persistence(
                 "durable capabilities are not enabled for this agent",
@@ -1144,6 +1178,14 @@ impl Agent {
         // must tombstone the same record id the credential carries.
         if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {
             live.record_id = record.record_id;
+        }
+        if let Some(store) = store {
+            if let Err(error) = store.mark_restored(&record.record_id) {
+                // The store could not remember the restore, so the grant must
+                // not outlive the refusal: revoke it and report.
+                let _ = self.revoke(&restored);
+                return Err(error);
+            }
         }
         Ok(restored)
     }

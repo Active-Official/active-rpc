@@ -19,6 +19,63 @@ use crate::budget::Budget;
 use crate::cap::{CapAttrs, CapPersistence, ToolPolicy};
 use crate::{Error, Result};
 
+/// A durable home for the "already restored" set.
+///
+/// [`crate::Agent::restore_capability`] remembers restored record ids only in
+/// the process that restored them. A record is a bearer credential whose seal is
+/// deployment-wide, so without a durable set a restart (or a second kernel)
+/// restores the same record again and mints a second grant for the full recorded
+/// budget. A deployment with persistent storage implements this over it and
+/// calls [`crate::Agent::restore_capability_with`].
+///
+/// Both methods are fallible in spirit: `is_restored` answers from the store, and
+/// `mark_restored` must fail closed — a store that cannot write must return an
+/// error, because the restore is then refused and the minted grant revoked.
+pub trait RecordStore {
+    /// True when this record id was restored by any kernel sharing the store.
+    fn is_restored(&self, record_id: &[u8; 32]) -> bool;
+
+    /// Remember a restore, or refuse when the store cannot.
+    fn mark_restored(&mut self, record_id: &[u8; 32]) -> Result<()>;
+}
+
+/// An in-memory [`RecordStore`], for tests and single-process deployments.
+///
+/// It buys nothing over the kernel's own set; it exists so an embedder can share
+/// one set between several agents in one process.
+#[derive(Debug, Default)]
+pub struct MemoryRecordStore {
+    ids: BTreeSet<[u8; 32]>,
+}
+
+impl MemoryRecordStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of record ids remembered.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// True when the store remembers nothing.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+impl RecordStore for MemoryRecordStore {
+    fn is_restored(&self, record_id: &[u8; 32]) -> bool {
+        self.ids.contains(record_id)
+    }
+
+    fn mark_restored(&mut self, record_id: &[u8; 32]) -> Result<()> {
+        self.ids.insert(*record_id);
+        Ok(())
+    }
+}
+
 /// Format tag of a capability record.
 pub const RECORD_FORMAT: &str = "active-rpc/capability-record/1";
 
@@ -240,7 +297,12 @@ impl CapabilityRecord {
             max_array_len: number("array_len")?,
             max_value_size: number("value_size")?,
         };
-        budget.check()?;
+        // A budget the parser refuses is a malformed record, not a bad argument:
+        // the whole durable surface speaks `rpc/persistence`, and `restore` maps
+        // the same check the same way.
+        budget
+            .check()
+            .map_err(|_| Error::persistence("the record's budget is invalid"))?;
         let read_only = value
             .get("read_only")
             .and_then(Json::as_bool)
@@ -351,12 +413,19 @@ impl CapabilityRecord {
         })
     }
 
-    /// The attributes a restore mints with.
+    /// The attributes a *restore* mints with.
+    ///
+    /// Crate-internal on purpose: this converts a parsed record into authority
+    /// attributes without looking at the seal, so exposing it would publish a
+    /// bridge that skips authentication (a record with `seal: null` would mint).
+    /// The audited path is [`crate::Agent::restore_capability`], which verifies
+    /// the seal, the tombstone and the binding first; an embedder that needs the
+    /// attributes should go through it.
     ///
     /// `ttl_ms` is the remaining lifetime, so the restored capability keeps the
     /// original absolute deadline. Persistence is `Durable`: this is a durable
     /// record by construction.
-    pub fn attrs(&self, ttl_ms: Option<u64>) -> CapAttrs {
+    pub(crate) fn attrs(&self, ttl_ms: Option<u64>) -> CapAttrs {
         let refs: Vec<&str> = self.methods.iter().map(String::as_str).collect();
         let mut attrs = CapAttrs::new(&refs).with_budget(self.budget);
         attrs.read_only = self.read_only;

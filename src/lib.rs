@@ -82,7 +82,7 @@ pub use identity::{
 };
 pub use kernel::{Agent, Event, Metrics, PromiseHandle, Provider};
 pub use lane::{Lane, LaneId};
-pub use persistence::CapabilityRecord;
+pub use persistence::{CapabilityRecord, MemoryRecordStore, RecordStore};
 pub use promise::{PromiseId, PromiseState};
 pub use receipts::{Receipt, ReceiptLog};
 pub use replay::{Op, ReplayPackage, Trace};

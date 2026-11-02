@@ -55,7 +55,14 @@ capability id at rest (it is a bearer token).
   verifies under the deployment key, it names the peer it was issued to, and it
   is the only live copy of that credential. A revoked capability's record id is
   tombstoned; a deployment replays its kill list at startup, because tombstones
-  are memory-only (ADR-0010).
+  are memory-only (ADR-0010). The restored set is memory-only too, so a
+  deployment that stores records passes a `RecordStore` to
+  `restore_capability_with`, which makes a record single-use across kernels and
+  restarts; without one the record is single-use per process.
+- `CapabilityRecord::from_json` is a parser, not a verifier: it accepts a record
+  with no seal. `restore_capability` is the only path that turns a record into
+  authority, and it checks the seal, the tombstone, the binding and the clock
+  first. The attribute bridge it uses is crate-internal for that reason.
 - A capability's budget bounds its whole subtree even after the parent handle is
   dropped: an ancestor's record and meter live while a derived capability can
   still call through it.

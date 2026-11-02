@@ -561,10 +561,15 @@ fn the_registry_and_the_lineage_are_bounded() {
     assert_eq!(error.code(), "rpc/attenuation-escalation", "{error}");
 }
 
-/// `CapabilityRecord::attrs` is the natural bridge to `mint`; it must carry the
-/// binding it describes.
+/// A restore carries the binding it describes.
+///
+/// `CapabilityRecord::attrs` used to be public, which published a bridge that
+/// turned an unauthenticated record into mintable authority (the seal is checked
+/// by `restore_capability`, not by the parser). The audited path is the restore
+/// itself, so this test drives that and compares the restored capability with
+/// the record.
 #[test]
-fn record_attrs_preserves_the_binding() {
+fn a_restore_preserves_the_binding() {
     let (agent, provider) = durable_agent();
     let owner = admitted(b"owner");
     let mut attrs = CapAttrs::new(&["echo"]);
@@ -573,9 +578,12 @@ fn record_attrs_preserves_the_binding() {
         .mint_bound(&owner, provider, 0, attrs)
         .expect("bound cap");
     let record = agent.export_capability(&cap).expect("export");
-    let minted = record.attrs(Some(1_000));
+    // One live capability per credential: releasing the handle frees the grant
+    // for the restore (a revocation would tombstone the record instead).
+    drop(cap);
+    let restored = agent.restore_capability(&record, &owner).expect("restore");
     assert_eq!(
-        minted.bound_to,
+        agent.cap_attrs(&restored).expect("attrs").bound_to,
         Some(PeerIdentity::from_certificate(b"owner").fingerprint())
     );
 }

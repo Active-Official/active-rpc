@@ -29,7 +29,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-13 | receipts | `src/receipts.rs` | rounds 1-3: 13 + 16 + 19 findings | 48 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | round 1: 1 critical + 3 highs + 5 mediums + 6 lows fixed | 15 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | round 1: 4 highs + 9 mediums + 6 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | pending | — | — |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | round 1: 2 mediums + 2 lows fixed | 4 fixed / 0 rejected / 0 open (1 documented residual: no store wired by default) | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | pending | — | — |
 | R-18 | CLI | `cli/active-rpc-cli/**` | pending | — | — |
 | R-19 | control-plane | `control-plane/**` | pending | — | — |
@@ -194,6 +194,29 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-16 security helpers - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `179c3ff`,
+with probes. No critical. Two mediums and two lows; the reviewer also ran a
+second independent pass and recorded four refuted hypotheses, which is why the
+report is short.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| S1 | medium | `CapabilityRecord::attrs` was public and unauthenticated: `from_json` never checks a seal, so a record with `seal: null` (or an edited one) could be turned into `CapAttrs` and minted, bypassing the tombstone and replay protection. The crate's own test advertised the bridge | **fixed**: `attrs` is `pub(crate)`; the audited path is `restore_capability` (seal, tombstone, binding, clock), and SECURITY.md says the parser is not a verifier; `an_unsealed_record_parses_but_never_restores` |
+| S2 | medium | the "already restored" set was per process, so a restart (or a second kernel) restored the same sealed record again and re-funded the full budget | **fixed**: `RecordStore` + `MemoryRecordStore`, `Agent::restore_capability_with`; the store is marked after the mint and a store that cannot write refuses the restore and revokes the grant; `a_record_restores_once_across_kernels_sharing_a_store`, `a_store_that_cannot_remember_refuses_and_revokes_the_grant` |
+| S3 | low | `assert_no_secret_material` and `redact_value` passed `Value::Module` through: a module is the one variant that can carry a secret | **fixed**: both decode the module, one shared `security::redact_module` (also used by the domain provider), and the catch-all arm is now an explicit match; `a_module_that_carries_a_secret_is_refused_and_redacts` |
+| S4 | low | `export_capability` could emit a record the parser refuses (path scope over 1 KiB, provider name over 128 bytes), after reserving the grant and consuming the record id | **fixed**: the record round-trips through `from_json` before the reserve; `an_export_that_would_be_unreadable_is_refused_before_it_costs_anything` |
+| — | low | the parser reported a bad record budget as `rpc/invalid-argument` while restore said `rpc/persistence` | **fixed**: the parser speaks the durable vocabulary; `a_record_with_a_zero_ceiling_is_a_persistence_refusal` |
+
+Recorded residual: a deployment still has to *wire* a `RecordStore` (the CLI has
+no durable store), so the shipped default is single-use **per process**. The
+registers carry it as the deployment half of RPC-5.
+
+Gate: `cargo test --all-features` 591 passed, 0 failed across 67 suites;
+`--no-default-features` 531 passed, 0 failed; clippy, fmt and
+`cargo doc -D warnings` clean on both feature sets; control plane 30, CLI 17.
 
 ### R-15 observability - 2026-11-01 (round 1)
 

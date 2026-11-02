@@ -78,8 +78,19 @@ resurrection:
   a copy is live, because revocation walks ids and could not reach an
   independent copy; and one after the copy is dropped, because the record is
   spent. A kernel remembers the ids it restored, so dropping the handle does
-  not make the credential restorable again in that process. A restart starts
-  with an empty set, which is why the kill list has to be replayed.
+  not make the credential restorable again **in that process**. A restart
+  starts with an empty set, which is why the kill list has to be replayed — and
+  why the "already restored" set has to be durable too: the seal key is
+  deployment-wide, so a second kernel (or a restart) would otherwise restore the
+  same record again and mint a fresh grant for the full recorded budget.
+
+  `Agent::restore_capability_with(record, peer, Some(&mut store))` takes a
+  [`crate::persistence::RecordStore`]: the deployment keeps the restored ids next
+  to its kill list, and a record is single-use across processes. The store is
+  marked only after the mint succeeds; a store that cannot write refuses the
+  restore and the minted capability is revoked. Without a store the record is a
+  single-use token **per process**, which is the fail-closed default for a
+  deployment that has not built persistent storage yet.
 
 Restore is refused (`rpc/persistence`) unless the agent enabled durable
 capabilities, a seal key is configured and the seal verifies, and the provider

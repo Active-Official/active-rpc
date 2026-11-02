@@ -706,20 +706,10 @@ fn tainted_labels(module: &InfinityModule) -> BTreeSet<String> {
 /// structure survives, the material does not. A caller that needs the raw module
 /// moves it through a transport payload, not through a capability result.
 fn redacted_module_bytes(module: &InfinityModule) -> Result<Vec<u8>> {
-    let mut redacted = module.clone();
-    for index in 0..redacted.node_count() {
-        let id = NodeId(index as u32);
-        let is_secret = redacted
-            .get(id)
-            .map(|node| node.is_secret())
-            .unwrap_or(false);
-        if is_secret {
-            *redacted.node_mut(id)? = Inode::Str(security::SECRET_MARKER.to_string());
-        }
-    }
-    let bytes = encode(&redacted).map_err(|error| Error::Payload(error.code().to_string()))?;
-    security::check_module_payload(&bytes)?;
-    Ok(bytes)
+    // One implementation, shared with the security helpers: a second copy of
+    // the redactor would drift, and the one that drifted would be the leak.
+    let bytes = encode(module).map_err(|error| Error::Payload(error.code().to_string()))?;
+    security::redact_module(&bytes)
 }
 
 /// Node ids that are secrets or contain one, transitively.
