@@ -626,3 +626,48 @@ fn a_scoped_patch_reply_carries_no_provenance() {
         "the scoped patch reply carried provenance"
     );
 }
+
+/// A binding is a second name for a node. `value_paths` reports that name, so an
+/// outside node bound under an in-scope-looking name would pass the scope check
+/// unless the name is required to resolve back to the node.
+#[test]
+fn a_binding_cannot_launder_an_outside_node_into_the_scope() {
+    let mut module = InfinityModule::new();
+    let outside = module.push(Inode::Str(OUTSIDE.to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("y".to_string(), outside)],
+    });
+    let other = module.push(Inode::Str("other".to_string()));
+    let ops = module.push(Inode::Table {
+        fields: vec![("secret".to_string(), other)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app), ("ops".to_string(), ops)],
+    });
+    module.set_root(Some(root));
+    // The value inside `app.y` is also reachable as an in-scope-looking binding.
+    module.bind("app.sneaky", outside);
+
+    let agent = Agent::with_secret([0x85; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["evaluate", "why", "subgraph"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("binding", Budget::default())
+        .expect("lane");
+    let fixture = Fixture { agent };
+
+    // The bound name does not resolve back to its node, so the closure is out of
+    // scope and every read is refused.
+    for method in ["evaluate", "why", "subgraph"] {
+        let result = call(&fixture, lane, &cap, method, vec![path("app.y")]);
+        assert_eq!(
+            result.as_ref().err().map(active_rpc::Error::code),
+            Some("rpc/path-not-granted"),
+            "{method}: {result:?}"
+        );
+    }
+}

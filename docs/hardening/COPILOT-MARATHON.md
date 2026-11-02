@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-4: 12 + 8 + 9 + 8 findings | 37 fixed / 0 rejected / 0 open (1 residual: binding names in `value_paths`) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-5: 12 + 8 + 9 + 8 + 1 findings | 38 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,23 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-07 domain operations - 2026-11-02 (round 5, closing round 4's verification)
+
+The round-4 verification confirmed T1-T8 and found one high: `value_paths`
+reports a *binding* name for a bound node, so an outside value bound as
+`app.sneaky` passed the scope check and a scoped `evaluate`/`why`/`subgraph`
+returned it.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| U1 | high | a binding laundered an outside node into the scope: the reported path looked in-scope but did not resolve back to the node | **fixed**: `in_scope_path` requires the path to resolve to the same node, and a scoped cone drops bindings whose name or value is outside it; `a_binding_cannot_launder_an_outside_node_into_the_scope` |
+
+Verified in the same pass: promise `Path` arguments are re-checked at dispatch,
+an interpolated secret is fail-closed, an unscoped subgraph keeps annotations and
+provenance, and the scoped patch cone strips them.
+
+Gate: `scripts/local_gate.sh` green; all-features 717.
 
 ### R-07 domain operations - 2026-11-02 (round 4, closing round 3's verification)
 

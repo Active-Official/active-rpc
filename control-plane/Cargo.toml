@@ -10,7 +10,7 @@ publish = false
 [workspace]
 
 [dependencies]
-active-infinity = { version = "2.1.0", features = ["active-core", "json"] }
+active-infinity = { version = "2.3.0", features = ["active-core", "json"] }
 active-rpc = { path = "..", version = "2.3.0" }
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"

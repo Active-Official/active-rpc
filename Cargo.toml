@@ -30,7 +30,7 @@ http2 = ["dep:h2", "dep:http", "dep:bytes", "dep:tokio"]
 wasm-tools = ["dep:wasmi"]
 
 [dependencies]
-active-infinity = "2.1.0"
+active-infinity = "2.3.0"
 active-core = { version = "1.4.0" }
 thiserror = "1.0"
 blake3 = "1.5"

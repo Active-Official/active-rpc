@@ -274,16 +274,14 @@ impl ModuleProvider {
             "subgraph" => {
                 check_node_budget(&slot.module, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
-                let mut scoped = false;
                 if let Some(scope) = &call.path_scope {
                     let (outside, environment) = scope_closure(&slot.module, node, scope);
                     if outside || environment {
                         return Err(Error::PathNotGranted(path));
                     }
-                    scoped = true;
                 }
                 let mut sub = restrict(&slot.module, node)?;
-                if scoped {
+                if let Some(scope) = &call.path_scope {
                     // A cone reply is the subtree's data. Provenance (producer,
                     // entries and the parent content address) describes the whole
                     // module, and an annotation's intent or constraint source is
@@ -291,6 +289,7 @@ impl ModuleProvider {
                     // the subtree.
                     sub.set_provenance(None);
                     sub.clear_annotations();
+                    keep_scoped_bindings(&mut sub, node, scope);
                 }
                 let bytes = redacted_module_bytes(&sub)?;
                 check_wall_budget(started, call)?;
@@ -364,11 +363,12 @@ impl ModuleProvider {
                     // a scoped writer must not receive the rest of the module
                     // back, and the bytes stay bounded by the write.
                     let mut cone = restrict(&patched, node)?;
-                    if call.path_scope.is_some() {
+                    if let Some(scope) = &call.path_scope {
                         // The same rule as `subgraph`: a scoped cone reply is the
                         // subtree's data, not the module's history.
                         cone.set_provenance(None);
                         cone.clear_annotations();
+                        keep_scoped_bindings(&mut cone, node, scope);
                     }
                     let bytes = redacted_module_bytes(&cone)?;
                     (patched, bytes)
@@ -835,6 +835,28 @@ fn immutable_node(module: &InfinityModule, node: NodeId) -> bool {
             .any(|id| immutable.contains(id))
 }
 
+/// Drop bindings whose name or value is outside the scope.
+///
+/// A binding is a second name for a node. A cone that carries one lets the
+/// receiver address data by a name the scope never granted, and `value_paths`
+/// would then report that name for the node.
+fn keep_scoped_bindings(module: &mut InfinityModule, node: NodeId, scope: &str) {
+    let inside: BTreeSet<NodeId> = transitive(module, node, true)
+        .into_iter()
+        .chain(std::iter::once(node))
+        .collect();
+    let bindings: Vec<(String, NodeId)> = module
+        .bindings()
+        .iter()
+        .filter(|(name, id)| inside.contains(id) && crate::cap::is_path_prefix(scope, name))
+        .cloned()
+        .collect();
+    module.clear_bindings();
+    for (name, id) in bindings {
+        module.bind(name, id);
+    }
+}
+
 /// True when every node in `ids` is named by a path inside `scope`.
 fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &str) -> bool {
     if ids.is_empty() {
@@ -842,9 +864,19 @@ fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &s
     }
     let paths = active_infinity::interop::value_paths(module);
     ids.iter().all(|id| match paths.get(id) {
-        Some(path) => crate::cap::is_path_prefix(scope, path),
+        Some(path) => in_scope_path(module, *id, path, scope),
         None => true,
     })
+}
+
+/// True when `path` is inside `scope` *and* still resolves to `id`.
+///
+/// `value_paths` reports a binding name for a node that has one, so a binding can
+/// present an outside node under an in-scope-looking name. A name that does not
+/// resolve back is not confinement.
+fn in_scope_path(module: &InfinityModule, id: NodeId, path: &str, scope: &str) -> bool {
+    crate::cap::is_path_prefix(scope, path)
+        && active_infinity::interop::resolve_path(module, path) == Some(id)
 }
 
 /// Whether a scoped read closure reaches a node named outside `scope`, and
@@ -879,7 +911,7 @@ fn scope_closure(module: &InfinityModule, node: NodeId, scope: &str) -> (bool, b
         .any(|id| matches!(module.get(*id), Some(Inode::Env { .. })));
     let paths = active_infinity::interop::value_paths(module);
     let outside = closure.iter().any(|id| match paths.get(id) {
-        Some(path) => !crate::cap::is_path_prefix(scope, path),
+        Some(path) => !in_scope_path(module, *id, path, scope),
         // A node no name reaches still travels in the cone: a floating value is
         // out of scope by construction.
         None => true,
