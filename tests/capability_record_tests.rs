@@ -67,6 +67,44 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle) {
 }
 
 #[test]
+fn export_and_restore_are_on_the_trace() {
+    // R-06: an export spends a grant and a restore mints authority from a
+    // sealed record. Both are events of their own, so an operator reading the
+    // tape can tell where a capability came from.
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    let original = cap.id();
+    // One live capability per credential: release the source handle before the
+    // restore, exactly as the round-trip test does.
+    drop(cap);
+    let owner = admitted(b"durable-owner");
+    let restored = agent.restore_capability(&record, &owner).expect("restore");
+
+    let trace = agent.trace();
+    let names: Vec<&str> = trace.iter().map(|event| event.event()).collect();
+    let exported = names
+        .iter()
+        .position(|name| *name == "cap.exported")
+        .expect("the export is on the tape");
+    let minted = names
+        .iter()
+        .position(|name| *name == "cap.minted")
+        .expect("the restore mints");
+    assert!(
+        names[minted + 1..].contains(&"cap.restored"),
+        "the restore is on the tape: {names:?}"
+    );
+    // The restored capability's correlation id travels with both events, and
+    // the raw ids never do.
+    let json = agent.trace_json();
+    assert!(json.contains("\"event\":\"cap.exported\""));
+    assert!(json.contains("\"event\":\"cap.restored\""));
+    assert!(!json.contains(&restored.id().hex()));
+    assert!(!json.contains(&original.hex()));
+    assert_eq!(trace[exported].event(), "cap.exported");
+}
+
+#[test]
 fn a_durable_capability_round_trips_through_a_record() {
     let (agent, _provider, cap) = durable_agent();
     let record = agent.export_capability(&cap).expect("export");

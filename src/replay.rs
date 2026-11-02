@@ -865,6 +865,14 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             event: "cap.expired".into(),
             cap: ordinal(*cap),
         },
+        Event::CapExported(cap) => Trace {
+            event: "cap.exported".into(),
+            cap: ordinal(*cap),
+        },
+        Event::CapRestored(cap) => Trace {
+            event: "cap.restored".into(),
+            cap: ordinal(*cap),
+        },
         Event::CapIntroduced { cap, fingerprint } => Trace {
             // A 128-bit prefix of the peer's public fingerprint: two
             // introductions to different peers must not compare equal, and a

@@ -87,6 +87,8 @@ that would violate one stops and needs an ADR.
 | The MCP handshake hangs forever | `initialize` and `tools/list` share a 5 s deadline (`handshake_within` for an explicit one); an already-expired deadline refuses before the frame leaves | `tool::McpSession::handshake` |
 | A prefix allowlist rule is a command line | an argument admitted only by a `*` rule may not contain shell syntax; the adapter documents prefix rules as unconfined and refuses the common escape | `tool::LocalProcess::permitted_by_prefix_only` |
 | A tool's output streams are mislabelled | each reader thread tags its stream, so `stdout` and `stderr` cannot swap when both pipes fill | `LocalProcess::invoke` |
+| A narrow lane sweeps the registry in one message | one message carries at most `MAX_CAPS_PER_MESSAGE = 1 024` handles; the ceiling is fixed, independent of a lane's budget, and duplicates are refused before any record is looked up | `Kernel::send`, `kernel::MAX_CAPS_PER_MESSAGE` |
+| A provider-local object number reads as authority | `object` is chosen by the provider that also serves it, and a capability names exactly one provider, so an object number means nothing across providers | `CapRecord`, `Provider::invoke` |
 
 ## 4. Non-goals
 
@@ -101,6 +103,14 @@ that would violate one stops and needs an ADR.
 - **Protection from a malicious provider.** A provider runs in the agent's own
   process and can do anything the process can. Tools are sandboxed at the
   adapter level (no shell, scrubbed environment, allowlists), not by the kernel.
+- **Pre-emption of a provider's own loop.** `max_wall_ms` binds every adapter
+  that can measure time (local process, HTTP, MCP, WASM fuel, the domain
+  evaluator), and `Call::budget` hands the ceiling to the provider. A custom
+  `Provider::invoke` runs on the dispatch thread and is not preempted: one that
+  loops forever hangs that thread, and stopping it would need a thread per call
+  or an interpreter. A provider is trusted code in the agent's process; an
+  untrusted implementation belongs behind a tool adapter, which enforces the
+  ceiling.
 
 ## 5. Verification
 

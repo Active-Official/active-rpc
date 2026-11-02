@@ -51,6 +51,8 @@ fn every_event(cap: CapId) -> Vec<Event> {
         Event::CapDropped(cap),
         Event::CapRevoked(cap),
         Event::CapExpired(cap),
+        Event::CapExported(cap),
+        Event::CapRestored(cap),
         Event::CapIntroduced {
             cap,
             fingerprint: [0x11; 32],

@@ -174,6 +174,102 @@ fn a_map_key_counts_towards_max_value_size() {
 }
 
 #[test]
+fn a_narrow_lane_cannot_mass_transfer_capabilities() {
+    // One message carries at most `MAX_CAPS_PER_MESSAGE` handles. The ceiling is
+    // a fixed kernel bound, so a lane whose budget is narrow still cannot sweep
+    // the registry in a single send.
+    let fixture = fixture_parts(Budget::default(), Budget::calls(1), Value::text("ok"));
+    let channel = fixture
+        .agent
+        .create_channel("caps", Direction::Both)
+        .expect("channel");
+    let mut caps = Vec::new();
+    for _ in 0..=1024 {
+        caps.push(
+            fixture
+                .agent
+                .attenuate(&fixture.cap, CapAttrs::new(&["ping"]))
+                .expect("attenuated child"),
+        );
+    }
+    let error = fixture
+        .agent
+        .send(fixture.lane, channel, Value::text("sweep"), &caps)
+        .expect_err("a message beyond the cap ceiling is refused");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert!(
+        error.to_string().contains("caps per message"),
+        "unexpected refusal: {error}"
+    );
+}
+
+#[test]
+fn lane_attenuation_after_queue_binds_dispatched_promise() {
+    // A call is authorized at queue time and dispatched later. Narrowing the
+    // lane in between must bind the dispatch: the grant the provider runs under
+    // is the capability's budget intersected with the lane's current one.
+    let fixture = fixture_with(Budget::default(), Value::text("ok"));
+    let wide = Value::list((0..8).map(Value::Int));
+    let promise = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, "ping", vec![Arg::Value(wide)])
+        .expect("a value inside the wide lane is queued");
+    fixture
+        .agent
+        .attenuate_lane(
+            fixture.lane,
+            Budget {
+                max_array_len: 3,
+                ..Budget::default()
+            },
+        )
+        .expect("attenuate the lane");
+    let error = promise
+        .value()
+        .expect_err("the narrowed lane must bind the queued call");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert_eq!(
+        fixture.calls.get(),
+        0,
+        "the provider ran under a grant the lane no longer allows"
+    );
+}
+
+#[test]
+fn a_million_wide_list_is_refused_without_a_full_walk() {
+    // Measuring the whole value before comparing it to the ceilings made the
+    // refusal cost the value's real size. A hostile in-process caller can build
+    // a list of a million elements under a grant of three, so the check must
+    // stop at the first violation. Both halves are timed in the same process,
+    // which makes the assertion about the walk rather than about the machine.
+    let wide = Value::list((0..1_000_000).map(|_| Value::Null));
+
+    let mut full_walk = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide.shape().widest, 1_000_000);
+        full_walk = full_walk.min(start.elapsed().as_nanos());
+    }
+
+    let mut bounded = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide.shape_exceeded(&budget()), Some("array_len"));
+        bounded = bounded.min(start.elapsed().as_nanos());
+    }
+
+    assert!(
+        bounded.saturating_mul(10) < full_walk,
+        "the bounded check ({bounded} ns) walked the whole value ({full_walk} ns)"
+    );
+
+    // And the kernel takes that path: the same value is refused, and the
+    // provider never runs.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    assert_eq!(refused(&fixture, wide), "rpc/budget-exceeded");
+}
+
+#[test]
 fn a_module_larger_than_max_value_size_is_refused() {
     let fixture = fixture_with(budget(), Value::text("ok"));
     assert_eq!(

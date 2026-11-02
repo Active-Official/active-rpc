@@ -35,6 +35,15 @@ prints a correlation id for exactly this reason.
    a metric; the library does not take an OpenTelemetry dependency, and a
    Prometheus deployment reads the counters map directly.
 
+## Addendum (2026-11-02): export and restore are events
+
+A durable capability moves authority across processes, so the tape has to say
+where it went and where it came from. `cap.exported` (the sealed record left) and
+`cap.restored` (a live capability was minted from a sealed record, emitted beside
+`cap.minted`) close the gap the R-06 audit found: an export that spent a grant
+left no trace of its own, and a restore read as a plain mint. Both carry only the
+correlation id, like every other capability event.
+
 ## Consequences
 
 - A support bundle, a CI log and a dashboard are safe to share by default. That

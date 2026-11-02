@@ -19,7 +19,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
-| R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
+| R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-3; round 3 was the confirmation pass) | 20 fixed / 0 rejected / 0 open (2 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-6: 12 + 8 + 9 + 8 + 1 + 4 findings | 42 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
@@ -932,6 +932,26 @@ The reviewer applied its fixes directly to the working tree; they are in commit
 Gate after the D-2..D-12 work: `cargo test --all-features` 466 passed, 0 failed
 (and the `--no-default-features` suite green); clippy clean on both feature sets;
 fmt clean.
+
+### R-06 budgets - 2026-11-02 (round 3, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `32454ca`.
+Targeted suites were green (`budget_shape` 16, `payload_budget` 3, `promise` 26)
+and the reviewer verified 8 of the 13 prior claims fixed (`R1-1`..`R2-5`); the
+verdict was not CLEAN because of the new defects below and five open items.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| R2-6 | low | export and restore emit no event of their own; a restore reads as a plain mint | **fixed**: `Event::CapExported`/`CapRestored` are on the tape, in `EVENT_NAMES`, in the projection, in the replay trace, and in `docs/spec/observability.md`; ADR-0014 carries the addendum; `export_and_restore_are_on_the_trace` |
+| R2-7 | low | six `if let Some(meter)` sites skip the charge when a chain member has no meter | **fixed, with the case the first fix got wrong**: the audit's own regression suite showed a provider dropping the last handle to its own object *during* a call, so a chain member's meter legitimately disappears mid-call. `meter_for`/`meter_mut_for` now return `None` only when the capability has no record either (dropped); a live capability with no meter fails closed with `rpc/persistence`. Tests: `a_capability_without_a_meter_fails_closed`, `a_publish_from_a_capability_without_a_meter_fails_closed`, plus the existing `on_drop_is_delivered_when_a_provider_releases_during_its_own_call` |
+| R2-8 | low | `object` is a provider-local id | **documented**: security model row (a capability names one provider, so an object number means nothing across providers) |
+| 1 | medium | `Value::shape()` measured the whole value before the ceilings were compared: an in-process 1M-element list under `max_array_len: 3` pushed 1M work items first | **fixed**: `Value::shape_exceeded` is a bounded walk that returns at the first violation; `shape_refusal` calls it first and only then measures. `a_million_wide_list_is_refused_without_a_full_walk` measures both walks in one process (10× headroom required) |
+| 2 | medium | `max_wall_ms` does not preempt a custom `Provider::invoke` | **accepted design, documented**: the security model now states that every shipped adapter enforces the ceiling and that a provider is trusted code on the dispatch thread; preemption would need a thread per call or an interpreter |
+| 3 | low | `job.call.budget` was frozen at queue time, so a lane narrowed afterwards did not bind the dispatch | **fixed**: dispatch recomputes `capability ∩ lane` from the live records and uses it for the byte re-check, the resolved-argument shape re-check, the `Call::budget` the provider receives and the egress shape check; `lane_attenuation_after_queue_binds_dispatched_promise` |
+| 4 | low | `MAX_CAPS_PER_MESSAGE` is a fixed kernel ceiling, not a budget field | **documented + pinned**: security model row; `a_narrow_lane_cannot_mass_transfer_capabilities` (a 1-call lane still cannot move 1 025 handles) |
+
+Gate after these fixes: `cargo test --all-features` (all green, see below);
+clippy and fmt clean on both feature sets.
 
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 

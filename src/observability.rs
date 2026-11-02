@@ -32,6 +32,8 @@ pub const EVENT_NAMES: &[&str] = &[
     "cap.dropped",
     "cap.revoked",
     "cap.expired",
+    "cap.exported",
+    "cap.restored",
     "cap.introduced",
     "cap.transferred",
     "lane.created",
@@ -185,6 +187,14 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
         }
         Event::CapExpired(cap) => {
             trace.event = "cap.expired";
+            trace.cap = Some(cap.correlation_id());
+        }
+        Event::CapExported(cap) => {
+            trace.event = "cap.exported";
+            trace.cap = Some(cap.correlation_id());
+        }
+        Event::CapRestored(cap) => {
+            trace.event = "cap.restored";
             trace.cap = Some(cap.correlation_id());
         }
         Event::CapIntroduced { cap, fingerprint } => {

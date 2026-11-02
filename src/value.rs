@@ -98,6 +98,102 @@ impl Value {
         }
     }
 
+    /// The first shape ceiling `budget` sets that this value exceeds, if any.
+    ///
+    /// [`Value::shape`] measures the whole value before the caller compares it
+    /// to the ceilings. That is fine for a value that arrived over the wire,
+    /// where the frame budget already bounded it, but an in-process caller can
+    /// build a list with a million elements under a ceiling of three and the
+    /// full walk would push a million work items before refusing it. This walk
+    /// stops at the first violation, so the cost of the refusal is bounded by
+    /// the work the ceiling allows rather than by the value's real shape.
+    ///
+    /// It reports the same dimensions as [`Value::shape`] and never reports a
+    /// violation the full walk would accept: sizes only accumulate here, so an
+    /// accumulator that is already over the ceiling stays over it.
+    pub fn shape_exceeded(&self, budget: &crate::budget::Budget) -> Option<&'static str> {
+        enum Work<'a> {
+            Visit(&'a Value, u64),
+            /// A container finished: fold its size into its parent.
+            Fold(u64),
+        }
+
+        let mut work = vec![Work::Visit(self, 0)];
+        let mut open: Vec<u64> = Vec::new();
+        let mut total = 0u64;
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Visit(value, depth) => {
+                    let scalar = match value {
+                        Value::Null | Value::Secret => Some(1u64),
+                        Value::Bool(_) => Some(2),
+                        Value::Int(_) | Value::Float(_) => Some(9),
+                        Value::Text(text) | Value::Path(text) => {
+                            Some(5u64.saturating_add(text.len() as u64))
+                        }
+                        Value::Module(bytes) => Some(5u64.saturating_add(bytes.len() as u64)),
+                        Value::List(_) | Value::Map(_) => None,
+                    };
+                    if let Some(size) = scalar {
+                        match open.last_mut() {
+                            Some(top) => *top = top.saturating_add(size),
+                            None => total = total.saturating_add(size),
+                        }
+                        if total > budget.max_value_size {
+                            return Some("value_size");
+                        }
+                        continue;
+                    }
+                    if depth + 1 > budget.max_depth {
+                        return Some("depth");
+                    }
+                    open.push(0);
+                    work.push(Work::Fold(5));
+                    match value {
+                        Value::List(items) => {
+                            if items.len() as u64 > budget.max_array_len {
+                                return Some("array_len");
+                            }
+                            for item in items {
+                                work.push(Work::Visit(item, depth + 1));
+                            }
+                        }
+                        Value::Map(entries) => {
+                            if entries.len() as u64 > budget.max_array_len {
+                                return Some("array_len");
+                            }
+                            for (key, item) in entries {
+                                let key_size = 5u64.saturating_add(key.len() as u64);
+                                match open.last_mut() {
+                                    Some(top) => *top = top.saturating_add(key_size),
+                                    None => total = total.saturating_add(key_size),
+                                }
+                                if total > budget.max_value_size {
+                                    return Some("value_size");
+                                }
+                                work.push(Work::Visit(item, depth + 1));
+                            }
+                        }
+                        _ => unreachable!("only containers open an accumulator"),
+                    }
+                }
+                Work::Fold(constant) => {
+                    let inner = open.pop().unwrap_or(0).saturating_add(constant);
+                    match open.last_mut() {
+                        Some(top) => *top = top.saturating_add(inner),
+                        None => {
+                            total = total.saturating_add(inner);
+                            if total > budget.max_value_size {
+                                return Some("value_size");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Measure the shape of this value in one iterative pass.
     ///
     /// A budget's `max_depth`, `max_array_len` and `max_value_size` are checked

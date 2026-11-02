@@ -185,6 +185,10 @@ pub enum Event {
     },
     /// A capability's lifetime elapsed; it is refused exactly like a revocation.
     CapExpired(CapId),
+    /// A capability was exported as a sealed, durable record.
+    CapExported(CapId),
+    /// A sealed durable record was restored as a live capability.
+    CapRestored(CapId),
     /// A capability was introduced to an authenticated peer and bound to it.
     CapIntroduced {
         /// Introduced capability.
@@ -1065,7 +1069,7 @@ impl Agent {
         let mut chain: Vec<CapId> = record.lineage.clone();
         chain.push(record.id);
         for id in &chain {
-            if let Some(meter) = kernel.meters.get(id) {
+            if let Some(meter) = meter_for(&kernel, *id)? {
                 meter
                     .check_reserve(remaining_calls, remaining_bytes)
                     .map_err(|_| Error::persistence("the grant is already committed"))?;
@@ -1103,13 +1107,14 @@ impl Agent {
         // capability now fails with its authority intact.
         crate::persistence::CapabilityRecord::from_json(&record.to_json())?;
         for id in &chain {
-            if let Some(meter) = kernel.meters.get_mut(id) {
+            if let Some(meter) = meter_mut_for(&mut kernel, *id)? {
                 meter
                     .reserve(remaining_calls, remaining_bytes)
                     .map_err(|_| Error::persistence("the grant is already committed"))?;
             }
         }
         kernel.consumed_records.insert(record.record_id);
+        kernel.push_event(Event::CapExported(cap.id()));
         Ok(record)
     }
 
@@ -1436,6 +1441,9 @@ impl Agent {
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.insert_cap_record(record);
         kernel.push_event(Event::CapMinted { cap: id, provider });
+        // A restore is a mint of a sealed record: the trace names both, so an
+        // operator reading only this tape sees where the authority came from.
+        kernel.push_event(Event::CapRestored(id));
         Ok(CapHandle::new(Rc::clone(&self.control), id))
     }
 
@@ -2238,12 +2246,12 @@ impl Agent {
         let mut chain: Vec<CapId> = record.lineage.clone();
         chain.push(cap.id());
         for id in &chain {
-            if let Some(meter) = kernel.meters.get(id) {
+            if let Some(meter) = meter_for(&kernel, *id)? {
                 meter.check(bytes)?;
             }
         }
         for id in &chain {
-            if let Some(meter) = kernel.meters.get_mut(id) {
+            if let Some(meter) = meter_mut_for(&mut kernel, *id)? {
                 meter.charge(bytes)?;
             }
         }
@@ -2624,12 +2632,12 @@ impl Agent {
         let mut chain: Vec<CapId> = record.lineage.clone();
         chain.push(cap_id);
         for id in &chain {
-            if let Some(meter) = kernel.meters.get(id) {
+            if let Some(meter) = meter_for(&kernel, *id)? {
                 meter.check(call_bytes)?;
             }
         }
         for id in &chain {
-            if let Some(meter) = kernel.meters.get_mut(id) {
+            if let Some(meter) = meter_mut_for(&mut kernel, *id)? {
                 meter.charge(call_bytes)?;
             }
         }
@@ -3529,12 +3537,12 @@ impl Agent {
             .unwrap_or_default();
         chain.push(job.cap);
         for id in &chain {
-            if let Some(meter) = kernel.meters.get(id) {
+            if let Some(meter) = meter_for(&kernel, *id)? {
                 meter.check_bytes(extra)?;
             }
         }
         for id in &chain {
-            if let Some(meter) = kernel.meters.get_mut(id) {
+            if let Some(meter) = meter_mut_for(&mut kernel, *id)? {
                 meter.charge_bytes(extra)?;
             }
         }
@@ -3582,12 +3590,12 @@ impl Agent {
             .unwrap_or_default();
         chain.push(cap);
         for id in &chain {
-            if let Some(meter) = kernel.meters.get(id) {
+            if let Some(meter) = meter_for(&kernel, *id)? {
                 meter.check_bytes(bytes)?;
             }
         }
         for id in &chain {
-            if let Some(meter) = kernel.meters.get_mut(id) {
+            if let Some(meter) = meter_mut_for(&mut kernel, *id)? {
                 meter.charge_bytes(bytes)?;
             }
         }
@@ -3745,6 +3753,19 @@ impl Agent {
                         }
                     }
                 }
+                // A lane's grant can be narrowed after a call was queued
+                // (`Agent::attenuate_lane`). The budget a queued call is
+                // re-checked against, and the one the provider receives, is the
+                // capability's grant intersected with the lane's *current*
+                // grant; the copy taken at queue time would let a call queued
+                // under a wide lane run after the lane narrowed.
+                let effective_budget = match (record.as_ref(), kernel.lanes.get(&job.lane)) {
+                    (Some(record), Some(lane_record)) => {
+                        record.attrs.budget.intersect(&lane_record.budget)
+                    }
+                    (Some(record), None) => record.attrs.budget,
+                    (None, _) => job.call.budget,
+                };
                 // A promise argument was a placeholder when the call was
                 // queued. Its value is authority-bearing too, so the path
                 // scope, the tool ceiling and the byte budget are re-checked
@@ -3769,7 +3790,7 @@ impl Agent {
                                 }
                             }
                         }
-                        if failure.is_none() && resolved_bytes > job.call.budget.max_bytes {
+                        if failure.is_none() && resolved_bytes > effective_budget.max_bytes {
                             failure = Some(Error::BudgetExceeded("byte"));
                         }
                         // A promise was a placeholder at queue time; what it
@@ -3778,7 +3799,7 @@ impl Agent {
                         if failure.is_none() {
                             for arg in &args {
                                 let Arg::Value(value) = arg else { continue };
-                                if let Some(error) = shape_refusal(value, &job.call.budget) {
+                                if let Some(error) = shape_refusal(value, &effective_budget) {
                                     failure = Some(error);
                                     break;
                                 }
@@ -3798,9 +3819,11 @@ impl Agent {
                     record.map(|record| record.object).unwrap_or(0),
                     expired,
                     extra,
+                    effective_budget,
                 ))
             };
-            let Some((job, args, failure, object, expired, extra)) = prepared else {
+            let Some((job, args, failure, object, expired, extra, effective_budget)) = prepared
+            else {
                 continue;
             };
             if expired {
@@ -3820,6 +3843,7 @@ impl Agent {
                 None => {
                     let mut call = Call {
                         args,
+                        budget: effective_budget,
                         ..job.call.clone()
                     };
                     // The decision time, from the kernel's clock, so a provider
@@ -3892,7 +3916,7 @@ impl Agent {
                         // The grant bounds what comes back as much as what went
                         // in: a provider returning a list far wider than the
                         // grant's `max_array_len` would otherwise be admitted.
-                        Ok(value) => match shape_refusal(&value, &job.call.budget) {
+                        Ok(value) => match shape_refusal(&value, &effective_budget) {
                             Some(error) => Err(error),
                             None => match self.charge_egress(&job, value.wire_size()) {
                                 Ok(()) => Ok(value),
@@ -4788,7 +4812,42 @@ type IdempotencyEntry = (PromiseId, [u8; 32], Option<[u8; 32]>);
 /// a provider runs (`call`), after a promise resolves (dispatch), on the
 /// response a provider produced (egress), and on lane traffic (`send`,
 /// `publish`). One helper keeps the four sites from drifting.
+/// The meter that bounds a capability in a call chain, when it still has one.
+///
+/// Every live capability has a meter: mint, attenuation and restore insert it,
+/// and `drop_record` removes the record and the meter together. A capability
+/// with no record was dropped, which a provider may do during its own call (the
+/// handle it holds is the last reference); its grant is gone with it and the
+/// rest of the chain still bounds the call, so `None` means "charge the rest".
+/// A capability that still has a record but no meter is a broken invariant, and
+/// skipping its charge would hand it an unbounded grant, so that fails closed.
+fn meter_for(kernel: &Kernel, id: CapId) -> Result<Option<&BudgetMeter>> {
+    match kernel.meters.get(&id) {
+        Some(meter) => Ok(Some(meter)),
+        None if kernel.caps.contains_key(&id) => {
+            Err(Error::Persistence("the capability has no meter"))
+        }
+        None => Ok(None),
+    }
+}
+
+fn meter_mut_for(kernel: &mut Kernel, id: CapId) -> Result<Option<&mut BudgetMeter>> {
+    if !kernel.meters.contains_key(&id) {
+        return if kernel.caps.contains_key(&id) {
+            Err(Error::Persistence("the capability has no meter"))
+        } else {
+            Ok(None)
+        };
+    }
+    Ok(kernel.meters.get_mut(&id))
+}
+
 fn shape_refusal(value: &Value, budget: &Budget) -> Option<Error> {
+    // The bounded walk stops at the first violation, so a hostile in-process
+    // value is refused without materialising its whole shape.
+    if let Some(dimension) = value.shape_exceeded(budget) {
+        return Some(Error::BudgetExceeded(dimension));
+    }
     let shape = value.shape();
     if shape.depth > budget.max_depth {
         return Some(Error::BudgetExceeded("depth"));
@@ -4954,5 +5013,78 @@ fn path_outside_scope(value: &Value, scope: &str) -> Option<String> {
             .values()
             .find_map(|item| path_outside_scope(item, scope)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    use super::*;
+
+    struct Ping;
+
+    impl Provider for Ping {
+        fn name(&self) -> &'static str {
+            "ping"
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["ping".to_string()]
+        }
+
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+
+        fn invoke(&mut self, _object: u64, _call: &Call) -> Result<Response> {
+            Ok(Response::Value(Value::Int(1)))
+        }
+    }
+
+    /// A capability in a chain without a meter has failed a kernel invariant.
+    /// Charging nothing for it would hand it an unbounded grant, so the call is
+    /// refused instead.
+    #[test]
+    fn a_capability_without_a_meter_fails_closed() {
+        let agent = Agent::with_secret([0x5a; 32]);
+        let provider = agent.register(Box::new(Ping));
+        let cap = agent
+            .mint(provider, 0, CapAttrs::new(&["ping"]))
+            .expect("mint");
+        let lane = agent
+            .create_lane("no-meter", Budget::default())
+            .expect("lane");
+        agent.cell.borrow_mut().meters.remove(&cap.id());
+        let error = agent
+            .call(lane, &cap, "ping", Vec::new())
+            .expect_err("a capability with no meter must not call unmetered");
+        assert_eq!(error.code(), "rpc/persistence");
+        assert_eq!(
+            error.to_string(),
+            "durable capability refused: the capability has no meter"
+        );
+    }
+
+    /// The publish path charges the same chain; a meter-less capability in it
+    /// must refuse the publish rather than send it unmetered.
+    #[test]
+    fn a_publish_from_a_capability_without_a_meter_fails_closed() {
+        let agent = Agent::with_secret([0x5b; 32]);
+        let provider = agent.register(Box::new(Ping));
+        let attrs = CapAttrs::new(&["ping", "publish"]).restrict_topics(&["t"]);
+        let cap = agent.mint(provider, 0, attrs).expect("mint");
+        let lane = agent
+            .create_lane("no-meter-publish", Budget::default())
+            .expect("lane");
+        let channel = agent
+            .create_channel("c", crate::channel::Direction::Both)
+            .expect("channel");
+        agent.cell.borrow_mut().meters.remove(&cap.id());
+        let error = agent
+            .publish(lane, channel, &cap, "t", Value::Int(1))
+            .expect_err("a publish through a capability with no meter must fail");
+        assert!(
+            error.to_string().ends_with("has no meter"),
+            "unexpected refusal: {error}"
+        );
     }
 }
