@@ -406,8 +406,9 @@ impl BridgeServer {
         // The read deadline's remainder may be milliseconds after a body that
         // landed just in time; give the response its own budget.
         let _ = stream.set_write_timeout(Some(CONNECTION_WAIT));
-        let _ = write_http_response(&mut stream, 200, &framed);
-        1
+        // A peer that never read the response was not served; counting it would
+        // make --limit and the served metric lie.
+        u64::from(write_http_response(&mut stream, 200, &framed).is_ok())
     }
 }
 

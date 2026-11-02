@@ -562,17 +562,27 @@ async fn respond_body(
         .send_response(head, false)
         .map_err(|error| Error::Transport(format!("send response: {error}")))?;
     let mut offset = 0usize;
+    // One budget for the whole response, not one per piece: a peer that grants
+    // a single byte per window would otherwise hold the task for pieces x
+    // deadline.
+    let total = tokio::time::Instant::now()
+        + deadline
+            .saturating_mul(8)
+            .min(std::time::Duration::from_secs(30));
     while offset < encoded.len() {
         let want = (encoded.len() - offset).min(PIECE);
         send.reserve_capacity(want);
-        let granted = match tokio::time::timeout(
-            deadline,
-            std::future::poll_fn(|context| send.poll_capacity(context)),
+        let granted = match tokio::time::timeout_at(
+            total,
+            tokio::time::timeout(
+                deadline,
+                std::future::poll_fn(|context| send.poll_capacity(context)),
+            ),
         )
         .await
         {
-            Ok(Some(Ok(capacity))) if capacity > 0 => capacity,
-            Ok(Some(Err(error))) => {
+            Ok(Ok(Some(Ok(capacity)))) if capacity > 0 => capacity,
+            Ok(Ok(Some(Err(error)))) => {
                 return Err(Error::Transport(format!("send body: {error}")));
             }
             // Timed out, or the stream closed under us.
@@ -844,17 +854,26 @@ async fn read_response(
     ceiling: usize,
     deadline: Option<std::time::Duration>,
 ) -> Result<(StatusCode, Vec<u8>)> {
-    // Inactivity bound per chunk, defaulting to 30 s: without one a server that
-    // sends a byte and stops parks the caller forever when no deadline is set.
+    // Inactivity bound per chunk plus a total bound: without them a server that
+    // sends a byte and stops (or drips inside the window) parks the caller.
     let inactivity = deadline.unwrap_or(std::time::Duration::from_secs(30));
+    let total = tokio::time::Instant::now()
+        + inactivity
+            .saturating_mul(8)
+            .min(std::time::Duration::from_secs(30));
     let status = response.status();
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     loop {
-        let next = match tokio::time::timeout(inactivity, body.data()).await {
-            Ok(next) => next,
-            Err(_) => return Err(Error::Transport("HTTP/2 response timed out".to_string())),
-        };
+        let next =
+            match tokio::time::timeout_at(total, tokio::time::timeout(inactivity, body.data()))
+                .await
+            {
+                Ok(Ok(next)) => next,
+                Ok(Err(_)) | Err(_) => {
+                    return Err(Error::Transport("HTTP/2 response timed out".to_string()))
+                }
+            };
         match next {
             Some(Ok(chunk)) => {
                 if bytes.len() + chunk.len() > ceiling {

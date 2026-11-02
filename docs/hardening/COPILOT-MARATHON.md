@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-6: 22 + 16 + 13 + 6 + 6 + 6 findings | 69 fixed / 0 rejected / 0 open | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,26 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-09 transports - 2026-11-02 (round 7, closing round 6's verification)
+
+The round-6 verification (Muse) confirmed M4 and the HTTP/2 half of M6, and
+found four issues in the round-6 code and its tests: the drip test never reached
+the total deadline, the response-write and client-read budgets were per piece,
+and the bridge counted a failed response as served. All four are fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| D1 | medium | the drip test's budget was exceeded by its own prefix, so the stream died on a 429 before the total body deadline could fire; the test passed without the fix | **fixed**: the budget leaves room for the prefix and the drips, the client keeps dripping until the server resets, and the test asserts fewer than 100 rounds (the old path would run all 200) |
+| D2 | medium | `respond_body` re-armed the deadline per 16 KiB piece, so a peer granting one byte per window held the task for pieces × deadline | **fixed**: one total budget (8 × the window, capped at 30 s) wraps the per-piece wait |
+| D3 | medium | the HTTP/2 client's read bound was per chunk, so a compliant drip with no caller deadline was unbounded | **fixed**: a total read budget (8 × the inactivity bound, capped at 30 s) |
+| D4 | low | the bridge returned served = 1 after a failed response write | **fixed**: it returns 1 only when the response was written |
+
+The same pass audited QUIC and TCP as **CLEAN** (no demonstrable defect in
+`read_frame_body`, `reply`, `send` or `recv`), with residuals recorded: 128
+HTTP/2 streams can pin 30 s of transient work, `block_in_place` serialises slow
+handlers, QUIC can buffer up to the flow-control window before the frame reader
+sees it, and the bridge ignores a write-timeout arming failure.
 
 ### R-09 transports - 2026-11-02 (round 6, second reviewer: Muse)
 

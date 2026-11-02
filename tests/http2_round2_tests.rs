@@ -97,6 +97,9 @@ fn a_stalled_stream_releases_the_budget_and_the_connection() {
 /// A drip that stays inside the per-chunk inactivity bound must still end: the
 /// body has a total deadline (eight inactivity windows, capped at 30 s), so the
 /// reservation is released and `serve` joins.
+///
+/// The budget is deliberately larger than the drip: the stream must be cut by the
+/// *total body deadline*, not by a `429` from its own prefix.
 #[test]
 fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
     let stalled_body = 60usize;
@@ -104,7 +107,8 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
         .encode()
         .expect("encode")
         .len();
-    let budget = real + 1 + stalled_body / 2;
+    // Room for the prefix, the drips and a real call.
+    let budget = real + 1 + stalled_body + 4096;
 
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&calls);
@@ -123,12 +127,12 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
     });
 
     // Connection one: a prefix, then one byte every 100 ms — inside the 300 ms
-    // inactivity window, so only the total body deadline can end it.
+    // inactivity window — until the server resets the stream.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("runtime");
-    runtime.block_on(async {
+    let drip_ended = runtime.block_on(async {
         let stream = tokio::net::TcpStream::connect(&address)
             .await
             .expect("connect");
@@ -145,7 +149,8 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
         let (_response, mut body) = sender.send_request(request, false).expect("send");
         body.send_data(bytes::Bytes::from(vec![b'x'; stalled_body]), false)
             .expect("prefix");
-        for _ in 0..30 {
+        let mut sent = 0usize;
+        for _ in 0..200 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if body
                 .send_data(bytes::Bytes::from_static(b"y"), false)
@@ -153,13 +158,17 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
             {
                 break;
             }
+            sent += 1;
         }
         drop(body);
         driver.abort();
+        sent
     });
+    assert!(
+        drip_ended < 100,
+        "the drip ran {drip_ended} rounds; the total body deadline never fired"
+    );
 
-    // The stalled reservation is gone, so a real call on a second connection is
-    // served.
     let mut client = Http2Client::connect(&address)
         .expect("connect")
         .with_deadline(Duration::from_secs(10));
