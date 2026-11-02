@@ -448,3 +448,103 @@ fn egress_payload_bytes_are_charged() {
         .expect_err("the grant is spent after the round trip");
     assert_eq!(error.code(), "rpc/budget-exceeded");
 }
+
+/// A retransmitted plan frame is ordinary on a flaky link. It must not reset the
+/// chunks the caller already sent and paid for.
+#[test]
+fn a_retried_plan_keeps_the_received_chunks() {
+    let payload = body(200_000, 21);
+    let sender = BulkSender::new(payload, 32 * 1024).expect("sender");
+    let plan = sender.plan().clone();
+    let mut provider = BulkProvider::new();
+
+    let call = active_rpc::Call::new("plan", Vec::new()).with_payload(plan.encode());
+    let first = provider.invoke(0, &call).expect("plan");
+    let missing_of = |response: &active_rpc::Response| -> i64 {
+        match response {
+            active_rpc::Response::Value(value) => match &value {
+                Value::Map(map) => match map.get("missing") {
+                    Some(Value::Int(missing)) => *missing,
+                    other => panic!("no missing field: {other:?}"),
+                },
+                other => panic!("not a map: {other:?}"),
+            },
+            other => panic!("not a value: {other:?}"),
+        }
+    };
+    let _ = first;
+
+    let frame = sender.frame_at(0).expect("frame");
+    let put = active_rpc::Call::new("put", Vec::new()).with_payload(frame);
+    provider.invoke(0, &put).expect("chunk");
+
+    let repeat = provider
+        .invoke(0, &call)
+        .expect("a retried plan is accepted");
+    assert_eq!(
+        missing_of(&repeat),
+        (plan.chunk_count() - 1) as i64,
+        "the retried plan kept the first chunk"
+    );
+    provider
+        .invoke(
+            0,
+            &active_rpc::Call::new("finish", Vec::new())
+                .with_payload(BulkFinish::new(&plan).encode()),
+        )
+        .expect_err("the rest is still missing");
+}
+
+/// A finish that cannot settle the transfer (wrong marker, or an incomplete
+/// body) must not destroy the chunks already received: the caller would have to
+/// pay for the whole body again.
+#[test]
+fn a_refused_finish_keeps_the_transfer() {
+    let payload = body(150_000, 22);
+    let sender = BulkSender::new(payload, 32 * 1024).expect("sender");
+    let plan = sender.plan().clone();
+    let mut provider = BulkProvider::new();
+
+    let plan_call = active_rpc::Call::new("plan", Vec::new()).with_payload(plan.encode());
+    provider.invoke(0, &plan_call).expect("plan");
+
+    // Every chunk but the last.
+    for index in 0..plan.chunk_count() - 1 {
+        let frame = sender.frame_at(index).expect("frame");
+        let put = active_rpc::Call::new("put", Vec::new()).with_payload(frame);
+        provider.invoke(0, &put).expect("chunk");
+    }
+
+    // A finish before the last chunk is refused and keeps the state.
+    let early =
+        active_rpc::Call::new("finish", Vec::new()).with_payload(BulkFinish::new(&plan).encode());
+    let error = provider.invoke(0, &early).expect_err("incomplete");
+    assert_eq!(error.code(), "rpc/bulk");
+    assert_eq!(provider.active_root(), Some(plan.root()));
+
+    let last = sender.frame_at(plan.chunk_count() - 1).expect("frame");
+    provider
+        .invoke(
+            0,
+            &active_rpc::Call::new("put", Vec::new()).with_payload(last),
+        )
+        .expect("last chunk");
+
+    // A marker for another transfer is refused and keeps the state too.
+    let other = BulkPlan::new(&body(150_000, 23), 32 * 1024).expect("other plan");
+    let foreign =
+        active_rpc::Call::new("finish", Vec::new()).with_payload(BulkFinish::new(&other).encode());
+    let error = provider.invoke(0, &foreign).expect_err("another transfer");
+    assert_eq!(error.code(), "rpc/bulk");
+    assert_eq!(provider.active_root(), Some(plan.root()));
+
+    provider
+        .invoke(
+            0,
+            &active_rpc::Call::new("finish", Vec::new())
+                .with_payload(BulkFinish::new(&plan).encode()),
+        )
+        .expect("the complete body settles");
+    let (assembled, _) = provider.take_body().expect("body");
+    assert_eq!(assembled.len(), plan.total() as usize);
+}

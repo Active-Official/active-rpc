@@ -113,7 +113,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // A plain TCP peer carries no identity, so the only honest admission rule is
     // the loopback one: a local caller is a loopback peer (which cannot hold a
     // binding), and anything off-host is refused rather than silently admitted.
-    let loopback = local.ip().is_loopback();
     let policy = IdentityPolicy::default();
     let bound = local.to_string();
     println!("listening {bound}");
@@ -122,6 +121,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut served = 0usize;
     for stream in listener.incoming() {
         let stream = stream?;
+        // The flag describes this connection, not the listener: a wildcard bind
+        // must still treat a remote client as remote, and must still serve a
+        // genuinely local one.
+        let loopback = stream
+            .peer_addr()
+            .map(|peer| peer.ip().is_loopback())
+            .unwrap_or(false);
         let transport = TcpTransport::new(stream)?;
         let handled = serve_connection(transport, |envelope| {
             handle(
@@ -173,6 +179,11 @@ fn dispatch(
     if envelope.kind != Kind::Request {
         return Err(Error::Wire("peer only serves requests"));
     }
+    // Admission covers every arm, not only the one that forwards the caller's
+    // authority: `pipeline` and `sequential` spend the peer's own capability and
+    // the shared lane's call budget, so an unadmitted caller must not reach them
+    // either.
+    let admitted = policy.admit(None, loopback)?;
     match envelope.method.as_str() {
         "hello" => {
             let mut map = BTreeMap::new();
@@ -215,7 +226,7 @@ fn dispatch(
             // Charge the envelope payload against the capability's byte budget,
             // exactly as the thin-client peers do.
             let promise =
-                agent.dispatch_envelope(policy, None, loopback, lane, module_cap, envelope)?;
+                agent.call_from_envelope(Some(admitted.identity()), lane, module_cap, envelope)?;
             promise.value()
         }
     }

@@ -568,3 +568,38 @@ fn tcp_transport_rejects_a_malformed_envelope() {
     assert_eq!(error.code(), "rpc/wire");
     let _ = BTreeMap::<u8, u8>::new();
 }
+
+/// The peer's admission flag describes the connection, not the listener: a
+/// wildcard bind still serves a genuinely local client, and the same bind
+/// refuses a remote one (which this test cannot produce, so it pins the half it
+/// can: the local client is not refused just because the listener is wildcard).
+#[test]
+fn a_wildcard_peer_still_serves_a_local_client() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_active-rpc-peer"))
+        .args(["--listen", "0.0.0.0:0", "--calls", "2"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn peer");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read listen line");
+    let bound = line
+        .trim()
+        .strip_prefix("listening ")
+        .expect("peer announces its address")
+        .to_string();
+    // Connect over loopback even though the listener is wildcard.
+    let port = bound.rsplit(':').next().expect("port");
+    let address = format!("127.0.0.1:{port}");
+
+    let mut transport = TcpTransport::connect(&address).expect("connect");
+    let ping = Envelope::request(1, "ping", vec![]);
+    transport.send(&ping).expect("send ping");
+    let response = transport.recv().expect("recv").expect("response");
+    assert_eq!(response.first_value(), Some(&Value::text("pong")));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}

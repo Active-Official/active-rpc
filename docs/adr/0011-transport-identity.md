@@ -40,9 +40,13 @@ introduction is a bearer token with no audience.
    across an identity boundary is an explicit `introduce_to`.
 4. **Attenuation is monotone for binding.** A child inherits the parent's
    binding; it may add a binding when the parent has none; it may never change
-   or drop one. Rebinding is `rpc/attenuation-escalation`. `introduce_to` binds
+   or drop one. A rebind attempt at `introduce_to` or `mint_bound` is
+   `rpc/identity` (the capability exists and the caller asked to move its
+   audience). `rpc/attenuation-escalation` is the class for an attribute
+   narrowing failure during attenuation, not for a rebind. `introduce_to` binds
    the capability **and every live capability derived from it**, so a child
-   minted before the introduction cannot stay unbound.
+   minted before the introduction cannot stay unbound; a revoked or expired
+   descendant is skipped, because dead authority must not block a live one.
 5. **QUIC mutual TLS is the first implementation.** `QuicServer::start_mutual_tls`
    verifies a client certificate against a CA and hands the identity to the
    handler. `QuicClient::connect_mutual_tls` presents a client certificate.

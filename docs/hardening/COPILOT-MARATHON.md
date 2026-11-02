@@ -23,8 +23,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
-| R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
-| R-11 | identity | `src/identity.rs` | rounds 1-2: 8 + 7 findings (2 round-1 dispositions partial) | 15 fixed / 0 rejected / 0 open | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
+| R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
@@ -49,6 +49,40 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-10 bulk transfer - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `6cc077a`.
+The frame codecs held: the reviewer found no panic, no unbounded allocation and
+no plan that lies about its own hashes. The two defects were in the provider that
+gives the format a consumer.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| B1 | medium | a retransmitted `plan` frame (ordinary on a flaky link) built a fresh receiver, discarding every chunk the caller had already sent and paid for | **fixed**: the same root keeps the existing receiver and reports its missing count; a different root is still refused; `a_retried_plan_keeps_the_received_chunks` |
+| B2 | medium | `finish` took the transfer before validating: a wrong marker or an early `finish` destroyed the received chunks | **fixed**: the marker and completeness are checked against a borrowed transfer, and only a successful finish consumes it; `a_refused_finish_keeps_the_transfer` |
+
+Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
+
+### R-11 identity - 2026-11-02 (round 3, fix verification)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `6cc077a`.
+Verified N1, N2, N4, N5 fixed; N3, N6, N7 partial; seven new findings, one high.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `src/bin/peer.rs` admitted only the module arm: `hello`, `ping`, `pipeline` and `sequential` ran before any policy check, so an off-host caller could spend the peer's capability and the shared lane budget (5 000 `pipeline` requests exhausted a 10 000-call lane) | **fixed**: admission runs once at the top of `dispatch`, before every arm, and the module arm uses the admitted identity; the loopback flag now comes from `stream.peer_addr()`, not the listener, so a wildcard bind still serves a local client and still refuses a remote one; `a_wildcard_peer_still_serves_a_local_client` |
+| F2 | medium | an **expired** descendant still blocked `introduce_to` (only revoked ones were skipped), and expiry is monotonic, so a dead child was permanent denial of service | **fixed**: expired records are skipped too; `an_expired_descendant_does_not_block_introduction` |
+| F3 | low | the idempotency cache re-checked the live binding but returned a promise whose job was stamped for the *first* caller, so another peer's replay failed at dispatch with a confusing `rpc/identity` | **fixed**: the cache stores the claiming fingerprint and a replay from another peer is refused at the hit; `an_idempotency_key_belongs_to_the_peer_that_claimed_it` |
+| F4 | low | truncating the escaped subject could end mid-escape (`\u{1b}` minus its last digit), leaving a dangling backslash | **fixed**: the escaped form is built one character's escape at a time and stops before the budget |
+| F5 | low | any *non-empty* placeholder certificate (an exporter string, a proxy header, a config value) still yields one shared, bindable identity | **accepted and documented**: the constructor says to pass only the authenticated DER and names the shared-principal hazard; a `VerifiedCertificate` witness type is a public API change to schedule with ADR-0011 |
+| F6 | low | `admit(Some(anonymous), loopback=true)` under `local()` was labelled `Unauthenticated` while `None` was labelled `Loopback` | **fixed**: an explicit anonymous identity is normalised to none before the match, so one label follows the connection |
+| F7 | low | ADR-0011 said a rebind is `rpc/attenuation-escalation`; the code and the tests say `rpc/identity` | **fixed**: the ADR names `rpc/identity` for a rebind and keeps the escalation class for an attenuation-narrowing failure |
+
+Also verified clean: no second `Job` construction site, so the stamped identity
+cannot be lost on a requeue; every dispatch funnels through phase 1; the
+fingerprint reaches no event, receipt or envelope except the documented public
+label in `cap.introduced`.
 
 ### R-11 identity - 2026-11-02 (round 2, confirmation)
 
@@ -76,7 +110,7 @@ Residual risks (recorded): an in-process caller can still fabricate a
 processes sharing a certificate share a binding, and a receipt cannot name the
 audience of an unbound capability.
 
-Gate: `scripts/local_gate.sh` green; all-features 681 passed.
+Gate: `scripts/local_gate.sh` green; all-features 686 passed.
 
 ### R-12 replay - 2026-11-02 (round 3, fix verification)
 

@@ -75,7 +75,11 @@ impl PeerIdentity {
     ///
     /// This is record-keeping, not proof: it cannot tell whether the chain was
     /// verified. Only a transport that verified it may call this, and the kernel
-    /// treats the value as the caller's claim about its own connection.
+    /// treats the value as the caller's claim about its own connection. Pass the
+    /// authenticated certificate's DER, never a placeholder, a proxy header or a
+    /// configuration string: every caller that passes the same bytes is the same
+    /// principal and can exercise the others' bound capabilities. An empty
+    /// buffer is treated as no identity at all.
     pub fn from_certificate(certificate: &[u8]) -> Self {
         // An empty buffer is not evidence of anything. Returning a `MutualTls`
         // identity for it would give every caller that passed an empty exporter,
@@ -183,16 +187,19 @@ fn sanitized_subject(subject: &str) -> String {
     }
     // Escaping can multiply the length (`\u{1b}` is six bytes for one
     // character), so the escaped form is bounded again at a character boundary.
-    let escaped: String = bounded.chars().flat_map(char::escape_debug).collect();
-    let mut end = 0;
-    for (index, character) in escaped.char_indices() {
-        let next = index + character.len_utf8();
-        if next > MAX_SUBJECT_BYTES {
+    // Emit one character's escape at a time and stop before the budget: cutting
+    // the escaped text at a byte boundary could end it mid-escape
+    // (`\u{1b}` minus its last digit is a dangling backslash).
+    let mut out = String::new();
+    for character in bounded.chars() {
+        let mut token = String::new();
+        token.extend(character.escape_debug());
+        if out.len() + token.len() > MAX_SUBJECT_BYTES {
             break;
         }
-        end = next;
+        out.push_str(&token);
     }
-    escaped[..end].to_string()
+    out
 }
 
 fn fingerprint_for(subject: &str, evidence: &[u8]) -> [u8; FINGERPRINT_LEN] {
@@ -360,6 +367,11 @@ impl IdentityPolicy {
     /// `loopback` must be computed from the connection's local and remote
     /// addresses, never from a header or a caller-supplied flag.
     pub fn admit(&self, peer: Option<&PeerIdentity>, loopback: bool) -> Result<AdmittedIdentity> {
+        // An explicitly anonymous identity says exactly what presenting none
+        // says. Normalising first keeps one label per connection: otherwise
+        // `local()` called a local caller `Loopback` when the transport passed
+        // `None` and `Unauthenticated` when it passed `anonymous()`.
+        let peer = peer.filter(|identity| !identity.is_anonymous());
         match peer {
             Some(identity) if identity.kind() == IdentityKind::MutualTls => Ok(AdmittedIdentity {
                 identity: identity.clone(),
@@ -377,16 +389,9 @@ impl IdentityPolicy {
                     ))
                 }
             }
-            Some(_) => {
-                if self.require_identity {
-                    Err(Error::Identity("anonymous peer refused"))
-                } else {
-                    Ok(AdmittedIdentity {
-                        identity: PeerIdentity::anonymous(),
-                        trust: TrustLevel::Unauthenticated,
-                    })
-                }
-            }
+            // Unreachable after the filter (every remaining kind is matched
+            // above); kept so a future kind cannot fall through silently.
+            Some(_) => Err(Error::Identity("unrecognised peer identity")),
             None => {
                 // The label follows the connection, not the identity
                 // requirement: an embedder that branches on `kind()` for

@@ -81,9 +81,16 @@ fn loopback_is_relaxed_by_default_and_strict_policy_refuses_it() {
 #[test]
 fn an_anonymous_peer_is_refused_when_identity_is_required() {
     let anonymous = PeerIdentity::anonymous();
-    let error = IdentityPolicy::default()
+    // An explicitly anonymous identity says what presenting none says, so on
+    // loopback it takes the loopback rule; off-host, a required identity refuses
+    // it.
+    let admitted = IdentityPolicy::default()
         .admit(Some(&anonymous), true)
-        .expect_err("anonymous refused");
+        .expect("loopback is relaxed under the default policy");
+    assert_eq!(admitted.identity().kind(), IdentityKind::Loopback);
+    let error = IdentityPolicy::default()
+        .admit(Some(&anonymous), false)
+        .expect_err("anonymous off-host is refused");
     assert_eq!(error.code(), "rpc/identity");
 
     let admitted = IdentityPolicy::local()

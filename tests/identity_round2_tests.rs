@@ -228,3 +228,78 @@ fn the_dispatch_helper_admits_before_it_dispatches() {
     agent.run();
     assert_eq!(promise.value().expect("dispatched"), Value::text("hi"));
 }
+
+/// Expiry is monotonic, so an expired-and-bound descendant would block the
+/// introduction of a live parent forever if it were not skipped.
+#[test]
+fn an_expired_descendant_does_not_block_introduction() {
+    let agent = Agent::with_secret([0x76; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(b"alice-round2");
+    let root = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("root");
+    let child = agent
+        .attenuate(&root, CapAttrs::new(&["echo"]).with_ttl_ms(1))
+        .expect("child");
+    agent.introduce_to(&child, &alice).expect("bind child");
+
+    // One round trip advances the virtual clock past the child's lifetime.
+    agent.set_latency(5);
+    let lane = agent
+        .create_lane("expiry", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(Some(alice.identity()), lane, &child, "echo", Vec::new())
+        .expect("queued");
+    agent.run();
+    let _ = promise.value();
+    assert!(
+        agent.cap_attrs(&child).expect("attrs").bound_to.is_some(),
+        "the binding stays on the record; only its effect is dead"
+    );
+
+    agent
+        .introduce_to(&root, &alice)
+        .expect("an expired descendant does not block the introduction");
+}
+
+/// An idempotency key names the principal that claimed it: a replay from another
+/// peer must be a clean `rpc/identity`, not a cached promise whose job was
+/// stamped for the first caller.
+#[test]
+fn an_idempotency_key_belongs_to_the_peer_that_claimed_it() {
+    let agent = Agent::with_secret([0x77; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(b"alice-round2");
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    let lane = agent.create_lane("idem", Budget::default()).expect("lane");
+
+    // Claimed anonymously while the capability is unbound.
+    let first = agent
+        .call_idempotent_as(None, lane, &cap, "echo", Vec::new(), "shared-key")
+        .expect("claimed");
+    agent.run();
+    let _ = first.value();
+
+    // Alice presents the same key: not her request.
+    let error = agent
+        .call_idempotent_as(
+            Some(alice.identity()),
+            lane,
+            &cap,
+            "echo",
+            Vec::new(),
+            "shared-key",
+        )
+        .expect_err("another peer cannot replay the key");
+    assert_eq!(error.code(), "rpc/identity");
+
+    // The same anonymous principal may still retry its own key.
+    let again = agent
+        .call_idempotent_as(None, lane, &cap, "echo", Vec::new(), "shared-key")
+        .expect("the claimer may retry");
+    assert_eq!(again.id(), first.id());
+}

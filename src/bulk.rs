@@ -950,12 +950,23 @@ impl BulkProvider {
         if let Some(expected) = self.expected_root {
             plan.require_root(expected)?;
         }
-        if let Some((active, _)) = &self.transfer {
+        if let Some((active, receiver)) = &self.transfer {
             // A second plan mid-transfer is either a retry of the same transfer
-            // (idempotent) or a substitution, which is refused.
+            // or a substitution, which is refused. A retry must not reset the
+            // chunks already received: the caller paid for them, and a
+            // retransmitted plan frame is ordinary on a flaky link.
             if active.root() != plan.root() {
                 return Err(Error::Bulk("a different transfer is already active"));
             }
+            let plan = active.clone();
+            let missing = receiver.missing().len() as u64;
+            return Ok(Response::Value(Value::map([
+                ("total", Value::Int(plan.total() as i64)),
+                ("chunk", Value::Int(plan.chunk_size() as i64)),
+                ("chunks", Value::Int(plan.chunk_count() as i64)),
+                ("root", Value::text(plan.root_hex())),
+                ("missing", Value::Int(missing as i64)),
+            ])));
         }
         let receiver = BulkReceiver::with_ceiling(plan.clone(), self.ceiling)?;
         let missing = receiver.missing().len() as u64;
@@ -1001,13 +1012,26 @@ impl BulkProvider {
     }
 
     fn finish_method(&mut self, call: &Call) -> Result<Response> {
-        let (plan, receiver) = self
+        // Validate before taking: a marker for another transfer, or a finish
+        // that arrives before the last chunk, must not destroy the chunks the
+        // caller has already paid for. Only a successful finish consumes the
+        // transfer.
+        {
+            let (plan, receiver) = self
+                .transfer
+                .as_ref()
+                .ok_or(Error::Bulk("no transfer is active"))?;
+            // The marker names the root and length the sender believes it sent;
+            // a marker for another transfer must not settle this one.
+            BulkFinish::decode(&call.payload, plan)?;
+            if !receiver.is_complete() {
+                return Err(Error::Bulk("body is incomplete"));
+            }
+        }
+        let (_, receiver) = self
             .transfer
             .take()
             .ok_or(Error::Bulk("no transfer is active"))?;
-        // The marker names the root and length the sender believes it sent; a
-        // marker for another transfer must not settle this one.
-        BulkFinish::decode(&call.payload, &plan)?;
         let body = receiver.finish()?;
         let hash = *blake3::hash(&body).as_bytes();
         let length = body.len() as u64;

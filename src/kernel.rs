@@ -439,7 +439,9 @@ pub struct Kernel {
     delivering: BTreeSet<ProviderId>,
     /// Payload bytes queued across every channel.
     queued_channel_bytes: u64,
-    idempotency: BTreeMap<IdempotencyKey, (PromiseId, [u8; 32])>,
+    /// Cached idempotency claims: the promise, the request fingerprint, and the
+    /// fingerprint of the peer that claimed the key.
+    idempotency: BTreeMap<IdempotencyKey, IdempotencyEntry>,
     allow_durable: bool,
     idempotency_order: VecDeque<IdempotencyKey>,
     now_ms: u64,
@@ -1499,10 +1501,14 @@ impl Agent {
         let subtree = descendants_of(&kernel.children, cap.id());
         for id in &subtree {
             if let Some(child) = kernel.caps.get(id) {
-                // A revoked record is dead authority: its binding is history, and
-                // letting it block the introduction would make a binding
-                // permanent denial of service on a live capability.
-                if child.revoked {
+                // A revoked or expired record is dead authority: its binding is
+                // history, and letting it block the introduction would make a
+                // dead child permanent denial of service on a live capability.
+                if child.revoked
+                    || child
+                        .expires_at
+                        .is_some_and(|expires_at| kernel.now_ms >= expires_at)
+                {
                     continue;
                 }
                 if let Some(bound) = child.attrs.bound_to {
@@ -3016,11 +3022,22 @@ impl Agent {
         let map_key = (cap.id(), lane, method.to_string(), key.to_string());
         {
             let mut kernel = self.cell.borrow_mut();
-            if let Some((id, stored_args)) = kernel.idempotency.get(&map_key).copied() {
+            if let Some((id, stored_args, stored_peer)) = kernel.idempotency.get(&map_key).copied()
+            {
                 if stored_args != fingerprint {
                     let error = Error::InvalidArgument(
                         "the idempotency key was used with different arguments",
                     );
+                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    return Err(error);
+                }
+                // A key names the principal that claimed it. A replay from
+                // another peer would hand it a promise whose job was stamped for
+                // the first caller, and dispatch would then refuse it — a
+                // confusing failure for a request that is simply not the same
+                // one.
+                if stored_peer != crate::identity::presented_fingerprint(peer) {
+                    let error = Error::Identity("the idempotency key belongs to another peer");
                     Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
                     return Err(error);
                 }
@@ -3094,9 +3111,14 @@ impl Agent {
         let promise = self.call_as_with_payload(peer, lane, cap, method, args, payload_bytes)?;
         let id = promise.id();
         let mut kernel = self.cell.borrow_mut();
-        kernel
-            .idempotency
-            .insert(map_key.clone(), (id, fingerprint));
+        kernel.idempotency.insert(
+            map_key.clone(),
+            (
+                id,
+                fingerprint,
+                crate::identity::presented_fingerprint(peer),
+            ),
+        );
         kernel.idempotency_order.push_back(map_key);
         const MAX_IDEMPOTENCY: usize = 1024;
         while kernel.idempotency.len() > MAX_IDEMPOTENCY {
@@ -4155,7 +4177,7 @@ impl Kernel {
                     || self
                         .idempotency
                         .values()
-                        .any(|(mapped, _)| mapped == id);
+                        .any(|(mapped, _, _)| mapped == id);
                 if !pinned {
                     victim = Some(index);
                     break;
@@ -4749,6 +4771,11 @@ fn args_fingerprint(args: &[Arg]) -> [u8; 32] {
 
 /// Key of the idempotency cache: capability, lane, method and caller key.
 type IdempotencyKey = (CapId, LaneId, String, String);
+
+/// One cached idempotency claim: the promise, the request fingerprint, and the
+/// fingerprint of the peer that claimed the key (so a replay from another peer
+/// is refused at the hit rather than at dispatch).
+type IdempotencyEntry = (PromiseId, [u8; 32], Option<[u8; 32]>);
 
 /// True when a provider's value nests deeper than the wire accepts.
 ///
