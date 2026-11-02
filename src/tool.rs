@@ -238,7 +238,7 @@ impl McpTransport for MemoryTransport {
         })?;
         let method = request.get("method").and_then(Json::as_str).unwrap_or("");
         let id = request.get("id").cloned().unwrap_or(Json::Null);
-        let response = self.responses.get(method).cloned().unwrap_or_else(|| {
+        let mut response = self.responses.get(method).cloned().unwrap_or_else(|| {
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -246,6 +246,17 @@ impl McpTransport for MemoryTransport {
             })
             .to_string()
         });
+        // A real server echoes the request id. A canned response carrying a
+        // fixed id desynchronises the session on its second call, which is a
+        // property of this test double and not of the client under test.
+        if let Ok(mut parsed) = serde_json::from_str::<Json>(&response) {
+            if let Some(object) = parsed.as_object_mut() {
+                if object.contains_key("id") {
+                    object.insert("id".to_string(), id);
+                    response = parsed.to_string();
+                }
+            }
+        }
         self.queue.push(response);
         Ok(())
     }

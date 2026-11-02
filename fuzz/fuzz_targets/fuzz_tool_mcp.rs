@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use libfuzzer_sys::fuzz_target;
 
+use active_rpc::kernel::Provider;
 use active_rpc::tool::{McpSession, MemoryTransport};
 use active_rpc::{Arg, Budget, CapAttrs, Value};
 
@@ -85,7 +86,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = promise.value();
         }
         Err(error) => assert!(
-            error.code().starts_with("rpc/"),
+            active_rpc::error::ERROR_CODES.contains(&error.code()),
             "unexpected {}",
             error.code()
         ),
@@ -110,26 +111,56 @@ fuzz_target!(|data: &[u8]| {
     malformed.insert("initialize".into(), "not json".into());
     assert!(McpSession::handshake(MemoryTransport::new(malformed)).is_err());
 
-    // The server is remote input: every byte of `data` is fed back as a
-    // response body for each method. The parser used to be reachable only
-    // through two hard-coded strings, so a remote MCP server had no coverage.
+    // The server is remote input: every byte of `data` is fed back as the body
+    // of one method's response, while the methods before it answer validly. A
+    // map keyed by method alone (the previous shape) left two of the three
+    // parsers unreachable: a fuzzed `tools/list` body never got past
+    // `initialize`.
     let body = String::from_utf8_lossy(data).into_owned();
-    for method in ["initialize", "tools/list", "tools/call"] {
+    let valid = responses();
+    let mut placements: Vec<(&str, BTreeMap<String, String>)> = Vec::new();
+    for method in ["initialize", "tools/list"] {
         let mut map = BTreeMap::new();
-        map.insert(method.to_string(), body.clone());
+        for (name, response) in &valid {
+            if name == method {
+                map.insert(name.clone(), body.clone());
+            } else if *name == "initialize" || method == "tools/list" {
+                map.insert(name.clone(), response.clone());
+            }
+        }
+        placements.push((method, map));
+    }
+    for (method, map) in placements {
         match McpSession::handshake(MemoryTransport::new(map)) {
             Ok(session) => {
                 // A body that parses must still be bounded: the tool list is a
                 // response an operator's policy is derived from.
                 assert!(
                     session.tools().len() <= 256,
-                    "a response cannot invent an unbounded tool list"
+                    "a {method} response cannot invent an unbounded tool list"
                 );
             }
             Err(error) => assert_eq!(
                 error.code(),
                 "rpc/provider",
                 "a malformed {method} response must be a provider error, got {error}"
+            ),
+        }
+    }
+
+    // `tools/call`: the result body is remote input too. A session with a valid
+    // handshake and the fuzzed call result must answer or refuse as a provider,
+    // and never panic in the JSON conversion.
+    let mut call_map = valid.clone();
+    call_map.insert("tools/call".to_string(), body);
+    if let Ok(session) = McpSession::handshake(MemoryTransport::new(call_map)) {
+        let mut tool = session;
+        match tool.invoke(0, &active_rpc::value::Call::new("echo", vec![Arg::text("x")])) {
+            Ok(_) => {}
+            Err(error) => assert_eq!(
+                error.code(),
+                "rpc/provider",
+                "a malformed tools/call result must be a provider error, got {error}"
             ),
         }
     }

@@ -1904,6 +1904,9 @@ impl Agent {
         // ceilings bound it, and every transferred id costs its wire size. A
         // lane that spends nothing while filling a channel would let 4 096
         // messages of 64 MiB sit in kernel memory it never paid for.
+        if let Some(error) = shape_refusal(&payload, &lane_budget) {
+            return Err(error);
+        }
         let bytes = payload
             .wire_size()
             .saturating_add((cap_ids.len() as u64).saturating_mul(16));
@@ -2089,6 +2092,9 @@ impl Agent {
             return Err(Error::Backpressure("the kernel's channel byte ceiling"));
         }
         let effective = record.attrs.budget.intersect(&lane_budget);
+        if let Some(error) = shape_refusal(&payload, &effective) {
+            return Err(error);
+        }
         if bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
@@ -2446,15 +2452,8 @@ impl Agent {
         // in-process caller never crosses the wire.
         for arg in &args {
             let Arg::Value(value) = arg else { continue };
-            let shape = value.shape();
-            if shape.depth > effective.max_depth {
-                return Err(Error::BudgetExceeded("depth"));
-            }
-            if shape.widest > effective.max_array_len {
-                return Err(Error::BudgetExceeded("array_len"));
-            }
-            if shape.largest_scalar > effective.max_value_size {
-                return Err(Error::BudgetExceeded("value_size"));
+            if let Some(error) = shape_refusal(value, &effective) {
+                return Err(error);
             }
         }
         // A lane's byte ceiling is cumulative, not a per-call limit: otherwise
@@ -3564,6 +3563,18 @@ impl Agent {
                         if failure.is_none() && resolved_bytes > job.call.budget.max_bytes {
                             failure = Some(Error::BudgetExceeded("byte"));
                         }
+                        // A promise was a placeholder at queue time; what it
+                        // resolved into is measured now, because the shape
+                        // ceilings are as much part of the grant as the bytes.
+                        if failure.is_none() {
+                            for arg in &args {
+                                let Arg::Value(value) = arg else { continue };
+                                if let Some(error) = shape_refusal(value, &job.call.budget) {
+                                    failure = Some(error);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 let extra = if failure.is_none() {
@@ -3651,10 +3662,18 @@ impl Agent {
             // Egress is charged before settlement: a response larger than the
             // remaining grant never leaves the kernel.
             let outcome = match outcome {
-                Ok(value) => match self.charge_egress(&job, value.wire_size()) {
-                    Ok(()) => Ok(value),
-                    Err(error) => Err(error),
-                },
+                Ok(value) => {
+                    // The grant bounds what comes back as much as what went in:
+                    // a provider returning a list far wider than the grant's
+                    // `max_array_len` would otherwise be admitted whole.
+                    match shape_refusal(&value, &job.call.budget) {
+                        Some(error) => Err(error),
+                        None => match self.charge_egress(&job, value.wire_size()) {
+                            Ok(()) => Ok(value),
+                            Err(error) => Err(error),
+                        },
+                    }
+                }
                 Err(error) => Err(error),
             };
 
@@ -4479,6 +4498,26 @@ type IdempotencyKey = (CapId, LaneId, String, String);
 /// The decoder caps nesting at 64; a provider can build anything. Settlement
 /// hashes and walks the value, so an unbounded one overflows the stack and
 /// aborts the process (a panic cannot be caught).
+/// Refuse a value whose shape exceeds the grant it is moved under.
+///
+/// The same three ceilings apply wherever a value crosses the boundary: before
+/// a provider runs (`call`), after a promise resolves (dispatch), on the
+/// response a provider produced (egress), and on lane traffic (`send`,
+/// `publish`). One helper keeps the four sites from drifting.
+fn shape_refusal(value: &Value, budget: &Budget) -> Option<Error> {
+    let shape = value.shape();
+    if shape.depth > budget.max_depth {
+        return Some(Error::BudgetExceeded("depth"));
+    }
+    if shape.widest > budget.max_array_len {
+        return Some(Error::BudgetExceeded("array_len"));
+    }
+    if shape.size > budget.max_value_size {
+        return Some(Error::BudgetExceeded("value_size"));
+    }
+    None
+}
+
 fn value_too_deep(value: &Value, limit: usize) -> bool {
     let mut stack: Vec<(&Value, usize)> = vec![(value, 1)];
     while let Some((value, depth)) = stack.pop() {

@@ -11,7 +11,7 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,7 +38,7 @@ jobs:
   perf-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - name: Run the machine-portable perf gate
         run: |
@@ -46,7 +46,7 @@ jobs:
           python3 scripts/perf_gate.py perf-matrix.json
       - name: Upload the matrix
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: perf-matrix
           path: perf-matrix.json
@@ -54,7 +54,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.88.0
       # 1.88 is the floor because the patched `time` (RUSTSEC-2026-0009) and
       # `proptest` 1.12 both require it; see docs/adr/0007-msrv.md.
@@ -66,7 +66,7 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - name: Package (the tarball must build on its own)
         run: cargo package --locked
@@ -74,7 +74,7 @@ jobs:
   hardening-status:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # A stale row, a missing test, or a critical invariant without a
       # negative-control plan fails the build.
       - name: Validate the hardening matrix
@@ -83,7 +83,7 @@ jobs:
   negative-controls:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       # A security test that still passes on a broken build proves nothing.
       - name: Every security-critical check must fail on a broken build
@@ -92,7 +92,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # A rolling nightly is deliberate: libFuzzer fixes and sanitizer support
       # land there first. The crate graph is pinned by the committed
       # fuzz/Cargo.lock, which cargo-fuzz uses as-is.
@@ -127,11 +127,23 @@ jobs:
             # the size every parser refuses.
             cargo fuzz run "$target" -- -runs=2000 -max_len=65536
           done
+      # A crash input is written under fuzz/artifacts, which is gitignored, so
+      # without this step the run that found it leaves nothing behind. The
+      # nightly lanes upload the same paths.
+      - name: Upload artifacts and corpus
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: fuzz-pr
+          path: |
+            fuzz/artifacts
+            fuzz/corpus
+          if-no-files-found: ignore
 
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - name: Install audit tools
         run: cargo install cargo-audit cargo-deny --locked
@@ -147,14 +159,14 @@ jobs:
   sbom:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - name: Generate and verify the SBOM
         run: |
           mkdir -p dist
           python3 scripts/sbom.py --output dist/active-rpc.cdx.json
           python3 scripts/sbom.py --check dist/active-rpc.cdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: sbom
           path: dist/*.cdx.json
@@ -162,7 +174,7 @@ jobs:
   api-surface:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@nightly
       # The authoritative check: the resolved public API, not a text scan.
       - name: Generate rustdoc JSON
@@ -172,8 +184,8 @@ jobs:
   presentation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: "3.12"
       - name: Install image reader
@@ -183,7 +195,7 @@ jobs:
   control-plane:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -203,7 +215,7 @@ jobs:
   cli:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -229,7 +241,7 @@ jobs:
           - active-rpc-tools
           - active-rpc-transport
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - name: Facade tests
         run: cargo test --manifest-path "facades/${{ matrix.crate }}/Cargo.toml"

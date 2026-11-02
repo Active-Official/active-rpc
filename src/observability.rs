@@ -382,7 +382,7 @@ fn hex(bytes: &[u8; 32]) -> String {
     out
 }
 
-/// Longest label a trace carries, in bytes.
+/// Longest label a trace carries, in bytes, including the ellipsis.
 pub const MAX_LABEL_BYTES: usize = 128;
 
 /// Bound and escape a free-form label before it enters a trace.
@@ -392,16 +392,21 @@ pub const MAX_LABEL_BYTES: usize = 128;
 /// one of them, and a trace is text that a collector may write into a line log
 /// or a terminal. Escaping and truncating here is the fail-closed boundary,
 /// independent of what each producer does.
+///
+/// The result is at most [`MAX_LABEL_BYTES`] bytes and contains no control
+/// character: the ellipsis is reserved for out of the budget, so the bound is
+/// the constant and not the constant plus three.
 pub fn label(text: &str) -> String {
     if text.len() <= MAX_LABEL_BYTES && !text.chars().any(char::is_control) {
         return text.to_string();
     }
-    let mut out = String::with_capacity(MAX_LABEL_BYTES + 4);
+    let budget = MAX_LABEL_BYTES - '…'.len_utf8();
+    let mut out = String::with_capacity(MAX_LABEL_BYTES);
     for ch in text.chars() {
         let piece: String = ch.escape_debug().collect();
-        if out.len() + piece.len() > MAX_LABEL_BYTES {
+        if out.len() + piece.len() > budget {
             out.push('…');
-            break;
+            return out;
         }
         out.push_str(&piece);
     }

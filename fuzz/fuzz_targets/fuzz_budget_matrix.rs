@@ -110,54 +110,55 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(error.code(), "rpc/invalid-argument");
     }
 
-    // 3. A value that exceeds the depth or size ceiling is refused. The
-    //    ceilings come from the input, and each probe is built *past* its
-    //    ceiling: a fixed tight budget with fixed probes could not tell "the
-    //    ceiling binds" from "the value was too big for any budget".
+    // 3. A value past one shape ceiling is refused for *that* dimension. The
+    //    ceilings come from the input and each probe is built past its own
+    //    ceiling; `max_bytes` stays generous so a byte refusal cannot satisfy
+    //    the assertion instead. The message names the dimension, because the
+    //    code is `rpc/budget-exceeded` for every one of them.
     let depth = 2 + usize::from(data[0] % 8);
-    let per_value = 8 * (1 + usize::from(data.get(1).copied().unwrap_or(1) % 16));
+    let width = 2 + usize::from(data.get(1).copied().unwrap_or(0) % 12);
+    let per_value = 8 * (1 + usize::from(data.get(2).copied().unwrap_or(1) % 16));
     let tight = Budget {
         max_depth: depth as u64,
+        max_array_len: width as u64,
         max_value_size: per_value as u64,
-        max_bytes: per_value as u64,
+        max_bytes: 1 << 20,
         ..Budget::default()
     };
     let tight_lane = agent.create_lane("tight", tight).expect("tight lane");
     let tight_cap = common::mint(&agent, provider, &["ping"], tight);
-    let deep = nested(depth + 4);
-    match agent.call(
-        tight_lane,
-        &tight_cap,
-        "ping",
-        vec![active_rpc::Arg::Value(deep)],
-    ) {
-        Ok(promise) => {
-            let _ = promise.value();
-            panic!("a value past max_depth = {depth} was admitted");
-        }
-        Err(error) => assert_eq!(
-            error.code(),
-            "rpc/budget-exceeded",
-            "a value past max_depth must be a budget refusal, got {error}"
-        ),
-    }
 
-    // A list past the value-size ceiling is refused for the same reason.
-    let wide = Value::List(vec![Value::Int(7); 4 + per_value]);
-    match agent.call(
-        tight_lane,
-        &tight_cap,
-        "ping",
-        vec![active_rpc::Arg::Value(wide)],
-    ) {
-        Ok(promise) => {
-            let _ = promise.value();
-            panic!("a value past max_value_size was admitted");
-        }
-        Err(error) => assert_eq!(
-            error.code(),
-            "rpc/budget-exceeded",
-            "a value past max_value_size must be a budget refusal, got {error}"
+    let probes = [
+        ("depth", nested(depth + 4)),
+        ("array_len", Value::List(vec![Value::Int(7); width + 4])),
+        (
+            "value_size",
+            Value::text("x".repeat(per_value.saturating_add(16))),
         ),
+    ];
+    for (dimension, value) in probes {
+        match agent.call(
+            tight_lane,
+            &tight_cap,
+            "ping",
+            vec![active_rpc::Arg::Value(value)],
+        ) {
+            Ok(promise) => {
+                let _ = promise.value();
+                panic!("a value past max_{dimension} was admitted");
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.code(),
+                    "rpc/budget-exceeded",
+                    "a value past max_{dimension} must be a budget refusal, got {error}"
+                );
+                let text = error.to_string();
+                assert!(
+                    text.contains(dimension),
+                    "the refusal must name the dimension that bound: {text}"
+                );
+            }
+        }
     }
 });

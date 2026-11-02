@@ -78,22 +78,14 @@ impl Value {
     }
 
     /// Bytes this value occupies on the wire (upper bound; used for budgets).
+    ///
+    /// Computed by [`Value::shape`], so the walk is iterative: a value nested
+    /// deeper than the stack can hold is measured (and then refused by the
+    /// depth ceiling), never an abort. It used to recurse, which meant the
+    /// ceiling that exists to stop such a value was applied after the walk that
+    /// fell over on it.
     pub fn wire_size(&self) -> u64 {
-        match self {
-            Value::Null => 1,
-            Value::Bool(_) => 2,
-            Value::Int(_) | Value::Float(_) => 9,
-            Value::Text(text) | Value::Path(text) => 5 + text.len() as u64,
-            Value::Secret => 1,
-            Value::Module(bytes) => 5 + bytes.len() as u64,
-            Value::List(items) => 5 + items.iter().map(Value::wire_size).sum::<u64>(),
-            Value::Map(entries) => {
-                5 + entries
-                    .iter()
-                    .map(|(key, value)| 5 + key.len() as u64 + value.wire_size())
-                    .sum::<u64>()
-            }
-        }
+        self.shape().size
     }
 
     /// True when this value or any descendant is a secret marker.
@@ -114,51 +106,88 @@ impl Value {
     /// build a value deeper than the Rust stack, and the check that is supposed
     /// to bound it must not be the thing that overflows.
     pub fn shape(&self) -> Shape {
+        enum Work<'a> {
+            Visit(&'a Value, u64),
+            /// A container finished: fold its size into its parent.
+            Fold(u64),
+        }
+
         let mut shape = Shape::default();
-        let mut stack: Vec<(&Value, u64)> = vec![(self, 0)];
-        while let Some((value, depth)) = stack.pop() {
-            match value {
-                Value::List(items) => {
+        let mut work = vec![Work::Visit(self, 0)];
+        // Accumulators, one per open container. A scalar at the top level (no
+        // open container) lands in `total` directly.
+        let mut open: Vec<u64> = Vec::new();
+        let mut total = 0u64;
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Visit(value, depth) => {
+                    let scalar = match value {
+                        Value::Null | Value::Secret => Some(1u64),
+                        Value::Bool(_) => Some(2),
+                        Value::Int(_) | Value::Float(_) => Some(9),
+                        Value::Text(text) | Value::Path(text) => {
+                            Some(5u64.saturating_add(text.len() as u64))
+                        }
+                        Value::Module(bytes) => Some(5u64.saturating_add(bytes.len() as u64)),
+                        Value::List(_) | Value::Map(_) => None,
+                    };
+                    if let Some(size) = scalar {
+                        match open.last_mut() {
+                            Some(top) => *top = top.saturating_add(size),
+                            None => total = total.saturating_add(size),
+                        }
+                        continue;
+                    }
                     shape.depth = shape.depth.max(depth + 1);
-                    shape.widest = shape.widest.max(items.len() as u64);
-                    for item in items {
-                        stack.push((item, depth + 1));
+                    open.push(0);
+                    work.push(Work::Fold(5));
+                    match value {
+                        Value::List(items) => {
+                            shape.widest = shape.widest.max(items.len() as u64);
+                            for item in items {
+                                work.push(Work::Visit(item, depth + 1));
+                            }
+                        }
+                        Value::Map(entries) => {
+                            shape.widest = shape.widest.max(entries.len() as u64);
+                            for (key, item) in entries {
+                                // A key is payload too: a grant that bounds the
+                                // size of a value must bound the name it arrives
+                                // under.
+                                let key_size = 5u64.saturating_add(key.len() as u64);
+                                match open.last_mut() {
+                                    Some(top) => *top = top.saturating_add(key_size),
+                                    None => total = total.saturating_add(key_size),
+                                }
+                                work.push(Work::Visit(item, depth + 1));
+                            }
+                        }
+                        _ => unreachable!("only containers open an accumulator"),
                     }
                 }
-                Value::Map(entries) => {
-                    shape.depth = shape.depth.max(depth + 1);
-                    shape.widest = shape.widest.max(entries.len() as u64);
-                    for (key, item) in entries {
-                        // A key is payload too: a grant that bounds the size of a
-                        // value must bound the name it arrives under.
-                        shape.largest_scalar = shape.largest_scalar.max(key.len() as u64);
-                        stack.push((item, depth + 1));
+                Work::Fold(constant) => {
+                    let inner = open.pop().unwrap_or(0).saturating_add(constant);
+                    match open.last_mut() {
+                        Some(top) => *top = top.saturating_add(inner),
+                        None => total = total.saturating_add(inner),
                     }
                 }
-                Value::Text(text) | Value::Path(text) => {
-                    shape.largest_scalar = shape.largest_scalar.max(text.len() as u64);
-                }
-                Value::Module(bytes) => {
-                    shape.largest_scalar = shape.largest_scalar.max(bytes.len() as u64);
-                }
-                // Scalars carry no structure, and a secret is a marker: its size
-                // is not read, because that would be an oracle.
-                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Secret => {}
             }
         }
+        shape.size = total;
         shape
     }
 }
 
-/// The structure a budget bounds: nesting, width and the largest single scalar.
+/// The structure a budget bounds: nesting, width and materialised size.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Shape {
     /// Nesting depth: a scalar is 0, a list holding a scalar is 1.
     pub depth: u64,
     /// Length of the longest list or map anywhere in the value.
     pub widest: u64,
-    /// Length of the largest text, path, module or map key, in bytes.
-    pub largest_scalar: u64,
+    /// Bytes the value occupies on the wire, matching [`Value::wire_size`].
+    pub size: u64,
 }
 
 /// One call argument.

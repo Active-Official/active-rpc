@@ -5,8 +5,11 @@
 //! Invariants under test (I-8, I-10):
 //!
 //! 1. A write larger than the remaining capacity is refused, never truncated
-//!    silently and never written out of bounds.
-//! 2. A frame whose declared length exceeds the segment is refused.
+//!    silently, never written out of bounds, and leaves no partial frame.
+//! 2. A frame header that claims more than the segment is refused by the reader.
+//!    The writer prefixes the length itself, so such a header cannot be produced
+//!    through the public API: the reader's bound is asserted on an empty ring and
+//!    after a refused write.
 //! 3. Arbitrary read/advance/reset sequences never panic.
 //! 4. gRPC length-prefix framing is self-delimiting and a fixed point.
 //!
@@ -16,9 +19,6 @@ use libfuzzer_sys::fuzz_target;
 
 use active_rpc::transport::connect::{grpc_frame, grpc_unframe};
 use active_rpc::transport::shm::SharedSegment;
-
-#[path = "common.rs"]
-mod common;
 
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
@@ -48,15 +48,29 @@ fuzz_target!(|data: &[u8]| {
     //    corpus seed can reach the boundary and the "refused" branch used to be
     //    unreachable.
     let oversized = vec![0u8; capacity + 1];
+
+    // 2. The reader's frame bound: a refused write leaves the ring exactly as it
+    //    was, and a fresh ring answers `Ok(None)` rather than inventing a frame.
+    let before_refusal = segment.available();
     assert!(
         segment.write(&oversized).is_err(),
         "a write larger than the segment must be refused"
     );
-
-    // 3. A frame header that claims more than the segment is refused.
-    let _ = segment.read();
-    let _ = segment.with_frame(|frame| frame.len());
-    let _ = segment.pop_frame(|frame| frame.len());
+    assert_eq!(
+        segment.available(),
+        before_refusal,
+        "a refused write must not leave a partial frame behind"
+    );
+    let empty = SharedSegment::new(1024);
+    assert!(
+        matches!(empty.read(), Ok(None)),
+        "an empty ring has no frame"
+    );
+    assert!(
+        matches!(empty.with_frame(|frame| frame.len()), Ok(None)),
+        "an empty ring has no frame header"
+    );
+    assert!(matches!(empty.pop_frame(|frame| frame.len()), Ok(None)));
 
     // 3. Arbitrary advance/reset sequences never panic and never move past the
     // produced head. `advance` takes no length: it reads the frame header, so a
@@ -93,5 +107,4 @@ fuzz_target!(|data: &[u8]| {
     bogus.extend_from_slice(payload);
     let _ = grpc_unframe(&bogus);
 
-    let _ = common::budget_from(data);
 });

@@ -33,7 +33,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | round 1: 2 highs + 6 mediums + 3 lows fixed | 11 fixed / 0 rejected / 0 open (1 recorded: publisher identity) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | round 1: 4 highs + 8 mediums + 7 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
 | R-19 | control-plane | `control-plane/**` | round 1: 3 highs + 5 mediums + 8 lows fixed | 16 fixed / 0 rejected / 0 open (3 documented) | this commit |
-| R-20 | fuzz | `fuzz/**` | pending | — | — |
+| R-20 | fuzz | `fuzz/**` | round 1: 9 highs + 8 mediums + 5 lows fixed (1 noted); found 3 kernel defects | 21 fixed / 0 rejected / 1 noted | `09b1c82` |
 
 ## Cross-cutting passes (after the sections)
 
@@ -49,6 +49,87 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-20 fuzz program - 2026-11-02 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `4c127c4`.
+No critical. The verdict was that `fuzz/` was "a smoke suite dressed as a
+security gate": five targets could not fail on the defect they named, three
+named invariants were no-ops, the two highest-risk parsers (MCP responses, module
+/domain) were unreachable from any input, and the nightly lane discarded the only
+artifact that would reproduce a crash. Nine highs, eight mediums, five lows.
+
+Fixing the targets found **three real kernel defects** that no unit test reached.
+They are the reason this section is not cosmetic: each was a check that existed
+in a declaration and nowhere else.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `fuzz_promise_graph`: the foreign-promise branch inspected `agent.call(..).err()`, but the refusal happens at dispatch, so the only assertion was `starts_with("rpc/")`, which every error satisfies. The named invariant was never checked | **fixed**: the foreign promise is refused at *queue* with `rpc/unknown-promise` (`expect_err`) |
+| F2 | high | `fuzz_capability_lifecycle`: a `for (_, cap) in &drops { let _ = cap; }` loop claimed to assert "exactly once per object"; a kernel that never notifies, or notifies N times, passed | **fixed**: `drop(caps)` then `assert_eq!(drops.len(), 1)`. This exposed **K1** immediately: the kernel notified once *per capability*, so nine notifications arrived for one object |
+| F3 | high | `fuzz_tool_process`: an argument policy that admitted `"ok;rm -rf /"` produced `Ok` and the target passed; only `Err` was asserted | **fixed**: the argument policy is enforced at dispatch, so the assertion moved to `promise.value()`: `Ok` only for `"ok"`, otherwise exactly `rpc/tool-policy` |
+| F4 | high | `fuzz_transport_framing`: "a frame larger than the segment is refused" required `payload.len() > capacity`, but `SharedSegment::new` clamps to 1024 and the largest seed is 901 B, so the branch was unreachable | **fixed**: the oversize frame is built in-target (`vec![0u8; capacity + 1]`) and the write must be refused |
+| F5 | high | `fuzz_tool_mcp`: the untrusted *server response* parser was never fuzzed (the input was a constant `BTreeMap`); the malformed-response cases were two hard-coded strings | **fixed**: `data` is fed back as the `initialize`/`tools/list`/`tools/call` response body and must be `rpc/provider` |
+| F6 | high | `nightly.yml` had no job timeout and no artifact upload, so a 200k-run crash was written to a gitignored directory and lost | **fixed**: `timeout-minutes: 120`, `-max_len=65536`, `upload-artifact` (`if: always()`) for `fuzz/artifacts` and the grown corpus |
+| F7 | high | `fuzz_wasm_module` installed the OS CSPRNG as `env.random`, so a failure on the guest's random path did not replay from the input | **fixed**: `random: false`; the clock is seeded by the embedder |
+| F8 | high | `fuzz_budget_matrix` could not tell "each ceiling binds" from "refuses everything": the loop broke on three codes and only asserted `calls <= max_calls` (true at zero calls), and the four shape ceilings used a fixed budget and fixed values | **fixed**: the first refusal must be `rpc/budget-exceeded` after exactly `max_calls`, and the `depth`/`max_value_size` probes are data-driven. This exposed **K2**: `max_depth`, `max_array_len` and `max_value_size` were never enforced on a call at all |
+| F9 | high | the domain and durable-record parsers had no target, and `STATUS.md` filed the Infinity names as `n/a` rather than an open gap | **fixed**: `fuzz_domain_module` (decode, canonical install, every domain method over fuzzed paths) and `fuzz_persistence_record` (`from_json`, canonical round trip, a seal that never verifies under a foreign key); invariant rows H1.25/H1.26 added and the matrix regenerated |
+| F10 | medium | `fuzz_tool_http` never called the allowed path, and accepted `rpc/invalid-argument` where the contract is `rpc/tool-policy` | **fixed**: the allowed path must be admitted and every escape must be `rpc/tool-policy` |
+| F11 | medium | `fuzz_channel_cap_transfer` asserted nothing on the receive half and only `!drops.is_empty()` on the drop half | **fixed**: the payload is compared, and `drops == vec![(0, cap.id())]` |
+| F12 | medium | `fuzz_arp1_frame`: a decoder that ignored the caller's limits passed, and the surviving assertions restated `decode`'s own work | **fixed**: a strict profile must refuse an envelope it bounds |
+| F13 | medium | `fuzz_bulk_plan` restated `decode_for`'s invariants and replayed the sender's own frames in order, so truncation, reordering and conflicting data were never exercised | **fixed**: a deterministic permutation, a tampered last byte and a truncated frame, with the receiver's `missing()` set asserted |
+| F14 | medium | `fuzz/README.md`, `STATUS.md` and `CORPUS.md` hid two targets and claimed a longer `main` campaign that no workflow ran | **fixed**: all three name sixteen targets, the campaigns table matches the workflows, and `tests/fuzz_manifest_tests.rs` fails when a workflow, the fuzz README, the corpus inventory or the runner script omits a target |
+| F15 | medium | `scripts/fuzz_docker.py` held a hand-copied target list that ended at `fuzz_topic_policy` and printed "all 12 targets completed" while four never ran | **fixed**: the list is read from `fuzz/Cargo.toml`, `--build` exits cleanly, `-max_len` matches CI, and the manifest test forbids a hard-coded list |
+| F16 | medium | the fuzz binary was not the shipped build: `default-features = false, features = ["wasm-tools"]` compiled out QUIC and HTTP/2 | **fixed**: `features = ["wasm-tools", "quic", "http2"]` |
+| F17 | medium | `fuzz_receipt_log` created, locked, synced and unlinked a file per execution, so its 200k-run bound could never be reached; `fuzz_replay_package` returned from the whole target for a package over the replay ceiling, skipping its structured half | **fixed**: the disk half runs on one input in sixteen (the parser half still sees every input); the over-ceiling package skips only its replay half |
+| F18 | low | `let _ = Value::Null`-style noise, and `let _ =` calls standing in for checks | **fixed** |
+| F19 | low | failure messages did not name the invariant (two targets asserted the same literal code for different rules) | **fixed**: one message per assertion |
+| F20 | low | `fuzz_wasm_module`'s size ceiling and its "the log is per call" claim were asserted nowhere | **fixed**: an oversize module built in-target must be `wasm/module`, and the log is drained and bounded after each call |
+| F21 | low | repeated seeds across targets, and a 0-byte receipt seed | **noted**: the action-stream seeds are identical by design (the same alphabet is interpreted per target), and the empty log is a real case (`verify_bytes(&[])`) |
+
+**K1 - `on_drop` fired once per capability (high).** The kernel notified the
+provider for every capability record that reached zero references, so a provider
+reclaiming per-object state on the first notification freed an object its parent
+could still call. The notification now fires when the last live capability for
+`(provider, object)` goes. `tests/redteam_tests.rs`
+(`threat_revocation_and_lifetime_edges`) and `tests/unit_tests.rs`
+(`capability_lifecycle_matches_the_bounded_model`, 625 sequences) hold the
+contract; the second had encoded the old rule and now asserts "exactly one
+notification, after the last handle, naming the object".
+
+**K2 - the budget's shape ceilings were never enforced (high).** `max_depth`,
+`max_array_len` and `max_value_size` were declared, intersected, exported and
+documented, and `call_inner_payload` checked only `max_bytes`. An in-process
+caller could hand a provider a value 10 000 levels deep under a grant that said
+"depth 2"; a peer's value was refused by `WireLimits` at ingress, which is why
+the wire tests never saw it. Now checked before the provider runs, with the
+dimension in the refusal and its own metrics label; `Value::shape()` measures
+depth, width and the largest scalar in one iterative pass (the check that bounds
+nesting must not be the thing that overflows the stack), and
+`tests/budget_shape_tests.rs` (10 tests, seven of which fail against the pre-fix
+tree) pins it.
+
+**K3 - the per-object scan was quadratic (medium).** Deciding "is this object
+still referenced" scanned every live capability, so a mint/drop loop was
+quadratic: dropping 20 000 capabilities took 1.33 s in a release build. A
+per-object count next to the registry makes one cycle constant work: 20 000
+drops in 31 ms, 60 000 in 116 ms, and 60 000 capabilities on one object produce
+exactly one notification. `tests/perf_budget.rs::capability_churn_is_linear`
+compares per-capability cost at 2k and 20k; `docs/spec/performance.md` records
+the numbers and the reproduction command.
+
+Campaign: `python scripts/fuzz_docker.py --all --runs 3000` on
+`active-fuzz:1.88`, sixteen targets, `-max_len=65536`. The first pass reached 840
+executions in `fuzz_wasm_module` and stopped on a wrong assertion in the new
+size-ceiling check (the refusal is `wasm/module`, not `wasm/limits`); the target
+was corrected and re-ran clean, and a follow-up `--runs 50000` run measured
+3 846 executions/s with no crash. The crash input from the `on_drop` discovery
+was promoted into the corpus as `r20-on-drop-per-object.bin`.
+
+Gate: `cargo test --all-features` 611 passed across 68 suites;
+`--no-default-features` 551; control plane 32; CLI 22; clippy, fmt and `cargo
+doc -D warnings` clean on both feature sets; fuzz crate clippy clean; negative
+controls 9/9.
 
 ### R-02 kernel dispatch - 2026-11-01 (round 3)
 

@@ -148,6 +148,48 @@ impl Error {
     }
 }
 
+/// Every machine-readable code [`Error::code`] can return.
+///
+/// The set is closed and part of the wire contract (`docs/spec/wire.md` names
+/// each one), so a consumer can reject an unexpected class. A fuzz oracle that
+/// writes `code().starts_with("rpc/")` accepts every error in this crate,
+/// because every code starts with `rpc/`; membership in this list is the check
+/// it meant. `tests/conformance_tests.rs` fails when a variant is added without
+/// registering its code here.
+pub const ERROR_CODES: &[&str] = &[
+    "rpc/attenuation-escalation",
+    "rpc/backpressure",
+    "rpc/budget-exceeded",
+    "rpc/bulk",
+    "rpc/capability-table",
+    "rpc/domain",
+    "rpc/identity",
+    "rpc/invalid-argument",
+    "rpc/method-not-granted",
+    "rpc/path-not-granted",
+    "rpc/payload",
+    "rpc/persistence",
+    "rpc/pipelined-cycle",
+    "rpc/promise-cancelled",
+    "rpc/promise-resolved",
+    "rpc/provider",
+    "rpc/read-only",
+    "rpc/receipt",
+    "rpc/replay",
+    "rpc/revoked",
+    "rpc/timeout",
+    "rpc/tool-policy",
+    "rpc/topic-not-granted",
+    "rpc/transport",
+    "rpc/transport-unavailable",
+    "rpc/unknown-capability",
+    "rpc/unknown-channel",
+    "rpc/unknown-lane",
+    "rpc/unknown-promise",
+    "rpc/unresolvable-promise",
+    "rpc/wire",
+];
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

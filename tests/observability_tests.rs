@@ -1,7 +1,9 @@
 //! The observability schema: stable names, correlation ids, no authority.
 
 use active_rpc::cap::CapAttrs;
-use active_rpc::observability::{project, EVENT_NAMES, METRICS_SCHEMA, SCHEMA};
+use active_rpc::observability::{
+    label, project, EVENT_NAMES, MAX_LABEL_BYTES, METRICS_SCHEMA, SCHEMA,
+};
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::{
     Agent, Budget, CapId, ChannelId, Event, IdentityPolicy, LaneId, PeerIdentity, PromiseId,
@@ -367,4 +369,36 @@ fn counters_agree_with_the_tape() {
         events.len() as u64,
         "the gauge is the tape length"
     );
+}
+
+/// `MAX_LABEL_BYTES` is the bound a collector sizes its buffer against, so the
+/// ellipsis has to fit inside it: a 200-character label used to escape with 128
+/// bytes of text plus a three-byte ellipsis.
+#[test]
+fn a_label_never_exceeds_its_declared_ceiling() {
+    for text in [
+        "a".repeat(200),
+        "b".repeat(MAX_LABEL_BYTES - 1),
+        "c".repeat(MAX_LABEL_BYTES),
+        "d".repeat(MAX_LABEL_BYTES + 1),
+        "e\n".repeat(200),
+        format!("{}\u{0}", "f".repeat(200)),
+        "é".repeat(200),
+        "🎉".repeat(100),
+    ] {
+        let label = label(&text);
+        assert!(
+            label.len() <= MAX_LABEL_BYTES,
+            "label of {} bytes produced {} bytes: {label:?}",
+            text.len(),
+            label.len()
+        );
+        assert!(
+            !label.chars().any(char::is_control),
+            "a label carries a control character: {label:?}"
+        );
+    }
+    // A short label is unchanged, and a truncated one says so.
+    assert_eq!(label("rpc/budget-exceeded"), "rpc/budget-exceeded");
+    assert!(label(&"x".repeat(1_000)).ends_with('…'));
 }

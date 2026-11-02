@@ -10,17 +10,20 @@ on:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 16 targets x 7 minutes of campaign, plus checkout, apt, cargo-fuzz and the
+    # builds. A job timeout cancels the run and GitHub skips the `always()`
+    # upload, so the ceiling has to leave room for the whole matrix.
+    timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install clang (libFuzzer runtime)
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: Campaign (ten minutes per target)
+      - name: Campaign (seven minutes per target)
         env:
-          FUZZ_SECONDS: "600"
+          FUZZ_SECONDS: "420"
         run: |
           status=0
           for target in \
@@ -47,7 +50,7 @@ jobs:
           exit "$status"
       - name: Upload artifacts and corpus
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: fuzz-nightly
           path: |

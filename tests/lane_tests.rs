@@ -97,6 +97,10 @@ fn a_publish_refused_on_a_full_channel_charges_nothing() {
             "fill",
             Budget {
                 max_bytes: u64::MAX,
+                // The filler is one 64 MiB message, so the per-value ceiling
+                // has to allow it: this test is about the channel's byte
+                // ceiling, not the shape ceilings.
+                max_value_size: u64::MAX,
                 ..Budget::default()
             },
         )

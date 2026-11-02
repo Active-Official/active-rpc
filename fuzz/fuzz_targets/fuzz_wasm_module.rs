@@ -10,8 +10,10 @@
 //!    over `MAX_MODULE_BYTES` is a limit refusal, and that is asserted on a
 //!    buffer built in-target so `-max_len` cannot hide it.
 //! 2. A tool the constructor accepted either runs under the limits and returns
-//!    bounded output, or refuses with a `wasm/...` code. A huge declared table
-//!    or memory is a refusal, not an allocation.
+//!    bounded output, or refuses with a `wasm/...` code. A limit that names a
+//!    huge table, memory or log is refused before anything is allocated; the
+//!    declared ceilings are asserted below, because a guest's own declaration is
+//!    only reachable through a module whose shape `-max_len` cannot explore.
 //! 3. The host log is per call and bounded: it never exceeds `max_log_bytes`,
 //!    and a second call starts from an empty log.
 //!
@@ -41,6 +43,37 @@ fn policy() -> WasmHostPolicy {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // A limit that asks for more than the ceiling allows is refused, so a
+    // caller cannot buy an unbounded table or memory by widening the policy.
+    for limits in [
+        WasmLimits {
+            max_table_elements: usize::MAX,
+            ..LIMITS
+        },
+        WasmLimits {
+            max_memory_bytes: usize::MAX,
+            ..LIMITS
+        },
+        WasmLimits {
+            max_output_bytes: usize::MAX,
+            ..LIMITS
+        },
+    ] {
+        let error = WasmTool::from_bytes_with_policy(b"\0asm", limits, policy())
+            .expect_err("a limit past the ceiling must be refused");
+        assert_eq!(error.provider_code(), Some("wasm/limits"));
+    }
+    let error = WasmTool::from_bytes_with_policy(
+        b"\0asm",
+        LIMITS,
+        WasmHostPolicy {
+            max_log_bytes: usize::MAX,
+            ..policy()
+        },
+    )
+    .expect_err("a log ceiling past the maximum must be refused");
+    assert_eq!(error.provider_code(), Some("wasm/limits"));
+
     // The declared ceiling itself: an oversize module is refused as a module
     // error, not handed to the compiler. Built here because libFuzzer cannot
     // reach it within `-max_len`.
@@ -68,7 +101,7 @@ fuzz_target!(|data: &[u8]| {
                     "the sandbox returned more output than its ceiling"
                 ),
                 Err(error) => assert!(
-                    error.code().starts_with("rpc/"),
+                    active_rpc::error::ERROR_CODES.contains(&error.code()),
                     "an unexpected error class: {error}"
                 ),
             }
@@ -89,7 +122,7 @@ fuzz_target!(|data: &[u8]| {
                     "the second call returned more output than its ceiling"
                 ),
                 Err(error) => assert!(
-                    error.code().starts_with("rpc/"),
+                    active_rpc::error::ERROR_CODES.contains(&error.code()),
                     "an unexpected error class on the second call: {error}"
                 ),
             }

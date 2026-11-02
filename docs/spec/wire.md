@@ -183,6 +183,7 @@ a message.
 | `rpc/identity` | the peer's authenticated identity is missing or does not match the capability's binding |
 | `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash |
 | `rpc/replay` | a replay package is malformed, tampered with, or disagrees with the decisions it recorded |
+| `rpc/persistence` | a durable capability record is unsealed, already restored, bound to another peer, or names a provider this kernel does not have |
 | `rpc/unresolvable-promise` | the promise can never settle |
 | `rpc/provider` | the provider failed the call |
 | `rpc/domain` | an Active or Infinity domain operation failed (the message carries the Active class, e.g. `X001`) |

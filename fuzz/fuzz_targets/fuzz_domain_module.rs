@@ -7,8 +7,9 @@
 //! 1. `install_canonical_image` is total over arbitrary bytes: a module or a
 //!    `rpc/payload` refusal, never a panic.
 //! 2. A call with a fuzzed path is refused or answered, never panics, and a
-//!    refusal is a stable code.
-//! 3. The provider never returns secret material for a redacting capability.
+//!    refusal is a code from the closed catalogue.
+//! 3. The provider never returns secret material for a redacting capability. The
+//!    fixture for that is fixed (a fuzzed image almost never carries a secret).
 //!
 //! This is the highest-risk parser reachable from a peer (a module image and a
 //! dotted path), and it had no target at all.
@@ -25,54 +26,58 @@ use active_rpc::{Agent, Budget};
 #[path = "common.rs"]
 mod common;
 
+/// Methods that answer without evaluating the module (an `evaluate` of a
+/// fuzzed image is slow enough to make the campaign useless).
+const PATH_METHODS: &[&str] = &["why", "impact", "subgraph"];
+const VALUE_METHODS: &[&str] = &[
+    "stats",
+    "content_hash",
+    "annotations",
+    "provenance",
+    "dependencies",
+    "dependents",
+];
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
 
-    // 1. The image parser is total.
+    // 1 and 2. The image parser is total, and a call through it answers or
+    // refuses with a catalogued code.
     let mut provider = ModuleProvider::new();
-    match provider.install_canonical_image(data) {
-        Ok(object) => {
-            // A module the parser accepted must answer a metadata query without
-            // panicking, on a kernel that holds a real capability.
-            let agent = Agent::with_secret([0x31; 32]);
-            let id = agent.register(Box::new(provider));
-            let cap = agent
-                .mint(
-                    id,
-                    object,
-                    CapAttrs::new(&["metadata", "why", "impact", "subgraph"]),
-                )
-                .expect("mint over an installed module");
-            let lane = agent
-                .create_lane("domain", Budget::default())
-                .expect("lane");
-            let path = String::from_utf8_lossy(&data[..data.len().min(64)]).into_owned();
-            for method in ["metadata", "why", "impact", "subgraph"] {
-                let promise = agent
-                    .call(
-                        lane,
-                        &cap,
-                        method,
-                        vec![Arg::Value(Value::path(path.clone()))],
-                    )
-                    .expect("queued");
-                agent.run();
-                // Either an answer or a refusal with a stable code; no panic.
-                if let Err(error) = promise.value() {
-                    assert!(
-                        error.code().starts_with("rpc/"),
-                        "unexpected class for {method}: {error}"
-                    );
+    if let Ok(object) = provider.install_canonical_image(data) {
+        let agent = Agent::with_secret([0x31; 32]);
+        let id = agent.register(Box::new(provider));
+        let cap = agent
+            .mint(id, object, CapAttrs::new(active_rpc::MODULE_METHODS))
+            .expect("mint over an installed module");
+        let lane = agent
+            .create_lane("domain", Budget::default())
+            .expect("lane");
+        let path = String::from_utf8_lossy(&data[..data.len().min(64)]).into_owned();
+        let calls: Vec<(&str, Vec<Arg>)> = PATH_METHODS
+            .iter()
+            .map(|method| (*method, vec![Arg::Value(Value::path(path.as_str()))]))
+            .chain(VALUE_METHODS.iter().map(|method| (*method, Vec::new())))
+            .collect();
+        for (method, args) in calls {
+            match agent.call(lane, &cap, method, args) {
+                Ok(promise) => {
+                    agent.run();
+                    if let Err(error) = promise.value() {
+                        assert!(
+                            active_rpc::error::ERROR_CODES.contains(&error.code()),
+                            "an unexpected class for {method}: {error}"
+                        );
+                    }
                 }
+                Err(error) => assert!(
+                    active_rpc::error::ERROR_CODES.contains(&error.code()),
+                    "an unexpected refusal class for {method}: {error}"
+                ),
             }
         }
-        Err(error) => assert_eq!(
-            error.code(),
-            "rpc/payload",
-            "a module image the parser refuses must be a payload error, got {error}"
-        ),
     }
 
     // 2. A second image parsed from the same bytes, then a fuzzed path through
@@ -84,16 +89,72 @@ fuzz_target!(|data: &[u8]| {
         let agent = Agent::with_secret([0x32; 32]);
         let id = agent.register(Box::new(provider));
         let cap = agent
-            .mint(id, object, CapAttrs::new(&["metadata"]))
+            .mint(id, object, CapAttrs::new(&["why"]))
             .expect("mint");
         let lane = agent
             .create_lane("source", Budget::default())
             .expect("lane");
         let path = format!("[{}", String::from_utf8_lossy(&data[..data.len().min(32)]));
-        let promise = agent
-            .call(lane, &cap, "metadata", vec![Arg::Value(Value::path(path))])
-            .expect("queued");
+        match agent.call(lane, &cap, "why", vec![Arg::Value(Value::path(path))]) {
+            Ok(promise) => {
+                agent.run();
+                if let Err(error) = promise.value() {
+                    assert!(
+                        active_rpc::error::ERROR_CODES.contains(&error.code()),
+                        "an unexpected class for why: {error}"
+                    );
+                }
+            }
+            Err(error) => assert!(
+                active_rpc::error::ERROR_CODES.contains(&error.code()),
+                "an unexpected refusal class for why: {error}"
+            ),
+        }
+    }
+
+    // 3. A redacting capability never returns secret material.
+    const CANARY: &str = "fuzz-canary-secret";
+    let source = format!("[app]\ntoken = secret(\"{CANARY}\")\nport = 8080\n");
+    let module = active_rpc::domain::module_from_source(&source, "canary").expect("fixture");
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x33; 32]);
+    let id = agent.register(Box::new(provider));
+    let redacted: Vec<&str> = PATH_METHODS
+        .iter()
+        .chain(VALUE_METHODS.iter())
+        .copied()
+        .collect();
+    let cap = agent
+        .mint(id, object, CapAttrs::new(&redacted).redacted())
+        .expect("mint");
+    let lane = agent
+        .create_lane("redact", Budget::default())
+        .expect("lane");
+    for method in redacted {
+        let args = if PATH_METHODS.contains(&method) {
+            vec![Arg::Value(Value::path("app"))]
+        } else {
+            Vec::new()
+        };
+        let promise = match agent.call(lane, &cap, method, args) {
+            Ok(promise) => promise,
+            Err(error) => {
+                assert!(
+                    active_rpc::error::ERROR_CODES.contains(&error.code()),
+                    "an unexpected refusal class for {method}: {error}"
+                );
+                continue;
+            }
+        };
         agent.run();
-        let _ = promise.value();
+        let answer = match promise.value() {
+            Ok(value) => format!("{value:?}"),
+            Err(error) => format!("{error}"),
+        };
+        assert!(
+            !answer.contains(CANARY),
+            "a redacting {method} answer carried the secret: {answer}"
+        );
     }
 });

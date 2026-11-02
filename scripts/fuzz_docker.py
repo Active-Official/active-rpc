@@ -106,23 +106,35 @@ def main() -> int:
             f"cargo +nightly fuzz run {target} -- -runs={args.runs} "
             f"-max_len={args.max_len} -print_final_stats=1"
         )
-        result = run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-v",
-                f"{root}:/work",
-                "-w",
-                "/work/fuzz",
-                IMAGE,
-                "bash",
-                "-c",
-                "export PATH=/usr/local/cargo/bin:$PATH; " + command,
-            ],
-            root,
-            timeout=args.timeout,
-        )
+        name = f"active-rpc-fuzz-{target}"
+        # A killed client leaves a `docker run` container behind even with
+        # `--rm`, so the container is named and removed on a timeout.
+        run(["docker", "rm", "-f", name], root)
+        try:
+            result = run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--name",
+                    name,
+                    "-v",
+                    f"{root}:/work",
+                    "-w",
+                    "/work/fuzz",
+                    IMAGE,
+                    "bash",
+                    "-c",
+                    "export PATH=/usr/local/cargo/bin:$PATH; " + command,
+                ],
+                root,
+                timeout=args.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            failures.append(target)
+            run(["docker", "rm", "-f", name], root)
+            print(f"FAIL {target}: exceeded {args.timeout}s, container removed")
+            continue
         output = result.stdout + result.stderr
         if result.returncode != 0:
             failures.append(target)

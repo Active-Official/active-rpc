@@ -189,6 +189,7 @@ fn every_error_code_is_unique_and_documented() {
         Error::Escalation("budget"),
         Error::ReadOnly,
         Error::PathNotGranted("a".into()),
+        Error::TopicNotGranted("t".into()),
         Error::ToolPolicy("x"),
         Error::Revoked(active_rpc::CapToken(1)),
         Error::BudgetExceeded("calls"),
@@ -200,6 +201,9 @@ fn every_error_code_is_unique_and_documented() {
         Error::Backpressure("queue"),
         Error::Identity("peer"),
         Error::Bulk("chunk"),
+        Error::Replay("package".to_string()),
+        Error::Receipt("sequence".to_string()),
+        Error::Persistence("record"),
         Error::UnresolvablePromise(1),
         Error::Provider { code: "x".into() },
         Error::Domain("X001"),
@@ -227,6 +231,69 @@ fn every_error_code_is_unique_and_documented() {
     .expect("wire spec");
     for code in codes {
         assert!(spec.contains(code), "wire spec must document {code}");
+    }
+}
+
+/// The closed catalogue is the oracle a fuzz target should use.
+///
+/// `code().starts_with("rpc/")` accepts every error in this crate, so a target
+/// that asserts it can never fail. `ERROR_CODES` is compared against the codes
+/// declared in `Error::code`, against the wire spec and against the event schema,
+/// so adding a variant without registering and documenting its code fails here.
+#[test]
+fn error_codes_are_a_closed_registered_and_documented_set() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("src/error.rs")).expect("error.rs");
+    let start = source
+        .find("pub const fn code(&self)")
+        .expect("the code function");
+    let end = source[start..]
+        .find("pub const fn is_fatal")
+        .map(|offset| start + offset)
+        .expect("the fatal predicate");
+    let body = &source[start..end];
+
+    let mut declared: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.split("=> \"").nth(1) else {
+            continue;
+        };
+        let Some(code) = rest.split('"').next() else {
+            continue;
+        };
+        if code.starts_with("rpc/") {
+            declared.push(code);
+        }
+    }
+    declared.sort_unstable();
+    let mut registered = active_rpc::error::ERROR_CODES.to_vec();
+    registered.sort_unstable();
+
+    assert_eq!(
+        declared, registered,
+        "ERROR_CODES must list every code `Error::code` returns"
+    );
+    let unique: BTreeSet<&str> = registered.iter().copied().collect();
+    assert_eq!(unique.len(), registered.len(), "a code is registered twice");
+
+    let spec = std::fs::read_to_string(root.join("docs/spec/wire.md")).expect("wire spec");
+    for code in &registered {
+        assert!(spec.contains(code), "the wire spec must document {code}");
+    }
+    // A sample from each family is in the catalogue and not merely formatted the
+    // same way as the rest.
+    for error in [
+        Error::ToolPolicy("x"),
+        Error::Provider {
+            code: "wasm/limits".into(),
+        },
+        Error::BudgetExceeded("depth"),
+    ] {
+        assert!(
+            registered.contains(&error.code()),
+            "{} unregistered",
+            error.code()
+        );
     }
 }
 
