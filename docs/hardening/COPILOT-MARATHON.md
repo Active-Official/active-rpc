@@ -32,7 +32,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | round 1: 2 mediums + 2 lows fixed | 4 fixed / 0 rejected / 0 open (1 documented residual: no store wired by default) | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | round 1: 2 highs + 6 mediums + 3 lows fixed | 11 fixed / 0 rejected / 0 open (1 recorded: publisher identity) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | round 1: 4 highs + 8 mediums + 7 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
-| R-19 | control-plane | `control-plane/**` | pending | — | — |
+| R-19 | control-plane | `control-plane/**` | round 1: 3 highs + 5 mediums + 8 lows fixed | 16 fixed / 0 rejected / 0 open (3 documented) | this commit |
 | R-20 | fuzz | `fuzz/**` | pending | — | — |
 
 ## Cross-cutting passes (after the sections)
@@ -194,6 +194,34 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-19 control plane - 2026-11-02 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `1a949e4`.
+No critical; the reviewer confirmed no authority reaches the UI model (every id
+is a correlation hash, peer fingerprints are truncated, `Value::Secret` carries
+no content). Three highs, five mediums, eight lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| P1 | high | `redaction_ok` failed open: a projection error became `""`, which does not contain the canary, so the health flag said PASS | **fixed**: fail closed on a projection error |
+| P2 | high | a wrapped kernel tape was silently trimmed (`min(tape.len())`) and the cursor advanced past the hole, leaving an audit gap with no marker | **fixed**: `events_since` + an explicit `event_gap` record with the count |
+| P3 | high | only the WS upgrade checked Origin; any page could POST `/demo/scenario`, `/demo/level` or `/benchmark/run` at the loopback plane, and DNS rebinding made the snapshot readable | **fixed**: a `loopback_only` middleware on every route (foreign `Host` refused; a foreign `Origin` on a mutating route refused; an absent one is a local script); `a_foreign_host_is_refused`, `a_cross_origin_post_is_refused` |
+| P4 | medium | a scenario could report success while its own stage was red | **fixed**: the verdict is the conjunction with the last stage |
+| P5 | medium | the call storm accepted any refusal as the budget ceiling | **fixed**: only `rpc/budget-exceeded` counts, other errors are counted separately and fail the probe |
+| P6 | medium | provider payloads are echoed into the operator surface unlabelled, and the "canary absent" test could not exercise the echo path | **fixed in part**: the echo is `{:?}`-quoted and truncated; the test still cannot carry provider text into the snapshot, which is noted |
+| P7 | medium | WS lag was swallowed (`RecvError::Lagged` → nothing), so the dashboard skipped state silently | **fixed**: the socket pushes an `event_gap`-shaped message with the skipped count |
+| P8 | medium | "budget pressure", `pipeline_depth`, `caps_live` and `observers` do not mean what their captions say | noted (demo gauges); `observers` is the one an operator acts on and is listed below |
+| P12 | low | `UiEvent.method` was always `None` although the kernel records the method | **fixed**: populated from `Event::CallQueued` |
+| P16 | low | two `innerHTML` sinks interpolated `event.category` raw | **fixed**: `escapeHtml` on both |
+| — | low | benchmark, process-stage label, duplicate cores, `catch_unwind` torn state | noted: the benchmark and the stage label are demo fixtures with their own tests; the core duplication and torn state are recorded |
+
+Recorded: the demo gauges (P8), the benchmark's unconditional `ok`, the
+per-core HTTP stub, and the `catch_unwind` torn state are demo-surface
+simplifications, documented rather than fixed; none of them hides a failed
+security check.
+
+Gate: `cargo test` 31 passed (1 + 6 API + 25 plane), clippy clean.
 
 ### R-18 CLI - 2026-11-02 (round 1)
 

@@ -619,7 +619,12 @@ fn redacted_probe() -> bool {
         fields: vec![(SECRET_CANARY.into(), secret), ("copy".into(), copy)],
     });
     module.set_root(Some(root));
-    let json = active_infinity::interop::to_redacted_json(&module).unwrap_or_default();
+    // Fail closed: a projection that errors tells us nothing about redaction, so
+    // it must read as "not proven" rather than as an empty string that happens
+    // not to contain the canary.
+    let Ok(json) = active_infinity::interop::to_redacted_json(&module) else {
+        return false;
+    };
     let debug = format!("{module:?} {secret:?}");
     !json.contains(SECRET_CANARY) && !debug.contains(SECRET_CANARY)
 }
@@ -1074,11 +1079,16 @@ impl PlaneCore {
                 detail: format!("capability transferred on channel {}", channel.0),
                 ..base
             },
-            Event::CallQueued { lane, cap, .. } => UiEvent {
+            Event::CallQueued {
+                lane, cap, method, ..
+            } => UiEvent {
                 category: category_for("call_queued").into(),
                 kind: "call_queued".into(),
                 lane: Some(format!("lane {}", lane.0)),
                 capability: Some(cap.correlation_id()),
+                // The kernel records the method as a bounded, escaped label, so
+                // it is safe to show and the drawer stops rendering "—".
+                method: Some(method.clone()),
                 detail: "call queued".into(),
                 ..base
             },
@@ -1177,25 +1187,40 @@ impl PlaneCore {
     }
 
     fn capture_kernel_events(&mut self) {
-        let total = self.agent.total_events();
-        if total <= self.kernel_events_seen {
+        // `events_since` answers `None` when the tape wrapped past the cursor,
+        // and the kernel documents that a consumer "must fail rather than
+        // pretend it saw a shorter history". Taking only the retained tail would
+        // leave a silent hole in an audit record, so the hole is reported.
+        let Some(fresh) = self.agent.events_since(self.kernel_events_seen) else {
+            let total = self.agent.total_events();
+            let missed = total.saturating_sub(self.kernel_events_seen);
+            self.kernel_events_seen = total;
+            let gap = UiEvent {
+                id: 0,
+                ts_ms: self.agent.now_ms(),
+                category: "system".into(),
+                kind: "event_gap".into(),
+                lane: None,
+                capability: None,
+                method: None,
+                code: Some("rpc/audit-gap".into()),
+                duration_us: None,
+                bytes: None,
+                scenario_id: None,
+                detail: format!("{missed} kernel event(s) were evicted before they were read"),
+            };
+            self.record(gap);
+            return;
+        };
+        if fresh.is_empty() {
             return;
         }
-        let tape = self.agent.events();
-        if tape.is_empty() {
-            return;
-        }
-        // The tape is bounded. A monotonic total lets us take only the events
-        // that arrived since the last read, even after the tape wraps.
-        let unseen = (total - self.kernel_events_seen).min(tape.len() as u64) as usize;
-        let start = tape.len() - unseen;
-        let fresh: Vec<UiEvent> = tape[start..]
-            .iter()
-            .map(|event| self.event_from_kernel(event))
-            .collect();
-        self.kernel_events_seen = total;
-        for event in fresh {
-            self.record(event);
+        // Advance by what was read, not by the current total: an event that
+        // arrived between the call and this line would otherwise be skipped.
+        self.kernel_events_seen = self.kernel_events_seen.saturating_add(fresh.len() as u64);
+        for event in fresh.iter() {
+            let projected = self.event_from_kernel(event);
+            self.record(projected);
         }
     }
 
@@ -1895,6 +1920,10 @@ impl PlaneCore {
             pipelined == 1,
         );
         let ok = pipelined < sequential;
+        // The headline is the conjunction of its own stages, not a separate
+        // condition: a ladder used to render a failed stage under a green
+        // result when the arithmetic happened to work out.
+        let ok = ok && self.activity.stages.last().is_some_and(|stage| stage.ok);
         (
             "Pipelining vs sequential".into(),
             ok,
@@ -2433,6 +2462,7 @@ impl PlaneCore {
             .expect("storm cap");
         let mut promises = Vec::new();
         let mut refused = 0u64;
+        let mut other = 0u64;
         for index in 0..8 {
             match self.agent.call(
                 self.lane,
@@ -2441,7 +2471,11 @@ impl PlaneCore {
                 vec![Arg::text(format!("storm-{index}"))],
             ) {
                 Ok(promise) => promises.push(promise),
-                Err(_) => refused += 1,
+                // Only the budget ceiling is the point of the probe: a revoked
+                // lane, a closed lane or a provider fault would satisfy "some
+                // call was refused" while proving nothing.
+                Err(error) if error.code() == "rpc/budget-exceeded" => refused += 1,
+                Err(_) => other += 1,
             }
         }
         let queued = promises.len();
@@ -2449,7 +2483,7 @@ impl PlaneCore {
             self.await_value(&promise).expect("storm value");
         }
         let elapsed = start.elapsed().as_secs_f64() * 1e6;
-        let ok = refused >= 1 && queued == 5;
+        let ok = refused == 3 && other == 0 && queued == 5;
         self.stage(
             "storm",
             format!("{queued} queued · {refused} refused"),
@@ -2460,7 +2494,7 @@ impl PlaneCore {
             "Call budget storm".into(),
             ok,
             format!("{queued} calls queued, {refused} refused at max_calls = 5"),
-            json!({"queued": queued, "refused": refused, "max_calls": 5}),
+            json!({"queued": queued, "refused": refused, "other": other, "max_calls": 5}),
         )
     }
 

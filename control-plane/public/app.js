@@ -685,7 +685,7 @@
 							.join(" · ");
 						return `<li class="${eventClass(event)}" data-event="${event.id}">
               <time>${time}</time>
-              <span class="cat cat-${event.category}">${event.category}</span>
+              <span class="cat cat-${escapeHtml(event.category)}">${escapeHtml(event.category)}</span>
               <b>${escapeHtml(event.kind)}</b>
               <span class="detail">${escapeHtml(event.detail)}</span>
               <span class="meta">${escapeHtml(meta)}</span>
@@ -925,7 +925,7 @@
       <p>${escapeHtml(event.detail)}</p>
       <dl class="detail-grid">
         <dt>Time</dt><dd>${new Date(event.ts_ms).toLocaleString()}</dd>
-        <dt>Category</dt><dd>${event.category}</dd>
+        <dt>Category</dt><dd>${escapeHtml(event.category)}</dd>
         <dt>Code</dt><dd><code>${escapeHtml(event.code || "none")}</code></dd>
         <dt>Duration</dt><dd>${event.duration_us != null ? `${fmt(event.duration_us, 1)} µs` : "—"}</dd>
         <dt>Bytes</dt><dd>${event.bytes != null ? fmt(event.bytes) : "—"}</dd>

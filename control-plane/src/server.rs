@@ -160,7 +160,50 @@ pub fn app(state: AppState) -> Router {
         .route("/status-module", get(status_module))
         .route("/ws", get(ws))
         .with_state(state)
+        // A loopback bind is not an authorization boundary: a page on another
+        // origin can POST to 127.0.0.1 (no preflight for a simple request) and
+        // DNS rebinding makes the snapshot readable. Every route therefore
+        // checks the Host it was addressed at, and a mutating route also checks
+        // the Origin.
+        .layer(axum::middleware::from_fn(loopback_only))
         .fallback_service(ServeDir::new(static_dir))
+}
+
+/// Refuse a request addressed at a name that is not this machine.
+///
+/// `Host` is attacker-controlled in a DNS-rebinding attack, which is exactly the
+/// case a loopback bind does not cover: the page's requests arrive at
+/// `127.0.0.1` but carry the attacker's name. A request with *no* `Host` is a
+/// local non-browser client (the test client, a script), which already holds the
+/// user's privileges, so it is allowed; a present but foreign name is refused.
+async fn loopback_only(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(host) = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    {
+        let name = host.rsplit_once(':').map(|(name, _)| name).unwrap_or(host);
+        if !matches!(name, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
+            return (StatusCode::FORBIDDEN, "unexpected Host").into_response();
+        }
+    }
+    if request.method() != axum::http::Method::GET {
+        // A browser sends `Origin` on a cross-site request; a local script does
+        // not. A present but foreign origin is the cross-site case.
+        if let Some(origin) = request
+            .headers()
+            .get(axum::http::header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+        {
+            if !loopback_origin(origin) {
+                return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+            }
+        }
+    }
+    next.run(request).await
 }
 
 fn snapshot(state: &AppState) -> Snapshot {

@@ -180,3 +180,42 @@ async fn a_scenario_post_returns_the_real_result_envelope() {
     assert_eq!(value["result"]["ok"], true);
     assert!(value["metrics"]["calls_queued"].is_u64());
 }
+
+/// A request addressed at a foreign Host is refused: a loopback bind does not
+/// stop DNS rebinding, where the page's requests arrive at 127.0.0.1 carrying
+/// the attacker's name.
+#[tokio::test]
+async fn a_foreign_host_is_refused() {
+    let app = app(spawn_worker(false));
+    let request = Request::builder()
+        .uri("/health")
+        .header("host", "evil.example")
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// A mutating request from another origin is refused, and one from loopback is
+/// allowed.
+#[tokio::test]
+async fn a_cross_origin_post_is_refused() {
+    let app = app(spawn_worker(false));
+    let foreign = Request::builder()
+        .method("POST")
+        .uri("/demo/scenario/round-trip")
+        .header("origin", "https://evil.example")
+        .body(Body::empty())
+        .expect("request");
+    let response = app.clone().oneshot(foreign).await.expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let local = Request::builder()
+        .method("POST")
+        .uri("/demo/scenario/round-trip")
+        .header("origin", "http://127.0.0.1:8787")
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(local).await.expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
