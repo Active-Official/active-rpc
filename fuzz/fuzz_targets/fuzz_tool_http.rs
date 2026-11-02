@@ -74,21 +74,37 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // A path outside the adapter allow-list is refused when the promise is
-    // settled, before any network call. The path travels as `Value::Path`: a
-    // text argument never reaches the path allow-list, so a text-only target
-    // would exercise the argument-kind check and nothing else.
-    if path != "/safe" {
-        let promise = agent
-            .call(lane, &cap, "get", vec![Arg::Value(Value::path(path))])
-            .expect("the call is queued");
-        let error = promise
-            .value()
-            .expect_err("an escaped path must be refused");
-        assert!(
-            matches!(error.code(), "rpc/tool-policy" | "rpc/invalid-argument"),
-            "unexpected code {}",
-            error.code()
-        );
+    // settled, before any network call. The allowed path is called too: it used
+    // to be skipped, so "an allowed path is admitted" was never exercised and a
+    // policy that refused everything passed.
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "get",
+            vec![Arg::Value(Value::path(path.clone()))],
+        )
+        .expect("the call is queued");
+    match promise.value() {
+        Ok(_) if path == "/safe" => {}
+        Ok(_) => panic!("an escaped path was admitted: {path}"),
+        Err(error) if path == "/safe" => {
+            // The endpoint is not listening; that is a transport class, not a
+            // policy refusal.
+            assert!(
+                matches!(
+                    error.code(),
+                    "rpc/provider" | "rpc/transport" | "rpc/timeout" | "rpc/transport-unavailable"
+                ),
+                "unexpected code {} for the allowed path",
+                error.code()
+            );
+        }
+        Err(error) => assert_eq!(
+            error.code(),
+            "rpc/tool-policy",
+            "an escaped path must be a tool-policy refusal, got {error}"
+        ),
     }
 
     // A method outside the capability's tool policy is refused first.

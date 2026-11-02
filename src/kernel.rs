@@ -130,6 +130,11 @@ pub trait Provider {
     /// Invoke a method on `object`.
     fn invoke(&mut self, object: u64, call: &Call) -> Result<Response>;
     /// Called when the last capability referencing `object` is dropped.
+    ///
+    /// Once per object, not once per capability: this is the signal a provider
+    /// uses to reclaim per-object state, so it must not fire while a sibling
+    /// capability on the same object can still call. Delivery happens with no
+    /// kernel borrow held (see `Agent::flush_drops`).
     fn on_drop(&mut self, _object: u64, _cap: CapId) {}
 
     /// Drain provider-side drop notifications recorded by [`Provider::on_drop`].
@@ -399,6 +404,12 @@ pub struct Kernel {
     /// Maintained on attenuation and on drop so revocation walks the subtree
     /// instead of rescanning every capability per doomed id.
     children: BTreeMap<CapId, BTreeSet<CapId>>,
+    /// Live capability records per `(provider, object)`.
+    ///
+    /// `on_drop` fires once per object, when its last record goes. Scanning
+    /// every capability to answer that was quadratic: dropping 20k capabilities
+    /// took 1.33 s in a release build.
+    object_records: BTreeMap<(ProviderId, u64), usize>,
     /// Reference operations that arrived while the kernel was borrowed.
     ///
     /// Shared with the handle control, which cannot borrow the kernel from a
@@ -707,6 +718,7 @@ impl Agent {
             restored_records: BTreeSet::new(),
             record_id_ceiling: MAX_RECORD_IDS,
             children: BTreeMap::new(),
+            object_records: BTreeMap::new(),
             deferred_refops: Rc::clone(&deferred_refops),
         };
         let cell: KernelCell = Rc::new(RefCell::new(kernel));
@@ -1262,7 +1274,7 @@ impl Agent {
         record.wall_clock = kernel.wall_clock;
         record.record_id = CapId::derive_record(&kernel.secret, serial, None);
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
-        kernel.caps.insert(id, record);
+        kernel.insert_cap_record(record);
         kernel.push_event(Event::CapMinted { cap: id, provider });
         Ok(CapHandle::new(Rc::clone(&self.control), id))
     }
@@ -1341,7 +1353,7 @@ impl Agent {
         record.wall_clock = kernel.wall_clock;
         record.record_id = CapId::derive_record(&kernel.secret, serial, None);
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
-        kernel.caps.insert(id, record);
+        kernel.insert_cap_record(record);
         kernel.push_event(Event::CapMinted { cap: id, provider });
         Ok(CapHandle::new(Rc::clone(&self.control), id))
     }
@@ -1501,7 +1513,7 @@ impl Agent {
             kernel.children.entry(*ancestor).or_default().insert(id);
         }
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
-        kernel.caps.insert(id, child);
+        kernel.insert_cap_record(child);
         kernel.push_event(Event::CapMinted {
             cap: id,
             provider: record.provider,
@@ -2426,6 +2438,24 @@ impl Agent {
         let effective = record.attrs.budget.intersect(&lane_budget);
         if call_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
+        }
+        // The shape ceilings are part of the budget, not decoration: a caller
+        // could hand a provider a value 10 000 levels deep, or one list of a
+        // million elements, under a grant whose `max_depth`/`max_array_len` said
+        // otherwise. The wire refuses such a value from a peer, but an
+        // in-process caller never crosses the wire.
+        for arg in &args {
+            let Arg::Value(value) = arg else { continue };
+            let shape = value.shape();
+            if shape.depth > effective.max_depth {
+                return Err(Error::BudgetExceeded("depth"));
+            }
+            if shape.widest > effective.max_array_len {
+                return Err(Error::BudgetExceeded("array_len"));
+            }
+            if shape.largest_scalar > effective.max_value_size {
+                return Err(Error::BudgetExceeded("value_size"));
+            }
         }
         // A lane's byte ceiling is cumulative, not a per-call limit: otherwise
         // any number of calls each just under it would pass.
@@ -3741,6 +3771,31 @@ impl Kernel {
         self.settled_bytes = self.settled_bytes.saturating_add(size);
     }
 
+    /// Record a new capability and count it against its object.
+    ///
+    /// Every capability enters the registry through here, so the per-object
+    /// count that drives `on_drop` cannot drift from the registry.
+    fn insert_cap_record(&mut self, record: CapRecord) {
+        *self
+            .object_records
+            .entry((record.provider, record.object))
+            .or_insert(0) += 1;
+        self.caps.insert(record.id, record);
+    }
+
+    /// Remove a capability and decrement its object's count.
+    fn remove_cap_record(&mut self, id: CapId) -> Option<CapRecord> {
+        let record = self.caps.remove(&id)?;
+        let key = (record.provider, record.object);
+        if let Some(count) = self.object_records.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.object_records.remove(&key);
+            }
+        }
+        Some(record)
+    }
+
     /// Remove a capability whose last reference died and notify its provider.
     ///
     /// The provider may be checked out for a call it is running; the drop is
@@ -3756,12 +3811,34 @@ impl Kernel {
             if record.refs > 0 || record.descendants > 0 {
                 continue;
             }
-            let Some(record) = kernel.caps.remove(&id) else {
+            let Some(record) = kernel.remove_cap_record(id) else {
                 continue;
             };
             kernel.meters.remove(&id);
             kernel.push_event(Event::CapDropped(id));
-            kernel.queue_provider_drop(record.provider, record.object, id);
+            // `on_drop` means "the last capability that referenced this object
+            // is gone": a provider may use it to reclaim per-object state. It
+            // used to fire for every capability, so a provider that freed the
+            // object when its first capability was dropped would free it while
+            // a sibling could still call it.
+            if !kernel
+                .object_records
+                .contains_key(&(record.provider, record.object))
+            {
+                kernel.queue_provider_drop(record.provider, record.object, id);
+            }
+            // The counter is an index over the registry, and every insertion
+            // and removal goes through `insert_cap_record`/`remove_cap_record`.
+            // A path that bypassed either would make `on_drop` fire early (the
+            // provider frees an object a sibling still calls) or never. A full
+            // drain must empty both, which is cheap to assert on every drop; a
+            // per-object cross-check would restore the quadratic scan this
+            // counter removed.
+            debug_assert_eq!(
+                kernel.caps.is_empty(),
+                kernel.object_records.is_empty(),
+                "the per-object record count disagrees with the registry"
+            );
             for ancestor in &record.lineage {
                 if let Some(parent) = kernel.caps.get_mut(ancestor) {
                     parent.descendants = parent.descendants.saturating_sub(1);
@@ -4127,6 +4204,9 @@ fn budget_dimension(error: &Error) -> &'static str {
             "tombstones" => "tombstones",
             "nodes" => "nodes",
             "wall" => "wall",
+            "depth" => "depth",
+            "array_len" => "array_len",
+            "value_size" => "value_size",
             "channel queue" => "channel queue",
             _ => "other",
         },

@@ -159,6 +159,30 @@ map and walks the cone, `subgraph` copies the cone and encodes it, and
 `evaluate` runs the engine. None of them re-encodes for the answer's sake; the
 subgraph encode is the payload.
 
+## Capability lifetime (R-20, 2026-11-02)
+
+`cargo test --release --all-features --test perf_budget capability_churn --
+--nocapture` (same host as the sections above). Dropping the last reference to a
+capability used to scan every live capability to decide whether the object was
+still referenced, so a mint/drop loop was quadratic; the registry now keeps a
+per-object count next to the capability map.
+
+| Work | Before | After |
+|---|---|---|
+| Mint + drop 20,000 capabilities (distinct objects) | 1.33 s drop, 47.6 ms mint | 30.9 ms drop, 40.5 ms mint |
+| Mint + drop 60,000 capabilities (distinct objects) | not measured (quadratic) | 116 ms drop, 144 ms mint |
+| Mint + drop 60,000 capabilities (one object) | not measured (quadratic) | 94 ms drop, one `on_drop` |
+| Per-capability cost, 2k versus 20k | 10x size, ~90x time | 10x size, 1.1x per-capability time |
+
+The shape changed with the semantics: `Provider::on_drop` means "the last
+capability that referenced this object is gone", which is the only form a
+provider can act on (a per-capability notification cannot tell it whether a
+sibling still calls the object). `tests/perf_budget.rs` holds the 2k/20k ratio
+so a reintroduced scan fails the suite, and `tests/redteam_tests.rs`
+(`threat_revocation_and_lifetime_edges`) holds the contract: a child that dies
+while its parent is alive notifies nothing, the parent's own drop notifies once
+and names the object.
+
 ## TCP syscall path (M-4.2, 2026-10-31)
 
 `cargo run --release --example tcp_bench -- <calls> <payload>`: one loopback

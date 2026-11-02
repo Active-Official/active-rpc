@@ -46,24 +46,48 @@ fuzz_target!(|data: &[u8]| {
                 "a plan must verify its own bytes"
             );
 
-            // The receive state machine: duplicate, conflicting and off-plan
-            // chunks must each take a defined path, never a panic.
+            // The receive state machine: duplicate, conflicting, reordered and
+            // truncated chunks must each take a defined path. Replaying the
+            // sender's own frames in order only proves the happy path, so the
+            // order is derived from the input and a frame is substituted.
             if let Ok(sender) = BulkSender::new(data.to_vec(), plan.chunk_size()) {
                 let frames = sender.frames();
                 let mut receiver = BulkReceiver::new(decoded.clone()).expect("admitted plan");
-                for (index, frame) in frames.iter().enumerate() {
-                    match receiver.accept(frame) {
-                        Ok(accepted) => assert_eq!(accepted as usize, index),
-                        Err(error) => assert_eq!(error.code(), "rpc/bulk"),
-                    }
-                    // Replay is idempotent.
-                    if let Ok(repeated) = receiver.accept(frame) {
-                        assert_eq!(repeated as usize, index);
+                let mut order: Vec<usize> = (0..frames.len()).collect();
+                // A deterministic permutation from the first byte: no RNG, so a
+                // failure reproduces from the saved input.
+                if !order.is_empty() {
+                    let pivot = usize::from(data[0]) % order.len();
+                    order.rotate_left(pivot);
+                }
+                for index in order {
+                    if let Some(frame) = frames.get(index) {
+                        match receiver.accept(frame) {
+                            Ok(_) => {}
+                            Err(error) => assert_eq!(error.code(), "rpc/bulk"),
+                        }
+                        // A conflicting frame for the same chunk must be
+                        // refused, not accepted as the body.
+                        let mut tampered = frame.clone();
+                        if !tampered.is_empty() {
+                            let last = tampered.len() - 1;
+                            tampered[last] ^= 0xFF;
+                        }
+                        if let Err(error) = receiver.accept(&tampered) {
+                            assert_eq!(error.code(), "rpc/bulk");
+                        }
                     }
                 }
                 if receiver.is_complete() {
                     let assembled = receiver.finish().expect("a complete body verifies");
                     assert_eq!(assembled, data);
+                }
+                // A truncated frame is refused, never panics.
+                if let Some(frame) = frames.first() {
+                    let short = &frame[..frame.len() / 2];
+                    if let Ok(plan_frame) = BulkChunk::decode(short) {
+                        let _ = plan_frame.index();
+                    }
                 }
                 // A resume request round-trips for every admitted plan.
                 let request = BulkRequest::new(&[0, 0]);

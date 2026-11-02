@@ -163,6 +163,120 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
 - `SharedSegment::advance()` takes no length, counters are monotone, and
   contiguous compaction moves in place.
 
+### Capability lifetime and budget shape (R-20)
+
+- **`Provider::on_drop` fires once per object, not once per capability.** The
+  notification is the signal a provider uses to reclaim per-object state, and a
+  per-capability notification cannot say whether a sibling still calls the
+  object: a provider that freed on the first drop freed an object its parent
+  still used. The kernel now notifies when the last live capability for that
+  `(provider, object)` goes, and never before.
+- **Dropping is linear.** The "is the object still referenced" decision was a
+  scan over every live capability, so a mint/drop loop was quadratic: dropping
+  20 000 capabilities took 1.33 s in a release build. A per-object count next to
+  the registry makes one cycle constant work (20 000 drops in 31 ms, 60 000 in
+  116 ms). `tests/perf_budget.rs` compares per-capability cost at 2k and 20k so a
+  reintroduced scan fails.
+- **The shape ceilings are enforced on arguments.** `Budget::max_depth`,
+  `max_array_len` and `max_value_size` were declared, intersected and exported
+  but never checked on a call, so a grant that set them bound nothing. They are
+  now refused before the provider runs, with the dimension that bound
+  (`depth`, `array_len`, `value_size`) in the refusal and the metrics label.
+
+### Tools and the WASM sandbox (R-14)
+
+- **A declared table is bounded before allocation.** A 130-byte module asked for
+  1.6 GB of table and the allocator aborted, which `catch_unwind` cannot contain;
+  `WasmLimits::max_table_elements` refuses it as `wasm/limits`.
+- **Fuel is coupled to the grant.** `FUEL_PER_MS` (5 000) turns a call's
+  `max_wall_ms` into fuel, with a `MAX_FUEL` ceiling, so a guest cannot run past
+  the wall budget it was granted.
+- **Declared memory is charged and capped** at 256 MiB.
+- **Host imports are capability-scoped.** Imports are matched on `ExternType::Func`
+  and an exact `FuncType`; a mutating import is refused on a read-only grant.
+- `Call::now_ms` is the guest clock, stamped at dispatch; `WasmTool::set_time_ms`
+  for embedders; the host log is cleared per call.
+- Text modules are refused unless `accept_wat`; a module result is
+  `Response::Module`.
+
+### Observability (R-15)
+
+- `Event::ProviderPanicked` (`provider.panicked`) joins the closed event set, so
+  a panicking provider is visible instead of silently failing the call.
+- `Agent::events_since(seen_total)` returns `None` when the caller's total is
+  newer than the tape (a restart) instead of returning an empty prefix; a consumer
+  that lost events records a gap.
+- `receipts.dropped` fires on a 1-2-4-8 ladder, and `metrics_json` exports
+  `events_total`, `events_retained`, `events_evicted`, `receipts_dropped` and
+  `promises_pending`/`promises_kept`.
+- One `note_refusal` path for `call`, `send`, `send_as`, `publish` and
+  `publish_as`; `CallRefused`/`BudgetExhausted` carry `Option<CapId>`; every
+  trace label is clamped by `observability::label`.
+
+### Security helpers and durable records (R-16)
+
+- `CapabilityRecord::attrs` is crate-private: the seal is only checked by
+  `restore_capability`, so reading authority out of an unverified record is not
+  possible.
+- `RecordStore`/`MemoryRecordStore` and `Agent::restore_capability_with` make a
+  durable record single-use across kernels and restarts; a store that cannot
+  record the restore revokes the grant and returns the refusal.
+- `security::redact_module` is the one redactor the domain provider and the
+  helpers share, and it handles `Value::Module`.
+- `export_capability` round-trips the record through `from_json` before
+  reserving the grant, and a bad budget in a record is reported as
+  `rpc/persistence`.
+
+### CLI (R-18)
+
+- **Only a `Response` is an answer.** `call` and `pipeline` treat a `Hello`,
+  `Request` or error reply as a failure, and the reply's request id must match.
+- **The peer prints a correlation id by default.** `--emit-cap-hex` is the
+  transfer form and the help says it is bearer authority.
+- `--name=value` parses, every command has a flag allowlist (an unknown flag is a
+  usage error), and a transport outside the four names is refused rather than
+  silently downgraded.
+- `--timeout-ms` on the client commands, plus a 10 s deadline on a served
+  connection (`TcpTransport::connect_with_timeout`/`with_timeout`).
+- A non-ASCII `--cap`, a hostile chunk size, an unbounded certificate or key file,
+  `--requests` below `--concurrency` and an uncapped concurrency are refusals, not
+  panics.
+- `receipts show` says the listing is unverified structure, `repair` says it
+  proves framing only, and `--limit 0` is a usage error.
+
+### Control plane (R-19)
+
+- **Every route is loopback-only.** A present-but-foreign `Host` (DNS rebinding)
+  or a foreign `Origin` on a mutating request is refused; an absent header is a
+  local script.
+- **Redaction fails closed.** A projection error can no longer read as "canary
+  absent".
+- **An audit gap is visible.** A wrapped kernel tape produces an `event_gap`
+  record with the skipped count instead of silently advancing the cursor.
+- A scenario's verdict is its last stage's verdict, and the call storm counts
+  only `rpc/budget-exceeded` as the budget ceiling.
+
+### Fuzzing (R-20)
+
+- **Sixteen targets.** `fuzz_domain_module` covers module decode, canonical
+  install and every domain method over fuzzed paths and values;
+  `fuzz_persistence_record` covers the durable record parser and its seal.
+- **The targets assert, they do not observe.** Ten targets had an invariants
+  section their code never checked (an unfalsifiable `starts_with("rpc/")`, a
+  `let _ =` loop standing in for "exactly once"): each now asserts the named
+  outcome, and running them found the `on_drop` and budget-shape defects above.
+- Every lane runs `-max_len=65536`; the per-target list is read from
+  `fuzz/Cargo.toml` instead of a second hand-copied list, and
+  `tests/fuzz_manifest_tests.rs` fails when a workflow, the fuzz README, the
+  corpus inventory or the runner script omits a target.
+- `fuzz_wasm_module` disables guest entropy so a failure reproduces from the
+  input, and asserts the module ceiling and the per-call log ceiling.
+- `fuzz_receipt_log` runs its file-backed half on one input in sixteen, so the
+  parser half keeps the campaign's budget; `fuzz_replay_package` no longer skips
+  its structured half for a package over the replay ceiling.
+- The nightly lane has a 120-minute job ceiling and uploads `fuzz/artifacts` and
+  the grown corpus on failure.
+
 ## CLI 0.3.1 - 2026-10-31
 
 - `version` (also `--version`, `-V`) prints the CLI and kernel versions, and

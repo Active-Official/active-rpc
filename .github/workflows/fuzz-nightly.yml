@@ -37,10 +37,12 @@ jobs:
             fuzz_replay_package \
             fuzz_topic_policy \
             fuzz_receipt_log \
-            fuzz_wasm_module; do
+            fuzz_wasm_module \
+            fuzz_domain_module \
+            fuzz_persistence_record; do
             echo "== $target =="
             cargo fuzz run "$target" -- \
-              -max_total_time="$FUZZ_SECONDS" -print_final_stats=1 || status=1
+              -max_total_time="$FUZZ_SECONDS" -max_len=65536 -print_final_stats=1 || status=1
           done
           exit "$status"
       - name: Upload artifacts and corpus

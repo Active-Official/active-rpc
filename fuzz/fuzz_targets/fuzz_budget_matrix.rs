@@ -38,8 +38,11 @@ fuzz_target!(|data: &[u8]| {
         .expect("a non-zero budget is accepted");
     let cap = common::mint(&agent, provider, &["ping"], budget);
 
-    // 1. Calls stop at the call ceiling.
+    // 1. Calls stop at the call ceiling, and the refusal is the ceiling itself:
+    //    "some call failed" used to satisfy this, which a lane that refuses
+    //    everything also does.
     let mut calls = 0u64;
+    let mut refusal: Option<String> = None;
     for _ in 0..32 {
         match agent.call(lane, &cap, "ping", vec![]) {
             Ok(promise) => {
@@ -47,19 +50,23 @@ fuzz_target!(|data: &[u8]| {
                 let _ = promise.value();
             }
             Err(error) => {
-                assert!(
-                    matches!(
-                        error.code(),
-                        "rpc/budget-exceeded" | "rpc/unknown-lane" | "rpc/invalid-argument"
-                    ),
-                    "unexpected code {}",
-                    error.code()
-                );
+                refusal = Some(error.code().to_string());
                 break;
             }
         }
     }
     assert!(calls <= budget.max_calls, "the call budget did not bind");
+    if calls < 32 {
+        assert_eq!(
+            refusal.as_deref(),
+            Some("rpc/budget-exceeded"),
+            "the refusal after {calls} calls must be the budget ceiling"
+        );
+        assert_eq!(
+            calls, budget.max_calls,
+            "the ceiling binds after exactly max_calls calls"
+        );
+    }
 
     // 2. A zero ceiling in every field is refused.
     let zeros = [
@@ -103,16 +110,21 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(error.code(), "rpc/invalid-argument");
     }
 
-    // 3. A value that exceeds the depth or size ceiling is refused.
+    // 3. A value that exceeds the depth or size ceiling is refused. The
+    //    ceilings come from the input, and each probe is built *past* its
+    //    ceiling: a fixed tight budget with fixed probes could not tell "the
+    //    ceiling binds" from "the value was too big for any budget".
+    let depth = 2 + usize::from(data[0] % 8);
+    let per_value = 8 * (1 + usize::from(data.get(1).copied().unwrap_or(1) % 16));
     let tight = Budget {
-        max_depth: 4,
-        max_value_size: 64,
-        max_bytes: 64,
+        max_depth: depth as u64,
+        max_value_size: per_value as u64,
+        max_bytes: per_value as u64,
         ..Budget::default()
     };
     let tight_lane = agent.create_lane("tight", tight).expect("tight lane");
     let tight_cap = common::mint(&agent, provider, &["ping"], tight);
-    let deep = nested(16);
+    let deep = nested(depth + 4);
     match agent.call(
         tight_lane,
         &tight_cap,
@@ -121,16 +133,17 @@ fuzz_target!(|data: &[u8]| {
     ) {
         Ok(promise) => {
             let _ = promise.value();
+            panic!("a value past max_depth = {depth} was admitted");
         }
-        Err(error) => assert!(
-            matches!(error.code(), "rpc/budget-exceeded" | "rpc/invalid-argument"),
-            "unexpected code {}",
-            error.code()
+        Err(error) => assert_eq!(
+            error.code(),
+            "rpc/budget-exceeded",
+            "a value past max_depth must be a budget refusal, got {error}"
         ),
     }
 
-    // An oversized boolean-free list must not pass the byte ceiling either.
-    let wide = Value::List(vec![Value::Int(7); 4096]);
+    // A list past the value-size ceiling is refused for the same reason.
+    let wide = Value::List(vec![Value::Int(7); 4 + per_value]);
     match agent.call(
         tight_lane,
         &tight_cap,
@@ -139,11 +152,12 @@ fuzz_target!(|data: &[u8]| {
     ) {
         Ok(promise) => {
             let _ = promise.value();
+            panic!("a value past max_value_size was admitted");
         }
-        Err(error) => assert!(
-            matches!(error.code(), "rpc/budget-exceeded" | "rpc/invalid-argument"),
-            "unexpected code {}",
-            error.code()
+        Err(error) => assert_eq!(
+            error.code(),
+            "rpc/budget-exceeded",
+            "a value past max_value_size must be a budget refusal, got {error}"
         ),
     }
 });

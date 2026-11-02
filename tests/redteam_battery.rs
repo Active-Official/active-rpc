@@ -337,9 +337,17 @@ fn h2_10_revoke() -> std::result::Result<(), String> {
 
     let second = mint(&agent, provider, &["ping"]);
     drop(second);
+    // `cap` is still a live handle for the same object, so the notification is
+    // the *last* reference going away, not the first one.
+    drop(cap);
     let notifications = agent.take_drops(provider);
-    if notifications.is_empty() {
-        return Err("the last handle drop did not notify the provider".into());
+    if notifications.len() != 1 {
+        return Err(format!(
+            "the last handle drop must notify the provider exactly once, got {notifications:?}"
+        ));
+    }
+    if notifications[0].0 != 0 {
+        return Err("the notification must name the object".into());
     }
     Ok(())
 }

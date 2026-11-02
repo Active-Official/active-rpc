@@ -72,18 +72,20 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             _ => {
-                // A never-minted promise id is refused.
+                // A never-minted promise id is refused when the call is queued:
+                // every dependency must exist before anything is charged, so the
+                // refusal is the `call` result. The old arm asserted
+                // `code.starts_with("rpc/")` on that result, which every code
+                // satisfies, so the invariant was unobservable.
                 let imported = active_rpc::PromiseId(u64::MAX);
                 let error = agent
                     .call(lane, &cap, "echo", vec![Arg::Promise(imported)])
-                    .err()
-                    .map(|error| error.code().to_string());
-                if let Some(code) = error {
-                    assert!(
-                        code.starts_with("rpc/"),
-                        "unexpected code {code} for a foreign promise"
-                    );
-                }
+                    .expect_err("a promise that was never minted must be refused");
+                assert_eq!(
+                    error.code(),
+                    "rpc/unknown-promise",
+                    "a foreign promise id must be refused with its own code"
+                );
             }
         }
     }

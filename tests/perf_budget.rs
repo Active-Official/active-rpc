@@ -78,6 +78,42 @@ fn envelope_decode_is_linear() {
 }
 
 #[test]
+fn capability_churn_is_linear() {
+    // Dropping the last reference to a capability used to scan every capability
+    // to decide whether the object was still referenced, so a mint/drop loop
+    // was quadratic. The per-object count makes one cycle constant work.
+    //
+    // The arms differ by 10x in size: linear work grows ~10x, quadratic ~100x.
+    // Compare per-capability cost so the constant factors cancel. Print the
+    // numbers (`--nocapture`) when refreshing `docs/spec/performance.md`.
+    fn churn(count: u64) -> Duration {
+        let agent = Agent::with_secret([11u8; 32]);
+        let provider = agent.register(Box::new(Echo));
+        let start = Instant::now();
+        let caps: Vec<_> = (0..count)
+            .map(|object| {
+                agent
+                    .mint(provider, object, CapAttrs::new(&["ping"]))
+                    .expect("cap")
+            })
+            .collect();
+        drop(caps);
+        start.elapsed()
+    }
+    let small = churn(2_000);
+    let large = churn(20_000);
+    let per_small = small.as_secs_f64() / 2_000.0;
+    let per_large = large.as_secs_f64() / 20_000.0;
+    println!(
+        "capability churn: 2k={small:?} 20k={large:?} per-cap {per_small:e}s / {per_large:e}s"
+    );
+    assert!(
+        per_large <= per_small * 3.0,
+        "capability churn scaled worse than linearly: 2k={small:?} 20k={large:?}"
+    );
+}
+
+#[test]
 fn in_process_call_throughput_is_bounded() {
     let (agent, _provider, cap, lane) = agent();
     let start = Instant::now();

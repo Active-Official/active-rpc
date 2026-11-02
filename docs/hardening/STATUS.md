@@ -29,14 +29,14 @@ and a doctest:
 
 | Suite | Tests | What it proves |
 |---|---|---|
-| `tests/unit_tests.rs` | 42 | capability mint/attenuation/revocation, drops, promises, lanes, channels, wire codec, tool policy, MCP handshake, bounded lifecycle model, observability metrics, process timeout |
+| `tests/unit_tests.rs` | 43 | capability mint/attenuation/revocation, drops, promises, lanes, channels, wire codec, tool policy, MCP handshake, bounded lifecycle model, observability metrics, process timeout |
 | `tests/integration_tests.rs` | 15 | real Infinity payloads, TCP peer pipelining, shared-memory transport, domain provider, tools |
 | `tests/property_tests.rs` | 3 | envelope round-trip, attenuation monotonicity, value redaction |
 | `tests/conformance_tests.rs` | 8 | error-code catalog, golden capability table, header attacks, stable encodings |
 | `tests/concurrency_tests.rs` | 5 | lanes, channels, concurrent batches, revocation races |
 | `tests/redteam_tests.rs` | 23 | forgery/transplant, confused deputy, escalation, secret wire, budgets, promises, malformed frames, revocation edges, argument bombs, review regressions |
 | `tests/redteam_battery.rs` | 1 (19 cases) | table-driven H2 cases, each naming its checklist id and invariant |
-| `tests/perf_budget.rs` | 3 | linear envelope decode, call throughput, shared-memory frames, RSS/FD/thread stability |
+| `tests/perf_budget.rs` | 4 | linear envelope decode, capability churn, call throughput, shared-memory frames, RSS/FD/thread stability |
 | `tests/doc_gate.rs` | 11 |
 | `tests/api_surface.rs` | 3 | semantic tripwire: no raw secret accessor, one documented `CapId::hex`, correlation-id Display and errors | error codes, wire spec, invariants, README, hardening docs, review record, performance matrix, release process, migration/compatibility, SECURITY evidence levels, status sign-off |
 
@@ -46,15 +46,19 @@ target, a vector, a gate or a script that the validator parses out of the tree.
 
 ### H0.2 Fuzz, corpus and coverage
 
-- Nine structure-aware targets cover the envelope and capability table,
+- Sixteen structure-aware targets cover the envelope and capability table,
   capability lifecycle, promise graph, budget matrix, MCP/HTTP/process tools,
-  channel capability transfer, and transport framing.
-- Corpora are **committed** under `fuzz/corpus/<target>/` (27 seeds) and
-  documented in `docs/hardening/CORPUS.md`.
+  channel capability transfer, transport framing, bulk plans, replay packages,
+  receipt logs, topic policy, WASM tools, the domain provider and the durable
+  record parser (`fuzz/README.md` is the table).
+- Corpora are **committed** under `fuzz/corpus/<target>/` (one directory per
+  target; `git ls-files fuzz/corpus | wc -l` counts the seeds) and documented in
+  `docs/hardening/CORPUS.md`.
 - Coverage (all features, Windows x86_64): 67.53% regions, 68.52% lines,
   58.62% functions, tracked by `docs/hardening/coverage-baseline.json`.
-- CI runs a 2,000-run campaign per target on every push and PR; the nightly
-  workflow runs 200,000 runs per target.
+- CI runs a 2,000-run campaign per target on every push and PR (`-max_len`
+  65536); the nightly workflow runs 200,000 runs per target with a 2 h ceiling
+  and uploads `fuzz/artifacts` and the grown corpus on failure.
 
 ### H0.3 Documentation inventory
 
@@ -151,7 +155,7 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
 | `cargo doc` with `RUSTDOCFLAGS=-D warnings` | pass | local run 2026-10-27 |
 | `cargo package --locked` | pass | local run 2026-10-27 |
 | `cargo audit` / `cargo deny check` | pass (1 allowed warning) | local run + CI `supply-chain` |
-| Fuzz campaigns (9 targets) | pass | CI 2k/target; nightly 200k/target |
+| Fuzz campaigns (16 targets) | pass | CI 2k/target; nightly 200k/target, artifacts uploaded |
 | Negative controls (9) | pass | local run + CI `negative-controls` |
 | 32-bit i686 lane | pass | `scripts/check_32bit.sh`, Docker |
 | Benchmark matrix | checked in | `benches/transport.rs`, `docs/spec/performance.md` |
@@ -246,7 +250,7 @@ Sign-off: 2026-10-27, Grok (AI coding and security agent)
 
 **Repository:** `active-rpc` **version:** `2.0.0` **baseline commit:** `69acea89bd03a9a69ff88cdd6dd8d12560a2d210` **baseline tag:** `hardening-baseline` **measured:** 2026-10-27
 
-Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136 done, 0 partial, 0 gap, 24 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 142.
+Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 138 done, 0 partial, 0 gap, 24 not applicable. Criticals with an implemented negative control: 7/7. Distinct automated checks resolved: 145.
 
 | Invariant | Meaning | Status | Checks | Negative control |
 |---|---|---|---|---|
@@ -289,13 +293,15 @@ Invariants: 12 covered, 0 partial, 0 gap, 1 not applicable. Checklist items: 136
 | **H1.15** | fuzz_tool_process | `done` | `fuzz:fuzz_tool_process` |
 | **H1.16** | fuzz_channel_cap_transfer | `done` | `fuzz:fuzz_channel_cap_transfer` |
 | **H1.17** | fuzz_transport_framing | `done` | `fuzz:fuzz_transport_framing` |
-| **H1.18** | Seed corpus = vectors, examples, almost-valid frames; document classes | `done` | `doc:docs/hardening/CORPUS.md` |
+| **H1.18** | Seed corpus = vectors, examples, almost-valid frames; document classes | `done` | `doc:docs/hardening/CORPUS.md`, `doc:fuzz/README.md` |
 | **H1.19** | Every fixed bug adds a minimized seed | `done` | `doc:docs/hardening/CORPUS.md` |
 | **H1.20** | CI fuzz budget on PRs, longer on main/nightly, fail on regression | `done` | `gate:fuzz`, `doc:.github/workflows/ci.yml`, `doc:.github/workflows/nightly.yml` |
 | **H1.21** | Optional public sanitized corpus | `done` | `doc:docs/hardening/CORPUS.md`, `doc:fuzz/corpus/fuzz_arp1_frame` |
 | **H1.22** | 32-bit target build and test lane | `done` | `script:scripts/check_32bit.sh` |
 | **H1.23** | Differential canonicalization oracle | `n/a` | - |
 | **H1.24** | fuzz_tool_policy: adversarial policy descriptors and tool calls | `done` | `fuzz:fuzz_tool_mcp`, `fuzz:fuzz_tool_http`, `fuzz:fuzz_tool_process` |
+| **H1.25** | fuzz_domain_module: module decode, canonical install and every domain method over peer bytes and paths | `done` | `fuzz:fuzz_domain_module` |
+| **H1.26** | fuzz_persistence_record: durable record JSON parse, canonical round trip and seal verification | `done` | `fuzz:fuzz_persistence_record` |
 | **H2.0** | Scripted negative controls prove each security-critical check fails on a broken build | `done` | `gate:negative-controls` |
 | **H2.1** | Integer overflow and underflow in length and offset arithmetic | `done` | `test:tests/conformance_tests.rs::header_field_attacks_are_rejected`, `test:tests/conformance_tests.rs::truncated_prefixes_are_always_rejected`, `test:tests/redteam_battery.rs::redteam_battery_is_green` |
 | **H2.2** | Overlapping and out-of-bounds sections | `n/a` | - |

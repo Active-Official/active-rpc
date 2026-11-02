@@ -312,16 +312,67 @@ fn threat_malformed_frames_and_bombs() {
 
 #[test]
 fn threat_revocation_and_lifetime_edges() {
-    let (agent, provider_id, cap, lane) = setup();
+    // `on_drop` means "the last capability referencing this object is gone", so
+    // a child that dies while its parent is alive must not tell the provider to
+    // reclaim the object. The provider is local because the notification names
+    // the object id.
+    let mut provider = ModuleProvider::new();
+    let object = provider
+        .install(active_rpc::domain::module_from_source(SOURCE, "rt").unwrap())
+        .expect("install");
+    let agent = Agent::with_secret([53u8; 32]);
+    let provider_id = agent.register(Box::new(provider));
+    let cap = agent
+        .mint(
+            provider_id,
+            object,
+            CapAttrs::new(active_rpc::MODULE_METHODS),
+        )
+        .unwrap();
+    let lane = agent.create_lane("main", Budget::default()).unwrap();
+
     let child = agent.attenuate(&cap, CapAttrs::new(&["stats"])).unwrap();
-    let clone = child.clone();
+    let sibling = child.clone();
     drop(child);
     assert!(agent.take_drops(provider_id).is_empty());
-    drop(clone);
-    assert_eq!(agent.take_drops(provider_id).len(), 1);
+    drop(sibling);
+    assert!(
+        agent.take_drops(provider_id).is_empty(),
+        "the parent still references object {object}"
+    );
+
+    let parent = cap.id();
+    drop(cap);
+    assert_eq!(
+        agent.take_drops(provider_id),
+        vec![(object, parent)],
+        "one notification for the last reference, naming the object"
+    );
+    assert!(agent
+        .events()
+        .iter()
+        .any(|event| matches!(event, Event::CapDropped(id) if *id == parent)));
 
     // Calling through a dropped handle is refused: the registry no longer knows
     // the id.
+    let leftover = agent.import(parent);
+    assert_eq!(
+        agent
+            .call(lane, &leftover, "stats", vec![])
+            .unwrap_err()
+            .code(),
+        "rpc/unknown-capability"
+    );
+
+    // A live capability that is revoked answers `rpc/revoked` from a borrowed
+    // handle, and the revocation reaches the tape.
+    let cap = agent
+        .mint(
+            provider_id,
+            object,
+            CapAttrs::new(active_rpc::MODULE_METHODS),
+        )
+        .unwrap();
     let leftover = agent.import(cap.id());
     agent.revoke(&cap).expect("revoke");
     assert_eq!(

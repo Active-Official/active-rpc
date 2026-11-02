@@ -43,7 +43,17 @@ fuzz_target!(|data: &[u8]| {
     }
     assert!(segment.available() <= segment.capacity());
 
-    // 2. A frame header that claims more than the segment is refused.
+    // 2. An oversized payload is refused, built here rather than taken from the
+    //    input: the constructor clamps a segment to at least 1024 bytes, so no
+    //    corpus seed can reach the boundary and the "refused" branch used to be
+    //    unreachable.
+    let oversized = vec![0u8; capacity + 1];
+    assert!(
+        segment.write(&oversized).is_err(),
+        "a write larger than the segment must be refused"
+    );
+
+    // 3. A frame header that claims more than the segment is refused.
     let _ = segment.read();
     let _ = segment.with_frame(|frame| frame.len());
     let _ = segment.pop_frame(|frame| frame.len());

@@ -372,8 +372,8 @@ checks = ["fuzz:fuzz_transport_framing"]
 id = "H1.18"
 title = "Seed corpus = vectors, examples, almost-valid frames; document classes"
 status = "done"
-checks = ["doc:docs/hardening/CORPUS.md"]
-note = "CI writes one ping envelope at run time; nothing is committed."
+checks = ["doc:docs/hardening/CORPUS.md", "doc:fuzz/README.md"]
+note = "Seeds are committed per target under fuzz/corpus/; a target without a structured seed starts from the action-stream seeds."
 
 [[phases]]
 id = "H1.19"
@@ -410,6 +410,18 @@ id = "H1.24"
 title = "fuzz_tool_policy: adversarial policy descriptors and tool calls"
 status = "done"
 checks = ["fuzz:fuzz_tool_mcp", "fuzz:fuzz_tool_http", "fuzz:fuzz_tool_process"]
+
+[[phases]]
+id = "H1.25"
+title = "fuzz_domain_module: module decode, canonical install and every domain method over peer bytes and paths"
+status = "done"
+checks = ["fuzz:fuzz_domain_module"]
+
+[[phases]]
+id = "H1.26"
+title = "fuzz_persistence_record: durable record JSON parse, canonical round trip and seal verification"
+status = "done"
+checks = ["fuzz:fuzz_persistence_record"]
 
 [[phases]]
 id = "H2.0"

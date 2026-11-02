@@ -29,14 +29,33 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Strict and two arbitrary limit profiles must also never panic.
-    let _ = Envelope::decode_with(data, WireLimits::strict());
+    // Strict and two arbitrary limit profiles must also never panic, and a
+    // profile must bind: an envelope the default accepts with more arguments
+    // than the strict limit allows must be refused under strict limits.
+    if let Ok(envelope) = Envelope::decode(data) {
+        let strict = WireLimits::strict();
+        if envelope.args.len() > strict.max_args as usize
+            || envelope.caps.len() > strict.max_caps as usize
+        {
+            assert!(
+                Envelope::decode_with(data, strict).is_err(),
+                "a strict profile must refuse the envelope it bounds"
+            );
+        }
+    }
     let tiny = WireLimits {
         max_args: 1,
         max_caps: 1,
         ..WireLimits::default()
     };
-    let _ = Envelope::decode_with(data, tiny);
+    if let Ok(envelope) = Envelope::decode(data) {
+        if envelope.args.len() > 1 || envelope.caps.len() > 1 {
+            assert!(
+                Envelope::decode_with(data, tiny).is_err(),
+                "a one-argument profile must refuse a wider envelope"
+            );
+        }
+    }
 
     // 2. Capability tables: independent entry point, same rules.
     if let Ok(caps) = decode_capability_table(data) {

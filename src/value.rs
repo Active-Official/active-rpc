@@ -105,6 +105,60 @@ impl Value {
             _ => false,
         }
     }
+
+    /// Measure the shape of this value in one iterative pass.
+    ///
+    /// A budget's `max_depth`, `max_array_len` and `max_value_size` are checked
+    /// against this, so a caller cannot hand a provider a value deeper, wider or
+    /// larger than its grant names. The walk uses an explicit stack: a caller can
+    /// build a value deeper than the Rust stack, and the check that is supposed
+    /// to bound it must not be the thing that overflows.
+    pub fn shape(&self) -> Shape {
+        let mut shape = Shape::default();
+        let mut stack: Vec<(&Value, u64)> = vec![(self, 0)];
+        while let Some((value, depth)) = stack.pop() {
+            match value {
+                Value::List(items) => {
+                    shape.depth = shape.depth.max(depth + 1);
+                    shape.widest = shape.widest.max(items.len() as u64);
+                    for item in items {
+                        stack.push((item, depth + 1));
+                    }
+                }
+                Value::Map(entries) => {
+                    shape.depth = shape.depth.max(depth + 1);
+                    shape.widest = shape.widest.max(entries.len() as u64);
+                    for (key, item) in entries {
+                        // A key is payload too: a grant that bounds the size of a
+                        // value must bound the name it arrives under.
+                        shape.largest_scalar = shape.largest_scalar.max(key.len() as u64);
+                        stack.push((item, depth + 1));
+                    }
+                }
+                Value::Text(text) | Value::Path(text) => {
+                    shape.largest_scalar = shape.largest_scalar.max(text.len() as u64);
+                }
+                Value::Module(bytes) => {
+                    shape.largest_scalar = shape.largest_scalar.max(bytes.len() as u64);
+                }
+                // Scalars carry no structure, and a secret is a marker: its size
+                // is not read, because that would be an oracle.
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Secret => {}
+            }
+        }
+        shape
+    }
+}
+
+/// The structure a budget bounds: nesting, width and the largest single scalar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Shape {
+    /// Nesting depth: a scalar is 0, a list holding a scalar is 1.
+    pub depth: u64,
+    /// Length of the longest list or map anywhere in the value.
+    pub widest: u64,
+    /// Length of the largest text, path, module or map key, in bytes.
+    pub largest_scalar: u64,
 }
 
 /// One call argument.

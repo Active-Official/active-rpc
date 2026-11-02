@@ -25,36 +25,45 @@ shape as committed seeds so libFuzzer starts from valid structure.
 
 ## Fuzz targets
 
+Sixteen structure-aware targets. `fuzz/README.md` is the primary table; this one
+records the corpus each target starts from. `tests/fuzz_manifest_tests.rs`
+fails if a lane (a workflow, the fuzz README, this file or the runner script)
+omits a target the manifest declares.
+
 | Target | File | Corpus | Semantic oracle |
 |---|---|---|---|
 | `fuzz_arp1_frame` | `fuzz_targets/fuzz_arp1_frame.rs` | ping, truncated, trailing | decode totality, fixed point, strict limits, table agreement |
-| `fuzz_capability_lifecycle` | `fuzz_targets/fuzz_capability_lifecycle.rs` | three action streams | attenuation narrows, revoked/foreign/forged refused, zero ceiling refused |
-| `fuzz_promise_graph` | `fuzz_targets/fuzz_promise_graph.rs` | three action streams | single settlement, cancel, pipelining, destroyed lane |
-| `fuzz_budget_matrix` | `fuzz_targets/fuzz_budget_matrix.rs` | three action streams | each ceiling binds; zero ceilings refused |
-| `fuzz_tool_mcp` | `fuzz_targets/fuzz_tool_mcp.rs` | three action streams | handshake is not a call; undiscovered tools refused; malformed responses error |
-| `fuzz_tool_http` | `fuzz_targets/fuzz_tool_http.rs` | three action streams | path and method escapes are `rpc/tool-policy` |
-| `fuzz_tool_process` | `fuzz_targets/fuzz_tool_process.rs` | three action streams | argv escapes are refused before spawn |
-| `fuzz_channel_cap_transfer` | `fuzz_targets/fuzz_channel_cap_transfer.rs` | three action streams | direction, close/drain, no lifetime extension |
-| `fuzz_transport_framing` | `fuzz_targets/fuzz_transport_framing.rs` | small frame, length prefix | ring capacity, frame bounds, gRPC framing |
+| `fuzz_capability_lifecycle` | `fuzz_targets/fuzz_capability_lifecycle.rs` | three action streams | attenuation narrows, revoked/foreign/forged refused, zero ceiling refused, one drop per object |
+| `fuzz_promise_graph` | `fuzz_targets/fuzz_promise_graph.rs` | three action streams | single settlement, cancel, pipelining, destroyed lane, unknown promise refused at queue |
+| `fuzz_budget_matrix` | `fuzz_targets/fuzz_budget_matrix.rs` | three action streams | each ceiling binds at its own value; zero ceilings refused |
+| `fuzz_tool_mcp` | `fuzz_targets/fuzz_tool_mcp.rs` | three action streams | handshake is not a call; undiscovered tools refused; a malformed server response is `rpc/provider` |
+| `fuzz_tool_http` | `fuzz_targets/fuzz_tool_http.rs` | three action streams | the allowed path is admitted; escapes are `rpc/tool-policy` |
+| `fuzz_tool_process` | `fuzz_targets/fuzz_tool_process.rs` | three action streams | argv escapes are refused at dispatch |
+| `fuzz_channel_cap_transfer` | `fuzz_targets/fuzz_channel_cap_transfer.rs` | three action streams | direction, close/drain, payload, no lifetime extension |
+| `fuzz_transport_framing` | `fuzz_targets/fuzz_transport_framing.rs` | small frame, length prefix | ring capacity (oversize built in-target), frame bounds, gRPC framing |
+| `fuzz_bulk_plan` | `fuzz_targets/fuzz_bulk_plan.rs` | plan and chunk frames | round trip, reorder/conflict/truncation refused, exact resume |
+| `fuzz_replay_package` | `fuzz_targets/fuzz_replay_package.rs` | real package plus four variants | total decode, canonical re-encode, replay matches or refuses |
+| `fuzz_topic_policy` | `fuzz_targets/fuzz_topic_policy.rs` | topic masks | publish exactly inside the grant, attenuation never widens |
+| `fuzz_receipt_log` | `fuzz_targets/fuzz_receipt_log.rs` | real log plus three variants | reader total and canonical, writer/reader agreement |
+| `fuzz_wasm_module` | `fuzz_targets/fuzz_wasm_module.rs` | four module classes | construction total, huge table refused, bounded run with clock and entropy disabled |
+| `fuzz_domain_module` | `fuzz_targets/fuzz_domain_module.rs` | module images and paths | the image parser is total; every domain method answers or refuses |
+| `fuzz_persistence_record` | `fuzz_targets/fuzz_persistence_record.rs` | sealed and edited records | parser total and canonical, seal only under its own key |
 
 `common.rs` holds the deterministic `Echo` provider and budget helpers; it is
 not a target. `fuzz/Cargo.toml` declares each binary.
 
 ## Committed corpora
 
-| Directory | Seeds |
-|---|---|
-| `fuzz/corpus/fuzz_arp1_frame` | 3 |
-| `fuzz/corpus/fuzz_capability_lifecycle` | 3 |
-| `fuzz/corpus/fuzz_promise_graph` | 3 |
-| `fuzz/corpus/fuzz_budget_matrix` | 3 |
-| `fuzz/corpus/fuzz_tool_mcp` | 3 |
-| `fuzz/corpus/fuzz_tool_http` | 3 |
-| `fuzz/corpus/fuzz_tool_process` | 3 |
-| `fuzz/corpus/fuzz_channel_cap_transfer` | 3 |
-| `fuzz/corpus/fuzz_transport_framing` | 3 |
+One directory per target under `fuzz/corpus/<target>/`; the count moves every
+time a campaign finds new coverage, so it is not written down here:
 
-`fuzz/target` and `fuzz/artifacts` remain ignored.
+```text
+git ls-files fuzz/corpus | wc -l
+```
+
+`fuzz/target` and `fuzz/artifacts` remain ignored. A crash libFuzzer writes
+lands in `fuzz/artifacts/<target>/`; CI and the nightly lanes upload it, and
+minimizing it into `fuzz/corpus/<target>/` is the first step of the fix.
 
 ## Coverage snapshot
 
@@ -97,4 +106,5 @@ Interpretation:
 3. Seeds are deterministic and contain no customer data.
 4. The corpus is hostile input: it runs under the same `WireLimits` and
    sanitizers as external bytes.
-5. Short campaign on pull requests; long campaign on `main` and nightly.
+5. Short campaign on pull requests and `main`, longer on the nightly lanes;
+   `-max_len=65536` matches the largest input every parser accepts.

@@ -248,7 +248,13 @@ fuzz_target!(|data: &[u8]| {
         ),
     }
     if !data.is_empty() {
-        writer(data);
-        structured(data);
+        // The kernel half creates, locks, syncs and unlinks a file per
+        // execution, which costs orders of magnitude more than the parser half.
+        // Run it for one input in sixteen: the byte-parser above still sees
+        // every input, and the corpus converges on inputs whose gate passes.
+        if data[0] & 0x0f == 0 {
+            writer(data);
+            structured(data);
+        }
     }
 });

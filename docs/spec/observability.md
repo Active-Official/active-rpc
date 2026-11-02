@@ -42,7 +42,7 @@ authority.
 | `channel` | u64 | the event names a channel |
 | `channel_sequence` | u64 | a channel send or receive |
 | `code` | string | a refusal or rejection with a stable `rpc/...` code |
-| `dimension` | string | a budget exhaustion or ceiling: `call`, `byte`, `lane call`, `lane byte`, `promises`, `jobs`, `caps`, `lanes`, `channels`, `subscriptions`, `records`, `tombstones`, `nodes`, `wall`, `channel queue` |
+| `dimension` | string | a budget exhaustion or ceiling: `call`, `byte`, `lane call`, `lane byte`, `promises`, `jobs`, `caps`, `lanes`, `channels`, `subscriptions`, `records`, `tombstones`, `nodes`, `wall`, `depth`, `array_len`, `value_size`, `channel queue` |
 | `identity` | string | a capability introduction; the peer fingerprint (a public label) |
 | `detail` | string | a short, value-free explanation (`"3 jobs in 2 lanes"`) |
 

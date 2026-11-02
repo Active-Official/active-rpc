@@ -96,23 +96,25 @@ fuzz_target!(|data: &[u8]| {
     // Arbitrary bytes: the decoder is total and its own fixed point.
     match ReplayPackage::decode(data) {
         Ok(package) => {
-            if package.ops.len() > REPLAY_OP_CEILING {
-                return;
-            }
-            let encoded = package.encode().expect("encode");
-            let again =
-                ReplayPackage::decode(&encoded).expect("a freshly encoded package must decode");
-            assert_eq!(again, package, "re-encode changed the package");
-            assert_eq!(
-                again.encode().expect("encode"),
-                encoded,
-                "encoding the same package twice differs"
-            );
-            // A replay either reproduces the recorded trace or refuses; it never
-            // panics and never reports success on a different trace.
-            match package.replay() {
-                Ok(()) => {}
-                Err(error) => assert_eq!(error.code(), "rpc/replay"),
+            // A package above the replay ceiling still has to re-encode
+            // exactly; only the replay half is skipped, and the structured
+            // half below still runs.
+            if package.ops.len() <= REPLAY_OP_CEILING {
+                let encoded = package.encode().expect("encode");
+                let again =
+                    ReplayPackage::decode(&encoded).expect("a freshly encoded package must decode");
+                assert_eq!(again, package, "re-encode changed the package");
+                assert_eq!(
+                    again.encode().expect("encode"),
+                    encoded,
+                    "encoding the same package twice differs"
+                );
+                // A replay either reproduces the recorded trace or refuses; it
+                // never panics and never reports success on a different trace.
+                match package.replay() {
+                    Ok(()) => {}
+                    Err(error) => assert_eq!(error.code(), "rpc/replay"),
+                }
             }
         }
         Err(error) => assert_eq!(

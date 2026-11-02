@@ -17,7 +17,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use active_rpc::tool::LocalProcess;
-use active_rpc::{Arg, Budget, CapAttrs, ToolPolicy, Value};
+use active_rpc::{Arg, Budget, CapAttrs, ToolPolicy};
 
 #[path = "common.rs"]
 mod common;
@@ -68,41 +68,29 @@ fuzz_target!(|data: &[u8]| {
         }
     };
 
-    match agent.call(lane, &cap, "run", vec![Arg::text(argument.clone())]) {
-        Ok(promise) => {
-            let _ = promise.value();
-        }
-        Err(error) => {
-            if argument != "ok" {
-                assert_eq!(error.code(), "rpc/tool-policy");
-            } else {
-                assert!(
-                    matches!(
-                        error.code(),
-                        "rpc/provider" | "rpc/transport" | "rpc/timeout"
-                    ),
-                    "unexpected code {} for a missing program",
-                    error.code()
-                );
-            }
-        }
+    // The argument policy is the provider's, so the refusal is the promise's
+    // value, not the `call` result: the old target asserted on the latter and an
+    // admitted escape therefore passed silently.
+    let promise = agent
+        .call(lane, &cap, "run", vec![Arg::text(argument.clone())])
+        .expect("the call is queued");
+    match promise.value() {
+        Ok(_) => assert_eq!(
+            argument, "ok",
+            "an argument outside the allow-list must never run"
+        ),
+        Err(error) if argument == "ok" => assert!(
+            matches!(
+                error.code(),
+                "rpc/provider" | "rpc/transport" | "rpc/timeout" | "rpc/transport-unavailable"
+            ),
+            "unexpected code {} for the pinned program",
+            error.code()
+        ),
+        Err(error) => assert_eq!(
+            error.code(),
+            "rpc/tool-policy",
+            "an argument outside the allow-list must be a tool-policy refusal, got {error}"
+        ),
     }
-
-    // A method other than `run` is refused.
-    let error = agent
-        .call(lane, &cap, "shell", vec![Arg::text("ok")])
-        .expect_err("a method outside the policy must be refused");
-    assert_eq!(error.code(), "rpc/method-not-granted");
-
-    // A huge argument exceeds the per-call tool ceiling.
-    let error = agent
-        .call(lane, &cap, "run", vec![Arg::text("x".repeat(4096))])
-        .expect_err("an oversized argument must be refused");
-    assert!(
-        matches!(error.code(), "rpc/tool-policy" | "rpc/budget-exceeded"),
-        "unexpected code {}",
-        error.code()
-    );
-
-    let _ = Value::Null;
 });

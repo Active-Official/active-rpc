@@ -44,7 +44,15 @@ fuzz_target!(|data: &[u8]| {
     }
     let received = channel.recv();
     if direction.can_receive() {
-        let _ = received;
+        // A receive-capable channel that drops the message used to pass: the
+        // receive half asserted nothing.
+        match received {
+            Ok(Some(message)) if direction.can_send() => {
+                assert_eq!(message.payload, Value::Int(1), "the payload survives");
+            }
+            Ok(_) => {}
+            Err(error) => panic!("a receive-capable channel refused a receive: {error}"),
+        }
     } else {
         assert!(received.is_err(), "a send-only channel refuses receive");
     }
@@ -102,8 +110,12 @@ fuzz_target!(|data: &[u8]| {
     // not create a reference.
     drop(cap);
     let drops = agent.take_drops(provider);
-    assert!(
-        !drops.is_empty(),
-        "sending a capability id must not keep it alive"
+    // Exactly one notification for the one object: "not empty" also passed for a
+    // kernel that notified twice, or for a different capability.
+    assert_eq!(
+        drops.len(),
+        1,
+        "one object must produce exactly one drop notification"
     );
+    assert_eq!(drops[0].0, 0, "the notification names the object");
 });

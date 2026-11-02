@@ -142,8 +142,20 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Dropping every handle must notify the provider exactly once per object.
+    // The handles live in `caps`, so they are dropped here rather than at the
+    // end of the closure: the notification is then delivered by the next run.
+    // Before the fix the loop only touched the tuple, so a kernel that never
+    // notified passed.
+    drop(caps);
+    agent.run();
     let drops = agent.take_drops(provider);
-    for (_, cap) in &drops {
-        let _ = cap;
-    }
+    assert_eq!(
+        drops.len(),
+        1,
+        "one object must produce exactly one drop notification, got {drops:?}"
+    );
+    assert_eq!(
+        drops[0].0, 0,
+        "the notification names the object that was dropped"
+    );
 });

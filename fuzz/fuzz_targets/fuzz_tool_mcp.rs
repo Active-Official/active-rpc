@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use libfuzzer_sys::fuzz_target;
 
 use active_rpc::tool::{McpSession, MemoryTransport};
-use active_rpc::{Arg, Budget, CapAttrs, Provider, Value};
+use active_rpc::{Arg, Budget, CapAttrs, Value};
 
 #[path = "common.rs"]
 mod common;
@@ -110,5 +110,27 @@ fuzz_target!(|data: &[u8]| {
     malformed.insert("initialize".into(), "not json".into());
     assert!(McpSession::handshake(MemoryTransport::new(malformed)).is_err());
 
-    let _ = Provider::name(&common::Echo::default());
+    // The server is remote input: every byte of `data` is fed back as a
+    // response body for each method. The parser used to be reachable only
+    // through two hard-coded strings, so a remote MCP server had no coverage.
+    let body = String::from_utf8_lossy(data).into_owned();
+    for method in ["initialize", "tools/list", "tools/call"] {
+        let mut map = BTreeMap::new();
+        map.insert(method.to_string(), body.clone());
+        match McpSession::handshake(MemoryTransport::new(map)) {
+            Ok(session) => {
+                // A body that parses must still be bounded: the tool list is a
+                // response an operator's policy is derived from.
+                assert!(
+                    session.tools().len() <= 256,
+                    "a response cannot invent an unbounded tool list"
+                );
+            }
+            Err(error) => assert_eq!(
+                error.code(),
+                "rpc/provider",
+                "a malformed {method} response must be a provider error, got {error}"
+            ),
+        }
+    }
 });

@@ -828,9 +828,9 @@ fn event_log_is_bounded_but_metrics_stay_exact() {
     assert_eq!(agent.metrics().calls_queued, 20_000);
 }
 
-/// A provider that answers one method and counts drop notifications.
+/// A provider that answers one method and records drop notifications.
 struct DropSpy {
-    drops: std::rc::Rc<std::cell::Cell<usize>>,
+    drops: std::rc::Rc<std::cell::RefCell<Vec<(u64, CapId)>>>,
 }
 
 impl Provider for DropSpy {
@@ -846,8 +846,8 @@ impl Provider for DropSpy {
     fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
         Ok(Response::Value(Value::text("pong")))
     }
-    fn on_drop(&mut self, _object: u64, _cap: CapId) {
-        self.drops.set(self.drops.get() + 1);
+    fn on_drop(&mut self, object: u64, cap: CapId) {
+        self.drops.borrow_mut().push((object, cap));
     }
 }
 
@@ -855,8 +855,12 @@ impl Provider for DropSpy {
 ///
 /// Five operations over four steps is 625 sequences. For each, the test drives
 /// the real kernel and compares the observable result (call accepted/refused,
-/// provider notification count) with a hand-written model. This is the bounded
-/// model check required by H6.8; the fuzz target explores longer sequences.
+/// provider notification) with a hand-written model. This is the bounded model
+/// check required by H6.8; the fuzz target explores longer sequences.
+///
+/// The notification model is per *object*: every capability in this test
+/// references object 0, so the provider must be told exactly once, after the
+/// last record goes, and never while a handle is still live.
 #[test]
 fn capability_lifecycle_matches_the_bounded_model() {
     use std::collections::BTreeSet;
@@ -870,7 +874,7 @@ fn capability_lifecycle_matches_the_bounded_model() {
             digits.push(rest % OPS);
             rest /= OPS;
         }
-        let drops = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let agent = Agent::with_secret([3u8; 32]);
         let provider = agent.register(Box::new(DropSpy {
             drops: std::rc::Rc::clone(&drops),
@@ -920,11 +924,28 @@ fn capability_lifecycle_matches_the_bounded_model() {
             }
         }
         let _ = agent.run();
+        if !handles.is_empty() {
+            assert!(
+                drops.borrow().is_empty(),
+                "sequence {code}: a live handle must not notify the provider"
+            );
+        }
+        // A sequence that emptied the handle list already released the object.
+        let before = drops.borrow().len();
         drop(handles);
+        let notifications = drops.borrow();
         assert_eq!(
-            drops.get(),
-            known.len(),
-            "sequence {code}: every capability id must notify exactly once"
+            notifications.len(),
+            1,
+            "sequence {code}: the object is released exactly once (was {before} before the drop)"
+        );
+        assert_eq!(
+            notifications[0].0, 0,
+            "sequence {code}: the notification names the object"
+        );
+        assert!(
+            known.contains(&notifications[0].1),
+            "sequence {code}: the notification names a capability that existed"
         );
     }
 }

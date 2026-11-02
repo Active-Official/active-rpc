@@ -9,6 +9,7 @@ Usage:
     python scripts/fuzz_docker.py --build
     python scripts/fuzz_docker.py --all --runs 20000
     python scripts/fuzz_docker.py --target fuzz_arp1_frame --runs 2000
+    python scripts/fuzz_docker.py --build --all --runs 5000
     python scripts/fuzz_docker.py --list
 """
 
@@ -16,25 +17,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 IMAGE = "active-fuzz:1.88"
-TARGETS = [
-    "fuzz_arp1_frame",
-    "fuzz_capability_lifecycle",
-    "fuzz_promise_graph",
-    "fuzz_budget_matrix",
-    "fuzz_tool_mcp",
-    "fuzz_tool_http",
-    "fuzz_tool_process",
-    "fuzz_channel_cap_transfer",
-    "fuzz_transport_framing",
-    "fuzz_bulk_plan",
-    "fuzz_replay_package",
-    "fuzz_topic_policy",
-]
+
+
+def targets() -> list[str]:
+    """The fuzz targets, read from the manifest.
+
+    A hand-copied list drifts: this one ended at `fuzz_topic_policy` and printed
+    "all 12 targets completed" while four targets were never run.
+    """
+    manifest = (
+        Path(__file__).resolve().parent.parent / "fuzz" / "Cargo.toml"
+    ).read_text(encoding="utf-8")
+    names = re.findall(r'^name = "(fuzz_[a-z0-9_]+)"$', manifest, re.MULTILINE)
+    return names
+
+
+TARGETS = targets()
 
 
 def run(
@@ -52,6 +56,12 @@ def main() -> int:
         "--runs", type=int, default=20000, help="libFuzzer -runs budget"
     )
     parser.add_argument("--list", action="store_true")
+    parser.add_argument(
+        "--max-len",
+        type=int,
+        default=65536,
+        help="libFuzzer -max_len (matches the CI lanes)",
+    )
     parser.add_argument("--timeout", type=int, default=1800, help="seconds per target")
     args = parser.parse_args()
 
@@ -78,6 +88,8 @@ def main() -> int:
             print(built.stdout + built.stderr, file=sys.stderr)
             return 1
         print(f"built {IMAGE}")
+        if not args.all and not args.target:
+            return 0
 
     selected = list(TARGETS) if args.all else args.target
     if not selected:
@@ -91,7 +103,8 @@ def main() -> int:
         print(f"== {target} ({args.runs} runs) ==")
         command = (
             f"cargo +nightly fuzz build {target} && "
-            f"cargo +nightly fuzz run {target} -- -runs={args.runs} -print_final_stats=1"
+            f"cargo +nightly fuzz run {target} -- -runs={args.runs} "
+            f"-max_len={args.max_len} -print_final_stats=1"
         )
         result = run(
             [

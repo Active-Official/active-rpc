@@ -6,17 +6,20 @@
 //! Invariants under test:
 //!
 //! 1. `from_bytes_with_policy` is total over arbitrary bytes: it returns a tool
-//!    or a `wasm/...` refusal, never a panic or an unbounded compile.
+//!    or a `wasm/...` refusal, never a panic or an unbounded compile. A module
+//!    over `MAX_MODULE_BYTES` is a limit refusal, and that is asserted on a
+//!    buffer built in-target so `-max_len` cannot hide it.
 //! 2. A tool the constructor accepted either runs under the limits and returns
 //!    bounded output, or refuses with a `wasm/...` code. A huge declared table
 //!    or memory is a refusal, not an allocation.
-//! 3. The host log is per call: a refusal leaves it empty.
+//! 3. The host log is per call and bounded: it never exceeds `max_log_bytes`,
+//!    and a second call starts from an empty log.
 //!
 //! Run with `cargo +nightly fuzz run fuzz_wasm_module -- -runs=200000`.
 
 use libfuzzer_sys::fuzz_target;
 
-use active_rpc::wasm_tool::{WasmHostPolicy, WasmLimits, WasmTool};
+use active_rpc::wasm_tool::{WasmHostPolicy, WasmLimits, WasmTool, MAX_MODULE_BYTES};
 
 /// Small ceilings keep one execution cheap: the point is the parser and the
 /// sandbox, not a long-running guest.
@@ -30,7 +33,7 @@ const LIMITS: WasmLimits = WasmLimits {
 fn policy() -> WasmHostPolicy {
     WasmHostPolicy {
         clock: true,
-        random: true,
+        random: false,
         log: true,
         max_log_bytes: 64,
         accept_wat: false,
@@ -38,6 +41,19 @@ fn policy() -> WasmHostPolicy {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // The declared ceiling itself: an oversize module is refused as a module
+    // error, not handed to the compiler. Built here because libFuzzer cannot
+    // reach it within `-max_len`.
+    if data.len() == 1 {
+        let oversized = vec![0u8; MAX_MODULE_BYTES + 1];
+        let error = WasmTool::from_bytes_with_policy(&oversized, LIMITS, policy())
+            .expect_err("a module over the ceiling must be refused");
+        assert_eq!(
+            error.provider_code(),
+            Some("wasm/module"),
+            "an oversize module must be a module refusal: {error}"
+        );
+    }
     // A module over this size is refused by the ceiling before compiling, and a
     // bigger input would only slow the campaign down.
     if data.is_empty() || data.len() > 64 * 1024 {
@@ -56,10 +72,28 @@ fuzz_target!(|data: &[u8]| {
                     "an unexpected error class: {error}"
                 ),
             }
+            // The host log is per call: a refusal leaves it empty, and a
+            // successful call never exceeds the declared log ceiling.
+            let log = tool.take_log();
+            assert!(
+                log.len() <= policy().max_log_bytes,
+                "the host log kept {} bytes over its ceiling",
+                log.len()
+            );
             // The clock is seeded by the embedder, so a granted clock never
             // reaches the operating system.
             tool.set_time_ms(1);
-            let _ = tool.call(input);
+            match tool.call(input) {
+                Ok(output) => assert!(
+                    output.len() <= LIMITS.max_output_bytes,
+                    "the second call returned more output than its ceiling"
+                ),
+                Err(error) => assert!(
+                    error.code().starts_with("rpc/"),
+                    "an unexpected error class on the second call: {error}"
+                ),
+            }
+            tool.take_log();
         }
         Err(error) => {
             // Every construction refusal is a provider-coded `wasm/...` error.

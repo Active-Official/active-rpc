@@ -8,6 +8,9 @@ on:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    # A slow target must not eat the six-hour default: the campaign is bounded
+    # per target and the job is bounded overall.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +29,8 @@ jobs:
           - fuzz_topic_policy
           - fuzz_receipt_log
           - fuzz_wasm_module
+          - fuzz_domain_module
+          - fuzz_persistence_record
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -34,7 +39,19 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Long campaign
-        run: cargo fuzz run "${{ matrix.target }}" -- -runs=200000 -print_final_stats=1
+        run: cargo fuzz run "${{ matrix.target }}" -- -runs=200000 -max_len=65536 -print_final_stats=1
+      # A crash input is the only thing that makes a nightly failure
+      # reproducible: `fuzz/artifacts` is gitignored, so without this step the
+      # artifact dies with the runner.
+      - name: Upload artifacts and corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz/artifacts
+            fuzz/corpus
+          if-no-files-found: ignore
 
   coverage:
     runs-on: ubuntu-latest

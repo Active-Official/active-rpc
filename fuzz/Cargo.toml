@@ -11,7 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 # The wasm target needs the interpreter; the feature is crate-wide, which only
 # makes the other targets build a little slower.
-active-rpc = { path = "..", default-features = false, features = ["wasm-tools"] }
+active-rpc = { path = "..", default-features = false, features = ["wasm-tools", "quic", "http2"] }
 
 [[bin]]
 name = "fuzz_arp1_frame"
@@ -107,6 +107,20 @@ bench = false
 [[bin]]
 name = "fuzz_wasm_module"
 path = "fuzz_targets/fuzz_wasm_module.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_domain_module"
+path = "fuzz_targets/fuzz_domain_module.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_persistence_record"
+path = "fuzz_targets/fuzz_persistence_record.rs"
 test = false
 doc = false
 bench = false
