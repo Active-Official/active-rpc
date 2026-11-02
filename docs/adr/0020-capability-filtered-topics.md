@@ -24,9 +24,11 @@ topics are the pub/sub analogue.
   - channel missing → `rpc/unknown-channel`, queue full → `rpc/backpressure`,
   - receive-only channel → `rpc/invalid-argument`.
   The message is queued with its topic and transfers no capabilities.
-- `Agent::recv_topic(channel, topic)` takes the oldest message on that topic;
-  later messages on other topics stay queued in order. `recv` still takes the
-  oldest message of any topic, and `send` still produces topic-less messages.
+- `Agent::recv_topic(lane, channel, topic)` takes the oldest message on that
+  topic; later messages on other topics stay queued in order.
+  `Agent::recv(lane, channel)` takes the oldest message of any topic, and `send`
+  produces topic-less messages. Both take the lane because reading is gated by
+  the channel's subscriber set (see the amendment).
 - **Attenuation only narrows.** `is_attenuation_of` and `attenuate` refuse a
   child whose topic set is not a subset of its parent's, and refuse a child that
   drops the restriction entirely. An unrestricted parent may be narrowed.
@@ -39,8 +41,10 @@ topics are the pub/sub analogue.
 - Topic strings are part of the local policy, not the wire envelope: a peer
   cannot widen a topic set by editing a descriptor, exactly like paths and
   tool policy.
-- Subscriptions are per receive call, not stored per lane. A sticky subscriber
-  registry would be a new ADR.
+- Subscriptions are a sticky per-lane registry (`Agent::subscribe`), and every
+  receive is gated on it. `Agent` is the host's authority object: a transport
+  carries peer requests as envelopes, and no envelope path reaches `subscribe`,
+  `send` or the channel lifecycle.
 
 ## Amendment (R-17, hostile review round 1)
 
@@ -51,8 +55,9 @@ no read authorization at all. Three changes:
   that lane to be in the channel's subscriber set. Channel ids were a sequential
   counter and a receive needed nothing but an id, so any lane in the kernel could
   drain any channel. A lane that may not read a channel gets `rpc/unknown-channel`
-  — the same answer as a channel that does not exist — so the ids are not a
-  membership oracle.
+  — the same answer as a channel that does not exist. That is a membership
+  oracle only for a caller that already holds `&Agent` (the host); no envelope
+  path reaches `subscribe`.
 - **Publishing is a grant.** `CapAttrs::publish` defaults to false and
   attenuation can only drop it, so holding a capability for one provider no
   longer lets a lane speak on a channel under a topic a subscriber trusts. A cap

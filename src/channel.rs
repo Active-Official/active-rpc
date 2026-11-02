@@ -88,6 +88,33 @@ pub struct Message {
     pub sequence: u64,
 }
 
+/// A message-free view of one channel.
+///
+/// [`Channel`] owns its queue, and a clone of it can `recv`: returning one from
+/// `Agent::channel` handed every lane the mailbox, including the capability ids
+/// a transfer queued, whether or not it had subscribed. This view cannot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelStats {
+    /// Kernel-assigned identifier.
+    pub id: ChannelId,
+    /// The name a peer subscribes by.
+    pub name: String,
+    /// Which ways messages may flow.
+    pub direction: Direction,
+    /// Messages queued and not yet received.
+    pub queued: usize,
+    /// Payload bytes currently queued.
+    pub queued_bytes: u64,
+    /// Total messages sent (including those already received).
+    pub sent: u64,
+    /// Total messages received.
+    pub received: u64,
+    /// Lanes subscribed to this channel.
+    pub subscribers: usize,
+    /// Whether the channel refuses new sends.
+    pub closed: bool,
+}
+
 /// A named channel.
 #[derive(Debug, Clone)]
 pub struct Channel {
@@ -187,6 +214,16 @@ impl Channel {
         caps: Vec<CapId>,
         bytes: u64,
     ) -> Result<Message> {
+        if let Some(topic) = topic {
+            // The type boundary enforces the same rule the kernel does: a
+            // directly driven `Channel` cannot store a topic the kernel would
+            // refuse.
+            if !crate::kernel::valid_topic(topic) {
+                return Err(Error::InvalidArgument(
+                    "a topic must be 1..=128 bytes without control or reordering characters",
+                ));
+            }
+        }
         if self.closed {
             return Err(Error::InvalidArgument("channel is closed"));
         }
@@ -259,6 +296,21 @@ impl Channel {
     /// Peek at the oldest message without consuming it.
     pub fn peek(&self) -> Option<&Message> {
         self.queue.front()
+    }
+
+    /// Everything about this channel that is not a message.
+    pub fn stats(&self) -> ChannelStats {
+        ChannelStats {
+            id: self.id,
+            name: self.name.clone(),
+            direction: self.direction,
+            queued: self.queue.len(),
+            queued_bytes: self.queued_bytes,
+            sent: self.sent,
+            received: self.received,
+            subscribers: self.subscribers.len(),
+            closed: self.closed,
+        }
     }
 
     /// Payload bytes currently queued.

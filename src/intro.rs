@@ -26,7 +26,16 @@ pub const MAX_NAME_BYTES: usize = 1024;
 pub fn build(peer: &str, providers: &[(String, Vec<String>)], budget: &Budget) -> Result<Vec<u8>> {
     check_name("peer", peer)?;
     let mut providers: Vec<(String, Vec<String>)> = providers.to_vec();
+    // One surface per provider name. Two entries for `"dup"` would tie on the
+    // name and keep the caller's order, so the same surface would encode to
+    // different bytes (and a different fingerprint) depending on how the caller
+    // built the list.
     providers.sort_by(|left, right| left.0.cmp(&right.0));
+    if providers.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(Error::InvalidArgument(
+            "a provider name appears more than once in the introduction",
+        ));
+    }
     for (provider, methods) in &mut providers {
         check_name("provider", provider)?;
         methods.sort();
@@ -59,34 +68,40 @@ pub fn build(peer: &str, providers: &[(String, Vec<String>)], budget: &Budget) -
         elements: provider_nodes,
     });
 
+    // A `u64` ceiling above `i64::MAX` would wrap to a negative module
+    // integer: the introduction would advertise a budget nobody can honour.
+    let ceiling = |value: u64| -> Result<i64> {
+        i64::try_from(value)
+            .map_err(|_| Error::InvalidArgument("a budget ceiling does not fit the module integer"))
+    };
     let budget_fields = vec![
         (
             "max_array_len".to_string(),
-            module.push(Inode::Int(budget.max_array_len as i64)),
+            module.push(Inode::Int(ceiling(budget.max_array_len)?)),
         ),
         (
             "max_bytes".to_string(),
-            module.push(Inode::Int(budget.max_bytes as i64)),
+            module.push(Inode::Int(ceiling(budget.max_bytes)?)),
         ),
         (
             "max_calls".to_string(),
-            module.push(Inode::Int(budget.max_calls as i64)),
+            module.push(Inode::Int(ceiling(budget.max_calls)?)),
         ),
         (
             "max_depth".to_string(),
-            module.push(Inode::Int(budget.max_depth as i64)),
+            module.push(Inode::Int(ceiling(budget.max_depth)?)),
         ),
         (
             "max_nodes".to_string(),
-            module.push(Inode::Int(budget.max_nodes as i64)),
+            module.push(Inode::Int(ceiling(budget.max_nodes)?)),
         ),
         (
             "max_value_size".to_string(),
-            module.push(Inode::Int(budget.max_value_size as i64)),
+            module.push(Inode::Int(ceiling(budget.max_value_size)?)),
         ),
         (
             "max_wall_ms".to_string(),
-            module.push(Inode::Int(budget.max_wall_ms as i64)),
+            module.push(Inode::Int(ceiling(budget.max_wall_ms)?)),
         ),
     ];
     let budget_node = module.push(Inode::Table {
@@ -113,11 +128,16 @@ pub fn build(peer: &str, providers: &[(String, Vec<String>)], budget: &Budget) -
 /// A name reaches a module, a fingerprint and a log line, so it is bounded and
 /// free of control characters, like a method name in a capability.
 fn check_name(kind: &str, name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.chars().any(char::is_control) {
+    // One rule for every name the crate carries: control characters, line and
+    // paragraph separators, bidi overrides and invisible formatting are refused,
+    // because a name reaches a module, a fingerprint and a log line.
+    if !crate::security::valid_text(name, MAX_NAME_BYTES) {
         return Err(Error::InvalidArgument(match kind {
-            "peer" => "a peer name must be 1..=1024 bytes without control characters",
-            "provider" => "a provider name must be 1..=1024 bytes without control characters",
-            _ => "a method name must be 1..=1024 bytes without control characters",
+            "peer" => "a peer name must be 1..=1024 bytes without control or reordering characters",
+            "provider" => {
+                "a provider name must be 1..=1024 bytes without control or reordering characters"
+            }
+            _ => "a method name must be 1..=1024 bytes without control or reordering characters",
         }));
     }
     Ok(())

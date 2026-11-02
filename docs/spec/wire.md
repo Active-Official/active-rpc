@@ -175,7 +175,7 @@ a message.
 | `rpc/revoked` | the capability (or an ancestor) was revoked |
 | `rpc/budget-exceeded` | a call, byte or lane budget is exhausted |
 | `rpc/unknown-lane` | the lane does not exist or was destroyed |
-| `rpc/unknown-channel` | the channel does not exist |
+| `rpc/unknown-channel` | the channel does not exist, or the lane is not subscribed to it |
 | `rpc/unknown-promise` | the promise id was never minted here |
 | `rpc/promise-cancelled` | the promise was cancelled |
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
@@ -298,9 +298,23 @@ any other import with `wasm/import`.
 A channel carries messages in one process; it is not a wire format. The rules a
 transport must preserve when it forwards one:
 
-- **A live capability publishes.** `Agent::publish` requires the capability to
+- **Publishing is an explicit grant.** A capability publishes only when its
+  attrs carry `publish` (`CapAttrs::allow_publish` or `restrict_topics`), which
+  attenuation may drop and never add; without it the answer is
+  `rpc/method-not-granted`. `Agent::publish` then requires the capability to
   exist, be unrevoked and be unexpired (`rpc/revoked`), and when it carries a
-  topic set the topic must be a member (`rpc/topic-not-granted`).
+  topic set the topic must be a member (`rpc/topic-not-granted`). The clock is
+  read before the deadline is compared, so a wall-clock kernel cannot publish
+  past a lease.
+- **Reading is a subscription.** `Agent::recv(lane, channel)` and
+  `recv_topic(lane, channel, topic)` require the lane to be in the channel's
+  subscriber set; a lane that is not gets `rpc/unknown-channel`, the same answer
+  as a missing channel. `Agent::channel(id)` returns counts and names only, never
+  a queued payload or a transferred capability id.
+- **A topic is bounded text.** 1..=128 bytes, no control characters, and none of
+  the characters that reorder or hide rendered text (U+2028/U+2029, bidi
+  controls, zero-width and tag characters), checked at the grant, at publish and
+  inside `Channel` itself. A channel and provider name follow the same rule.
 - **A bound capability needs its peer.** A capability bound with `mint_bound`
   publishes only through `Agent::publish_as`, and the presented peer fingerprint
   must match the binding (`rpc/identity`). A channel cannot prove who published,

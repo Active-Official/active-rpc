@@ -171,3 +171,55 @@ pub fn assert_no_secret_material(value: &Value) -> Result<()> {
         | Value::Path(_) => Ok(()),
     }
 }
+
+/// Characters that reorder rendered text or render as nothing.
+///
+/// A log line splits on `\n` and `\r`, never on U+2028/U+2029, so an unscrubbed
+/// line separator makes one value render as two log records. The format
+/// characters have no width, so they can hide text or join two words into one.
+///
+/// One predicate for every name, topic and tool description the crate accepts:
+/// `tool.rs` used to carry its own copy, and `intro.rs`, `kernel.rs` and
+/// `receipts.rs` carried none, so a bidi override in a *topic* passed.
+pub fn is_invisible_or_reordering(character: char) -> bool {
+    matches!(
+        character,
+        // Bidi embeddings, overrides, isolates, LRM/RLM, and the Arabic letter
+        // mark.
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            // Zero-width space, non-joiner, joiner, and word joiner.
+            | '\u{200B}'..='\u{200D}'
+            | '\u{2060}'
+            // Byte order mark / zero-width no-break space, and soft hyphen.
+            | '\u{FEFF}'
+            | '\u{00AD}'
+            // Line and paragraph separators.
+            | '\u{2028}'
+            | '\u{2029}'
+            // Unicode tag characters: the standard invisible-ASCII smuggling
+            // channel, and invisible by design.
+            | '\u{E0000}'..='\u{E007F}'
+            // Invisible operators, the Mongolian vowel separator, and variation
+            // selectors, which change rendering without adding width.
+            | '\u{2061}'..='\u{2064}'
+            | '\u{180E}'
+            | '\u{FE00}'..='\u{FE0F}'
+    )
+}
+
+/// True when `text` is a name, topic or label the crate can carry safely.
+///
+/// Non-empty, at most `max` bytes, and free of control characters and of the
+/// characters that reorder or hide rendered text. This is the one rule for
+/// method names, topics, provider names and channel names.
+pub fn valid_text(text: &str, max: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max
+        && !text
+            .chars()
+            .any(|character| character.is_control() || is_invisible_or_reordering(character))
+}

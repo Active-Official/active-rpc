@@ -85,6 +85,13 @@ pub const MAX_CHANNELS_PER_LANE: usize = 1_024;
 /// Global ceiling on channels in one kernel.
 pub const MAX_CHANNELS: usize = 4_096;
 
+/// Most capabilities one channel message may carry.
+///
+/// A message is a bounded transfer, not a sweep of the registry: the duplicate
+/// check was a linear scan per capability, so 65 536 handles meant ~2×10⁹
+/// comparisons on the dispatch thread before any budget was charged.
+pub const MAX_CAPS_PER_MESSAGE: usize = 1_024;
+
 /// Global ceiling on live promise and job records in one kernel.
 ///
 /// The ceiling covers a kernel that keeps issuing calls on long-lived lanes and
@@ -518,6 +525,27 @@ impl CapControl for HandleControl {
 /// Shared kernel cell.
 pub type KernelCell = Rc<RefCell<Kernel>>;
 
+/// Puts the provider table back when it is dropped, on the normal path and on
+/// unwind.
+///
+/// `Agent::intro` takes the table out so provider code runs with no kernel
+/// borrow held; a panic inside that code must not leave the kernel with no
+/// providers.
+struct ProviderTableGuard {
+    cell: KernelCell,
+    table: Option<BTreeMap<ProviderId, Box<dyn Provider>>>,
+}
+
+impl Drop for ProviderTableGuard {
+    fn drop(&mut self) {
+        if let Some(table) = self.table.take() {
+            if let Ok(mut kernel) = self.cell.try_borrow_mut() {
+                kernel.providers = table;
+            }
+        }
+    }
+}
+
 /// Restores the kernel after one dispatch batch, on the normal path and on
 /// unwind.
 ///
@@ -739,19 +767,32 @@ impl Agent {
     /// ceilings. It carries no capability ids, arguments or secrets, and its
     /// bytes are deterministic for a given provider table.
     pub fn intro(&self) -> Result<Vec<u8>> {
-        let (providers, budget) = {
-            let kernel = self.cell.borrow();
-            let providers: Vec<(String, Vec<String>)> = kernel
-                .providers
-                .values()
-                .map(|provider| (provider.name().to_string(), provider.methods()))
-                .collect();
-            (providers, Budget::default())
+        // Provider code runs with no kernel borrow held, exactly as dispatch
+        // arranges it: a provider that holds an `Agent` clone and calls back into
+        // the kernel would otherwise panic on a re-borrow, and one that calls
+        // `intro()` again would recurse to a stack overflow.
+        let table = std::mem::take(&mut self.cell.borrow_mut().providers);
+        let guard = ProviderTableGuard {
+            cell: Rc::clone(&self.cell),
+            table: Some(table),
         };
+        let surface: Vec<(String, Vec<String>)> = guard
+            .table
+            .as_ref()
+            .map(|table| {
+                table
+                    .values()
+                    .map(|provider| (provider.name().to_string(), provider.methods()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The guard puts the table back before the module is built, so an error
+        // from `intro::build` never leaves the kernel without providers.
+        drop(guard);
         crate::intro::build(
             &format!("active-rpc/{}", crate::VERSION),
-            &providers,
-            &budget,
+            &surface,
+            &Budget::default(),
         )
     }
 
@@ -898,6 +939,7 @@ impl Agent {
             ));
         }
         let mut kernel = self.cell.borrow_mut();
+        refresh_clock(&mut kernel);
         // A clone: the export reserves the budget on the meters, which needs a
         // mutable borrow.
         let record = kernel
@@ -1159,7 +1201,11 @@ impl Agent {
                 "the record's clock mode differs from this kernel's",
             ));
         }
-        let now = self.cell.borrow().now_ms;
+        let now = {
+            let mut kernel = self.cell.borrow_mut();
+            refresh_clock(&mut kernel);
+            kernel.now_ms
+        };
         let ttl_ms = match record.expires_at {
             Some(expires_at) if expires_at <= now => {
                 return Err(Error::persistence("the record's deadline has passed"))
@@ -1374,8 +1420,18 @@ impl Agent {
                 "cannot introduce a capability to an unauthenticated peer",
             ));
         }
+        // Introducing authority requires holding it: an imported handle is a
+        // borrowed id, not ownership. A channel message shows ids, so without
+        // this a receiver could bind the sender's capability to a peer of its
+        // choosing and lock the owner out.
+        if !cap.is_owning() {
+            return Err(Error::Identity(
+                "an imported handle cannot introduce authority",
+            ));
+        }
         let fingerprint = peer.fingerprint();
         let mut kernel = self.cell.borrow_mut();
+        refresh_clock(&mut kernel);
         let (revoked, expired, already_bound) = {
             let record = kernel
                 .caps
@@ -1441,6 +1497,7 @@ impl Agent {
     pub fn attenuate(&self, parent: &CapHandle, attrs: CapAttrs) -> Result<CapHandle> {
         let parent_id = parent.id();
         let mut kernel = self.cell.borrow_mut();
+        refresh_clock(&mut kernel);
         let record = kernel
             .caps
             .get(&parent_id)
@@ -1710,8 +1767,13 @@ impl Agent {
         direction: Direction,
     ) -> Result<ChannelId> {
         let name = name.into();
-        if name.len() > MAX_OBJECT_NAME_BYTES {
-            return Err(Error::InvalidArgument("channel name is too long"));
+        // A channel name reaches a log line and an event, so it is bounded text
+        // like a topic: control and reordering characters would let it render
+        // as two records or as a different name.
+        if !crate::security::valid_text(&name, MAX_OBJECT_NAME_BYTES) {
+            return Err(Error::InvalidArgument(
+                "a channel name must be 1..=1024 bytes without control or reordering characters",
+            ));
         }
         let mut kernel = self.cell.borrow_mut();
         if kernel.channels.len() >= MAX_CHANNELS {
@@ -1839,6 +1901,7 @@ impl Agent {
         caps: &[CapHandle],
     ) -> Result<u64> {
         let mut kernel = self.cell.borrow_mut();
+        refresh_clock(&mut kernel);
         let (lane_closed, lane_budget, lane_bytes, lane_capacity) = {
             let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
             (
@@ -1858,14 +1921,24 @@ impl Agent {
             .channels
             .get(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
+        // A closed or receive-only channel is not "busy": reporting
+        // backpressure for it would tell the sender to retry a send that can
+        // never succeed.
+        if !channel_record.can_send() {
+            return Err(Error::InvalidArgument("channel is closed or receive-only"));
+        }
         if channel_record.queued() >= kernel.channel_ceiling {
             kernel.metrics.backpressure_refusals =
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("channel queue ceiling reached"));
         }
+        if caps.len() > MAX_CAPS_PER_MESSAGE {
+            return Err(Error::BudgetExceeded("caps per message"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
         let mut cap_ids = Vec::with_capacity(caps.len());
         for cap in caps {
-            if cap_ids.contains(&cap.id()) {
+            if !seen.insert(cap.id()) {
                 return Err(Error::InvalidArgument(
                     "a message cannot transfer the same capability twice",
                 ));
@@ -1993,6 +2066,7 @@ impl Agent {
         payload: Value,
     ) -> Result<u64> {
         let mut kernel = self.cell.borrow_mut();
+        refresh_clock(&mut kernel);
         let (lane_closed, lane_budget, lane_bytes, lane_capacity) = {
             let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
             (
@@ -3293,12 +3367,17 @@ impl Agent {
     }
 
     /// Channel statistics.
-    pub fn channel(&self, channel: ChannelId) -> Result<Channel> {
+    /// Statistics for one channel, with no queue and no messages.
+    ///
+    /// This used to return a clone of the channel, which owns its queue and can
+    /// `recv`: a lane that was refused a read could take the mailbox, payload and
+    /// transferred capability ids included.
+    pub fn channel(&self, channel: ChannelId) -> Result<crate::channel::ChannelStats> {
         self.cell
             .borrow()
             .channels
             .get(&channel)
-            .cloned()
+            .map(crate::channel::Channel::stats)
             .ok_or(Error::UnknownChannel(channel.0))
     }
 
@@ -4172,7 +4251,7 @@ pub const MAX_TOPIC_BYTES: usize = 128;
 /// the first is indistinguishable from "no topic", the second is a memory and
 /// log problem, and the third forges a line in a terminal or a log file.
 pub fn valid_topic(topic: &str) -> bool {
-    !topic.is_empty() && topic.len() <= MAX_TOPIC_BYTES && !topic.chars().any(char::is_control)
+    crate::security::valid_text(topic, MAX_TOPIC_BYTES)
 }
 
 /// Refuse a topic the channel surfaces cannot represent.
@@ -4533,6 +4612,19 @@ fn value_too_deep(value: &Value, limit: usize) -> bool {
         }
     }
     false
+}
+
+/// Advance the wall clock before an authority check.
+///
+/// The stored clock moves on a dispatch. A kernel that only publishes, sends,
+/// attenuates or introduces would otherwise compare a deadline against a stale
+/// `now_ms`, so a time-bounded capability would never expire on those paths. The
+/// virtual clock is left alone: it advances by a round trip per dispatch, which
+/// is what makes replays deterministic.
+fn refresh_clock(kernel: &mut Kernel) {
+    if kernel.wall_clock {
+        kernel.now_ms = kernel.now_ms.max(wall_now_ms());
+    }
 }
 
 fn cap_token(id: CapId) -> crate::cap::CapToken {

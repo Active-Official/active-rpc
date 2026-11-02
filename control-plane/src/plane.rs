@@ -1563,7 +1563,7 @@ impl PlaneCore {
                 name: channel.name,
                 sent: channel.sent,
                 received: channel.received,
-                subscribers: channel.subscribers.len(),
+                subscribers: channel.subscribers,
             })
             .collect();
         EngineView {

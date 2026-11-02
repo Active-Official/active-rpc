@@ -292,10 +292,7 @@ fn channel_bytes_are_exact() {
     let value = Value::text("payload");
     let size = value.wire_size();
     agent.send(lane, channel, value, &[]).expect("send");
-    assert_eq!(
-        agent.channel(channel).expect("channel").queued_bytes(),
-        size
-    );
+    assert_eq!(agent.channel(channel).expect("channel").queued_bytes, size);
     agent.recv(lane, channel).expect("recv").expect("message");
-    assert_eq!(agent.channel(channel).expect("channel").queued_bytes(), 0);
+    assert_eq!(agent.channel(channel).expect("channel").queued_bytes, 0);
 }

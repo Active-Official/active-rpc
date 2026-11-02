@@ -172,40 +172,7 @@ fn bounded_description(text: &str) -> String {
     out
 }
 
-/// Characters that reorder rendered text or render as nothing.
-///
-/// A log line splits on `\n` and `\r`, never on U+2028/U+2029, so an unscrubbed
-/// line separator makes one description render as two log records. The format
-/// characters have no width, so they can hide text or join two words into one.
-fn is_invisible_or_reordering(character: char) -> bool {
-    matches!(
-        character,
-        // Bidi embeddings, overrides, isolates, LRM/RLM, and the Arabic letter
-        // mark.
-        '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{200E}'
-            | '\u{200F}'
-            | '\u{061C}'
-            // Zero-width space, non-joiner, joiner, and word joiner.
-            | '\u{200B}'..='\u{200D}'
-            | '\u{2060}'
-            // Byte order mark / zero-width no-break space, and soft hyphen.
-            | '\u{FEFF}'
-            | '\u{00AD}'
-            // Line and paragraph separators.
-            | '\u{2028}'
-            | '\u{2029}'
-            // Unicode tag characters: the standard invisible-ASCII smuggling
-            // channel, and invisible by design.
-            | '\u{E0000}'..='\u{E007F}'
-            // Invisible operators, the Mongolian vowel separator, and variation
-            // selectors, which change rendering without adding width.
-            | '\u{2061}'..='\u{2064}'
-            | '\u{180E}'
-            | '\u{FE00}'..='\u{FE0F}'
-    )
-}
+use crate::security::is_invisible_or_reordering;
 
 /// An in-memory transport: requests are answered by a closure.
 pub struct MemoryTransport {

@@ -534,12 +534,12 @@ fn a_channel_accounts_for_queued_bytes() {
     let message = agent
         .send(lane, channel, Value::text("payload"), &[])
         .expect("send");
-    let queued = agent.channel(channel).expect("channel").queued_bytes();
+    let queued = agent.channel(channel).expect("channel").queued_bytes;
     assert!(queued > 0, "the message was not accounted");
     let received = agent.recv(lane, channel).expect("recv").expect("message");
     assert_eq!(received.sequence, message);
     assert_eq!(
-        agent.channel(channel).expect("channel").queued_bytes(),
+        agent.channel(channel).expect("channel").queued_bytes,
         0,
         "receiving must release the accounting"
     );

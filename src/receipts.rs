@@ -159,7 +159,7 @@ impl Receipt {
 /// log or a terminal; the bound matches the log record field (a `u16`, but the
 /// receipt format caps it lower so a reader and a writer agree).
 pub fn valid_method(method: &str) -> bool {
-    !method.is_empty() && method.len() <= MAX_METHOD_BYTES && !method.chars().any(char::is_control)
+    crate::security::valid_text(method, MAX_METHOD_BYTES)
 }
 
 /// Whether a refusal code can travel in a receipt.

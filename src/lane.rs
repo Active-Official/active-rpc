@@ -42,7 +42,9 @@ pub struct Lane {
     pub bytes: u64,
     /// Channels this lane is subscribed to.
     ///
-    /// Subscription is advisory: the kernel does not use it to gate receives.
+    /// The kernel gates every receive on this set: `Agent::recv` and
+    /// `recv_topic` refuse a lane that is not listed here with
+    /// `rpc/unknown-channel`, the same answer as a channel that does not exist.
     pub channels: BTreeSet<u64>,
     /// True once the lane has been destroyed; further calls are refused.
     pub closed: bool,
