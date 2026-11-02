@@ -42,7 +42,48 @@ pub struct AppState {
     pub latest: Arc<Mutex<Snapshot>>,
     pub broadcast: broadcast::Sender<Snapshot>,
     pub read_only: bool,
+    /// Last `uptime_ms` observed from a *fresh* snapshot, and when it was seen.
+    ///
+    /// The kernel runs on one thread: if it panics or hangs, `latest` freezes
+    /// and every read route keeps answering 200 with stale data. `/health`
+    /// compares the snapshot's uptime against the last one it saw, so a frozen
+    /// worker reads as unhealthy instead of immortal.
+    pub heartbeat: Arc<Mutex<Heartbeat>>,
 }
+
+/// When the last snapshot was taken, and the uptime it carried.
+#[derive(Debug, Clone, Copy)]
+pub struct Heartbeat {
+    uptime_ms: u64,
+    seen: std::time::Instant,
+}
+
+impl Heartbeat {
+    fn new(uptime_ms: u64) -> Self {
+        Self {
+            uptime_ms,
+            seen: std::time::Instant::now(),
+        }
+    }
+
+    /// Feed a snapshot's uptime; true while the worker is still ticking.
+    fn observe(&mut self, uptime_ms: u64) -> bool {
+        self.observe_within(uptime_ms, STALE_WORKER_AFTER)
+    }
+
+    /// [`Heartbeat::observe`] with the staleness limit spelled out (tests).
+    fn observe_within(&mut self, uptime_ms: u64, limit: Duration) -> bool {
+        if uptime_ms != self.uptime_ms {
+            self.uptime_ms = uptime_ms;
+            self.seen = std::time::Instant::now();
+            return true;
+        }
+        self.seen.elapsed() < limit
+    }
+}
+
+/// How long a snapshot may keep the same uptime before the worker is stale.
+pub const STALE_WORKER_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct BenchmarkRequest {
@@ -75,63 +116,157 @@ pub fn spawn_worker(read_only: bool) -> AppState {
     // an unbounded queue behind the single kernel worker.
     let (tx, rx) = bounded::<Command>(8);
     let (broadcast, _) = broadcast::channel::<Snapshot>(64);
-    let initial = {
-        let mut core = PlaneCore::new();
-        core.set_mode(if read_only { "read-only" } else { "demo" });
-        core.snapshot()
-    };
-    let latest = Arc::new(Mutex::new(initial));
-    let latest_thread = Arc::clone(&latest);
+    // One core. The worker builds it, publishes its first snapshot and hands
+    // back the shared cell; this function used to build a second core (a second
+    // set of capabilities, a second HTTP stub, a second listener) only to have
+    // an initial value.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Arc<Mutex<Snapshot>>>();
     let broadcast_thread = broadcast.clone();
     std::thread::Builder::new()
         .name("active-kernel".into())
         .spawn(move || {
             let mut core = PlaneCore::new();
             core.set_mode(if read_only { "read-only" } else { "demo" });
+            let first = core.snapshot();
+            let latest: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(first.clone()));
+            let heartbeat: Arc<Mutex<Heartbeat>> =
+                Arc::new(Mutex::new(Heartbeat::new(first.uptime_ms)));
+            let _ = broadcast_thread.send(first);
+            if ready_tx.send(Arc::clone(&latest)).is_err() {
+                // The caller went away before the first snapshot; nothing to
+                // serve.
+                return;
+            }
             let publish = |core: &mut PlaneCore,
                            latest: &Arc<Mutex<Snapshot>>,
-                           broadcast: &broadcast::Sender<Snapshot>| {
+                           broadcast: &broadcast::Sender<Snapshot>,
+                           heartbeat: &Arc<Mutex<Heartbeat>>| {
                 let snapshot = core.snapshot();
                 if let Ok(mut guard) = latest.lock() {
                     *guard = snapshot.clone();
                 }
+                if let Ok(mut beat) = heartbeat.lock() {
+                    beat.observe(snapshot.uptime_ms);
+                }
                 let _ = broadcast.send(snapshot);
             };
-            publish(&mut core, &latest_thread, &broadcast_thread);
+            // A panic in provider or scenario code must not leave `/health`
+            // claiming a live kernel: the last snapshot is republished with
+            // `kernel: "down"` and every later read route sees it. The core is
+            // not touched afterwards, because a panic can leave a `RefCell`
+            // borrow held.
+            let publish_down =
+                |latest: &Arc<Mutex<Snapshot>>, broadcast: &broadcast::Sender<Snapshot>| {
+                    if let Some(snapshot) = mark_worker_down(latest) {
+                        let _ = broadcast.send(snapshot);
+                    }
+                };
             loop {
+                // Everything that runs kernel or provider code goes through
+                // `catch_unwind`: the API returns a refusal, and the health flag
+                // goes down, instead of a thread that died silently.
+                let guarded = |core: &mut PlaneCore,
+                               latest: &Arc<Mutex<Snapshot>>,
+                               broadcast: &broadcast::Sender<Snapshot>,
+                               heartbeat: &Arc<Mutex<Heartbeat>>,
+                               run: &mut dyn FnMut(&mut PlaneCore)|
+                 -> Result<(), String> {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(core))) {
+                        Ok(()) => {
+                            publish(core, latest, broadcast, heartbeat);
+                            Ok(())
+                        }
+                        Err(_) => {
+                            publish_down(latest, broadcast);
+                            Err("the kernel worker panicked".to_string())
+                        }
+                    }
+                };
                 match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(Command::Scenario(id, reply)) => {
-                        let result = core.run_scenario(&id);
-                        publish(&mut core, &latest_thread, &broadcast_thread);
-                        let _ = reply.send(result);
+                        let mut result = None;
+                        let outcome = guarded(
+                            &mut core,
+                            &latest,
+                            &broadcast_thread,
+                            &heartbeat,
+                            &mut |core| result = Some(core.run_scenario(&id)),
+                        );
+                        match outcome {
+                            Ok(()) => {
+                                let _ =
+                                    reply.send(result.unwrap_or_else(|| Err("no result".into())));
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
                     }
                     Ok(Command::Level(level, up_to, reply)) => {
-                        let results = core.run_level(level, up_to);
-                        publish(&mut core, &latest_thread, &broadcast_thread);
-                        let _ = reply.send(results);
+                        let mut results = None;
+                        let outcome = guarded(
+                            &mut core,
+                            &latest,
+                            &broadcast_thread,
+                            &heartbeat,
+                            &mut |core| results = Some(core.run_level(level, up_to)),
+                        );
+                        if outcome.is_ok() {
+                            let _ = reply.send(results.unwrap_or_default());
+                        }
                     }
                     Ok(Command::Benchmark(iterations, reply)) => {
-                        let result = core.run_benchmark(iterations);
-                        publish(&mut core, &latest_thread, &broadcast_thread);
-                        let _ = reply.send(result);
+                        let mut report = None;
+                        let outcome = guarded(
+                            &mut core,
+                            &latest,
+                            &broadcast_thread,
+                            &heartbeat,
+                            &mut |core| report = Some(core.run_benchmark(iterations)),
+                        );
+                        match outcome {
+                            Ok(()) => {
+                                let _ =
+                                    reply.send(report.unwrap_or_else(|| Err("no result".into())));
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
                     }
                     Ok(Command::Status(reply)) => {
-                        let result = core.status_module_json();
-                        let _ = reply.send(result);
+                        let mut status = None;
+                        let outcome = guarded(
+                            &mut core,
+                            &latest,
+                            &broadcast_thread,
+                            &heartbeat,
+                            &mut |core| status = Some(core.status_module_json()),
+                        );
+                        if outcome.is_ok() {
+                            let _ = reply.send(status.unwrap_or_else(|| Ok(json!({}))));
+                        }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        publish(&mut core, &latest_thread, &broadcast_thread);
+                        publish(&mut core, &latest, &broadcast_thread, &heartbeat);
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
         })
         .expect("kernel worker thread");
+    let latest = ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the worker's first snapshot");
+    // Seed the heartbeat from the first snapshot so a fresh process does not
+    // read as stale before the first tick.
+    let uptime = latest.lock().map(|guard| guard.uptime_ms).unwrap_or(0);
     AppState {
         tx,
         latest,
         broadcast,
         read_only,
+        heartbeat: Arc::new(Mutex::new(Heartbeat::new(uptime))),
     }
 }
 
@@ -165,45 +300,107 @@ pub fn app(state: AppState) -> Router {
         // DNS rebinding makes the snapshot readable. Every route therefore
         // checks the Host it was addressed at, and a mutating route also checks
         // the Origin.
-        .layer(axum::middleware::from_fn(loopback_only))
+        //
+        // The layer comes *after* the fallback: `Router::layer` only covers what
+        // was already added, so a static asset installed first was served
+        // without the guard.
         .fallback_service(ServeDir::new(static_dir))
+        .layer(axum::middleware::from_fn(guard))
 }
 
-/// Refuse a request addressed at a name that is not this machine.
+/// Refuse a request addressed at a name that is not this machine, and stamp a
+/// framing policy on every response.
 ///
 /// `Host` is attacker-controlled in a DNS-rebinding attack, which is exactly the
 /// case a loopback bind does not cover: the page's requests arrive at
 /// `127.0.0.1` but carry the attacker's name. A request with *no* `Host` is a
 /// local non-browser client (the test client, a script), which already holds the
 /// user's privileges, so it is allowed; a present but foreign name is refused.
-async fn loopback_only(
+///
+/// A website can also *frame* the dashboard and let the user click "run": the
+/// click then originates in the framed document, so the Host and Origin checks
+/// both pass. `frame-ancestors 'none'` is what refuses that, and it is set here
+/// rather than per route so a route added later cannot forget it.
+async fn guard(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if let Some(host) = request
+    let host = request
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
-    {
-        let name = host.rsplit_once(':').map(|(name, _)| name).unwrap_or(host);
-        if !matches!(name, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
+        .map(str::to_string);
+    if let Some(host) = &host {
+        if !is_loopback_host(host) {
             return (StatusCode::FORBIDDEN, "unexpected Host").into_response();
         }
     }
     if request.method() != axum::http::Method::GET {
         // A browser sends `Origin` on a cross-site request; a local script does
-        // not. A present but foreign origin is the cross-site case.
+        // not. A present but foreign origin is the cross-site case, and a
+        // loopback origin on another *port* is another local program, not this
+        // dashboard.
         if let Some(origin) = request
             .headers()
             .get(axum::http::header::ORIGIN)
             .and_then(|value| value.to_str().ok())
         {
-            if !loopback_origin(origin) {
+            if !same_origin(origin, host.as_deref()) {
                 return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
             }
         }
     }
-    next.run(request).await
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-frame-options",
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    // `style-src 'unsafe-inline'` is required and alone: the dashboard draws its
+    // bar widths with inline style attributes and `node.style`, which the
+    // directive blocks without the keyword (a browser reports every one as a
+    // violation, which is how this was found). Scripts stay `'self'` only, the
+    // frame policy is `'none'`, and no form or base can be repointed.
+    headers.insert(
+        "content-security-policy",
+        axum::http::HeaderValue::from_static(
+            "frame-ancestors 'none'; default-src 'self'; script-src 'self'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+             connect-src 'self' ws://127.0.0.1:*; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    headers.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "referrer-policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+/// True when a `Host` header names this machine.
+///
+/// The bracketed IPv6 form is the only unambiguous one (a bare `::1` cannot
+/// carry a port); `[::1]:8787` and `[::1]` are accepted, `::1` is refused.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((name, tail)) = rest.split_once(']') else {
+            return false;
+        };
+        if !tail.is_empty() && !tail.starts_with(':') {
+            return false;
+        }
+        return name.eq_ignore_ascii_case("::1");
+    }
+    if host.matches(':').count() > 1 {
+        // A bare IPv6 address: ambiguous without brackets, so refused.
+        return false;
+    }
+    let name = host.split_once(':').map(|(name, _)| name).unwrap_or(host);
+    name.eq_ignore_ascii_case("127.0.0.1") || name.eq_ignore_ascii_case("localhost")
 }
 
 fn snapshot(state: &AppState) -> Snapshot {
@@ -212,11 +409,19 @@ fn snapshot(state: &AppState) -> Snapshot {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let snapshot = snapshot(&state);
+    // A frozen snapshot is not a healthy one: the uptime has to move.
+    let ticking = state
+        .heartbeat
+        .lock()
+        .map(|mut beat| beat.observe(snapshot.uptime_ms))
+        .unwrap_or(false);
     Json(json!({
-        "ok": snapshot.health.kernel == "up",
+        "ok": snapshot.health.kernel == "up" && ticking,
+        "worker": if ticking { "live" } else { "stale" },
         "mode": snapshot.health.mode,
         "read_only": state.read_only,
         "redaction_ok": snapshot.health.redaction_ok,
+        "audit_gap": snapshot.health.audit_gap,
         "uptime_ms": snapshot.uptime_ms,
     }))
 }
@@ -254,7 +459,17 @@ async fn logs_tail(
     let start = snapshot.events.len().saturating_sub(limit);
     let events = snapshot.events[start..].to_vec();
     let cursor = events.last().map(|event| event.id).unwrap_or(0);
-    Json(json!({"count": events.len(), "cursor": cursor, "events": events}))
+    let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
+    // `truncated` says the 500-event ring has already dropped history: a poller
+    // that asks for a tail is looking at a window, not at the whole run.
+    let truncated = start > 0 || events.first().is_some_and(|event| event.id > oldest);
+    Json(json!({
+        "count": events.len(),
+        "cursor": cursor,
+        "oldest": oldest,
+        "truncated": truncated,
+        "events": events,
+    }))
 }
 
 async fn logs_since(
@@ -263,13 +478,25 @@ async fn logs_since(
 ) -> impl IntoResponse {
     let snapshot = snapshot(&state);
     let cursor = query.id.unwrap_or(0);
+    let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
+    let retained = snapshot.events.len();
     let events: Vec<_> = snapshot
         .events
         .into_iter()
         .filter(|event| event.id > cursor)
         .collect();
-    let cursor = events.last().map(|event| event.id).unwrap_or(cursor);
-    Json(json!({"count": events.len(), "cursor": cursor, "events": events}))
+    let next = events.last().map(|event| event.id).unwrap_or(cursor);
+    // A cursor older than the oldest retained id means the ring wrapped and the
+    // caller is missing events it will never see. Reporting them as a silent
+    // jump is how an operator reads "quiet" when the plane was busy.
+    let gap = retained > 0 && cursor.saturating_add(1) < oldest;
+    Json(json!({
+        "count": events.len(),
+        "cursor": next,
+        "oldest": oldest,
+        "gap": gap,
+        "events": events,
+    }))
 }
 
 async fn logs_export(State(state): State<AppState>) -> Response {
@@ -419,8 +646,12 @@ async fn ws(ws: WebSocketUpgrade, headers: HeaderMap, State(state): State<AppSta
     // Same-origin dashboard connections carry the loopback Origin. Refuse a
     // page loaded from another site, so a localhost plane is not readable by
     // any website the user happens to visit. Non-browser clients omit Origin.
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     if let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) {
-        if !loopback_origin(origin) {
+        if !same_origin(origin, host.as_deref()) {
             return (StatusCode::FORBIDDEN, "cross-origin websocket refused").into_response();
         }
     }
@@ -457,12 +688,44 @@ async fn stream_socket(mut socket: WebSocket, state: AppState) {
                             if socket.send(Message::Text(text.into())).await.is_err() { break; }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Falling behind used to be silent: the dashboard kept
+                        // its last value and read as "nothing happened". The
+                        // skipped count is pushed as its own frame.
+                        let frame = gap_frame(skipped, snapshot(&state).ts_ms);
+                        if socket.send(Message::Text(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
     }
+}
+
+/// The frame a dashboard receives when the broadcast ring dropped snapshots.
+///
+/// It has the same shape as an audit-gap event so one client filter sees both
+/// kinds of hole.
+pub fn gap_frame(skipped: u64, ts_ms: u64) -> String {
+    json!({
+        "kind": "event_gap",
+        "code": "rpc/audit-gap",
+        "skipped": skipped,
+        "ts_ms": ts_ms,
+    })
+    .to_string()
+}
+
+/// Republish the last snapshot with the kernel marked down.
+///
+/// Called when the worker panicked: the alternative is a process that keeps
+/// answering 200 with a frozen snapshot while `/health` says `ok`.
+fn mark_worker_down(latest: &Arc<Mutex<Snapshot>>) -> Option<Snapshot> {
+    let mut guard = latest.lock().ok()?;
+    guard.health.kernel = "down".to_string();
+    Some(guard.clone())
 }
 
 pub async fn serve(port: u16, read_only: bool) -> std::io::Result<()> {
@@ -486,24 +749,66 @@ async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// True only for an Origin whose parsed host is loopback.
+/// Split a `Host` header into its name and port.
+fn host_parts(host: &str) -> Option<(String, u16)> {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        let (name, tail) = rest.split_once(']')?;
+        let port = match tail.strip_prefix(':') {
+            Some(port) => port.parse().ok()?,
+            None if tail.is_empty() => 80,
+            None => return None,
+        };
+        return Some((format!("[{}]", name.to_ascii_lowercase()), port));
+    }
+    match host.split_once(':') {
+        Some((name, port)) => Some((name.to_ascii_lowercase(), port.parse().ok()?)),
+        None => Some((host.to_ascii_lowercase(), 80)),
+    }
+}
+
+/// True only for an Origin that is this dashboard's own origin.
 ///
 /// Prefix matching is wrong here: `http://127.0.0.1.evil.com` starts with the
-/// loopback string but is a different host.
+/// loopback string but is a different host. Comparing the host alone is also
+/// wrong: another local program on a different port is another principal.
+pub fn same_origin(origin: &str, host: Option<&str>) -> bool {
+    let parsed = match origin.parse::<axum::http::Uri>() {
+        Ok(uri) => uri,
+        Err(_) => return false,
+    };
+    let Some(name) = parsed.host() else {
+        return false;
+    };
+    let name = name.trim_matches(['[', ']']).to_ascii_lowercase();
+    let default_port = match parsed.scheme_str() {
+        Some("https") => 443,
+        Some("http") => 80,
+        _ => return false,
+    };
+    let port = parsed.port_u16().unwrap_or(default_port);
+    match host.and_then(host_parts) {
+        // The dashboard's own origin: the browser sent both, and they must agree.
+        Some((expected, expected_port)) => {
+            expected
+                .trim_matches(['[', ']'])
+                .eq_ignore_ascii_case(&name)
+                && expected_port == port
+        }
+        // A client that sends `Origin` without `Host` (a raw script) still has
+        // to name a loopback origin.
+        None => matches!(name.as_str(), "127.0.0.1" | "localhost" | "::1"),
+    }
+}
+
+/// True when `origin` names this machine (used by tests and by the WS check).
 pub fn loopback_origin(origin: &str) -> bool {
-    let host = origin.parse::<axum::http::Uri>().ok().and_then(|uri| {
-        uri.host()
-            .map(|host| host.trim_matches(['[', ']']).to_ascii_lowercase())
-    });
-    matches!(
-        host.as_deref(),
-        Some("127.0.0.1") | Some("localhost") | Some("::1")
-    )
+    same_origin(origin, None)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::loopback_origin;
+    use super::{is_loopback_host, loopback_origin, same_origin};
 
     #[test]
     fn only_loopback_hosts_are_accepted_for_websockets() {
@@ -513,5 +818,80 @@ mod tests {
         assert!(!loopback_origin("http://127.0.0.1.evil.com"));
         assert!(!loopback_origin("https://evil.com/http://127.0.0.1"));
         assert!(!loopback_origin("null"));
+    }
+
+    #[test]
+    fn a_host_header_names_this_machine_or_it_does_not() {
+        for host in [
+            "127.0.0.1:8787",
+            "127.0.0.1",
+            "localhost:8787",
+            "LOCALHOST",
+            "[::1]:8787",
+            "[::1]",
+        ] {
+            assert!(is_loopback_host(host), "{host} should be accepted");
+        }
+        for host in [
+            "evil.example",
+            "127.0.0.1.evil.example",
+            "::1",
+            "[::1]evil",
+            "[2001:db8::1]:8787",
+            "",
+        ] {
+            assert!(!is_loopback_host(host), "{host} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_frozen_worker_reads_as_stale() {
+        use super::{Heartbeat, STALE_WORKER_AFTER};
+        use std::time::Duration;
+
+        let mut beat = Heartbeat::new(10);
+        assert!(beat.observe_within(11, Duration::from_secs(60)));
+        assert!(beat.observe_within(11, Duration::from_millis(50)));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!beat.observe_within(11, Duration::from_millis(50)));
+        // A new uptime clears the staleness.
+        assert!(beat.observe_within(12, Duration::from_millis(50)));
+        // The production limit is generous enough for a one-second tick.
+        assert!(STALE_WORKER_AFTER >= Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_lag_frame_names_the_hole() {
+        let frame = super::gap_frame(7, 1_234);
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("json");
+        assert_eq!(parsed["kind"], "event_gap");
+        assert_eq!(parsed["code"], "rpc/audit-gap");
+        assert_eq!(parsed["skipped"], 7);
+        assert_eq!(parsed["ts_ms"], 1_234);
+    }
+
+    #[test]
+    fn the_origin_must_share_the_host_and_the_port() {
+        assert!(same_origin("http://127.0.0.1:8787", Some("127.0.0.1:8787")));
+        // A `Host` with no port is port 80, so an HTTPS origin on 443 is a
+        // different origin from this (plain-HTTP) plane.
+        assert!(same_origin("https://localhost", Some("localhost:443")));
+        assert!(!same_origin("https://localhost:443", Some("localhost")));
+        assert!(same_origin("http://[::1]:8787", Some("[::1]:8787")));
+        // Another local program is another principal.
+        assert!(!same_origin(
+            "http://127.0.0.1:9999",
+            Some("127.0.0.1:8787")
+        ));
+        assert!(!same_origin(
+            "http://localhost:8787",
+            Some("127.0.0.1:8787")
+        ));
+        assert!(!same_origin(
+            "http://127.0.0.1.evil.example:8787",
+            Some("127.0.0.1:8787")
+        ));
+        assert!(!same_origin("null", Some("127.0.0.1:8787")));
+        assert!(!same_origin("ftp://127.0.0.1:8787", Some("127.0.0.1:8787")));
     }
 }

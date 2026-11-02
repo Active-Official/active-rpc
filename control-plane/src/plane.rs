@@ -113,6 +113,11 @@ pub struct Health {
     pub observers: u64,
     pub last_event_ms_ago: u64,
     pub redaction_ok: bool,
+    /// True once the audit trail lost events it will never show again.
+    ///
+    /// Sticky: a gap that is only visible in the ring can itself be evicted, so
+    /// the fact is carried in the health record as well.
+    pub audit_gap: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -178,6 +183,10 @@ pub struct BenchmarkReport {
     pub validate: BenchmarkStats,
     pub call_sequential: BenchmarkStats,
     pub call_pipelined: BenchmarkStats,
+    /// Per-arm raw samples. They are exported through `/benchmark/export.csv`
+    /// and are *not* part of the snapshot: a 5 000-iteration run added ~96 KB to
+    /// every push, per client, per second.
+    #[serde(skip_serializing)]
     pub samples: BTreeMap<String, Vec<f64>>,
     #[serde(skip_serializing)]
     pub csv: String,
@@ -209,6 +218,10 @@ pub struct ActivityView {
     pub stages: Vec<ActivityStage>,
     pub hash_prefix: Option<String>,
     pub bytes: Option<u64>,
+    /// Iterations completed by the last benchmark.
+    ///
+    /// The worker publishes only after a command returns, so this is always a
+    /// final count, never a live fraction; the dashboard labels it as such.
     pub progress: Option<(u64, u64)>,
     pub promise_chain: Vec<u64>,
     pub lanes: Vec<LaneStat>,
@@ -535,6 +548,23 @@ pub struct PlaneCore {
     activity: ActivityState,
     gauge_samples: BTreeMap<String, VecDeque<GaugeSample>>,
     plane_mode: String,
+    /// Absolute path of the process tool's program, for the stage detail. The
+    /// bare name the scenario used to print ("cmd") was never what ran.
+    process_program: String,
+    /// Set on drop: the HTTP stub's accept loop checks it and exits.
+    http_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Sticky: the audit trail lost events.
+    audit_gap: bool,
+}
+
+impl Drop for PlaneCore {
+    fn drop(&mut self) {
+        // Ask the stub to stop and wake its blocking `accept` with one
+        // connection; the loop then exits and the thread ends.
+        self.http_shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(&self.http_address);
+    }
 }
 
 fn now_ms() -> u64 {
@@ -646,7 +676,10 @@ fn category_for(kind: &str) -> &'static str {
 
 impl PlaneCore {
     pub fn new() -> Self {
-        let agent = Agent::with_secret([0x51; 32]);
+        // A fresh secret per process: a constant one made every deployment
+        // derive the same capability ids and correlation ids, which are then
+        // linkable across processes and predictable from the source.
+        let agent = Agent::new();
         let echo_provider = agent.register(Box::new(Echo));
         let mut module_provider = ModuleProvider::new();
         let object = module_provider
@@ -719,10 +752,19 @@ impl PlaneCore {
         // tool provider is registered once; each run mints only a capability.
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("http stub bind");
         let http_address = listener.local_addr().expect("http stub addr").to_string();
+        // The loop ends when the core is dropped: the flag is checked after each
+        // accept, and `Drop` connects once to wake a blocking accept. Without
+        // this, every core built for a test (and every worker) left a listener
+        // and a thread alive for the life of the process.
+        let http_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = std::sync::Arc::clone(&http_shutdown);
         std::thread::Builder::new()
             .name("http-stub".into())
             .spawn(move || {
                 for stream in listener.incoming() {
+                    if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     let Ok(mut stream) = stream else { continue };
                     // One short-lived handler per connection: a client that
                     // stalls must never block the next ladder run.
@@ -760,9 +802,14 @@ impl PlaneCore {
         let (program, flag) = ("C:\\Windows\\System32\\cmd.exe", "/C");
         #[cfg(not(windows))]
         let (program, flag) = ("/bin/sh", "-c");
-        let process = LocalProcess::new(program, &[flag, "echo*"])
+        // The allow list names the *whole* argument: a prefix rule (`"echo*"`)
+        // over a shell is a grant to run any command line that starts with
+        // `echo`, and the adapter's metacharacter refusal is a second line of
+        // defence, not the control.
+        let process = LocalProcess::new(program, &[flag, "echo active"])
             .expect("an absolute program")
             .with_timeout(3_000);
+        let process_program = program.to_string();
         let process_policy = process.policy();
         let process_provider = agent.register(Box::new(process));
         let process_allowed = agent
@@ -894,6 +941,8 @@ impl PlaneCore {
             http_address,
             process_allowed: process_allowed.clone(),
             process_denied: process_denied.clone(),
+            process_program,
+            http_shutdown,
             caps,
             channels,
             channel_messages,
@@ -927,6 +976,7 @@ impl PlaneCore {
             activity: ActivityState::idle(),
             gauge_samples: BTreeMap::new(),
             plane_mode: "demo".into(),
+            audit_gap: false,
         };
         core.redaction_ok = redacted_probe();
         core.capture_kernel_events();
@@ -946,6 +996,11 @@ impl PlaneCore {
         &self.agent
     }
 
+    /// Address of the loopback HTTP stub the `http-tool` scenario drives.
+    pub fn http_address(&self) -> &str {
+        &self.http_address
+    }
+
     pub fn set_mode(&mut self, mode: impl Into<String>) {
         self.plane_mode = mode.into();
     }
@@ -956,11 +1011,13 @@ impl PlaneCore {
         if self.events.len() >= EVENT_TAIL {
             // Keep the security-relevant and scenario record even when kernel
             // chatter fills the ring. Only ordinary progress events age out.
+            // The audit-gap marker is protected too: it is the one event whose
+            // whole purpose is to outlive the ring it reports on.
             let protected = |candidate: &UiEvent| {
                 matches!(
                     candidate.category.as_str(),
                     "scenario" | "benchmark" | "refusals"
-                )
+                ) || candidate.code.as_deref() == Some("rpc/audit-gap")
             };
             if let Some(index) = self
                 .events
@@ -1193,8 +1250,23 @@ impl PlaneCore {
         // leave a silent hole in an audit record, so the hole is reported.
         let Some(fresh) = self.agent.events_since(self.kernel_events_seen) else {
             let total = self.agent.total_events();
-            let missed = total.saturating_sub(self.kernel_events_seen);
+            // Two cases reach `None`: the tape wrapped past the cursor, or the
+            // whole tape is *older* than the cursor (a kernel restart reusing the
+            // number space). The second used to report "0 events were evicted"
+            // and discard the new tape without saying so.
+            let reset = total < self.kernel_events_seen;
+            let missed = if reset {
+                total
+            } else {
+                total.saturating_sub(self.kernel_events_seen)
+            };
             self.kernel_events_seen = total;
+            self.audit_gap = true;
+            let detail = if reset {
+                format!("the kernel event tape restarted; {missed} event(s) since the restart")
+            } else {
+                format!("{missed} kernel event(s) were evicted before they were read")
+            };
             let gap = UiEvent {
                 id: 0,
                 ts_ms: self.agent.now_ms(),
@@ -1207,7 +1279,7 @@ impl PlaneCore {
                 duration_us: None,
                 bytes: None,
                 scenario_id: None,
-                detail: format!("{missed} kernel event(s) were evicted before they were read"),
+                detail,
             };
             self.record(gap);
             return;
@@ -1424,6 +1496,33 @@ impl PlaneCore {
         };
     }
 
+    /// A scenario whose kernel call was refused: a red stage that names the
+    /// code, the same envelope a passing scenario returns.
+    fn refused_scenario(
+        &mut self,
+        title: &str,
+        stage: &str,
+        error: &active_rpc::Error,
+        duration_us: f64,
+    ) -> (String, bool, String, Json) {
+        let code = error.code();
+        self.stage(stage, code, duration_us, false);
+        self.note(
+            "tool_refused",
+            Some(code),
+            format!("{error}"),
+            Some(duration_us),
+            None,
+            None,
+        );
+        (
+            title.into(),
+            false,
+            format!("refused with {code}"),
+            json!({"code": code, "message": error.to_string()}),
+        )
+    }
+
     fn stage(&mut self, name: &str, detail: impl Into<String>, duration_us: f64, ok: bool) {
         self.activity.stages.push(ActivityStage {
             name: name.into(),
@@ -1573,6 +1672,7 @@ impl PlaneCore {
                 observers: 0,
                 last_event_ms_ago: now.saturating_sub(last_event),
                 redaction_ok: self.redaction_ok,
+                audit_gap: self.audit_gap,
             },
             metrics,
             infinity: InfinityView {
@@ -1643,12 +1743,26 @@ impl PlaneCore {
                 ),
             })) {
                 Ok(result) => result,
-                Err(_) => (
-                    "Scenario panic".into(),
-                    false,
-                    "the scenario panicked; the worker and kernel are still serving".into(),
-                    json!({"panic": true}),
-                ),
+                Err(payload) => {
+                    // A panic used to be reported as one opaque string, which
+                    // hid which check refused and why. The message is bounded
+                    // and escaped like any other provider-derived text.
+                    let raw = payload
+                        .downcast_ref::<&str>()
+                        .map(|text| (*text).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    let message: String = raw.chars().take(200).collect();
+                    self.stage("panic", message.clone(), 0.0, false);
+                    (
+                        "Scenario panic".into(),
+                        false,
+                        format!(
+                        "the scenario panicked: {message}; the worker and kernel are still serving"
+                    ),
+                        json!({"panic": true, "message": message}),
+                    )
+                }
             };
         let duration_us = started.elapsed().as_micros() as u64;
         self.refresh_status();
@@ -1919,11 +2033,11 @@ impl PlaneCore {
             pipelined_us,
             pipelined == 1,
         );
-        let ok = pipelined < sequential;
         // The headline is the conjunction of its own stages, not a separate
         // condition: a ladder used to render a failed stage under a green
-        // result when the arithmetic happened to work out.
-        let ok = ok && self.activity.stages.last().is_some_and(|stage| stage.ok);
+        // result when the arithmetic happened to work out. Conjoining only the
+        // *last* stage left an earlier red stage under a green result.
+        let ok = pipelined < sequential && self.activity.stages.iter().all(|stage| stage.ok);
         (
             "Pipelining vs sequential".into(),
             ok,
@@ -1939,6 +2053,9 @@ impl PlaneCore {
     }
 
     fn scenario_redaction(&mut self) -> (String, bool, String, Json) {
+        // Fail closed before the first fallible projection: if one panics or
+        // errors, the flag must read "not proven", not keep last run's `true`.
+        self.redaction_ok = false;
         let mut module = InfinityModule::new();
         let secret = module.push(Inode::Secret(SecretBytes::from(SECRET_CANARY)));
         let copy = module.push(Inode::Str(SECRET_CANARY.into()));
@@ -2105,11 +2222,26 @@ impl PlaneCore {
         self.stage("handshake", "registered once at startup", 0.0, true);
         let cap = self.mcp_cap.clone();
         let start = Instant::now();
-        let promise = self
+        // A kernel refusal is a result, not a bug: the stage names the code the
+        // way the wire does, so a second run that hits `mcp/id-mismatch` reads
+        // as that code instead of "Scenario panic".
+        let promise = match self
             .agent
             .call(self.lane, &cap, "echo", vec![Arg::text("hi")])
-            .expect("tool call");
-        let value = self.await_value(&promise).expect("tool value");
+        {
+            Ok(promise) => promise,
+            Err(error) => {
+                let us = start.elapsed().as_secs_f64() * 1e6;
+                return self.refused_scenario("MCP memory tool", "tools/call", &error, us);
+            }
+        };
+        let value = match self.await_value(&promise) {
+            Ok(value) => value,
+            Err(error) => {
+                let call_us = start.elapsed().as_secs_f64() * 1e6;
+                return self.refused_scenario("MCP memory tool", "tools/call", &error, call_us);
+            }
+        };
         let call_us = start.elapsed().as_secs_f64() * 1e6;
         self.counters.tool_calls += 1;
         let ok = format!("{value:?}").contains("pong");
@@ -2228,9 +2360,12 @@ impl PlaneCore {
 
     fn scenario_local_process(&mut self) -> (String, bool, String, Json) {
         #[cfg(windows)]
-        let (program, flag) = ("cmd", "/C");
+        let flag = "/C";
         #[cfg(not(windows))]
-        let (program, flag) = ("sh", "-c");
+        let flag = "-c";
+        // The absolute program that was registered, not a bare name: an
+        // operator told "cmd" would reasonably assume `PATH` was consulted.
+        let program = self.process_program.clone();
         let allowed = self.process_allowed.clone();
         let denied = self.process_denied.clone();
         self.stage(
@@ -2254,6 +2389,25 @@ impl PlaneCore {
         self.counters.tool_calls += 1;
         let echoed = format!("{value:?}").contains("active");
         self.stage("stdout", brief(&value), run_us, echoed);
+        // A prefix allow list over a shell would admit this line; the exact
+        // entry does not. The policy is enforced at dispatch, so the refusal
+        // arrives on the promise.
+        let start = Instant::now();
+        let promise = self
+            .agent
+            .call(
+                self.lane,
+                &allowed,
+                "run",
+                vec![Arg::text(flag), Arg::text("echo active & whoami")],
+            )
+            .expect("queued: the argument policy runs at dispatch");
+        let escape = self
+            .await_value(&promise)
+            .expect_err("a shell escape must be refused");
+        let escape_us = start.elapsed().as_secs_f64() * 1e6;
+        let escape_ok = escape.code() == "rpc/tool-policy";
+        self.stage("shell escape", escape.code(), escape_us, escape_ok);
         let start = Instant::now();
         let promise = self
             .agent
@@ -2266,17 +2420,23 @@ impl PlaneCore {
             .expect("queued denied call");
         let error = self.await_value(&promise).expect_err("process denial");
         let deny_us = start.elapsed().as_secs_f64() * 1e6;
-        let ok = echoed && error.code() == "rpc/tool-policy";
-        self.stage("denied", error.code(), deny_us, ok);
+        let deny_ok = error.code() == "rpc/tool-policy";
+        self.stage("denied", error.code(), deny_us, deny_ok);
+        let ok = echoed && deny_ok && escape_ok;
         (
             "Local process policy".into(),
             ok,
             format!(
-                "allowlisted echo returned {}; denial refused with {}",
-                brief(&value),
+                "exact command line ran; escape and denial refused with {} and {}",
+                escape.code(),
                 error.code()
             ),
-            json!({"value": brief(&value), "deny_code": error.code(), "run_us": run_us}),
+            json!({
+                "value": brief(&value),
+                "escape_code": escape.code(),
+                "deny_code": error.code(),
+                "run_us": run_us,
+            }),
         )
     }
 

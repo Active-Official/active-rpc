@@ -131,6 +131,12 @@ impl Attach {
         if self.read_only {
             return Err("read-only plane: scenarios are disabled".to_string());
         }
+        // The id is interpolated into a URL path. Accepting only the ids this
+        // plane defines keeps a `/`, `?` or `#` from rewriting the request, and
+        // the allowlist is enforced here as well as in the router.
+        if crate::plane::scenario_def(id).is_none() {
+            return Err(format!("unknown scenario {id}"));
+        }
         if let Some(local) = &self.local {
             let mut core = local.lock().map_err(|_| "plane poisoned".to_string())?;
             return core.run_scenario(id).and_then(|result| {
@@ -325,15 +331,75 @@ fn respond(request: &Json, attach: &Attach) -> Option<Json> {
     })
 }
 
+/// Longest MCP request line accepted, in bytes.
+///
+/// `stdin.lines()` grows a `String` until it finds a newline, so a host that
+/// never sends one could grow this process's memory without bound.
+pub const MAX_REQUEST_LINE: usize = 1 << 20;
+
+/// Read one `\n`-terminated line, refusing one longer than `limit` bytes.
+///
+/// Returns the number of bytes buffered (0 at end of input).
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<usize> {
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Ok(buffer.len());
+        }
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(index) => {
+                if buffer.len() + index > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "MCP request line exceeds the ceiling",
+                    ));
+                }
+                buffer.extend_from_slice(&available[..=index]);
+                reader.consume(index + 1);
+                return Ok(buffer.len());
+            }
+            None => {
+                let length = available.len();
+                if buffer.len() + length > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "MCP request line exceeds the ceiling",
+                    ));
+                }
+                buffer.extend_from_slice(available);
+                reader.consume(length);
+            }
+        }
+    }
+}
+
 pub fn run(attach_url: Option<String>, read_only: bool) -> io::Result<()> {
-    let attach = Attach::new(
-        attach_url.unwrap_or_else(|| DEFAULT_ATTACH.to_string()),
-        read_only,
-    );
-    let stdin = io::stdin();
+    let base = attach_url.unwrap_or_else(|| DEFAULT_ATTACH.to_string());
+    // The plane is loopback-only, so a base that names another machine cannot
+    // be the plane this process is supposed to read.
+    if !crate::server::same_origin(&base, None) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--attach must name a loopback origin, got {base}"),
+        ));
+    }
+    let attach = Attach::new(base, read_only);
+    let mut stdin = io::BufReader::new(io::stdin());
     let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
+    loop {
+        let mut buffer = Vec::new();
+        if read_bounded_line(&mut stdin, &mut buffer, MAX_REQUEST_LINE)? == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&buffer).into_owned();
         if line.trim().is_empty() {
             continue;
         }
@@ -355,4 +421,48 @@ pub fn run(attach_url: Option<String>, read_only: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_bounded_line, MAX_REQUEST_LINE};
+    use std::io::Cursor;
+
+    #[test]
+    fn a_request_line_is_bounded() {
+        let mut reader = Cursor::new(b"{\"jsonrpc\":\"2.0\"}\n".to_vec());
+        let mut buffer = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buffer, 64).expect("line"),
+            18
+        );
+        assert_eq!(buffer, b"{\"jsonrpc\":\"2.0\"}\n");
+
+        // A line that never ends is refused instead of buffered: `lines()`
+        // would have grown this process's memory until the host stopped.
+        let mut reader = Cursor::new(vec![b'x'; 4096]);
+        let mut buffer = Vec::new();
+        assert!(read_bounded_line(&mut reader, &mut buffer, 1024).is_err());
+        assert!(buffer.len() <= 1024);
+
+        // End of input is not an error.
+        let mut reader = Cursor::new(Vec::new());
+        let mut buffer = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut buffer, MAX_REQUEST_LINE).expect("eof"),
+            0
+        );
+    }
+
+    #[test]
+    fn the_attach_base_must_be_loopback() {
+        // The same predicate the client uses before it opens a socket.
+        assert!(crate::server::same_origin("http://127.0.0.1:8787", None));
+        assert!(crate::server::same_origin("http://localhost:8787", None));
+        assert!(!crate::server::same_origin("http://example.com:8787", None));
+        assert!(!crate::server::same_origin(
+            "http://127.0.0.1.evil.example",
+            None
+        ));
+    }
 }

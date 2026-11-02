@@ -416,9 +416,9 @@
 			const [done, total] = activity.progress;
 			const fraction = total ? Math.min(100, (done / total) * 100) : 0;
 			$("activity-progress").innerHTML =
-				`progress ${fmt(done)} / ${fmt(total)} <span class="inline-bar"><i style="width:${fraction}%"></i></span>`;
+				`iterations ${fmt(done)} / ${fmt(total)} <span class="inline-bar"><i style="width:${fraction}%"></i></span>`;
 		} else {
-			setText("activity-progress", "progress —");
+			setText("activity-progress", "iterations —");
 		}
 		const chain = activity.promise_chain || [];
 		if (!chain.length) {
@@ -590,6 +590,17 @@
 			: "Drag across the tracks to brush a time window; the event log follows.";
 	}
 
+	// One document-level mouseup for every brush. It used to be installed
+	// inside `attachBrush`, which runs for six tracks on every render, so the
+	// listeners accumulated at ~6/s for the life of the tab, each retaining its
+	// own track and bounds.
+	let activeBrush = null;
+	document.addEventListener("mouseup", (event) => {
+		const finish = activeBrush;
+		activeBrush = null;
+		if (finish) finish(event);
+	});
+
 	function attachBrush(track, bounds, span) {
 		let start = null;
 		track.addEventListener("mousedown", (event) => {
@@ -617,8 +628,12 @@
 			};
 			render(state.snapshot);
 		};
+		// A drag that started on this track is finished by the document handler,
+		// wherever the pointer was released.
+		track.addEventListener("mousedown", () => {
+			activeBrush = finish;
+		});
 		track.addEventListener("mouseup", finish);
-		document.addEventListener("mouseup", finish, { once: true });
 	}
 
 	function matchesFilter(event) {
@@ -1118,11 +1133,32 @@
 		const protocol = location.protocol === "https:" ? "wss" : "ws";
 		const ws = new WebSocket(`${protocol}://${location.host}/ws`);
 		state.ws = ws;
+		let lastFrame = 0;
+		let status = "connecting";
 		ws.addEventListener("open", () => {
 			state.retry = 0;
-			setStatus("live", "live");
+			setStatus("connected", "live");
+			status = "connected";
 		});
+		// A socket that opened and then stopped delivering frames used to keep
+		// advertising "live". The frame age decides, not the socket state.
+		const watchdog = setInterval(() => {
+			if (state.ws !== ws) {
+				clearInterval(watchdog);
+				return;
+			}
+			if (lastFrame && Date.now() - lastFrame > 3000) {
+				setStatus("stale", "error");
+				status = "stale";
+			}
+		}, 1000);
+		ws.addEventListener("close", () => clearInterval(watchdog));
 		ws.addEventListener("message", (event) => {
+			lastFrame = Date.now();
+			if (status !== "live") {
+				setStatus("live", "live");
+				status = "live";
+			}
 			try {
 				render(JSON.parse(event.data));
 			} catch (error) {

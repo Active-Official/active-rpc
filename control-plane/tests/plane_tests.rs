@@ -184,6 +184,45 @@ fn status_module_is_valid_ainf_with_a_matching_hash() {
         .contains(active_control_plane::plane::SECRET_CANARY));
 }
 
+/// A scenario is not a one-shot: "Run ≤ L6" twice must pass twice.
+///
+/// The MCP step used to reuse one session whose transport answered with fixed
+/// request ids, so the second run got `mcp/id-mismatch` and the ladder painted a
+/// red stage that said only "Scenario panic".
+#[test]
+fn every_ladder_step_passes_twice() {
+    let mut core = PlaneCore::new();
+    for round in 0..2 {
+        for def in SCENARIOS {
+            let result = core.run_scenario(def.id).expect("scenario");
+            assert!(
+                result.ok,
+                "round {round}: {} failed: {} ({})",
+                def.id, result.detail, result.data
+            );
+            assert_eq!(
+                result.data["panic"],
+                serde_json::json!(null),
+                "round {round}: {} panicked",
+                def.id
+            );
+        }
+    }
+}
+
+/// A refusal the kernel actually made is reported as its code, and a panic is
+/// reported with a message, so an operator can tell the two apart.
+#[test]
+fn a_scenario_reports_the_code_it_refused_with() {
+    let mut core = PlaneCore::new();
+    // `mcp-memory` is the step whose second run used to desynchronise.
+    let first = core.run_scenario("mcp-memory").expect("scenario");
+    assert!(first.ok, "{}", first.detail);
+    assert!(first.data["panic"].is_null());
+    let second = core.run_scenario("mcp-memory").expect("scenario");
+    assert!(second.ok, "{}", second.detail);
+}
+
 #[test]
 fn every_ladder_step_runs_real_code_and_passes() {
     let mut core = PlaneCore::new();
@@ -411,4 +450,25 @@ fn read_only_mode_is_labeled_without_changing_observations() {
     let snapshot = core.snapshot();
     assert_eq!(snapshot.health.mode, "read-only");
     assert!(snapshot.infinity.counters.encodes > 0);
+}
+
+/// Dropping a core closes its HTTP stub: the thread used to keep accepting for
+/// the life of the process, so every core built (every test, every worker, the
+/// MCP fallback) leaked a listener and a thread.
+#[test]
+fn dropping_a_core_closes_the_http_stub() {
+    let core = PlaneCore::new();
+    let address = core.http_address().to_string();
+    assert!(
+        std::net::TcpStream::connect(&address).is_ok(),
+        "the stub listens while the core is alive"
+    );
+    drop(core);
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(&address).is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("the HTTP stub is still accepting after the core was dropped");
 }
