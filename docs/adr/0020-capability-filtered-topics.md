@@ -14,7 +14,9 @@ topics are the pub/sub analogue.
 
 - `CapAttrs` gains `topics: Option<BTreeSet<String>>`. `None` means no topic
   restriction; `Some(set)` is an allow-list.
-- `CapAttrs::restrict_topics(&["a", "b"])` builds the set.
+- `CapAttrs::restrict_topics(&["a", "b"])` builds the set **and** the publish
+  grant; `CapAttrs::allow_publish()` grants any topic. Publishing is an explicit
+  grant, not a side effect of holding a capability (see the amendment below).
 - `Agent::publish(lane, channel, cap, topic, payload)` requires a live
   capability:
   - revoked or expired → `rpc/revoked` (with `Event::CapExpired` for expiry),
@@ -39,3 +41,27 @@ topics are the pub/sub analogue.
   tool policy.
 - Subscriptions are per receive call, not stored per lane. A sticky subscriber
   registry would be a new ADR.
+
+## Amendment (R-17, hostile review round 1)
+
+The review found that the topic set filtered *publishers* while the channel had
+no read authorization at all. Three changes:
+
+- **Reading is a subscription.** `recv`/`recv_topic` take the lane and require
+  that lane to be in the channel's subscriber set. Channel ids were a sequential
+  counter and a receive needed nothing but an id, so any lane in the kernel could
+  drain any channel. A lane that may not read a channel gets `rpc/unknown-channel`
+  — the same answer as a channel that does not exist — so the ids are not a
+  membership oracle.
+- **Publishing is a grant.** `CapAttrs::publish` defaults to false and
+  attenuation can only drop it, so holding a capability for one provider no
+  longer lets a lane speak on a channel under a topic a subscriber trusts. A cap
+  without the grant gets `rpc/method-not-granted`; the record persists the flag.
+- **A topic is bounded text.** 1..=128 bytes, no control characters, checked at
+  the grant and again at publish. An empty topic was publishable and
+  indistinguishable from "no topic"; an unbounded one reached an error message
+  and an event unclamped; a control character forged a line in a terminal.
+
+Remaining, recorded: a publisher's *identity* is not in the message, so two
+capabilities granted the same topic are indistinguishable to a subscriber. A
+future revision can record the publishing correlation id on `Message`.

@@ -194,7 +194,11 @@ impl Channel {
             return Err(Error::InvalidArgument("channel is receive-only"));
         }
         if self.queue.len() >= MAX_QUEUED_PER_CHANNEL {
-            return Err(Error::BudgetExceeded("channel queue"));
+            // A full channel is backpressure, like the byte ceiling: the sender's
+            // grant is untouched and the call can be retried later. Reporting a
+            // spent budget here misclassified the refusal and charged the sender
+            // a budget exhaustion it never earned.
+            return Err(Error::Backpressure("channel queue ceiling reached"));
         }
         if !self.has_room_for(bytes) {
             // A full channel is backpressure, not a spent budget: the sender's

@@ -2264,7 +2264,7 @@ impl PlaneCore {
                     .channel_messages
                     .entry("work-queue".to_string())
                     .or_insert(0) += 1;
-                let _ = self.agent.recv(channel);
+                let _ = self.agent.recv(self.lane, channel);
             }
         }
         let start = Instant::now();
@@ -2329,7 +2329,7 @@ impl PlaneCore {
         let start = Instant::now();
         let message = self
             .agent
-            .recv(channel)
+            .recv(self.lane, channel)
             .expect("channel recv")
             .expect("a queued message");
         let recv_us = start.elapsed().as_secs_f64() * 1e6;

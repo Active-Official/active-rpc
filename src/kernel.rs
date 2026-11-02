@@ -1005,6 +1005,7 @@ impl Agent {
             redact: record.attrs.redact,
             path_scope: record.attrs.path_scope.clone(),
             topics: record.attrs.topics.clone(),
+            publish: record.attrs.publish,
             tool_policy: record.attrs.tool_policy.clone(),
             bound_to: record.attrs.bound_to,
             expires_at: record.expires_at,
@@ -2018,6 +2019,18 @@ impl Agent {
             // Publishing writes to a channel; a read-only grant cannot mutate.
             return Err(Error::ReadOnly);
         }
+        // Publishing is a grant of its own: holding a capability for some other
+        // provider must not let a lane speak on a channel under a topic a
+        // subscriber trusts.
+        if !record.attrs.publish {
+            return Err(Error::MethodNotGranted {
+                method: "publish".to_string(),
+            });
+        }
+        // The topic is attacker-controlled text that reaches an event and an
+        // error message, so it is validated here like a method name, before it
+        // can be copied anywhere.
+        check_topic(topic)?;
         if let Some(topics) = &record.attrs.topics {
             if !topics.contains(topic) {
                 return Err(Error::TopicNotGranted(topic.to_string()));
@@ -2101,9 +2114,21 @@ impl Agent {
         Ok(message.sequence)
     }
 
-    /// Receive the next message published on `topic`.
-    pub fn recv_topic(&self, channel: ChannelId, topic: &str) -> Result<Option<Message>> {
+    /// Receive the next message published on `topic`, as `lane`.
+    ///
+    /// `lane` must be subscribed to the channel. Receiving used to need nothing
+    /// but a channel id, and ids were a sequential counter, so any lane in the
+    /// kernel could drain any other lane's messages. A lane that may not read a
+    /// channel gets the same answer as one that names a channel which does not
+    /// exist, so the refusal is not an oracle.
+    pub fn recv_topic(
+        &self,
+        lane: LaneId,
+        channel: ChannelId,
+        topic: &str,
+    ) -> Result<Option<Message>> {
         let mut kernel = self.cell.borrow_mut();
+        check_subscriber(&kernel, lane, channel)?;
         let record = kernel
             .channels
             .get_mut(&channel)
@@ -2121,9 +2146,12 @@ impl Agent {
         Ok(message)
     }
 
-    /// Receive the next message on a channel.
-    pub fn recv(&self, channel: ChannelId) -> Result<Option<Message>> {
+    /// Receive the next message on a channel, as `lane`.
+    ///
+    /// `lane` must be subscribed to the channel; see [`Agent::recv_topic`].
+    pub fn recv(&self, lane: LaneId, channel: ChannelId) -> Result<Option<Message>> {
         let mut kernel = self.cell.borrow_mut();
+        check_subscriber(&kernel, lane, channel)?;
         let record = kernel
             .channels
             .get_mut(&channel)
@@ -4038,6 +4066,41 @@ impl Kernel {
     }
 }
 
+/// Longest topic a channel accepts, in bytes.
+pub const MAX_TOPIC_BYTES: usize = 128;
+
+/// Whether a topic can travel through a channel, an event and an error message.
+///
+/// A topic is caller-supplied text that a subscriber treats as provenance, so an
+/// empty string, an unbounded string or a control character cannot be accepted:
+/// the first is indistinguishable from "no topic", the second is a memory and
+/// log problem, and the third forges a line in a terminal or a log file.
+pub fn valid_topic(topic: &str) -> bool {
+    !topic.is_empty() && topic.len() <= MAX_TOPIC_BYTES && !topic.chars().any(char::is_control)
+}
+
+/// Refuse a topic the channel surfaces cannot represent.
+fn check_topic(topic: &str) -> Result<()> {
+    if !valid_topic(topic) {
+        return Err(Error::InvalidArgument(
+            "a topic must be 1..=128 bytes without control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a receive from a lane that did not subscribe.
+///
+/// The same error as an unknown channel: a lane that may not read a channel must
+/// not be able to tell it apart from one that does not exist, or the ids become
+/// a membership oracle.
+fn check_subscriber(kernel: &Kernel, lane: LaneId, channel: ChannelId) -> Result<()> {
+    match kernel.channels.get(&channel) {
+        Some(record) if record.subscribers.contains(&lane.0) => Ok(()),
+        _ => Err(Error::UnknownChannel(channel.0)),
+    }
+}
+
 /// Milliseconds since the Unix epoch, or 0 if the clock is before it.
 fn wall_now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -4150,6 +4213,16 @@ fn check_method_names(attrs: &CapAttrs) -> Result<()> {
         return Err(Error::InvalidArgument(
             "a method name must be 1..=1024 bytes without control characters",
         ));
+    }
+    // A granted topic the channel cannot carry would mint a capability that can
+    // never publish, and the name reaches an event: both are checked at the
+    // grant, like a method name.
+    if let Some(topics) = &attrs.topics {
+        if topics.iter().any(|topic| !valid_topic(topic)) {
+            return Err(Error::InvalidArgument(
+                "a topic must be 1..=128 bytes without control characters",
+            ));
+        }
     }
     Ok(())
 }

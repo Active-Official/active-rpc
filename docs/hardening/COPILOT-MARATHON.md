@@ -30,7 +30,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-14 | wasm tools | `src/wasm_tool.rs` | round 1: 1 critical + 3 highs + 5 mediums + 6 lows fixed | 15 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | round 1: 4 highs + 9 mediums + 6 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | round 1: 2 mediums + 2 lows fixed | 4 fixed / 0 rejected / 0 open (1 documented residual: no store wired by default) | this commit |
-| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | pending | — | — |
+| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | round 1: 2 highs + 6 mediums + 3 lows fixed | 11 fixed / 0 rejected / 0 open (1 recorded: publisher identity) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | pending | — | — |
 | R-19 | control-plane | `control-plane/**` | pending | — | — |
 | R-20 | fuzz | `fuzz/**` | pending | — | — |
@@ -194,6 +194,35 @@ worktree was being edited). Five highs, four mediums, six lows.
 
 Gate: `cargo test --all-features` 469 passed, 0 failed; clippy clean on both
 feature sets; fmt clean.
+
+### R-17 introduction and topics - 2026-11-01 (round 1)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `5bc90f7`,
+with probes. No critical; two highs, six mediums, three lows. The first high is
+the kind of gap that only a probe finds: the isolation the multi-tenant test
+advertised was the sequential channel id, not a check.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| T1 | high | `recv`/`recv_topic` took only a `ChannelId` and never consulted `subscribers`, so any lane could drain any channel (ids are a counter) | **fixed**: both take the lane and require a subscription; the refusal is `rpc/unknown-channel` so ids are not an oracle; `a_lane_that_did_not_subscribe_cannot_read_a_channel` |
+| T2 | high | topic grants filtered publishers only; a message carried no publisher, so a subscriber could not tell two publishers apart | **partly fixed**: the root cause (any cap could publish) is closed by the publish grant; per-message publisher identity is recorded as the residual below |
+| T3 | medium | any live capability was a publish grant | **fixed**: `CapAttrs::publish` (default false, monotone, persisted), `allow_publish`/`restrict_topics`; `publishing_requires_an_explicit_grant`, `attenuation_cannot_add_the_publish_grant` |
+| T4 | medium | topics were unvalidated: empty was publishable, no ceiling, control characters reached an error verbatim | **fixed**: 1..=128 bytes, no control characters, at the grant and at publish; `a_topic_must_be_bounded_and_printable` |
+| T5 | medium | `Agent::channel` returned a detached clone whose mutators reported success | documented: the type is a snapshot; the mutating methods are for the kernel's own use |
+| T6 | medium | an introduction was not canonical: provider order and duplicate methods changed its bytes (and the fingerprint) | **fixed**: sort providers, sort and dedupe methods; `an_introduction_is_canonical_whatever_order_the_caller_used` |
+| T7 | medium | `introduce_to` binds the live subtree irreversibly, so the grantor loses local use | documented as the intent in ADR-0017 (hand-over, not share); an embedder that wants to keep authority attenuates a child |
+| T8 | medium | `channel.push` reported a full queue as a spent budget, and `publish_inner` charged before queueing | **fixed**: both ceilings are `rpc/backpressure`, which `note_refusal` does not count as an exhaustion |
+| T9 | low | introduction names were unbounded and the encode error lost its reason | **fixed**: `check_name` + the reason kept; `an_introduction_refuses_an_unprintable_name` |
+| T10 | low | no test touched receive isolation, empty/huge/control topics, or the publish grant | **fixed**: `tests/intro_topic_hardening_tests.rs` (6) plus the updated topic/lane/multi-tenant suites |
+| T11 | low | `queued_size` duplicated the kernel's byte formula | noted: the two agree, and the count check in the kernel now matches the channel |
+
+Recorded residual: `Message` does not name the publishing capability, so two
+grants for the same topic are indistinguishable to a receiver. Adding the
+publisher correlation id to `Message` is additive and is the next step.
+
+Gate: `cargo test --all-features` 597 passed, 0 failed across 68 suites;
+`--no-default-features` 537 passed, 0 failed; clippy, fmt and
+`cargo doc -D warnings` clean on both feature sets; control plane 30, CLI 17.
 
 ### R-16 security helpers - 2026-11-01 (round 1)
 

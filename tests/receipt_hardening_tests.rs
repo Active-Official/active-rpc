@@ -641,25 +641,43 @@ fn an_ungranted_method_leaves_no_receipt() {
 // F7: appends stay linear
 // ---------------------------------------------------------------------------
 
-/// The cached state makes a long append sequence linear: N appends do not
-/// re-read and re-walk the file each time.
+/// Appending does not get slower as the log grows: the cached state means one
+/// stat, one small read and one append, not a re-walk of the file.
+///
+/// The measure is *growth*, not absolute time: a `sync_data` costs whatever the
+/// disk costs (about 8 ms on the machine this was written on), and a bound on
+/// that number fails on a loaded CI box while saying nothing about the
+/// algorithm. A quadratic append would make the last 200 records far slower than
+/// the first 200; a linear one keeps the ratio near one.
 #[test]
 fn many_appends_stay_linear() {
     let dir = sandbox("linear");
     let path = dir.join("receipts.arrl");
     let log = ReceiptLog::create(&path).expect("create");
     const COUNT: u64 = 2_000;
-    let started = std::time::Instant::now();
+    const BATCH: u64 = 200;
+
+    let mut early = std::time::Duration::ZERO;
+    let mut late = std::time::Duration::ZERO;
     for sequence in 1..=COUNT {
+        let started = std::time::Instant::now();
         log.append(&receipt(sequence, sequence)).expect("append");
+        let elapsed = started.elapsed();
+        if sequence <= BATCH {
+            early += elapsed;
+        }
+        if sequence > COUNT - BATCH {
+            late += elapsed;
+        }
     }
-    let elapsed = started.elapsed();
     assert_eq!(log.len().expect("len"), COUNT);
-    // A quadratic append (re-walking the whole file each time) is orders of
-    // magnitude slower than this; the bound is loose enough for a loaded CI box.
+    // Quadratic behaviour at this size is roughly a 10x ratio; a linear append
+    // stays within a small multiple even when the disk stutters.
+    let ratio = late.as_secs_f64() / early.as_secs_f64().max(1e-9);
     assert!(
-        elapsed < std::time::Duration::from_secs(20),
-        "{COUNT} appends took {elapsed:?}, which suggests a re-read per append"
+        ratio < 5.0,
+        "the last {BATCH} appends took {late:?} against {early:?} for the first {BATCH} \
+         (ratio {ratio:.1}), which suggests the cost grows with the log"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

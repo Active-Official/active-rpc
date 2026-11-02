@@ -59,6 +59,9 @@ fn mint_tenant(agent: &Agent, provider: active_rpc::ProviderId, index: usize) ->
     let channel = agent
         .create_channel(format!("channel-{index}"), Direction::Both)
         .expect("channel");
+    // Receiving is a subscription: only the tenant's own lane may drain its
+    // channel, so one tenant cannot read another's traffic.
+    agent.subscribe(lane, channel).expect("subscribe");
     Tenant {
         cap,
         lane,
@@ -129,7 +132,7 @@ fn one_kernel_keeps_sixteen_tenants_apart_under_interleaving() {
     for (index, tenant) in tenants.iter().enumerate().rev() {
         let mut seen = Vec::new();
         while let Some(message) = agent
-            .recv_topic(tenant.channel, &tenant.topic)
+            .recv_topic(tenant.lane, tenant.channel, &tenant.topic)
             .expect("recv")
         {
             assert_eq!(message.topic.as_deref(), Some(tenant.topic.as_str()));
@@ -147,7 +150,7 @@ fn one_kernel_keeps_sixteen_tenants_apart_under_interleaving() {
         // A topic this tenant never published is empty.
         let empty = (index + 3) % TENANTS;
         assert!(agent
-            .recv_topic(tenant.channel, &tenants[empty].topic)
+            .recv_topic(tenant.lane, tenant.channel, &tenants[empty].topic)
             .expect("recv")
             .is_none());
     }

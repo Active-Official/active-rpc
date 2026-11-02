@@ -530,12 +530,13 @@ fn a_channel_accounts_for_queued_bytes() {
     let channel = agent
         .create_channel("counted", Direction::Both)
         .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
     let message = agent
         .send(lane, channel, Value::text("payload"), &[])
         .expect("send");
     let queued = agent.channel(channel).expect("channel").queued_bytes();
     assert!(queued > 0, "the message was not accounted");
-    let received = agent.recv(channel).expect("recv").expect("message");
+    let received = agent.recv(lane, channel).expect("recv").expect("message");
     assert_eq!(received.sequence, message);
     assert_eq!(
         agent.channel(channel).expect("channel").queued_bytes(),

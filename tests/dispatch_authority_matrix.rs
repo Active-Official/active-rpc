@@ -81,7 +81,10 @@ fn fixture(ttl_ms: Option<u64>) -> Fixture {
     let attrs = match ttl_ms {
         Some(ttl) => CapAttrs::new(&["echo", "mutate"]).with_ttl_ms(ttl),
         None => CapAttrs::new(&["echo", "mutate"]),
-    };
+    }
+    // Publishing is a grant of its own, not a side effect of holding any
+    // capability: the matrix mints one that can publish.
+    .allow_publish();
     let cap = agent.mint(provider, 0, attrs).expect("mint");
     let lane = agent
         .create_lane("matrix", Budget::default())
@@ -273,7 +276,12 @@ fn publish_as_enforces_the_identity_binding() {
     let owner_peer = peer(b"publish-owner");
     let stranger = peer(b"publish-stranger");
     let cap = agent
-        .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]))
+        .mint_bound(
+            &owner,
+            provider,
+            0,
+            CapAttrs::new(&["echo"]).allow_publish(),
+        )
         .expect("bound cap");
     let lane = agent.create_lane("bound", Budget::default()).expect("lane");
     let channel = agent

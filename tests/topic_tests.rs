@@ -46,27 +46,42 @@ fn fixture() -> Fixture {
 }
 
 fn cap(fixture: &Fixture, attrs: CapAttrs) -> CapHandle {
+    // Every capability in this file is a publishing grant: the tests vary the
+    // topic set, not whether publishing is allowed at all.
     fixture
         .agent
-        .mint(fixture.provider, 0, attrs)
+        .mint(fixture.provider, 0, attrs.allow_publish())
         .expect("mint")
+}
+
+/// Create a channel and subscribe the fixture lane to it.
+///
+/// Receiving is a subscription: a lane that did not subscribe cannot drain a
+/// channel, so every test that reads one subscribes here.
+fn channel(fixture: &Fixture, name: &str) -> active_rpc::ChannelId {
+    let channel = fixture
+        .agent
+        .create_channel(name, Direction::Both)
+        .expect("channel");
+    fixture
+        .agent
+        .subscribe(fixture.lane, channel)
+        .expect("subscribe");
+    channel
 }
 
 #[test]
 fn an_unrestricted_capability_publishes_any_topic() {
     let fixture = fixture();
     let cap = cap(&fixture, CapAttrs::new(&["echo"]));
-    let channel = fixture
-        .agent
-        .create_channel("news", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "news");
     fixture
         .agent
         .publish(fixture.lane, channel, &cap, "alerts", Value::text("hi"))
         .expect("publish");
     let message = fixture
         .agent
-        .recv_topic(channel, "alerts")
+        .recv_topic(fixture.lane, channel, "alerts")
         .expect("recv")
         .expect("message");
     assert_eq!(message.topic.as_deref(), Some("alerts"));
@@ -80,10 +95,7 @@ fn a_topic_outside_the_capability_is_refused() {
         &fixture,
         CapAttrs::new(&["echo"]).restrict_topics(&["a", "b"]),
     );
-    let channel = fixture
-        .agent
-        .create_channel("news", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "news");
     fixture
         .agent
         .publish(fixture.lane, channel, &cap, "a", Value::text("ok"))
@@ -106,10 +118,7 @@ fn attenuation_narrows_the_topic_set() {
         .agent
         .attenuate(&parent, CapAttrs::new(&["echo"]).restrict_topics(&["a"]))
         .expect("narrowed child");
-    let channel = fixture
-        .agent
-        .create_channel("news", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "news");
     fixture
         .agent
         .publish(fixture.lane, channel, &child, "a", Value::text("child"))
@@ -162,10 +171,7 @@ fn the_empty_topic_set_is_the_narrowest_grant() {
         .agent
         .attenuate(&parent, CapAttrs::new(&["echo"]).restrict_topics(&[]))
         .expect("an empty set attenuated to itself");
-    let channel = fixture
-        .agent
-        .create_channel("empty", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "empty");
     let error = fixture
         .agent
         .publish(fixture.lane, channel, &child, "any", Value::text("x"))
@@ -186,10 +192,7 @@ fn a_subscriber_receives_only_its_topic_and_others_stay_queued() {
         &fixture,
         CapAttrs::new(&["echo"]).restrict_topics(&["a", "b"]),
     );
-    let channel = fixture
-        .agent
-        .create_channel("news", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "news");
     for topic in ["a", "b", "a"] {
         fixture
             .agent
@@ -198,26 +201,35 @@ fn a_subscriber_receives_only_its_topic_and_others_stay_queued() {
     }
     let first_b = fixture
         .agent
-        .recv_topic(channel, "b")
+        .recv_topic(fixture.lane, channel, "b")
         .expect("recv b")
         .expect("b message");
     assert_eq!(first_b.payload, Value::text("b"));
     // The two "a" messages remain, in order.
-    let one = fixture.agent.recv(channel).expect("recv").expect("a");
-    let two = fixture.agent.recv(channel).expect("recv").expect("a");
+    let one = fixture
+        .agent
+        .recv(fixture.lane, channel)
+        .expect("recv")
+        .expect("a");
+    let two = fixture
+        .agent
+        .recv(fixture.lane, channel)
+        .expect("recv")
+        .expect("a");
     assert_eq!(one.topic.as_deref(), Some("a"));
     assert_eq!(two.topic.as_deref(), Some("a"));
-    assert!(fixture.agent.recv(channel).expect("empty").is_none());
+    assert!(fixture
+        .agent
+        .recv(fixture.lane, channel)
+        .expect("empty")
+        .is_none());
 }
 
 #[test]
 fn a_revoked_capability_cannot_publish() {
     let fixture = fixture();
     let cap = cap(&fixture, CapAttrs::new(&["echo"]));
-    let channel = fixture
-        .agent
-        .create_channel("news", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "news");
     fixture.agent.revoke(&cap).expect("revoke");
     let error = fixture
         .agent
@@ -225,7 +237,11 @@ fn a_revoked_capability_cannot_publish() {
         .expect_err("revoked");
     assert_eq!(error.code(), "rpc/revoked");
     // Nothing was queued.
-    assert!(fixture.agent.recv(channel).expect("recv").is_none());
+    assert!(fixture
+        .agent
+        .recv(fixture.lane, channel)
+        .expect("recv")
+        .is_none());
 }
 
 #[test]
@@ -233,10 +249,7 @@ fn an_expired_capability_cannot_publish() {
     let fixture = fixture();
     fixture.agent.set_latency(100);
     let cap = cap(&fixture, CapAttrs::new(&["echo"]).with_ttl_ms(100));
-    let channel = fixture
-        .agent
-        .create_channel("news", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "news");
     // Advance the clock past the deadline. The call is itself refused at
     // dispatch (the deadline is re-checked there), and the round trip still
     // moves the virtual clock to the expiry instant.
@@ -259,10 +272,7 @@ fn an_expired_capability_cannot_publish() {
 #[test]
 fn a_capability_from_another_kernel_cannot_publish() {
     let fixture = fixture();
-    let channel = fixture
-        .agent
-        .create_channel("news", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "news");
     let other = Agent::with_secret([0x7f; 32]);
     let provider = other.register(Box::new(Echo));
     let foreign = other
@@ -278,15 +288,16 @@ fn a_capability_from_another_kernel_cannot_publish() {
 #[test]
 fn plain_send_and_recv_still_carry_no_topic() {
     let fixture = fixture();
-    let channel = fixture
-        .agent
-        .create_channel("news", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "news");
     fixture
         .agent
         .send(fixture.lane, channel, Value::text("plain"), &[])
         .expect("send");
-    let message = fixture.agent.recv(channel).expect("recv").expect("message");
+    let message = fixture
+        .agent
+        .recv(fixture.lane, channel)
+        .expect("recv")
+        .expect("message");
     assert_eq!(message.topic, None);
     assert_eq!(message.payload, Value::text("plain"));
     let _ = Arg::text("unused");
@@ -305,12 +316,14 @@ fn a_capability_bound_to_a_peer_publishes_only_through_that_peer() {
         .expect("admit");
     let cap = fixture
         .agent
-        .mint_bound(&admitted, fixture.provider, 0, CapAttrs::new(&["echo"]))
+        .mint_bound(
+            &admitted,
+            fixture.provider,
+            0,
+            CapAttrs::new(&["echo"]).allow_publish(),
+        )
         .expect("bound cap");
-    let channel = fixture
-        .agent
-        .create_channel("bound", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "bound");
 
     // An unauthenticated publish cannot exercise a bound capability: a channel
     // cannot prove who published.
@@ -346,7 +359,7 @@ fn a_capability_bound_to_a_peer_publishes_only_through_that_peer() {
         .expect("the bound peer publishes");
     let message = fixture
         .agent
-        .recv_topic(channel, "news")
+        .recv_topic(fixture.lane, channel, "news")
         .expect("recv")
         .expect("queued");
     assert_eq!(message.payload, Value::text("bound"));
@@ -358,10 +371,7 @@ fn a_publish_charges_the_capability_byte_budget() {
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.budget.max_bytes = 16;
     let cap = cap(&fixture, attrs);
-    let channel = fixture
-        .agent
-        .create_channel("budget", Direction::Both)
-        .expect("channel");
+    let channel = channel(&fixture, "budget");
 
     let error = fixture
         .agent
@@ -377,7 +387,7 @@ fn a_publish_charges_the_capability_byte_budget() {
     // The refusal did not queue anything.
     assert!(fixture
         .agent
-        .recv_topic(channel, "news")
+        .recv_topic(fixture.lane, channel, "news")
         .expect("recv")
         .is_none());
 
@@ -405,7 +415,7 @@ fn a_publish_charges_the_capability_byte_budget() {
         .expect("publish inside the budget");
     assert!(fixture
         .agent
-        .recv_topic(channel, "news")
+        .recv_topic(fixture.lane, channel, "news")
         .expect("recv")
         .is_some());
 }

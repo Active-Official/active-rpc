@@ -108,18 +108,22 @@ fn a_publish_refused_on_a_full_channel_charges_nothing() {
     agent
         .send(lane, channel, filler, &[])
         .expect("the ceiling itself fits");
-    let mut attrs = CapAttrs::new(&["echo"]);
+    let mut attrs = CapAttrs::new(&["echo"]).allow_publish();
     attrs.budget.max_bytes = 16;
     attrs.budget.max_calls = 1;
     let cap = agent.mint(provider, 0, attrs).expect("small cap");
     let publish_lane = agent.create_lane("pub", Budget::default()).expect("lane");
+    agent.subscribe(publish_lane, channel).expect("subscribe");
     let error = agent
         .publish(publish_lane, channel, &cap, "t", Value::text("0123456789"))
         .expect_err("the channel is full");
     assert_eq!(error.code(), "rpc/backpressure", "{error}");
 
     // Drain, then the same grant still works: the refusal charged nothing.
-    agent.recv(channel).expect("recv").expect("message");
+    agent
+        .recv(publish_lane, channel)
+        .expect("recv")
+        .expect("message");
     agent
         .publish(publish_lane, channel, &cap, "t", Value::text("0123456789"))
         .expect("the grant survived the refusal");
@@ -280,6 +284,7 @@ fn channel_bytes_are_exact() {
     let channel = agent
         .create_channel("exact", Direction::Both)
         .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
     let value = Value::text("payload");
     let size = value.wire_size();
     agent.send(lane, channel, value, &[]).expect("send");
@@ -287,6 +292,6 @@ fn channel_bytes_are_exact() {
         agent.channel(channel).expect("channel").queued_bytes(),
         size
     );
-    agent.recv(channel).expect("recv").expect("message");
+    agent.recv(lane, channel).expect("recv").expect("message");
     assert_eq!(agent.channel(channel).expect("channel").queued_bytes(), 0);
 }

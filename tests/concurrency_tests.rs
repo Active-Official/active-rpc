@@ -129,6 +129,10 @@ fn channels_do_not_cross_talk() {
     let lane = agent.create_lane("main", Budget::default()).unwrap();
     let left = agent.create_channel("left", Direction::Both).unwrap();
     let right = agent.create_channel("right", Direction::Both).unwrap();
+    // Receiving is a subscription: a lane that did not subscribe cannot drain a
+    // channel, which is what keeps one lane out of another's traffic.
+    agent.subscribe(lane, left).unwrap();
+    agent.subscribe(lane, right).unwrap();
     for index in 0..5 {
         agent.send(lane, left, Value::Int(index), &[]).unwrap();
         agent
@@ -136,14 +140,14 @@ fn channels_do_not_cross_talk() {
             .unwrap();
     }
     for index in 0..5 {
-        let message = agent.recv(left).unwrap().expect("left message");
+        let message = agent.recv(lane, left).unwrap().expect("left message");
         assert_eq!(message.payload, Value::Int(index));
         assert_eq!(message.sequence, index as u64);
-        let message = agent.recv(right).unwrap().expect("right message");
+        let message = agent.recv(lane, right).unwrap().expect("right message");
         assert_eq!(message.payload, Value::Int(100 + index));
     }
-    assert!(agent.recv(left).unwrap().is_none());
-    assert!(agent.recv(right).unwrap().is_none());
+    assert!(agent.recv(lane, left).unwrap().is_none());
+    assert!(agent.recv(lane, right).unwrap().is_none());
 }
 
 #[test]

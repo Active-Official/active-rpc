@@ -104,6 +104,8 @@ pub struct CapabilityRecord {
     pub path_scope: Option<String>,
     /// Topic set, when restricted.
     pub topics: Option<BTreeSet<String>>,
+    /// Whether the record carries the publish grant.
+    pub publish: bool,
     /// Tool policy, when present.
     pub tool_policy: Option<ToolPolicy>,
     /// Peer this capability was bound to, if it was.
@@ -173,6 +175,7 @@ impl CapabilityRecord {
                 None => Json::Null,
             },
         );
+        map.insert("publish".into(), self.publish.into());
         map.insert(
             "tool_policy".into(),
             match &self.tool_policy {
@@ -319,6 +322,13 @@ impl CapabilityRecord {
             Some(_) => return Err(Error::persistence("path scope is malformed")),
         };
         let topics = string_set(&value, "topics")?;
+        // A record written before the grant existed carries no field. The
+        // default narrows authority (no publishing) rather than widening it, and
+        // a record that names topics implies the grant.
+        let publish = value
+            .get("publish")
+            .and_then(Json::as_bool)
+            .unwrap_or_else(|| topics.is_some());
         let tool_policy = match value.get("tool_policy") {
             None | Some(Json::Null) => None,
             Some(Json::Object(policy)) => {
@@ -403,6 +413,7 @@ impl CapabilityRecord {
             redact,
             path_scope,
             topics,
+            publish,
             tool_policy,
             bound_to,
             expires_at,
@@ -432,6 +443,7 @@ impl CapabilityRecord {
         attrs.redact = self.redact;
         attrs.path_scope = self.path_scope.clone();
         attrs.topics = self.topics.clone();
+        attrs.publish = self.publish;
         attrs.tool_policy = self.tool_policy.clone();
         attrs.bound_to = self.bound_to;
         attrs.persistence = CapPersistence::Durable;

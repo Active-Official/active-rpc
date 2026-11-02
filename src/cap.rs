@@ -193,6 +193,13 @@ pub struct CapAttrs {
     ///
     /// `None` means no topic restriction. Attenuation may only narrow the set.
     pub topics: Option<BTreeSet<String>>,
+    /// Whether the capability may publish to a channel at all.
+    ///
+    /// Off by default: holding *any* live capability used to be enough to
+    /// publish an arbitrary topic, which made a subscriber's topic filter
+    /// spoofable by a lane that was granted a method on some other provider.
+    /// Publishing is now an explicit grant, and attenuation can only drop it.
+    pub publish: bool,
     /// Tool policy, when the capability targets a tool.
     pub tool_policy: Option<ToolPolicy>,
     /// Whether the capability is ephemeral or eligible for durable restore.
@@ -223,6 +230,7 @@ impl CapAttrs {
             redact: false,
             path_scope: None,
             topics: None,
+            publish: false,
             tool_policy: None,
             persistence: CapPersistence::Ephemeral,
             bound_to: None,
@@ -273,8 +281,19 @@ impl CapAttrs {
     }
 
     /// Restrict a publisher to a fixed topic set.
+    ///
+    /// A topic set implies the publish grant: naming the topics a capability may
+    /// publish to is the grant. Use [`CapAttrs::allow_publish`] for "any topic".
     pub fn restrict_topics(mut self, topics: &[&str]) -> Self {
         self.topics = Some(topics.iter().map(|topic| topic.to_string()).collect());
+        self.publish = true;
+        self
+    }
+
+    /// Grant publishing to any topic (still bounded by the method set and the
+    /// budget).
+    pub fn allow_publish(mut self) -> Self {
+        self.publish = true;
         self
     }
 
@@ -377,6 +396,8 @@ impl CapAttrs {
             (None, Some(_)) => false,
             (Some(child), Some(parent)) => child.is_subset(parent),
         };
+        // Publishing is authority: a child may drop the grant, never add it.
+        let publish_ok = !self.publish || parent.publish;
         methods_ok
             && budget_ok
             && read_only_ok
@@ -387,6 +408,7 @@ impl CapAttrs {
             && binding_ok
             && ttl_ok
             && topics_ok
+            && publish_ok
     }
 
     /// Attenuate, refusing anything that would widen authority.
@@ -432,6 +454,10 @@ impl CapAttrs {
             (None, Some(_)) => return Err(Error::Escalation("topic restriction removed")),
             (Some(child), Some(parent)) if child.is_subset(parent) => {}
             (Some(_), Some(_)) => return Err(Error::Escalation("topic set widens")),
+        }
+        // The publish grant may only be dropped.
+        if child.publish && !self.publish {
+            return Err(Error::Escalation("publish grant added"));
         }
         match (&child.path_scope, &self.path_scope) {
             (_, None) => {}

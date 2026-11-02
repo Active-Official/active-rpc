@@ -470,10 +470,10 @@ fn channels_carry_messages_and_transfer_capabilities() {
         )
         .unwrap();
     assert_eq!(sequence, 0);
-    let message = agent.recv(channel).unwrap().expect("message");
+    let message = agent.recv(lane, channel).unwrap().expect("message");
     assert_eq!(message.payload, Value::text("hello"));
     assert_eq!(message.caps, vec![cap.id()]);
-    assert!(agent.recv(channel).unwrap().is_none());
+    assert!(agent.recv(lane, channel).unwrap().is_none());
 
     // Channel capability sharing is a borrow within one agent: the sender keeps
     // its handle and the ids travel with the message.
@@ -496,8 +496,12 @@ fn send_only_and_receive_only_channels_enforce_direction() {
     let lane = agent.create_lane("main", Budget::default()).unwrap();
     let send_only = agent.create_channel("out", Direction::Send).unwrap();
     let receive_only = agent.create_channel("in", Direction::Receive).unwrap();
+    // Subscription and direction are separate checks: subscribe to both so the
+    // refusals below are about direction, not about who may read the channel.
+    agent.subscribe(lane, send_only).unwrap();
+    agent.subscribe(lane, receive_only).unwrap();
     assert!(agent.send(lane, send_only, Value::Null, &[]).is_ok());
-    let error = agent.recv(send_only).unwrap_err();
+    let error = agent.recv(lane, send_only).unwrap_err();
     assert_eq!(error.code(), "rpc/invalid-argument");
     let error = agent
         .send(lane, receive_only, Value::Null, &[])
@@ -988,7 +992,9 @@ fn channel_queue_ceiling_bounds_one_sender() {
     let error = channel
         .send(active_rpc::LaneId(1), Value::Null, vec![])
         .expect_err("channel queue must be bounded");
-    assert_eq!(error.code(), "rpc/budget-exceeded");
+    // A full channel is backpressure, like its byte ceiling: the sender's grant
+    // is untouched, so this is not a budget exhaustion.
+    assert_eq!(error.code(), "rpc/backpressure");
 }
 
 #[test]

@@ -39,3 +39,21 @@ Table {
 - A future revision may add units or capability *classes* to the description;
   that changes the module shape and needs a new ADR plus a schema class.
 - The introduction is not authority: presenting it grants nothing.
+
+## Amendment (R-17, hostile review round 1)
+
+- **Canonical by construction.** `build` sorts the providers and sorts and
+  deduplicates each method list, so the same surface produces the same bytes
+  whatever order the caller used. A peer's fingerprint is derived from those
+  bytes, and a `HashSet`-ordered plugin used to change the digest without
+  changing the surface. Duplicates are dropped for the same reason.
+- **Names are validated.** A peer, provider or method name is 1..=1024 bytes and
+  free of control characters, at the same boundary as a capability method name:
+  every one of them reaches a module, a fingerprint and a log line.
+- **The binding is one-way, by design.** `introduce_to` writes `bound_to` into
+  the live records of the subtree, including the root, so after an introduction
+  the local kernel can no longer use the capability it handed over. That is the
+  intent — the capability now belongs to that peer — but it is irreversible and
+  there is no `unbind`, so an embedder that wants to keep its own authority
+  should attenuate a child and introduce that. A future revision may return a
+  bound child instead; it is a breaking change to the call's semantics.

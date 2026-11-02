@@ -56,6 +56,26 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
   the lock; `set_receipt_sequence` lets a restart continue a log; `Event` is
   `#[non_exhaustive]` (2.3.0); paths and keys are validated without panicking.
 
+### Introductions and pub/sub (R-17)
+
+- **Reading a channel needs a subscription.** `Agent::recv(lane, channel)` and
+  `recv_topic(lane, channel, topic)` take the lane and require it to be in the
+  channel's subscriber set. A channel id used to be enough, so any lane could
+  drain any channel; a non-subscriber now gets `rpc/unknown-channel`, the same
+  answer as a channel that does not exist.
+- **Publishing is an explicit grant.** `CapAttrs::publish` (default false,
+  attenuation may only drop it, persisted in the record) with
+  `allow_publish()`/`restrict_topics()`. Holding a capability for one provider no
+  longer lets a lane publish under a topic a subscriber trusts.
+- **A topic is bounded text.** 1..=128 bytes, no control characters, checked at
+  the grant and at publish; an empty topic was publishable and a control
+  character reached an error message verbatim.
+- **An introduction is canonical.** Providers are sorted and method lists are
+  sorted and deduplicated, so the same surface always hashes the same; names are
+  bounded and printable.
+- A full channel reports `rpc/backpressure` for the record ceiling too, not
+  `rpc/budget-exceeded`.
+
 ### Replay
 
 - **A package can no longer be edited into a different call.** The decision

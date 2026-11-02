@@ -13,16 +13,34 @@ use active_infinity::{encode, InfinityModule, Inode};
 use crate::budget::Budget;
 use crate::error::{Error, Result};
 
+/// Longest name an introduction accepts for a peer, a provider or a method.
+pub const MAX_NAME_BYTES: usize = 1024;
+
 /// Build the canonical introduction module for a peer.
 ///
-/// `providers` is ordered; the kernel passes its provider table in id order, so
-/// the same peer always produces the same bytes.
+/// The encoding is canonical regardless of how the caller ordered anything: the
+/// providers are sorted by name, and each method list is sorted and deduplicated,
+/// so the same surface always produces the same bytes. That matters because a
+/// peer's fingerprint is derived from these bytes — a `HashSet`-ordered plugin
+/// must not change the digest without changing the surface.
 pub fn build(peer: &str, providers: &[(String, Vec<String>)], budget: &Budget) -> Result<Vec<u8>> {
+    check_name("peer", peer)?;
+    let mut providers: Vec<(String, Vec<String>)> = providers.to_vec();
+    providers.sort_by(|left, right| left.0.cmp(&right.0));
+    for (provider, methods) in &mut providers {
+        check_name("provider", provider)?;
+        methods.sort();
+        methods.dedup();
+        for method in methods.iter() {
+            check_name("method", method)?;
+        }
+    }
+
     let mut module = InfinityModule::new();
     let peer_node = module.push(Inode::Str(peer.to_string()));
 
     let mut provider_nodes = Vec::with_capacity(providers.len());
-    for (provider, methods) in providers {
+    for (provider, methods) in &providers {
         let name_node = module.push(Inode::Str(provider.clone()));
         let method_nodes: Vec<_> = methods
             .iter()
@@ -83,5 +101,24 @@ pub fn build(peer: &str, providers: &[(String, Vec<String>)], budget: &Budget) -
         ],
     });
     module.set_root(Some(root));
-    encode(&module).map_err(|error| Error::Payload(error.code().to_string()))
+    encode(&module).map_err(|error| {
+        // Keep the reason: an introduction that cannot encode is a surface the
+        // peer should be told about, not an opaque payload failure.
+        Error::Payload(format!("{}: {error}", error.code()))
+    })
+}
+
+/// Refuse a name the introduction cannot carry.
+///
+/// A name reaches a module, a fingerprint and a log line, so it is bounded and
+/// free of control characters, like a method name in a capability.
+fn check_name(kind: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.chars().any(char::is_control) {
+        return Err(Error::InvalidArgument(match kind {
+            "peer" => "a peer name must be 1..=1024 bytes without control characters",
+            "provider" => "a provider name must be 1..=1024 bytes without control characters",
+            _ => "a method name must be 1..=1024 bytes without control characters",
+        }));
+    }
+    Ok(())
 }

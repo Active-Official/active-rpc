@@ -51,7 +51,7 @@ fn main() -> Result<()> {
         Value::text("hello, peer"),
         std::slice::from_ref(&leaf),
     )?;
-    let message = agent.recv(channel)?.expect("message");
+    let message = agent.recv(lane, channel)?.expect("message");
     println!(
         "channel message payload={:?} caps={}",
         message.payload,
