@@ -30,8 +30,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-14 | wasm tools | `src/wasm_tool.rs` | round 1: 1 critical + 3 highs + 5 mediums + 6 lows fixed | 15 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | round 1: 4 highs + 9 mediums + 6 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | round 1: 2 mediums + 2 lows fixed | 4 fixed / 0 rejected / 0 open (1 documented residual: no store wired by default) | this commit |
-| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | round 1: 2 highs + 6 mediums + 3 lows fixed | 11 fixed / 0 rejected / 0 open (1 recorded: publisher identity) | this commit |
-| R-18 | CLI | `cli/active-rpc-cli/**` | round 1: 4 highs + 8 mediums + 7 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
+| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | rounds 1-2: 11 + 14 findings fixed (2 design-level documented) | 25 fixed / 0 rejected / 0 open (2 recorded: publisher identity, host authority) | `190e9c9` |
+| R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
 | R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
 
@@ -49,6 +49,65 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-18 CLI - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `d2ee809`,
+driving the built binary against scripted hostile TCP/HTTP peers. One high,
+eight mediums and ten lows were still open; three round-1 fixes had regressed or
+were partial. Every fix has a test in `tests/hostile_input_round2_tests.rs`.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N1 | high | `events --follow` was a usage error: `reject_unknown` refused any flag with an empty value, so the documented bare form exited 2 and only the undocumented `--follow=1` worked | **fixed**: one `BOOLEAN_FLAGS` list exempts every boolean from the value rule |
+| N2 | medium | `pipeline`/`loadgen` never correlated reply ids: one replayed `Response` answered every request and both reported a clean run | **fixed**: each reply must answer an outstanding request, once; `a_replayed_answer_is_not_a_pipeline_success` |
+| N3 | medium | `--timeout-ms` was consumed only by the tcp arm; connect/http2 (and the connect phase) hung on a silent peer, and `loadgen` had no flag | **fixed**: one `with_deadline` wraps the exchange on every transport, and `loadgen` gained the flag; `a_silent_peer_is_a_deadline_on_every_transport` |
+| N4 | medium | a boolean was true regardless of its value: `--emit-cap-hex=false` printed authority, `--chain-only=0` downgraded a verification | **fixed**: `flag_bool` parses bare/`true`/`1`/`yes` and `false`/`0`/`no`, and refuses anything else |
+| N5 | medium | the demo peer's `sum` used `+=`: `i64::MAX + 1` from the wire panicked (exit 101) and wrapped in release | **fixed**: `checked_add` with `rpc/invalid-argument` |
+| N6 | medium | `events` printed a non-JSON 200 raw on an exit-0 path (a forged ANSI/HTML body) | **fixed**: a 200 whose body is not the event array is a refusal |
+| N7 | medium | `events` had no connect/read deadline and no per-poll bound | **fixed**: socket read/write timeouts plus the per-poll deadline |
+| N8 | medium | `receipts` and `replay` never validated flags or positionals: `--limt 1` printed an unverified listing with exit 0 | **fixed**: per-subcommand allowlists and positional counts |
+| N9 | medium | `--cert` was accepted on cleartext transports (and `peer --cert-out` silently wrote nothing): the flag implied a check that never ran | **fixed**: both require `--transport quic` |
+| N10 | low | the default `peer` output printed a sentence where the documented `awk '/^cap=/'` expects 32 hex characters | **fixed**: the hint is a `#` comment, and README and the man page pass `--emit-cap-hex` with the bearer-authority caveat |
+| N11 | low | the bearer id had to be passed in argv (process table, shell history) | **fixed**: `--cap-file` (a 0600 file), preferred in the docs |
+| N12 | low | `pipeline --calls 0` reported a round trip it never made | **fixed**: a usage error |
+| N13 | low | `http_get` ignored `Content-Length`, and `dechunk` accepted a body with no terminal chunk; headers were matched by substring | **fixed**: headers by name, a declared length is enforced, a chunk must be followed by CRLF and the body must terminate |
+| N14 | low | the http2 peer had no served-connection deadline, so `--limit` was unreachable behind a stalled client | **fixed**: `Http2Server::with_connection_deadline` (default 60 s, the peer uses 10 s) |
+| N15 | low | a CRLF receipt-key file (66 bytes) was refused by a 65-byte ceiling; the mode check re-stat'ed a path | **fixed**: 68 bytes and a trim, and the mode check stats the open handle |
+| N16 | low | `println!` panicked on EPIPE: `receipts show \| head` exited 101 | **fixed**: every operator line goes through `out_line`, and a closed pipe is a clean stop |
+| N17 | low | `loadgen` cloned the payload per worker (64 GiB of address space at the ceilings), had no request cap, and a failed spawn panicked; `pipeline` kept every reply | **fixed**: one `Arc<[u8]>`, `MAX_REQUESTS`, `Builder::spawn` as exit 3, and a `MAX_PIPELINE_BYTES` retention ceiling |
+| N18 | low | `dispatch` charged egress as `payload.len()` only, so echoed arguments were free outbound | **fixed**: the value plus the payload is charged before the response is returned |
+| N19 | low | `std::env::args()` panics on non-UTF-8 argv (exit 101) | **fixed**: `args_os` with a usage refusal |
+
+Gate: CLI 33 (was 22), 627 all-features, 567 no-default, control plane 46,
+clippy/fmt/doc clean, negative controls 9/9. Commit `af12e3a`, CI green on both
+orgs.
+
+### R-17 introduction and topics - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `d2ee809`.
+Two highs and five mediums were still open; the review confirmed that the publish
+grant, the topic bounds and the backpressure code held.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| R2.1 | high | a wall-clock TTL never fired on `publish`, `send`, `attenuate`, `introduce_to`, `export` or a restore: the stored clock only moved on a dispatch, so a 1 ms lease published forever | **fixed**: `refresh_clock` at the top of every synchronous authority check; proved by removing it (the test fails) |
+| R2.2 | high | `Agent::channel` returned a clone of the channel, which owns its queue and can `recv`: a lane refused a read took the mailbox, payload and transferred capability ids included, and the control plane cloned up to 64 MiB per channel per refresh | **fixed**: `ChannelStats` (counts and names only) |
+| R2.3 | medium | `subscribe`/`close`/`destroy`/`create` take no authority, and `UnknownChannel` doubles as "not subscribed", so an in-process caller learns which ids exist | **documented**: `Agent` is the host's authority object and no envelope path reaches those methods; the ADR, `wire.md` and `Lane::channels` now say so, and the false "anti-oracle" and "advisory" claims are gone |
+| R2.4 | medium | `introduce_to` accepted a borrowed handle: a receiver could bind the sender's capability to a peer of its choosing and lock the owner out | **fixed**: `cap.is_owning()`, as `export_capability` already required; proved by removing the check |
+| R2.5 | medium | `send` bypasses the publish grant and can fill a channel with topic-less messages | **documented** as the host-side path (`publish` is the capability-gated one); a closed channel now answers `invalid-argument` instead of `backpressure` |
+| R2.6 | medium | topics, channel names and intro names accepted U+2028/U+2029, bidi controls, zero-width and tag characters (only Cc/C1 were refused) | **fixed**: one `security::valid_text`, used by method names, topics, provider names, channel names, intro names and `Channel`; proved by reverting the rule |
+| R2.7 | medium | duplicate provider names tied on the sort key, so the same surface encoded to different bytes and a different fingerprint | **fixed**: a duplicate provider name is refused |
+| R2.8 | low | a `u64` budget ceiling above `i64::MAX` wrapped to a negative module integer | **fixed**: `i64::try_from` with a refusal |
+| R2.9 | low | `intro()` called provider code while holding the kernel borrow: a provider that calls back in panicked on a re-borrow, and one that calls `intro()` recursed | **fixed**: the provider table is taken out and restored by a guard; `a_provider_may_call_the_agent_from_methods` |
+| R2.10 | low | the duplicate-capability check was a linear scan per capability with no per-message ceiling | **fixed**: `MAX_CAPS_PER_MESSAGE` (1 024) and a `BTreeSet` |
+| R2.11 | low | `Channel::send_topic` stored an unvalidated topic | **fixed**: `push` validates it, so the type boundary enforces the rule |
+| R2.12 | low | `Message.from` is the caller-supplied lane, and `publish_as`/`send_as` do not check lane ownership | **documented**: the lane is host-selected and `Agent` is the authority object; the recorded residual (no publisher identity) stands |
+| R2.13 | low | a closed and full channel answered `backpressure` (retry) instead of `invalid-argument` | **fixed**: `can_send()` is checked first |
+| R2.14 | low | `wire.md`, ADR-0020 and `Lane::channels` contradicted the code on the read gate, the publish grant and the topic bounds | **fixed** |
+
+Gate: 627 all-features (71 suites, 8 new), 567 no-default, control plane 46,
+CLI 22, clippy/fmt/doc clean. Commit `190e9c9`, CI green on both orgs.
 
 ### R-20 fuzz program - 2026-11-02 (round 2, confirmation)
 
