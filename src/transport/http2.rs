@@ -144,7 +144,8 @@ impl Http2Server {
         self
     }
 
-    /// Cap the request-body bytes this server accumulates per connection.
+    /// Cap the request-body bytes this server accumulates across every
+    /// connection of this `serve` call.
     ///
     /// A body that would take a connection over the budget is refused with
     /// `429` before it is buffered. The default is [`MAX_INFLIGHT_BODY`], which
@@ -221,25 +222,23 @@ impl Http2Server {
                     }
                 };
                 accepted += 1;
-                stream
-                    .set_nodelay(true)
-                    .map_err(|error| Error::Transport(format!("nodelay: {error}")))?;
+                // A socket that was reset between accept and here is this
+                // connection's problem; the listener keeps serving.
+                let _ = stream.set_nodelay(true);
                 let handler = Arc::clone(&handler);
                 let served_for_task = Arc::clone(&served);
                 let inflight = Arc::clone(&inflight);
                 active.spawn(async move {
                     // A connection that never completes is abandoned at the
                     // deadline instead of holding the join set.
-                    let _ = tokio::time::timeout(
+                    let _ = serve_connection(
+                        stream,
+                        handler,
+                        served_for_task,
+                        limits,
+                        inflight,
+                        inflight_budget,
                         connection_deadline,
-                        serve_connection(
-                            stream,
-                            handler,
-                            served_for_task,
-                            limits,
-                            inflight,
-                            inflight_budget,
-                        ),
                     )
                     .await;
                 });
@@ -261,6 +260,7 @@ async fn serve_connection<S, H>(
     limits: WireLimits,
     inflight: Arc<AtomicUsize>,
     inflight_budget: usize,
+    connection_deadline: std::time::Duration,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -280,8 +280,17 @@ where
     // Streams are handled concurrently; the join set keeps the connection alive
     // until every response has been written.
     let mut streams = tokio::task::JoinSet::new();
-    while let Some(request) = connection.accept().await {
-        let (request, respond) = match request {
+    loop {
+        // The deadline bounds *inactivity*: a client that connects and then says
+        // nothing is dropped, while an active connection lives as long as both
+        // sides keep talking. Wrapping the whole connection instead cut every
+        // long-lived agent off mid-session.
+        let accepted = match tokio::time::timeout(connection_deadline, connection.accept()).await {
+            Ok(Some(request)) => request,
+            // The peer closed, or the connection went idle past the deadline.
+            Ok(None) | Err(_) => break,
+        };
+        let (request, respond) = match accepted {
             Ok(parts) => parts,
             Err(error) => {
                 return Err(Error::Transport(format!("h2 accept: {error}")));
@@ -402,6 +411,7 @@ where
     if envelope.kind != crate::wire::Kind::Request {
         return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
     }
+    let request_id = envelope.request_id;
     let response = {
         // A kernel handler is single-threaded and may block on the kernel
         // loop; `block_in_place` moves the runtime worker aside instead of
@@ -411,7 +421,15 @@ where
                 Ok(handler) => handler,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            handler(envelope)
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(envelope))) {
+                Ok(response) => response,
+                Err(_) => Envelope::error(
+                    request_id,
+                    &Error::Provider {
+                        code: "rpc/provider".to_string(),
+                    },
+                ),
+            }
         })
     };
     let encoded = match response.encode() {
@@ -606,40 +624,49 @@ impl Http2Client {
         }
         let sender = self.sender.clone();
         let limits = self.limits;
+        let deadline = self.deadline;
         let responses = self.runtime.block_on(async move {
-            let mut tasks = Vec::with_capacity(payloads.len());
-            for body in payloads {
-                let mut sender = sender.clone();
-                tasks.push(tokio::spawn(async move {
-                    let request = Request::builder()
-                        .method(Method::POST)
-                        .uri(PATH)
-                        .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
-                        .body(())
-                        .map_err(|error| Error::Transport(format!("request: {error}")))?;
-                    let (response, mut send) = sender
-                        .send_request(request, false)
-                        .map_err(|error| Error::Transport(format!("send header: {error}")))?;
-                    send.send_data(Bytes::from(body), true)
-                        .map_err(|error| Error::Transport(format!("send body: {error}")))?;
-                    let response = response
-                        .await
-                        .map_err(|error| Error::Transport(format!("response: {error}")))?;
-                    read_response(response, limits.max_bytes.min(MAX_BODY)).await
-                }));
-            }
-            let mut out = Vec::with_capacity(tasks.len());
-            for task in tasks {
-                let (status, body) = task
-                    .await
-                    .map_err(|error| Error::Transport(format!("stream task: {error}")))??;
-                if status != StatusCode::OK {
-                    out.push(Err(refusal(&body)));
-                } else {
-                    out.push(Envelope::decode_with(&body, limits));
+            let exchange = async move {
+                let mut tasks = Vec::with_capacity(payloads.len());
+                for body in payloads {
+                    let mut sender = sender.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let request = Request::builder()
+                            .method(Method::POST)
+                            .uri(PATH)
+                            .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
+                            .body(())
+                            .map_err(|error| Error::Transport(format!("request: {error}")))?;
+                        let (response, mut send) = sender
+                            .send_request(request, false)
+                            .map_err(|error| Error::Transport(format!("send header: {error}")))?;
+                        send.send_data(Bytes::from(body), true)
+                            .map_err(|error| Error::Transport(format!("send body: {error}")))?;
+                        let response = response
+                            .await
+                            .map_err(|error| Error::Transport(format!("response: {error}")))?;
+                        read_response(response, limits.max_bytes.min(MAX_BODY)).await
+                    }));
                 }
+                let mut out = Vec::with_capacity(tasks.len());
+                for task in tasks {
+                    let (status, body) = task
+                        .await
+                        .map_err(|error| Error::Transport(format!("stream task: {error}")))??;
+                    if status != StatusCode::OK {
+                        out.push(Err(refusal(&body)));
+                    } else {
+                        out.push(Envelope::decode_with(&body, limits));
+                    }
+                }
+                Ok::<_, Error>(out)
+            };
+            match deadline {
+                Some(limit) => tokio::time::timeout(limit, exchange)
+                    .await
+                    .map_err(|_| Error::Transport("HTTP/2 call_many timed out".to_string()))?,
+                None => exchange.await,
             }
-            Ok::<_, Error>(out)
         })?;
         responses.into_iter().collect()
     }

@@ -690,6 +690,24 @@ fn peer(args: &[String]) -> CliResult {
     }
 }
 
+/// Dispatch one envelope, turning a provider panic into a refusal.
+///
+/// The kernel settles a panicking call and then resumes the unwind, so a
+/// `catch_unwind` here is what keeps one hostile module from ending the peer.
+fn dispatch_guarded(kernel: &Kernel, envelope: &Envelope) -> Envelope {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch(&kernel.agent, kernel.lane, envelope)
+    })) {
+        Ok(response) => response,
+        Err(_) => Envelope::error(
+            envelope.request_id,
+            &Error::Provider {
+                code: "rpc/provider".to_string(),
+            },
+        ),
+    }
+}
+
 fn peer_tcp(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
     let (listener, address) =
         bind_loopback().map_err(|error| CliError::transport(error.to_string()))?;
@@ -717,11 +735,28 @@ fn peer_tcp(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
         // A client that connects and says nothing must not hold the only
         // serving thread: without a deadline `--limit` is unreachable and the
         // second caller waits forever.
-        let transport = TcpTransport::with_timeout(stream, SERVER_DEADLINE)
-            .map_err(|error| CliError::transport(error.to_string()))?;
+        let transport = match TcpTransport::with_timeout(stream, SERVER_DEADLINE) {
+            Ok(transport) => transport,
+            // The socket was reset between accept and here: this connection's
+            // problem, not the server's.
+            Err(_) => continue,
+        };
         let Kernel { agent, lane, .. } = &kernel;
-        serve_connection(transport, |envelope| dispatch(agent, *lane, &envelope))
-            .map_err(|error| CliError::transport(error.to_string()))?;
+        serve_connection(transport, |envelope| {
+            let request_id = envelope.request_id;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dispatch(agent, *lane, &envelope)
+            })) {
+                Ok(response) => response,
+                Err(_) => Envelope::error(
+                    request_id,
+                    &Error::Provider {
+                        code: "rpc/provider".to_string(),
+                    },
+                ),
+            }
+        })
+        .map_err(|error| CliError::transport(error.to_string()))?;
         served += 1;
     }
     Ok(())
@@ -746,7 +781,7 @@ fn peer_http2(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
         })
     });
     for (envelope, reply) in rx {
-        let response = dispatch(&kernel.agent, kernel.lane, &envelope);
+        let response = dispatch_guarded(&kernel, &envelope);
         let _ = reply.send(response);
     }
     server_thread
@@ -774,7 +809,7 @@ fn peer_connect(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
         })
     });
     for (envelope, reply) in rx {
-        let response = dispatch(&kernel.agent, kernel.lane, &envelope);
+        let response = dispatch_guarded(&kernel, &envelope);
         let _ = reply.send(response);
     }
     server_thread
@@ -824,7 +859,7 @@ fn peer_quic(
 
     let mut served = 0usize;
     for (envelope, reply) in rx {
-        let response = dispatch(&kernel.agent, kernel.lane, &envelope);
+        let response = dispatch_guarded(&kernel, &envelope);
         let _ = reply.send(response);
         served += 1;
         if served >= limit {
@@ -1224,7 +1259,7 @@ fn bridge(args: &[String]) -> CliResult {
         })
     });
     for (envelope, reply) in rx {
-        let response = dispatch(&kernel.agent, kernel.lane, &envelope);
+        let response = dispatch_guarded(&kernel, &envelope);
         let _ = reply.send(response);
     }
     server_thread

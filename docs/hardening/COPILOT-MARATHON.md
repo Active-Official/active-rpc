@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-2: 22 + 16 findings (7 round-1 dispositions partial) | 38 fixed / 0 rejected / 0 open | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-3: 22 + 16 + 13 findings | 51 fixed / 0 rejected / 0 open | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,38 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-09 transports - 2026-11-02 (round 3, fix verification)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `4b18153`.
+It re-ran the transport suites and measured every round-2 claim with its own
+probes (temporary, removed). Verdict: eight of sixteen partial or unexercised.
+Three were highs that reproduce the same amplifier one step over.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| Q1 | high | the stepwise QUIC reservation was taken **before** the read, so 4096 streams that sent only a 4-byte header held the whole 256 MiB budget and denied every peer (measured with 4100 streams, ~16 KiB on the wire) | **fixed**: `read_chunk` + reserve only the bytes that arrived; one whole-frame deadline, exact `try_reserve` so a body is not double-counted; `an_idle_announcement_does_not_consume_the_quic_body_budget` |
+| Q2 | high | the bridge armed its wall deadline once; `read_head`'s per-line reads got a fresh socket timeout, so a head drip held the serial accept slot (measured 18.5 s against a 2 s deadline) | **fixed**: `read_head` re-arms the connection deadline before every line and answers 408 on expiry; `a_dripping_head_cannot_stretch_the_bridge_connection` |
+| Q3 | high | the same per-read timeout on the framed TCP transport let a body drip keep `read_frame` alive forever, so the serial peer never accepted again | **fixed**: `read_frame_before` checks one wall deadline between reads, `TcpTransport` carries the deadline from `with_timeout`, and `recv` applies it; `a_dripping_client_does_not_block_the_peer`, `a_timed_out_frame_does_not_poison_the_next_connection` |
+| Q4 | medium | `with_connection_deadline` was a total connection lifetime, so an active HTTP/2 agent was cut off mid-session (the CLI lost every connection after 10 s) | **fixed**: the deadline now wraps `connection.accept()` only, so it is an inactivity bound |
+| Q5 | medium | the six early-error QUIC replies were written without a deadline, so a peer with a one-byte receive window parked the task and held its permit | **fixed**: every reply goes through `reply()`, which bounds the write and resets the stream |
+| Q6 | medium | `call_many` ignored the client deadline | **fixed**: the join loop runs under it |
+| Q7 | medium | a provider panic exited the CLI peer loops, and QUIC/HTTP/2 answered a bare reset | **fixed**: `catch_unwind` around the handler in QUIC and HTTP/2 (answering `rpc/provider`), and `dispatch_guarded` in all four CLI kernel loops |
+| Q8 | medium | an unauthenticated QUIC listener could bind a non-loopback address | **fixed**: `start_with_identity` refuses `client_ca: None` on a non-loopback bind |
+| Q9 | low | a socket-option failure on an accepted socket ended the server | **fixed**: the option is best-effort and the connection is dropped |
+| Q10 | low | `refusal()` accepted any lowercase `rpc/*` token, so a peer could invent a class | **fixed**: only `ERROR_CODES` survive; everything else is `rpc/provider` |
+| Q11 | low | the QUIC trailing-byte window is a timing property | **documented** in `wire.md` §6 (one stream carries one frame; a byte after 250 ms is discarded, and a peer that needs the guarantee closes the stream) |
+| Q12 | low | the HTTP/2 budget doc and test name still said "per connection" | **fixed**: "across every connection of this `serve` call", test renamed |
+| Q13 | low | a growing body could double its capacity transiently | **fixed** by Q1's exact `try_reserve` per delivered chunk |
+
+Verified clean by the reviewer: no leak of the HTTP/2 reservation on any path
+(including abort), no poisoned state after a caught panic (the kernel's
+`DispatchGuard` restores), and no second logical message can be smuggled.
+
+Residual risks (recorded): the QUIC idle timeout is peer-resettable, so the slot
+count is the connection cap; the bridge answers 4xx and closes with unread body
+bytes; `MAX_INFLIGHT_BODY`'s doc math describes an attack the per-stream cap
+already prevents.
 
 ### R-09 transports - 2026-11-02 (round 2, confirmation)
 

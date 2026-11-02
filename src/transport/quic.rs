@@ -197,6 +197,14 @@ impl QuicServer {
                 "server identity has no certificate".to_string(),
             ));
         }
+        // Without a client CA every peer is anonymous, and an anonymous listener
+        // reachable off-host serves anyone. The loopback bind is the only place
+        // that is a deliberate choice; anything else must say `client_ca`.
+        if client_ca.is_none() && !bind.ip().is_loopback() {
+            return Err(Error::Transport(
+                "an unauthenticated QUIC listener must bind a loopback address".to_string(),
+            ));
+        }
         let certificate = identity.chain[0].clone();
         let tls = match &client_ca {
             Some(ca) => {
@@ -579,8 +587,7 @@ async fn serve_stream<H>(
     if !matches!(read, Ok(Ok(()))) {
         let error = Error::Wire("stream did not deliver a frame prefix");
         let response = Envelope::error(0, &error);
-        let _ = send_envelope(&mut send, &response).await;
-        let _ = send.finish();
+        reply(&mut send, &response).await;
         return;
     }
     let len = u32::from_le_bytes(header) as usize;
@@ -588,8 +595,7 @@ async fn serve_stream<H>(
     if len > ceiling {
         let error = Error::Wire("frame exceeds the size ceiling");
         let response = Envelope::error(0, &error);
-        let _ = send_envelope(&mut send, &response).await;
-        let _ = send.finish();
+        reply(&mut send, &response).await;
         return;
     }
     // The aggregate budget tracks bytes the server is actually holding. It is
@@ -599,18 +605,14 @@ async fn serve_stream<H>(
     let body = match read_frame_body(&mut recv, len, &mut budget).await {
         Ok(body) => body,
         Err(error) => {
-            let response = Envelope::error(0, &error);
-            let _ = send_envelope(&mut send, &response).await;
-            let _ = send.finish();
+            reply(&mut send, &Envelope::error(0, &error)).await;
             return;
         }
     };
     let envelope = match Envelope::decode_with(&body, wire) {
         Ok(envelope) => envelope,
         Err(error) => {
-            let response = Envelope::error(0, &error);
-            let _ = send_envelope(&mut send, &response).await;
-            let _ = send.finish();
+            reply(&mut send, &Envelope::error(0, &error)).await;
             let _ =
                 tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped()).await;
             return;
@@ -620,8 +622,7 @@ async fn serve_stream<H>(
     if envelope.kind != crate::wire::Kind::Request {
         let error = Error::Wire("a server only serves requests");
         let response = Envelope::error(envelope.request_id, &error);
-        let _ = send_envelope(&mut send, &response).await;
-        let _ = send.finish();
+        reply(&mut send, &response).await;
         return;
     }
     // One stream is one frame. A frame followed by more bytes would be a second
@@ -633,35 +634,31 @@ async fn serve_stream<H>(
     match tokio::time::timeout(STREAM_TAIL_WAIT, recv.read_chunk(1, true)).await {
         Ok(Ok(Some(chunk))) if !chunk.bytes.is_empty() => {
             let error = Error::Wire("trailing bytes after the QUIC frame");
-            let response = Envelope::error(envelope.request_id, &error);
-            let _ = send_envelope(&mut send, &response).await;
-            let _ = send.finish();
+            reply(&mut send, &Envelope::error(envelope.request_id, &error)).await;
             return;
         }
         _ => {}
     }
+    let request_id = envelope.request_id;
     let response = {
         let mut handler = match handler.lock() {
             Ok(handler) => handler,
             Err(poisoned) => poisoned.into_inner(),
         };
-        handler(envelope, peer)
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(envelope, peer))) {
+            Ok(response) => response,
+            Err(_) => Envelope::error(
+                request_id,
+                &Error::Provider {
+                    code: "rpc/provider".to_string(),
+                },
+            ),
+        }
     };
     // A peer controls its own receive window: a response larger than the credit
     // it grants parks `write_all` forever without this deadline. Reset the
     // stream instead of holding the task.
-    let written = tokio::time::timeout(STREAM_WAIT, async {
-        if let Err(error) = send_envelope(&mut send, &response).await {
-            return Err(std::io::Error::other(error.to_string()));
-        }
-        send.finish()
-            .map_err(|error| std::io::Error::other(error.to_string()))
-    })
-    .await;
-    if !matches!(written, Ok(Ok(()))) {
-        let _ = send.reset(0u32.into());
-        return;
-    }
+    reply(&mut send, &response).await;
     if exhausted(&served, max_calls) {
         // Give the peer a moment to drain the stream before the endpoint
         // closes; closing first would abort the response.
@@ -734,25 +731,52 @@ async fn read_frame_body(
     len: usize,
     budget: &mut BodyBudget<'_>,
 ) -> Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(len.min(BODY_STEP));
+    // One deadline for the whole frame, not one per step: a peer that sends a
+    // byte every few seconds keeps a per-step timeout alive forever.
+    let deadline = tokio::time::Instant::now() + STREAM_WAIT;
+    let mut body = Vec::new();
     let mut remaining = len;
     while remaining > 0 {
         let want = remaining.min(BODY_STEP);
-        budget.reserve(want)?;
-        let mut chunk = vec![0u8; want];
-        match tokio::time::timeout(STREAM_WAIT, recv.read_exact(&mut chunk)).await {
-            Ok(Ok(())) => {
-                body.extend_from_slice(&chunk);
-                remaining -= want;
-            }
-            // A short read is a truncated frame; a reset is the peer's fault.
-            Ok(Err(_)) => return Err(Error::Wire("truncated QUIC frame")),
-            // The stream stalled past its deadline. The peer gets a stable code
+        let chunk = match tokio::time::timeout_at(deadline, recv.read_chunk(want, true)).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            // A short stream is a truncated frame; a reset is the peer's fault.
+            Ok(Ok(None)) | Ok(Err(_)) => return Err(Error::Wire("truncated QUIC frame")),
+            // The frame stalled past its deadline. The peer gets a stable code
             // instead of silence.
             Err(_) => return Err(Error::Transport("stream read timed out".to_string())),
+        };
+        let bytes = chunk.bytes;
+        if bytes.is_empty() {
+            return Err(Error::Wire("truncated QUIC frame"));
         }
+        // Reserve what actually arrived. Charging a step before reading it let
+        // 4096 stalled streams hold the whole budget while sending 4 bytes each.
+        budget.reserve(bytes.len())?;
+        body.try_reserve(bytes.len())
+            .map_err(|_| Error::Backpressure("the server cannot buffer the frame"))?;
+        body.extend_from_slice(&bytes);
+        remaining = remaining.saturating_sub(bytes.len());
     }
     Ok(body)
+}
+
+/// Write one response and finish the stream, bounded.
+///
+/// Every reply path uses this: a peer that advertises a one-byte receive window
+/// and never reads parks `write_all` after the first byte, so an unbounded early
+/// error reply held the task (and its connection permit) forever.
+async fn reply(send: &mut quinn::SendStream, response: &Envelope) {
+    let written = tokio::time::timeout(STREAM_WAIT, async {
+        if send_envelope(send, response).await.is_err() {
+            return;
+        }
+        let _ = send.finish();
+    })
+    .await;
+    if written.is_err() {
+        let _ = send.reset(0u32.into());
+    }
 }
 
 async fn send_envelope(send: &mut quinn::SendStream, envelope: &Envelope) -> Result<()> {

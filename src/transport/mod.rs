@@ -52,11 +52,10 @@ pub(crate) fn refusal(body: &[u8]) -> Error {
     if text == "rpc/wire" {
         return Error::Wire("the peer rejected the frame");
     }
-    let code = if text.starts_with("rpc/")
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'/' | b'-' | b'_'))
-    {
+    // Only the documented classes. A peer that labels its own refusal
+    // `rpc/revoked` (or `rpc/` alone) must not make an operator branch on a
+    // class the kernel never decided.
+    let code = if crate::error::ERROR_CODES.contains(&text) {
         text.to_string()
     } else {
         "rpc/provider".to_string()
@@ -198,6 +197,8 @@ pub struct TcpTransport {
     /// later send would append a header to a half-written body, so the
     /// connection is unusable.
     poisoned: bool,
+    /// Wall deadline for one received frame, set by `with_timeout`.
+    frame_deadline: Option<std::time::Duration>,
 }
 
 /// Receive buffer for one connection.
@@ -215,6 +216,7 @@ impl TcpTransport {
             written: 0,
             limits: WireLimits::default(),
             poisoned: false,
+            frame_deadline: None,
         })
     }
 
@@ -244,12 +246,18 @@ impl TcpTransport {
     }
 
     /// Wrap an accepted or connected stream with a read and write deadline.
+    ///
+    /// The socket timeout bounds one `read`; the transport also bounds one
+    /// *frame* by it, because a peer that sends a byte just inside the read
+    /// timeout would otherwise keep a frame alive forever.
     pub fn with_timeout(stream: TcpStream, timeout: std::time::Duration) -> Result<Self> {
         stream
             .set_read_timeout(Some(timeout))
             .and_then(|()| stream.set_write_timeout(Some(timeout)))
             .map_err(|error| Error::Transport(error.to_string()))?;
-        Self::new(stream)
+        let mut transport = Self::new(stream)?;
+        transport.frame_deadline = Some(timeout);
+        Ok(transport)
     }
 }
 
@@ -284,7 +292,13 @@ impl Transport for TcpTransport {
         if let Some(envelope) = self.inbox.pop_front() {
             return Ok(Some(envelope));
         }
-        let Some(body) = read_frame(&mut self.stream, &self.limits)? else {
+        // One deadline for the whole frame: the socket timeout only bounds a
+        // single read, so a peer that sends a byte just inside it would keep a
+        // frame alive forever.
+        let deadline = self
+            .frame_deadline
+            .map(|wait| std::time::Instant::now() + wait);
+        let Some(body) = read_frame_before(&mut self.stream, &self.limits, deadline)? else {
             return Ok(None);
         };
         Ok(Some(Envelope::decode_with(&body, self.limits)?))
@@ -378,9 +392,28 @@ pub fn bind_loopback() -> Result<(TcpListener, String)> {
 /// arrives: a four-byte header must not allocate the ceiling while the peer is
 /// free to send nothing.
 pub fn read_frame<R: Read>(reader: &mut R, limits: &WireLimits) -> Result<Option<Vec<u8>>> {
+    read_frame_before(reader, limits, None)
+}
+
+/// [`read_frame`] with one wall deadline for the whole frame.
+///
+/// A per-read socket timeout is not a frame bound: a peer that sends one byte
+/// just inside it keeps the read alive forever. The deadline is checked between
+/// reads, so a drip ends on schedule.
+pub fn read_frame_before<R: Read>(
+    reader: &mut R,
+    limits: &WireLimits,
+    deadline: Option<std::time::Instant>,
+) -> Result<Option<Vec<u8>>> {
+    let expired = |deadline: Option<std::time::Instant>| {
+        deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    };
     let mut header = [0u8; 4];
     let mut filled = 0usize;
     while filled < header.len() {
+        if expired(deadline) {
+            return Err(Error::Transport("frame timed out".to_string()));
+        }
         match reader.read(&mut header[filled..]) {
             Ok(0) if filled == 0 => return Ok(None),
             Ok(0) => {
@@ -400,11 +433,21 @@ pub fn read_frame<R: Read>(reader: &mut R, limits: &WireLimits) -> Result<Option
         return Err(Error::Wire("frame exceeds the size ceiling"));
     }
     let mut body = Vec::with_capacity(len.min(64 << 10));
-    reader
-        .by_ref()
-        .take(len as u64)
-        .read_to_end(&mut body)
-        .map_err(|error| Error::Transport(error.to_string()))?;
+    // Read in chunks so the deadline is checked while the body arrives; a single
+    // `read_to_end` would only see it after the peer stopped.
+    let mut chunk = [0u8; 16 * 1024];
+    while body.len() < len {
+        if expired(deadline) {
+            return Err(Error::Transport("frame timed out".to_string()));
+        }
+        let want = (len - body.len()).min(chunk.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(Error::Transport(error.to_string())),
+        }
+    }
     if body.len() != len {
         return Err(Error::Transport(
             "truncated frame body at end of stream".to_string(),

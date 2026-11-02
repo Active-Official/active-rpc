@@ -342,6 +342,12 @@ transport must preserve when it forwards one:
 A malformed frame is always an error at the frame boundary: no transport retries,
 guesses or forwards a partially decoded envelope.
 
+One stream carries one frame. On QUIC the reader takes the announced length and
+then probes for trailing bytes with a `250 ms` window (`STREAM_TAIL_WAIT`): a
+byte sent later than that is silently discarded with the stream, never
+dispatched. The window is a timing property, not a framing guarantee, so a peer
+that must prove "one frame only" should close the stream after the frame.
+
 ---
 
 ## 7. Versioning

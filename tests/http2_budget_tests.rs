@@ -125,7 +125,7 @@ fn a_normal_call_is_served_after_a_header_refusal() {
 }
 
 #[test]
-fn a_body_over_the_connection_budget_is_refused_with_429() {
+fn a_body_over_the_server_budget_is_refused_with_429() {
     // A tight budget makes the refusal deterministic with one stream: 200 KiB
     // of body against a 64 KiB connection budget.
     let calls = Arc::new(AtomicUsize::new(0));

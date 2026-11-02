@@ -221,11 +221,23 @@ impl BridgeServer {
             let _ = write_http_response(&mut stream, 408, b"rpc/transport");
             return 0;
         }
-        let head = match read_head(&mut reader, MAX_HEAD) {
+        let head = match read_head(&mut reader, MAX_HEAD, Some((&stream, deadline))) {
             Ok(Some(head)) => head,
             Ok(None) => return 0,
             Err(_) => {
-                let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                // A head that ran out of time is a timeout, not a malformed
+                // request: the operator can tell a drip from a bad grammar.
+                let status = if std::time::Instant::now() >= deadline {
+                    408
+                } else {
+                    400
+                };
+                let body: &[u8] = if status == 408 {
+                    b"rpc/transport"
+                } else {
+                    b"rpc/wire"
+                };
+                let _ = write_http_response(&mut stream, status, body);
                 return 0;
             }
         };
@@ -367,10 +379,22 @@ impl BridgeServer {
 /// fit is refused without growing. Bytes are decoded lossily: a header value is
 /// not required to be UTF-8, and a non-UTF-8 byte must not be able to end the
 /// server.
-fn read_head<R: BufRead>(reader: &mut R, max: usize) -> Result<Option<Vec<String>>> {
+fn read_head<R: BufRead>(
+    reader: &mut R,
+    max: usize,
+    guard: Option<(&TcpStream, std::time::Instant)>,
+) -> Result<Option<Vec<String>>> {
     let mut head = Vec::new();
     let mut total = 0usize;
     loop {
+        // The socket timeout is per read; a head that dribbles one byte just
+        // inside it would hold the serial accept slot for hours. Re-arm the
+        // connection deadline before every line.
+        if let Some((stream, deadline)) = guard {
+            if !arm_deadline(stream, deadline) {
+                return Err(Error::Transport("request head timed out".to_string()));
+            }
+        }
         let remaining = max.saturating_sub(total);
         let mut raw = Vec::new();
         let read = reader
@@ -510,7 +534,7 @@ impl ConnectClient {
             .and_then(|_| stream.flush())
             .map_err(|error| Error::Transport(error.to_string()))?;
         let mut reader = BufReader::new(stream);
-        let Some(head) = read_head(&mut reader, MAX_HEAD)? else {
+        let Some(head) = read_head(&mut reader, MAX_HEAD, None)? else {
             return Err(Error::Transport(
                 "bridge closed without a response".to_string(),
             ));
