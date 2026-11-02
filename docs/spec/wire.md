@@ -459,7 +459,9 @@ op_count u32   ops...       trace_count u32  traces...   checksum blake3[32]
 ```
 
 An operation is `SetLatency`, `Mint`, `Attenuate`, `Call` or `Revoke`; a call
-records the method and the argument wire size, never the argument. The trace is
+records the method and the size of the text value replay synthesizes, never
+the argument. The kernel's charged wire size is a different number and is in
+the `call.queued` trace entry. The trace is
 the decision stream plus one `op.*` input entry per operation, so an edit to a
 grant, a TTL, a latency or a refused call's method does not match a replayed
 trace. The recorder, the encoder and the decoder share one set of limits

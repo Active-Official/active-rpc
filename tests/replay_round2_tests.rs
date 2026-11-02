@@ -366,3 +366,97 @@ fn a_recorder_that_lost_events_still_reports_the_kernel_outcome() {
         "{error}"
     );
 }
+
+/// The input entries use the module's 128-bit discriminator width, and a call's
+/// digest is domain-separated so it cannot collide with another digest by
+/// accident.
+#[test]
+fn the_input_digests_are_128_bits() {
+    let mut recorder = Recorder::new(0).expect("recorder");
+    let cap = recorder.mint(&["echo", "sum"], Some(5)).expect("mint");
+    recorder.call(cap, "echo", 1).expect("call");
+    recorder.revoke(cap).expect("revoke");
+    let package = recorder.package().expect("package");
+
+    let mint = package
+        .trace
+        .iter()
+        .find(|entry| entry.event.starts_with("op.mint:"))
+        .expect("a mint entry");
+    // op.mint:<32 hex>:<ttl=5>
+    assert_eq!(
+        mint.event,
+        format!("op.mint:{}:ttl=5", &mint.event[8..40]),
+        "the grant digest is 128 bits: {mint:?}"
+    );
+    assert_eq!(&mint.event[40..], ":ttl=5");
+    assert!(mint.event[8..40].chars().all(|c| c.is_ascii_hexdigit()));
+
+    let call = package
+        .trace
+        .iter()
+        .find(|entry| entry.event.starts_with("op.call:"))
+        .expect("a call entry");
+    let digest = call.event.rsplit(':').nth(1).expect("a digest field");
+    assert_eq!(digest.len(), 32, "the method digest is 128 bits: {call:?}");
+}
+
+/// `encode` refuses a string over the ceiling; the recorder must refuse the same
+/// method before it records it, or the session cannot be written back.
+#[test]
+fn a_call_method_over_the_string_ceiling_is_refused_at_record_time() {
+    let mut recorder = Recorder::new(0).expect("recorder");
+    let cap = recorder.mint(&["echo"], None).expect("mint");
+    let long = "m".repeat(active_rpc::replay::MAX_STRING + 1);
+    let error = recorder
+        .call(cap, &long, 0)
+        .expect_err("a method over the string ceiling is refused");
+    assert_eq!(error.code(), "rpc/replay");
+    assert!(error.to_string().contains("string"), "{error}");
+    let package = recorder.package().expect("package");
+    package.encode().expect("the refused call is not recorded");
+}
+
+/// The recorder tracks the encoded size as it records, so an oversized session
+/// fails while it is being recorded instead of retaining a body that cannot be
+/// written.
+///
+/// The mint's names are longer than the kernel accepts, which is exactly what a
+/// recording is for: a refusal is an input too, and the operation still costs
+/// the bytes it would encode to.
+#[test]
+fn the_recorder_refuses_a_body_over_the_package_ceiling() {
+    let method = "m".repeat(60 << 10);
+    let methods: Vec<String> = (0..MAX_METHODS).map(|_| method.clone()).collect();
+    let refs: Vec<&str> = methods.iter().map(String::as_str).collect();
+
+    let mut recorder = Recorder::new(0).expect("recorder");
+    let mut recorded = 0u32;
+    let error = loop {
+        match recorder.mint(&refs, None) {
+            Ok(_) => recorded += 1,
+            // The kernel refuses a 60 KiB method name; the operation is still a
+            // recorded input.
+            Err(error) if error.code() == "rpc/replay" => break error,
+            Err(_) => recorded += 1,
+        }
+        assert!(
+            recorded < 40,
+            "the body ceiling was never reached after {recorded} mints"
+        );
+    };
+    assert_eq!(error.code(), "rpc/replay");
+    assert!(error.to_string().contains("size ceiling"), "{error}");
+    assert!(recorded > 15, "the ceiling was reached at {recorded} mints");
+
+    // What it holds is a real artifact: the refusal is the next operation, not a
+    // lost session.
+    let package = recorder.package().expect("package");
+    let encoded = package.encode().expect("encode");
+    assert!(
+        encoded.len() <= MAX_PACKAGE_BYTES,
+        "the artifact is {} bytes",
+        encoded.len()
+    );
+    ReplayPackage::decode(&encoded).expect("the session up to the ceiling decodes");
+}

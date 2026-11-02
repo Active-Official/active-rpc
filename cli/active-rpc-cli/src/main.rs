@@ -1446,14 +1446,31 @@ fn replay(args: &[String]) -> CliResult {
             let encoded = package.encode().map_err(refusal)?;
             // Write beside the destination and rename, so an interrupted dump
             // leaves the old artifact intact instead of a truncated one.
-            let temporary = format!("{path}.tmp-{}", std::process::id());
-            std::fs::write(&temporary, encoded).map_err(|error| {
-                CliError::transport(format!("cannot write {temporary}: {error}"))
-            })?;
-            std::fs::rename(&temporary, &path).map_err(|error| {
+            //
+            // `create_new` is the safe primitive here: it fails on anything that
+            // already exists at the path (a planted symlink included) instead of
+            // following it, and it is atomic, so two dumps cannot share a temp.
+            // The suffix only keeps the two names apart; correctness rests on
+            // `create_new`.
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0);
+            let temporary = format!("{path}.tmp-{}-{stamp}", std::process::id());
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| {
+                    CliError::transport(format!("cannot write {temporary}: {error}"))
+                })?;
+            let write_result = file.write_all(&encoded).and_then(|()| file.sync_all());
+            drop(file);
+            let written = write_result.and_then(|()| std::fs::rename(&temporary, &path));
+            if let Err(error) = written {
                 let _ = std::fs::remove_file(&temporary);
-                CliError::transport(format!("cannot write {path}: {error}"))
-            })?;
+                return Err(CliError::transport(format!("cannot write {path}: {error}")));
+            }
             out_line(format!(
                 "wrote {path} ops={} trace={}",
                 package.ops.len(),

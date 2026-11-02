@@ -97,22 +97,39 @@ fn a_method_name_over_64k_is_refused_at_record_time() {
 }
 
 /// A session longer than the package format can carry must fail while it is
-/// being recorded, not when the artifact is read back.
+/// being recorded, not when the artifact is read back. The refusal is the extra
+/// operation: the transcript up to the ceiling is complete and still packages.
 #[test]
 fn a_session_past_the_op_ceiling_is_refused_at_record_time() {
     let mut recorder = Recorder::new(0).expect("recorder");
     for index in 0..MAX_OPS - 1 {
         recorder.set_latency(index as u64).expect("latency");
     }
+    assert_eq!(
+        recorder
+            .trace()
+            .iter()
+            .filter(|entry| entry.event.starts_with("op."))
+            .count(),
+        MAX_OPS
+    );
     let error = recorder
         .set_latency(1)
         .expect_err("the op ceiling is enforced while recording");
     assert_eq!(error.code(), "rpc/replay");
-    assert!(recorder.package().is_err());
+    // Nothing was lost, so the recorder still produces the session it holds.
+    let package = recorder.package().expect("the session up to the ceiling");
+    assert_eq!(package.ops.len(), MAX_OPS);
+    let encoded = package.encode().expect("encode");
+    ReplayPackage::decode(&encoded)
+        .expect("decode")
+        .replay()
+        .expect("the session up to the ceiling replays");
 }
 
 /// The header latency is the *initial* rate; a package that does not begin with
-/// it would replay at the wrong speed and move every expiry boundary.
+/// it would replay at the wrong speed and move every expiry boundary, so the
+/// encoder refuses to write one.
 #[test]
 fn a_package_that_does_not_begin_with_its_latency_is_refused() {
     let mut package = recorded_session();
@@ -120,9 +137,7 @@ fn a_package_that_does_not_begin_with_its_latency_is_refused() {
         methods: vec!["echo".to_string()],
         ttl_ms: None,
     };
-    let encoded = package.encode().expect("encode");
-    let decoded = ReplayPackage::decode(&encoded).expect("decode");
-    let error = decoded.replay().expect_err("no header latency");
+    let error = package.encode().expect_err("no header latency");
     assert_eq!(error.code(), "rpc/replay");
     assert!(format!("{error}").contains("header latency"), "{error}");
 }

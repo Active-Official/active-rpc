@@ -239,13 +239,13 @@ fn a_declared_argument_total_over_the_ceiling_is_refused() {
     // force. Sixteen fit exactly, so the encoder accepts them and refuses the
     // seventeenth; the decoder refuses a hostile package that carries it.
     let calls = |count: usize| -> Vec<Op> {
-        (0..count)
-            .map(|_| Op::Call {
-                cap: 0,
-                method: "echo".to_string(),
-                arg_bytes: 1 << 20,
-            })
-            .collect()
+        let mut ops = vec![Op::SetLatency(0)];
+        ops.extend((0..count).map(|_| Op::Call {
+            cap: 0,
+            method: "echo".to_string(),
+            arg_bytes: 1 << 20,
+        }));
+        ops
     };
     let package = ReplayPackage {
         latency_ms: 0,

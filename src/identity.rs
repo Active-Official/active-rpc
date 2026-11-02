@@ -20,6 +20,14 @@ use crate::error::{Error, Result};
 /// Length of a peer fingerprint in bytes.
 pub const FINGERPRINT_LEN: usize = 32;
 
+/// Longest subject label an identity keeps, in bytes.
+///
+/// The subject reaches logs, JSON and the control plane; an unbounded principal
+/// name amplifies every record it appears in, and a control or bidi character in
+/// it can forge a log line. Longer names are cut at a character boundary and
+/// unrepresentable characters are escaped.
+pub const MAX_SUBJECT_BYTES: usize = 512;
+
 const FINGERPRINT_DOMAIN: &[u8] = b"active-rpc/peer-identity/v1\0";
 
 /// How a peer proved who it is.
@@ -86,9 +94,13 @@ impl PeerIdentity {
     /// attached. Two identities for the same certificate with different subjects
     /// are distinct values (equality includes the subject) but share a
     /// fingerprint, which is exactly the binding key.
+    ///
+    /// The label is bounded to [`MAX_SUBJECT_BYTES`] and any control, line
+    /// separator or bidi character is escaped, because the same string is
+    /// rendered into logs and JSON.
     pub fn with_subject(self, subject: impl Into<String>) -> Self {
         Self {
-            subject: subject.into(),
+            subject: sanitized_subject(&subject.into()),
             ..self
         }
     }
@@ -144,12 +156,33 @@ impl PeerIdentity {
     }
 }
 
+/// Bounded, log-safe form of a principal label.
+///
+/// Cut at a character boundary at [`MAX_SUBJECT_BYTES`], then any character that
+/// a log line or a JSON cell cannot carry literally is rendered by
+/// `escape_debug`. A plain ASCII name is unchanged.
+fn sanitized_subject(subject: &str) -> String {
+    let mut end = 0;
+    for (index, character) in subject.char_indices() {
+        let next = index + character.len_utf8();
+        if next > MAX_SUBJECT_BYTES {
+            break;
+        }
+        end = next;
+    }
+    let bounded = &subject[..end];
+    if crate::security::valid_text(bounded, MAX_SUBJECT_BYTES) {
+        return bounded.to_string();
+    }
+    bounded.chars().flat_map(char::escape_debug).collect()
+}
+
 fn fingerprint_for(subject: &str, evidence: &[u8]) -> [u8; FINGERPRINT_LEN] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(FINGERPRINT_DOMAIN);
-    // A subject is a label (a certificate SAN or a fixed word); `u32` framing is
-    // unambiguous for anything a certificate can carry. A longer one is refused
-    // rather than truncated into a colliding framing.
+    // The word separates the loopback constant from a certificate digest; a
+    // principal label never reaches this function, because the label must not
+    // change the binding key.
     let length = u32::try_from(subject.len()).unwrap_or(u32::MAX);
     hasher.update(&length.to_le_bytes());
     hasher.update(subject.as_bytes());
@@ -197,7 +230,7 @@ pub fn matches(presented: Option<[u8; FINGERPRINT_LEN]>, bound: [u8; FINGERPRINT
 
 fn hex_prefix(bytes: &[u8; FINGERPRINT_LEN], len: usize) -> String {
     let mut out = String::with_capacity(len * 2);
-    for byte in &bytes[..len] {
+    for byte in &bytes[..len.min(FINGERPRINT_LEN)] {
         out.push_str(&format!("{byte:02x}"));
     }
     out

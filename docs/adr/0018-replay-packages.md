@@ -49,8 +49,10 @@ checksum or an out-of-range ordinal is refused with `rpc/replay`.
 Semantics:
 
 1. **Inputs, not values.** A call records its capability ordinal, method and
-   argument wire size. The argument text is never stored; replay synthesizes a
-   value of the same size. A package cannot leak the secrets it exercised.
+   the size of the text value replay synthesizes. The argument text is never
+   stored, and the number is the synthesized length, not the wire size the
+   kernel charges (that appears as `call.queued:<method>:<bytes>`). A package
+   cannot leak the secrets it exercised.
 2. **Ordinals, not ids.** Capability ids are replaced by first-seen ordinals, so
    the trace is stable across kernels with different secrets.
 3. **Decisions are the trace.** Refusals (including an expired capability and a
@@ -122,10 +124,34 @@ following replace the earlier claim.
   `MAX_EVENTS` descendants emits every dropped capability in one operation, so a
   capture then fails by design; `a_recorder_that_lost_events_still_reports_the_kernel_outcome`
   drives it.
-- **Discriminators are 128 bits.** The introduction fingerprint in the trace and
-  the method digest tail in `call.queued` are 16 bytes: a peer that chooses its
-  certificate, or a caller that chooses two long names with a shared prefix, must
-  not be able to target a collision.
+- **Discriminators are 128 bits.** The introduction fingerprint in the trace, the
+  method digest tail in `call.queued` and every `op.*` digest are 16 bytes: a
+  peer that chooses its certificate, or a caller that chooses two long names with
+  a shared prefix, must not be able to target a collision. A call's method digest
+  is domain-separated like a grant digest.
+
+## Amendment (R-12 round 3, 2026-11-02)
+
+The verification pass found four places where the round-2 claim was still looser
+than it read.
+
+- **The recorder budgets the body as it records.** A running byte count (header,
+  each operation, each input entry, the checksum) refuses the operation that
+  would cross `MAX_PACKAGE_BYTES`, so an embedder cannot retain a body that
+  `encode` will reject. The operator's session up to that point stays valid and
+  readable.
+- **`encode` refuses a package `replay` refuses.** A missing or foreign header
+  latency is an encode error, not only a replay error, so "written" implies
+  "readable" implies "replayable".
+- **A method over `MAX_STRING` is refused at record time**, matching `encode`.
+- **The op ceiling is a refusal, not a poisoning.** Reaching `MAX_OPS` refuses
+  the next operation and leaves the recorder usable; only a lost capture poisons
+  a session. (The earlier code also reported the loss as `"lost events"` for a
+  ceiling refusal, which was the wrong diagnosis.)
+
+The CLI writes a package through a `create_new` temporary beside the destination
+and renames it, so a planted symlink at the temporary path cannot redirect the
+write, and an interrupted write leaves the previous artifact intact.
 
 ## Consequences
 

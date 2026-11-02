@@ -629,3 +629,47 @@ fn call_peer_uses_the_admitted_identity() {
         .expect_err("another admitted peer is refused");
     assert_eq!(error.code(), "rpc/identity");
 }
+
+/// The subject is a label that reaches logs, JSON and the control plane. A
+/// control or bidi character in it can forge a line, and an unbounded name
+/// amplifies every record, so both are handled at construction.
+#[test]
+fn a_subject_is_bounded_and_escaped() {
+    let certificate = b"-----BEGIN CERTIFICATE-----\nMIIB\n";
+    let base = PeerIdentity::from_certificate(certificate);
+    let fingerprint = base.fingerprint();
+
+    let hostile = base.clone().with_subject("\u{1b}[2J\u{202e}admin\nforged");
+    assert!(
+        !hostile.subject().contains('\u{1b}') && !hostile.subject().contains('\u{202e}'),
+        "an escape survived into the label: {:?}",
+        hostile.subject()
+    );
+    assert!(
+        !hostile.subject().contains('\n'),
+        "a raw newline survived into the label: {:?}",
+        hostile.subject()
+    );
+    // The label is a label: the binding key is untouched.
+    assert_eq!(hostile.fingerprint(), fingerprint);
+
+    let long = base
+        .clone()
+        .with_subject("s".repeat(active_rpc::identity::MAX_SUBJECT_BYTES * 4));
+    assert!(
+        long.subject().len() <= active_rpc::identity::MAX_SUBJECT_BYTES,
+        "the label is {} bytes",
+        long.subject().len()
+    );
+
+    // A multibyte character straddling the ceiling is cut, not split.
+    let wide = base
+        .clone()
+        .with_subject("\u{00e9}".repeat(active_rpc::identity::MAX_SUBJECT_BYTES));
+    assert!(wide.subject().len() <= active_rpc::identity::MAX_SUBJECT_BYTES);
+    assert!(std::str::from_utf8(wide.subject().as_bytes()).is_ok());
+
+    // A plain ASCII principal is unchanged.
+    let plain = base.with_subject("client.example");
+    assert_eq!(plain.subject(), "client.example");
+}

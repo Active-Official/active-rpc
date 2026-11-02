@@ -25,7 +25,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
-| R-12 | replay | `src/replay.rs` | rounds 1-2: 9 + 11 findings (5 round-1 dispositions were partial) | 20 fixed / 0 rejected / 0 open | this commit |
+| R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
@@ -49,6 +49,31 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-12 replay - 2026-11-02 (round 3, fix verification)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `08e49a5`.
+Asked to verify N1-N11 one at a time and then attack the new code. It ran the
+replay suites itself (14/14, 13/13, 10/10, 4/4, 17/17). Verdict: N2, N3, N4, N5,
+N6, N7, N9, N10, N11 fixed; **N1 and N8 partial**, with eight new findings. All
+are fixed here.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| R12-4 | medium | `reserve_op` poisoned the recorder at `MAX_OPS`, so an honest session one operation past a complete, encodable package refused with "the recorder lost events" (a wrong diagnosis for a legal ceiling) | **fixed**: the op ceiling is a refusal that leaves the recorder usable; only a lost capture poisons. `a_session_past_the_op_ceiling_is_refused_at_record_time` now asserts the session up to the ceiling packages, encodes, decodes and replays |
+| R12-3 | low | `Recorder::call` never checked `MAX_STRING`, so a 1 MiB+1 method recorded, packaged and replayed but `encode` refused it | **fixed**: the same ceiling as `encode`; `a_call_method_over_the_string_ceiling_is_refused_at_record_time` |
+| R12-2 | low | no record-time body budget: 20 legal mints of 64 × 64 KiB methods recorded, then `encode` refused; at the op ceiling the recorder could retain gigabytes | **fixed**: `Recorder` tracks the encoded body (header, each op, each input entry, checksum) and refuses the crossing operation; `the_recorder_refuses_a_body_over_the_package_ceiling` drives the recorder itself to the 64 MiB ceiling and asserts the retained session still encodes and decodes |
+| R12-5 | low | the CLI's `--force` temp path was predictable and written with `fs::write`, which follows a planted symlink; no `sync_all`, and a failed write left the temp behind | **fixed**: `create_new` (fails on any existing path, symlink included), a pid+nanos suffix, `sync_all` before the rename, and removal on failure; `replay_dump_leaves_no_temporary_files` and (unix) `replay_dump_replaces_a_destination_symlink_not_its_target` |
+| R12-1 | low | the input entries used 64-bit digests while the module's bar is 128 bits, and a call's digest was not domain-separated | **fixed**: 16 bytes everywhere, `digest_of_text` prefixes a domain; `the_input_digests_are_128_bits` |
+| R12-6 | low | `encode` accepted an empty op list or a foreign header that `replay` refused | **fixed**: `encode` refuses a missing header; the round-1 test now asserts the encoder refusal, and the argument-total test builds a legal header |
+| R12-7 | low (doc) | "argument wire size" was wrong: `Op::Call.arg_bytes` is the synthesized text length, and the charged wire size is the separate `call.queued` number | **fixed** in `src/replay.rs`, ADR-0018 and `docs/spec/wire.md` |
+| R12-8 | low (doc) | the `revoke_subtree` doc comment had been fused onto `MAX_METHOD_EVENT_BYTES` | **fixed**: the doc is on its function again |
+
+Also: `set_latency` now captures, so a future clock that emits an event cannot
+leave it for the next operation's trace.
+
+Gate: `scripts/local_gate.sh` green; all-features 673 passed; CLI suite 5 (6 on
+unix).
 
 ### R-12 replay - 2026-11-02 (round 2, confirmation)
 

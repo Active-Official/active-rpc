@@ -4435,11 +4435,6 @@ fn durable_ceiling_reached(kernel: &Kernel) -> bool {
     kernel.revoked_records.len().saturating_add(live) >= MAX_TOMBSTONES
 }
 
-/// Revoke `seeds`, every capability derived from them and every capability that
-/// carries one of their record ids; tombstone each durable record.
-///
-/// One walk, shared by `revoke` and `tombstone_record`, so a kill switch cannot
-/// reach a capability that a revocation would have reached.
 /// Longest method label a queued-call event carries.
 ///
 /// The trace needs the method to pin what a queued call asked for; a method
@@ -4556,6 +4551,11 @@ fn descendants_of(children: &BTreeMap<CapId, BTreeSet<CapId>>, root: CapId) -> V
     seen.into_iter().collect()
 }
 
+/// Revoke `seeds`, every capability derived from them and every capability that
+/// carries one of their record ids; tombstone each durable record.
+///
+/// One walk, shared by `revoke` and `tombstone_record`, so a kill switch cannot
+/// reach a capability that a revocation would have reached.
 fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
     let mut doomed = BTreeSet::new();
     let mut stack: Vec<CapId> = seeds.into_iter().collect();

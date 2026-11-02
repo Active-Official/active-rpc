@@ -83,7 +83,12 @@ pub enum Op {
         cap: u32,
         /// Method name.
         method: String,
-        /// Argument wire-size bytes (values are never recorded).
+        /// Bytes of the text value replay synthesizes for this argument.
+        ///
+        /// This is the synthesized text length, not the charged wire size: the
+        /// kernel charges the value's encoded size, which the trace records
+        /// separately as `call.queued:<method>:<bytes>`. The two are different
+        /// numbers by design, and no argument value is recorded.
         arg_bytes: u64,
     },
     /// Revoke a capability.
@@ -123,6 +128,13 @@ impl ReplayPackage {
     /// refused here instead of silently truncated into a package that re-frames
     /// its own op stream.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        // The format's first operation carries the header rate; a package that
+        // does not is one `replay` refuses, so `encode` must not write it.
+        if self.ops.first() != Some(&Op::SetLatency(self.latency_ms)) {
+            return Err(Error::Replay(
+                "the package does not begin with its header latency".into(),
+            ));
+        }
         if self.ops.len() > MAX_OPS {
             return Err(Error::Replay("too many operations".into()));
         }
@@ -441,6 +453,13 @@ pub struct Recorder {
     /// [`MAX_ARG_TOTAL_BYTES`], so the recorder counts as it records and refuses
     /// before the artifact exists.
     arg_total: u64,
+    /// Bytes the encoded package would take, excluding the checksum.
+    ///
+    /// `encode` and `decode` share the body ceiling, so the recorder tracks the
+    /// same number as it records. A session that reaches the ceiling is refused
+    /// while it is being recorded instead of retaining a body that cannot be
+    /// written.
+    body: usize,
 }
 
 impl Recorder {
@@ -463,6 +482,9 @@ impl Recorder {
             initial_latency_ms: latency_ms,
             poisoned: false,
             arg_total: 0,
+            // magic, version, flags, latency, op_count, and the trace count that
+            // follows the operations.
+            body: 4 + 1 + 2 + 8 + 4 + 4,
         };
         recorder.capture()?;
         recorder.note(&Op::SetLatency(latency_ms))?;
@@ -476,12 +498,17 @@ impl Recorder {
 
     /// Change the simulated latency and record the change.
     pub fn set_latency(&mut self, latency_ms: u64) -> Result<()> {
-        self.reserve_op()?;
+        let op = Op::SetLatency(latency_ms);
+        self.reserve_op(&op)?;
         self.latency_ms = latency_ms;
         self.agent.set_latency(latency_ms);
-        let op = Op::SetLatency(latency_ms);
         self.ops.push(op.clone());
-        self.note(&op)
+        self.note(&op)?;
+        // The kernel does not emit an event for a clock change today, so this
+        // usually captures nothing; a future clock that does emit one must not
+        // leave it for the next operation's trace.
+        self.capture()?;
+        Ok(())
     }
 
     /// The decisions recorded so far.
@@ -490,17 +517,29 @@ impl Recorder {
     }
 
     /// Refuse a session that would produce a package its own decoder rejects.
-    fn reserve_op(&mut self) -> Result<()> {
+    ///
+    /// The body estimate runs as the session is recorded, not at `encode`, so a
+    /// long or large session fails before it retains the bytes. A refusal here
+    /// leaves the recorder usable: the operations before it are still a valid,
+    /// encodable transcript, so only a lost capture poisons a session.
+    fn reserve_op(&mut self, op: &Op) -> Result<()> {
         if self.poisoned {
             return Err(Error::Replay(
                 "the recorder lost events; the session cannot be packaged".into(),
             ));
         }
         if self.ops.len() >= MAX_OPS {
-            self.poisoned = true;
             return Err(Error::Replay(
                 "the session exceeds the operation ceiling".into(),
             ));
+        }
+        let addition = op_len(op)?
+            .checked_add(trace_len(&input_event(op))?)
+            .ok_or_else(|| Error::Replay("the package size overflows".into()))?;
+        // The header and the trace count are already counted in `body`; the
+        // checksum is reserved here.
+        if self.body.saturating_add(addition) > MAX_PACKAGE_BYTES - 32 {
+            return Err(Error::Replay("package exceeds the size ceiling".into()));
         }
         Ok(())
     }
@@ -540,30 +579,13 @@ impl Recorder {
     /// The entry carries a digest rather than the text: a method name is
     /// caller-chosen and may be a megabyte long.
     fn note(&mut self, op: &Op) -> Result<()> {
-        let event = match op {
-            Op::SetLatency(ms) => format!("op.latency:{ms}"),
-            Op::Mint { methods, ttl_ms } => {
-                format!("op.mint:{}:{}", digest_of(methods), ttl_label(*ttl_ms))
-            }
-            Op::Attenuate {
-                parent,
-                methods,
-                ttl_ms,
-            } => format!(
-                "op.attenuate:{parent}:{}:{}",
-                digest_of(methods),
-                ttl_label(*ttl_ms)
-            ),
-            Op::Call {
-                cap,
-                method,
-                arg_bytes,
-            } => format!(
-                "op.call:{cap}:{}:{arg_bytes}",
-                hex_prefix(blake3::hash(method.as_bytes()).as_bytes(), 8)
-            ),
-            Op::Revoke { cap } => format!("op.revoke:{cap}"),
-        };
+        let event = input_event(op);
+        // The operation's own bytes plus its input entry: the same sum
+        // `reserve_op` predicted, and `encode` writes exactly this.
+        let addition = op_len(op)
+            .unwrap_or(usize::MAX)
+            .saturating_add(trace_len(&event).unwrap_or(usize::MAX));
+        self.body = self.body.saturating_add(addition);
         self.trace.push(Trace { event, cap: None });
         if self.trace.len() > MAX_TRACES {
             self.poisoned = true;
@@ -608,7 +630,6 @@ impl Recorder {
     /// legitimate input.
     pub fn mint(&mut self, methods: &[&str], ttl_ms: Option<u64>) -> Result<u32> {
         Self::check_methods(methods)?;
-        self.reserve_op()?;
         let attrs = attrs_for(
             &methods
                 .iter()
@@ -620,6 +641,7 @@ impl Recorder {
             methods: methods.iter().map(|method| method.to_string()).collect(),
             ttl_ms,
         };
+        self.reserve_op(&op)?;
         self.ops.push(op.clone());
         self.note(&op)?;
         let cap = match self.agent.mint(self.provider, 0, attrs) {
@@ -647,7 +669,6 @@ impl Recorder {
     /// recorded.
     pub fn attenuate(&mut self, parent: u32, methods: &[&str], ttl_ms: Option<u64>) -> Result<u32> {
         Self::check_methods(methods)?;
-        self.reserve_op()?;
         let handle =
             self.caps.get(parent as usize).cloned().ok_or_else(|| {
                 Error::Replay(format!("capability ordinal {parent} does not exist"))
@@ -664,6 +685,7 @@ impl Recorder {
             methods: methods.iter().map(|method| method.to_string()).collect(),
             ttl_ms,
         };
+        self.reserve_op(&op)?;
         self.ops.push(op.clone());
         self.note(&op)?;
         let outcome = self.agent.attenuate(&handle, attrs);
@@ -687,7 +709,6 @@ impl Recorder {
 
     /// Issue a call. Refusals are recorded in the trace, not returned.
     pub fn call(&mut self, cap: u32, method: &str, arg_bytes: usize) -> Result<()> {
-        self.reserve_op()?;
         let arg_bytes = u64::try_from(arg_bytes)
             .map_err(|_| Error::Replay("argument size exceeds the ceiling".into()))?;
         // Both ceilings are the decoder's: a package that cannot be read back
@@ -702,6 +723,11 @@ impl Recorder {
                 "declared argument sizes exceed the package ceiling".into(),
             ));
         }
+        // `encode` refuses a string over `MAX_STRING`; a method the package
+        // cannot carry must be refused here, not at read-back.
+        if method.len() > MAX_STRING {
+            return Err(Error::Replay("string exceeds the ceiling".into()));
+        }
         let handle = self
             .caps
             .get(cap as usize)
@@ -712,6 +738,7 @@ impl Recorder {
             method: method.to_string(),
             arg_bytes,
         };
+        self.reserve_op(&op)?;
         self.ops.push(op.clone());
         self.note(&op)?;
         self.arg_total = arg_total;
@@ -734,13 +761,13 @@ impl Recorder {
 
     /// Revoke a capability.
     pub fn revoke(&mut self, cap: u32) -> Result<()> {
-        self.reserve_op()?;
         let handle = self
             .caps
             .get(cap as usize)
             .cloned()
             .ok_or_else(|| Error::Replay(format!("capability ordinal {cap} does not exist")))?;
         let op = Op::Revoke { cap };
+        self.reserve_op(&op)?;
         self.ops.push(op.clone());
         self.note(&op)?;
         let outcome = self.agent.revoke(&handle);
@@ -761,6 +788,9 @@ impl Recorder {
             return Err(Error::Replay(
                 "the recorder lost events; the session cannot be packaged".into(),
             ));
+        }
+        if self.body.saturating_add(32) > MAX_PACKAGE_BYTES {
+            return Err(Error::Replay("package exceeds the size ceiling".into()));
         }
         Ok(ReplayPackage {
             // The header is the initial rate; each `SetLatency` op moves it from
@@ -918,7 +948,88 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
     }
 }
 
-/// A 64-bit digest of a granted method set.
+/// The input entry one operation contributes to the trace.
+///
+/// Every field the kernel's events do not name appears here, digested: the grant
+/// and TTL of a mint, the parent of an attenuation, the method and size of a
+/// call (admitted or refused), the target of a revoke. 128-bit digests, like
+/// every discriminator in this module.
+fn input_event(op: &Op) -> String {
+    match op {
+        Op::SetLatency(ms) => format!("op.latency:{ms}"),
+        Op::Mint { methods, ttl_ms } => {
+            format!("op.mint:{}:{}", digest_of(methods), ttl_label(*ttl_ms))
+        }
+        Op::Attenuate {
+            parent,
+            methods,
+            ttl_ms,
+        } => format!(
+            "op.attenuate:{parent}:{}:{}",
+            digest_of(methods),
+            ttl_label(*ttl_ms)
+        ),
+        Op::Call {
+            cap,
+            method,
+            arg_bytes,
+        } => format!(
+            "op.call:{cap}:{}:{arg_bytes}",
+            digest_of_text(b"active-rpc/replay/op-call/v1\0", method)
+        ),
+        Op::Revoke { cap } => format!("op.revoke:{cap}"),
+    }
+}
+
+/// The encoded size of one operation, in bytes.
+///
+/// `encode` writes the fields directly; this is its accounting, and
+/// `the_size_estimate_matches_the_encoder` holds the two together.
+fn op_len(op: &Op) -> Result<usize> {
+    let attrs = |methods: &[String], ttl_ms: Option<u64>| -> Result<usize> {
+        let mut len = 2usize;
+        for method in methods {
+            len = len
+                .checked_add(2)
+                .and_then(|len| len.checked_add(method.len()))
+                .ok_or_else(|| Error::Replay("the package size overflows".into()))?;
+        }
+        Ok(len + 1 + if ttl_ms.is_some() { 8 } else { 0 })
+    };
+    let len = match op {
+        Op::SetLatency(_) => 1 + 8,
+        Op::Mint { methods, ttl_ms } => 1 + attrs(methods, *ttl_ms)?,
+        Op::Attenuate {
+            methods, ttl_ms, ..
+        } => 1 + 4 + attrs(methods, *ttl_ms)?,
+        Op::Call {
+            method, arg_bytes, ..
+        } => {
+            if *arg_bytes > MAX_ARG_BYTES {
+                return Err(Error::Replay("argument size exceeds the ceiling".into()));
+            }
+            if method.len() > MAX_STRING {
+                return Err(Error::Replay("string exceeds the ceiling".into()));
+            }
+            1 + 4 + 4 + method.len() + 8
+        }
+        Op::Revoke { .. } => 1 + 4,
+    };
+    Ok(len)
+}
+
+/// The encoded size of one trace entry, in bytes.
+fn trace_len(event: &str) -> Result<usize> {
+    if event.len() > MAX_STRING {
+        return Err(Error::Replay("string exceeds the ceiling".into()));
+    }
+    1usize
+        .checked_add(4)
+        .and_then(|len| len.checked_add(event.len()))
+        .ok_or_else(|| Error::Replay("the package size overflows".into()))
+}
+
+/// A 128-bit digest of a method set.
 ///
 /// Length-prefixed so `["ab", "c"]` and `["a", "bc"]` differ, and hashed rather
 /// than rendered because a method name is caller-chosen and can be megabytes.
@@ -929,7 +1040,16 @@ fn digest_of(methods: &[String]) -> String {
         hasher.update(&(method.len() as u64).to_le_bytes());
         hasher.update(method.as_bytes());
     }
-    hex_prefix(hasher.finalize().as_bytes(), 8)
+    hex_prefix(hasher.finalize().as_bytes(), 16)
+}
+
+/// A 128-bit, domain-separated digest of one text value.
+fn digest_of_text(domain: &[u8], text: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(&(text.len() as u64).to_le_bytes());
+    hasher.update(text.as_bytes());
+    hex_prefix(hasher.finalize().as_bytes(), 16)
 }
 
 fn ttl_label(ttl_ms: Option<u64>) -> String {

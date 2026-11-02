@@ -117,3 +117,50 @@ fn a_missing_package_is_usage() {
     let output = run(&["replay", "run", "no-such-package.arrp"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
 }
+
+/// The dump writes beside the destination and renames, so an interrupted write
+/// cannot leave a truncated artifact and a successful one leaves nothing
+/// behind.
+#[test]
+fn replay_dump_leaves_no_temporary_files() {
+    let dir = sandbox("temporaries");
+    let path = dir.join("session.arrp");
+    let output = run(&["replay", "dump", "--output", path.to_str().expect("utf8")]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .expect("dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--force` replaces the *destination*, not what a symlink there points at: the
+/// rename is atomic and does not open the link.
+#[cfg(unix)]
+#[test]
+fn replay_dump_replaces_a_destination_symlink_not_its_target() {
+    let dir = sandbox("symlink");
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, b"do not touch").expect("victim");
+    let path = dir.join("session.arrp");
+    std::os::unix::fs::symlink(&victim, &path).expect("symlink");
+    let output = run(&[
+        "replay",
+        "dump",
+        "--output",
+        path.to_str().expect("utf8"),
+        "--force",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        std::fs::read(&victim).expect("victim"),
+        b"do not touch",
+        "the symlink target was overwritten"
+    );
+    let bytes = std::fs::read(&path).expect("package");
+    assert_eq!(&bytes[..4], b"ARRP");
+    let _ = std::fs::remove_dir_all(&dir);
+}
