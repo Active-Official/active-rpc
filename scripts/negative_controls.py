@@ -27,9 +27,12 @@ CONTROLS = [
     {
         "id": "I-3-redaction",
         "invariant": "I-3",
-        "file": "src/domain.rs",
-        "find": "        if is_secret {\n            *redacted.node_mut(id)? = Inode::Str(security::SECRET_MARKER.to_string());\n        }\n",
-        "replace": "        if false {\n            *redacted.node_mut(id)? = Inode::Str(security::SECRET_MARKER.to_string());\n        }\n",
+        # The redactor lives in security.rs and the domain provider shares it
+        # (one implementation, so a fix in one place cannot drift). The anchor
+        # follows the code.
+        "file": "src/security.rs",
+        "find": "        if is_secret {\n            *module\n                .node_mut(id)\n                .map_err(|error| Error::Payload(error.code().to_string()))? =\n                active_infinity::Inode::Str(SECRET_MARKER.to_string());\n        }\n",
+        "replace": "        if false {\n            *module\n                .node_mut(id)\n                .map_err(|error| Error::Payload(error.code().to_string()))? =\n                active_infinity::Inode::Str(SECRET_MARKER.to_string());\n        }\n",
         "suite": "redteam_tests",
         "test": "review_module_payloads_are_redacted",
         "why": "Module payload redaction is disabled; the subgraph response carries the canary.",
