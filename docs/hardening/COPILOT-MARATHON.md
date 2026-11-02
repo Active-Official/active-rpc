@@ -28,8 +28,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-3: 13 + 16 + 19 findings | 48 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | round 1: 1 critical + 3 highs + 5 mediums + 6 lows fixed | 15 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
-| R-15 | observability | `src/observability.rs` | round 1: 4 highs + 9 mediums + 6 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | round 1: 2 mediums + 2 lows fixed | 4 fixed / 0 rejected / 0 open (1 documented residual: no store wired by default) | this commit |
+| R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-2: 4 + 11 findings (1 noted) | 14 fixed / 0 rejected / 1 noted (no store wired by default; virtual-epoch deadline) | `cb44d07` |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | rounds 1-2: 11 + 14 findings fixed (2 design-level documented) | 25 fixed / 0 rejected / 0 open (2 recorded: publisher identity, host authority) | `190e9c9` |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
@@ -49,6 +49,59 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-16 security helpers and persistence - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `af12e3a`.
+One high, four mediums and six lows were open; the high was a regression of the
+round-1 export fix.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `export_capability` reserved the grant and consumed the record id before `from_json` validated the record, so an unexportable capability was refused and left dead | **fixed**: build, seal and read back the record first, then reserve and consume |
+| F2 | high | `redact_module` replaced secret nodes before encoding, which empties the secret heap before the codec's fragment check runs: a literal in an annotation, provenance or a binding name survived | **fixed**: encode first (fragments still present, so the label checks apply), then replace and re-encode |
+| F3 | medium | `RecordStore` was check-then-mark: two processes restored one record into two grants; `MemoryRecordStore` accepted a duplicate | **fixed**: an atomic `claim` (default insert-if-absent), called after the seal and binding and before the mint; a duplicate `mark_restored` is an error |
+| F4 | medium | a sealed record with `lease_ms` and no `expires_at` restored with no deadline | **fixed**: the parser refuses it |
+| F5 | medium | egress never applied the secret helpers, so a provider bug could leak structural secrets or skip redaction | **fixed**: a redacting call gets `redact_value`; a non-redacting call refuses a module with secret nodes and still accepts the marker and opaque bytes |
+| F6 | medium | a record whose deadline passed is refused even when the restorer's virtual clock is unrelated | **noted**: the lease alone cannot distinguish a same-domain expiry from a foreign epoch, and restoring on the lease would hand a fresh lease to an expired record; refusing is the safe side (documented in `kernel.rs`) |
+| F7 | medium | the parser accepted an empty or reordering method and a malformed topic, then the mint reported `rpc/invalid-argument` | **fixed**: validated in `from_json` as `rpc/persistence` |
+| F8 | medium | the invisible-character set missed 15+ format characters, the variation-selector supplement and the invisible fillers | **fixed**: the ranges are added and table-tested |
+| F9 | medium | a duplicate JSON key (serde keeps the last) or an unknown field was outside the seal | **fixed**: the text must be the canonical rendering of the parsed value, and an unknown field is refused |
+| F10 | low | the seal had no purpose prefix, so a MAC from another protocol over the same key could pass | **fixed**: `active-rpc/capability-record-seal/v1\0` |
+| F11 | low | a `Value::Map` key bypassed both helpers | **fixed**: a key carrying the marker collapses the map to the marker |
+
+Routed from this review to the domain section and fixed there:
+**`content_hash` was an equality oracle over the secret heap for a redacting
+capability**; it now hashes the redacted image.
+
+An extra correction found while fixing F5: `redact_value` collapsed a `Text` that
+*is* the marker, so an already-redacted answer (`["***SECRET***"]`) was destroyed
+on a second pass; and it refused opaque `Value::Module` bytes (a WASM tool's
+binary output) because they do not decode as an image. Both are fixed.
+
+Gate: 643 all-features (74 suites), 583 no-default, control plane 46, CLI 33,
+clippy/fmt/doc clean. Commit `cb44d07`.
+
+### R-15 observability - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `af12e3a`.
+One high, two mediums and four lows were open; the review confirmed that no
+payload or secret reaches a trace, that `label`'s arithmetic is exact, that
+`events_since` never skips a concurrent event, and that one operation never
+emits two refusals.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the whole `call_idempotent*` path returned early without recording anything, so a replay refused because the capability was revoked left no `call.refused` and no counter, and a key reused with different arguments did the same | **fixed**: `record_refusal` / `record_refusal_in` is called at every early return; `an_idempotent_replay_refusal_is_observable` |
+| 2 | medium | a budget or tool refusal decided at dispatch (a promise's resolved bytes, a shape ceiling, the egress charge) settled as a bare rejection: `budget_exhaustions`/`tool_refusals` stayed flat and the dimension was lost | **fixed**: the settle path pushes `budget.exhausted`/`tool.refused` and counts them; `a_dispatch_time_ceiling_is_counted` |
+| 3 | medium | `revoke` counted and recorded again for an already-revoked capability: a retry loop over-reported the kill switch and could flush the tape | **fixed**: `was_revoked` guards the record and the counter; `revoking_twice_is_one_revocation` |
+| 4 | low | `caps per message` fell through `budget_dimension` to `other` | **fixed**: it keeps its own label, and `other` is documented as the catch-all |
+| 5 | low | `promise.rejected` was said to carry a provider-authored code | **false positive**: `Event::PromiseRejected` uses `Error::code`, which is the closed envelope class (`rpc/provider` for any provider text); a test pins it |
+| 6 | low | `calls_refused` counts refused sends and publishes but was documented as calls-only | **fixed**: the doc says what it counts |
+| 7 | low | the tape has no epoch, so a collector paging with `last_sequence + 1` silently drops events after a restart | **documented**: a collector must reset its cursor when `events_total` decreases |
+
+Gate: 643 all-features, 583 no-default, control plane 46, CLI 33, clippy/fmt/doc
+clean. Commit `cb44d07`.
 
 ### R-18 CLI - 2026-11-02 (round 2, confirmation)
 
