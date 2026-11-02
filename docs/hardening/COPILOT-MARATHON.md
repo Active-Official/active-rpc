@@ -59,7 +59,7 @@ and the bridge counted a failed response as served. All four are fixed.
 
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
-| D1 | medium | the drip test's budget was exceeded by its own prefix, so the stream died on a 429 before the total body deadline could fire; the test passed without the fix | **fixed**: the budget leaves room for the prefix and the drips, the client keeps dripping until the server resets, and the test asserts fewer than 100 rounds (the old path would run all 200) |
+| D1 | medium | the drip test's budget was exceeded by its own prefix, so the stream died on a 429 before the total body deadline could fire; the test passed without the fix | **fixed**: the budget leaves room for the prefix and the drips, a second stream is issued every 100 ms so the accept-inactivity deadline cannot end the connection first, and the client drips until the server resets. Verified by mutation: with the total deadline removed the test fails after 200 rounds (23.7 s); restored, it passes in ~2.5 s |
 | D2 | medium | `respond_body` re-armed the deadline per 16 KiB piece, so a peer granting one byte per window held the task for pieces × deadline | **fixed**: one total budget (8 × the window, capped at 30 s) wraps the per-piece wait |
 | D3 | medium | the HTTP/2 client's read bound was per chunk, so a compliant drip with no caller deadline was unbounded | **fixed**: a total read budget (8 × the inactivity bound, capped at 30 s) |
 | D4 | low | the bridge returned served = 1 after a failed response write | **fixed**: it returns 1 only when the response was written |
@@ -69,6 +69,23 @@ The same pass audited QUIC and TCP as **CLEAN** (no demonstrable defect in
 HTTP/2 streams can pin 30 s of transient work, `block_in_place` serialises slow
 handlers, QUIC can buffer up to the flow-control window before the frame reader
 sees it, and the bridge ignores a write-timeout arming failure.
+
+### R-09 transports - 2026-11-02 (round 7b, second clean audit)
+
+Reviewer: Muse again, at `b689025`, with a CLEAN-TWICE instruction. Verdict on
+D1-D4: D2, D3 and D4 fixed in code (tests still thin, recorded below), D1's code
+fixed but its test not discriminating — the connection died on accept-inactivity
+before the body total could fire. Fixed by keeping a second stream active every
+100 ms; the mutation check (total deadline removed) now fails after 200 rounds.
+**Final hostile pass over the HTTP/2 server and client and the bridge: CLEAN.**
+
+Recorded residuals for this section:
+- `respond_status`'s early refusals have no write deadline (a zero-window peer
+  could park one; sizes are tiny, so it is not demonstrable).
+- the bridge's response write uses a per-syscall timeout; loopback absorbs it.
+- the bridge client's response-head read has no wall deadline unless the caller
+  sets `with_deadline`.
+- the H2 client's request write is unbounded without a caller deadline.
 
 ### R-09 transports - 2026-11-02 (round 6, second reviewer: Muse)
 

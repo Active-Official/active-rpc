@@ -95,11 +95,11 @@ fn a_stalled_stream_releases_the_budget_and_the_connection() {
 }
 
 /// A drip that stays inside the per-chunk inactivity bound must still end: the
-/// body has a total deadline (eight inactivity windows, capped at 30 s), so the
-/// reservation is released and `serve` joins.
+/// body has a total deadline (eight inactivity windows, capped at 30 s).
 ///
-/// The budget is deliberately larger than the drip: the stream must be cut by the
-/// *total body deadline*, not by a `429` from its own prefix.
+/// A second stream keeps issuing requests so the connection is not torn down by
+/// the accept-inactivity deadline first; the body total is the only bound that
+/// can end the drip, and the budget leaves room so a 429 cannot either.
 #[test]
 fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
     let stalled_body = 60usize;
@@ -126,8 +126,6 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
             .expect("serve")
     });
 
-    // Connection one: a prefix, then one byte every 100 ms — inside the 300 ms
-    // inactivity window — until the server resets the stream.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -136,7 +134,7 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
         let stream = tokio::net::TcpStream::connect(&address)
             .await
             .expect("connect");
-        let (mut sender, connection) = h2::client::handshake(stream).await.expect("handshake");
+        let (sender, connection) = h2::client::handshake(stream).await.expect("handshake");
         let driver = tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -146,9 +144,10 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
             .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
             .body(())
             .expect("request");
-        let (_response, mut body) = sender.send_request(request, false).expect("send");
+        let (_response, mut body) = sender.clone().send_request(request, false).expect("send");
         body.send_data(bytes::Bytes::from(vec![b'x'; stalled_body]), false)
             .expect("prefix");
+
         let mut sent = 0usize;
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -159,6 +158,20 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
                 break;
             }
             sent += 1;
+            // Keep the connection's accept loop fresh so the accept-inactivity
+            // deadline is not what ends the drip.
+            {
+                let ping = http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri(PATH)
+                    .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
+                    .body(())
+                    .expect("request");
+                if let Ok((response, mut send)) = sender.clone().send_request(ping, false) {
+                    let _ = send.send_data(bytes::Bytes::new(), true);
+                    let _ = tokio::time::timeout(Duration::from_secs(2), response).await;
+                }
+            }
         }
         drop(body);
         driver.abort();
@@ -166,7 +179,7 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
     });
     assert!(
         drip_ended < 100,
-        "the drip ran {drip_ended} rounds; the total body deadline never fired"
+        "the drip ran {drip_ended} rounds; only the total body deadline can end it"
     );
 
     let mut client = Http2Client::connect(&address)
