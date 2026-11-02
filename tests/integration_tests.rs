@@ -285,8 +285,9 @@ fn evaluate_honors_the_capability_budget() {
         .expect("call")
         .value()
         .expect_err("evaluation must trip the node budget");
-    assert_eq!(error.code(), "rpc/domain");
-    assert!(error.to_string().contains("X001"), "{error}");
+    // The provider checks the arena against the ceiling before the engine runs,
+    // so the class is the kernel's budget dimension rather than an engine code.
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
 
 #[test]

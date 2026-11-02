@@ -728,8 +728,8 @@ impl Http2Client {
                                 sender.send_request(request, false).map_err(|error| {
                                     Error::Transport(format!("send header: {error}"))
                                 })?;
-                            send.send_data(Bytes::from(body), true)
-                                .map_err(|error| Error::Transport(format!("send body: {error}")))?;
+                            // The same early-answer case as `request`.
+                            let _ = send.send_data(Bytes::from(body), true);
                             let response = response
                                 .await
                                 .map_err(|error| Error::Transport(format!("response: {error}")))?;
@@ -826,8 +826,10 @@ impl Http2Client {
                 let (response, mut send) = sender
                     .send_request(request, false)
                     .map_err(|error| Error::Transport(format!("send header: {error}")))?;
-                send.send_data(payload, true)
-                    .map_err(|error| Error::Transport(format!("send body: {error}")))?;
+                // An early answer (a 415 before the body is read, say) closes the
+                // stream underneath us; that response is the answer, so the send
+                // error is not fatal. A server that never answers fails below.
+                let _ = send.send_data(payload, true);
                 let response = response
                     .await
                     .map_err(|error| Error::Transport(format!("response: {error}")))?;

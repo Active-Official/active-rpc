@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-2: 12 + 8 findings (D-1, D-2, D-5, D-8..D-12 partial) | 20 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-3: 12 + 8 + 9 findings (D-1, D-2, D-5, D-8..D-12 partial; N1-N3/N5/N7 partial) | 29 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,29 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-07 domain operations - 2026-11-02 (round 3, fix verification)
+
+Reviewer: Muse at `d03413c`. It verified N1-N8 (N4 and N6 fixed; N1, N2, N3, N5,
+N7 partial) and demonstrated nine more findings with black-box probes.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| S1 | high | the constraint-expression of an annotation whose subject is in the cone was not in the read closure, so a scoped `evaluate`/`subgraph` carried it | **fixed**: `scope_closure` unions constraint expressions (to a fixpoint) into the closure; `a_scoped_answer_cannot_reach_a_constraint_expression_outside_the_scope` |
+| S2 | high | a constraint's free-text `source` travelled in cone bytes | **fixed with S5**: a scoped cone reply carries values only |
+| S3 | high | an `Env` node in the cone read the host environment under a scope (no path, so no closure could see it) | **fixed**: `scope_closure` refuses a closure containing `Env`; `a_scoped_evaluate_refuses_a_host_environment_read` |
+| S4 | medium | a pathless root passed the scope check and `labels_for` emitted `Kind[index]` node-id labels | **fixed**: `scoped_labels` drops pathless labels under a scope (the root of every walk is pathless, so refusing would make the queries unusable) |
+| S5 | medium | `restrict` copies provenance wholesale, so an allowed leaf `subgraph` returned the producer and parent hash | **fixed**: a scoped `subgraph` clears provenance; `a_scoped_subgraph_carries_no_provenance` |
+| S6 | high | an ancestor patch deleted a marked subtree because the immutability check walked dependencies only | **fixed**: `immutable_node` walks both directions (a marked node above or below the target refuses); `an_ancestor_patch_cannot_delete_an_immutable_subtree` |
+| S7 | low | `value_paths` returns the binding name for a bound node, so an outside alias made an in-scope read refuse | **accepted residual**: fail-closed and installer-controlled; recorded |
+| S8 | medium | `evaluate` had no node ceiling (the engine reported `rpc/domain`) and `patch` had no wall check | **fixed**: `check_node_budget` in `evaluate` (`rpc/budget-exceeded`, integration test updated), `check_wall_budget` in `patch`; `evaluate_respects_the_node_budget` |
+| S9 | medium | `immutable_node` rebuilt adjacency per mark on a method with no wall check | **fixed**: one dependency walk and one dependent walk per patch |
+
+Verified clean: promise/channel/promise-path smuggling (the kernel re-checks
+scope and shape at dispatch), Ref and interpolated chains, patch rollback, and
+no panic or unbounded loop in `restrict`.
+
+Gate: `scripts/local_gate.sh` green; all-features 711.
 
 ### R-07 domain operations - 2026-11-02 (round 2, confirmation)
 

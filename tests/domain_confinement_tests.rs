@@ -216,3 +216,197 @@ fn an_alias_cannot_bypass_ai_immutable() {
     agent.run();
     assert_eq!(promise.value().expect("value"), Value::text("original"));
 }
+
+/// A constraint expression is stored text the cone carries: a scoped answer must
+/// not include one from outside the scope.
+#[test]
+fn a_scoped_answer_cannot_reach_a_constraint_expression_outside_the_scope() {
+    let mut module = InfinityModule::new();
+    let canary = module.push(Inode::Str(OUTSIDE.to_string()));
+    let inside = module.push(Inode::Str("in".to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("y".to_string(), inside)],
+    });
+    let ops = module.push(Inode::Table {
+        fields: vec![("secret".to_string(), canary)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app), ("ops".to_string(), ops)],
+    });
+    module.set_root(Some(root));
+    // The app subtree is watched by a rule whose expression lives in ops.
+    module.annotate(
+        app,
+        AnnotationKind::Constraint {
+            source: "ops-bound".to_string(),
+            expr: canary,
+        },
+    );
+
+    let agent = Agent::with_secret([0x7a; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["evaluate", "subgraph"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("expr", Budget::default()).expect("lane");
+    let fixture = Fixture { agent };
+
+    for method in ["evaluate", "subgraph"] {
+        let result = call(&fixture, lane, &cap, method, vec![path("app")]);
+        assert_eq!(
+            result.as_ref().err().map(active_rpc::Error::code),
+            Some("rpc/path-not-granted"),
+            "{method}: {result:?}"
+        );
+    }
+}
+
+/// `Env` resolves against the process environment, which a scope never granted.
+#[test]
+fn a_scoped_evaluate_refuses_a_host_environment_read() {
+    let mut module = InfinityModule::new();
+    let env = module.push(Inode::Env {
+        name: "PATH".to_string(),
+        default: None,
+    });
+    let app = module.push(Inode::Table {
+        fields: vec![("k".to_string(), env)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+
+    let agent = Agent::with_secret([0x7b; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["evaluate"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("env", Budget::default()).expect("lane");
+    let fixture = Fixture { agent };
+
+    let result = call(&fixture, lane, &cap, "evaluate", vec![path("app.k")]);
+    assert_eq!(
+        result.as_ref().err().map(active_rpc::Error::code),
+        Some("rpc/path-not-granted"),
+        "{result:?}"
+    );
+}
+
+/// Replacing an ancestor deletes its subtree, so a marked descendant protects
+/// the ancestor from a patch.
+#[test]
+fn an_ancestor_patch_cannot_delete_an_immutable_subtree() {
+    let mut module = InfinityModule::new();
+    let value = module.push(Inode::Str("original".to_string()));
+    let protected = module.push(Inode::Table {
+        fields: vec![("value".to_string(), value)],
+    });
+    let outer = module.push(Inode::Table {
+        fields: vec![("protected".to_string(), protected)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("outer".to_string(), outer)],
+    });
+    module.set_root(Some(root));
+    module.annotate(protected, AnnotationKind::AiImmutable(true));
+
+    let agent = Agent::with_secret([0x7c; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let cap = agent
+        .mint(id, object, CapAttrs::new(&["patch", "evaluate"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("ancestor", Budget::default())
+        .expect("lane");
+
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "patch",
+            vec![path("outer"), Arg::Value(Value::text("pwned"))],
+        )
+        .expect("queued");
+    agent.run();
+    let error = promise
+        .value()
+        .expect_err("the patch would delete the marked subtree");
+    assert_eq!(error.code(), "rpc/read-only", "{error}");
+
+    let promise = agent
+        .call(lane, &cap, "evaluate", vec![path("outer.protected.value")])
+        .expect("call");
+    agent.run();
+    assert_eq!(promise.value().expect("value"), Value::text("original"));
+}
+
+/// A scoped cone reply is the subtree's data: the module's provenance (producer,
+/// parent hash) is not part of it.
+#[test]
+fn a_scoped_subgraph_carries_no_provenance() {
+    let mut module = hostile_module();
+    module.set_provenance(Some(active_infinity::Provenance {
+        producer: Some("OUTSIDE-PRODUCER".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: None,
+        entries: Vec::new(),
+    }));
+
+    let agent = Agent::with_secret([0x7d; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["subgraph"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("cone", Budget::default()).expect("lane");
+
+    let promise = agent
+        .call(lane, &cap, "subgraph", vec![path("app.y")])
+        .expect("queued");
+    agent.run();
+    let bytes = match promise.value().expect("subgraph") {
+        Value::Module(bytes) => bytes,
+        other => panic!("expected module bytes, got {other:?}"),
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    assert!(
+        decoded.provenance().is_none(),
+        "the cone carried provenance"
+    );
+    let rendered = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(!rendered.contains("OUTSIDE-PRODUCER"), "{rendered}");
+}
+
+/// `evaluate` is evaluator work like the queries: it honours the node ceiling.
+#[test]
+fn evaluate_respects_the_node_budget() {
+    let agent = Agent::with_secret([0x7e; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(hostile_module()).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["evaluate"]);
+    attrs.budget = Budget {
+        max_nodes: 1,
+        ..Budget::default()
+    };
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent.create_lane("nodes", Budget::default()).expect("lane");
+    let fixture = Fixture { agent };
+
+    let result = call(&fixture, lane, &cap, "evaluate", vec![path("app.y")]);
+    assert_eq!(
+        result.as_ref().err().map(active_rpc::Error::code),
+        Some("rpc/budget-exceeded"),
+        "{result:?}"
+    );
+}

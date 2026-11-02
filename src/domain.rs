@@ -202,6 +202,7 @@ impl ModuleProvider {
         let started = std::time::Instant::now();
         match call.method.as_str() {
             "evaluate" => {
+                check_node_budget(&slot.module, call)?;
                 let budget = call.budget.to_active_budget();
                 let (value, _diagnostics) = match Self::path_arg(call) {
                     Some(path) => {
@@ -211,8 +212,8 @@ impl ModuleProvider {
                         // must not read a value that is built from data outside
                         // its subtree.
                         if let Some(scope) = &call.path_scope {
-                            let dependencies = transitive(&slot.module, node, true);
-                            if !nodes_within_scope(&slot.module, &dependencies, scope) {
+                            let (outside, environment) = scope_closure(&slot.module, node, scope);
+                            if outside || environment {
                                 return Err(Error::PathNotGranted(path));
                             }
                         }
@@ -237,7 +238,8 @@ impl ModuleProvider {
                 // out-of-scope data would return it under the labels of a walk
                 // the capability was never granted.
                 if let Some(scope) = &call.path_scope {
-                    if !nodes_within_scope(&slot.module, &dependencies, scope) {
+                    let (outside, environment) = scope_closure(&slot.module, node, scope);
+                    if outside || environment {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
@@ -271,13 +273,21 @@ impl ModuleProvider {
             "subgraph" => {
                 check_node_budget(&slot.module, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
+                let mut scoped = false;
                 if let Some(scope) = &call.path_scope {
-                    let dependencies = transitive(&slot.module, node, true);
-                    if !nodes_within_scope(&slot.module, &dependencies, scope) {
+                    let (outside, environment) = scope_closure(&slot.module, node, scope);
+                    if outside || environment {
                         return Err(Error::PathNotGranted(path));
                     }
+                    scoped = true;
                 }
-                let sub = restrict(&slot.module, node)?;
+                let mut sub = restrict(&slot.module, node)?;
+                if scoped {
+                    // A cone reply is the subtree's data. Provenance (producer,
+                    // entries and the parent content address) describes the whole
+                    // module and is not part of it.
+                    sub.set_provenance(None);
+                }
                 let bytes = redacted_module_bytes(&sub)?;
                 check_wall_budget(started, call)?;
                 Ok(Response::Module(bytes))
@@ -378,7 +388,7 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels = labels_for(&slot.module, ids);
+                let labels = scoped_labels(&slot.module, ids, call.path_scope.as_deref());
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -402,7 +412,7 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels = labels_for(&slot.module, ids);
+                let labels = scoped_labels(&slot.module, ids, call.path_scope.as_deref());
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -773,11 +783,12 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
         .all(|(name, id)| !affected.contains(id) || crate::cap::is_path_prefix(scope, name))
 }
 
-/// True when `node` is marked immutable, or is reachable from an immutable node.
+/// True when `node` is immutable, is inside a marked subtree, or protects one.
 ///
 /// `@ai_immutable` protects a subtree. A shared DAG lets the same node be named
-/// by an alias outside the marked path, so a per-path check is not enough: the
-/// node and its dependencies are what a write changes.
+/// by an alias outside the marked path, and replacing an ancestor deletes its
+/// children, so both directions count: the node's dependencies (it is inside a
+/// marked subtree) and the marked nodes below it (it would delete one).
 fn immutable_node(module: &InfinityModule, node: NodeId) -> bool {
     let immutable: BTreeSet<NodeId> = active_infinity::interop::immutable_nodes(module)
         .into_iter()
@@ -788,9 +799,31 @@ fn immutable_node(module: &InfinityModule, node: NodeId) -> bool {
     if immutable.contains(&node) {
         return true;
     }
-    immutable
-        .iter()
-        .any(|root| transitive(module, *root, true).contains(&node))
+    let (dependencies, _) = adjacency(module);
+    // One reachability pass from the target over dependencies, and one over its
+    // dependents: a marked node either above or below the target is protected.
+    let reachable = |walk: &dyn Fn(NodeId) -> Vec<NodeId>| {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            for id in walk(current) {
+                if seen.insert(id) {
+                    stack.push(id);
+                }
+            }
+        }
+        seen
+    };
+    let below = reachable(&|id| dependencies.get(id.index()).cloned().unwrap_or_default());
+    if below.iter().any(|id| immutable.contains(id)) {
+        return true;
+    }
+    let dependents: Vec<Vec<NodeId>> = {
+        let (_, dependents) = adjacency(module);
+        dependents
+    };
+    let above = reachable(&|id| dependents.get(id.index()).cloned().unwrap_or_default());
+    above.iter().any(|id| immutable.contains(id))
 }
 
 /// True when every node in `ids` is named by a path inside `scope`.
@@ -803,6 +836,61 @@ fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &s
         Some(path) => crate::cap::is_path_prefix(scope, path),
         None => true,
     })
+}
+
+/// Whether a scoped read closure reaches a node named outside `scope`, and
+/// whether it reads the host environment.
+///
+/// `transitive` walks value edges only; a constraint's expression is stored text
+/// the cone carries, so it joins the closure here. `Env` resolves against the
+/// process environment at evaluation time and has no path at all, so a scope
+/// always refuses it.
+fn scope_closure(module: &InfinityModule, node: NodeId, scope: &str) -> (bool, bool) {
+    let mut closure = transitive(module, node, true);
+    closure.insert(node);
+    for _ in 0..8 {
+        let before = closure.len();
+        let subjects = closure.clone();
+        for annotation in module.annotations() {
+            if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
+                if subjects.contains(&annotation.node) {
+                    closure.extend(transitive(module, *expr, true));
+                    closure.insert(*expr);
+                }
+            }
+        }
+        if closure.len() == before {
+            break;
+        }
+    }
+    let environment = closure
+        .iter()
+        .any(|id| matches!(module.get(*id), Some(Inode::Env { .. })));
+    let paths = active_infinity::interop::value_paths(module);
+    let outside = closure.iter().any(|id| match paths.get(id) {
+        Some(path) => !crate::cap::is_path_prefix(scope, path),
+        None => false,
+    });
+    (outside, environment)
+}
+
+/// Labels for a set of node ids under an optional scope.
+///
+/// A node with no value path is labelled `Kind[index]`, which names a node id
+/// the scope never granted; under a scope those labels are dropped rather than
+/// refused, because the root of every walk is pathless and refusing would make
+/// the dependent queries unusable.
+fn scoped_labels(
+    module: &InfinityModule,
+    ids: impl IntoIterator<Item = NodeId>,
+    scope: Option<&str>,
+) -> Vec<String> {
+    let ids: Vec<NodeId> = ids.into_iter().collect();
+    if scope.is_none() {
+        return labels_for(module, ids);
+    }
+    let paths = active_infinity::interop::value_paths(module);
+    labels_for(module, ids.into_iter().filter(|id| paths.contains_key(id)))
 }
 
 /// Answer a metadata query under a redacting capability.
