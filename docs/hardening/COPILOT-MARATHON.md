@@ -32,8 +32,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | round 1: 2 mediums + 2 lows fixed | 4 fixed / 0 rejected / 0 open (1 documented residual: no store wired by default) | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | round 1: 2 highs + 6 mediums + 3 lows fixed | 11 fixed / 0 rejected / 0 open (1 recorded: publisher identity) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | round 1: 4 highs + 8 mediums + 7 lows fixed | 19 fixed / 0 rejected / 0 open | this commit |
-| R-19 | control-plane | `control-plane/**` | round 1: 3 highs + 5 mediums + 8 lows fixed | 16 fixed / 0 rejected / 0 open (3 documented) | this commit |
-| R-20 | fuzz | `fuzz/**` | round 1: 9 highs + 8 mediums + 5 lows fixed (1 noted); found 3 kernel defects | 21 fixed / 0 rejected / 1 noted | `09b1c82` |
+| R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
+| R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
 
 ## Cross-cutting passes (after the sections)
 
@@ -49,6 +49,86 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-20 fuzz program - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `09b1c82`.
+Verdict: not clean. K1 and K3 confirmed fixed; K2 confirmed only for `Arg::Value`
+at queue time. Three highs, three mediums and five lows were still open, and all
+of them were real:
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| C1 | high | a promise argument bypassed every shape ceiling: queue time sees a placeholder, dispatch substituted the value and re-checked only bytes | **fixed**: dispatch measures the resolved arguments; `a_promise_argument_is_measured_when_it_resolves` drives a wide value through a permissive capability into a narrow one |
+| C2 | high | `Value::wire_size` recursed and ran *before* the depth guard, so a deep value aborted the process where no `catch_unwind` reaches | **fixed**: `wire_size` is `shape().size`, one iterative pass (depth, width, size); `shape_refusal` is the single place the ceilings are compared |
+| C3 | high | a provider's response was never shape-checked against the grant | **fixed**: egress runs `shape_refusal` before the byte charge; `a_response_wider_than_the_grant_is_refused`, `a_response_deeper_than_the_grant_is_refused` |
+| C4 | medium | `send` and `publish` carried no shape ceiling at all | **fixed**: both run `shape_refusal` (lane budget for `send`, the intersected grant for `publish`) |
+| C5 | medium | `max_value_size` is documented as the materialised value size and implemented as the largest *scalar*: a list of 200 `Null` is 205 bytes and passed a ceiling of 8 | **fixed**: `Shape.size` is the wire size, matching the doc and `active_core`'s notion; `a_list_of_scalars_over_max_value_size_is_refused` |
+| C6 | medium | F5 was only half fixed: `MemoryTransport` answered by method name with a fixed request id, so a fuzzed `tools/list` body never got past `initialize`, and `tools/call` results were never parsed | **fixed**: the transport echoes the request id (which is what a real server does, and what made the MCP scenario single-shot), and the target places the fuzzed body in each of the three parsers, then drives `tools/call` |
+| C7 | medium | F8 was only half fixed: the "value size" probe always exceeded `max_bytes` first, so deleting the shape check would not have failed it, and `max_array_len` was never probed | **fixed**: `max_bytes` is generous, each probe is built past its own ceiling, and the refusal must *name the dimension* |
+| C8 | medium | the PR fuzz lane still discarded its crash artifacts, and the nightly lane's 16 × 600 s campaign did not fit its 180-minute ceiling (and a timeout skips the `always()` upload) | **fixed**: the PR job uploads `fuzz/artifacts` + corpus; the nightly runs 420 s per target under a 300-minute ceiling |
+| C9 | low | three targets named invariants in their headers that nothing asserted | **fixed**: the domain target drives the methods that exist (`metadata` is not one — the first block had been dead), asserts a redacting capability never carries the canary, and the wasm target asserts the limit ceilings; the framing target's unreachable "declared header" claim is replaced by what the public API can reach |
+| C10 | low | every action was on a moving tag, and the release job held `contents: write` | **fixed**: `checkout`, `upload-artifact` and `setup-python` are pinned by SHA with the tag in a comment (`dtolnay/rust-toolchain` keeps its version tag: the ref *is* the toolchain selector) |
+| C11 | low | `fuzz_docker.py` let `TimeoutExpired` escape, aborting the lane and leaving the container running | **fixed**: the container is named, removed on a timeout, and the target is recorded as a failure |
+| C12 | low | 411 untracked seeds contradicted "corpora are committed" | **fixed**: committed; `CORPUS.md` now says how to count them instead of a number that rots |
+
+Also in this round: `ERROR_CODES` (31 codes) is the closed catalogue, compared
+against `Error::code`, the wire spec and a sample of variants by the conformance
+suite — four variants had no test, and `rpc/persistence` was undocumented.
+`observability::label` keeps its declared 128-byte ceiling including the ellipsis
+(it could return 131).
+
+**Verified pre-fix**: 8 of the 16 `budget_shape_tests` fail against `09b1c82`
+(the four new boundaries and the size semantics), the MCP target fails against
+the old transport, and the label test fails against the old formatter.
+
+Campaign after the fixes: 16 targets × 3000 runs, clean; the two repaired targets
+re-run clean, and `fuzz_wasm_module` measured 3 846 exec/s over 50 000 runs.
+
+Gate: 619 all-features (70 suites), 559 no-default, control plane 32, CLI 22,
+clippy/fmt/doc clean on both feature sets, fuzz clippy clean, negative controls
+9/9. Commit `1c4cb37`, CI green on both orgs.
+
+### R-19 control plane - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `09b1c82`.
+Verdict: not clean. Two highs and six mediums were still open; the review also
+confirmed that three of the five round-1 fixes were real.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| P1 | high | the MCP step was single-shot: the transport answered with a fixed request id, so every run after the first got `mcp/id-mismatch` and the ladder painted a red stage that said only "Scenario panic" | **fixed**: `MemoryTransport` echoes the request id; the scenario maps a refusal to a stage carrying its code; a panic reports its message; `every_ladder_step_passes_twice` runs the whole ladder twice |
+| P2 | high | the WebSocket's `RecvError::Lagged` arm was `{}`: the lag signal P7 claimed to have added was never in the tree | **fixed**: a lag pushes an `event_gap` frame with the skipped count (`gap_frame`), unit-tested |
+| P3 | medium | `/logs/since` gave no gap signal when the 500-event ring wrapped | **fixed**: the envelope carries `oldest` and `gap`; `/logs/tail` carries `oldest` and `truncated` |
+| P4 | medium | the `event_gap` marker was category `system`, i.e. not protected from the eviction it reports | **fixed**: `code == "rpc/audit-gap"` is protected, and `Health.audit_gap` is sticky |
+| P5 | medium | `.layer()` before `.fallback_service()`: static assets answered `Host: evil.example` with 200 | **fixed**: the layer comes after the fallback; `a_static_asset_with_a_foreign_host_is_refused` |
+| P6 | medium | no `X-Frame-Options`/`frame-ancestors`: a framed dashboard defeats both the Host and Origin guards with one click | **fixed**: one middleware stamps `x-frame-options`, `frame-ancestors 'none'`, `script-src 'self'`, `style-src 'unsafe-inline'`, `nosniff`, `base-uri`/`form-action 'none'` |
+| P7 | medium | `/health` could not fail (`kernel: "up"` was a constant) and a dead worker kept answering 200 | **fixed**: `Heartbeat` staleness, `catch_unwind` around every command, a panic republishes `kernel: "down"` |
+| P8 | medium | `redaction_ok` was written only on success, so a projection error kept last run's `true` | **fixed**: the flag is cleared before the first projection |
+| P9 | medium | `BenchmarkReport.samples` was rebroadcast in every snapshot (~96 KB per client per second after a 5 000-iteration run) | **fixed**: `skip_serializing`; the CSV endpoint still serves them |
+| P10 | low | the `"::1"` allow-arm was dead: `rsplit_once(':')` turned `Host: ::1` into `":"` | **fixed**: `is_loopback_host` parses the bracketed form and refuses a bare IPv6 address |
+| P11 | low | the Origin check ignored scheme and port: another local program on 9999 drove the plane | **fixed**: `same_origin` compares host and port, and the WS upgrade uses it too |
+| P12 | low | the process policy was a prefix wildcard over a shell (`"echo*"` + `cmd /C`) | **fixed**: the exact command line `echo active` is allowlisted, and a new stage proves `echo active & whoami` is refused. (The adapter's metacharacter refusal already covered the exploit the review named, so the finding was **partly a false positive**; the scenario now tests both lines of defence.) |
+| P13 | low | the process stage printed `cmd` while the registered program is an absolute path | **fixed**: the core carries the program and the stage prints it |
+| P14 | low | the kernel secret was a source constant, so every process derived the same capability and correlation ids | **fixed**: `Agent::new()` (a random secret per process) |
+| P15 | low | `activity.progress` can never be a fraction (the worker publishes after a command returns) | **fixed in the label**: the field documents that it is a final count and the UI says "iterations" |
+| P16 | low | the verdict conjoined only the *last* stage although its comment said "conjunction of its own stages" | **fixed**: every stage must be green |
+| P17 | low | the MCP client accepted any `--attach`, interpolated an unvalidated scenario id into a URL, and read stdin with `lines()` | **fixed**: the base must be a loopback origin, the id must be a declared scenario, and a request line is bounded at 1 MiB (`read_bounded_line`) |
+| P18 | low | one document-level `mouseup` was registered per track per render (~6/s, each retaining its track) and the status said "live" on a frozen socket | **fixed**: one document handler for every brush; the status follows the last frame's age. Verified by dragging in headless Chrome |
+| P19 | low | `PlaneCore::new()` bound a listener and spawned a thread that outlived the core; `spawn_worker` built two cores per worker | **fixed**: the stub loop stops on drop (woken by one connection), `spawn_worker` builds one core and takes the state from its first snapshot; `dropping_a_core_closes_the_http_stub` |
+| P20 | low | a kernel restart (`total < seen`) reported "0 events were evicted" and discarded the new tape | **fixed**: a restart is reported as a restart with its own count |
+
+**Browser verification** (headless Chrome over CDP, `control-plane` on :8795):
+`/` and `/app.js` served under the new CSP with **0 console errors**, 20 gauges
+showing measured values (encode 319.6 µs, decode 117.4 µs, hash 69.5 µs), a
+scenario run from the ladder (5 green stages), a level-6 run with no failures, a
+brush drag that set the window (`Brush: 23:42:18 → 23:42:59`), and the status
+leaving "live" when the plane was stopped. The first pass found 294 CSP
+violations: the dashboard draws bar widths with inline styles, so
+`style-src 'unsafe-inline'` is required (scripts stay `'self'`).
+
+Gate: control plane 46 (was 32), 619 all-features, 559 no-default, CLI 22,
+clippy/fmt/doc clean. Commit `d2ee809`.
 
 ### R-20 fuzz program - 2026-11-02 (round 1)
 
