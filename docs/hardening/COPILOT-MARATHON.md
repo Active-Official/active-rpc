@@ -24,7 +24,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
-| R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
+| R-11 | identity | `src/identity.rs` | rounds 1-2: 8 + 7 findings (2 round-1 dispositions partial) | 15 fixed / 0 rejected / 0 open | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
@@ -49,6 +49,34 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-11 identity - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `ea3f658`.
+It re-checked the eight round-1 dispositions (six fixed, two partial) and then
+reviewed the module and every enforcement site. Tests:
+`tests/identity_round2_tests.rs` (8), `tests/identity_tests.rs` (+1).
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N1 | medium | `from_certificate(&[])` produced a `MutualTls`, bindable identity, so every caller that passed an empty exporter, proxy header or config string shared one wildcard fingerprint | **fixed**: empty evidence is `anonymous()`; the empty-certificate digest is refused by `bindable` as a second layer; `an_empty_certificate_is_not_a_bindable_identity` |
+| N2 | medium | the binding was checked at queue time only, so a call queued anonymously on an unbound capability ran after the operator introduced it to someone else | **fixed**: `Job` stamps the presented fingerprint and dispatch phase 1 re-checks it; `a_queued_call_does_not_survive_a_later_binding` and `a_queued_call_from_the_bound_peer_still_runs` |
+| N3 | low | the escaped subject could reach six times `MAX_SUBJECT_BYTES` (3072 bytes for 512 escapes), so the bound in the doc was false | **fixed**: the escaped form is bounded again at a character boundary; `a_subject_stays_bounded_when_every_character_escapes` |
+| N4 | low | `IdentityPolicy::local()` labelled a loopback caller `Anonymous`/`Unauthenticated`, because the loopback arm also required `require_identity` | **fixed**: `loopback && trust_loopback` labels first; `local_policy_labels_a_loopback_peer_as_loopback` |
+| N5 | low | `is_attenuation_of` reports true for a child that drops a bound parent's binding (it models `attenuate`'s merge) | **documented and pinned**: the predicate models the operation, a validator must merge before minting; `a_child_that_omits_a_binding_inherits_it` |
+| N6 | low | a revoked descendant bound to another peer blocked `introduce_to` forever | **fixed**: revoked records are skipped in the subtree validation; `a_revoked_descendant_does_not_block_introduction` |
+| N7 | medium | `IdentityPolicy::admit` had no non-test caller: the bridge and HTTP/2 dispatched with `None`, so `require_identity` gated nothing | **fixed**: `Agent::dispatch_envelope` admits under the policy and dispatches the admitted identity; `src/bin/peer.rs` uses it with a loopback-derived flag, so an off-host listener refuses anonymous callers; `the_dispatch_helper_admits_before_it_dispatches` |
+
+Verified clean by the reviewer (no change): no rebinding path; a bound
+capability cannot travel over a channel; the record seal covers `bound_to`; the
+descriptor and the envelope carry no identity.
+
+Residual risks (recorded): an in-process caller can still fabricate a
+`PeerIdentity` (no wire path reaches it), one leaf per process means two
+processes sharing a certificate share a binding, and a receipt cannot name the
+audience of an unbound capability.
+
+Gate: `scripts/local_gate.sh` green; all-features 681 passed.
 
 ### R-12 replay - 2026-11-02 (round 3, fix verification)
 

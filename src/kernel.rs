@@ -372,6 +372,13 @@ struct Job {
     /// True once a receipt records this job's decision, so a later failure path
     /// does not record a second one.
     receipted: bool,
+    /// Fingerprint the caller presented when the call was queued.
+    ///
+    /// Dispatch re-checks the binding against this value, not against whatever
+    /// peer the batch is dispatched for: a capability introduced while the call
+    /// waits must not hand the queued caller authority the operator withdrew
+    /// after it was authorized.
+    identity: Option<[u8; crate::identity::FINGERPRINT_LEN]>,
 }
 
 /// The deterministic kernel: providers, capabilities, budgets and promises.
@@ -1492,6 +1499,12 @@ impl Agent {
         let subtree = descendants_of(&kernel.children, cap.id());
         for id in &subtree {
             if let Some(child) = kernel.caps.get(id) {
+                // A revoked record is dead authority: its binding is history, and
+                // letting it block the introduction would make a binding
+                // permanent denial of service on a live capability.
+                if child.revoked {
+                    continue;
+                }
                 if let Some(bound) = child.attrs.bound_to {
                     if bound != fingerprint {
                         return Err(Error::Identity(
@@ -2663,6 +2676,7 @@ impl Agent {
             state: JobState::Queued,
             args_bytes,
             receipted: false,
+            identity: crate::identity::presented_fingerprint(peer),
         };
         kernel.jobs.insert(job_id, job);
         kernel.queue.push_back(job_id);
@@ -2930,6 +2944,29 @@ impl Agent {
         args: Vec<Arg>,
     ) -> Result<PromiseHandle> {
         self.call_as(Some(peer.identity()), lane, cap, method, args)
+    }
+
+    /// Admit a transport peer under `policy`, then dispatch an envelope.
+    ///
+    /// This is the one call a transport-side dispatcher needs: the policy decides
+    /// whether the peer may proceed at all, and the admitted identity is what the
+    /// kernel checks a binding against. Calling [`Agent::call_from_envelope`]
+    /// directly with a raw `PeerIdentity` skips [`crate::identity::IdentityPolicy::admit`]
+    /// entirely.
+    ///
+    /// `loopback` must come from the connection's own addresses (see
+    /// [`crate::identity::IdentityPolicy::admit`]); it is never a header or a caller flag.
+    pub fn dispatch_envelope(
+        &self,
+        policy: &crate::identity::IdentityPolicy,
+        peer: Option<&PeerIdentity>,
+        loopback: bool,
+        lane: LaneId,
+        cap: &CapHandle,
+        envelope: &crate::wire::Envelope,
+    ) -> Result<PromiseHandle> {
+        let admitted = policy.admit(peer, loopback)?;
+        self.call_from_envelope(Some(admitted.identity()), lane, cap, envelope)
     }
 
     /// [`Agent::call_idempotent_as`] for a call that carries `payload_bytes`.
@@ -3671,6 +3708,21 @@ impl Agent {
                         }
                     }
                 };
+                // The identity binding is re-checked here, not only at queue
+                // time: a capability introduced to another peer after this call
+                // was authorized must not hand the queued caller authority the
+                // operator has since withdrawn.
+                if failure.is_none() {
+                    if let Some(record) = &record {
+                        if let Some(bound) = record.attrs.bound_to {
+                            if !crate::identity::matches(job.identity, bound) {
+                                failure = Some(Error::Identity(
+                                    "capability is bound to a different peer identity",
+                                ));
+                            }
+                        }
+                    }
+                }
                 // A promise argument was a placeholder when the call was
                 // queued. Its value is authority-bearing too, so the path
                 // scope, the tool ceiling and the byte budget are re-checked

@@ -77,6 +77,13 @@ impl PeerIdentity {
     /// verified. Only a transport that verified it may call this, and the kernel
     /// treats the value as the caller's claim about its own connection.
     pub fn from_certificate(certificate: &[u8]) -> Self {
+        // An empty buffer is not evidence of anything. Returning a `MutualTls`
+        // identity for it would give every caller that passed an empty exporter,
+        // proxy header or config string *one shared* bindable fingerprint — the
+        // same wildcard class as the all-zero binding, wearing a cert label.
+        if certificate.is_empty() {
+            return Self::anonymous();
+        }
         let fingerprint = fingerprint_for("", certificate);
         let subject = format!("cert:{}", hex_prefix(&fingerprint, 16));
         Self {
@@ -174,7 +181,18 @@ fn sanitized_subject(subject: &str) -> String {
     if crate::security::valid_text(bounded, MAX_SUBJECT_BYTES) {
         return bounded.to_string();
     }
-    bounded.chars().flat_map(char::escape_debug).collect()
+    // Escaping can multiply the length (`\u{1b}` is six bytes for one
+    // character), so the escaped form is bounded again at a character boundary.
+    let escaped: String = bounded.chars().flat_map(char::escape_debug).collect();
+    let mut end = 0;
+    for (index, character) in escaped.char_indices() {
+        let next = index + character.len_utf8();
+        if next > MAX_SUBJECT_BYTES {
+            break;
+        }
+        end = next;
+    }
+    escaped[..end].to_string()
 }
 
 fn fingerprint_for(subject: &str, evidence: &[u8]) -> [u8; FINGERPRINT_LEN] {
@@ -194,13 +212,21 @@ fn loopback_fingerprint() -> [u8; FINGERPRINT_LEN] {
     fingerprint_for("loopback", b"loopback")
 }
 
+fn empty_certificate_fingerprint() -> [u8; FINGERPRINT_LEN] {
+    fingerprint_for("", b"")
+}
+
 /// Whether a fingerprint names a peer that can hold a binding.
 ///
 /// The all-zero fingerprint is the anonymous constant and the loopback
 /// fingerprint is shared by every local process: binding to either would make
 /// the capability usable by a peer that never proved anything.
 pub fn bindable(fingerprint: [u8; FINGERPRINT_LEN]) -> bool {
-    fingerprint != [0u8; FINGERPRINT_LEN] && fingerprint != loopback_fingerprint()
+    fingerprint != [0u8; FINGERPRINT_LEN]
+        && fingerprint != loopback_fingerprint()
+        // The digest `from_certificate` would have produced for empty evidence,
+        // refused as a second layer against a hand-built identity.
+        && fingerprint != empty_certificate_fingerprint()
 }
 
 /// The fingerprint a peer presents, or `None` when it presented no identity.
@@ -362,7 +388,11 @@ impl IdentityPolicy {
                 }
             }
             None => {
-                if loopback && self.trust_loopback && self.require_identity {
+                // The label follows the connection, not the identity
+                // requirement: an embedder that branches on `kind()` for
+                // local-only operations must see `Loopback` for a local caller
+                // under `local()` as well as under the default policy.
+                if loopback && self.trust_loopback {
                     Ok(AdmittedIdentity {
                         identity: PeerIdentity::loopback(),
                         trust: TrustLevel::LoopbackRelaxed,

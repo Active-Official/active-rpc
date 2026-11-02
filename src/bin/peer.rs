@@ -21,6 +21,7 @@ use std::io::Write;
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::domain::ModuleProvider;
+use active_rpc::identity::IdentityPolicy;
 use active_rpc::transport::{serve_connection, TcpTransport};
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::wire::{Envelope, Kind};
@@ -108,7 +109,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let lane = agent.create_lane("peer", Budget::default())?;
 
     let listener = std::net::TcpListener::bind(&address)?;
-    let bound = listener.local_addr()?.to_string();
+    let local = listener.local_addr()?;
+    // A plain TCP peer carries no identity, so the only honest admission rule is
+    // the loopback one: a local caller is a loopback peer (which cannot hold a
+    // binding), and anything off-host is refused rather than silently admitted.
+    let loopback = local.ip().is_loopback();
+    let policy = IdentityPolicy::default();
+    let bound = local.to_string();
     println!("listening {bound}");
     std::io::stdout().flush()?;
 
@@ -117,7 +124,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let stream = stream?;
         let transport = TcpTransport::new(stream)?;
         let handled = serve_connection(transport, |envelope| {
-            handle(&agent, lane, &module_cap, &echo_cap, envelope)
+            handle(
+                &agent,
+                lane,
+                &policy,
+                loopback,
+                &module_cap,
+                &echo_cap,
+                envelope,
+            )
         })?;
         served += handled as usize;
         if max_calls != 0 && served >= max_calls {
@@ -127,22 +142,30 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     agent: &Agent,
     lane: active_rpc::LaneId,
+    policy: &IdentityPolicy,
+    loopback: bool,
     module_cap: &active_rpc::CapHandle,
     echo_cap: &active_rpc::CapHandle,
     envelope: Envelope,
 ) -> Envelope {
-    match dispatch(agent, lane, module_cap, echo_cap, &envelope) {
+    match dispatch(
+        agent, lane, policy, loopback, module_cap, echo_cap, &envelope,
+    ) {
         Ok(value) => Envelope::response(envelope.request_id, value),
         Err(error) => Envelope::error(envelope.request_id, &error),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     agent: &Agent,
     lane: active_rpc::LaneId,
+    policy: &IdentityPolicy,
+    loopback: bool,
     module_cap: &active_rpc::CapHandle,
     echo_cap: &active_rpc::CapHandle,
     envelope: &Envelope,
@@ -191,7 +214,8 @@ fn dispatch(
         _ => {
             // Charge the envelope payload against the capability's byte budget,
             // exactly as the thin-client peers do.
-            let promise = agent.call_from_envelope(None, lane, module_cap, envelope)?;
+            let promise =
+                agent.dispatch_envelope(policy, None, loopback, lane, module_cap, envelope)?;
             promise.value()
         }
     }
