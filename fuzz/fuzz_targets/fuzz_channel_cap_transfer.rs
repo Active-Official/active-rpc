@@ -77,7 +77,10 @@ fuzz_target!(|data: &[u8]| {
             std::slice::from_ref(&cap)
         )
         .is_ok());
-    let message = agent.recv(channel_id).expect("channel").expect("message");
+    let message = agent
+        .recv(lane, channel_id)
+        .expect("channel")
+        .expect("message");
     assert_eq!(message.caps.len(), 1);
     assert_eq!(message.caps[0], cap.id());
 

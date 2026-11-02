@@ -56,6 +56,9 @@ fuzz_target!(|data: &[u8]| {
     let channel = agent
         .create_channel("news", Direction::Both)
         .expect("the fuzz harness creates a valid channel");
+    agent
+        .subscribe(lane, channel)
+        .expect("the lane subscribes");
 
     // Bit 7 set means "unrestricted"; otherwise the low bits pick the topics.
     let grants: Option<Vec<&'static str>> = if data[0] & 0x80 != 0 {
@@ -125,7 +128,7 @@ fuzz_target!(|data: &[u8]| {
                             "a child capability published outside its topic set"
                         );
                         let message = agent
-                            .recv_topic(channel, topic)
+                            .recv_topic(lane, channel, topic)
                             .expect("receive")
                             .expect("the published message is queued");
                         assert_eq!(message.topic.as_deref(), Some(*topic));
@@ -150,7 +153,7 @@ fuzz_target!(|data: &[u8]| {
                     "published {topic} outside the granted set"
                 );
                 let message = agent
-                    .recv_topic(channel, topic)
+                    .recv_topic(lane, channel, topic)
                     .expect("receive")
                     .expect("the published message is queued");
                 assert_eq!(message.topic.as_deref(), Some(topic));
@@ -167,7 +170,7 @@ fuzz_target!(|data: &[u8]| {
                 );
                 assert!(
                     agent
-                        .recv_topic(channel, topic)
+                        .recv_topic(lane, channel, topic)
                         .expect("receive after a refusal")
                         .is_none(),
                     "a refused publish left a message behind"
@@ -190,7 +193,7 @@ fuzz_target!(|data: &[u8]| {
                 )
                 .expect("an unrestricted capability publishes any topic");
             let message = agent
-                .recv_topic(channel, topic)
+                .recv_topic(lane, channel, topic)
                 .expect("receive")
                 .expect("the published message is queued");
             assert_eq!(message.topic.as_deref(), Some(*topic));
