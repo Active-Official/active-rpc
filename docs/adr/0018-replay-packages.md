@@ -40,9 +40,11 @@ Trace entries: `flags u8` (0 = no capability, 1 = capability), `event (len u32,
 bytes)`, and `cap u32` when the flag is set.
 
 Limits: `op_count ≤ 100,000`, `trace_count ≤ 1,000,000`, method and event names
-≤ 1 MiB, methods per capability ≤ 64, `arg_bytes ≤ 1 MiB`. A package with an
-unknown tag, a reserved flag set, trailing bytes, a bad checksum or an
-out-of-range ordinal is refused with `rpc/replay`.
+≤ 1 MiB, methods per capability ≤ 64, `arg_bytes ≤ 1 MiB`, 16 MiB of declared
+argument bytes per package, and a 64 MiB body. The recorder, the encoder and the
+decoder enforce the same set, so a package that is written is a package that
+reads. A package with an unknown tag, a reserved flag set, trailing bytes, a bad
+checksum or an out-of-range ordinal is refused with `rpc/replay`.
 
 Semantics:
 
@@ -85,6 +87,46 @@ Semantics:
   describes a synthetic demo session: the method and the argument *size* are
   faithful inputs, the argument shape is not.
 
+## Amendments (R-12 round 2, 2026-11-02)
+
+The round-1 amendment claimed the trace pinned a call's method and size. It did
+for an admitted call (`call.queued:<method>:<bytes>`) and for nothing else: a
+refused call's method, a mint's grant, a TTL, the latency operation and a
+revoke's target were unpinned, and `replay` also compared a replayed op list it
+had itself rebuilt from the package, so that comparison could never fire. The
+following replace the earlier claim.
+
+- **Every operation has an input entry in the trace.** `op.latency:<ms>`,
+  `op.mint:<digest>:<ttl>`, `op.attenuate:<parent>:<digest>:<ttl>`,
+  `op.call:<cap>:<digest>:<bytes>` and `op.revoke:<cap>`, appended before that
+  operation's kernel events. The digest is 64 bits over length-prefixed method
+  names, so the text of a caller-chosen name is never recorded. The entry is
+  computed from the package's fields at replay time and from the live arguments
+  at record time: an edit that is not followed by re-running the replay no longer
+  matches the trace. The op-list comparison is gone; it proved nothing.
+- **Record and encode enforce the same ceilings as decode**: argument bytes per
+  call, the 16 MiB argument total, `MAX_METHODS` (64) per grant, and the 64 MiB
+  body (checked as the body grows). Before this, a recorder could emit a package
+  its own decoder refused, and `String::repeat` in `Recorder::call` would abort
+  the process on a caller-chosen size.
+- **An operation whose kernel action succeeded reports that action.** A capture
+  that loses events poisons the recorder and `package()` refuses, but it does not
+  turn a completed revocation into `rpc/replay`: a caller would retry a kill
+  switch that already fired.
+- **A borrowed handle's release belongs to the operation that borrowed it.** The
+  transient `CapHandle` clone is dropped before the capture that closes the
+  operation, so the trace never ends an operation on an unmatched retain.
+- **`replay_trace` applies the header-latency rule too.** The diagnostic half is
+  public and used to skip operation 0 without checking that it is the header.
+- **The tape-wrap guard is reachable.** Revoking a subtree of more than
+  `MAX_EVENTS` descendants emits every dropped capability in one operation, so a
+  capture then fails by design; `a_recorder_that_lost_events_still_reports_the_kernel_outcome`
+  drives it.
+- **Discriminators are 128 bits.** The introduction fingerprint in the trace and
+  the method digest tail in `call.queued` are 16 bytes: a peer that chooses its
+  certificate, or a caller that chooses two long names with a shared prefix, must
+  not be able to target a collision.
+
 ## Consequences
 
 - `active_rpc::replay` exposes `Recorder`, `ReplayPackage`, `Op` and `Trace`.
@@ -98,6 +140,6 @@ Semantics:
   transient allocation during replay.
 - The recorder tails the kernel tape by *total* event count. If the bounded tape
   wrapped between two captures, the recorder refuses with `rpc/replay` instead
-  of shipping a trace with a missing prefix. No current operation emits enough
-  events in one gap to reach this, so it is a guard rather than a reachable
-  state today.
+  of shipping a trace with a missing prefix. One operation can reach this today
+  (a revoke over a subtree larger than the tape), and the recorder reports the
+  revoke's own outcome while `package()` refuses.

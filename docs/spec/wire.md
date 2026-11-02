@@ -447,3 +447,23 @@ A record carries the decision the kernel took at dispatch
 and then refused is evidence of a refusal. Records carry correlation ids, method
 names, times and decisions; they never carry arguments, values, capability ids
 or secret material.
+
+### Replay package (`ARRP`)
+
+A recorded session is a second exchanged artifact, refused with `rpc/replay`.
+Its layout is in ADR-0018; the parts a consumer must be able to rely on:
+
+```text
+magic "ARRP"   version u8   flags u16 (0)   latency_ms u64
+op_count u32   ops...       trace_count u32  traces...   checksum blake3[32]
+```
+
+An operation is `SetLatency`, `Mint`, `Attenuate`, `Call` or `Revoke`; a call
+records the method and the argument wire size, never the argument. The trace is
+the decision stream plus one `op.*` input entry per operation, so an edit to a
+grant, a TTL, a latency or a refused call's method does not match a replayed
+trace. The recorder, the encoder and the decoder share one set of limits
+(100 000 operations, 1 000 000 trace entries, 64 methods per grant, 1 MiB per
+argument and 16 MiB per package, 64 MiB body), so an artifact that is written is
+an artifact that reads. The checksum detects corruption, not forgery: a party
+that can rewrite the file can recompute it.

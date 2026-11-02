@@ -31,6 +31,13 @@ pub const MAX_STRING: usize = 1 << 20;
 /// Largest synthesized argument a replay call may carry.
 pub const MAX_ARG_BYTES: u64 = 1 << 20;
 
+/// Most methods one operation may grant.
+///
+/// The decoder refuses a larger set, so the recorder and the encoder do too:
+/// a package that cannot be read back is not a package. A capability with more
+/// than 64 methods is outside what a replay artifact can describe.
+pub const MAX_METHODS: usize = 64;
+
 /// Largest package the decoder accepts, in bytes.
 ///
 /// The per-field ceilings (operation count, trace count, string length) do not
@@ -128,6 +135,8 @@ impl ReplayPackage {
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&self.latency_ms.to_le_bytes());
         out.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
+        check_body(&out)?;
+        let mut arg_total: u64 = 0;
         for op in &self.ops {
             match op {
                 Op::SetLatency(ms) => {
@@ -152,6 +161,15 @@ impl ReplayPackage {
                     method,
                     arg_bytes,
                 } => {
+                    if *arg_bytes > MAX_ARG_BYTES {
+                        return Err(Error::Replay("argument size exceeds the ceiling".into()));
+                    }
+                    arg_total = arg_total.saturating_add(*arg_bytes);
+                    if arg_total > MAX_ARG_TOTAL_BYTES {
+                        return Err(Error::Replay(
+                            "declared argument sizes exceed the package ceiling".into(),
+                        ));
+                    }
                     out.push(4);
                     out.extend_from_slice(&cap.to_le_bytes());
                     write_str(&mut out, method)?;
@@ -162,14 +180,17 @@ impl ReplayPackage {
                     out.extend_from_slice(&cap.to_le_bytes());
                 }
             }
+            check_body(&out)?;
         }
         out.extend_from_slice(&(self.trace.len() as u32).to_le_bytes());
+        check_body(&out)?;
         for trace in &self.trace {
             out.push(u8::from(trace.cap.is_some()));
             write_str(&mut out, &trace.event)?;
             if let Some(cap) = trace.cap {
                 out.extend_from_slice(&cap.to_le_bytes());
             }
+            check_body(&out)?;
         }
         let checksum = blake3::hash(&out);
         out.extend_from_slice(checksum.as_bytes());
@@ -282,24 +303,15 @@ impl ReplayPackage {
     ///
     /// Operation errors are part of the recorded decision (the trace carries the
     /// refusal), so they do not abort the replay; a mismatch aborts with the
-    /// first differing entry. The rebuilt operation list is compared too, which
-    /// is what catches an edit to a call's method or argument size: those fields
-    /// are recorded but no kernel event names them.
+    /// first differing entry.
+    ///
+    /// The trace pins the inputs: every operation appends an `op.*` entry
+    /// derived from its own fields, so a package edited without re-running the
+    /// replay no longer matches its own trace. Comparing the replayed operation
+    /// list would prove nothing, because `replay_trace` builds that list from
+    /// the very operations it reads.
     pub fn replay(&self) -> Result<()> {
-        // The header latency is the *initial* rate; the recording always emits
-        // it as the first operation, and a package that does not is using the
-        // field for something else.
-        if self.ops.first() != Some(&Op::SetLatency(self.latency_ms)) {
-            return Err(Error::Replay(
-                "the package does not begin with its header latency".into(),
-            ));
-        }
-        let (trace, rebuilt) = self.replay_trace()?;
-        if rebuilt.len() != self.ops.len() || rebuilt[1..] != self.ops[1..] {
-            return Err(Error::Replay(
-                "the recorded operations do not match the replayed ones".into(),
-            ));
-        }
+        let (trace, _) = self.replay_trace()?;
         if self.trace.len() != trace.len() {
             return Err(Error::Replay(format!(
                 "trace length differs: recorded {}, replayed {}",
@@ -324,8 +336,18 @@ impl ReplayPackage {
     ///
     /// This is the diagnostic half of [`ReplayPackage::replay`]: it lets a
     /// caller inspect where a package diverges instead of only learning that it
-    /// did.
+    /// did. It refuses the same malformed header `replay` does: a package whose
+    /// first operation is not its header latency would otherwise run every
+    /// operation except the one the header describes.
     pub fn replay_trace(&self) -> Result<(Vec<Trace>, Vec<Op>)> {
+        // The header latency is the *initial* rate; the recording always emits
+        // it as the first operation, and a package that does not is using the
+        // field for something else.
+        if self.ops.first() != Some(&Op::SetLatency(self.latency_ms)) {
+            return Err(Error::Replay(
+                "the package does not begin with its header latency".into(),
+            ));
+        }
         // Replay through the same recorder code path the original session used,
         // so handle lifetimes (retain/release events) are identical by
         // construction.
@@ -413,6 +435,12 @@ pub struct Recorder {
     /// so the recorder refuses to produce a package rather than emit one that
     /// cannot replay.
     poisoned: bool,
+    /// Declared argument bytes across every recorded call.
+    ///
+    /// The decoder refuses a package whose sum exceeds
+    /// [`MAX_ARG_TOTAL_BYTES`], so the recorder counts as it records and refuses
+    /// before the artifact exists.
+    arg_total: u64,
 }
 
 impl Recorder {
@@ -434,8 +462,10 @@ impl Recorder {
             latency_ms,
             initial_latency_ms: latency_ms,
             poisoned: false,
+            arg_total: 0,
         };
         recorder.capture()?;
+        recorder.note(&Op::SetLatency(latency_ms))?;
         Ok(recorder)
     }
 
@@ -449,8 +479,9 @@ impl Recorder {
         self.reserve_op()?;
         self.latency_ms = latency_ms;
         self.agent.set_latency(latency_ms);
-        self.ops.push(Op::SetLatency(latency_ms));
-        Ok(())
+        let op = Op::SetLatency(latency_ms);
+        self.ops.push(op.clone());
+        self.note(&op)
     }
 
     /// The decisions recorded so far.
@@ -476,12 +507,13 @@ impl Recorder {
 
     /// Refuse a method set the package format cannot encode.
     ///
-    /// The wire stores a method count and each length as `u16`; recording
-    /// something larger would make `encode` truncate a length and re-frame the
-    /// rest of the package, so the limit is enforced here, at the only place a
-    /// caller can reach it.
+    /// The wire stores a method count and each length as `u16`, while the
+    /// decoder accepts at most [`MAX_METHODS`]; recording something larger would
+    /// make `encode` produce an artifact `decode` refuses, so the limit is
+    /// enforced here, at the only place a caller can reach it. A method name
+    /// beyond `u16::MAX` bytes is refused for the same reason.
     fn check_methods(methods: &[&str]) -> Result<()> {
-        if methods.len() > u16::MAX as usize {
+        if methods.len() > MAX_METHODS {
             return Err(Error::Replay("too many methods for a package".into()));
         }
         if methods
@@ -493,6 +525,61 @@ impl Recorder {
             ));
         }
         Ok(())
+    }
+
+    /// Record one operation's input in the trace.
+    ///
+    /// The kernel's events name a capability, never the grant, the TTL, the
+    /// method text or the argument size, so a trace built only from events
+    /// cannot tell an edited package from the original: swapping a grant or a
+    /// refused call's method and re-checksumming replayed clean. The input entry
+    /// is derived from the *package's* fields at replay time and from the live
+    /// arguments at record time, so a package edited without re-running the
+    /// replay no longer matches its own trace.
+    ///
+    /// The entry carries a digest rather than the text: a method name is
+    /// caller-chosen and may be a megabyte long.
+    fn note(&mut self, op: &Op) -> Result<()> {
+        let event = match op {
+            Op::SetLatency(ms) => format!("op.latency:{ms}"),
+            Op::Mint { methods, ttl_ms } => {
+                format!("op.mint:{}:{}", digest_of(methods), ttl_label(*ttl_ms))
+            }
+            Op::Attenuate {
+                parent,
+                methods,
+                ttl_ms,
+            } => format!(
+                "op.attenuate:{parent}:{}:{}",
+                digest_of(methods),
+                ttl_label(*ttl_ms)
+            ),
+            Op::Call {
+                cap,
+                method,
+                arg_bytes,
+            } => format!(
+                "op.call:{cap}:{}:{arg_bytes}",
+                hex_prefix(blake3::hash(method.as_bytes()).as_bytes(), 8)
+            ),
+            Op::Revoke { cap } => format!("op.revoke:{cap}"),
+        };
+        self.trace.push(Trace { event, cap: None });
+        if self.trace.len() > MAX_TRACES {
+            self.poisoned = true;
+            return Err(Error::Replay("the trace exceeds the ceiling".into()));
+        }
+        Ok(())
+    }
+
+    /// Capture after the kernel already acted.
+    ///
+    /// A refused capture means the trace lost events, so `package()` refuses;
+    /// the operation itself succeeded or failed for its own reasons and its
+    /// answer must not be replaced by `rpc/replay`, which would make a caller
+    /// believe a revocation did not happen.
+    fn capture_acted(&mut self) {
+        let _ = self.capture();
     }
 
     fn capture(&mut self) -> Result<()> {
@@ -529,22 +616,24 @@ impl Recorder {
                 .collect::<Vec<_>>(),
             ttl_ms,
         );
-        self.ops.push(Op::Mint {
+        let op = Op::Mint {
             methods: methods.iter().map(|method| method.to_string()).collect(),
             ttl_ms,
-        });
+        };
+        self.ops.push(op.clone());
+        self.note(&op)?;
         let cap = match self.agent.mint(self.provider, 0, attrs) {
             Ok(cap) => cap,
             Err(error) => {
                 // A refusal emits events (`cap.expired`, retention churn); they
                 // belong to the recorded session even though the op failed.
-                self.capture()?;
+                self.capture_acted();
                 return Err(error);
             }
         };
         let ordinal = self.caps.len() as u32;
         self.caps.push(cap);
-        self.capture()?;
+        self.capture_acted();
         Ok(ordinal)
     }
 
@@ -570,52 +659,76 @@ impl Recorder {
                 .collect::<Vec<_>>(),
             ttl_ms,
         );
-        self.ops.push(Op::Attenuate {
+        let op = Op::Attenuate {
             parent,
             methods: methods.iter().map(|method| method.to_string()).collect(),
             ttl_ms,
-        });
-        let child = match self.agent.attenuate(&handle, attrs) {
-            Ok(child) => child,
-            Err(error) => {
-                // The refusal churns the parent handle (retain/release) and may
-                // emit `cap.expired`; capture before returning so the trace
-                // still describes what the kernel decided.
-                self.capture()?;
-                return Err(error);
-            }
         };
-        let ordinal = self.caps.len() as u32;
-        self.caps.push(child);
-        self.capture()?;
-        Ok(ordinal)
+        self.ops.push(op.clone());
+        self.note(&op)?;
+        let outcome = self.agent.attenuate(&handle, attrs);
+        // The borrowed handle's `cap.released` is a decision of this operation:
+        // drop it before the capture that closes the operation, or the trace
+        // ends on an unmatched retain.
+        drop(handle);
+        match outcome {
+            Ok(child) => {
+                let ordinal = self.caps.len() as u32;
+                self.caps.push(child);
+                self.capture_acted();
+                Ok(ordinal)
+            }
+            Err(error) => {
+                self.capture_acted();
+                Err(error)
+            }
+        }
     }
 
     /// Issue a call. Refusals are recorded in the trace, not returned.
     pub fn call(&mut self, cap: u32, method: &str, arg_bytes: usize) -> Result<()> {
         self.reserve_op()?;
+        let arg_bytes = u64::try_from(arg_bytes)
+            .map_err(|_| Error::Replay("argument size exceeds the ceiling".into()))?;
+        // Both ceilings are the decoder's: a package that cannot be read back
+        // is not a package. The check also keeps a caller-chosen size away from
+        // `String::repeat`, which would otherwise abort on allocation failure.
+        if arg_bytes > MAX_ARG_BYTES {
+            return Err(Error::Replay("argument size exceeds the ceiling".into()));
+        }
+        let arg_total = self.arg_total.saturating_add(arg_bytes);
+        if arg_total > MAX_ARG_TOTAL_BYTES {
+            return Err(Error::Replay(
+                "declared argument sizes exceed the package ceiling".into(),
+            ));
+        }
         let handle = self
             .caps
             .get(cap as usize)
             .cloned()
             .ok_or_else(|| Error::Replay(format!("capability ordinal {cap} does not exist")))?;
-        self.ops.push(Op::Call {
+        let op = Op::Call {
             cap,
             method: method.to_string(),
-            arg_bytes: arg_bytes as u64,
-        });
+            arg_bytes,
+        };
+        self.ops.push(op.clone());
+        self.note(&op)?;
+        self.arg_total = arg_total;
         let args = if arg_bytes == 0 {
             Vec::new()
         } else {
-            vec![Arg::text("x".repeat(arg_bytes))]
+            vec![Arg::text("x".repeat(arg_bytes as usize))]
         };
-        if let Ok(promise) = self.agent.call(self.lane, &handle, method, args) {
+        let outcome = self.agent.call(self.lane, &handle, method, args);
+        drop(handle);
+        if let Ok(promise) = outcome {
             self.agent.run();
             let _ = promise.value();
         } else {
             self.agent.run();
         }
-        self.capture()?;
+        self.capture_acted();
         Ok(())
     }
 
@@ -627,14 +740,16 @@ impl Recorder {
             .get(cap as usize)
             .cloned()
             .ok_or_else(|| Error::Replay(format!("capability ordinal {cap} does not exist")))?;
-        self.ops.push(Op::Revoke { cap });
-        if let Err(error) = self.agent.revoke(&handle) {
-            // A refused revoke still produced a decision.
-            self.capture()?;
-            return Err(error);
-        }
-        self.capture()?;
-        Ok(())
+        let op = Op::Revoke { cap };
+        self.ops.push(op.clone());
+        self.note(&op)?;
+        let outcome = self.agent.revoke(&handle);
+        drop(handle);
+        // A refused revoke still produced a decision, and a successful one must
+        // be reported as a success even when the capture that follows lost
+        // events: `package()` is where that loss is refused.
+        self.capture_acted();
+        outcome
     }
 
     /// The recorded package.
@@ -721,10 +836,11 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             cap: ordinal(*cap),
         },
         Event::CapIntroduced { cap, fingerprint } => Trace {
-            // A short prefix of the peer's public fingerprint: two introductions
-            // to different peers must not compare equal, and the raw identity is
-            // never recorded.
-            event: format!("cap.introduced:{}", hex_prefix(fingerprint, 4)),
+            // A 128-bit prefix of the peer's public fingerprint: two
+            // introductions to different peers must not compare equal, and a
+            // peer that chooses its own certificate must not be able to target
+            // a collision. The raw identity is never recorded.
+            event: format!("cap.introduced:{}", hex_prefix(fingerprint, 16)),
             cap: ordinal(*cap),
         },
         Event::ProviderPanicked { phase, .. } => Trace {
@@ -802,6 +918,27 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
     }
 }
 
+/// A 64-bit digest of a granted method set.
+///
+/// Length-prefixed so `["ab", "c"]` and `["a", "bc"]` differ, and hashed rather
+/// than rendered because a method name is caller-chosen and can be megabytes.
+fn digest_of(methods: &[String]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"active-rpc/replay/op-methods/v1\0");
+    for method in methods {
+        hasher.update(&(method.len() as u64).to_le_bytes());
+        hasher.update(method.as_bytes());
+    }
+    hex_prefix(hasher.finalize().as_bytes(), 8)
+}
+
+fn ttl_label(ttl_ms: Option<u64>) -> String {
+    match ttl_ms {
+        Some(ttl) => format!("ttl={ttl}"),
+        None => "ttl=-".to_string(),
+    }
+}
+
 fn hex_prefix(bytes: &[u8; 32], len: usize) -> String {
     let mut out = String::with_capacity(len * 2);
     for byte in &bytes[..len.min(32)] {
@@ -836,7 +973,24 @@ impl Provider for Demo {
 // Encoding helpers
 // ---------------------------------------------------------------------------
 
+/// Refuse a body that the decoder's whole-package ceiling would reject.
+///
+/// The check runs as the body grows, not at the end: a session that would build
+/// 77 MiB of package (300 mints of 64 four-kilobyte methods is a legal one) must
+/// fail before the allocation, and the decoder refuses anything over the same
+/// ceiling.
+fn check_body(out: &[u8]) -> Result<()> {
+    // The checksum is 32 bytes and is appended after the body.
+    if out.len() > MAX_PACKAGE_BYTES - 32 {
+        return Err(Error::Replay("package exceeds the size ceiling".into()));
+    }
+    Ok(())
+}
+
 fn write_str(out: &mut Vec<u8>, value: &str) -> Result<()> {
+    if value.len() > MAX_STRING {
+        return Err(Error::Replay("string exceeds the ceiling".into()));
+    }
     let bytes = value.as_bytes();
     let length = u32::try_from(bytes.len())
         .map_err(|_| Error::Replay("a string is too long for a package".into()))?;
@@ -846,6 +1000,9 @@ fn write_str(out: &mut Vec<u8>, value: &str) -> Result<()> {
 }
 
 fn write_attrs(out: &mut Vec<u8>, methods: &[String], ttl_ms: Option<u64>) -> Result<()> {
+    if methods.len() > MAX_METHODS {
+        return Err(Error::Replay("too many methods for a package".into()));
+    }
     let count = u16::try_from(methods.len())
         .map_err(|_| Error::Replay("too many methods for a package".into()))?;
     out.extend_from_slice(&count.to_le_bytes());
@@ -868,7 +1025,7 @@ fn write_attrs(out: &mut Vec<u8>, methods: &[String], ttl_ms: Option<u64>) -> Re
 
 fn read_attrs(reader: &mut Reader<'_>) -> Result<(Vec<String>, Option<u64>)> {
     let count = reader.u16()? as usize;
-    if count > 64 {
+    if count > MAX_METHODS {
         return Err(Error::Replay("too many methods".into()));
     }
     let mut methods = Vec::with_capacity(count);
@@ -947,5 +1104,40 @@ impl<'a> Reader<'a> {
 
     fn is_empty(&self) -> bool {
         self.cursor == self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trace keeps a 128-bit prefix of an introduced peer's fingerprint. A
+    /// host chooses its certificate, so a 32-bit prefix was a target, not a
+    /// discriminator; two fingerprints that differ only past the old prefix must
+    /// produce different entries.
+    #[test]
+    fn two_introductions_are_distinct_in_the_trace() {
+        let first = [0x11u8; 32];
+        let mut second = first;
+        second[15] ^= 0x01;
+        let mut ordinals = BTreeMap::new();
+        let left = trace_of(
+            &Event::CapIntroduced {
+                cap: CapId([1u8; 16]),
+                fingerprint: first,
+            },
+            &mut ordinals,
+        );
+        let right = trace_of(
+            &Event::CapIntroduced {
+                cap: CapId([1u8; 16]),
+                fingerprint: second,
+            },
+            &mut ordinals,
+        );
+        assert_ne!(left.event, right.event, "{left:?} and {right:?}");
+        assert!(left.event.starts_with("cap.introduced:"));
+        // 32 hex characters, plus the prefix and the colon.
+        assert_eq!(left.event.len(), "cap.introduced:".len() + 32);
     }
 }

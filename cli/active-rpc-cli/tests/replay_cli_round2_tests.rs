@@ -1,0 +1,119 @@
+//! R-12 replay, confirmation round 2: the CLI gates on the library's package
+//! ceiling, refuses to replace an existing artifact by accident, and validates
+//! every flag it accepts.
+
+use std::io::Write;
+use std::process::{Command, Output};
+
+fn cli() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_active-rpc-cli"))
+}
+
+fn run(args: &[&str]) -> Output {
+    cli().args(args).output().expect("spawn cli")
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A fresh temporary directory per test.
+fn sandbox(name: &str) -> std::path::PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("active-rpc-cli-r12-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("sandbox");
+    dir
+}
+
+/// `replay dump` writes an evidence artifact; the default path makes an
+/// accidental replacement likely, so replacing takes `--force`.
+#[test]
+fn replay_dump_refuses_to_overwrite_without_force() {
+    let dir = sandbox("overwrite");
+    let path = dir.join("session.arrp");
+    let path = path.to_str().expect("utf8");
+
+    let first = run(&["replay", "dump", "--output", path]);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+
+    let second = run(&["replay", "dump", "--output", path]);
+    assert_eq!(second.status.code(), Some(1), "{}", stderr(&second));
+    assert!(
+        stderr(&second).contains("--force"),
+        "the refusal names the way through: {}",
+        stderr(&second)
+    );
+
+    let forced = run(&["replay", "dump", "--output", path, "--force"]);
+    assert_eq!(forced.status.code(), Some(0), "{}", stderr(&forced));
+    assert!(stdout(&forced).contains("ops="));
+
+    // A flag that takes a boolean is validated, not ignored.
+    let garbage = run(&["replay", "dump", "--output", path, "--force=garbage"]);
+    assert_eq!(garbage.status.code(), Some(2), "{}", stderr(&garbage));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--emit-cap-hex` belongs to the commands that print a capability; `replay
+/// dump` never read it, so accepting it meant accepting a typo.
+#[test]
+fn replay_dump_rejects_the_capability_flag() {
+    let dir = sandbox("cap-flag");
+    let path = dir.join("session.arrp");
+    let output = run(&[
+        "replay",
+        "dump",
+        "--output",
+        path.to_str().expect("utf8"),
+        "--emit-cap-hex",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("unknown option"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!path.exists(), "a rejected invocation wrote an artifact");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A package over the ceiling is refused (exit 1), like a damaged one. The
+/// ceiling is the library's constant, so the CLI and the format cannot drift.
+#[test]
+fn an_oversize_package_is_refused_not_usage() {
+    let dir = sandbox("oversize");
+    let path = dir.join("huge.arrp");
+    {
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(active_rpc::replay::MAX_PACKAGE_BYTES as u64 + 1)
+            .expect("extend");
+        // One real byte, so the sparse file is not all that the length says.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        file.write_all(b"ARRP").expect("write");
+    }
+    let output = run(&["replay", "run", path.to_str().expect("utf8")]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("ceiling"),
+        "the message names the ceiling: {}",
+        stderr(&output)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing package is still a usage error: the command line named a file that
+/// is not there.
+#[test]
+fn a_missing_package_is_usage() {
+    let output = run(&["replay", "run", "no-such-package.arrp"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+}

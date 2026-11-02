@@ -25,7 +25,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-09 | transports | `src/transport/**` | round 1: 4 highs + 11 mediums + 3 lows fixed | 18 fixed / 0 rejected / 0 open (1 documented residual) | this commit |
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
-| R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
+| R-12 | replay | `src/replay.rs` | rounds 1-2: 9 + 11 findings (5 round-1 dispositions were partial) | 20 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
@@ -49,6 +49,39 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-12 replay - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `ada2025`.
+The reviewer read the round-1 entry first and re-checked every disposition, then
+reviewed the module as hostile code. Verdict on round 1: five of the nine
+dispositions were **partial** — F1 (the op-list comparison), F2 (the trailing
+release), F3 (the method count), F4 (the argument and body ceilings) and F6 (the
+header check on `replay_trace`). Tests: `tests/replay_round2_tests.rs` (14),
+`cli/active-rpc-cli/tests/replay_cli_round2_tests.rs` (4), one unit test for the
+introduction fingerprint, one in the observability suite for the method label.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N1 | medium | the recorder could emit packages its own decoder refuses: `arg_bytes` per call, the 16 MiB total, the method count and the 64 MiB body were unchecked at record and at encode (and `"x".repeat(arg_bytes)` aborted on a caller-chosen size) | **fixed**: `MAX_METHODS` shared by record/encode/decode; `Recorder::call` refuses the per-call and the running total before allocating; `encode` checks both, the event length and a running body ceiling; `tests/replay_round2_tests.rs` (`a_call_over_the_arg_ceiling…`, `a_declared_argument_total…`, `a_mint_with_too_many_methods…`, `the_encoder_refuses_a_body…`, `a_recorder_package_at_the_edges_always_decodes`) |
+| N2 | medium | the replayed-op comparison was tautological (`replay_trace` rebuilt the list from the package), so a doctored grant, TTL, latency or refused call's method replayed clean | **fixed**: every operation appends an `op.*` input entry (digest of the grant, TTL, parent, method digest, size, target) before its kernel events, and the tautological comparison is gone; `editing_a_grant_is_refused`, `editing_a_ttl_is_refused`, `editing_the_latency_is_refused`, `editing_a_refused_calls_method_is_refused`, `editing_a_revoked_target_is_refused`; the round-1 tests now require a `mismatch` instead of accepting either error |
+| N3 | medium | the transient handle was dropped after `capture`, so an operation's own `cap.released` landed outside its trace (the round-1 test accepted `retained` *or* `released`) | **fixed**: the clone is dropped before the capture; `a_trailing_handle_release_is_in_the_trace` counts retains against releases, and the round-1 test now requires `cap.released` |
+| N4 | low | a revoke that succeeded returned `rpc/replay` when the capture lost events, so a caller read a fired kill switch as a failed one | **fixed**: `capture_acted` keeps the kernel's answer and lets `package()` refuse; `a_recorder_that_lost_events_still_reports_the_kernel_outcome` |
+| N5 | low | `replay_trace` (public) skipped operation 0 without the header-latency check | **fixed**: the check moved into `replay_trace`; `the_diagnostic_path_refuses_a_package_without_its_header_latency` |
+| N6 | low | 32-bit discriminators where the comments claimed uniqueness (introduction fingerprint, method digest tail) | **fixed**: 128 bits in both; `two_introductions_are_distinct_in_the_trace` (unit) and `two_long_method_names_with_a_shared_prefix_stay_distinct` drive the mapping |
+| N7 | low | `replay dump` accepted `--emit-cap-hex`, ignored it and never validated it | **fixed**: removed from the allowlist; `replay_dump_rejects_the_capability_flag` |
+| N8 | low | `replay dump` overwrote an existing artifact silently, with `session.arrp` as the default | **fixed**: refuses a non-empty destination unless `--force` (validated as a boolean), and writes beside the destination then renames; `replay_dump_refuses_to_overwrite_without_force` |
+| N9 | low | an oversize package exited 2 (usage) while a damaged one exited 1, and the CLI re-declared the 64 MiB constant | **fixed**: `read_bounded_artifact` classifies the ceiling as a refusal, and the ceiling is `active_rpc::replay::MAX_PACKAGE_BYTES`; `an_oversize_package_is_refused_not_usage` |
+| N10 | low | `Recorder::call` reached `String::repeat` with a caller-supplied size | **fixed** by N1's ceiling |
+| N11 | low | ADR-0018 called the tape-wrap guard unreachable; a revoke over a subtree larger than the tape reaches it | **fixed**: the ADR says so, and N4's test drives 17 000 attenuations then one revoke |
+
+Residual risks (recorded, no action): package integrity is Blake3-only by
+design, so N2 pins inputs against naive edits, not against a party that re-runs
+the replay; `Recorder` has no introduce/channel/tool op, so those trace arms stay
+unexercised; `docs/spec/wire.md` now documents `ARRP`.
+
+Gate: `scripts/local_gate.sh` green (all-features 669, no-default, clippy both
+sets, fmt, doc, fuzz, control-plane, CLI, negative controls 9/9, MSRV 1.88).
 
 ### R-14 wasm tools - 2026-11-02 (round 2, confirmation)
 

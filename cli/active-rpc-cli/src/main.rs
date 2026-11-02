@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use active_rpc::cap::CapAttrs;
 use active_rpc::kernel::Provider;
 use active_rpc::receipts::ReceiptLog;
-use active_rpc::replay::{Recorder, ReplayPackage};
+use active_rpc::replay::{Recorder, ReplayPackage, MAX_PACKAGE_BYTES};
 use active_rpc::transport::connect::{BridgeServer, ConnectClient};
 use active_rpc::transport::http2::{Http2Client, Http2Server};
 use active_rpc::transport::quic::{QuicClient, QuicServer};
@@ -225,7 +225,9 @@ fn dispatch(kernel: &Agent, lane: LaneId, request: &Envelope) -> Envelope {
                     // charged like the inbound side, so `max_bytes` bounds the
                     // round trip rather than one direction of it. Charging only
                     // `payload.len()` left the arguments free outbound.
-                    let response_bytes = value.wire_size().saturating_add(request.payload.len() as u64);
+                    let response_bytes = value
+                        .wire_size()
+                        .saturating_add(request.payload.len() as u64);
                     if let Err(error) = kernel.charge_egress_bytes(lane, &cap, response_bytes) {
                         return Envelope::error(request.request_id, &error);
                     }
@@ -311,8 +313,8 @@ fn request(id: u64, method: &str, args: Vec<Arg>, payload: &[u8], cap: Option<Ca
 /// world-readable check as a receipt key.
 fn cap_from_file(path: &str) -> Result<CapId, CliError> {
     let bytes = read_bounded(path, 65)?;
-    let text = String::from_utf8(bytes)
-        .map_err(|_| CliError::usage(format!("{path} is not UTF-8")))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| CliError::usage(format!("{path} is not UTF-8")))?;
     parse_cap(text.trim())
 }
 
@@ -326,7 +328,9 @@ fn capability(flags: &BTreeMap<String, String>) -> Result<CapId, CliError> {
         )),
         (Some(text), None) => parse_cap(text),
         (None, Some(path)) => cap_from_file(path),
-        (None, None) => Err(CliError::usage("--cap or --cap-file is required".to_string())),
+        (None, None) => Err(CliError::usage(
+            "--cap or --cap-file is required".to_string(),
+        )),
     }
 }
 
@@ -450,6 +454,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "--chain-only",
     "--emit-cap-hex",
     "--follow",
+    "--force",
     "--up-to",
     "--read-only",
 ];
@@ -519,7 +524,6 @@ fn reject_unknown(flags: &BTreeMap<String, String>, allowed: &[&str]) -> CliResu
     }
     Ok(())
 }
-
 
 /// Largest certificate file the CLI will read.
 const MAX_CERT_BYTES: u64 = 1 << 20;
@@ -643,7 +647,16 @@ fn announce(
 
 fn peer(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
-    reject_unknown(&flags, &["--transport", "--limit", "--methods", "--cert-out", "--emit-cap-hex"])?;
+    reject_unknown(
+        &flags,
+        &[
+            "--transport",
+            "--limit",
+            "--methods",
+            "--cert-out",
+            "--emit-cap-hex",
+        ],
+    )?;
     let transport = transport_name(&flags)?;
     let limit = flag_number(&flags, "--limit", 1)?;
     // Printing the raw capability id is a transfer of authority, so it is opt-in.
@@ -920,7 +933,18 @@ fn call(args: &[String]) -> CliResult {
 
 fn pipeline(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
-    reject_unknown(&flags, &["--addr", "--cap", "--calls", "--method", "--payload", "--text", "--timeout-ms"])?;
+    reject_unknown(
+        &flags,
+        &[
+            "--addr",
+            "--cap",
+            "--calls",
+            "--method",
+            "--payload",
+            "--text",
+            "--timeout-ms",
+        ],
+    )?;
     let address = endpoint(&flags)?;
     let cap = parse_cap(
         flags
@@ -1071,13 +1095,12 @@ fn loadgen(args: &[String]) -> CliResult {
             .spawn(move || {
                 let mut latencies = Vec::new();
                 let mut errors = 0usize;
-                let mut transport =
-                    match TcpTransport::connect_with_timeout(&address, deadline) {
-                        Ok(transport) => transport,
-                        // The worker could not open its connection: every
-                        // request it was assigned failed.
-                        Err(_) => return (Vec::new(), per_worker),
-                    };
+                let mut transport = match TcpTransport::connect_with_timeout(&address, deadline) {
+                    Ok(transport) => transport,
+                    // The worker could not open its connection: every
+                    // request it was assigned failed.
+                    Err(_) => return (Vec::new(), per_worker),
+                };
                 for _ in 0..per_worker {
                     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let envelope = request(id, &method, Vec::new(), &payload, Some(cap));
@@ -1085,7 +1108,9 @@ fn loadgen(args: &[String]) -> CliResult {
                     let result = transport
                         .send(&envelope)
                         .and_then(|()| transport.recv())
-                        .map(|response| response.map(|envelope| (envelope.kind, envelope.request_id)));
+                        .map(|response| {
+                            response.map(|envelope| (envelope.kind, envelope.request_id))
+                        });
                     match result {
                         // A reply must carry the id this request used: a peer that
                         // replays one answer stopped being counted as `ok`.
@@ -1202,7 +1227,13 @@ fn events(args: &[String]) -> CliResult {
     let (_, flags) = split_args(&args[1..]);
     reject_unknown(
         &flags,
-        &["--plane", "--after", "--follow", "--interval-ms", "--timeout-ms"],
+        &[
+            "--plane",
+            "--after",
+            "--follow",
+            "--interval-ms",
+            "--timeout-ms",
+        ],
     )?;
     let plane = flags
         .get("--plane")
@@ -1371,7 +1402,9 @@ fn dechunk(body: &[u8]) -> Result<String, CliError> {
             .ok_or_else(|| CliError::transport("chunk framing overflows"))?;
     }
     if !terminated {
-        return Err(CliError::transport("the chunked body has no terminal chunk"));
+        return Err(CliError::transport(
+            "the chunked body has no terminal chunk",
+        ));
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
@@ -1380,28 +1413,47 @@ fn dechunk(body: &[u8]) -> Result<String, CliError> {
 // replay
 // ---------------------------------------------------------------------------
 
-/// Largest replay package the CLI will read.
-const MAX_PACKAGE_BYTES: u64 = 64 << 20;
-
 fn replay(args: &[String]) -> CliResult {
     let (positional, flags) = split_args(&args[1..]);
     match positional.first().map(String::as_str) {
         Some("dump") => {
-            reject_unknown(&flags, &["--output", "--emit-cap-hex"])?;
+            reject_unknown(&flags, &["--output", "--force"])?;
             if positional.len() > 1 {
                 return Err(CliError::usage(
                     "replay dump takes no positional arguments".to_string(),
                 ));
             }
+            let force = flag_bool(&flags, "--force")?;
             let package = demo_package()?;
             let path = flags
                 .get("--output")
                 .filter(|value| !value.is_empty())
                 .cloned()
                 .unwrap_or_else(|| "session.arrp".to_string());
+            // Evidence is not overwritten silently, the same rule the receipt
+            // log follows: a default path (`session.arrp`) makes an accidental
+            // replacement likely.
+            if !force {
+                match std::fs::metadata(&path) {
+                    Ok(metadata) if metadata.len() > 0 => {
+                        return Err(CliError::refused(format!(
+                            "{path:?} already holds a package; pass --force to replace it"
+                        )))
+                    }
+                    _ => {}
+                }
+            }
             let encoded = package.encode().map_err(refusal)?;
-            std::fs::write(&path, encoded)
-                .map_err(|error| CliError::transport(format!("cannot write {path}: {error}")))?;
+            // Write beside the destination and rename, so an interrupted dump
+            // leaves the old artifact intact instead of a truncated one.
+            let temporary = format!("{path}.tmp-{}", std::process::id());
+            std::fs::write(&temporary, encoded).map_err(|error| {
+                CliError::transport(format!("cannot write {temporary}: {error}"))
+            })?;
+            std::fs::rename(&temporary, &path).map_err(|error| {
+                let _ = std::fs::remove_file(&temporary);
+                CliError::transport(format!("cannot write {path}: {error}"))
+            })?;
             out_line(format!(
                 "wrote {path} ops={} trace={}",
                 package.ops.len(),
@@ -1419,7 +1471,7 @@ fn replay(args: &[String]) -> CliResult {
             let path = positional
                 .get(1)
                 .ok_or_else(|| CliError::usage("replay run needs a package path"))?;
-            let bytes = read_bounded(path, MAX_PACKAGE_BYTES)?;
+            let bytes = read_bounded_artifact(path, MAX_PACKAGE_BYTES as u64)?;
             let package = ReplayPackage::decode(&bytes)
                 .map_err(|error| CliError::refused(format!("{}: {error}", error.code())))?;
             package
@@ -1434,7 +1486,7 @@ fn replay(args: &[String]) -> CliResult {
             Ok(())
         }
         _ => Err(CliError::usage(
-            "usage: replay dump [--output PATH]\n       replay run <package>",
+            "usage: replay dump [--output PATH] [--force]\n       replay run <package>",
         )),
     }
 }
@@ -1465,6 +1517,19 @@ fn refusal(error: active_rpc::Error) -> CliError {
 }
 
 fn read_bounded(path: &str, ceiling: u64) -> Result<Vec<u8>, CliError> {
+    read_bounded_class(path, ceiling, false)
+}
+
+/// Read an input artifact.
+///
+/// A file over the ceiling is a refusal of the artifact, not a usage error: the
+/// command line was well formed, and the operator reads the same exit class for
+/// a package that is too large as for one that is damaged.
+fn read_bounded_artifact(path: &str, ceiling: u64) -> Result<Vec<u8>, CliError> {
+    read_bounded_class(path, ceiling, true)
+}
+
+fn read_bounded_class(path: &str, ceiling: u64, artifact: bool) -> Result<Vec<u8>, CliError> {
     let file = std::fs::File::open(path)
         .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
     let mut bytes = Vec::new();
@@ -1472,9 +1537,12 @@ fn read_bounded(path: &str, ceiling: u64) -> Result<Vec<u8>, CliError> {
         .read_to_end(&mut bytes)
         .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
     if bytes.len() as u64 > ceiling {
-        return Err(CliError::usage(format!(
-            "{path} is larger than the {ceiling}-byte ceiling"
-        )));
+        let message = format!("{path} is larger than the {ceiling}-byte ceiling");
+        return Err(if artifact {
+            CliError::refused(message)
+        } else {
+            CliError::usage(message)
+        });
     }
     Ok(bytes)
 }

@@ -43,11 +43,13 @@ Serve the Connect/gRPC interop adapter against the demo kernel.
 Tail the control-plane event stream. Events carry correlation ids, never raw
 authority.
 .TP
-.B replay dump [--output PATH]
+.B replay dump [--output PATH] [--force]
 Record a deterministic demo session (mint, calls, a refusal, a TTL expiry and a
 revocation) as an
 .I ARRP
-package.
+package. An existing non-empty destination is refused unless
+.B --force
+is given, and the package is written beside the destination and renamed.
 .TP
 .B replay run \fIpackage\fR
 Re-execute a package against a fresh kernel and compare every decision. A

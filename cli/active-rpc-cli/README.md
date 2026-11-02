@@ -20,7 +20,7 @@ active-rpc-cli <command> [options]
           [--method M] [--payload FILE]
   bridge [--limit N]
   events [--plane URL] [--after ID] [--follow] [--interval-ms N]
-  replay dump [--output PATH]
+  replay dump [--output PATH] [--force]
   replay run <package>
   help
 ```

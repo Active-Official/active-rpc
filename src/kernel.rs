@@ -4463,7 +4463,9 @@ fn method_event_label(method: &str) -> String {
         .collect();
     let digest = blake3::hash(method.as_bytes());
     label.push('#');
-    for byte in &digest.as_bytes()[..4] {
+    // 128 bits: a caller chooses the name, so a short tail would let two names
+    // that share a prefix be confused for one another in a receipt or a trace.
+    for byte in &digest.as_bytes()[..16] {
         label.push_str(&format!("{byte:02x}"));
     }
     label

@@ -16,9 +16,9 @@ fn recorded_session() -> ReplayPackage {
     recorder.package().expect("package")
 }
 
-/// The trace records cap and event, and no event names the method or the
-/// argument size: those fields are only covered by comparing the rebuilt op
-/// list.
+/// A call's method is pinned by the `op.call` input entry, so an edit is caught
+/// by the trace comparison rather than by the replayed op list (which is built
+/// from the package and therefore proves nothing).
 #[test]
 fn changing_a_recorded_call_method_is_refused() {
     let mut package = recorded_session();
@@ -34,10 +34,7 @@ fn changing_a_recorded_call_method_is_refused() {
     *call = "sum".to_string();
     let error = package.replay().expect_err("an edited method is refused");
     assert_eq!(error.code(), "rpc/replay");
-    assert!(
-        format!("{error}").contains("mismatch") || format!("{error}").contains("do not match"),
-        "{error}"
-    );
+    assert!(format!("{error}").contains("mismatch"), "{error}");
 }
 
 #[test]
@@ -55,10 +52,11 @@ fn changing_a_recorded_arg_size_is_refused() {
     *size = 0;
     let error = package.replay().expect_err("an edited size is refused");
     assert_eq!(error.code(), "rpc/replay");
+    assert!(format!("{error}").contains("mismatch"), "{error}");
 }
 
 /// A refused attenuation emits `cap.retained`/`cap.released`; when it is the
-/// last operation, those decisions must still be in the trace.
+/// last operation, both decisions must be in the trace, release included.
 #[test]
 fn a_trailing_refused_attenuation_keeps_its_events() {
     let mut recorder = Recorder::new(0).expect("recorder");
@@ -71,9 +69,9 @@ fn a_trailing_refused_attenuation_keeps_its_events() {
 
     let package = recorder.package().expect("package");
     let last = package.trace.last().expect("a trace");
-    assert!(
-        last.event.starts_with("cap.released") || last.event.starts_with("cap.retained"),
-        "the refused attenuation's handle churn is missing: {last:?}"
+    assert_eq!(
+        last.event, "cap.released",
+        "the refused attenuation's borrowed handle is still retained: {last:?}"
     );
     package.replay().expect("the recording replays");
 }

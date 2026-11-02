@@ -201,7 +201,13 @@ fn an_empty_session_round_trips() {
     let decoded = ReplayPackage::decode(&package.encode().expect("encode")).expect("decode");
     decoded.replay().expect("replay");
     assert_eq!(decoded.latency_ms, 0);
-    assert_eq!(decoded.trace.len(), 1, "{:?}", decoded.trace);
+    // The lane creation and the header latency's input entry.
+    assert_eq!(
+        decoded.trace.last().map(|entry| entry.event.as_str()),
+        Some("op.latency:0"),
+        "{:?}",
+        decoded.trace
+    );
 }
 
 #[test]
@@ -230,21 +236,54 @@ fn arguments_never_enter_the_package() {
 fn a_declared_argument_total_over_the_ceiling_is_refused() {
     // Each call is legal on its own (1 MiB); together they exceed the
     // package-wide ceiling, which bounds the transient allocation a replay can
-    // force.
-    let ops = (0..17)
-        .map(|_| Op::Call {
-            cap: 0,
-            method: "echo".to_string(),
-            arg_bytes: 1 << 20,
-        })
-        .collect();
+    // force. Sixteen fit exactly, so the encoder accepts them and refuses the
+    // seventeenth; the decoder refuses a hostile package that carries it.
+    let calls = |count: usize| -> Vec<Op> {
+        (0..count)
+            .map(|_| Op::Call {
+                cap: 0,
+                method: "echo".to_string(),
+                arg_bytes: 1 << 20,
+            })
+            .collect()
+    };
     let package = ReplayPackage {
         latency_ms: 0,
-        ops,
+        ops: calls(16),
         trace: Vec::new(),
     };
-    let error =
-        ReplayPackage::decode(&package.encode().expect("encode")).expect_err("total ceiling");
+    let encoded = package.encode().expect("exactly the ceiling encodes");
+    ReplayPackage::decode(&encoded).expect("16 MiB of declared arguments is legal for the format");
+
+    let over = ReplayPackage {
+        latency_ms: 0,
+        ops: calls(17),
+        trace: Vec::new(),
+    };
+    let error = over
+        .encode()
+        .expect_err("the encoder refuses a total over the ceiling");
+    assert_eq!(error.code(), "rpc/replay");
+    assert!(error.to_string().contains("argument sizes"), "{error}");
+
+    // A hostile package can carry that seventeenth call without the encoder:
+    // splice a one-byte call into the operation region and re-checksum.
+    let mut body = encoded[..encoded.len() - 32].to_vec();
+    let op_count_at = 4 + 1 + 2 + 8;
+    let count = u32::from_le_bytes(
+        body[op_count_at..op_count_at + 4]
+            .try_into()
+            .expect("four bytes"),
+    );
+    body[op_count_at..op_count_at + 4].copy_from_slice(&(count + 1).to_le_bytes());
+    let mut extra = vec![4u8];
+    extra.extend_from_slice(&0u32.to_le_bytes());
+    extra.extend_from_slice(&4u32.to_le_bytes());
+    extra.extend_from_slice(b"echo");
+    extra.extend_from_slice(&1u64.to_le_bytes());
+    body.splice(op_count_at + 4..op_count_at + 4, extra);
+    body.extend_from_slice(blake3::hash(&body).as_bytes());
+    let error = ReplayPackage::decode(&body).expect_err("the decoder refuses the total");
     assert_eq!(error.code(), "rpc/replay");
     assert!(error.to_string().contains("argument sizes"), "{error}");
 }

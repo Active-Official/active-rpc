@@ -210,3 +210,65 @@ fn a_promise_rejection_code_is_closed() {
         assert!(active_rpc::error::ERROR_CODES.contains(&domain.code()));
     }
 }
+
+/// Two long method names that differ only after the 64-byte prefix the event
+/// label keeps. A four-byte digest tail let them share a label, in a receipt or
+/// in a replay trace.
+#[test]
+fn two_long_method_names_with_a_shared_prefix_stay_distinct() {
+    struct LongMethods;
+
+    impl Provider for LongMethods {
+        fn name(&self) -> &'static str {
+            "long-methods"
+        }
+        fn methods(&self) -> Vec<String> {
+            names()
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Ok(Response::Value(Value::text("ok")))
+        }
+    }
+
+    fn names() -> Vec<String> {
+        let prefix = "m".repeat(70);
+        vec![format!("{prefix}-first"), format!("{prefix}-second")]
+    }
+
+    let agent = Agent::with_secret([0x5c; 32]);
+    let provider = agent.register(Box::new(LongMethods));
+    let granted = names();
+    let refs: Vec<&str> = granted.iter().map(String::as_str).collect();
+    let cap = agent.mint(provider, 0, CapAttrs::new(&refs)).expect("mint");
+    let lane = agent
+        .create_lane("labels", Budget::default())
+        .expect("lane");
+    for method in &granted {
+        let promise = agent.call(lane, &cap, method, Vec::new()).expect("call");
+        agent.run();
+        let _ = promise.value();
+    }
+
+    let events = agent.events();
+    let labels: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::CallQueued { method, .. } => Some(method.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels.len(), 2, "{labels:?}");
+    assert_ne!(
+        labels[0], labels[1],
+        "two long names that share a prefix must not share a label: {labels:?}"
+    );
+    for label in &labels {
+        assert!(
+            label.len() > 64,
+            "the digest tail is present on a long name: {label:?}"
+        );
+    }
+}
