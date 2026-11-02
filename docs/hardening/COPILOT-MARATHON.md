@@ -26,8 +26,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | round 1: 3 highs + 4 mediums + 5 lows fixed | 12 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | round 1: 3 highs + 2 mediums + 3 lows fixed | 8 fixed / 0 rejected / 0 open | this commit |
 | R-12 | replay | `src/replay.rs` | round 1: 5 mediums + 4 lows fixed | 9 fixed / 0 rejected / 0 open | this commit |
-| R-13 | receipts | `src/receipts.rs` | rounds 1-3: 13 + 16 + 19 findings | 48 fixed / 0 rejected / 0 open | this commit |
-| R-14 | wasm tools | `src/wasm_tool.rs` | round 1: 1 critical + 3 highs + 5 mediums + 6 lows fixed | 15 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
+| R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
+| R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-2: 4 + 11 findings (1 noted) | 14 fixed / 0 rejected / 1 noted (no store wired by default; virtual-epoch deadline) | `cb44d07` |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | rounds 1-2: 11 + 14 findings fixed (2 design-level documented) | 25 fixed / 0 rejected / 0 open (2 recorded: publisher identity, host authority) | `190e9c9` |
@@ -49,6 +49,52 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-14 wasm tools - 2026-11-02 (round 2, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `cb44d07`.
+Tests: `tests/wasm_round2_tests.rs` (5, feature-gated) and
+`tests/wasm_hardening_tests.rs` (+1). Four of the five fail against the pre-fix
+tree; the rate test pins the numbers the fixes are derived from.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `env.random` bounded one request only, so a guest loop made the host produce 37 MiB of CSPRNG in 25.6 ms under a **1 ms** wall grant | **fixed**: `HostState::random_used`/`max_random` bound the call cumulatively (`MAX_RANDOM_PER_CALL`, 64 KiB); `a_random_loop_cannot_outlive_its_wall_budget` |
+| 2 | medium | instantiating a guest materialises its declared memory and wasmi charges no fuel for it (5.5 ms release for 16 MiB, 90 ms for 256 MiB under any grant) | **fixed**: the declared memory is charged at `FUEL_PER_MEMORY_KIB` (2) before the guest runs; `declared_memory_is_charged_against_the_grant` |
+| 3 | medium | a trap raised in `start` was classified `wasm/instantiate`, so a caller that retries fixable modules looped forever | **fixed**: `classify_instantiation` maps a trap code to `wasm/trap`; `a_start_trap_is_wasm_trap` |
+| 4 | low | the log was left in place on the instantiate/memory-error paths, and `start`'s log was dropped | **fixed**: both error paths take the store log into `self.log` |
+| 5 | low | a refused `invoke` returned with the previous call's log intact, attributing one caller's bytes to another caller's failure | **fixed**: `invoke` clears the log before the first refusal; `a_refused_invoke_clears_the_log` |
+| 6 | low | `FUEL_PER_MEMORY_KIB` and the entropy budget were undocumented magic numbers | **fixed**: documented against the measurements above, with the rate test |
+| 7 | low | `Response::Module` documented as "a serialized Active Infinity module" although native and WASM tools return opaque bytes | **fixed**: `src/value.rs` says "a serialized Active Infinity module, or opaque provider bytes" |
+
+Gate: `cargo test --all-features` 648 passed, 0 failed; clippy clean on both
+feature sets; fmt and doc clean.
+
+### R-13 receipts - 2026-11-02 (round 4, confirmation)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `cb44d07`.
+Tests: `tests/receipt_round4_tests.rs` (5). The log, the writer and the reader
+are real files and real threads.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the stale-lock steal judged staleness and then renamed *whatever* was at the path, so two stealers could each move the other's fresh lock and both append | **fixed**: the steal is by identity — `stale_nonce` reads the nonce it judged, `nonce_of` checks the stolen file, and a mismatch renames it back; `an_unidentifiable_lock_is_refused_within_a_bounded_time` |
+| 2 | medium | the append cache revalidated length and header start, so a replacement of exactly the same length with another chain was trusted and the append linked to a head the file does not carry | **fixed**: revalidation also compares `read_tail_head` with the cached head; `a_replacement_at_the_same_size_and_start_is_not_trusted` |
+| 3 | medium | an egress refusal (budget or secret) was decided after the pre-dispatch receipt was dropped and before the settle receipt, so the call was receipted as nothing | **fixed**: the refusal is receipted as `Refused(code)` before the settle phase; `an_egress_refusal_is_receipted_as_an_egress_refusal` |
+| 4 | low | `set_receipt_sequence` accepted a rewind and a start above `u64::MAX - MAX_LOG_RECORDS` | **fixed**: both refused, and the adopted gap is counted in `receipts_dropped`; `the_sequence_setter_refuses_a_rewind_and_an_impossible_start` |
+| 5 | low | a reader landing mid-append called an intact log damaged after one 20 ms sleep | **fixed**: `read_stable` retries while the length keeps changing (10 × 20 ms) and reports "being written by another process" rather than damage; `a_reader_does_not_call_an_in_progress_append_damage` |
+| 6 | low | an unidentifiable or held lock cost ~3 s of retries before refusal | **fixed**: 40 attempts (~1.8 s, still above one append plus `sync_data`), documented |
+| 7 | low | `receipt_method`'s fallback could still produce a label `valid_method` rejects | **fixed**: the fallback is `"<unrepresentable>"`; `tests/receipts_tests.rs` covers the escaped label |
+
+Also closed while fixing (R-14 interplay): `content_hash` for a redacting
+capability now hashes `redact_module`'s output, so the hash no longer offers an
+equality oracle over a secret the module was meant to hide
+(`tests/domain_hardening_tests.rs`,
+`a_redacting_capability_hashes_the_redacted_image`).
+
+Gate: full `gate-rpc.sh` green — all-features and no-default suites, clippy on
+both sets, fmt, doc, the fuzz and control-plane and CLI manifests, and
+`python scripts/negative_controls.py --check` 9/9.
 
 ### R-16 security helpers and persistence - 2026-11-02 (round 2, confirmation)
 

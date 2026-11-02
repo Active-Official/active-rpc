@@ -296,7 +296,13 @@ impl Call {
 pub enum Response {
     /// A plain value.
     Value(Value),
-    /// A serialized module (already canonical and validated).
+    /// A serialized Active Infinity module, or opaque provider bytes.
+    ///
+    /// A domain operation returns a canonical image here; the WASM adapter
+    /// returns the guest's raw output, which is not a module at all. A consumer
+    /// that needs an image validates it with `active_infinity::validate`; the
+    /// kernel's egress gate treats a module with structural secrets as a leak and
+    /// leaves opaque bytes alone.
     Module(Vec<u8>),
     /// An ordered list of labels (why/impact answers).
     Labels(Vec<String>),

@@ -845,14 +845,34 @@ impl Agent {
     /// refuses a receipt that does not follow its own order. Zero is not a
     /// sequence, and `u64::MAX` would be issued twice, so both are refused.
     pub fn set_receipt_sequence(&self, next: u64) -> crate::Result<()> {
-        if next == 0 || next == u64::MAX {
+        // The last sequence a log can hold: a window starting above this would
+        // seal receipts no `create_starting_at` accepts, so the session's
+        // evidence could never be exported.
+        let ceiling = u64::MAX - crate::receipts::MAX_LOG_RECORDS;
+        if next == 0 || next > ceiling {
             return Err(Error::InvalidArgument(
-                "a receipt sequence must be 1..u64::MAX",
+                "a receipt sequence must be 1..=u64::MAX - MAX_LOG_RECORDS",
             ));
+        }
+        let mut kernel = self.cell.borrow_mut();
+        if kernel.next_receipt > 0 && next <= kernel.next_receipt {
+            // A rewind reuses a sequence the ring already holds: both copies
+            // verify, and the batch can no longer be exported.
+            return Err(Error::InvalidArgument(
+                "a receipt sequence cannot move backwards",
+            ));
+        }
+        // A gap is a hole in the evidence, so it is counted like an eviction:
+        // an auditor could not otherwise tell a continued log from a truncated
+        // one.
+        if kernel.next_receipt > 0 {
+            kernel.receipts_dropped = kernel
+                .receipts_dropped
+                .saturating_add(next - kernel.next_receipt - 1);
         }
         // `next_receipt` holds the last sequence issued, so the seal increments
         // before using it: storing `next - 1` makes the next receipt `next`.
-        self.cell.borrow_mut().next_receipt = next - 1;
+        kernel.next_receipt = next - 1;
         Ok(())
     }
 
@@ -3720,12 +3740,6 @@ impl Agent {
                 Some(error) => Some(error),
                 None => self.charge_dispatch_delta(&job, extra).err(),
             };
-            // The decision is final here: the capability was re-checked at
-            // dispatch (revocation, expiry, identity, scope, tool policy and
-            // budget). Record it before provider code runs, with the outcome the
-            // kernel chose, so a refused call cannot leave an "authorized"
-            // receipt behind.
-            self.record_receipt(&job, failure.as_ref());
             // Phase 2: run provider code with no borrow held.
             let outcome = match failure {
                 Some(error) => Err(error),
@@ -3782,11 +3796,23 @@ impl Agent {
                     // provider: a redacting call gets a redacted value, and a
                     // call that did not ask for redaction must not receive a
                     // module that still carries structural secrets.
-                    let checked = if job.call.redact {
-                        Ok(crate::security::redact_value(value))
-                    } else {
-                        crate::security::assert_no_structural_secrets(&value).map(|()| value)
-                    };
+                    // The policy decodes `Value::Module` bytes, and those may be
+                    // chosen by remote code (a WASM guest's output). The codec is
+                    // fail-closed by contract, but a panic here would unwind
+                    // outside the provider's `catch_unwind`, so it is contained
+                    // and reported as a provider fault.
+                    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if job.call.redact {
+                            Ok(crate::security::redact_value(value))
+                        } else {
+                            crate::security::assert_no_structural_secrets(&value).map(|()| value)
+                        }
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(Error::Provider {
+                            code: "wasm/trap".to_string(),
+                        })
+                    });
                     match checked {
                         Err(error) => Err(error),
                         // The grant bounds what comes back as much as what went
@@ -3803,6 +3829,14 @@ impl Agent {
                 }
                 Err(error) => Err(error),
             };
+
+            // The decision is final here: dispatch's re-checks, provider code
+            // and the egress policy (redaction, shape ceilings, the byte charge)
+            // have all run. Seal exactly one receipt with the outcome the caller
+            // will see: a refusal after that point (an egress budget, a module
+            // carrying secret material) used to be sealed as `Admitted`, so the
+            // audit artifact disagreed with the metric and the caller.
+            self.record_receipt(&job, outcome.as_ref().err());
 
             // Phase 3: settle under a write borrow.
             let mut kernel = self.cell.borrow_mut();
@@ -4415,7 +4449,11 @@ pub const MAX_METHOD_EVENT_BYTES: usize = 64;
 
 /// A log-safe, bounded label for a method name.
 fn method_event_label(method: &str) -> String {
-    if method.len() <= MAX_METHOD_EVENT_BYTES && !method.chars().any(char::is_control) {
+    // The fast path applies the receipt rule, not just "no control character":
+    // `valid_text` also refuses line separators, bidi controls and zero-width
+    // characters, and a method carrying one would be sealed into a receipt the
+    // log then refuses to encode.
+    if method.len() <= MAX_METHOD_EVENT_BYTES && crate::security::valid_text(method, method.len()) {
         return method.to_string();
     }
     let mut label: String = method
@@ -4443,6 +4481,11 @@ fn receipt_method(method: &str) -> String {
         return method.to_string();
     }
     let label = method_event_label(method);
+    // The fallback must be total: an escaped label that still fails the receipt
+    // rule would make the whole ring unexportable.
+    if !crate::receipts::valid_method(&label) {
+        return "<unrepresentable>".to_string();
+    }
     if label.is_empty() {
         "<empty>".to_string()
     } else {

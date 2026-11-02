@@ -127,14 +127,38 @@ pub struct WasmHostPolicy {
 /// Largest log a guest may emit in one call, whatever the policy asks for.
 pub const MAX_HOST_LOG: usize = 64 << 10;
 
-/// Largest buffer `env.random` will fill in one call.
+/// Largest buffer `env.random` will fill in one call (per request; the call's
+/// cumulative budget is [`MAX_RANDOM_PER_CALL`]).
 pub const MAX_HOST_RANDOM: u32 = 64 << 10;
+
+/// Entropy one guest call may be given in total, in bytes.
+///
+/// The per-request ceiling alone bounds nothing a loop cannot repeat.
+pub const MAX_RANDOM_PER_CALL: usize = 64 << 10;
+
+/// Fuel charged per KiB of linear memory the instance declares.
+///
+/// Instantiating a guest materialises its declared memory, and wasmi charges no
+/// fuel for it: measured 5.5 ms (release) for the 16 MiB default and 90 ms for
+/// the 256 MiB ceiling, under a grant of any size. At the documented rate
+/// ([`FUEL_PER_MS`]) that is ~1.7 fuel per KiB; the charge is 2, so a 16 MiB
+/// guest costs one millisecond of grant and the ceiling costs sixteen.
+pub const FUEL_PER_MEMORY_KIB: u64 = 2;
 
 /// The wasmi store state: the resource ceilings and the host log.
 struct HostState {
     limits: wasmi::StoreLimits,
     log: Vec<u8>,
     max_log: usize,
+    /// Bytes of entropy this call has been given.
+    ///
+    /// `MAX_HOST_RANDOM` bounds one request; without a cumulative bound a guest
+    /// loops and makes the host service megabytes of CSPRNG per call, which is
+    /// host work the wall grant does not pay for (measured 37 MiB in 25.6 ms
+    /// under a 1 ms grant).
+    random_used: usize,
+    /// Cumulative entropy budget for one call, in bytes.
+    max_random: usize,
 }
 
 /// A sandboxed guest tool.
@@ -293,6 +317,8 @@ impl WasmTool {
             limits,
             log: Vec::new(),
             max_log: self.host.max_log_bytes,
+            random_used: 0,
+            max_random: MAX_RANDOM_PER_CALL,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -319,6 +345,14 @@ impl WasmTool {
                         if len > MAX_HOST_RANDOM {
                             return -1;
                         }
+                        // One request is bounded, and so is the call: a guest
+                        // that loops would otherwise make the host work far past
+                        // the wall grant it paid for.
+                        let used = caller.data().random_used;
+                        if used.saturating_add(len as usize) > caller.data().max_random {
+                            return -1;
+                        }
+                        caller.data_mut().random_used = used.saturating_add(len as usize);
                         let Some(memory) = caller
                             .get_export("memory")
                             .and_then(|export| export.into_memory())
@@ -377,12 +411,34 @@ impl WasmTool {
                 )
                 .map_err(|_| provider("wasm/import"))?;
         }
-        let instance = linker
-            .instantiate_and_start(&mut store, &self.module)
-            .map_err(classify_instantiation)?;
-        let memory = instance
-            .get_memory(&store, "memory")
-            .ok_or_else(|| provider("wasm/memory"))?;
+        // A start function that traps keeps its log: the log is diagnostic
+        // evidence (ADR-0019), not a success signal.
+        let instance = match linker.instantiate_and_start(&mut store, &self.module) {
+            Ok(instance) => instance,
+            Err(error) => {
+                self.log = std::mem::take(&mut store.data_mut().log);
+                return Err(classify_instantiation(error));
+            }
+        };
+        let memory = match instance.get_memory(&store, "memory") {
+            Some(memory) => memory,
+            None => {
+                self.log = std::mem::take(&mut store.data_mut().log);
+                return Err(provider("wasm/memory"));
+            }
+        };
+        // The instance's declared memory was just materialised; charge it before
+        // the guest can spend its whole grant on allocations it never pays for.
+        let memory_kib = (memory.data_size(&store) as u64).div_ceil(1024);
+        let memory_fuel = memory_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
+        let remaining = store.get_fuel().unwrap_or(0);
+        if memory_fuel > remaining {
+            self.log = std::mem::take(&mut store.data_mut().log);
+            return Err(provider("wasm/limits"));
+        }
+        store
+            .set_fuel(remaining - memory_fuel)
+            .map_err(|_| provider("wasm/fuel"))?;
         {
             let data = memory.data_mut(&mut store);
             if data.len() < input.len() {
@@ -450,6 +506,10 @@ impl Provider for WasmTool {
     }
 
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
+        // Every refusal below returns before the child tool (and its cleared
+        // log) exists, so the previous call's bytes would be attributed to this
+        // one. The kernel-facing path is the one an operator reads.
+        self.log.clear();
         if call.method != "run" {
             return Err(Error::MethodNotGranted {
                 method: call.method.clone(),
@@ -536,6 +596,13 @@ fn classify_instantiation(error: wasmi::Error) -> Error {
         || matches!(error.kind(), wasmi::errors::ErrorKind::Fuel(_));
     if out_of_fuel {
         return provider("wasm/fuel");
+    }
+    // A trap raised by the start function is the guest's fault, not a malformed
+    // module: the caller retries `wasm/instantiate` (a module it can fix) and
+    // reports `wasm/trap` (a guest that failed), so mapping the two together
+    // looped.
+    if error.as_trap_code().is_some() {
+        return provider("wasm/trap");
     }
     match error.kind() {
         wasmi::errors::ErrorKind::Linker(_) => provider("wasm/import"),

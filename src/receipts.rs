@@ -311,9 +311,11 @@ impl LogLock {
     /// `create_new` is atomic on every supported platform: one writer wins. The
     /// others retry with backoff, which covers a normal append (including a
     /// large batch and its `sync_data`), then refuse rather than corrupt the
-    /// chain. A lock older than `LOCK_STALE_MS` is stolen atomically: the
-    /// stealer renames the file away, so two stealers cannot both proceed and a
-    /// steal cannot delete a lock that a live writer just created.
+    /// chain. A lock older than `LOCK_STALE_MS` is stolen by *identity*: the
+    /// stealer reads the nonce it judged stale, renames the path away and
+    /// verifies the stolen file carries that nonce. A rename alone moved
+    /// whatever was at the path, so two stealers could each rename the other's
+    /// fresh lock and then both append.
     fn acquire(log: &std::path::Path) -> Result<Self> {
         let path = lock_path(log);
         let nonce = format!(
@@ -324,7 +326,7 @@ impl LogLock {
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or(0)
         );
-        for attempt in 0..600u32 {
+        for attempt in 0..40u32 {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -346,23 +348,31 @@ impl LogLock {
                     return Ok(Self { path, nonce });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if attempt % 20 == 0 && stale(&path) {
-                        // Rename is the steal: exactly one process moves *that*
-                        // file, so a stealer can never unlink a lock that a live
-                        // writer created after the staleness check.
-                        let stolen = path.with_file_name(format!(
-                            "{}.steal-{nonce}",
-                            path.file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "receipt-lock".to_string())
-                        ));
-                        if std::fs::rename(&path, &stolen).is_ok() {
-                            let _ = std::fs::remove_file(&stolen);
+                    if attempt % 20 == 0 {
+                        if let Some(judged) = stale_nonce(&path) {
+                            let stolen = path.with_file_name(format!(
+                                "{}.steal-{nonce}",
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "receipt-lock".to_string())
+                            ));
+                            if std::fs::rename(&path, &stolen).is_ok() {
+                                // Only remove the file that was judged stale. A
+                                // different nonce means a live writer created a
+                                // new lock between the judgement and the rename:
+                                // put it back and keep waiting.
+                                if nonce_of(&stolen).as_deref() == Some(judged.as_str()) {
+                                    let _ = std::fs::remove_file(&stolen);
+                                } else {
+                                    let _ = std::fs::rename(&stolen, &path);
+                                }
+                            }
+                            continue;
                         }
-                        continue;
                     }
-                    // Backoff: 5 ms rising to 50 ms, about 3 s in total, so a
-                    // slow disk write is not mistaken for a dead writer.
+                    // Backoff: 5 ms rising to 45 ms, about 1.8 s in total. The
+                    // wait only has to cover one append; a longer one is a lock
+                    // that a caller should see refused rather than a stall.
                     let step = u64::from(attempt.min(20));
                     std::thread::sleep(std::time::Duration::from_millis(5 + step * 2));
                 }
@@ -386,6 +396,23 @@ fn lock_path(log: &std::path::Path) -> std::path::PathBuf {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "receipts".to_string());
     log.with_file_name(format!("{name}.lock"))
+}
+
+/// The nonce of a lock that is older than the stale ceiling.
+///
+/// `None` when the lock is fresh, missing, or carries no readable nonce: a lock
+/// that cannot be identified cannot be stolen safely.
+fn stale_nonce(path: &std::path::Path) -> Option<String> {
+    if !stale(path) {
+        return None;
+    }
+    nonce_of(path)
+}
+
+/// The first token of a lock file: the nonce the creator wrote.
+fn nonce_of(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.split_whitespace().next().map(str::to_string)
 }
 
 /// True when a lock file is older than the stale ceiling.
@@ -613,8 +640,13 @@ impl ReceiptLog {
             // same length (a fresh header of another start sequence, for
             // instance) would let the append write a sequence the header does
             // not number, producing a log nothing can walk.
-            let usable =
-                cached.bytes == observed && read_header_start(&self.path) == Some(cached.start);
+            let usable = cached.bytes == observed
+                && read_header_start(&self.path) == Some(cached.start)
+                // A replacement of exactly the same length would pass the two
+                // checks above while its trailing head is another chain: the
+                // append would link to a head the file does not carry, and
+                // nothing could read the log again.
+                && read_tail_head(&self.path) == Some(cached.head);
             if usable {
                 cached
             } else {
@@ -849,6 +881,23 @@ fn read_header_start(path: &std::path::Path) -> Option<u64> {
     ))
 }
 
+/// The trailing head of a log: the record hash of its last complete record.
+///
+/// A record's hash is its last 32 bytes, so the last 32 bytes of
+/// the file are the head an append links to.
+fn read_tail_head(path: &std::path::Path) -> Option<[u8; 32]> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    if length < (LOG_HEADER_LEN + 32) as u64 {
+        return None;
+    }
+    file.seek(SeekFrom::End(-32)).ok()?;
+    let mut head = [0u8; 32];
+    file.read_exact(&mut head).ok()?;
+    Some(head)
+}
+
 /// Read a log file under the size ceiling, refusing a larger one without
 /// allocating it.
 fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
@@ -872,18 +921,37 @@ fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
 /// record. That is a torn read, not a torn file: reading again once the writer
 /// has finished settles it, and a file that is really damaged fails twice.
 fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogState)> {
-    let bytes = read_capped(path)?;
-    match walk_log(&bytes) {
-        Ok((receipts, state)) => Ok((bytes, receipts, state)),
-        Err(first) => {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let bytes = read_capped(path)?;
-            match walk_log(&bytes) {
-                Ok((receipts, state)) => Ok((bytes, receipts, state)),
-                Err(_) => Err(first),
+    let mut bytes = read_capped(path)?;
+    let mut first = match walk_log(&bytes) {
+        Ok((receipts, state)) => return Ok((bytes, receipts, state)),
+        Err(error) => error,
+    };
+    // Wait while the writer is still making progress: a batch `write_all` plus
+    // `sync_data` routinely exceeds one fixed sleep, and calling an intact log
+    // damaged because a writer held it is what made `receipts verify` fail in
+    // CI. Bounded, so a genuinely torn file still fails.
+    for _ in 0..10 {
+        let length = bytes.len();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        bytes = read_capped(path)?;
+        match walk_log(&bytes) {
+            Ok((receipts, state)) => return Ok((bytes, receipts, state)),
+            Err(error) => {
+                if bytes.len() == length {
+                    // No progress: the writer finished (or never started).
+                    return Err(error);
+                }
+                first = error;
             }
         }
     }
+    // Still growing after the bound: a writer is active, which is not damage.
+    if std::path::Path::new(&lock_path(path)).exists() {
+        return Err(Error::receipt(
+            "the receipt log is being written by another process",
+        ));
+    }
+    Err(first)
 }
 
 /// Encode one record: `len u32 | sequence u64 | at_ms u64 | decision u8 |

@@ -139,9 +139,12 @@ fn a_wall_budget_bounds_the_fuel_a_guest_may_burn() {
     let lane = agent
         .create_lane("wasm-budget", Budget::default())
         .expect("lane");
-    // The grant is the capability's: one millisecond of wall time.
+    // The grant is the capability's. Ten milliseconds, not one: the sandbox's
+    // own 16 MiB memory is charged against the same grant (2 fuel per KiB, so
+    // 32 768 of the 50 000 fuel), and a grant that cannot pay for the sandbox is
+    // a `wasm/limits` refusal before the guest runs at all (asserted below).
     let grant = Budget {
-        max_wall_ms: 1,
+        max_wall_ms: 10,
         ..Budget::default()
     };
     let cap = agent
@@ -158,6 +161,29 @@ fn a_wall_budget_bounds_the_fuel_a_guest_may_burn() {
     );
     // The rate is the documented one: one millisecond buys FUEL_PER_MS fuel.
     assert_eq!(FUEL_PER_MS, 5_000);
+
+    // A grant that cannot pay for the declared memory is refused before the
+    // guest runs, rather than spending host CPU on an allocation it never
+    // charged.
+    let tiny = Budget {
+        max_wall_ms: 1,
+        ..Budget::default()
+    };
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["run"]).with_budget(tiny))
+        .expect("mint");
+    let promise = agent
+        .call(lane, &cap, "run", vec![Arg::text("")])
+        .expect("queued");
+    agent.run();
+    let error = promise.value().expect_err("the sandbox is unaffordable");
+    // `wasm/fuel` when the instantiation itself exhausts the grant (wasmi charges
+    // for it), `wasm/limits` when the explicit memory charge does. Either way the
+    // guest never runs, which is the property under test.
+    assert!(
+        matches!(&error, Error::Provider { code } if code == "wasm/limits" || code == "wasm/fuel"),
+        "a grant below the sandbox's cost must be refused: {error:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
