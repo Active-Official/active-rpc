@@ -111,15 +111,15 @@ fn arm_deadline(stream: &TcpStream, deadline: std::time::Instant) -> bool {
 /// socket timeout for the whole line: a peer that sends one byte every second
 /// keeps a 16 KiB line alive for hours. Reading a chunk at a time puts the
 /// deadline back in charge.
-fn read_line_before<R: BufRead>(
-    reader: &mut R,
+fn read_line_before(
+    reader: &mut BufReader<TcpStream>,
     max: usize,
-    guard: Option<(&TcpStream, std::time::Instant)>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
-        if let Some((stream, deadline)) = guard {
-            if !arm_deadline(stream, deadline) {
+        if let Some(deadline) = deadline {
+            if !arm_deadline(reader.get_ref(), deadline) {
                 return Err(Error::Transport("request head timed out".to_string()));
             }
         }
@@ -151,7 +151,6 @@ fn read_line_before<R: BufRead>(
 /// every read.
 fn read_body_by_deadline(
     reader: &mut BufReader<TcpStream>,
-    stream: &TcpStream,
     length: usize,
     deadline: std::time::Instant,
     body: &mut Vec<u8>,
@@ -159,7 +158,7 @@ fn read_body_by_deadline(
     use std::io::Read;
     let mut chunk = [0u8; 16 * 1024];
     while body.len() < length {
-        if !arm_deadline(stream, deadline) {
+        if !arm_deadline(reader.get_ref(), deadline) {
             return false;
         }
         let want = (length - body.len()).min(chunk.len());
@@ -260,7 +259,7 @@ impl BridgeServer {
             let _ = write_http_response(&mut stream, 408, b"rpc/transport");
             return 0;
         }
-        let head = match read_head(&mut reader, MAX_HEAD, Some((&stream, deadline))) {
+        let head = match read_head(&mut reader, MAX_HEAD, Some(deadline)) {
             Ok(Some(head)) => head,
             Ok(None) => return 0,
             Err(_) => {
@@ -349,8 +348,7 @@ impl BridgeServer {
             return 0;
         }
         let mut body = Vec::with_capacity(content_length.min(64 * 1024));
-        let complete =
-            read_body_by_deadline(&mut reader, &stream, content_length, deadline, &mut body);
+        let complete = read_body_by_deadline(&mut reader, content_length, deadline, &mut body);
         if !complete {
             // A truncated body is one bad connection, not a server failure:
             // answer 400 for it and keep accepting the next one. Growing the
@@ -421,24 +419,24 @@ impl BridgeServer {
 /// fit is refused without growing. Bytes are decoded lossily: a header value is
 /// not required to be UTF-8, and a non-UTF-8 byte must not be able to end the
 /// server.
-fn read_head<R: BufRead>(
-    reader: &mut R,
+fn read_head(
+    reader: &mut BufReader<TcpStream>,
     max: usize,
-    guard: Option<(&TcpStream, std::time::Instant)>,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Option<Vec<String>>> {
     let mut head = Vec::new();
     let mut total = 0usize;
     loop {
         // The socket timeout is per read; a head that dribbles one byte just
         // inside it would hold the serial accept slot for hours. Re-arm the
-        // connection deadline before every line.
-        if let Some((stream, deadline)) = guard {
-            if !arm_deadline(stream, deadline) {
+        // connection deadline before every line, on the handle that reads.
+        if let Some(deadline) = deadline {
+            if !arm_deadline(reader.get_ref(), deadline) {
                 return Err(Error::Transport("request head timed out".to_string()));
             }
         }
         let remaining = max.saturating_sub(total);
-        let raw: Vec<u8> = read_line_before(reader, remaining + 1, guard)?.unwrap_or_default();
+        let raw: Vec<u8> = read_line_before(reader, remaining + 1, deadline)?.unwrap_or_default();
         let read = raw.len();
         if read == 0 {
             if head.is_empty() {

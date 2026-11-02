@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | CLEAN (rounds 1-2) | 8 fixed / 0 rejected / 5 open (logged) | this commit |
 | R-07 | domain ops | `src/domain.rs` | round 1: 12 fixed, 0 open | 12 fixed / 0 rejected / 0 open | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-5: 22 + 16 + 13 + 6 + 6 findings | 63 fixed / 0 rejected / 0 open | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-6: 22 + 16 + 13 + 6 + 6 + 6 findings | 69 fixed / 0 rejected / 0 open | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -49,6 +49,31 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-09 transports - 2026-11-02 (round 6, second reviewer: Muse)
+
+Reviewer: the local Muse proxy (`muse-spark-1.3-contributor`, `xhigh`) — the
+CommandCode proxy had begun answering HTTP 403, so this round is the second
+opinion the marathon asks for. It re-checked R1-R6 and found one fix complete
+(R6) and five partial, plus two new issues.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M1 | high | the HTTP/2 body deadline was per chunk, so a drip of one byte every 200 ms inside a 300 ms window held the reservation and `serve` forever | **fixed**: a total body deadline (8 × the inactivity bound, capped at 30 s) runs with the per-chunk bound; `a_dripping_body_cannot_hold_the_http2_budget_forever` |
+| M2 | high | the HTTP/2 response write was unbounded: `send_data` buffers without a reservation, so a peer with a zero window parked the task and its reservation | **fixed**: `respond_body` reserves capacity per 16 KiB piece and waits for the grant under the deadline, resetting the stream on expiry |
+| M3 | medium | the HTTP/2 client's response read had no inactivity bound | **fixed**: 30 s by default, the client's own deadline when set |
+| M4 | low | the bridge armed the accepted stream's socket timeout but read from its `try_clone`, which can carry a stale timeout | **fixed**: `read_head`, `read_line_before` and `read_body_by_deadline` take the `BufReader` and arm `reader.get_ref()` |
+| M5 | low | `set_read_timeout`/`set_write_timeout` failures were ignored (fail-open) | **partly fixed**: the frame path treats an arming failure as a timeout; the response path keeps the previous budget rather than aborting a valid response |
+| M6 | low | a response write failure was reported as a served call | **fixed** with M2: the write returns false on expiry, and `serve` counts only a completed response |
+
+Verified in the same pass: `call_many` order holds under a reset stream (the
+indexed slots make it fail-closed), and `read_line_before` re-arms on buffered
+bytes because each `fill_buf` checks the clock first.
+
+Residual risks (unchanged): a write budget sized to the read deadline can still
+be tight for a 64 MiB reply on a slow link; the QUIC buffering ceiling is the
+flow-control window, not `MAX_INFLIGHT_BODY`; the QUIC idle timeout is
+peer-resettable.
 
 ### R-09 transports - 2026-11-02 (round 5, closing the round-4 findings)
 

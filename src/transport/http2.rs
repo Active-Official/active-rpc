@@ -377,14 +377,26 @@ where
     let mut reservation = Reservation::new(inflight);
     // The caller's wire ceiling bounds the body; `MAX_BODY` is the hard cap.
     let ceiling = limits.max_bytes.min(MAX_BODY);
+    // Two bounds. Per-chunk inactivity catches a stall; the total catches a drip
+    // that stays just inside the inactivity window (one byte every 200 ms keeps
+    // a per-chunk timeout alive forever). The total scales with the inactivity
+    // bound so a test deadline stays fast and the default stays generous.
+    let body_deadline = tokio::time::Instant::now()
+        + connection_deadline
+            .saturating_mul(8)
+            .min(std::time::Duration::from_secs(30));
     loop {
-        // Inactivity bound per chunk: a peer that sends steadily is never cut
-        // off, while one that stops leaves its reservation (and this connection
-        // task) pinned forever.
-        let next = match tokio::time::timeout(connection_deadline, body.data()).await {
-            Ok(next) => next,
-            Err(_) => {
-                return respond_status(&mut respond, StatusCode::REQUEST_TIMEOUT, b"rpc/transport")
+        let next = {
+            let inactivity = tokio::time::timeout(connection_deadline, body.data());
+            match tokio::time::timeout_at(body_deadline, inactivity).await {
+                Ok(Ok(next)) => next,
+                Ok(Err(_)) | Err(_) => {
+                    return respond_status(
+                        &mut respond,
+                        StatusCode::REQUEST_TIMEOUT,
+                        b"rpc/transport",
+                    )
+                }
             }
         };
         match next {
@@ -460,18 +472,7 @@ where
             );
         }
     };
-    let head = Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
-        .header(http::header::CONTENT_LENGTH, encoded.len())
-        .body(())
-        .map_err(|error| Error::Transport(format!("response head: {error}")))?;
-    let mut send = respond
-        .send_response(head, false)
-        .map_err(|error| Error::Transport(format!("send response: {error}")))?;
-    send.send_data(Bytes::from(encoded), true)
-        .map_err(|error| Error::Transport(format!("send body: {error}")))?;
-    Ok(true)
+    respond_body(respond, encoded, connection_deadline).await
 }
 
 /// Bytes of request body one stream has reserved on its connection.
@@ -534,6 +535,59 @@ fn respond_status(
     send.send_data(Bytes::copy_from_slice(body), true)
         .map_err(|error| Error::Transport(format!("send body: {error}")))?;
     Ok(false)
+}
+
+/// Write one response body, bounded.
+///
+/// `send_data` awaits flow-control capacity: a peer that advertises a zero
+/// window and never reads parks it forever, keeping the stream task and its
+/// reservation alive. On expiry the stream is reset.
+async fn respond_body(
+    mut respond: h2::server::SendResponse<Bytes>,
+    encoded: Vec<u8>,
+    deadline: std::time::Duration,
+) -> Result<bool> {
+    // A piece per window grant: `send_data` without a reservation buffers
+    // unboundedly, so the loop asks for capacity and waits with a deadline. A
+    // peer that advertises a zero window and never reads parks the wait, and the
+    // stream is reset instead of holding the task and its reservation.
+    const PIECE: usize = 16 * 1024;
+    let head = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, CONTENT_TYPE)
+        .header(http::header::CONTENT_LENGTH, encoded.len())
+        .body(())
+        .map_err(|error| Error::Transport(format!("response head: {error}")))?;
+    let mut send = respond
+        .send_response(head, false)
+        .map_err(|error| Error::Transport(format!("send response: {error}")))?;
+    let mut offset = 0usize;
+    while offset < encoded.len() {
+        let want = (encoded.len() - offset).min(PIECE);
+        send.reserve_capacity(want);
+        let granted = match tokio::time::timeout(
+            deadline,
+            std::future::poll_fn(|context| send.poll_capacity(context)),
+        )
+        .await
+        {
+            Ok(Some(Ok(capacity))) if capacity > 0 => capacity,
+            Ok(Some(Err(error))) => {
+                return Err(Error::Transport(format!("send body: {error}")));
+            }
+            // Timed out, or the stream closed under us.
+            _ => {
+                send.send_reset(h2::Reason::CANCEL);
+                return Ok(false);
+            }
+        };
+        let take = granted.min(want).min(encoded.len() - offset);
+        let end = offset + take == encoded.len();
+        send.send_data(Bytes::copy_from_slice(&encoded[offset..offset + take]), end)
+            .map_err(|error| Error::Transport(format!("send body: {error}")))?;
+        offset += take;
+    }
+    Ok(true)
 }
 
 /// An HTTP/2 client that reuses one connection for every call.
@@ -670,7 +724,8 @@ impl Http2Client {
                                 .await
                                 .map_err(|error| Error::Transport(format!("response: {error}")))?;
                             let (status, body) =
-                                read_response(response, limits.max_bytes.min(MAX_BODY)).await?;
+                                read_response(response, limits.max_bytes.min(MAX_BODY), deadline)
+                                    .await?;
                             if status != StatusCode::OK {
                                 Err(refusal(&body))
                             } else {
@@ -766,7 +821,7 @@ impl Http2Client {
                 let response = response
                     .await
                     .map_err(|error| Error::Transport(format!("response: {error}")))?;
-                read_response(response, limits.max_bytes.min(MAX_BODY)).await
+                read_response(response, limits.max_bytes.min(MAX_BODY), deadline).await
             };
             match deadline {
                 Some(limit) => tokio::time::timeout(limit, exchange)
@@ -787,12 +842,20 @@ impl Drop for Http2Client {
 async fn read_response(
     response: Response<h2::RecvStream>,
     ceiling: usize,
+    deadline: Option<std::time::Duration>,
 ) -> Result<(StatusCode, Vec<u8>)> {
+    // Inactivity bound per chunk, defaulting to 30 s: without one a server that
+    // sends a byte and stops parks the caller forever when no deadline is set.
+    let inactivity = deadline.unwrap_or(std::time::Duration::from_secs(30));
     let status = response.status();
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     loop {
-        match body.data().await {
+        let next = match tokio::time::timeout(inactivity, body.data()).await {
+            Ok(next) => next,
+            Err(_) => return Err(Error::Transport("HTTP/2 response timed out".to_string())),
+        };
+        match next {
             Some(Ok(chunk)) => {
                 if bytes.len() + chunk.len() > ceiling {
                     return Err(Error::Wire("HTTP/2 response exceeds the ceiling"));
