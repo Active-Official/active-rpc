@@ -447,6 +447,41 @@ fn a_json_body_past_the_token_ceiling_is_too_complex() {
         .expect_err("a body past the token ceiling is refused");
     assert_eq!(error.provider_code(), Some("http/too-complex"), "{error}");
 
+    // A leading byte-order mark is ignored, so the same body is still gated
+    // (round 17, F-5).
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let scripted = format!("\u{feff}{body}");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{scripted}",
+        scripted.len()
+    );
+    fixed_response(listener, response.into_bytes());
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/bom")]);
+    tool.max_body = 4 << 20;
+    let error = tool
+        .invoke(0, &http_get("/bom", 20_000))
+        .expect_err("a BOM does not hide a huge body");
+    assert_eq!(error.provider_code(), Some("http/too-complex"), "{error}");
+
+    // A small BOM-prefixed object is still JSON.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let small = "\u{feff}{\"a\":1}";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{small}",
+        small.len()
+    );
+    fixed_response(listener, response.into_bytes());
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/bom-small")]);
+    let response = tool
+        .invoke(0, &http_get("/bom-small", 2_000))
+        .expect("a BOM-prefixed object answers");
+    match response {
+        Response::Value(Value::Map(entries)) => assert_eq!(entries.len(), 1),
+        other => panic!("a BOM-prefixed object became {other:?}"),
+    }
+
     // A CSV report is not JSON: its commas do not make it a JSON tree.
     let mut csv = String::with_capacity(2 << 20);
     for _ in 0..((1usize << 20) / 2) {
@@ -1182,6 +1217,18 @@ fn a_spent_deadline_does_not_write_a_line() {
         .expect("the transport still writes");
 }
 
+/// A program that does not resolve is refused at construction, so a symlink
+/// planted before the first spawn cannot choose the binary (round 17, F-3).
+#[test]
+fn a_program_that_does_not_resolve_is_refused() {
+    #[cfg(windows)]
+    let missing = "C:\\nonexistent-active-rpc-program.exe";
+    #[cfg(not(windows))]
+    let missing = "/nonexistent-active-rpc-program";
+    let error = LocalProcess::new(missing, &[]).expect_err("a missing program");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
 /// `Command` panics on an interior NUL. A caller-supplied argument and a
 /// configured environment entry must be refusals.
 #[test]
@@ -1730,6 +1777,17 @@ fn a_json_integer_past_i64_is_not_rounded() {
     let wide = serde_json::Value::Array(vec![serde_json::Value::from(0); 1_100_000]);
     assert!(active_rpc::tool::json_too_many_nodes(&wide));
     assert!(!active_rpc::tool::json_has_unrepresentable_number(&wide));
+
+    // A direct caller gets `Null` for the one number with no `Value` form, and
+    // never an invented float (round 17, F-4).
+    let past = serde_json::json!({ "id": 18_446_744_073_709_551_615u64 });
+    match active_rpc::tool::json_to_value(&past) {
+        Value::Map(entries) => match entries.get("id") {
+            Some(Value::Null) => {}
+            other => panic!("a u64 past i64 became {other:?}"),
+        },
+        other => panic!("unexpected {other:?}"),
+    }
 }
 
 /// A scoped wasm capability is refused (round 11, #13).

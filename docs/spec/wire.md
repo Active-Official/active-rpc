@@ -269,8 +269,9 @@ system resolver’s own timeout, because the endpoint is the operator’s, not t
 peer’s. A server that drips a byte per timeout period cannot stretch the
 ceiling. A HEAD,
 204 or 304 reply is read as bodyless whatever its headers say. A path is
-refused if it contains a byte below `0x21` or `0x7f`, because it is
-interpolated into the request line.
+refused if it contains a byte outside `0x21..=0x7e`, because it is
+interpolated into the request line. A leading UTF-8 byte-order mark on an
+answer is ignored before the JSON gates and the decode.
 
 ### Process adapter codes (`LocalProcess`)
 

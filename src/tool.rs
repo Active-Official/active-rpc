@@ -165,8 +165,8 @@ pub fn json_text_bad_number(text: &str) -> bool {
 ///
 /// This separates "the answer is JSON and one of its numbers is out of range"
 /// from "the answer is not JSON at all": only a document that opens as an
-/// object or an array is re-examined, so a plain-text body is never accused of
-/// carrying a bad number (round 15, F-1).
+/// object, an array or a number is re-examined, so a plain-text body is never
+/// accused of carrying a bad number (round 15, F-1; round 16, F-1).
 fn text_fails_only_on_a_number(text: &str) -> bool {
     let trimmed = text.trim_start();
     // A document that opens as an object, an array or a number is JSON; plain
@@ -240,7 +240,12 @@ pub fn json_to_value(value: &Json) -> Value {
             if let Some(int) = number.as_i64() {
                 Value::Int(int)
             } else {
-                Value::Float(number.as_f64().unwrap_or(0.0))
+                // A number with no finite `f64` form becomes `Null`, never an
+                // invented `0.0` (round 17, F-4).
+                match number.as_f64() {
+                    Some(float) => Value::Float(float),
+                    None => Value::Null,
+                }
             }
         }
         Json::String(text) => Value::Text(text.clone()),
@@ -1899,34 +1904,40 @@ impl Provider for HttpTool {
         let Ok(text) = String::from_utf8(response.clone()) else {
             return Ok(Response::Value(Value::Module(response)));
         };
+        // RFC 8259 lets a parser ignore a leading byte-order mark; serde_json
+        // does not, and an unstripped one would hide a huge array from the size
+        // gate and the number scan (round 17, F-5).
+        let json_text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         // Only an object or an array can hold more nodes than the ceiling (a
         // top-level scalar is one node), so a large non-JSON body — a CSV or a
-        // log extract — is left as text (round 15, F-6). The gate's limit is
-        // two below the tree ceiling because a tree has at most two more
-        // nodes than it has structural tokens, so a tree that passes the gate
-        // can never be refused later as `http/bad-number` for its size
-        // (round 15, F-5).
-        let trimmed = text.trim_start();
+        // log extract — is left as text (round 15, F-6). The token gate runs
+        // first so the decode is bounded; a tree the gate lets through but that
+        // still holds too many nodes (a chain of single-element arrays adds
+        // nodes without tokens) is answered from the tree with the same code
+        // (round 16, F-2).
+        let trimmed = json_text.trim_start();
         if (trimmed.starts_with('{') || trimmed.starts_with('['))
-            && json_text_too_complex(&text, MAX_JSON_NODES)
+            && json_text_too_complex(json_text, MAX_JSON_NODES)
         {
             return Err(Error::Provider {
                 code: "http/too-complex".to_string(),
             });
         }
-        let value = match serde_json::from_str::<Json>(&text) {
+        let value = match serde_json::from_str::<Json>(json_text) {
             Ok(json) if json_too_many_nodes(&json) => {
                 return Err(Error::Provider {
                     code: "http/too-complex".to_string(),
                 })
             }
-            Ok(json) if json_has_unrepresentable_number(&json) || json_text_bad_number(&text) => {
+            Ok(json)
+                if json_has_unrepresentable_number(&json) || json_text_bad_number(json_text) =>
+            {
                 return Err(Error::Provider {
                     code: "http/bad-number".to_string(),
                 })
             }
             Ok(json) => json_to_value(&json),
-            Err(_) if text_fails_only_on_a_number(&text) => {
+            Err(_) if text_fails_only_on_a_number(json_text) => {
                 return Err(Error::Provider {
                     code: "http/bad-number".to_string(),
                 })
@@ -2033,9 +2044,9 @@ fn kill_process_tree(child: &mut Child) {
 /// A bare or relative name would be resolved from the parent's `PATH` or its
 /// working directory, which is ambient authority: anything that can write an
 /// earlier `PATH` entry picks the binary a capability runs. The canonical path
-/// is pinned so a symlink swapped in after construction cannot redirect the
-/// exec. A path that does not exist yet keeps its absolute form and fails at
-/// spawn with the operating system's own error.
+/// is pinned so a symlink swapped in before the first spawn cannot redirect the
+/// exec, so the program must resolve now: a path that does not exist is
+/// refused rather than carried to a later spawn (round 17, F-3).
 fn pin_program(program: &str, refusal: &'static str) -> Result<PathBuf> {
     // A NUL never reaches an exec, and `canonicalize` would fail into a raw
     // path and a spawn-time provider fault (round 9, F-7).
@@ -2045,7 +2056,8 @@ fn pin_program(program: &str, refusal: &'static str) -> Result<PathBuf> {
     if !Path::new(program).is_absolute() {
         return Err(Error::InvalidArgument(refusal));
     }
-    Ok(std::fs::canonicalize(program).unwrap_or_else(|_| PathBuf::from(program)))
+    std::fs::canonicalize(program)
+        .map_err(|_| Error::InvalidArgument("the program path does not resolve"))
 }
 
 /// A sandboxed local process tool.

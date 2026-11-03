@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-23; 23 was clean, its five lows closed; round 24 is the confirmation | 128 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-16: ... + 8 findings; round 17 is the confirmation | 137 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-17: ... + 5 findings; round 18 is the confirmation | 142 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -138,6 +138,23 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 17)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `843bbeb`. All eight
+round-16 fixes verified against the code and the tests. Five new lows, all
+fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the size-gate comment still described the removed `-2` arithmetic and the old code | **fixed**: the comment describes the two gates and their codes |
+| 2 | low | `text_fails_only_on_a_number`'s doc named only objects and arrays while the code admits a number | **fixed** |
+| 3 | low | `pin_program` fell back to the raw path when `canonicalize` failed, so a symlink planted before the first spawn chose the binary | **fixed**: a program that does not resolve is `rpc/invalid-argument` at construction; `a_program_that_does_not_resolve_is_refused`; the red-team case now uses a real shell |
+| 4 | low | `json_to_value` still invented `0.0` for a number with no `f64` form | **fixed**: it is `Null`, matching the integer case; `a_json_integer_past_i64_is_not_rounded` asserts it |
+| 5 | low | a leading BOM hid a huge body from the size gate, so it answered text; the path sentence in the spec said "below 0x21 or 0x7f" | **fixed**: one leading BOM is ignored before the gates and the decode; the spec says outside `0x21..=0x7e`; the token test runs a BOM-prefixed body and a small BOM object |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt clean; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 16)
 
