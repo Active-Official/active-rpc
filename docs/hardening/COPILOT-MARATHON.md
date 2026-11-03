@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-12: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 findings; round-12 fixes green, confirmation round pending | 77 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-13: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 + 5 findings; round-13 fixes green, confirmation round pending | 82 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-7: 15 + 16 + 9 + 6 + 6 + 2 + 2 findings; round-7 fixes green, confirmation round pending | 51 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,26 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 13)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `7c80955`. All six round-12
+fixes verified; two highs, one medium and two lows, closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `dependents`/`dependencies` checked only the result set, never the entry node, so an alias to an outside node answered (and a redacting answer returned the marker, an outside-taint oracle) | **fixed**: both arms require the entry node to be named by the scope, as `why`/`impact` already did; `a_scoped_dependency_query_refuses_an_alias_entry` (both capabilities) |
+| 2 | high | the round-12 hash fix missed `provenance` and the cones: a non-redacting caller on a secret-bearing module still received the raw parent content address | **fixed**: `provenance` and both cones drop every content address when the module holds a secret, for every capability; `a_secret_bearing_module_serves_no_raw_parent_hash` |
+| 3 | medium | `structural_resolve` walked only tables, so a legitimate scoped array element (`app.0`) was refused and its label dropped | **fixed**: numeric segments select array elements, a `Semantic` wrapper is transparent; fail-closed on anything else |
+| 4 | low | a quantity whose unit is a placeholder stayed text while a table key collapsed | **fixed**: the same collapse applies to a unit |
+| 5 | low | the walk-amplification residual was under-counted (adjacency three times, `value_paths` twice, wall checked after) | **recorded accurately**: linear per build, bounded by `max_nodes`, planned with the resource-bomb pass |
+
+Also tightened: the two alias tests now build a module with no real field of that
+name, so the refusal comes from the structural check, not from the resolver's
+table-first preference.
+
+Gate: 88 suites / 845 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 12)
 

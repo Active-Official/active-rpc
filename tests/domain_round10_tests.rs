@@ -268,14 +268,12 @@ fn an_undotted_binding_alias_does_not_widen_the_scope() {
     let ops = module.push(Inode::Table {
         fields: vec![("s".to_string(), outside)],
     });
-    let app = module.push(Inode::Table {
-        fields: vec![("y".to_string(), outside)],
-    });
+    // No real `app` field: the alias is the only meaning of the name, so the
+    // resolution follows it and the structural check is what refuses.
     let root = module.push(Inode::Table {
-        fields: vec![("ops".to_string(), ops), ("app".to_string(), app)],
+        fields: vec![("ops".to_string(), ops)],
     });
     module.set_root(Some(root));
-    // The alias claims the in-scope name for a node that lives in `ops`.
     module.bind("app", outside);
 
     let (agent, cap, lane) = install(module, &["evaluate", "subgraph", "why"], Some("app"), false);
@@ -324,4 +322,100 @@ fn the_last_drop_reclaims_the_module() {
     agent.run();
     let error = promise.value().expect_err("the module is gone");
     assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// The entry node of a dependency query is part of the answer: an alias that
+/// names an outside node must not answer, with or without redaction.
+#[test]
+fn a_scoped_dependency_query_refuses_an_alias_entry() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let ops = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret)],
+    });
+    // No real `app` field: the only meaning of the name is the alias.
+    let root = module.push(Inode::Table {
+        fields: vec![("ops".to_string(), ops)],
+    });
+    module.set_root(Some(root));
+    module.bind("app", secret);
+
+    for redact in [false, true] {
+        let (agent, cap, lane) = install(
+            module.clone(),
+            &["dependents", "dependencies"],
+            Some("app"),
+            redact,
+        );
+        for method in ["dependents", "dependencies"] {
+            let promise = agent
+                .call(lane, &cap, method, vec![path("app")])
+                .expect("queued");
+            agent.run();
+            let error = promise
+                .value()
+                .expect_err("the alias entry is outside the scope");
+            assert_eq!(error.code(), "rpc/path-not-granted", "{method}: {error}");
+        }
+    }
+}
+
+/// A secret-bearing module never serves a raw content address through its
+/// provenance, with or without a redacting capability.
+#[test]
+fn a_secret_bearing_module_serves_no_raw_parent_hash() {
+    use active_infinity::Provenance;
+
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let root = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+    module.set_provenance(Some(Provenance {
+        producer: Some("test".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: Some([0x61; 32]),
+        entries: Vec::new(),
+    }));
+
+    for redact in [false, true] {
+        let (agent, cap, lane) = install(module.clone(), &["provenance", "subgraph"], None, redact);
+        let value = {
+            let promise = agent
+                .call(lane, &cap, "provenance", Vec::new())
+                .expect("queued");
+            agent.run();
+            promise.value().expect("provenance")
+        };
+        if let Value::Map(fields) = value {
+            for (key, value) in &fields {
+                if let Value::Text(text) = value {
+                    assert!(
+                        !text.starts_with("blake3:"),
+                        "a raw content address leaked (redact={redact}): {key}={text}"
+                    );
+                }
+            }
+            assert!(!fields.contains_key("parent"), "{fields:?}");
+        }
+
+        let cone = {
+            let promise = agent
+                .call(lane, &cap, "subgraph", vec![path("s")])
+                .expect("queued");
+            agent.run();
+            promise.value().expect("subgraph")
+        };
+        let Value::Module(bytes) = cone else {
+            panic!("a module: {cone:?}");
+        };
+        let decoded = active_infinity::decode(&bytes).expect("decode");
+        assert!(
+            decoded.provenance().is_none(),
+            "the cone carries a raw content address (redact={redact})"
+        );
+    }
 }

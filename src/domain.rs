@@ -324,7 +324,11 @@ impl ModuleProvider {
                 // metadata filter below needs the original cone.
                 let tainted = call.redact.then(|| tainted_nodes(&sub));
                 security::redact_derived(&mut sub, &security::redactor_for(&slot.module))?;
-                if call.redact {
+                // A secret-bearing module carries a raw content address in its
+                // provenance; that is an offline oracle, so the cone drops it
+                // for every capability (round 13, H2).
+                let holds_secret = slot.module.nodes().iter().any(|node| node.is_secret());
+                if call.redact || holds_secret {
                     // A redacting cone is data only: provenance (producer,
                     // entries and the parent content address) describes the
                     // whole module, annotation text and a binding that names a
@@ -333,6 +337,8 @@ impl ModuleProvider {
                     // equality oracle over the secret heap, exactly as on the
                     // patch path (round 9, #1).
                     sub.set_provenance(None);
+                }
+                if call.redact {
                     redact_cone_metadata(&mut sub, &tainted.unwrap_or_default());
                 }
                 if let Some(scope) = &call.path_scope {
@@ -428,6 +434,7 @@ impl ModuleProvider {
                     // a secret literal in the cone is still the secret.
                     let tainted = call.redact.then(|| tainted_nodes(&cone));
                     security::redact_derived(&mut cone, &security::redactor_for(&patched))?;
+                    let holds_secret = patched.nodes().iter().any(|node| node.is_secret());
                     if call.redact {
                         // The provenance records the parent's content address,
                         // and a redacting caller may not receive a hash of an
@@ -437,6 +444,10 @@ impl ModuleProvider {
                         // it, so they go with it (round 8, #3).
                         cone.set_provenance(None);
                         redact_cone_metadata(&mut cone, &tainted.unwrap_or_default());
+                    } else if holds_secret && call.path_scope.is_none() {
+                        // The new provenance records the pre-patch content
+                        // address, which covers the secret heap (round 13, H2).
+                        cone.set_provenance(None);
                     }
                     if let Some(scope) = &call.path_scope {
                         // The same rule as `subgraph`: a scoped cone reply is the
@@ -462,6 +473,14 @@ impl ModuleProvider {
             "dependents" => {
                 check_node_budget(&slot.module, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
+                // The entry node is part of the answer's meaning: an alias can
+                // name an outside node, and checking only the result set let a
+                // scoped query start outside the scope (round 13, H1).
+                if let Some(scope) = &call.path_scope {
+                    if !in_scope_path(&slot.module, node, &path, scope) {
+                        return Err(Error::PathNotGranted(path));
+                    }
+                }
                 let (_, dependents) = adjacency(&slot.module);
                 let ids: BTreeSet<NodeId> = dependents
                     .get(node.index())
@@ -487,6 +506,12 @@ impl ModuleProvider {
             "dependencies" => {
                 check_node_budget(&slot.module, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
+                // As in `dependents`: the entry node must be named by the scope.
+                if let Some(scope) = &call.path_scope {
+                    if !in_scope_path(&slot.module, node, &path, scope) {
+                        return Err(Error::PathNotGranted(path));
+                    }
+                }
                 let (dependencies, _) = adjacency(&slot.module);
                 let ids: BTreeSet<NodeId> = dependencies
                     .get(node.index())
@@ -647,6 +672,10 @@ impl ModuleProvider {
             }
             "provenance" => {
                 check_node_budget(&slot.module, call)?;
+                // A raw content address over the secret heap is an offline
+                // oracle, so a secret-bearing module hides it from every
+                // capability, exactly like `content_hash` (round 13, H2).
+                let holds_secret = slot.module.nodes().iter().any(|node| node.is_secret());
                 Ok(match slot.module.provenance() {
                     None => Response::Value(Value::Null),
                     Some(prov) => {
@@ -655,7 +684,7 @@ impl ModuleProvider {
                         // string is replaced by the marker instead of leaving as
                         // ordinary text.
                         let mut map = provenance_map(&slot.module);
-                        if call.redact {
+                        if call.redact || holds_secret {
                             // Every content address is an oracle over an image
                             // the caller may not read: the parent, and the
                             // `Input` lineage entries a patch carries forward
@@ -1068,13 +1097,50 @@ fn structural_resolve(module: &InfinityModule, path: &str) -> Option<NodeId> {
         if segment.is_empty() || segment == ".." {
             return None;
         }
-        let Some(Inode::Table { fields }) = module.get(current) else {
-            return None;
+        current = match module.get(current)? {
+            Inode::Table { fields } => fields
+                .iter()
+                .find(|(name, _)| name == segment)
+                .map(|(_, id)| *id)?,
+            // A number selects an array element; `value_paths` spells it the
+            // same way, so a scoped array access is a legitimate name
+            // (round 13, M1).
+            Inode::Array { elements } => {
+                let index: usize = segment.parse().ok()?;
+                *elements.get(index)?
+            }
+            // A semantic wrapper is transparent to the path walk.
+            Inode::Semantic { inner, .. } => {
+                return structural_resolve_from(module, *inner, &path[segment.len() + 1..]);
+            }
+            _ => return None,
         };
-        current = fields
-            .iter()
-            .find(|(name, _)| name == segment)
-            .map(|(_, id)| *id)?;
+    }
+    Some(current)
+}
+
+/// Continue a structural walk from `start` with the remaining dotted path.
+fn structural_resolve_from(module: &InfinityModule, start: NodeId, rest: &str) -> Option<NodeId> {
+    if rest.is_empty() {
+        return Some(start);
+    }
+    let mut current = start;
+    for segment in rest.split('.') {
+        if segment.is_empty() || segment == ".." {
+            return None;
+        }
+        current = match module.get(current)? {
+            Inode::Table { fields } => fields
+                .iter()
+                .find(|(name, _)| name == segment)
+                .map(|(_, id)| *id)?,
+            Inode::Array { elements } => {
+                let index: usize = segment.parse().ok()?;
+                *elements.get(index)?
+            }
+            Inode::Semantic { inner, .. } => *inner,
+            _ => return None,
+        };
     }
     Some(current)
 }
@@ -1374,6 +1440,11 @@ fn mark_secret_texts(
                 .collect(),
         ),
         CoreValue::String(text) if placeholders.contains(text.as_str()) => {
+            CoreValue::Secret(active_infinity::interop::SECRET_MARKER.to_string())
+        }
+        // A unit is text too: one that matches a placeholder means the value's
+        // shape came from a secret, as with a table key (round 13, L1).
+        CoreValue::Quantity(_, unit) if placeholders.iter().any(|text| *text == unit.suffix()) => {
             CoreValue::Secret(active_infinity::interop::SECRET_MARKER.to_string())
         }
         CoreValue::Array(items) => CoreValue::Array(
