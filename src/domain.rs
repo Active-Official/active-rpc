@@ -240,11 +240,19 @@ impl ModuleProvider {
                     // budget refusal, not a payload fault: a caller branches on
                     // the two differently (round 16, #1).
                     active_infinity::Error::Limit { kind, .. } => {
-                        // The variants name the ceiling; the provider's own
-                        // vocabulary is a closed set, so an evaluator ceiling is
-                        // the value budget.
-                        let _ = kind;
-                        Error::BudgetExceeded("value")
+                        // Keep the caller's branch: the provider's own gates use
+                        // `nodes`, `depth` and `wall`, and an evaluator ceiling
+                        // names the same conditions (round 17, F4).
+                        let kind = if kind.starts_with("node") {
+                            "nodes"
+                        } else if kind.starts_with("depth") {
+                            "depth"
+                        } else if kind.starts_with("wall") {
+                            "wall"
+                        } else {
+                            "value"
+                        };
+                        Error::BudgetExceeded(kind)
                     }
                     other => Error::Payload(other.code().to_string()),
                 })?;
@@ -420,7 +428,9 @@ impl ModuleProvider {
                         })
                         .ok_or(Error::InvalidArgument("patch needs a literal value"))?;
                     let mut patched = module.clone();
-                    *patched.node_mut(node)? = replacement;
+                    *patched
+                        .node_mut(node)
+                        .map_err(|error| Error::Payload(error.code().to_string()))? = replacement;
                     // The producer chain survives: the new module records the
                     // old content address as its parent and keeps the entries
                     // (and the identities) the module already carried.
@@ -1587,7 +1597,8 @@ fn restrict(module: &InfinityModule, node: NodeId) -> Result<InfinityModule> {
             .get(id)
             .ok_or(Error::InvalidArgument("subgraph node missing from the map"))?;
         let rewritten = remap_node(source, &map)?;
-        *sub.node_mut(target)? = rewritten;
+        *sub.node_mut(target)
+            .map_err(|error| Error::Payload(error.code().to_string()))? = rewritten;
     }
     // Annotations follow the cone. A constraint or an `@ai_immutable` flag whos
     // node moved must move with it: without this a scoped evaluation silently

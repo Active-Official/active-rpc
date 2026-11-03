@@ -37,6 +37,13 @@ pub fn active_value_too_deep(value: &active_core::Value, limit: usize) -> bool {
             ActiveValue::Table(entries) => {
                 work.extend(entries.iter().map(|(_, item)| (item, depth + 1)));
             }
+            // These two convert into a synthetic map, one level deeper than
+            // the Active node itself (round 17, F5).
+            ActiveValue::DurationMs(_) | ActiveValue::Quantity(..)
+                if depth.saturating_add(1) > limit =>
+            {
+                return true;
+            }
             _ => {}
         }
     }
@@ -56,9 +63,14 @@ pub fn from_active_value(value: &active_core::Value) -> Value {
         ActiveValue::Float(number) => Value::Float(*number),
         ActiveValue::String(text) => Value::Text(text.clone()),
         ActiveValue::DurationMs(ms) => Value::Map(
-            [("ms".to_string(), Value::Int(*ms as i64))]
-                .into_iter()
-                .collect(),
+            // A duration past `i64::MAX` saturates: a cast wraps negative
+            // and a consumer that reads `ms` as a deadline misbehaves.
+            [(
+                "ms".to_string(),
+                Value::Int(i64::try_from(*ms).unwrap_or(i64::MAX)),
+            )]
+            .into_iter()
+            .collect(),
         ),
         ActiveValue::Quantity(amount, unit) => Value::Map(
             [

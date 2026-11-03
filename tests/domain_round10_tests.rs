@@ -658,3 +658,41 @@ fn an_empty_placeholder_collapses_public_empty_text() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 17
+// ---------------------------------------------------------------------------
+
+/// A duration past `i64::MAX` saturates instead of wrapping negative
+/// (round 17, F1).
+#[test]
+fn a_duration_past_i64_saturates() {
+    let mut module = InfinityModule::new();
+    let duration = module.push(Inode::DurationMs(u64::MAX));
+    let root = module.push(Inode::Table {
+        fields: vec![("d".to_string(), duration)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], None, false);
+    let promise = agent
+        .call(lane, &cap, "evaluate", vec![path("d")])
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("evaluate");
+    let Value::Map(fields) = value else {
+        panic!("a duration answers a map: {value:?}");
+    };
+    assert_eq!(fields.get("ms"), Some(&Value::Int(i64::MAX)), "{fields:?}");
+}
+
+/// Caller text with a line separator or a zero-width character does not reach
+/// the log verbatim (round 17, F2).
+#[test]
+fn a_displayed_path_cannot_forge_a_log_line() {
+    let error = active_rpc::Error::PathNotGranted("a\u{2028}b\u{200b}c\nd".to_string());
+    let text = error.to_string();
+    for hostile in ['\u{2028}', '\u{200b}', '\n'] {
+        assert!(!text.contains(hostile), "raw {hostile:?} in {text:?}");
+    }
+}

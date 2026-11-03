@@ -201,10 +201,7 @@ fn escaped(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control()
-                || ('\u{202a}'..='\u{202e}').contains(&c)
-                || ('\u{2066}'..='\u{2069}').contains(&c) =>
-            {
+            c if c.is_control() || crate::security::is_invisible_or_reordering(c) => {
                 out.push_str(&format!("\\u{{{:x}}}", c as u32));
             }
             other => out.push(other),
@@ -239,17 +236,19 @@ impl fmt::Display for Error {
             Error::Backpressure(what) => write!(f, "backpressure: {what}"),
             Error::Identity(what) => write!(f, "peer identity refused: {what}"),
             Error::Bulk(what) => write!(f, "bulk transfer rejected: {what}"),
-            Error::Replay(what) => write!(f, "replay package rejected: {what}"),
-            Error::Receipt(what) => write!(f, "receipt log rejected: {what}"),
+            Error::Replay(what) => write!(f, "replay package rejected: {}", escaped(what)),
+            Error::Receipt(what) => write!(f, "receipt log rejected: {}", escaped(what)),
             Error::Persistence(what) => write!(f, "durable capability refused: {what}"),
             Error::UnresolvablePromise(id) => write!(f, "promise {id} can never resolve"),
-            Error::Provider { code } => write!(f, "provider failed: {code}"),
+            Error::Provider { code } => write!(f, "provider failed: {}", escaped(code)),
             Error::Domain(code) => write!(f, "domain operation failed: {code}"),
-            Error::Payload(reason) => write!(f, "invalid payload: {reason}"),
+            Error::Payload(reason) => write!(f, "invalid payload: {}", escaped(reason)),
             Error::Wire(reason) => write!(f, "malformed envelope: {reason}"),
             Error::CapabilityTable(reason) => write!(f, "malformed capability table: {reason}"),
-            Error::Transport(reason) => write!(f, "transport failure: {reason}"),
-            Error::TransportUnavailable(name) => write!(f, "transport {name} is unavailable"),
+            Error::Transport(reason) => write!(f, "transport failure: {}", escaped(reason)),
+            Error::TransportUnavailable(name) => {
+                write!(f, "transport {} is unavailable", escaped(name))
+            }
             Error::Timeout => write!(f, "deadline elapsed"),
             Error::PipelinedCycle => write!(f, "pipelined calls form a cycle"),
             Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
@@ -259,11 +258,9 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<active_infinity::Error> for Error {
-    fn from(error: active_infinity::Error) -> Self {
-        Error::Payload(error.code().to_string())
-    }
-}
+// No blanket `From<active_infinity::Error>`: it mapped a budget ceiling and an
+// evaluation failure to `rpc/payload`, so the next bare `?` would silently
+// misclassify both (round 17, F7). Every call site maps explicitly.
 
 impl Error {
     /// Build a durable-capability refusal.

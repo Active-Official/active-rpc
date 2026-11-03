@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-16: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 + 5 + 5 + 6 + 4 findings; round-16 fixes green, confirmation round pending | 96 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-17: ... + 6 findings; round-17 fixes green, confirmation round pending | 102 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-9: 15 + 16 + 9 + 6 + 6 + 2 + 2 + 9 + 8 findings; round-9 fixes green, confirmation round pending | 68 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,23 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 17)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `d3facc0`. One round-16 fix
+had not landed and two were incomplete; four lows and three hardening notes.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the `DurationMs` saturation never landed (the edit was lost with a later assertion in the same batch); the cast still wrapped | **fixed**: `i64::try_from(..).unwrap_or(i64::MAX)`; `a_duration_past_i64_saturates` |
+| 2 | low | `escaped` covered a subset of the crate's invisible-character set (`U+2028`, zero-widths, tag characters) | **fixed**: it reuses `security::is_invisible_or_reordering`; `a_displayed_path_cannot_forge_a_log_line` |
+| 3 | low | `Provider`, `Payload`, `Replay`, `Receipt` and `Transport` printed caller-influenced text raw | **fixed**: all five are escaped |
+| 4 | low | an evaluator `Limit` collapsed every ceiling to `"value"` | **fixed**: `node*`, `depth*` and `wall*` map to the provider's own vocabulary |
+| 5 | low | the depth probe ignored the level `DurationMs`/`Quantity` add when converted | **fixed**: both count one level |
+| 6 | low | the blanket `From<active_infinity::Error>` mapped a budget or evaluation failure to `rpc/payload` | **fixed**: removed; both remaining `?` sites map explicitly |
+
+Gate: 88 suites / 858 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 16)
 
