@@ -431,7 +431,18 @@ impl ModuleProvider {
                         } else {
                             parent_hash
                         },
-                        entries: previous.map(|prov| prov.entries).unwrap_or_default(),
+                        // A `Hash` entry renders as a content address: the
+                        // pre-patch image's, when the history held a secret
+                        // (round 15, #2).
+                        entries: previous
+                            .map(|prov| prov.entries)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|entry| {
+                                !slot.module.nodes().iter().any(|node| node.is_secret())
+                                    || !matches!(entry.value, active_infinity::ProvValue::Hash(_))
+                            })
+                            .collect(),
                     }));
                     // The reply is the cone at the target, not the whole arena:
                     // a scoped writer must not receive the rest of the module
@@ -687,7 +698,12 @@ impl ModuleProvider {
                 // capability, exactly like `content_hash` (round 13, H2).
                 let holds_secret = slot.module.nodes().iter().any(|node| node.is_secret());
                 Ok(match slot.module.provenance() {
-                    None => Response::Value(Value::Null),
+                    None => {
+                        // Every arm charges the ceiling; this one returned
+                        // first (round 15, #4).
+                        check_wall_budget(started, call)?;
+                        Response::Value(Value::Null)
+                    }
                     Some(prov) => {
                         // Text fields come from `provenance_lines`, which owns
                         // the redaction: a copy of a secret literal in a producer
@@ -972,10 +988,11 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
     let root = module.root();
     if !affected.iter().all(|id| match named_path(&paths, *id) {
         Some(path) => in_scope_path(module, *id, path, scope),
-        // The module root is pathless by construction. Any other pathless node is
-        // a floating value or an expression: it still travels in a cone and can be
-        // named by a binding, so an affected one makes the write unconfined.
-        None => Some(*id) == root,
+        // The module root is pathless by construction. A pathless node inside
+        // the scope's subtree is part of the scope; any other is a floating
+        // value or an expression, and an affected one makes the write
+        // unconfined (round 15, #1).
+        None => Some(*id) == root || in_scope_node(module, *id, scope),
     }) {
         return false;
     }
@@ -1076,10 +1093,11 @@ fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &s
     let root = module.root();
     ids.iter().all(|id| match named_path(&paths, *id) {
         Some(path) => in_scope_path(module, *id, path, scope),
-        // The module root is pathless by construction; any other pathless node
-        // is a floating value or an expression, and a scoped answer that dropped
-        // it presented itself as complete (round 8, #6).
-        None => Some(*id) == root,
+        // The module root is pathless by construction; a pathless node inside
+        // the scope's subtree is part of it; any other is a floating value or an
+        // expression, and a scoped answer that dropped it presented itself as
+        // complete (round 8, #6).
+        None => Some(*id) == root || in_scope_node(module, *id, scope),
     })
 }
 
@@ -1089,7 +1107,68 @@ fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &s
 /// present an outside node under an in-scope-looking name. A name that does not
 /// resolve back is not confinement.
 fn in_scope_path(module: &InfinityModule, id: NodeId, path: &str, scope: &str) -> bool {
-    crate::cap::is_path_prefix(scope, path) && structural_resolve(module, path) == Some(id)
+    if !crate::cap::is_path_prefix(scope, path) {
+        return false;
+    }
+    if path.starts_with('@') {
+        // A synthetic label (`@node[id]`, a redaction collision) is not a name,
+        // so it is no evidence either way: decide by walking the scope's
+        // subtree. This is the semantic-wrapper collision case, where the
+        // wrapper and its inner node share one dotted name (round 15, #1).
+        return in_scope_node(module, id, scope);
+    }
+    structural_resolve(module, path).is_some_and(|resolved| same_place(module, resolved, id))
+}
+
+/// Whether `id` is a node of the subtree the scope names.
+fn in_scope_node(module: &InfinityModule, id: NodeId, scope: &str) -> bool {
+    let Some(root) = structural_resolve(module, scope) else {
+        return false;
+    };
+    let mut seen = vec![false; module.node_count()];
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if current.index() >= seen.len() || seen[current.index()] {
+            continue;
+        }
+        seen[current.index()] = true;
+        if current == id || same_place(module, current, id) {
+            return true;
+        }
+        match module.get(current) {
+            Some(Inode::Table { fields }) => {
+                stack.extend(fields.iter().map(|(_, child)| *child));
+            }
+            Some(Inode::SchemaTable { fields, .. }) => {
+                stack.extend(fields.iter().map(|(_, child)| *child));
+            }
+            Some(Inode::Array { elements }) => stack.extend(elements.iter().copied()),
+            Some(Inode::Semantic { inner, .. }) => stack.push(*inner),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether two ids name the same value through semantic wrappers.
+///
+/// A semantic wrapper is transparent to the path walk, so a name can resolve to
+/// the wrapper while the walk reports the inner node (or the other way round).
+fn same_place(module: &InfinityModule, left: NodeId, right: NodeId) -> bool {
+    let through = |start: NodeId, target: NodeId| {
+        let mut current = start;
+        for _ in 0..64 {
+            if current == target {
+                return true;
+            }
+            match module.get(current) {
+                Some(Inode::Semantic { inner, .. }) => current = *inner,
+                _ => return false,
+            }
+        }
+        false
+    };
+    through(left, right) || through(right, left)
 }
 
 /// Resolve a dotted path through table fields from the module root.
@@ -1107,48 +1186,26 @@ fn structural_resolve(module: &InfinityModule, path: &str) -> Option<NodeId> {
         if segment.is_empty() || segment == ".." {
             return None;
         }
-        current = match module.get(current)? {
+        // A semantic wrapper above a container is transparent: unwrap it
+        // without consuming the segment. An earlier version sliced the path by
+        // the segment's length and skipped the segment itself, which panicked on
+        // a single-segment path and refused a legal nested name
+        // (round 14 H2/M1, round 15 #1).
+        let mut node = current;
+        while let Some(Inode::Semantic { inner, .. }) = module.get(node) {
+            node = *inner;
+        }
+        current = match module.get(node)? {
             Inode::Table { fields } => fields
                 .iter()
                 .find(|(name, _)| name == segment)
                 .map(|(_, id)| *id)?,
             // A number selects an array element; `value_paths` spells it the
-            // same way, so a scoped array access is a legitimate name
-            // (round 13, M1).
+            // same way, so a scoped array access is a legitimate name.
             Inode::Array { elements } => {
                 let index: usize = segment.parse().ok()?;
                 *elements.get(index)?
             }
-            // A semantic wrapper is transparent to the path walk.
-            Inode::Semantic { inner, .. } => {
-                return structural_resolve_from(module, *inner, &path[segment.len() + 1..]);
-            }
-            _ => return None,
-        };
-    }
-    Some(current)
-}
-
-/// Continue a structural walk from `start` with the remaining dotted path.
-fn structural_resolve_from(module: &InfinityModule, start: NodeId, rest: &str) -> Option<NodeId> {
-    if rest.is_empty() {
-        return Some(start);
-    }
-    let mut current = start;
-    for segment in rest.split('.') {
-        if segment.is_empty() || segment == ".." {
-            return None;
-        }
-        current = match module.get(current)? {
-            Inode::Table { fields } => fields
-                .iter()
-                .find(|(name, _)| name == segment)
-                .map(|(_, id)| *id)?,
-            Inode::Array { elements } => {
-                let index: usize = segment.parse().ok()?;
-                *elements.get(index)?
-            }
-            Inode::Semantic { inner, .. } => *inner,
             _ => return None,
         };
     }
@@ -1189,9 +1246,10 @@ fn scope_closure(module: &InfinityModule, node: NodeId, scope: &str) -> (bool, b
     let root = module.root();
     let outside = closure.iter().any(|id| match named_path(&paths, *id) {
         Some(path) => !in_scope_path(module, *id, path, scope),
-        // The module root is the module itself; any other pathless node still
-        // travels in the cone and is out of scope by construction.
-        None => Some(*id) != root,
+        // The module root is the module itself. A pathless node is inside only
+        // when the scope's own subtree reaches it (a node behind a semantic
+        // wrapper or an array has no dotted name of its own) (round 15, #1).
+        None => Some(*id) != root && !in_scope_node(module, *id, scope),
     });
     (outside, environment)
 }
@@ -1223,7 +1281,8 @@ fn scoped_labels(
     labels_for(
         module,
         ids.into_iter().filter(|id| match named_path(&paths, *id) {
-            Some(path) => structural_resolve(module, path) == Some(*id),
+            Some(path) => structural_resolve(module, path)
+                .is_some_and(|resolved| same_place(module, resolved, *id)),
             None => false,
         }),
     )
@@ -1395,10 +1454,15 @@ fn evaluate_for_caller(
     // secret, the empty string when a secret is a substring of the marker. One
     // placeholder from the first secret missed the second case when a module
     // held both (round 12, F2).
-    let placeholders: BTreeSet<String> = (0..module.node_count())
+    // A restricted cone no longer holds the secret node, so the placeholders are
+    // read from a redacted copy of the source (round 15, #6).
+    let mut redacted_source = source.clone();
+    security::redact_derived(&mut redacted_source, &redactor)
+        .map_err(|error| active_infinity::Error::Encode(error.code()))?;
+    let placeholders: BTreeSet<String> = (0..source.node_count())
         .map(|index| NodeId(index as u32))
-        .filter(|id| module.get(*id).is_some_and(|node| node.is_secret()))
-        .filter_map(|id| match redacted.get(id) {
+        .filter(|id| source.get(*id).is_some_and(|node| node.is_secret()))
+        .filter_map(|id| match redacted_source.get(id) {
             Some(Inode::Str(text)) => Some(text.clone()),
             _ => None,
         })

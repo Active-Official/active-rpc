@@ -526,3 +526,135 @@ fn an_embedded_content_address_is_dropped() {
         }
     }
 }
+
+/// The scope walk is exercised with a scope: a semantic wrapper above a table is
+/// transparent, and a single-segment path never panics (round 15, #1).
+#[test]
+fn a_scoped_semantic_wrapper_resolves() {
+    use active_infinity::SemanticTag;
+
+    let mut module = InfinityModule::new();
+    let leaf = module.push(Inode::Str("inside".to_string()));
+    let inner = module.push(Inode::Table {
+        fields: vec![("w".to_string(), leaf)],
+    });
+    let wrapped = module.push(Inode::Semantic {
+        tag: SemanticTag::Policy,
+        inner,
+    });
+    let app = module.push(Inode::Table {
+        fields: vec![("w".to_string(), wrapped)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], Some("app"), false);
+    // `app.w` is a Table behind a Semantic wrapper: a legal in-scope name.
+    let promise = agent
+        .call(lane, &cap, "evaluate", vec![path("app.w")])
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("the wrapper is transparent");
+    assert!(matches!(value, Value::Map(_)), "{value:?}");
+}
+
+/// A declassifying patch drops the hash-bearing provenance entries too: they
+/// name the pre-patch image (round 15, #2).
+#[test]
+fn a_patch_removing_the_last_secret_drops_hash_entries() {
+    use active_infinity::{ProvEntry, ProvValue, Provenance};
+
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let root = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+    module.set_provenance(Some(Provenance {
+        producer: Some("test".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: None,
+        entries: vec![ProvEntry {
+            key: "input".to_string(),
+            value: ProvValue::Hash([0x63; 32]),
+        }],
+    }));
+
+    let (agent, cap, lane) = install(module, &["patch", "provenance"], None, false);
+    let promise = agent
+        .call(lane, &cap, "patch", vec![path("s"), Arg::text("public")])
+        .expect("queued");
+    agent.run();
+    promise.value().expect("patch");
+
+    let promise = agent
+        .call(lane, &cap, "provenance", Vec::new())
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("provenance");
+    if let Value::Map(fields) = value {
+        for text in fields.values() {
+            if let Value::Text(text) = text {
+                assert!(
+                    !text.contains("blake3:"),
+                    "a pre-patch address survives: {text}"
+                );
+            }
+        }
+    }
+}
+
+/// An over-deep evaluation result is refused with the depth code every other
+/// depth refusal uses (round 15, #3).
+#[test]
+fn an_over_deep_evaluation_is_a_budget_refusal() {
+    let mut module = InfinityModule::new();
+    let mut current = module.push(Inode::Int(1));
+    for index in 0..80 {
+        current = module.push(Inode::Table {
+            fields: vec![(format!("f{index}"), current)],
+        });
+    }
+    module.set_root(Some(current));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], None, false);
+    let promise = agent
+        .call(lane, &cap, "evaluate", Vec::new())
+        .expect("queued");
+    agent.run();
+    let error = promise.value().expect_err("too deep for the wire");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A marker-substring secret collapses public empty text too: the accepted
+/// fail-closed direction (round 15, #6).
+#[test]
+fn an_empty_placeholder_collapses_public_empty_text() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret("*".into()));
+    let public = module.push(Inode::Str(String::new()));
+    let root = module.push(Inode::Table {
+        fields: vec![
+            ("secret".to_string(), secret),
+            ("public".to_string(), public),
+        ],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], None, true);
+    for name in ["secret", "public"] {
+        let promise = agent
+            .call(lane, &cap, "evaluate", vec![path(name)])
+            .expect("queued");
+        agent.run();
+        let value = promise.value().expect("evaluate");
+        assert!(
+            matches!(value, Value::Secret),
+            "{name} answered {value:?}; the empty placeholder collapses as documented"
+        );
+    }
+}
