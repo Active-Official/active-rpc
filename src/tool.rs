@@ -34,12 +34,21 @@ use crate::value::{Arg, Call, Value};
 /// changes the meaning of a peer answer (round 12, F-1).
 pub fn json_has_unrepresentable_number(value: &Json) -> bool {
     let mut stack = vec![value];
+    let mut nodes = 0usize;
     while let Some(value) = stack.pop() {
+        // The decoded tree is far larger than the body: a 1 MiB array of zeros
+        // is half a million values. Bound the node count, not just the bytes
+        // (round 13, F-8).
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_JSON_NODES {
+            return true;
+        }
         match value {
             Json::Number(number) => {
-                // `Value` has an `i64` only: a u64 past it and a negative past
-                // `i64::MIN` are both unrepresentable.
-                if number.as_i64().is_none() {
+                // `Value::Int` holds an `i64` and `Value::Float` an `f64`, so a
+                // float is representable. Only a u64 past `i64::MAX` has no
+                // form (round 13, F-1).
+                if number.as_i64().is_none() && number.as_u64().is_some() {
                     return true;
                 }
             }
@@ -185,6 +194,9 @@ pub trait McpTransport {
         self.recv_line()
     }
 }
+
+/// Largest JSON tree either adapter will decode from one answer.
+const MAX_JSON_NODES: usize = 1 << 20;
 
 /// Largest child output this adapter will buffer.
 const MAX_OUTPUT_BYTES: usize = 16 << 20;
@@ -617,11 +629,18 @@ impl StdioTransport {
         let mut child = command.spawn().map_err(|error| Error::Provider {
             code: format!("mcp/spawn:{error}"),
         })?;
-        let stdin = child.stdin.take().ok_or(Error::Provider {
-            code: "mcp/stdin".to_string(),
+        let stdin = child.stdin.take().ok_or_else(|| {
+            // `Child::Drop` neither kills nor reaps (round 13, F-7).
+            kill_process_tree(&mut child);
+            Error::Provider {
+                code: "mcp/stdin".to_string(),
+            }
         })?;
-        let stdout = child.stdout.take().ok_or(Error::Provider {
-            code: "mcp/stdout".to_string(),
+        let stdout = child.stdout.take().ok_or_else(|| {
+            kill_process_tree(&mut child);
+            Error::Provider {
+                code: "mcp/stdout".to_string(),
+            }
         })?;
         // A bounded queue: a server that streams frames forever must fill the
         // pipe and block, not grow the host's memory (round 8, F1).
@@ -634,7 +653,9 @@ impl StdioTransport {
                     let mut line = String::new();
                     let read = reader
                         .by_ref()
-                        .take((MAX_MCP_LINE_BYTES + 1) as u64)
+                        // One extra byte for the delimiter: a line of exactly
+                        // the cap plus `\n` is legal (round 13, F-9).
+                        .take((MAX_MCP_LINE_BYTES + 2) as u64)
                         .read_line(&mut line);
                     let outcome = match read {
                         Ok(0) => Err(Error::Provider {
@@ -714,11 +735,9 @@ impl McpTransport for StdioTransport {
         // the deadline returns `Timeout` but still reaches the wire, and the
         // stream is then one request ahead of the session's state
         // (round 5, #5).
-        if let Some(deadline) = deadline {
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::Timeout);
-            }
-        }
+        // The session checks the ceiling before calling in; repeating it here
+        // made a spent deadline look like a frame that may have left, which
+        // poisons a session that was never touched (round 13, F-5).
         let (reply, outcome) = std::sync::mpsc::channel();
         // A blocking `send` on the capacity-1 queue has no ceiling: a writer
         // stuck in `write_all` leaves the queue full and the next send waits
@@ -1354,7 +1373,11 @@ impl HttpTool {
             .ok_or(Error::Provider {
                 code: "http/status".to_string(),
             })?;
-        if !status_line.starts_with("HTTP/1.") {
+        let version_ok = status_line
+            .strip_prefix("HTTP/1.")
+            .and_then(|rest| rest.as_bytes().first())
+            .is_some_and(|byte| byte.is_ascii_digit());
+        if !version_ok {
             return Err(Error::Provider {
                 code: "http/status".to_string(),
             });
@@ -1466,11 +1489,9 @@ impl HttpTool {
                 reader.body_exact(length)?
             }
             None => {
-                let rest = reader.body_rest(self.max_body.min(MAX_RESPONSE_BYTES))?;
-                if rest.len() > self.max_body {
-                    return Err(Error::ToolPolicy("response too large"));
-                }
-                rest
+                // `body_rest` already enforces `min(max_body, MAX_RESPONSE_BYTES)`
+                // and answers `http/body-too-large` (round 13, F-4).
+                reader.body_rest(self.max_body.min(MAX_RESPONSE_BYTES))?
             }
         };
         Ok((status, body))
@@ -2190,14 +2211,15 @@ impl Provider for LocalProcess {
             "status".to_string(),
             Value::Int(status.code().unwrap_or(-1) as i64),
         );
-        map.insert(
-            "stdout".to_string(),
-            Value::Text(String::from_utf8_lossy(&stdout).to_string()),
-        );
-        map.insert(
-            "stderr".to_string(),
-            Value::Text(String::from_utf8_lossy(&stderr).to_string()),
-        );
+        // A binary stream is not text: transcoding it inserts replacement
+        // characters, so two different byte strings would compare equal
+        // (round 13, F-6).
+        let stream = |bytes: Vec<u8>| match String::from_utf8(bytes.clone()) {
+            Ok(text) => Value::Text(text),
+            Err(_) => Value::Module(bytes),
+        };
+        map.insert("stdout".to_string(), stream(stdout));
+        map.insert("stderr".to_string(), stream(stderr));
         Ok(Response::Value(Value::Map(map)))
     }
 }

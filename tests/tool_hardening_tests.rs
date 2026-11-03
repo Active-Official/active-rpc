@@ -1408,12 +1408,15 @@ fn a_json_integer_past_i64_is_not_rounded() {
     let json = serde_json::json!({ "id": 18_446_744_073_709_551_615u64 });
     assert!(
         active_rpc::tool::json_has_unrepresentable_number(&json),
-        "the adapter must refuse the answer"
+        "a u64 past i64::MAX has no Value form"
     );
-    // Both signs: a negative value past `i64::MIN` has no form either.
-    let json: serde_json::Value =
-        serde_json::from_str(r#"{"debit": -9223372036854775809}"#).expect("parse");
-    assert!(active_rpc::tool::json_has_unrepresentable_number(&json));
+    // An ordinary decimal is representable: `Value::Float` is its form.
+    let json = serde_json::json!({ "price": 9.99, "scaled": 1e3 });
+    assert!(!active_rpc::tool::json_has_unrepresentable_number(&json));
+    // A flat array past the node ceiling is refused (a wide tree, not a deep
+    // one: doubling would build 2^40 values).
+    let wide = serde_json::Value::Array(vec![serde_json::Value::from(0); 1_100_000]);
+    assert!(active_rpc::tool::json_has_unrepresentable_number(&wide));
 }
 
 /// A scoped wasm capability is refused (round 11, #13).

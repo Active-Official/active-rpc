@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-21: ... + 5 findings; one more clean round closes it | 118 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-12: ... + 13 findings (rounds 11-12: no critical/high); one clean round closes it | 101 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-13: ... + 11 findings; one clean round closes it | 112 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -106,6 +106,32 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 13)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `f16fbe6`.
+The round-12 number check was over-broad (it refused every float); one medium and
+ten lows, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `json_has_unrepresentable_number` refused every non-integer JSON number, so `{"price": 9.99}` failed | **fixed**: only a u64 past `i64::MAX` is unrepresentable (`Value::Float` is the form for a float); the test now covers `9.99`/`1e3` and a wide tree |
+| 2 | medium | the spec rows still described the old status rule and lacked `*-bad-number` | **fixed**: `http/<status>` covers non-2xx, `http/status` names three digits and the range, both `bad-number` rows exist, the output ceiling is documented |
+| 3 | low | ADR-0019 contradicted the wasm adapter on `wasm/input` and `clock_ms` | **recorded** for the ADR pass |
+| 4 | low | a dead second body-ceiling branch remained | **removed** |
+| 5 | low | a duplicate pre-send deadline check could poison an untouched session | **removed**: the session's own check runs first |
+| 6 | low | `LocalProcess` still transcoded binary output | **fixed**: a non-UTF-8 stream is a module value |
+| 7 | low | the two post-spawn `?` arms leaked the child | **fixed**: both kill the tree |
+| 8 | low | the decoded JSON tree was unbounded (a 1 MiB array is ~500k values) | **fixed**: a 2^20-node ceiling in the same walk |
+| 9 | low | the MCP line cap was off by one (the delimiter counted) | **fixed** |
+| 10 | low | the HTTP version check accepted `HTTP/1. 200` | **fixed**: `HTTP/1.<digit>` |
+| 11 | low | a test asserted only `> 0` | **recorded**: the malformed-answer test is strengthened in the next round |
+
+Also fixed: a test built a 2^40-node JSON tree (doubling) and hung the suite; it
+now uses a flat wide array.
+
+Gate: 88 suites / 874 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9; hardening status clean.
 
 ### R-08 tools and MCP - 2026-11-03 (round 12)
 

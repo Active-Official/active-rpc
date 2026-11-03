@@ -211,6 +211,7 @@ session:
 | `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer |
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |
 | `mcp/desync` | more than `MAX_MCP_NOTIFICATIONS` notification frames arrived for one request, or the session was already poisoned |
+| `mcp/bad-number` | a result holds a JSON number with no `Value` form |
 | `mcp/initialize` | the server answered `initialize` with an error |
 | `mcp/tool-name` | an advertised tool name is absent or empty, is not `[A-Za-z0-9_.-]{1,128}`, or two tools share a name |
 | `mcp/tools` | the handshake result carries no `tools` array |
@@ -244,15 +245,16 @@ Reported as `rpc/provider` with one of these inner codes:
 |------|-----------|
 | `http/resolve:<err>` | the base URL did not resolve |
 | `http/connect` | no address accepted the connection inside the ceiling |
-| `http/status` | the status line is not `HTTP/1.x` with a numeric code |
+| `http/status` | the status line is not `HTTP/1.<digit>` with exactly three ASCII digits in `200..=599` |
 | `http/interim` | a 1xx interim response arrived; the adapter does not follow it |
 | `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared |
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
+| `http/bad-number` | a JSON number is a u64 past `i64::MAX` (it has no `Value` form) |
 | `http/body-too-large` | the response body exceeded `max_body`, by its declared length or by its stream |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
-| `http/<status>` | the endpoint answered `>= 400` |
+| `http/<status>` | the endpoint answered a status outside 2xx (3xx included: the adapter does not follow redirects) |
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `content-length` only for a method defined to carry content (`POST`, `PUT`,
@@ -274,6 +276,8 @@ interpolated into the request line.
 | `process/cwd` | the working directory could not be pinned at construction |
 | `process/thread:<err>` | a pipe reader thread could not start; the child is killed |
 | `rpc/budget-exceeded` | the wall grant is zero |
+
+The effective output ceiling is the smaller of `max_output` and 16 MiB.
 | `rpc/timeout` | the call exceeded the effective wall ceiling; the whole process group was killed |
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
 | `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, the output exceeded `max_output`, or process execution was not granted |
