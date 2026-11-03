@@ -1961,7 +1961,7 @@ const SHELL_METACHARACTERS: &[char] = &[
 ];
 
 /// RFC 9110 token characters, the only bytes legal in a request method.
-fn is_http_token(byte: u8) -> bool {
+pub(crate) fn is_http_token(byte: u8) -> bool {
     matches!(
         byte,
         b'!' | b'#'

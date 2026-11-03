@@ -647,7 +647,82 @@ fn an_annotation_flood_is_refused_by_the_node_ceiling() {
         .value()
         .expect_err("four annotations over three nodes");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
-    assert!(format!("{error}").contains("annotations"), "{error}");
+    // One kind for both counts: a distinct label would let a scoped or
+    // redacting caller binary-search a size `stats` hides (round 24, F6).
+    assert!(format!("{error}").contains("nodes"), "{error}");
+}
+
+/// A scope closure over a hostile annotation count is bounded by the wall
+/// ceiling inside the round, not after it: the adjacency is built once and the
+/// grant is checked every 64 annotations (round 24, F1).
+#[test]
+fn a_scoped_walk_over_many_constraints_stays_within_the_wall_ceiling() {
+    use std::time::Instant;
+
+    let mut module = InfinityModule::new();
+    // A wide expression (depth 2) keeps the module inside the format's depth
+    // ceiling while making every walk visit four hundred nodes. The annotation
+    // subject is a single small node: an annotation's key renders its subject,
+    // so a wide subject would hit the key-byte ceiling first.
+    let mut fields = Vec::with_capacity(400);
+    for index in 0..400 {
+        let field = module.push(Inode::Int(index));
+        fields.push((format!("f{index}"), field));
+    }
+    let wide = module.push(Inode::Table { fields });
+    let subject = module.push(Inode::Int(7));
+    let app = module.push(Inode::Table {
+        fields: vec![("a".to_string(), subject)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+    // Every rule watches the wide expression, so one round walks it once per
+    // rule. The default install ceiling accepts 4 096 annotations.
+    for index in 0..4_000 {
+        module.annotate(
+            subject,
+            AnnotationKind::Constraint {
+                source: format!("rule {index}"),
+                expr: wide,
+            },
+        );
+    }
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x73; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["why", "patch"]);
+    attrs.path_scope = Some("app.a".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane(
+            "r24-wall",
+            Budget {
+                max_wall_ms: 5,
+                ..Budget::default()
+            },
+        )
+        .expect("lane");
+
+    for (method, args) in [
+        ("why", vec![path("app.a")]),
+        ("patch", vec![path("app.a"), Arg::Value(Value::Int(7))]),
+    ] {
+        let started = Instant::now();
+        let promise = agent.call(lane, &cap, method, args).expect("queued");
+        agent.run();
+        let error = promise.value().expect_err("the walk exceeds the grant");
+        let elapsed = started.elapsed();
+        assert_eq!(error.code(), "rpc/budget-exceeded", "{method}: {error}");
+        assert!(format!("{error}").contains("wall"), "{method}: {error}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "{method} took {elapsed:?} for a 20 ms grant"
+        );
+    }
 }
 
 /// An over-deep evaluation result is refused with the depth code every other

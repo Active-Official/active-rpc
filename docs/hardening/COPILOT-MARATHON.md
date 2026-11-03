@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-23; 23 was clean, its five lows closed; round 24 is the confirmation | 128 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-24: 24 found 2 highs + 4 mediums, fixed; round 25 is the confirmation | 139 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-17: ... + 5 findings; round 18 is the confirmation | 142 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,35 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 24)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `843bbeb`.
+The five round-23 fixes held, with three gaps; the reviewer then defeated the
+new mid-walk wall check with measurements (8 000 annotations: 9.7 s on a 5 s
+grant; patch 18.4 s; 20 000: 60.5 s / 116 s). Two highs, four mediums, five
+lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the wall check sat between fixpoint rounds while one round rebuilt the adjacency per annotation, and `effects_within_scope` (patch) had no inner check at all | **fixed**: `transitive_with` walks an adjacency built once, and both loops check the grant every 64 annotations; `a_scoped_walk_over_many_constraints_stays_within_the_wall_ceiling` (4 000 distinct constraints, 400-node expression, 5 ms grant; `why` and `patch` answer wall in < 1 s; fails pre-fix after running a whole round) |
+| 2 | high | the HTTP/2 handshake ran outside the connection deadline, so a peer that connected and sent no preface held the serve task forever | **fixed**: `tokio::time::timeout(connection_deadline, handshake)`; `a_silent_connection_is_dropped_at_the_deadline` (50 ms, serve returns) |
+| 3 | medium | a folded or whitespace-only head line, and a field name that is not a token, were silently skipped: a gateway that ends the block there sees a different request | **fixed**: both are `400 rpc/wire`; `a_folded_or_untokenized_head_line_is_refused` |
+| 4 | medium | a body that ran past the connection budget answered `400 rpc/wire`, contradicting the interop spec and the head path | **fixed**: `408 rpc/transport` on the deadline; `a_stalled_body_is_408_request_timeout` |
+| 5 | medium | one detached resolver thread per call, spawned even after the deadline, unbounded | **fixed**: the client caches its first lookup, checks the remaining budget before spawning, and a process-wide cap (64) refuses rather than grows; interop.md documents the 2 s default budget |
+| 6 | medium | the annotation charge was a distinguishable size oracle for a scoped/redacting caller | **fixed**: both counts report `nodes`; the `annotations` dimension was withdrawn from observability.md; `an_annotation_flood_is_refused_by_the_node_ceiling` asserts the single kind |
+| 7 | low | the client accepted `+200` and `0200` as a status | **fixed**: exactly three digits; `a_non_three_digit_status_is_a_wire_fault` |
+| 8 | low | the HTTP/2 in-flight refusal answered `rpc/wire`, which a client treats as fatal | **fixed**: `rpc/backpressure`; `an_inflight_budget_refusal_is_backpressure` |
+| 9 | low | without `with_deadline`, the 2 s budget now includes DNS | **documented** in interop.md: 2 s total, resolution included |
+| 10 | low | the patch replaced `slot.module` before recomputing `slot.hash`, so a failure between them left a stale hash | **fixed**: both are computed into locals and assigned together |
+| 11 | low | the round-23 UTF-8 rule also hit response heads, where obs-text is legal | **fixed**: strict for request lines, lossy for response values |
+
+Residuals recorded: `Http2Client::connect` uses an unbounded TCP connect (OS
+SYN timeout); `respond_status` does not drain a refused body (the h2 reset
+does); `read_head` refuses a head of exactly `MAX_HEAD` plus its CRLF.
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt clean; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 23 residuals)
 

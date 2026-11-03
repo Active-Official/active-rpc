@@ -465,7 +465,7 @@ impl ModuleProvider {
                         return Err(Error::ReadOnly);
                     }
                     if let Some(scope) = &call.path_scope {
-                        if !effects_within_scope(module, node, scope) {
+                        if !effects_within_scope(module, node, scope, started, call)? {
                             // The write would change a value the scope does not
                             // name: a shared DAG is not confinement.
                             return Err(Error::PathNotGranted(path.clone()));
@@ -570,12 +570,16 @@ impl ModuleProvider {
                     encode(&patched).map_err(|error| Error::Payload(error.code().to_string()))?;
                 active_infinity::validate_canonical(&canonical, active_infinity::Limits::default())
                     .map_err(|error| Error::Payload(error.code().to_string()))?;
-                slot.module = active_infinity::decode(&canonical)
+                // Both fields change together: a failure between the two
+                // assignments left a cached hash naming the previous image,
+                // so the module identity and the next patch's parent were
+                // wrong (round 24, F10).
+                let decoded = active_infinity::decode(&canonical)
                     .map_err(|error| Error::Payload(error.code().to_string()))?;
-                slot.hash = Some(
-                    active_infinity::content_hash(&canonical)
-                        .map_err(|error| Error::Payload(error.code().to_string()))?,
-                );
+                let hash = active_infinity::content_hash(&canonical)
+                    .map_err(|error| Error::Payload(error.code().to_string()))?;
+                slot.module = decoded;
+                slot.hash = Some(hash);
                 Ok(Response::Module(bytes))
             }
             "dependents" => {
@@ -895,9 +899,11 @@ fn check_node_budget(module: &InfinityModule, call: &Call) -> Result<()> {
     // Annotations are extra records, each carrying text the metadata walks and
     // the scope closure scan; they are charged against the same node ceiling
     // so a module with one per node cannot make one charged call quadratic
-    // (round 23, #5).
+    // (round 23, #5). The kind is `nodes` for both counts: a distinct label
+    // would let a redacting or scoped caller binary-search a size `stats`
+    // deliberately hides (round 24, F6).
     if module.annotations().len() as u64 > call.budget.max_nodes {
-        return Err(Error::BudgetExceeded("annotations"));
+        return Err(Error::BudgetExceeded("nodes"));
     }
     Ok(())
 }
@@ -936,6 +942,20 @@ fn adjacency(module: &InfinityModule) -> (Vec<Vec<NodeId>>, Vec<Vec<NodeId>>) {
 /// from and `impact` is what is built from it.
 fn transitive(module: &InfinityModule, node: NodeId, walk_dependencies: bool) -> BTreeSet<NodeId> {
     let (dependencies, dependents) = adjacency(module);
+    transitive_with(&dependencies, &dependents, node, walk_dependencies)
+}
+
+/// Transitive closure over an adjacency that the caller built once.
+///
+/// A scope check walks once per matching constraint annotation; rebuilding the
+/// adjacency for each made one round cost `O(annotations x edges)` before any
+/// ceiling could be observed (round 24, F1).
+fn transitive_with(
+    dependencies: &[Vec<NodeId>],
+    dependents: &[Vec<NodeId>],
+    node: NodeId,
+    walk_dependencies: bool,
+) -> BTreeSet<NodeId> {
     let graph = if walk_dependencies {
         dependencies
     } else {
@@ -1046,8 +1066,15 @@ fn immutable_target(module: &InfinityModule, path: &str) -> bool {
 /// A module is a shared DAG: constraining the *target* node is not confinement
 /// if the write changes a value another path can read. A dependent with no
 /// value path of its own is a structural node, not a value the scope names.
-fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> bool {
-    let mut affected = transitive(module, node, false);
+fn effects_within_scope(
+    module: &InfinityModule,
+    node: NodeId,
+    scope: &str,
+    started: std::time::Instant,
+    call: &Call,
+) -> Result<bool> {
+    let (dependencies, dependents) = adjacency(module);
+    let mut affected = transitive_with(&dependencies, &dependents, node, false);
     affected.insert(node);
     // A constraint's expression is part of the validation of its subject: a
     // scoped write may not change the meaning of a rule that watches data
@@ -1056,9 +1083,16 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
     // reversed annotation order let a write through that the forward order
     // refused (round 7, #1).
     loop {
+        check_wall_budget(started, call)?;
         let before = affected.len();
         let subjects = affected.clone();
-        for annotation in module.annotations() {
+        for (index, annotation) in module.annotations().iter().enumerate() {
+            // A round over a hostile annotation count is itself unbounded work;
+            // the ceiling is checked inside it, not only between rounds
+            // (round 24, F1).
+            if index % 64 == 63 {
+                check_wall_budget(started, call)?;
+            }
             if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
                 // The relation is undirected: changing a rule's subject changes
                 // what is validated, and changing its expression changes the
@@ -1069,7 +1103,7 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
                     // The expression's own dependencies too: `scope_closure`
                     // follows them on the read side, and a write that changes
                     // the rule's meaning is the same access (round 8, #4).
-                    affected.extend(transitive(module, *expr, true));
+                    affected.extend(transitive_with(&dependencies, &dependents, *expr, true));
                     affected.insert(*expr);
                     affected.insert(annotation.node);
                 }
@@ -1085,7 +1119,7 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
         .iter()
         .any(|id| matches!(module.get(*id), Some(Inode::Env { .. })))
     {
-        return false;
+        return Ok(false);
     }
     let paths = active_infinity::interop::value_paths(module);
     let root = module.root();
@@ -1097,14 +1131,14 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
         // unconfined (round 15, #1).
         None => Some(*id) == root || in_scope_node(module, *id, scope),
     }) {
-        return false;
+        return Ok(false);
     }
     // A binding is a name for a node: if a dependent is bound outside the
     // scope, changing the node changes what that name resolves to.
-    module
+    Ok(module
         .bindings()
         .iter()
-        .all(|(name, id)| !affected.contains(id) || crate::cap::is_path_prefix(scope, name))
+        .all(|(name, id)| !affected.contains(id) || crate::cap::is_path_prefix(scope, name)))
 }
 
 /// True when `node` is immutable, is inside a marked subtree, or protects one.
@@ -1345,7 +1379,8 @@ fn scope_closure(
     started: std::time::Instant,
     call: &Call,
 ) -> Result<(bool, bool)> {
-    let mut closure = transitive(module, node, true);
+    let (dependencies, dependents) = adjacency(module);
+    let mut closure = transitive_with(&dependencies, &dependents, node, true);
     closure.insert(node);
     // A constraint chain can be arbitrarily deep, so iterate until nothing new
     // arrives; the closure is bounded by the node count, and every round is
@@ -1355,10 +1390,13 @@ fn scope_closure(
         check_wall_budget(started, call)?;
         let before = closure.len();
         let subjects = closure.clone();
-        for annotation in module.annotations() {
+        for (index, annotation) in module.annotations().iter().enumerate() {
+            if index % 64 == 63 {
+                check_wall_budget(started, call)?;
+            }
             if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
                 if subjects.contains(&annotation.node) {
-                    closure.extend(transitive(module, *expr, true));
+                    closure.extend(transitive_with(&dependencies, &dependents, *expr, true));
                     closure.insert(*expr);
                 }
             }

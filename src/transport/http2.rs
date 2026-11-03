@@ -273,9 +273,12 @@ where
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .initial_window_size(MAX_STREAM_WINDOW)
         .initial_connection_window_size(MAX_CONNECTION_WINDOW);
-    let mut connection = builder
-        .handshake(io)
+    // A peer that connects and never sends the preface would otherwise hold
+    // this task (and the join set) forever: the deadline starts at the
+    // handshake, not at the first stream (round 24, F2).
+    let mut connection = tokio::time::timeout(connection_deadline, builder.handshake(io))
         .await
+        .map_err(|_| Error::Transport("h2 handshake timed out".to_string()))?
         .map_err(|error| Error::Transport(format!("h2 handshake: {error}")))?;
     // Streams are handled concurrently; the join set keeps the connection alive
     // until every response has been written.
@@ -406,10 +409,13 @@ where
                 }
                 if !reservation.reserve(chunk.len(), inflight_budget) {
                     // The connection already holds its budget in other streams.
+                    // The class is backpressure, not a wire fault: `rpc/wire`
+                    // is fatal to a client, and a healthy server under budget
+                    // pressure must not be abandoned as hostile (round 24, F8).
                     return respond_status(
                         &mut respond,
                         StatusCode::TOO_MANY_REQUESTS,
-                        b"rpc/wire",
+                        b"rpc/backpressure",
                     );
                 }
                 let len = chunk.len();

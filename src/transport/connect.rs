@@ -260,7 +260,7 @@ impl BridgeServer {
             drain_before_close(&mut stream);
             return 0;
         }
-        let head = match read_head(&mut reader, MAX_HEAD, Some(deadline)) {
+        let head = match read_head(&mut reader, MAX_HEAD, Some(deadline), true) {
             Ok(Some(head)) => head,
             Ok(None) => return 0,
             Err(_) => {
@@ -295,10 +295,24 @@ impl BridgeServer {
         // request ride in front of this one.
         let mut lengths: Vec<usize> = Vec::new();
         let mut transfer_encoding = false;
-        for line in &head {
-            let Some((name, value)) = line.split_once(':') else {
+        for (index, line) in head.iter().enumerate() {
+            if index == 0 {
+                // The request line is parsed on its own.
                 continue;
+            }
+            // A field the server ignores is a field a gateway may act on: an
+            // unparsable line or a name that is not a token is a refusal, not
+            // something to skip (round 24, F3).
+            let Some((name, value)) = line.split_once(':') else {
+                let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                drain_before_close(&mut stream);
+                return 0;
             };
+            if name.is_empty() || !name.bytes().all(crate::tool::is_http_token) {
+                let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                drain_before_close(&mut stream);
+                return 0;
+            }
             if name.eq_ignore_ascii_case("transfer-encoding") {
                 transfer_encoding = true;
             }
@@ -361,8 +375,14 @@ impl BridgeServer {
             // A truncated body is one bad connection, not a server failure:
             // answer 400 for it and keep accepting the next one. Growing the
             // buffer with the bytes that arrive means a header that announces
-            // 64 MiB and sends ten bytes costs 64 KiB, not 64 MiB.
-            let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            // 64 MiB and sends ten bytes costs 64 KiB, not 64 MiB. A body that
+            // ran out of time is a timeout instead, the same discrimination
+            // the head path makes (round 24, F4).
+            if std::time::Instant::now() >= deadline {
+                let _ = write_http_response(&mut stream, 408, b"rpc/transport");
+            } else {
+                let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            }
             drain_before_close(&mut stream);
             return 0;
         }
@@ -438,6 +458,7 @@ fn read_head(
     reader: &mut BufReader<TcpStream>,
     max: usize,
     deadline: Option<std::time::Instant>,
+    request_side: bool,
 ) -> Result<Option<Vec<String>>> {
     let mut head = Vec::new();
     let mut total = 0usize;
@@ -479,12 +500,25 @@ fn read_head(
         if body.is_empty() {
             break;
         }
+        // RFC 9112 has no folded line: a line that starts with a space or a
+        // tab is obs-fold, and a front proxy that ends the block there while
+        // this server reads the fold sees a different request (round 24, F3).
+        if matches!(body.first(), Some(b' ' | b'\t')) {
+            return Err(Error::Wire("request head line starts with whitespace"));
+        }
         // An HTTP/1.1 field is an ASCII token plus a UTF-8 value. A lossy
         // decode turned an invalid byte into U+FFFD, so a `transfer-encoding`
         // name carrying one was not the name the peer sent and slipped past
         // the refusal (round 23, #4).
-        let Ok(line) = String::from_utf8(body.to_vec()) else {
-            return Err(Error::Wire("request head line is not UTF-8"));
+        let line = if request_side {
+            let Ok(line) = String::from_utf8(body.to_vec()) else {
+                return Err(Error::Wire("request head line is not UTF-8"));
+            };
+            line
+        } else {
+            // A response field value may carry obs-text; a lossy decode cannot
+            // turn a field name into another token (round 24, F11).
+            String::from_utf8_lossy(body).into_owned()
         };
         head.push(line);
     }
@@ -555,18 +589,35 @@ fn resolve_within(
     deadline: std::time::Instant,
 ) -> Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // A resolver that never returns would otherwise leave one parked thread
+    // per call; the process keeps at most this many, and a refused call is a
+    // transport fault rather than an unbounded leak (round 24, F5).
+    const MAX_LIVE_RESOLVERS: usize = 64;
+    static LIVE_RESOLVERS: AtomicUsize = AtomicUsize::new(0);
+    // An already-spent budget must not spawn anything.
+    let left = remaining(deadline)?;
+    let live = LIVE_RESOLVERS.fetch_add(1, Ordering::SeqCst);
+    if live >= MAX_LIVE_RESOLVERS {
+        LIVE_RESOLVERS.fetch_sub(1, Ordering::SeqCst);
+        return Err(Error::Transport("resolver busy".to_string()));
+    }
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let target = address.to_string();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("active-rpc-resolve".to_string())
         .spawn(move || {
             let result = target
                 .to_socket_addrs()
                 .map(|addresses| addresses.collect::<Vec<_>>());
             let _ = sender.send(result);
-        })
-        .map_err(|error| Error::Transport(format!("resolve thread: {error}")))?;
-    match receiver.recv_timeout(remaining(deadline)?) {
+            LIVE_RESOLVERS.fetch_sub(1, Ordering::SeqCst);
+        });
+    if let Err(error) = spawned {
+        LIVE_RESOLVERS.fetch_sub(1, Ordering::SeqCst);
+        return Err(Error::Transport(format!("resolve thread: {error}")));
+    }
+    match receiver.recv_timeout(left) {
         Ok(Ok(addresses)) => Ok(addresses),
         Ok(Err(error)) => Err(Error::Transport(format!("resolve: {error}"))),
         Err(_) => Err(Error::Transport("resolve timed out".to_string())),
@@ -579,6 +630,9 @@ pub struct ConnectClient {
     limits: WireLimits,
     /// Wall deadline for one request, when the caller sets one.
     deadline: Option<std::time::Duration>,
+    /// Addresses from the first successful lookup, so a long-lived client
+    /// resolves once (round 24, F5).
+    resolved: Option<Vec<std::net::SocketAddr>>,
 }
 
 impl ConnectClient {
@@ -590,6 +644,7 @@ impl ConnectClient {
             address: address.to_string(),
             limits: WireLimits::default(),
             deadline: None,
+            resolved: None,
         })
     }
 
@@ -647,7 +702,15 @@ impl ConnectClient {
         let deadline = std::time::Instant::now()
             .checked_add(wait)
             .unwrap_or_else(std::time::Instant::now);
-        let address = resolve_within(&self.address, deadline)?
+        let addresses = match &self.resolved {
+            Some(addresses) => addresses.clone(),
+            None => {
+                let addresses = resolve_within(&self.address, deadline)?;
+                self.resolved = Some(addresses.clone());
+                addresses
+            }
+        };
+        let address = addresses
             .first()
             .copied()
             .ok_or_else(|| Error::Transport("no address".to_string()))?;
@@ -670,7 +733,7 @@ impl ConnectClient {
         // never come (the client sends exactly `content-length`).
         let _ = stream.shutdown(std::net::Shutdown::Write);
         let mut reader = BufReader::new(stream);
-        let Some(head) = read_head(&mut reader, MAX_HEAD, Some(deadline))? else {
+        let Some(head) = read_head(&mut reader, MAX_HEAD, Some(deadline), false)? else {
             return Err(Error::Transport(
                 "bridge closed without a response".to_string(),
             ));
@@ -678,6 +741,10 @@ impl ConnectClient {
         let status: u16 = head
             .first()
             .and_then(|line| line.split_whitespace().nth(1))
+            // `u16::from_str` accepts `+200` and `0200`; RFC 9112 defines three
+            // digits, and a lenient parse lets an intermediary's non-status be
+            // read as success (round 24, F7).
+            .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
             .and_then(|code| code.parse().ok())
             .ok_or(Error::Wire("malformed status line"))?;
         // The server refuses `+25`, a duplicate length and a

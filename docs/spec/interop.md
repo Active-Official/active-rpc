@@ -35,7 +35,11 @@ a head or body that runs past the connection budget is `408` with
 `rpc/transport`.
 `BridgeServer` accepts a fixed number of requests and `ConnectClient` can post
 raw bodies (`post_raw`) or a chosen content type (`post_typed`) for negative
-tests.
+tests. A client created without `with_deadline` has a 2 s budget for the whole
+request, name resolution included; a lookup or connect that overruns it is
+`rpc/transport`. The client resolves once and reuses the addresses, and at most
+64 resolver threads run process-wide, so a hung resolver cannot grow the
+process without bound.
 
 ## Authority
 

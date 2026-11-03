@@ -102,6 +102,29 @@ fn http2_rejects_a_wrong_path_a_wrong_media_type_and_a_malformed_body() {
     serve.join().expect("join").expect("serve");
 }
 
+/// A peer that connects and never sends the preface is dropped at the
+/// connection deadline instead of holding the serve task (round 24, F2).
+#[test]
+fn a_silent_connection_is_dropped_at_the_deadline() {
+    use std::time::{Duration, Instant};
+
+    let server = Http2Server::bind_loopback()
+        .expect("bind")
+        .with_connection_deadline(Duration::from_millis(50));
+    let address = server.address().to_string();
+    let serve = std::thread::spawn(move || server.serve(1, handler));
+    let quiet = std::net::TcpStream::connect(&address).expect("connect");
+    let started = Instant::now();
+    let served = serve.join().expect("join").expect("serve");
+    assert_eq!(served, 0, "a silent peer served nothing");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "serve held for {:?}",
+        started.elapsed()
+    );
+    drop(quiet);
+}
+
 #[test]
 fn http2_enforces_wire_limits_from_the_server_side() {
     let server = Http2Server::bind_loopback()
@@ -119,6 +142,28 @@ fn http2_enforces_wire_limits_from_the_server_side() {
     assert_eq!(status.as_u16(), 400);
     assert_eq!(body, b"rpc/wire");
 
+    drop(client);
+    serve.join().expect("join").expect("serve");
+}
+
+/// A connection over its in-flight budget answers backpressure, not a wire
+/// fault: `rpc/wire` is fatal to a client, and a healthy server under load
+/// must not be abandoned as hostile (round 24, F8).
+#[test]
+fn an_inflight_budget_refusal_is_backpressure() {
+    let server = Http2Server::bind_loopback()
+        .expect("bind")
+        .with_inflight_budget(1);
+    let address = server.address().to_string();
+    let serve = std::thread::spawn(move || server.serve(1, handler));
+
+    let mut client = Http2Client::connect(&address).expect("connect");
+    let body = sample_envelope(5).encode().expect("encode");
+    let (status, body) = client
+        .request_raw(PATH, CONTENT_TYPE, &body)
+        .expect("over budget");
+    assert_eq!(status.as_u16(), 429);
+    assert_eq!(body, b"rpc/backpressure");
     drop(client);
     serve.join().expect("join").expect("serve");
 }

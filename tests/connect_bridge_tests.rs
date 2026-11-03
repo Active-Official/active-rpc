@@ -345,6 +345,109 @@ fn a_wrong_target_is_a_wire_refusal() {
     assert_eq!(served, 0);
 }
 
+/// A folded or whitespace-only line, and a field whose name is not a token,
+/// are refusals, not lines to skip: a gateway that ends the block at the
+/// whitespace sees a different request (round 24, F3).
+#[test]
+fn a_folded_or_untokenized_head_line_is_refused() {
+    use std::io::{Read, Write};
+
+    let cases: [&[u8]; 2] = [
+        b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: active-rpc\r\ncontent-length: 0\r\n \r\ncontent-length: 37\r\n\r\n",
+        b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: active-rpc\r\nbad name: x\r\ncontent-length: 0\r\n\r\n",
+    ];
+    for request in cases {
+        let server = BridgeServer::bind_loopback().expect("bind");
+        let address = server.address().to_string();
+        let bytes = request.to_vec();
+        let client = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+            stream.write_all(&bytes).expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read");
+            response
+        });
+        let mut served = 0;
+        server
+            .serve(1, |envelope| {
+                served += 1;
+                Envelope::error(
+                    envelope.request_id,
+                    &Error::Transport("unreachable".to_string()),
+                )
+            })
+            .expect("serve");
+        let response = client.join().expect("client");
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "expected a 400, got {response:?}"
+        );
+        assert_eq!(served, 0);
+    }
+}
+
+/// A body that runs past the connection budget is a timeout, matching the head
+/// path and the interop spec (round 24, F4).
+#[test]
+fn a_stalled_body_is_408_request_timeout() {
+    use std::io::{Read, Write};
+
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+        stream
+            .write_all(
+                b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: active-rpc\r\ncontent-type: application/connect+active-infinity\r\ncontent-length: 64\r\n\r\n",
+            )
+            .expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    });
+    let mut served = 0;
+    server
+        .serve(1, |envelope| {
+            served += 1;
+            Envelope::error(
+                envelope.request_id,
+                &Error::Transport("unreachable".to_string()),
+            )
+        })
+        .expect("serve");
+    let response = client.join().expect("client");
+    assert!(
+        response.starts_with("HTTP/1.1 408 Request Timeout"),
+        "expected a 408, got {response:?}"
+    );
+    assert!(response.contains("rpc/transport"), "{response}");
+    assert_eq!(served, 0);
+}
+
+/// The client reads only a three-digit status: a lenient `u16` parse accepted
+/// `+200` and treated an intermediary's non-status as success (round 24, F7).
+#[test]
+fn a_non_three_digit_status_is_a_wire_fault() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut scratch = [0u8; 4096];
+        let _ = stream.read(&mut scratch);
+        stream
+            .write_all(b"HTTP/1.1 +200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .expect("write");
+    });
+    let mut client = ConnectClient::connect(&address).expect("connect");
+    let error = client
+        .call(&request(18, "echo", Vec::new()))
+        .expect_err("a signed status is not a status");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+    server.join().expect("server");
+}
+
 /// A truncated body is one bad connection: the bridge answers 400 and keeps
 /// accepting. Before this, the read error aborted `serve`, so one hostile
 /// connection could refuse service to every later caller.
