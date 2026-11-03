@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use active_rpc::error::Error;
 use active_rpc::kernel::Provider;
 use active_rpc::tool::{McpSession, McpTransport, MAX_MCP_LINE_BYTES};
-use active_rpc::value::{Call, Response, Value};
+use active_rpc::value::{Arg, Call, Response, Value};
 
 struct Scripted {
     queue: VecDeque<String>,
@@ -528,4 +528,32 @@ fn has_method_does_not_rebuild_the_method_table() {
         elapsed < std::time::Duration::from_secs(1),
         "2 000 membership checks over {count} tools took {elapsed:?}"
     );
+}
+
+/// A frame that reuses our id but carries a `method` is a server-initiated
+/// request, not the answer to our call (round 18, L-3).
+#[test]
+fn a_server_request_with_our_id_is_not_an_answer() {
+    let (initialize, list) = handshake_responses();
+    let response = r#"{"jsonrpc":"2.0","id":3,"method":"sampling/createMessage","result":{}}"#;
+    let mut session = McpSession::handshake(Scripted::new(&[
+        initialize.as_str(),
+        list.as_str(),
+        response,
+    ]))
+    .expect("handshake");
+    let mut call = Call::new("read", vec![Arg::text("x")]);
+    call.tool_allows_process = true;
+    let error = Provider::invoke(&mut session, 0, &call).expect_err("a request is not an answer");
+    assert_eq!(error.provider_code(), Some("mcp/id-mismatch"), "{error}");
+}
+
+/// A failed `tools/list` keeps the server pair's code, as `initialize` does
+/// (round 18, L-4).
+#[test]
+fn a_tools_list_error_keeps_the_server_code() {
+    let (initialize, _) = handshake_responses();
+    let list = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"nope"}}"#;
+    let session = McpSession::handshake(Scripted::new(&[initialize.as_str(), list]));
+    assert_eq!(code(session), "mcp/-32000");
 }

@@ -127,6 +127,26 @@ fn the_table_ceiling_is_validated() {
     }
 }
 
+/// The declared memory ceiling is charged before the instance exists: a
+/// quarter-gigabyte module under a small grant is refused quickly instead of
+/// allocating first (round 18, #1).
+#[test]
+fn a_memory_reservation_is_charged_before_instantiation() {
+    let started = std::time::Instant::now();
+    let limits = WasmLimits {
+        fuel: 10_000,
+        max_memory_bytes: 256 << 20,
+        ..WasmLimits::default()
+    };
+    let mut tool = WasmTool::from_bytes(&binary(CONSTANT), limits).expect("compile");
+    assert_eq!(error_code(tool.call(b"")), "wasm/limits");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "the memory was materialised before the refusal: {:?}",
+        started.elapsed()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // W3: the call's wall budget bounds the guest
 // ---------------------------------------------------------------------------
@@ -232,8 +252,12 @@ fn an_import_with_the_right_name_but_the_wrong_kind_is_refused() {
 
 #[test]
 fn a_start_function_out_of_fuel_is_a_fuel_refusal() {
+    // The default 16 MiB memory reservation would spend the whole grant before
+    // the start function runs (round 18, #1), so the ceiling is the minimum:
+    // the loop is then what exhausts the fuel.
     let limits = WasmLimits {
         fuel: 10_000,
+        max_memory_bytes: active_rpc::wasm_tool::MIN_MEMORY_BYTES,
         ..WasmLimits::default()
     };
     let mut tool = WasmTool::from_bytes(&binary(START_LOOP), limits).expect("compile");

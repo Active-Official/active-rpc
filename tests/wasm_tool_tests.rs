@@ -102,6 +102,9 @@ fn a_guest_round_trips_its_input_through_memory() {
 fn fuel_exhaustion_is_refused_with_its_own_code() {
     let limits = WasmLimits {
         fuel: 10_000,
+        // The 16 MiB ceiling would spend the grant before the guest runs
+        // (round 18, #1); this test is about the guest's own fuel.
+        max_memory_bytes: active_rpc::wasm_tool::MIN_MEMORY_BYTES,
         ..WasmLimits::default()
     };
     let mut tool = WasmTool::from_bytes(&binary(BURN), limits).expect("compile");
@@ -196,6 +199,9 @@ fn a_fuel_refusal_reaches_the_caller_through_the_kernel() {
     let agent = Agent::with_secret([0x2d; 32]);
     let limits = WasmLimits {
         fuel: 10_000,
+        // The 16 MiB ceiling would spend the grant before the guest runs
+        // (round 18, #1); this test is about the guest's own fuel.
+        max_memory_bytes: active_rpc::wasm_tool::MIN_MEMORY_BYTES,
         ..WasmLimits::default()
     };
     let tool = WasmTool::from_bytes(&binary(BURN), limits).expect("compile");

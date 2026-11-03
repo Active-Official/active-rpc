@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-24: 24 found 2 highs + 4 mediums, fixed; round 25 is the confirmation | 139 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-17: ... + 5 findings; round 18 is the confirmation | 142 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-18: ... + 7 findings; round 19 is the confirmation | 149 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -167,6 +167,30 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 18)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `fc176bd`. All five
+round-17 fixes verified. One medium (a wasm wall bypass the earlier section had
+recorded as a residual) and six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `WasmTool` materialised the declared memory (up to 256 MiB, ~90 ms) before charging its fuel, so a 1 ms grant spent host CPU on an allocation it then refused | **fixed**: the declared ceiling is reserved against the fuel before `instantiate_and_start`, and the difference against the materialised size is refunded; `a_memory_reservation_is_charged_before_instantiation`; two fuel tests now set the memory ceiling explicitly |
+| 2 | low | only one leading BOM was stripped, so `"\u{FEFF}\u{FEFF}[huge]"` or `" \u{FEFF}[huge]"` skipped the size gate and answered text | **fixed**: the decode and the gates share one `trim_start_matches` over whitespace and BOM; the token test runs three prefixes |
+| 3 | low | a frame that reused our id but carried a `method` was accepted as the answer | **fixed**: `mcp/id-mismatch`; `a_server_request_with_our_id_is_not_an_answer` |
+| 4 | low | a failed `tools/list` was reported as a missing array (`mcp/tools`), losing the server's code | **fixed**: `mcp/<code>` like `initialize`; `a_tools_list_error_keeps_the_server_code` |
+| 5 | low | a NUL in the working directory reached `Command` and surfaced as a provider fault | **fixed**: `rpc/invalid-argument` at `with_current_dir` and at invoke; `a_nul_working_directory_is_refused` |
+| 6 | low | `body_exact` allocated the peer-declared length before reading | **fixed**: grows with the bytes that arrive, 4 KiB at a time |
+| 7 | low | `send_line(None)` spun forever on a full writer queue | **fixed**: the queue wait is bounded at 5 s even with no deadline; the ack stays unbounded because a large line may legitimately take long |
+
+Residuals recorded: a parent-directory swap between `canonicalize` and spawn can
+still redirect the pinned path (needs directory write access); the HTTP
+adapter's resolver has no ceiling of its own (operator endpoint, documented);
+the MCP reader queue is 64 x 1 MiB.
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt clean; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 17)
 

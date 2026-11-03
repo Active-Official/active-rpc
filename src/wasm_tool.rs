@@ -413,6 +413,19 @@ impl WasmTool {
         }
         // A start function that traps keeps its log: the log is diagnostic
         // evidence (ADR-0019), not a success signal.
+        // Reserve the declared memory ceiling before the instance exists: a
+        // module that asks for 256 MiB must not spend the allocation (and its
+        // wall time) before the refusal (round 18, #1). The difference between
+        // the reservation and the materialised size is refunded below.
+        let reserved_kib = (self.limits.max_memory_bytes as u64).div_ceil(1024);
+        let reserved_fuel = reserved_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
+        let granted = store.get_fuel().unwrap_or(0);
+        if reserved_fuel > granted {
+            return Err(provider("wasm/limits"));
+        }
+        store
+            .set_fuel(granted - reserved_fuel)
+            .map_err(|_| provider("wasm/fuel"))?;
         let instance = match linker.instantiate_and_start(&mut store, &self.module) {
             Ok(instance) => instance,
             Err(error) => {
@@ -432,12 +445,14 @@ impl WasmTool {
         let memory_kib = (memory.data_size(&store) as u64).div_ceil(1024);
         let memory_fuel = memory_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
         let remaining = store.get_fuel().unwrap_or(0);
-        if memory_fuel > remaining {
+        if memory_fuel > reserved_fuel {
+            // The store limiter caps the materialised size at the reservation,
+            // so this is a defensive refusal, not a reachable one.
             self.log = std::mem::take(&mut store.data_mut().log);
             return Err(provider("wasm/limits"));
         }
         store
-            .set_fuel(remaining - memory_fuel)
+            .set_fuel(remaining + (reserved_fuel - memory_fuel))
             .map_err(|_| provider("wasm/fuel"))?;
         {
             let data = memory.data_mut(&mut store);

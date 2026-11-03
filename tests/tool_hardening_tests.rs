@@ -449,6 +449,29 @@ fn a_json_body_past_the_token_ceiling_is_too_complex() {
 
     // A leading byte-order mark is ignored, so the same body is still gated
     // (round 17, F-5).
+    // Any run of a byte-order mark and whitespace is skipped, so repeated
+    // or spaced marks cannot hide the body from the gate (round 18, L-2).
+    for prefix in ["\u{feff}", "\u{feff}\u{feff}", " \u{feff}"] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let scripted = format!("{prefix}{body}");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{scripted}",
+            scripted.len()
+        );
+        fixed_response(listener, response.into_bytes());
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/bom")]);
+        tool.max_body = 4 << 20;
+        let error = tool
+            .invoke(0, &http_get("/bom", 20_000))
+            .expect_err("a prefix does not hide a huge body");
+        assert_eq!(
+            error.provider_code(),
+            Some("http/too-complex"),
+            "{prefix:?}: {error}"
+        );
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
     let scripted = format!("\u{feff}{body}");
@@ -1226,6 +1249,28 @@ fn a_program_that_does_not_resolve_is_refused() {
     #[cfg(not(windows))]
     let missing = "/nonexistent-active-rpc-program";
     let error = LocalProcess::new(missing, &[]).expect_err("a missing program");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// A working directory with an interior NUL never reaches `Command`, which
+/// would panic; it is an argument fault (round 18, L-5).
+#[test]
+fn a_nul_working_directory_is_refused() {
+    #[cfg(windows)]
+    let (program, bad) = ("C:\\Windows\\System32\\cmd.exe", "C:\\x\0");
+    #[cfg(not(windows))]
+    let (program, bad) = ("/bin/sh", "/x\0");
+    let tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    let error = tool.with_current_dir(bad).expect_err("a NUL directory");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+
+    // The field is public: a caller that assigns it directly is refused at
+    // invoke.
+    let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    tool.workdir = std::path::PathBuf::from(bad);
+    let mut call = Call::new("run", vec![Arg::text("echo")]);
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("a NUL directory");
     assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
 }
 

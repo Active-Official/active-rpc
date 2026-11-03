@@ -631,21 +631,24 @@ impl DeadlineReader {
 
     /// Read exactly `length` body bytes under the wall deadline.
     fn body_exact(&mut self, length: usize) -> Result<Vec<u8>> {
-        let mut body = vec![0u8; length];
-        let mut filled = 0usize;
-        while filled < length {
+        // Grow with the bytes that actually arrive: a peer-declared 64 MiB
+        // body used to be allocated before the first read, and a short body
+        // paid the whole reservation (round 18, L-6).
+        let mut body = Vec::with_capacity(length.min(64 * 1024));
+        let mut chunk = [0u8; 4_096];
+        while body.len() < length {
             self.arm()?;
-            let want = (length - filled).min(4_096);
+            let want = (length - body.len()).min(chunk.len());
             let read = self
                 .reader
-                .read(&mut body[filled..filled + want])
+                .read(&mut chunk[..want])
                 .map_err(map_http_read)?;
             if read == 0 {
                 return Err(Error::Provider {
                     code: "http/read:truncated-body".to_string(),
                 });
             }
-            filled += read;
+            body.extend_from_slice(&chunk[..read]);
             remaining_until(self.deadline)?;
         }
         Ok(body)
@@ -920,6 +923,15 @@ impl McpTransport for StdioTransport {
         // forever (round 11, #1). `try_send` under the deadline keeps the
         // promise the trait makes.
         let mut command = (line.to_string(), reply);
+        // A caller with no deadline still gets a bounded queue wait: the writer
+        // blocks while the child does not read, and an unbounded loop parked
+        // the dispatch thread forever (round 18, L-7). The ack below is still
+        // unbounded, because a large line may legitimately take long to write.
+        let enqueue_deadline = deadline.unwrap_or_else(|| {
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(5))
+                .unwrap_or_else(std::time::Instant::now)
+        });
         loop {
             match self.writer.try_send(command) {
                 Ok(()) => break,
@@ -930,10 +942,8 @@ impl McpTransport for StdioTransport {
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
                     command = returned;
-                    if let Some(deadline) = deadline {
-                        if std::time::Instant::now() >= deadline {
-                            return Err(Error::Timeout);
-                        }
+                    if std::time::Instant::now() >= enqueue_deadline {
+                        return Err(Error::Timeout);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -1059,6 +1069,19 @@ impl<T: McpTransport> McpSession<T> {
             });
         }
         let list = session.request_within("tools/list", json!({}), deadline)?;
+        if let Some(error) = list.get("error") {
+            // `initialize` already keeps the server's code; a failed list was
+            // reported as a missing array and the code was lost
+            // (round 18, L-4).
+            let Some(code) = error.get("code").and_then(Json::as_i64) else {
+                return Err(Error::Provider {
+                    code: "mcp/bad-response".to_string(),
+                });
+            };
+            return Err(Error::Provider {
+                code: format!("mcp/{code}"),
+            });
+        }
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let Some(items) = list
             .get("result")
@@ -1230,7 +1253,10 @@ impl<T: McpTransport> McpSession<T> {
                 });
             };
             match object.get("id") {
-                Some(value) if value.as_u64() == Some(id) => {
+                // A frame carrying a `method` is a server-initiated request,
+                // whatever id it reuses: answering it as our result lets a
+                // peer choose the shape of our answer (round 18, L-3).
+                Some(value) if value.as_u64() == Some(id) && !object.contains_key("method") => {
                     if object.get("result").is_none() && object.get("error").is_none() {
                         self.poisoned = true;
                         return Err(Error::Provider {
@@ -1906,8 +1932,12 @@ impl Provider for HttpTool {
         };
         // RFC 8259 lets a parser ignore a leading byte-order mark; serde_json
         // does not, and an unstripped one would hide a huge array from the size
-        // gate and the number scan (round 17, F-5).
-        let json_text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        // gate and the number scan (round 17, F-5). Whitespace and repeated
+        // marks are skipped too: one `strip_prefix` let `" \u{feff}[huge]"`
+        // through as text (round 18, L-2).
+        let json_text = text.trim_start_matches(|character: char| {
+            character.is_whitespace() || character == '\u{feff}'
+        });
         // Only an object or an array can hold more nodes than the ceiling (a
         // top-level scalar is one node), so a large non-JSON body — a CSV or a
         // log extract — is left as text (round 15, F-6). The token gate runs
@@ -2060,6 +2090,14 @@ fn pin_program(program: &str, refusal: &'static str) -> Result<PathBuf> {
         .map_err(|_| Error::InvalidArgument("the program path does not resolve"))
 }
 
+/// Whether an encoded path carries an interior NUL.
+///
+/// `Command` panics on one, and the panic is not a provider fault a retry
+/// policy can interpret (round 18, L-5).
+fn has_nul(path: &std::path::Path) -> bool {
+    path.as_os_str().as_encoded_bytes().contains(&0)
+}
+
 /// A sandboxed local process tool.
 ///
 /// The allowlist is the program plus its permitted argument prefixes. The child
@@ -2125,6 +2163,11 @@ impl LocalProcess {
         if !directory.is_absolute() {
             return Err(Error::InvalidArgument(
                 "a process working directory must be absolute",
+            ));
+        }
+        if has_nul(&directory) {
+            return Err(Error::InvalidArgument(
+                "a process working directory contains a NUL byte",
             ));
         }
         self.workdir = directory;
@@ -2261,6 +2304,11 @@ impl Provider for LocalProcess {
         if !self.workdir.is_absolute() {
             return Err(Error::InvalidArgument(
                 "a process working directory must be absolute",
+            ));
+        }
+        if has_nul(&self.workdir) {
+            return Err(Error::InvalidArgument(
+                "a process working directory contains a NUL byte",
             ));
         }
         let mut command = Command::new(&self.resolved);
