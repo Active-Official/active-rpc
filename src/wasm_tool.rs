@@ -523,6 +523,14 @@ impl Provider for WasmTool {
                 "the wasm adapter reads its input from a single argument, not a payload",
             ));
         }
+        if call.path_scope.is_some() {
+            // The input is bytes and the kernel inspects only `Value::Path`: a
+            // scope attached here would read as confinement while enforcing
+            // nothing (round 10, F-6).
+            return Err(Error::ToolPolicy(
+                "this adapter cannot enforce a path scope",
+            ));
+        }
         let mut input = None;
         for arg in &call.args {
             let bytes = match arg {

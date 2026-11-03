@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-17: ... + 6 findings; round-17 fixes green, confirmation round pending | 102 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-9: 15 + 16 + 9 + 6 + 6 + 2 + 2 + 9 + 8 findings; round-9 fixes green, confirmation round pending | 68 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-10: ... + 10 findings; round-10 fixes green, confirmation round pending | 77 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -98,6 +98,35 @@ fixes verified; two mediums and two lows.
 | 4 | low | a path or method with a newline or bidi override reached `Display` verbatim (log forging) | **fixed**: caller text is escaped in `Display` (`PathNotGranted`, `TopicNotGranted`, `MethodNotGranted`) |
 
 Gate: 88 suites / 856 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 10)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `d3facc0`.
+Six of the eight round-9 fixes held fully; two highs and four mediums, plus
+five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the writer-thread spawn failure path returned without killing the child (the reader path did) | **fixed**: it kills the tree too |
+| 2 | high | a child that floods its output blocked on the pipe, so the call burned the whole grant and answered `Timeout` instead of the output refusal | **fixed**: the wait loop drains the report channel and refuses `rpc/tool-policy` as soon as a buffer passes `max_output`; `an_output_flood_is_refused_not_waited_out` (200k lines, 5 s grant, refused in < 3 s) |
+| 3 | medium | a timeout after the frame left was treated as retryable: the answer was still in flight and a retry read it as the next answer while the peer had run the tool | **fixed**: every receive timeout poisons the session; `a_post_send_timeout_poisons_the_session` |
+| 4 | medium | `LocalProcess` used `thread::spawn` (panics on failure) and leaked the child | **fixed**: a named builder, a `process/thread:<err>` code, and the tree is killed |
+| 5 | medium | the spec claimed one deadline covers resolve; resolution happens outside it | **fixed**: the spec states the resolver is outside the deadline |
+| 6 | medium | `WasmTool` accepted a `path_scope` the kernel cannot enforce | **fixed**: refused with `rpc/tool-policy`, as the text adapters do |
+| 7 | low | a malformed JSON-RPC error object was reported as `mcp/0` | **fixed**: `mcp/bad-response`; `a_malformed_error_object_is_a_bad_response` |
+| 8 | low | two handshake constants, and the fallback used unchecked `Instant + Duration` | **fixed**: one constant, `checked_add` |
+| 9 | low | `http/body:<err>` was documented and never emitted; the status-line UTF-8 fault was described narrowly | **fixed**: the table matches the code |
+| 10 | low | the argument-cap test only asserted the arithmetic | **recorded**: the strengthened kernel+policy test is scheduled with the resource-bomb pass |
+| 11 | low | the workdir is absolute-checked but not canonicalised, while the spec implied a symlink swap was covered | **fixed**: the spec says what the code does |
+
+Residuals recorded: the reader queue is count- not byte-bounded (64 x 1 MiB);
+the writer blocks on a full pipe until the session drops; `kill_process_tree`
+can lose a tree that `setsid`s away and may signal a recycled pid; MCP has no
+`notifications/initialized`, `protocolVersion` check or pagination; positional
+`argN` arguments cannot address a declared `inputSchema`.
+
+Gate: 88 suites / 861 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 9)

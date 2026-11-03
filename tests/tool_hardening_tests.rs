@@ -1256,3 +1256,132 @@ fn the_advertised_cap_leaves_escaping_room() {
         policy.max_arg_bytes
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 10
+// ---------------------------------------------------------------------------
+
+/// A child that floods its output is refused instead of waited out (round 10,
+/// F-2).
+#[test]
+fn an_output_flood_is_refused_not_waited_out() {
+    use std::time::{Duration, Instant};
+
+    #[cfg(windows)]
+    let (program, args) = (
+        "C:\\Windows\\System32\\cmd.exe",
+        vec![
+            "/C",
+            "for /L %i in (1,1,200000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        ],
+    );
+    #[cfg(not(windows))]
+    let (program, args) = (
+        "/bin/sh",
+        vec!["-c", "yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
+    );
+    let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    let mut call = Call::new("run", args.iter().map(|arg| Arg::text(*arg)).collect());
+    call.tool_allows_process = true;
+    call.budget.max_wall_ms = 5_000;
+    let started = Instant::now();
+    let error = tool.invoke(0, &call).expect_err("the flood is refused");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the refusal waited {:?}",
+        started.elapsed()
+    );
+}
+
+/// A malformed JSON-RPC error object is a bad response, not code 0
+/// (round 10, F-7).
+#[test]
+fn a_malformed_error_object_is_a_bad_response() {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/call".to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"error":{}}"#.to_string(),
+    );
+    let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
+    let mut call = Call::new("echo", Vec::new());
+    call.tool_allows_process = true;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("a malformed error object");
+    assert_eq!(error.provider_code(), Some("mcp/bad-response"), "{error}");
+}
+
+/// A timeout after the frame left poisons the session: the answer is still in
+/// flight (round 10, F-3).
+#[test]
+fn a_post_send_timeout_poisons_the_session() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+
+    /// Answers the handshake, then never answers again.
+    struct Silent {
+        inner: MemoryTransport,
+        answers: usize,
+    }
+
+    impl McpTransport for Silent {
+        fn send_line(&mut self, line: &str) -> active_rpc::Result<()> {
+            self.inner.send_line(line)
+        }
+        fn recv_line(&mut self) -> active_rpc::Result<String> {
+            self.recv_line_within(None)
+        }
+        fn recv_line_within(
+            &mut self,
+            deadline: Option<std::time::Instant>,
+        ) -> active_rpc::Result<String> {
+            if self.answers == 0 {
+                return Err(active_rpc::Error::Timeout);
+            }
+            self.answers -= 1;
+            self.inner.recv_line_within(deadline)
+        }
+    }
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(Silent {
+        inner: MemoryTransport::new(responses),
+        answers: 2,
+    })
+    .expect("handshake");
+    let mut call = Call::new("echo", Vec::new());
+    call.tool_allows_process = true;
+    call.budget.max_wall_ms = 50;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the answer never arrives");
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("a poisoned session refuses");
+    assert!(
+        error
+            .provider_code()
+            .is_some_and(|code| code == "mcp/desync"),
+        "{error}"
+    );
+}

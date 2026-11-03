@@ -158,7 +158,7 @@ pub trait McpTransport {
 }
 
 /// Default ceiling for a handshake that names none.
-const DEFAULT_HANDSHAKE_MS: u64 = 5_000;
+const DEFAULT_HANDSHAKE_MS: u64 = DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS;
 
 /// Lines the reader thread may hold while the session is busy.
 ///
@@ -650,8 +650,13 @@ impl StdioTransport {
                     }
                 }
             })
-            .map_err(|error| Error::Provider {
-                code: format!("mcp/thread:{error}"),
+            .map_err(|error| {
+                // The reader's arm already kills the child; this one must too
+                // (`Child::Drop` neither kills nor reaps) (round 10, F-1).
+                kill_process_tree(&mut child);
+                Error::Provider {
+                    code: format!("mcp/thread:{error}"),
+                }
             })?;
         Ok(Self {
             child,
@@ -776,7 +781,9 @@ impl<T: McpTransport> McpSession<T> {
         // A handshake without a ceiling would hold the dispatch thread for as
         // long as a silent server stays silent (round 8, F8).
         let deadline = Some(deadline.unwrap_or_else(|| {
-            std::time::Instant::now() + std::time::Duration::from_millis(DEFAULT_HANDSHAKE_MS)
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(DEFAULT_HANDSHAKE_MS))
+                .unwrap_or_else(std::time::Instant::now)
         }));
         let mut session = McpSession {
             transport,
@@ -920,13 +927,13 @@ impl<T: McpTransport> McpSession<T> {
             let line = match self.transport.recv_line_within(deadline) {
                 Ok(line) => line,
                 Err(error) => {
-                    // A timeout leaves the stream where it was and can be
-                    // retried; every other failure means the framing is broken,
-                    // and the next read could answer with a stale remainder
-                    // (round 4, #6).
-                    if !matches!(error, Error::Timeout) {
-                        self.poisoned = true;
-                    }
+                    // The frame has already left (a send failure returned
+                    // above), so a timeout here means the answer is still in
+                    // flight: retrying would read it as the next answer while
+                    // the peer has already run the (possibly mutating) tool
+                    // (round 10, F-3).
+                    let _ = matches!(error, Error::Timeout);
+                    self.poisoned = true;
                     return Err(error);
                 }
             };
@@ -1112,11 +1119,15 @@ impl<T: McpTransport> Provider for McpSession<T> {
             Some(deadline),
         )?;
         if let Some(error) = response.get("error") {
+            let Some(code) = error.get("code").and_then(Json::as_i64) else {
+                // A missing or non-integer code is a malformed answer, not
+                // code 0 (round 10, F-7).
+                return Err(Error::Provider {
+                    code: "mcp/bad-response".to_string(),
+                });
+            };
             return Err(Error::Provider {
-                code: format!(
-                    "mcp/{}",
-                    error.get("code").and_then(Json::as_i64).unwrap_or(0)
-                ),
+                code: format!("mcp/{code}"),
             });
         }
         let result = response.get("result").cloned().unwrap_or(Json::Null);
@@ -1960,17 +1971,26 @@ impl Provider for LocalProcess {
         // pipes quickly would otherwise have its streams swapped.
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut readers = 0usize;
+        let mut spawn_error: Option<std::io::Error> = None;
         let mut drain =
             |sender: std::sync::mpsc::Sender<(u8, Vec<u8>)>,
              tag: u8,
              mut stream: Option<Box<dyn std::io::Read + Send>>| {
                 if let Some(stream) = stream.take() {
-                    std::thread::spawn(move || {
-                        let mut buffer = Vec::new();
-                        let _ = stream.take(ceiling).read_to_end(&mut buffer);
-                        let _ = sender.send((tag, buffer));
-                    });
-                    readers += 1;
+                    // `thread::spawn` panics on failure; a named builder
+                    // reports it, and the child is killed rather than leaked
+                    // (round 10, F-4).
+                    let spawned = std::thread::Builder::new()
+                        .name("active-rpc-process-reader".to_string())
+                        .spawn(move || {
+                            let mut buffer = Vec::new();
+                            let _ = stream.take(ceiling).read_to_end(&mut buffer);
+                            let _ = sender.send((tag, buffer));
+                        });
+                    match spawned {
+                        Ok(_) => readers += 1,
+                        Err(error) => spawn_error = Some(error),
+                    }
                 }
             };
         drain(
@@ -1989,6 +2009,12 @@ impl Provider for LocalProcess {
                 .take()
                 .map(|stream| Box::new(stream) as Box<dyn std::io::Read + Send>),
         );
+        if let Some(error) = spawn_error {
+            kill_process_tree(&mut child);
+            return Err(Error::Provider {
+                code: format!("process/thread:{error}"),
+            });
+        }
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut received = 0usize;
@@ -2003,6 +2029,22 @@ impl Provider for LocalProcess {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
+                    // A reader that hit the cap reports without EOF: the child
+                    // is blocked on a full pipe, so waiting for it to exit
+                    // would burn the whole grant and answer `Timeout` instead
+                    // of the output refusal (round 10, F-2).
+                    while let Ok((tag, buffer)) = receiver.try_recv() {
+                        received += 1;
+                        if tag == 1 {
+                            stdout = buffer;
+                        } else {
+                            stderr = buffer;
+                        }
+                        if stdout.len() > self.max_output || stderr.len() > self.max_output {
+                            kill_process_tree(&mut child);
+                            return Err(Error::ToolPolicy("output too large"));
+                        }
+                    }
                     if std::time::Instant::now() >= deadline {
                         // The whole tree is killed, not just the direct child:
                         // the leader may have exited already while a descendant

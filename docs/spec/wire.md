@@ -247,11 +247,11 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/status` | the status line is not `HTTP/1.x` with a numeric code |
 | `http/interim` | a 1xx interim response arrived; the adapter does not follow it |
 | `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared |
-| `http/header-not-utf8` | a header line is not UTF-8 |
+| `http/header-not-utf8` | the status line or a header line is not UTF-8 |
 | `http/body-too-large` | the response body exceeded `max_body` |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
-| `http/write:<err>`, `http/read:<err>`, `http/body:<err>` | socket I/O failed |
+| `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
 | `http/<status>` | the endpoint answered `>= 400` |
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
