@@ -756,7 +756,19 @@ impl<T: McpTransport> McpSession<T> {
         }
         let mut skipped = 0usize;
         loop {
-            let line = self.transport.recv_line_within(deadline)?;
+            let line = match self.transport.recv_line_within(deadline) {
+                Ok(line) => line,
+                Err(error) => {
+                    // A timeout leaves the stream where it was and can be
+                    // retried; every other failure means the framing is broken,
+                    // and the next read could answer with a stale remainder
+                    // (round 4, #6).
+                    if !matches!(error, Error::Timeout) {
+                        self.poisoned = true;
+                    }
+                    return Err(error);
+                }
+            };
             if line.len() > MAX_MCP_LINE_BYTES {
                 self.poisoned = true;
                 return Err(Error::Provider {
@@ -862,6 +874,9 @@ impl<T: McpTransport> Provider for McpSession<T> {
 
     fn invoke(&mut self, object: u64, call: &Call) -> Result<Response> {
         self.calls += 1;
+        if call.budget.max_wall_ms == 0 {
+            return Err(Error::BudgetExceeded("wall"));
+        }
         if !call.payload.is_empty() {
             // The adapter builds `arguments` from the arguments; an envelope
             // payload would be dropped without the caller knowing
@@ -886,8 +901,16 @@ impl<T: McpTransport> Provider for McpSession<T> {
         }
         let mut arguments = serde_json::Map::new();
         for (index, arg) in call.args.iter().enumerate() {
-            if let Arg::Value(value) = arg {
-                arguments.insert(format!("arg{index}"), value_to_json(value));
+            match arg {
+                Arg::Value(value) => {
+                    arguments.insert(format!("arg{index}"), value_to_json(value));
+                }
+                // A capability or a promise is authority, not JSON text: the
+                // adapter used to drop it and call the tool with the rest
+                // (round 4, #3).
+                Arg::Cap(_) | Arg::Promise(_) => {
+                    return Err(Error::InvalidArgument("an MCP argument must be a value"))
+                }
             }
         }
         // The capability's wall ceiling bounds the wait, not only the total: a
@@ -996,6 +1019,7 @@ impl HttpTool {
             })?
             .collect();
         let mut connected = None;
+        let mut last = None;
         for address in addresses {
             // Every attempt gets only the time that is left, so a host with
             // many addresses cannot multiply the ceiling.
@@ -1005,16 +1029,30 @@ impl HttpTool {
                     connected = Some(stream);
                     break;
                 }
-                Err(error) if connected.is_none() => {
-                    connected = None;
-                    let _ = error;
-                }
-                Err(_) => {}
+                Err(error) => last = Some(error),
             }
         }
-        let mut stream = connected.ok_or(Error::Provider {
-            code: "http/connect".to_string(),
-        })?;
+        let mut stream = match connected {
+            Some(stream) => stream,
+            // A connect that timed out is the ceiling (a blackhole burns the
+            // whole grant); anything else is a transport fault
+            // (round 4, #2).
+            None => {
+                let timed_out = last.is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    )
+                });
+                return Err(if timed_out {
+                    Error::Timeout
+                } else {
+                    Error::Provider {
+                        code: "http/connect".to_string(),
+                    }
+                });
+            }
+        };
         stream
             .set_write_timeout(Some(remaining_until(deadline)?))
             .map_err(|_| Error::Timeout)?;
@@ -1039,9 +1077,7 @@ impl HttpTool {
                 None => Ok(()),
             })
             .and_then(|_| stream.flush())
-            .map_err(|error| Error::Provider {
-                code: format!("http/write:{error}"),
-            })?;
+            .map_err(map_http_read)?;
         let mut reader = DeadlineReader::new(stream, deadline);
         // Every line is read under a cap, and the block has its own budget: a
         // hostile endpoint that streams headers would otherwise grow a `String`
@@ -1164,6 +1200,11 @@ impl Provider for HttpTool {
 
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
         self.calls += 1;
+        if call.budget.max_wall_ms == 0 {
+            // A zero grant is a refusal, not a one-millisecond grant: the
+            // adapters used `.max(1)` and did the work anyway (round 4, #5).
+            return Err(Error::BudgetExceeded("wall"));
+        }
         if !call.payload.is_empty() {
             // This adapter sends the body it builds from the arguments; an
             // envelope payload would be silently dropped (round 3, #6).
@@ -1178,6 +1219,21 @@ impl Provider for HttpTool {
             return Err(Error::ToolPolicy(
                 "a secret argument cannot be sent to an external peer",
             ));
+        }
+        for arg in &call.args {
+            match arg {
+                // The request is built from a method text, a path and a body
+                // map; any other shape used to be dropped silently
+                // (round 4, #3).
+                Arg::Value(Value::Text(_))
+                | Arg::Value(Value::Path(_))
+                | Arg::Value(Value::Map(_)) => {}
+                Arg::Value(_) | Arg::Cap(_) | Arg::Promise(_) => {
+                    return Err(Error::InvalidArgument(
+                        "an HTTP argument is a method text, a path or a body object",
+                    ))
+                }
+            }
         }
         let method: String = match call.method.as_str() {
             "get" => "GET".to_string(),
@@ -1251,7 +1307,7 @@ impl Provider for HttpTool {
         }
         // The base is the operator's endpoint, but a control character in it is a
         // request split waiting for a configuration mistake (round 3, #8).
-        if self.base.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        if self.base.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
             return Err(Error::ToolPolicy(
                 "the HTTP base contains whitespace or a control character",
             ));
@@ -1549,6 +1605,11 @@ impl Provider for LocalProcess {
 
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
         self.calls += 1;
+        if call.budget.max_wall_ms == 0 {
+            // Before the spawn: a zero grant must not start a child and kill it
+            // (round 4, #5).
+            return Err(Error::BudgetExceeded("wall"));
+        }
         if !call.payload.is_empty() {
             return Err(Error::InvalidArgument(
                 "the process adapter does not accept an envelope payload",

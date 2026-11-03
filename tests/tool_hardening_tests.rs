@@ -645,3 +645,132 @@ fn a_prefix_argument_cannot_expand_a_glob() {
         assert_eq!(error.code(), "rpc/tool-policy", "{injected:?}: {error}");
     }
 }
+
+/// A server that reads the head and then stops reading fills the socket: the
+/// write must report the ceiling, not a transport fault, or a caller retries a
+/// call that ran out of its grant.
+#[test]
+fn a_stalled_http_reader_reports_the_ceiling() {
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let Ok((mut socket, _)) = listener.accept() else {
+            return;
+        };
+        // Read the head, then never read again: the client's body write fills
+        // the socket buffer and hits its write timeout.
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
+        while !head.ends_with(b"\r\n\r\n") {
+            match socket.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => head.push(byte[0]),
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
+
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("POST", "/stall")]);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("blob".to_string(), Value::text("x".repeat(256 << 10)));
+    let mut call = Call::new(
+        "post",
+        vec![
+            Arg::Value(Value::path("/stall")),
+            Arg::Value(Value::Map(entries)),
+        ],
+    );
+    call.tool_allows_process = true;
+    call.budget.max_wall_ms = 200;
+    let started = Instant::now();
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the write never completes");
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a 200 ms grant took {:?}",
+        started.elapsed()
+    );
+}
+
+/// An adapter that cannot deliver an argument refuses the request instead of
+/// calling the peer with the rest.
+#[test]
+fn an_undeliverable_argument_is_refused() {
+    use active_rpc::cap::CapId;
+    use active_rpc::value::Arg;
+
+    // HTTP: an integer argument is not a method, a path or a body.
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x")]);
+    let mut call = Call::new(
+        "get",
+        vec![Arg::Value(Value::path("/x")), Arg::Value(Value::Int(1))],
+    );
+    call.tool_allows_process = true;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("an integer is not deliverable");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+
+    // MCP: a capability argument is authority, not JSON.
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Cap(CapId([0x11; 16]))]);
+    call.tool_allows_process = true;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("a capability is not deliverable");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// The base is part of the request line and the `Host` header.
+#[test]
+fn a_non_ascii_base_is_refused() {
+    let mut tool = HttpTool::new("http://ex\u{00e4}mple.test", &[("GET", "/x")]);
+    let mut call = http_get("/x", 500);
+    call.tool_allows_process = true;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a non-ASCII base is refused");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// A zero wall grant is a refusal, before any work or spawn.
+#[test]
+fn a_zero_wall_grant_is_a_budget_refusal() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/x"))]);
+    call.tool_allows_process = true;
+    call.budget.max_wall_ms = 0;
+    let error = tool.invoke(0, &call).expect_err("a zero grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\cmd.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    let mut process = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    let mut call = Call::new("run", Vec::new());
+    call.tool_allows_process = true;
+    call.budget.max_wall_ms = 0;
+    let error = process.invoke(0, &call).expect_err("a zero grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}

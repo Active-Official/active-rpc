@@ -868,3 +868,117 @@ fn a_redacting_patch_cone_carries_no_provenance() {
         "the cone carries the parent hash a redacting caller may not see"
     );
 }
+
+/// A node that names one child twice used to stall the Kahn pass, so the taint
+/// never reached the node above it and a redacting query returned its intent in
+/// clear.
+#[test]
+fn a_doubly_referenced_secret_taints_everything_above_it() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(active_infinity::SecretBytes::new(b"canary")));
+    let middle = module.push(Inode::Table {
+        fields: vec![("a".to_string(), secret), ("b".to_string(), secret)],
+    });
+    let top = module.push(Inode::Table {
+        fields: vec![("m".to_string(), middle)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("top".to_string(), top)],
+    });
+    module.set_root(Some(root));
+    module.annotate(middle, AnnotationKind::Intent("CANARY-MIDDLE".to_string()));
+    module.annotate(top, AnnotationKind::Intent("CANARY-TOP".to_string()));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let mut call = active_rpc::value::Call::new("annotations", Vec::new());
+    call.redact = true;
+    let response =
+        active_rpc::kernel::Provider::invoke(&mut provider, object, &call).expect("annotations");
+    let active_rpc::value::Response::Value(Value::List(entries)) = response else {
+        panic!("annotations answers a list: {response:?}");
+    };
+    for entry in &entries {
+        if let Value::Map(fields) = entry {
+            if let Some(Value::Text(text)) = fields.get("text") {
+                assert!(
+                    !text.contains("CANARY"),
+                    "a redacting answer carried an intent above a doubly-referenced secret: {text}"
+                );
+            }
+        }
+    }
+}
+
+/// A patch carries the previous content address in its `Input` entry, so a
+/// redacting provenance answer used to serve the same oracle as `parent`.
+#[test]
+fn a_redacting_provenance_answer_serves_no_hash() {
+    let mut module = hostile_module();
+    module.set_provenance(Some(active_infinity::Provenance {
+        producer: Some("test".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: Some([0x44; 32]),
+        entries: vec![active_infinity::ProvEntry {
+            key: "input".to_string(),
+            value: active_infinity::ProvValue::Hash([0xAB; 32]),
+        }],
+    }));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let mut call = active_rpc::value::Call::new("provenance", Vec::new());
+    call.redact = true;
+    let response =
+        active_rpc::kernel::Provider::invoke(&mut provider, object, &call).expect("provenance");
+    let active_rpc::value::Response::Value(Value::Map(fields)) = response else {
+        panic!("provenance answers a map: {response:?}");
+    };
+    for (key, value) in &fields {
+        if let Value::Text(text) = value {
+            assert!(
+                !text.starts_with("blake3:"),
+                "a redacting answer served the content address {key}={text}"
+            );
+        }
+    }
+    assert!(!fields.contains_key("parent"));
+}
+
+/// The cone bytes and the metadata query must agree: a redacting cone carries
+/// neither the intent text nor a binding that names a tainted node.
+#[test]
+fn a_redacting_cone_carries_no_annotation_text() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(active_infinity::SecretBytes::new(b"canary")));
+    let holder = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("holder".to_string(), holder)],
+    });
+    module.set_root(Some(root));
+    module.annotate(holder, AnnotationKind::Intent("CANARY-LABEL".to_string()));
+    module.bind("named", holder);
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let mut call = active_rpc::value::Call::new("subgraph", vec![path("holder")]);
+    call.redact = true;
+    let response =
+        active_rpc::kernel::Provider::invoke(&mut provider, object, &call).expect("subgraph");
+    let active_rpc::value::Response::Module(bytes) = response else {
+        panic!("subgraph answers a module: {response:?}");
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    assert!(
+        decoded.annotations().is_empty(),
+        "the cone carries annotation text a redacting caller may not see"
+    );
+    assert!(
+        decoded.bindings().is_empty(),
+        "the cone carries a binding that names a tainted node"
+    );
+}

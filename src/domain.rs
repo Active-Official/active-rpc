@@ -228,14 +228,17 @@ impl ModuleProvider {
                     active_infinity::Error::Evaluation(code) => Error::Domain(code),
                     other => Error::Payload(other.code().to_string()),
                 })?;
-                check_wall_budget(started, call)?;
                 // The conversion recurses; a result deeper than the wire can
                 // carry can never be returned, so it is refused before the walk
                 // (round 7, #4).
                 if security::active_value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
                     return Err(Error::BudgetExceeded("depth"));
                 }
-                Ok(Response::Value(security::from_active_value(&value)))
+                let converted = security::from_active_value(&value);
+                // The conversion is work too: the ceiling covers it
+                // (round 8, #7).
+                check_wall_budget(started, call)?;
+                Ok(Response::Value(converted))
             }
             "why" => {
                 check_node_budget(&slot.module, call)?;
@@ -292,6 +295,12 @@ impl ModuleProvider {
                     }
                 }
                 let mut sub = restrict(&slot.module, node)?;
+                if call.redact {
+                    // A redacting cone is data only: annotation text and a
+                    // binding that names a tainted node describe it, and the
+                    // `annotations` method already hides them (round 8, #3).
+                    redact_cone_metadata(&mut sub);
+                }
                 if let Some(scope) = &call.path_scope {
                     // A cone reply is the subtree's data. Provenance (producer,
                     // entries and the parent content address) describes the whole
@@ -379,7 +388,10 @@ impl ModuleProvider {
                         // and a redacting caller may not receive a hash of an
                         // image it cannot read: comparing it with a guessed hash
                         // is an equality oracle over secrets (round 7, #2).
+                        // Annotation text and bindings on a tainted node describe
+                        // it, so they go with it (round 8, #3).
                         cone.set_provenance(None);
+                        redact_cone_metadata(&mut cone);
                     }
                     if let Some(scope) = &call.path_scope {
                         // The same rule as `subgraph`: a scoped cone reply is the
@@ -577,10 +589,13 @@ impl ModuleProvider {
                         // ordinary text.
                         let mut map = provenance_map(&slot.module);
                         if call.redact {
-                            // The parent is a content address: under a redacting
-                            // capability it is an equality oracle over an image
-                            // the caller may not read (round 7, #2).
-                            map.remove("parent");
+                            // Every content address is an oracle over an image
+                            // the caller may not read: the parent, and the
+                            // `Input` lineage entries a patch carries forward
+                            // (round 7 #2, round 8 #2).
+                            map.retain(|_, value| {
+                                !matches!(value, Value::Text(text) if text.starts_with("blake3:"))
+                            });
                         }
                         let timestamp = i64::try_from(prov.timestamp_ms).unwrap_or(i64::MAX);
                         map.insert("timestamp_ms".to_string(), Value::Int(timestamp));
@@ -800,9 +815,14 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
     // refused (round 7, #1).
     loop {
         let before = affected.len();
+        let subjects = affected.clone();
         for annotation in module.annotations() {
             if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
-                if affected.contains(&annotation.node) {
+                if subjects.contains(&annotation.node) {
+                    // The expression's own dependencies too: `scope_closure`
+                    // follows them on the read side, and a write that changes
+                    // the rule's meaning is the same access (round 8, #4).
+                    affected.extend(transitive(module, *expr, true));
                     affected.insert(*expr);
                 }
             }
@@ -810,6 +830,14 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
         if affected.len() == before {
             break;
         }
+    }
+    // An environment node is host state: a scoped write whose rule reads it is
+    // not confined, exactly as on the read side.
+    if affected
+        .iter()
+        .any(|id| matches!(module.get(*id), Some(Inode::Env { .. })))
+    {
+        return false;
     }
     let paths = active_infinity::interop::value_paths(module);
     let root = module.root();
@@ -916,9 +944,13 @@ fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &s
         return true;
     }
     let paths = active_infinity::interop::value_paths(module);
+    let root = module.root();
     ids.iter().all(|id| match paths.get(id) {
         Some(path) => in_scope_path(module, *id, path, scope),
-        None => true,
+        // The module root is pathless by construction; any other pathless node
+        // is a floating value or an expression, and a scoped answer that dropped
+        // it presented itself as complete (round 8, #6).
+        None => Some(*id) == root,
     })
 }
 
@@ -1041,6 +1073,30 @@ fn redacted_module_bytes(module: &InfinityModule) -> Result<Vec<u8>> {
     security::redact_module(&bytes)
 }
 
+/// Strip the metadata a redacting cone must not carry.
+///
+/// An annotation's intent or constraint source is free text, and a binding is a
+/// name that resolves to a node: both describe the cone, and the `annotations`
+/// method already hides them for a tainted node. Keeping them in the bytes while
+/// hiding them in the query made the two answers disagree (R-07 round 8, #3).
+fn redact_cone_metadata(module: &mut InfinityModule) {
+    keep_immutable_annotations(module);
+    let tainted = tainted_nodes(module);
+    if tainted.is_empty() {
+        return;
+    }
+    let kept: Vec<(String, NodeId)> = module
+        .bindings()
+        .iter()
+        .filter(|(_, id)| !tainted.contains(id))
+        .map(|(name, id)| (name.clone(), *id))
+        .collect();
+    module.clear_bindings();
+    for (name, id) in kept {
+        module.bind(name, id);
+    }
+}
+
 /// Node ids that are secrets or contain one, transitively.
 fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
     let count = module.node_count();
@@ -1053,7 +1109,15 @@ fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
             module
                 .nodes()
                 .get(index)
-                .map(|node| node.children().len())
+                .map(|node| {
+                    // `dependents` is deduplicated, so a node that names one
+                    // child twice would never reach zero and its descendants
+                    // would never be decanted (round 8, #1).
+                    let mut children = node.children();
+                    children.sort_unstable();
+                    children.dedup();
+                    children.len()
+                })
                 .unwrap_or(0)
         })
         .collect();

@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-6: 12 + 8 + 9 + 8 + 1 + 4 findings | 42 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-8: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 findings; round-8 fixes green, confirmation round pending | 53 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-4: 15 + 16 + 9 + 6 findings; round-4 fixes green, confirmation round pending | 41 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,40 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-02 (round 8)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `8481c61`. Two highs and two
+mediums, plus three lows; all closed except the two it called residuals.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the Kahn taint pass counted a node's children including duplicates while the dependents index is deduplicated, so a node naming one child twice never reached zero and the taint stopped below it: a redacting `annotations` returned the intent above it in clear | **fixed**: unique children; `a_doubly_referenced_secret_taints_everything_above_it` |
+| 2 | high | a redacting `provenance` answer dropped `parent` but still served `Hash` entries (the patch `Input` lineage), the same content-address oracle | **fixed**: under redaction every `blake3:` value is dropped; `a_redacting_provenance_answer_serves_no_hash` |
+| 3 | medium | a redacting `subgraph`/`patch` cone kept intent and constraint-source text and bindings on tainted nodes, while `annotations` hid them: the two answers disagreed | **fixed**: `redact_cone_metadata` keeps only `@ai_immutable` and drops a binding that names a tainted node; `a_redacting_cone_carries_no_annotation_text` |
+| 4 | medium | the write-confinement check was weaker than the read check: it followed a constraint expression but not the expression's dependencies, and accepted an `Env` expression | **fixed**: both checks run the same closure and refuse an environment node |
+| 5 | low | `active_value_too_deep` pushed every child of a container before the first check | **fixed**: one frame per open container, like the value walks |
+| 6 | low | `nodes_within_scope` treated every pathless node as inside while `scope_closure` treats it as outside: a scoped `dependents`/`impact` dropped a floating node and presented a filtered answer as complete | **fixed**: only the module root is pathless-inside |
+| 7 | low | the evaluate wall check ran before the value conversion, so the conversion itself was unmeasured | **fixed**: the check runs after the conversion |
+
+Gate: 806 tests all-features, 0 failed; clippy/fmt/doc clean; negative controls
+9/9.
+
+### R-08 tools and MCP - 2026-11-02 (round 4)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `8481c61`. The round-3 fixes
+hold; three mediums and three lows, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a write that hit its socket timeout was reported as `http/write:…` (a provider fault) while a read timeout is `rpc/timeout` | **fixed**: write errors go through the same mapping; `a_stalled_http_reader_reports_the_ceiling` |
+| 2 | medium | a connect timeout was discarded and every connect failure collapsed to a provider fault | **fixed**: the last error decides, and a timeout is `rpc/timeout` |
+| 3 | medium | MCP dropped `Cap`/`Promise` arguments and HTTP dropped any shape that was not a method text, a path or a body map: the peer acted on a subset | **fixed**: both refuse the request; `an_undeliverable_argument_is_refused` |
+| 4 | low | the base check admitted bytes above ASCII | **fixed**: the base must be printable ASCII like the path; `a_non_ascii_base_is_refused` |
+| 5 | low | a zero wall grant became one millisecond, and the process adapter spawned the child before checking | **fixed**: a zero grant is `rpc/budget-exceeded` before any work or spawn; `a_zero_wall_grant_is_a_budget_refusal` |
+| 6 | low | a framing fault on receive did not poison the session until the next mismatch | **fixed**: any non-timeout receive error poisons at once |
+
+Gate: 806 tests all-features, 0 failed; clippy/fmt/doc clean.
 
 ### R-07 domain operations - 2026-11-02 (round 6, closing round 5's verification)
 
