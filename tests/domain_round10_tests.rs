@@ -257,3 +257,71 @@ fn a_redacting_annotation_answer_collapses_the_hidden_set() {
     assert!(!fields.contains_key("kind"), "the kind leaks: {fields:?}");
     assert!(!fields.contains_key("node"), "the node leaks: {fields:?}");
 }
+
+/// A binding that spells the scope exactly still names an outside node: the
+/// scope is a statement about the field tree, so the alias does not move the
+/// node inside it.
+#[test]
+fn an_undotted_binding_alias_does_not_widen_the_scope() {
+    let mut module = InfinityModule::new();
+    let outside = module.push(Inode::Str("OUTSIDE-DATA".to_string()));
+    let ops = module.push(Inode::Table {
+        fields: vec![("s".to_string(), outside)],
+    });
+    let app = module.push(Inode::Table {
+        fields: vec![("y".to_string(), outside)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("ops".to_string(), ops), ("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+    // The alias claims the in-scope name for a node that lives in `ops`.
+    module.bind("app", outside);
+
+    let (agent, cap, lane) = install(module, &["evaluate", "subgraph", "why"], Some("app"), false);
+    for method in ["evaluate", "subgraph", "why"] {
+        let promise = agent
+            .call(lane, &cap, method, vec![path("app")])
+            .expect("queued");
+        agent.run();
+        let error = promise
+            .value()
+            .expect_err("the alias points outside the scope");
+        assert_eq!(error.code(), "rpc/path-not-granted", "{method}: {error}");
+    }
+}
+
+/// The last capability drop reclaims the module: a later mint on the same
+/// object finds no module.
+#[test]
+fn the_last_drop_reclaims_the_module() {
+    let mut module = InfinityModule::new();
+    let value = module.push(Inode::Str("v".to_string()));
+    let root = module.push(Inode::Table {
+        fields: vec![("v".to_string(), value)],
+    });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x72; 32]);
+    let provider_id = agent.register(Box::new(provider));
+    let cap = agent
+        .mint(provider_id, object, CapAttrs::new(&["evaluate"]))
+        .expect("cap");
+    drop(cap);
+    let _ = agent.take_drops(provider_id);
+
+    let stale = agent
+        .mint(provider_id, object, CapAttrs::new(&["evaluate"]))
+        .expect("mint on a stale object is the caller's business");
+    let lane = agent
+        .create_lane("reclaim", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call(lane, &stale, "evaluate", vec![path("v")])
+        .expect("queued");
+    agent.run();
+    let error = promise.value().expect_err("the module is gone");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}

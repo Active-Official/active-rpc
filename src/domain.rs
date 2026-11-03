@@ -1277,15 +1277,16 @@ fn evaluate_for_caller(
     let mut redacted = module.clone();
     security::redact_derived(&mut redacted, &redactor)
         .map_err(|error| active_infinity::Error::Encode(error.code()))?;
-    let placeholder = secret_node.and_then(|id| match redacted.get(id) {
-        Some(Inode::Str(text)) => Some(text.clone()),
-        _ => None,
-    });
+    let placeholder = secret_node
+        .and_then(|id| match redacted.get(id) {
+            Some(Inode::Str(text)) => Some(text.clone()),
+            _ => None,
+        })
+        // The redactor always writes a `Str` for a secret node; keep the marker
+        // as the fallback so the mapping never silently stops (round 11, #2).
+        .unwrap_or_else(|| active_infinity::interop::SECRET_MARKER.to_string());
     let (value, diagnostics) = active_infinity::interop::evaluate(&redacted, budget)?;
-    Ok((
-        mark_secret_texts(value, placeholder.as_deref()),
-        diagnostics,
-    ))
+    Ok((mark_secret_texts(value, &placeholder), diagnostics))
 }
 
 /// Replace a text equal to the redaction marker with the structural marker.
@@ -1293,11 +1294,8 @@ fn evaluate_for_caller(
 /// The engine has no secret value, so the marker comes back as text; a caller
 /// that reads a `Value::Secret` knows the field was secret, and a caller that
 /// reads `"***SECRET***"` might treat it as data.
-fn mark_secret_texts(value: active_core::Value, placeholder: Option<&str>) -> active_core::Value {
+fn mark_secret_texts(value: active_core::Value, placeholder: &str) -> active_core::Value {
     use active_core::Value as CoreValue;
-    let Some(placeholder) = placeholder else {
-        return value;
-    };
     match value {
         // The marker stands for the secret. When it is the empty string (a
         // secret is a substring of the marker) every empty string collapses;
@@ -1308,13 +1306,13 @@ fn mark_secret_texts(value: active_core::Value, placeholder: Option<&str>) -> ac
         CoreValue::Array(items) => CoreValue::Array(
             items
                 .into_iter()
-                .map(|item| mark_secret_texts(item, Some(placeholder)))
+                .map(|item| mark_secret_texts(item, placeholder))
                 .collect(),
         ),
         CoreValue::Table(entries) => CoreValue::Table(
             entries
                 .into_iter()
-                .map(|(key, value)| (key, mark_secret_texts(value, Some(placeholder))))
+                .map(|(key, value)| (key, mark_secret_texts(value, placeholder)))
                 .collect(),
         ),
         other => other,

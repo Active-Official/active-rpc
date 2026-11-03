@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-10: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 findings; round-10 fixes green, confirmation round pending | 69 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-11: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 findings; round-11 fixes green, confirmation round pending | 72 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-7: 15 + 16 + 9 + 6 + 6 + 2 + 2 findings; round-7 fixes green, confirmation round pending | 51 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,27 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 11)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `5b3e567`. All seven
+round-10 fixes held; one high, two mediums and two lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the round-10 root fix covered only the root: every scope check used one `value_paths` name plus `resolve_path`, so an undotted binding that spells the scope exactly (`bind("app", outside)`) presented an outside node as in-scope for `evaluate`, `subgraph`, `why` and `patch` | **fixed**: `in_scope_path` resolves the name by walking table fields from the module root (`structural_resolve`), never through a binding, so an alias cannot move a node into a scope; the label filter uses the same rule. `an_undotted_binding_alias_does_not_widen_the_scope` (three methods) |
+| 2 | medium | the evaluated placeholder was read from the first secret node's redacted form and skipped the mapping entirely if that form was not a `Str`; table keys and quantity units were never mapped | **fixed**: the redactor always writes a `Str`, and the marker is the fallback, so the mapping never stops. Table keys and unit text are names, not values: mapping them would change the value's shape, and a unit that copies a secret is a module-author error (recorded) |
+| 3 | medium | a metadata call rebuilds adjacency and `value_paths` several times, and the wall ceiling is checked only at the end | **accepted residual**: the work is linear per build and bounded by `max_nodes`; the plan is one adjacency + one path map per call plus an edge ceiling, tracked for the RPC cross-cutting pass on resource bombs |
+| 4 | low | `on_drop` reclaim had no section test | **fixed**: `the_last_drop_reclaims_the_module` drops the last handle and finds no module on the next mint |
+| 5 | low | a real field named `a[0]` resolves and passes the label filter, so a receiver cannot tell it from a synthetic label | **recorded**: escaping every label changes the wire text a caller uses in paths; the synthetic forms are refused, and a real field keeps its own name |
+
+Residuals recorded: taint completeness depends on `edges()` covering every
+child-bearing variant (a per-variant secret test is planned with the Infinity
+re-round); `MAX_DROP_LOG` truncates diagnostics by design; the hidden-annotation
+presence bit and `stats` counts are accepted oracles.
+
+Gate: 88 suites / 841 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9; hardening status 13 invariants / 145 checks.
 
 ### R-07 domain operations - 2026-11-03 (round 10)
 
