@@ -392,7 +392,6 @@ enum JobState {
     /// dispatch owns the settlement, and a rejection here would disagree with
     /// the receipt the same dispatch seals.
     Running,
-    Done,
 }
 
 #[derive(Debug, Clone)]
@@ -2152,9 +2151,13 @@ impl Agent {
         if let Some(error) = shape_refusal(&payload, &lane_budget) {
             return Err(error);
         }
+        if value_too_deep(&payload, crate::wire::MAX_VALUE_DEPTH) {
+            return Err(Error::BudgetExceeded("depth"));
+        }
         let bytes = payload
             .wire_size()
-            .saturating_add((cap_ids.len() as u64).saturating_mul(16));
+            .checked_add((cap_ids.len() as u64).saturating_mul(16))
+            .ok_or(Error::BudgetExceeded("byte"))?;
         if bytes > lane_budget.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
@@ -2328,6 +2331,9 @@ impl Agent {
         // refuses must not pay that walk first (round 6, #1).
         if let Some(error) = shape_refusal(&payload, &effective) {
             return Err(error);
+        }
+        if value_too_deep(&payload, crate::wire::MAX_VALUE_DEPTH) {
+            return Err(Error::BudgetExceeded("depth"));
         }
         // The topic name is metadata the channel stores and forwards, so it is
         // payload as far as the grant is concerned: charging only the value let
@@ -2715,6 +2721,13 @@ impl Agent {
             if let Some(error) = shape_refusal(value, &effective) {
                 return Err(error);
             }
+            // The wire's absolute ceiling binds an in-process caller too: a
+            // value deeper than that cannot be dropped or cloned safely
+            // (round 10, #2). It runs after the budget gate, which refuses a
+            // wide value in constant time.
+            if value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
+                return Err(Error::BudgetExceeded("depth"));
+            }
         }
         // Path scope is enforced here, before the provider sees the call. The
         // walk is recursive: a `Path` nested in a list or map is the same
@@ -2939,8 +2952,20 @@ impl Agent {
         self.cell.borrow().metrics.round_trips
     }
 
+    /// Whether this kernel issued `promise`.
+    ///
+    /// Promise ids are a per-kernel counter, so two agents in one process issue
+    /// colliding ids. A handle index into the wrong kernel would read, cancel or
+    /// answer another tenant's call (round 3, F1).
+    fn owns_promise(&self, promise: &PromiseHandle) -> bool {
+        std::rc::Rc::ptr_eq(&self.cell, &promise.agent.cell)
+    }
+
     /// Await a promise, running the kernel until it settles.
     pub fn await_promise(&self, promise: &PromiseHandle) -> Result<Value> {
+        if !self.owns_promise(promise) {
+            return Err(Error::UnknownPromise(promise.id.0));
+        }
         if self.cell.borrow().dispatching {
             // A provider is running and the kernel cannot make progress for it:
             // the outer dispatch owns the queue. Spinning here would burn CPU
@@ -3036,8 +3061,34 @@ impl Agent {
             if let Some(error) = shape_refusal(&value, &budget) {
                 return Err(error);
             }
+            // The absolute wire ceiling too: a redaction or a later clone walks
+            // the value recursively (round 10, #1).
+            if value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
+                return Err(Error::BudgetExceeded("depth"));
+            }
         }
         drop(kernel);
+        // The same egress policy dispatch applies: a redacting call receives a
+        // redacted value, and a call that did not ask for redaction must not
+        // receive a module that still carries structural secrets.
+        let value = match &job {
+            Some(job) => {
+                let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if job.call.redact {
+                        Ok(crate::security::redact_value(value))
+                    } else {
+                        crate::security::assert_no_structural_secrets(&value).map(|()| value)
+                    }
+                }))
+                .unwrap_or_else(|_| {
+                    Err(Error::Provider {
+                        code: "wasm/trap".to_string(),
+                    })
+                });
+                checked?
+            }
+            None => value,
+        };
         if let Some(job) = &job {
             // Charged before the settlement: a value the grant cannot afford
             // must not become the promise's answer. When the job is still in the
@@ -3306,7 +3357,12 @@ impl Agent {
         // ceilings gate the work before anything traverses the value. The
         // capability's budget is the widest grant this call can run under; the
         // lane intersection is re-checked on the queue path (round 5, N3).
-        {
+        if !self.cell.borrow().caps.contains_key(&cap.id()) {
+            let error = Error::UnknownCapability(cap_token(cap.id()));
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
+        }
+        let shape_error = {
             let kernel = self.cell.borrow();
             let cap_budget = kernel
                 .caps
@@ -3321,14 +3377,23 @@ impl Agent {
                 Some(lane_record) => cap_budget.intersect(&lane_record.budget),
                 None => cap_budget,
             };
-            drop(kernel);
+            let mut error = None;
             for arg in &args {
                 let Arg::Value(value) = arg else { continue };
-                if let Some(error) = shape_refusal(value, &budget) {
-                    self.record_refusal(lane, Some(cap.id()), &error);
-                    return Err(error);
+                if let Some(refusal) = shape_refusal(value, &budget) {
+                    error = Some(refusal);
+                    break;
+                }
+                if value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
+                    error = Some(Error::BudgetExceeded("depth"));
+                    break;
                 }
             }
+            error
+        };
+        if let Some(error) = shape_error {
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
         }
         let fingerprint = fingerprint_with_payload(&args, payload_bytes, body);
         // A replay is an exercise of authority in one lane: the key is scoped
@@ -3415,6 +3480,27 @@ impl Agent {
                     })
                     .unwrap_or(false);
                 if reusable {
+                    // The value was admitted under the grant at the time. A lane
+                    // narrowed since then must not serve it again, or a replay
+                    // becomes a way past the current ceiling (round 10, #3).
+                    let current = match (kernel.caps.get(&cap.id()), kernel.lanes.get(&lane)) {
+                        (Some(record), Some(lane_record)) => {
+                            record.attrs.budget.intersect(&lane_record.budget)
+                        }
+                        (Some(record), None) => record.attrs.budget,
+                        _ => return Err(Error::UnknownCapability(cap_token(cap.id()))),
+                    };
+                    let over = match kernel.promises.get(&id) {
+                        Some(record) => match &record.state {
+                            PromiseState::Resolved(value) => shape_refusal(value, &current),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let Some(error) = over {
+                        Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                        return Err(error);
+                    }
                     if let Some(record) = kernel.promises.get_mut(&id) {
                         record.handles = record.handles.saturating_add(1);
                     }
@@ -3483,6 +3569,9 @@ impl Agent {
     /// cancellation really prevents the provider call (and its side effects). A
     /// job already in flight cannot be stopped; its result is discarded.
     pub fn cancel(&self, promise: &PromiseHandle) -> Result<()> {
+        if !self.owns_promise(promise) {
+            return Err(Error::UnknownPromise(promise.id.0));
+        }
         let mut kernel = self.cell.borrow_mut();
         {
             let record = kernel
@@ -3532,6 +3621,9 @@ impl Agent {
     /// provider call and its side effects. An already-settled root is refused;
     /// dependent promises that already settled are left untouched.
     pub fn cancel_tree(&self, promise: &PromiseHandle) -> Result<Vec<PromiseId>> {
+        if !self.owns_promise(promise) {
+            return Err(Error::UnknownPromise(promise.id.0));
+        }
         let mut kernel = self.cell.borrow_mut();
         let root_pending = kernel
             .promises
@@ -3594,6 +3686,13 @@ impl Agent {
             if let Some(lane_record) = kernel.lanes.get_mut(&LaneId(lane)) {
                 lane_record.complete();
             }
+        }
+        // A target whose job is already in the current batch is removed by its
+        // dispatch, which cannot settle a cancelled record: without this the
+        // record is never evictable and repeated cancellations wedge the
+        // promise ceiling (round 3, F3). `record_settled` is idempotent.
+        for id in &targets_set {
+            kernel.record_settled(*id);
         }
         Ok(targets)
     }
@@ -3661,6 +3760,9 @@ impl Agent {
 
     /// Live dependents of a promise, for operators and tests.
     pub fn promise_waiters(&self, promise: &PromiseHandle) -> u32 {
+        if !self.owns_promise(promise) {
+            return 0;
+        }
         self.cell
             .borrow()
             .promises
@@ -4044,9 +4146,6 @@ impl Agent {
                 let Some(job) = kernel.jobs.get(job_id).cloned() else {
                     continue;
                 };
-                if job.state == JobState::Done {
-                    continue;
-                }
                 let mut args = Vec::with_capacity(job.call.args.len());
                 // The arguments were authorized when they were queued, possibly
                 // under a wider lane. Gate them before this loop copies
@@ -4059,15 +4158,15 @@ impl Agent {
                 let mut failure = None;
                 for arg in &job.call.args {
                     let Arg::Value(value) = arg else { continue };
+                    if let Some(error) = shape_refusal(value, &gate_budget) {
+                        failure = Some(error);
+                        break;
+                    }
                     // Budget-relative ceilings are not enough here: a lane may
                     // allow a depth the derived `Clone` cannot survive, and the
                     // substitution loop below copies every value (round 9, F1).
                     if value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
                         failure = Some(Error::BudgetExceeded("depth"));
-                        break;
-                    }
-                    if let Some(error) = shape_refusal(value, &gate_budget) {
-                        failure = Some(error);
                         break;
                     }
                 }
@@ -4192,9 +4291,17 @@ impl Agent {
                     }
                 }
                 let resolved_bytes: u64 = if failure.is_none() {
-                    args.iter()
-                        .map(Arg::wire_size)
-                        .fold(0u64, u64::saturating_add)
+                    let mut total = 0u64;
+                    for arg in &args {
+                        match total.checked_add(Arg::wire_size(arg)) {
+                            Some(next) => total = next,
+                            None => {
+                                failure = Some(Error::BudgetExceeded("byte"));
+                                break;
+                            }
+                        }
+                    }
+                    total
                 } else {
                     0
                 };
@@ -4283,9 +4390,7 @@ impl Agent {
                             // unbounded one would abort the process where no
                             // catch_unwind can reach.
                             if value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
-                                Err(Error::Provider {
-                                    code: "rpc/provider".to_string(),
-                                })
+                                Err(Error::BudgetExceeded("depth"))
                             } else {
                                 Ok(value)
                             }
@@ -4307,6 +4412,10 @@ impl Agent {
                 }
             };
 
+            // Set when an out-of-band answer settled the promise while the
+            // provider was running: phase 3 then discards this outcome, which is
+            // not a kernel double settlement.
+            let mut resolved_out_of_band = false;
             // Egress is charged before settlement: a response larger than the
             // remaining grant never leaves the kernel.
             let outcome = match outcome {
@@ -4339,10 +4448,26 @@ impl Agent {
                         // grant's `max_array_len` would otherwise be admitted.
                         Ok(value) => match shape_refusal(&value, &effective_budget) {
                             Some(error) => Err(error),
-                            None => match self.charge_egress(&job, value.wire_size()) {
-                                Ok(()) => Ok(value),
-                                Err(error) => Err(error),
-                            },
+                            None => {
+                                // A resolve that won the race already delivered
+                                // its value; charging this one would bill twice
+                                // for a value the caller never sees (round 3, F4).
+                                let already = self
+                                    .cell
+                                    .borrow()
+                                    .promises
+                                    .get(&job.promise)
+                                    .is_some_and(|record| record.state.is_settled());
+                                if already {
+                                    resolved_out_of_band = true;
+                                    Ok(value)
+                                } else {
+                                    match self.charge_egress(&job, value.wire_size()) {
+                                        Ok(()) => Ok(value),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                            }
                         },
                     }
                 }
@@ -4365,7 +4490,9 @@ impl Agent {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
                         if record.resolve(value.clone()).is_ok() {
                             settled_now = true;
-                        } else if record.state != crate::promise::PromiseState::Cancelled {
+                        } else if record.state != crate::promise::PromiseState::Cancelled
+                            && !resolved_out_of_band
+                        {
                             // A cancelled promise is a caller decision, not a
                             // kernel double settlement: the outcome is
                             // discarded on purpose (round 5, N4).
@@ -4383,7 +4510,9 @@ impl Agent {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
                         if record.reject(error.clone()).is_ok() {
                             settled_now = true;
-                        } else if record.state != crate::promise::PromiseState::Cancelled {
+                        } else if record.state != crate::promise::PromiseState::Cancelled
+                            && !resolved_out_of_band
+                        {
                             kernel.metrics.promises_double_settled =
                                 kernel.metrics.promises_double_settled.saturating_add(1);
                         }
@@ -4416,6 +4545,32 @@ impl Agent {
                                 kernel.push_event(Event::ToolRefused {
                                     cap: job.cap,
                                     reason: error.to_string(),
+                                });
+                            }
+                            // An authority refusal that only surfaced at
+                            // dispatch (a revoke, an expiry, a binding, a gone
+                            // lane) was invisible to the counters and the tape
+                            // (round 3, F7).
+                            Error::Identity(_) => {
+                                kernel.metrics.identity_refusals =
+                                    kernel.metrics.identity_refusals.saturating_add(1);
+                                kernel.metrics.calls_refused =
+                                    kernel.metrics.calls_refused.saturating_add(1);
+                                kernel.push_event(Event::CallRefused {
+                                    lane: job.lane,
+                                    cap: Some(job.cap),
+                                    code: error.code().to_string(),
+                                });
+                            }
+                            Error::Revoked(_)
+                            | Error::UnknownCapability(_)
+                            | Error::UnknownLane(_) => {
+                                kernel.metrics.calls_refused =
+                                    kernel.metrics.calls_refused.saturating_add(1);
+                                kernel.push_event(Event::CallRefused {
+                                    lane: job.lane,
+                                    cap: Some(job.cap),
+                                    code: error.code().to_string(),
                                 });
                             }
                             _ => {}
@@ -4840,7 +4995,6 @@ impl Kernel {
             .unwrap_or_default();
         Kernel::release_waiters(self, &deps);
         if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.state = JobState::Done;
             let promise = job.promise;
             let lane = job.lane;
             let code = error.code().to_string();

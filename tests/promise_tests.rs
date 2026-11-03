@@ -724,8 +724,10 @@ fn a_provider_value_deeper_than_the_wire_limit_is_refused() {
     let lane = agent.create_lane("deep", Budget::default()).expect("lane");
     let promise = agent.call(lane, &cap, "deep", Vec::new()).expect("call");
     agent.run();
-    let error = promise.value().expect_err("too deep is a provider fault");
-    assert_eq!(error.code(), "rpc/provider", "{error}");
+    let error = promise.value().expect_err("too deep is a budget refusal");
+    // Round 10 (#4): the same condition on the argument side is a budget
+    // refusal, so the answer carries the dimension and the event too.
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
 
 /// A record is restored once per kernel: the budgets inside it were reserved at

@@ -540,12 +540,11 @@ fn an_oversized_method_name_is_refused_before_it_is_copied() {
 #[test]
 fn a_deep_path_nest_is_walked_iteratively() {
     // Round 6 (#3): the path-scope walk recursed, so a deep value could abort
-    // the process in the check that exists to refuse it. The depth is two
-    // thousand, well past the wire's 64: `Value` is a public type with a derived
-    // (recursive) destructor, so a deeper value would also overflow while this
-    // test's own temporary is dropped.
+    // the process in the check that exists to refuse it. Fifty levels is half
+    // the absolute wire ceiling (the kernel refuses anything deeper before this
+    // walk), and enough to exercise the explicit stack.
     let mut value = Value::path("secret/leaf");
-    for _ in 0..2_000 {
+    for _ in 0..50 {
         value = Value::list(std::iter::once(value));
     }
     let mut fixture = fixture_parts(
@@ -607,7 +606,7 @@ fn a_deep_resolved_value_is_refused_before_the_dispatch_clone() {
         .agent
         .call(fixture.lane, &fixture.cap, "ping", Vec::new())
         .expect("queued");
-    let dependent = fixture
+    let _dependent = fixture
         .agent
         .call(
             fixture.lane,
@@ -616,15 +615,14 @@ fn a_deep_resolved_value_is_refused_before_the_dispatch_clone() {
             vec![Arg::Promise(pending.id())],
         )
         .expect("dependent");
-    // Inside the capability's depth ceiling (256) but past the wire's 64.
-    fixture
+    // Inside the capability's depth ceiling (256) but past the wire's 64: the
+    // resolve gate refuses it, so the dispatch never sees such a value.
+    let error = fixture
         .agent
         .resolve(&pending, nested(100))
-        .expect("resolve accepts a value inside the grant");
-    let error = dependent
-        .value()
-        .expect_err("the dispatch refuses a value deeper than the wire allows");
+        .expect_err("the absolute wire ceiling binds an out-of-band answer");
     assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert!(!pending.is_settled());
 }
 
 #[test]
@@ -768,7 +766,7 @@ fn a_deep_queued_value_is_refused_before_the_dispatch_clone() {
         },
         Value::text("ok"),
     );
-    let promise = fixture
+    let error = fixture
         .agent
         .call(
             fixture.lane,
@@ -776,10 +774,7 @@ fn a_deep_queued_value_is_refused_before_the_dispatch_clone() {
             "ping",
             vec![Arg::Value(nested(2_000))],
         )
-        .expect("queued");
-    let error = promise
-        .value()
-        .expect_err("a value deeper than the wire allows is refused");
+        .expect_err("a value deeper than the wire allows is refused at the queue");
     assert_eq!(error.code(), "rpc/budget-exceeded");
     assert_eq!(fixture.calls.get(), 0);
 }
@@ -886,6 +881,150 @@ fn an_idempotent_body_reaches_the_provider() {
         Value::Int(12),
         "the provider did not receive the body the call was charged for"
     );
+}
+
+#[test]
+fn a_promise_handle_names_its_own_kernel() {
+    // Round 3 (F1): promise ids are a per-kernel counter, so a handle from one
+    // agent that named the same id in another read, cancelled or answered the
+    // other tenant's call.
+    let first = fixture_with(Budget::default(), Value::text("first"));
+    let second = fixture_with(Budget::default(), Value::text("second"));
+    let promise = first
+        .agent
+        .call(first.lane, &first.cap, "ping", Vec::new())
+        .expect("queued");
+    assert_eq!(
+        second
+            .agent
+            .await_promise(&promise)
+            .expect_err("a foreign handle cannot be awaited")
+            .code(),
+        "rpc/unknown-promise"
+    );
+    assert_eq!(
+        second
+            .agent
+            .resolve(&promise, Value::text("forged"))
+            .expect_err("a foreign handle cannot be answered")
+            .code(),
+        "rpc/unknown-promise"
+    );
+    assert_eq!(
+        second
+            .agent
+            .cancel(&promise)
+            .expect_err("a foreign handle cannot be cancelled")
+            .code(),
+        "rpc/unknown-promise"
+    );
+    first.agent.run();
+    assert_eq!(promise.value().expect("own kernel"), Value::text("first"));
+}
+
+#[test]
+fn an_out_of_band_answer_obeys_the_egress_policy() {
+    // Round 10 (#1): resolve stored a secret-bearing module and skipped the
+    // redaction policy dispatch applies.
+    use active_infinity::{encode, InfinityModule, Inode};
+
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(active_infinity::SecretBytes::new(b"canary")));
+    let key = module.push(Inode::Str("password".to_string()));
+    let root = module.push(Inode::Table {
+        fields: vec![("k".to_string(), key), ("v".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+    let bytes = encode(&module).expect("encode");
+
+    let fixture = fixture_with(Budget::default(), Value::text("ok"));
+    let promise = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, "ping", Vec::new())
+        .expect("queued");
+    let error = fixture
+        .agent
+        .resolve(&promise, Value::Module(bytes))
+        .expect_err("a secret-bearing module is refused");
+    assert_eq!(error.code(), "rpc/provider");
+    assert!(!promise.is_settled());
+}
+
+#[test]
+fn a_cached_replay_obeys_the_narrowed_lane() {
+    // Round 10 (#3): the hit path returned a cached value the lane would now
+    // refuse, with no charge.
+    let fixture = fixture_with(Budget::default(), Value::text("ok"));
+    let args = vec![Arg::Value(Value::list((0..64).map(Value::Int)))];
+    let first = fixture
+        .agent
+        .call_idempotent(fixture.lane, &fixture.cap, "ping", args, "narrowed")
+        .expect("queued");
+    fixture.agent.run();
+    first.value().expect("value");
+    fixture
+        .agent
+        .attenuate_lane(
+            fixture.lane,
+            Budget {
+                max_array_len: 3,
+                ..Budget::default()
+            },
+        )
+        .expect("attenuate");
+    let error = fixture
+        .agent
+        .call_idempotent(
+            fixture.lane,
+            &fixture.cap,
+            "ping",
+            vec![Arg::Value(Value::list((0..64).map(Value::Int)))],
+            "narrowed",
+        )
+        .expect_err("a replay is held to the current grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+}
+
+#[test]
+fn a_provider_answer_deeper_than_the_wire_is_a_budget_refusal() {
+    // Round 10 (#4): the same condition was a generic provider fault on one
+    // side and a budget refusal on the other, so the dimension and the
+    // `budget.exhausted` event were lost.
+    struct DeepReply;
+
+    impl Provider for DeepReply {
+        fn name(&self) -> &'static str {
+            "deep"
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["go".to_string()]
+        }
+
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            let mut value = Value::Int(1);
+            for _ in 0..200 {
+                value = Value::list(std::iter::once(value));
+            }
+            Ok(Response::Value(value))
+        }
+    }
+
+    let agent = Agent::with_secret([0x84; 32]);
+    let provider = agent.register(Box::new(DeepReply));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["go"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("deep-answer", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "go", Vec::new()).expect("queued");
+    let error = promise.value().expect_err("the answer is too deep");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
 }
 
 #[test]

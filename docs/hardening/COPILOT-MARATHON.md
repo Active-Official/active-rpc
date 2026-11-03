@@ -1146,6 +1146,45 @@ change is a workspace-wide grep, not a kernel-only edit.
 Gate: 764 tests all-features, 0 failed; control-plane 28 + 11 + 7 pass;
 clippy/fmt/doc clean; negative controls 9/9.
 
+### R-06 budgets - 2026-11-02 (round 10)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `e83a018`. Round-9 fixes
+verified; two highs and four lower findings, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `resolve_as` skipped the egress policy dispatch applies: a secret-bearing module was stored on a plain cap, and an unredacted one on a redacting cap | **fixed**: the same `catch_unwind { redact or assert }` runs before the charge, plus the absolute depth gate; `an_out_of_band_answer_obeys_the_egress_policy` |
+| 2 | high | the absolute `MAX_VALUE_DEPTH` gate existed only at dispatch, so a deep value could be stored at the queue, the keyed path, `send`, `publish` or `resolve`, where the derived destructor would later abort the process | **fixed**: the absolute depth probe runs next to every ingress shape gate (after it, so a wide value is still refused in constant time) |
+| 3 | medium | a cached replay returned a value the lane would no longer allow, with no charge | **fixed**: the hit path re-runs the shape gate against `capability ∩ lane`; `a_cached_replay_obeys_the_narrowed_lane` |
+| 4 | medium | a provider answer deeper than the wire reported `rpc/provider` on one side and `rpc/budget-exceeded` on the other | **fixed**: both are budget refusals with the dimension and event; `a_provider_answer_deeper_than_the_wire_is_a_budget_refusal` |
+| 5 | low | the dispatch byte sums and one channel sum still saturated | **fixed**: `checked_add` at all of them |
+| 6 | low | the recursive redact/assert helpers were reachable with an unbounded value | **fixed by #2**: every stored or settled value is now at most 64 deep |
+
+Gate: 768 tests all-features, 0 failed; clippy/fmt/doc clean; negative controls
+9/9; control-plane green.
+
+### R-04 promises / pipelining - 2026-11-02 (round 3, confirmation)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `e83a018`. It re-checked the
+two earlier rounds, upgraded one carried low to a high, and found five more.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | a `PromiseHandle` was not bound to its kernel: ids are a per-kernel counter, so a handle from one agent awaited/resolved/cancelled the other agent's call with the same number | **fixed**: `Agent::owns_promise` (pointer identity of the kernel cell) guards `await_promise`, `cancel`, `cancel_tree`, `resolve_as` and `promise_waiters`; `a_promise_handle_names_its_own_kernel` |
+| F2 | high | `resolve_as` skipped the egress gates dispatch enforces | **fixed** with R-06 round 10 #1 (one code path) |
+| F3 | medium | `cancel_tree` never marked a cancelled *running* promise trim-eligible, so repeated cancellations leaked records to the promise ceiling | **fixed**: every target is recorded settled (idempotent), as `cancel` already did |
+| F4 | medium | when a resolve won the race with the provider, dispatch charged egress a second time and then counted the discarded outcome as a kernel double settlement, while the receipt said refused | **fixed**: dispatch skips the charge when the promise is already settled and does not count the discard as a double settlement |
+| F5 | low | an unknown capability on the keyed path returned without the refusal accounting every other arm performs | **fixed**: one pre-check that records; the shape block's `?` is now unreachable |
+| F6 | low | `JobState::Done` was write-only (set immediately before the record is removed) | **fixed**: the variant and its two references are gone |
+| F7 | low | authority refusals that only surfaced at dispatch (revoke, expiry, binding, gone lane) were invisible to `calls_refused`/`identity_refusals` and the tape | **fixed**: phase 3 counts and emits `CallRefused` for them |
+
+The two remaining residuals are documented, not defects: `flush_promise_refops`
+can defer a stale reference count when a borrow is held (try_borrow only fails
+inside a borrow; rare), and `PipelinedCycle` is a dead fail-closed arm.
+
+Gate: 768 tests all-features, 0 failed; clippy/fmt/doc clean; negative controls
+9/9.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`
