@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-8: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 findings; round-8 fixes green, confirmation round pending | 53 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-4: 15 + 16 + 9 + 6 findings; round-4 fixes green, confirmation round pending | 41 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-9: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 findings; round-9 fixes green, confirmation round pending | 60 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-5: 15 + 16 + 9 + 6 + 6 findings; round-5 fixes green, confirmation round pending | 47 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,46 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 9)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `3ce5069`.
+It confirmed five of the six round-8 fixes and found one half-fix, three new
+highs/mediums and four lows. All closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a redacting `subgraph` still returned the cone's provenance (the parent content address and a `Hash` entry): an offline equality oracle over the secret heap, while `patch` cleared it | **fixed**: the redacting cone clears provenance like the patch path; `a_redacting_subgraph_carries_no_provenance` |
+| 2 | high | redaction rewrote only `is_secret()` nodes: a plain `Str` holding the same bytes was neither replaced in a cone nor refused in an evaluated value | **fixed**: `interop::Redactor` in Active Infinity 2.4.x — the library that holds the heap — covers every text surface, and the provider redacts cones, patches and the evaluated copy; `a_redacted_cone_carries_no_secret_literal_copy`, `an_evaluated_secret_copy_is_not_text`, `review_module_payloads_redact_a_secret_copy` (negative control I-3) |
+| 3 | medium | the write-confinement relation followed only subject -> expression, so a scoped write could rewrite an outside subtree's rule expression | **fixed**: the relation is undirected at the fixpoint; `a_scoped_patch_cannot_change_an_outside_rule_expression` |
+| 4 | low | a redacting cone dropped every intent/constraint while `annotations` hid only tainted ones: the two answers disagreed | **fixed**: only rules on tainted nodes are dropped; `a_redacting_cone_keeps_rules_outside_the_secret_cone` |
+| 5 | low | an encode failure on the second patch reported `active/lower` (an evaluator class) | **fixed**: `Error::Payload(code)` (no reachable trigger through the public API; an error-code correction) |
+| 6 | low | a redacting, unscoped `why`/`impact` still emitted `Str[7]` labels for pathless nodes: an arena-position oracle | **fixed**: pathless labels are dropped under redaction too; `a_redacting_answer_never_names_a_node_index` |
+| 7 | low | the `install` doc claimed a lazy hash while `install` seeds it | **fixed**: the doc matches the code |
+
+Residuals recorded: a default-minted capability has `redact = false`, so the
+oracle mitigations are opt-in; the `blake3:` prefix rule is textual; a binding
+on a read-closure node still refuses a scoped read (fail-closed); the wall
+ceiling is checked after the work.
+
+Gate: 87 suites / 833 tests all-features, clippy/fmt/doc clean; negative
+controls 9/9; hardening status 13 invariants / 145 checks.
+
+### R-08 tools and MCP - 2026-11-03 (round 5)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `3ce5069`. All six round-4
+fixes held; three highs/mediums and three lows, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `get`/`post` silently dropped a `Text` argument (only `request` consumes one) | **fixed**: refused; `a_text_argument_on_a_named_method_is_refused` |
+| 2 | medium | MCP accepted a `Value::Module` (and a module nested in a body) and sent `{"$module_bytes":N}`: the peer acted on a request nobody made | **fixed**: a recursive check refuses it in both adapters; `a_module_argument_is_not_sent` |
+| 3 | medium | write faults were labelled `http/read:`, so a retry policy would retry a half-sent POST | **fixed**: `map_http_write` (`http/write:`), documented direction; no reachable trigger on this host (a closed peer surfaces on the read), so the mapping is inspected rather than test-forced |
+| 4 | low | a bodyless POST sent the four bytes `null` under `content-length: 4` | **fixed**: no body object means an empty body; `a_bodyless_post_sends_no_body` |
+| 5 | low | a send under a spent deadline reported `Timeout` but still reached the wire (the frame was enqueued first) | **fixed**: the deadline is checked before enqueueing, and the request path refuses a spent deadline without poisoning; `a_spent_deadline_does_not_write_a_line` |
+| 6 | low | a NUL in an exact-matched process argument (or an env entry) panicked `Command` | **fixed**: refused as `rpc/invalid-argument`; `a_nul_argument_is_refused` |
+
+Gate: as above (the same commit).
 
 ### R-07 domain operations - 2026-11-02 (round 8)
 

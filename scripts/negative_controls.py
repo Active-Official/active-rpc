@@ -31,10 +31,10 @@ CONTROLS = [
         # (one implementation, so a fix in one place cannot drift). The anchor
         # follows the code.
         "file": "src/security.rs",
-        "find": "        if is_secret {\n            *module\n                .node_mut(id)\n                .map_err(|error| Error::Payload(error.code().to_string()))? =\n                active_infinity::Inode::Str(SECRET_MARKER.to_string());\n        }\n",
-        "replace": "        if false {\n            *module\n                .node_mut(id)\n                .map_err(|error| Error::Payload(error.code().to_string()))? =\n                active_infinity::Inode::Str(SECRET_MARKER.to_string());\n        }\n",
+        "find": "    redactor\n        .redact(module)\n        .map_err(|error| Error::Payload(error.code().to_string()))\n",
+        "replace": "    Ok(())\n",
         "suite": "redteam_tests",
-        "test": "review_module_payloads_are_redacted",
+        "test": "review_module_payloads_redact_a_secret_copy",
         "why": "Module payload redaction is disabled; the subgraph response carries the canary.",
     },
     {

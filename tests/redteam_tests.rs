@@ -761,3 +761,56 @@ fn review_attenuation_validates_the_budget() {
         .unwrap_err();
     assert_eq!(error.code(), "rpc/invalid-argument");
 }
+
+/// A plain string that copies a secret literal is still the secret. The secret
+/// lives outside the cone, so the redaction has to come from the module the
+/// capability was installed from: the cone itself no longer names it (R-07
+/// round 9, high).
+#[test]
+fn review_module_payloads_redact_a_secret_copy() {
+    use active_infinity::{InfinityModule, Inode};
+
+    const CANARY: &str = "red-team-copy-canary";
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let copy = module.push(Inode::Str(CANARY.to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("copy".to_string(), copy)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app), ("secret".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([52u8; 32]);
+    let provider_id = agent.register(Box::new(provider));
+    let cap = agent
+        .mint(
+            provider_id,
+            object,
+            CapAttrs::new(active_rpc::MODULE_METHODS),
+        )
+        .expect("cap");
+    let lane = agent.create_lane("copy", Budget::default()).expect("lane");
+    let value = agent
+        .call(
+            lane,
+            &cap,
+            "subgraph",
+            vec![Arg::Value(Value::Path("app".into()))],
+        )
+        .expect("call")
+        .value()
+        .expect("subgraph");
+    let Value::Module(bytes) = value else {
+        panic!("a subgraph answers a module: {value:?}");
+    };
+    assert!(
+        !bytes
+            .windows(CANARY.len())
+            .any(|window| window == CANARY.as_bytes()),
+        "a cone carried a copy of a secret literal"
+    );
+}

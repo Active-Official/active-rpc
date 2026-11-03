@@ -774,3 +774,147 @@ fn a_zero_wall_grant_is_a_budget_refusal() {
     let error = process.invoke(0, &call).expect_err("a zero grant");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 5
+// ---------------------------------------------------------------------------
+
+/// A stub MCP server that lists one `echo` tool and answers a call.
+fn echo_session() -> active_rpc::tool::McpSession<active_rpc::tool::MemoryTransport> {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/call".to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#
+            .to_string(),
+    );
+    McpSession::handshake(MemoryTransport::new(responses)).expect("handshake")
+}
+
+/// `get` and `post` name their method in the capability. A text argument used to
+/// reach them and be dropped, so the peer acted without data the caller
+/// approved.
+#[test]
+fn a_text_argument_on_a_named_method_is_refused() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x"), ("POST", "/y")]);
+    for (method, path) in [("get", "/x"), ("post", "/y")] {
+        let mut call = Call::new(
+            method,
+            vec![Arg::Value(Value::path(path)), Arg::text("idempotency-key")],
+        );
+        call.tool_allows_process = true;
+        let error = tool
+            .invoke(0, &call)
+            .expect_err("a text is not deliverable");
+        assert_eq!(error.code(), "rpc/invalid-argument", "{method}: {error}");
+    }
+}
+
+/// The JSON form of a module is its byte length, not its content: a peer that
+/// receives it acts on a request the caller never made. Nested too.
+#[test]
+fn a_module_argument_is_not_sent() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("POST", "/y")]);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("m".to_string(), Value::Module(vec![1, 2, 3]));
+    let mut call = Call::new(
+        "post",
+        vec![
+            Arg::Value(Value::path("/y")),
+            Arg::Value(Value::Map(entries)),
+        ],
+    );
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("a module body");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+
+    let mut session = echo_session();
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Module(vec![1, 2, 3]))]);
+    call.tool_allows_process = true;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("a module argument");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// A POST with no body object sends no bytes. It used to send the four bytes
+/// `null` under `content-length: 4`, which a lax peer acts on.
+#[test]
+fn a_bodyless_post_sends_no_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = record_one_request(listener);
+
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("POST", "/submit")]);
+    let mut call = Call::new("post", vec![Arg::Value(Value::path("/submit"))]);
+    call.tool_allows_process = true;
+    tool.invoke(0, &call).expect("POST answers");
+
+    let (head, body) = server.join().expect("server thread");
+    assert!(
+        head.to_ascii_lowercase().contains("content-length: 0"),
+        "an empty body is declared: {head}"
+    );
+    assert_eq!(body, 0, "a bodyless POST carried bytes: {head}");
+}
+
+/// A ceiling already spent writes nothing: the transport stays usable instead
+/// of the next call reading the previous answer.
+#[test]
+fn a_spent_deadline_does_not_write_a_line() {
+    use active_rpc::tool::{McpTransport, StdioTransport};
+
+    let mut env = std::collections::BTreeMap::new();
+    env.insert(
+        "SystemRoot".to_string(),
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+    );
+    let mut transport = StdioTransport::spawn(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        &["-NoProfile", "-Command", "Start-Sleep -Seconds 20"],
+        &env,
+    )
+    .expect("spawn");
+    let error = transport
+        .send_line_within("{\"jsonrpc\":\"2.0\"}", Some(std::time::Instant::now()))
+        .expect_err("a spent deadline");
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    transport
+        .send_line_within("{\"jsonrpc\":\"2.0\"}", None)
+        .expect("the transport still writes");
+}
+
+/// `Command` panics on an interior NUL. A caller-supplied argument and a
+/// configured environment entry must be refusals.
+#[test]
+fn a_nul_argument_is_refused() {
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\cmd.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    let mut call = Call::new(
+        "run",
+        vec![Arg::text("/C"), Arg::text("echo"), Arg::text("a\0b")],
+    );
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("a NUL argument");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+
+    tool.env
+        .insert("ACTIVE_TEST".to_string(), "a\0b".to_string());
+    let mut call = Call::new("run", vec![Arg::text("/C"), Arg::text("echo")]);
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("a NUL environment value");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}

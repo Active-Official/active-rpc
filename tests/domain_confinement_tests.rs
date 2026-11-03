@@ -982,3 +982,237 @@ fn a_redacting_cone_carries_no_annotation_text() {
         "the cone carries a binding that names a tainted node"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R-07 round 9
+// ---------------------------------------------------------------------------
+
+const PROBE_SECRET: &str = "probe-canary-9f3a";
+
+/// A module where the secret is copied as ordinary data and where an outside
+/// subtree's rule watches an in-scope value.
+fn copying_module() -> InfinityModule {
+    use active_infinity::{Constraint, Provenance};
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(PROBE_SECRET.into()));
+    let copy = module.push(Inode::Str(PROBE_SECRET.to_string()));
+    let in_scope = module.push(Inode::Str("in".to_string()));
+    let outside = module.push(Inode::Str("outside".to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("copy".to_string(), copy), ("y".to_string(), in_scope)],
+    });
+    let ops = module.push(Inode::Table {
+        fields: vec![("rule".to_string(), outside)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![
+            ("app".to_string(), app),
+            ("ops".to_string(), ops),
+            ("secret".to_string(), secret),
+        ],
+    });
+    module.set_root(Some(root));
+    // The rule on `ops` is validated by the in-scope value: rewriting `app.y`
+    // changes the rule that watches data the scope does not name.
+    module.annotate(
+        ops,
+        AnnotationKind::Constraint {
+            source: "rule".to_string(),
+            expr: in_scope,
+        },
+    );
+    module.annotate(ops, AnnotationKind::Intent("OUTSIDE-RULE".to_string()));
+    module.annotate(app, AnnotationKind::Intent("APP-RULE".to_string()));
+    module.set_provenance(Some(Provenance {
+        producer: Some("test".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: Some([0x51; 32]),
+        entries: vec![active_infinity::ProvEntry {
+            key: "input".to_string(),
+            value: active_infinity::ProvValue::Hash([0x52; 32]),
+        }],
+    }));
+    let _ = Constraint::Odd;
+    module
+}
+
+fn install_copying(attrs: CapAttrs) -> (Agent, CapHandle, LaneId, u64) {
+    let agent = Agent::with_secret([0x62; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(copying_module()).expect("install");
+    let id = agent.register(Box::new(provider));
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("round9", Budget::default())
+        .expect("lane");
+    (agent, cap, lane, object)
+}
+
+/// F1: the parent content address is an equality oracle over the secret heap,
+/// and a redacting cone served it on the `subgraph` path while `patch` cleared
+/// it.
+#[test]
+fn a_redacting_subgraph_carries_no_provenance() {
+    let mut attrs = CapAttrs::new(&["subgraph"]);
+    attrs.redact = true;
+    let (agent, cap, lane, _) = install_copying(attrs);
+    let value = call(
+        &Fixture { agent },
+        lane,
+        &cap,
+        "subgraph",
+        vec![path("app")],
+    )
+    .expect("subgraph");
+    let Value::Module(bytes) = value else {
+        panic!("subgraph answers a module: {value:?}");
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    assert!(
+        decoded.provenance().is_none(),
+        "the cone carries the whole module's provenance"
+    );
+}
+
+/// F2: a plain `Str` that copies a secret literal is neither a secret node nor
+/// metadata, so the old redactor left it in the cone verbatim.
+#[test]
+fn a_redacted_cone_carries_no_secret_literal_copy() {
+    let mut attrs = CapAttrs::new(&["subgraph"]);
+    attrs.redact = true;
+    let (agent, cap, lane, _) = install_copying(attrs);
+    let value = call(
+        &Fixture { agent },
+        lane,
+        &cap,
+        "subgraph",
+        vec![path("app")],
+    )
+    .expect("subgraph");
+    let Value::Module(bytes) = value else {
+        panic!("subgraph answers a module: {value:?}");
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    for index in 0..decoded.node_count() {
+        let id = active_infinity::NodeId(index as u32);
+        if let Some(Inode::Str(text)) | Some(Inode::Ident(text)) = decoded.get(id) {
+            assert!(
+                !text.contains(PROBE_SECRET),
+                "the cone carries a copy of the secret: {text}"
+            );
+        }
+    }
+}
+
+/// F2 on the evaluator: the engine has no notion of a secret literal, so it
+/// returned the copy as text.
+#[test]
+fn an_evaluated_secret_copy_is_not_text() {
+    let mut attrs = CapAttrs::new(&["evaluate"]);
+    attrs.redact = true;
+    let (agent, cap, lane, _) = install_copying(attrs);
+    let value = call(
+        &Fixture { agent },
+        lane,
+        &cap,
+        "evaluate",
+        vec![path("app.copy")],
+    )
+    .expect("evaluate");
+    match &value {
+        Value::Text(text) => assert!(
+            !text.contains(PROBE_SECRET),
+            "evaluate returned the secret copy: {text}"
+        ),
+        Value::Secret => {}
+        other => panic!("unexpected answer {other:?}"),
+    }
+}
+
+/// F3: the constraint relation is undirected. A scoped write to a rule's
+/// expression changes the rule that guards an outside subtree.
+#[test]
+fn a_scoped_patch_cannot_change_an_outside_rule_expression() {
+    let (fixture, cap, lane) = fixture(&["patch"], Some("app"));
+    let error = call(
+        &fixture,
+        lane,
+        &cap,
+        "patch",
+        vec![path("app.y"), Arg::text("changed")],
+    )
+    .expect_err("the rule on ops watches app.y");
+    assert_eq!(error.code(), "rpc/path-not-granted", "{error}");
+}
+
+/// F4: the cone and the `annotations` query must agree. A rule on a node outside
+/// the secret cone is data the capability was granted, so it travels.
+#[test]
+fn a_redacting_cone_keeps_rules_outside_the_secret_cone() {
+    let mut attrs = CapAttrs::new(&["subgraph"]);
+    attrs.redact = true;
+    let (agent, cap, lane, _) = install_copying(attrs);
+    let value = call(
+        &Fixture { agent },
+        lane,
+        &cap,
+        "subgraph",
+        vec![path("app")],
+    )
+    .expect("subgraph");
+    let Value::Module(bytes) = value else {
+        panic!("subgraph answers a module: {value:?}");
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    let intents: Vec<&str> = decoded
+        .annotations()
+        .iter()
+        .filter_map(|annotation| match &annotation.kind {
+            AnnotationKind::Intent(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        intents.contains(&"APP-RULE"),
+        "the cone dropped a rule on a granted node: {intents:?}"
+    );
+}
+
+/// F6: `Kind[index]` names an arena position. Under a redacting capability a
+/// pathless node has no name the caller may receive.
+#[test]
+fn a_redacting_answer_never_names_a_node_index() {
+    use active_infinity::BinOp;
+    let mut module = InfinityModule::new();
+    let left = module.push(Inode::Str("1".to_string()));
+    let right = module.push(Inode::Str("2".to_string()));
+    let sum = module.push(Inode::Binary {
+        op: BinOp::Add,
+        lhs: left,
+        rhs: right,
+    });
+    let app = module.push(Inode::Table {
+        fields: vec![("x".to_string(), sum)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let mut call = active_rpc::value::Call::new("why", vec![path("app.x")]);
+    call.redact = true;
+    let response = active_rpc::kernel::Provider::invoke(&mut provider, object, &call).expect("why");
+    let active_rpc::value::Response::Labels(labels) = response else {
+        panic!("why answers labels: {response:?}");
+    };
+    for label in &labels {
+        assert!(
+            !label.contains('['),
+            "a redacting answer names an arena position: {label}"
+        );
+    }
+}

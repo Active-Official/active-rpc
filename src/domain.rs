@@ -91,8 +91,10 @@ impl ModuleProvider {
 
     /// Install a module and return the object id to mint capabilities for.
     ///
-    /// The canonical hash is computed lazily on the first `content_hash` call.
-    /// The module is validated as canonical first: a hand-built arena can carry
+    /// The install seeds the cached hash from the bytes it produced, so a
+    /// `content_hash` call answers without re-encoding; a `patch` clears the
+    /// cache and the next call recomputes it. The module is validated as
+    /// canonical first: a hand-built arena can carry
     /// a dangling reference, a secret copy in provenance text, or a node graph
     /// that no encoder would produce, and every query below assumes the codec's
     /// invariants hold.
@@ -218,11 +220,11 @@ impl ModuleProvider {
                             }
                         }
                         let sub = restrict(&slot.module, node)?;
-                        active_infinity::interop::evaluate(&sub, budget)
+                        evaluate_for_caller(&slot.module, &sub, budget)
                     }
                     // No path means the module root: evaluate in place rather
                     // than cloning the whole arena.
-                    None => active_infinity::interop::evaluate(&slot.module, budget),
+                    None => evaluate_for_caller(&slot.module, &slot.module, budget),
                 }
                 .map_err(|error| match &error {
                     active_infinity::Error::Evaluation(code) => Error::Domain(code),
@@ -253,7 +255,12 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels = scoped_labels(&slot.module, dependencies, call.path_scope.as_deref());
+                let labels = scoped_labels(
+                    &slot.module,
+                    dependencies,
+                    call.path_scope.as_deref(),
+                    call.redact,
+                );
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -276,7 +283,12 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels = scoped_labels(&slot.module, dependents, call.path_scope.as_deref());
+                let labels = scoped_labels(
+                    &slot.module,
+                    dependents,
+                    call.path_scope.as_deref(),
+                    call.redact,
+                );
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -295,11 +307,25 @@ impl ModuleProvider {
                     }
                 }
                 let mut sub = restrict(&slot.module, node)?;
+                // The wire has no tag for secret bytes, so the cone is redacted
+                // from the source module's literal set: the cone itself no
+                // longer holds the secret node, and a plain copy used to travel
+                // verbatim (round 9, #2).
+                // The taint set is computed before the redaction: replacing the
+                // secret node with the marker leaves nothing to taint, and the
+                // metadata filter below needs the original cone.
+                let tainted = call.redact.then(|| tainted_nodes(&sub));
+                security::redact_derived(&mut sub, &security::redactor_for(&slot.module))?;
                 if call.redact {
-                    // A redacting cone is data only: annotation text and a
-                    // binding that names a tainted node describe it, and the
-                    // `annotations` method already hides them (round 8, #3).
-                    redact_cone_metadata(&mut sub);
+                    // A redacting cone is data only: provenance (producer,
+                    // entries and the parent content address) describes the
+                    // whole module, annotation text and a binding that names a
+                    // tainted node describe it, and the `annotations` method
+                    // already hides them (round 8, #3). The parent hash is an
+                    // equality oracle over the secret heap, exactly as on the
+                    // patch path (round 9, #1).
+                    sub.set_provenance(None);
+                    redact_cone_metadata(&mut sub, &tainted.unwrap_or_default());
                 }
                 if let Some(scope) = &call.path_scope {
                     // A cone reply is the subtree's data. Provenance (producer,
@@ -326,11 +352,11 @@ impl ModuleProvider {
                 let parent_hash = match slot.hash {
                     Some(hash) => Some(hash),
                     None => {
-                        let bytes =
-                            encode(&slot.module).map_err(|_| Error::Domain("active/lower"))?;
+                        let bytes = encode(&slot.module)
+                            .map_err(|error| Error::Payload(error.code().to_string()))?;
                         Some(
                             active_infinity::content_hash(&bytes)
-                                .map_err(|_| Error::Domain("active/lower"))?,
+                                .map_err(|error| Error::Payload(error.code().to_string()))?,
                         )
                     }
                 };
@@ -383,6 +409,10 @@ impl ModuleProvider {
                     // a scoped writer must not receive the rest of the module
                     // back, and the bytes stay bounded by the write.
                     let mut cone = restrict(&patched, node)?;
+                    // As in `subgraph`: the reply is a projection, and a copy of
+                    // a secret literal in the cone is still the secret.
+                    let tainted = call.redact.then(|| tainted_nodes(&cone));
+                    security::redact_derived(&mut cone, &security::redactor_for(&patched))?;
                     if call.redact {
                         // The provenance records the parent's content address,
                         // and a redacting caller may not receive a hash of an
@@ -391,7 +421,7 @@ impl ModuleProvider {
                         // Annotation text and bindings on a tainted node describe
                         // it, so they go with it (round 8, #3).
                         cone.set_provenance(None);
-                        redact_cone_metadata(&mut cone);
+                        redact_cone_metadata(&mut cone, &tainted.unwrap_or_default());
                     }
                     if let Some(scope) = &call.path_scope {
                         // The same rule as `subgraph`: a scoped cone reply is the
@@ -429,7 +459,8 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels = scoped_labels(&slot.module, ids, call.path_scope.as_deref());
+                let labels =
+                    scoped_labels(&slot.module, ids, call.path_scope.as_deref(), call.redact);
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -453,7 +484,8 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels = scoped_labels(&slot.module, ids, call.path_scope.as_deref());
+                let labels =
+                    scoped_labels(&slot.module, ids, call.path_scope.as_deref(), call.redact);
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(redact_answer(
                     &slot.module,
@@ -728,6 +760,18 @@ fn transitive(module: &InfinityModule, node: NodeId, walk_dependencies: bool) ->
     seen
 }
 
+/// The value path a node is *named* by.
+///
+/// `value_paths` labels the module root with the empty string and leaves a node
+/// no walk reaches out of the map. Neither is a name a scope can grant: the root
+/// is the module itself, and a floating node is out of scope by construction.
+fn named_path(paths: &std::collections::HashMap<NodeId, String>, id: NodeId) -> Option<&str> {
+    paths
+        .get(&id)
+        .map(String::as_str)
+        .filter(|path| !path.is_empty())
+}
+
 /// Labels for a set of node ids, from one `value_paths` pass.
 ///
 /// `node_label` rebuilds the whole path map per node, which is what made these
@@ -736,8 +780,8 @@ fn labels_for(module: &InfinityModule, ids: impl IntoIterator<Item = NodeId>) ->
     let paths = active_infinity::interop::value_paths(module);
     let mut labels: Vec<String> = ids
         .into_iter()
-        .map(|id| match paths.get(&id) {
-            Some(path) => path.clone(),
+        .map(|id| match named_path(&paths, id) {
+            Some(path) => path.to_string(),
             None => match module.get(id) {
                 Some(node) => format!("{}[{}]", node.kind().name(), id.0),
                 None => format!("node[{}]", id.0),
@@ -818,12 +862,18 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
         let subjects = affected.clone();
         for annotation in module.annotations() {
             if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
-                if subjects.contains(&annotation.node) {
+                // The relation is undirected: changing a rule's subject changes
+                // what is validated, and changing its expression changes the
+                // same rule from the other side. Following only subject ->
+                // expression let a scoped write rewrite an outside subtree's
+                // rule expression (round 9, #3).
+                if subjects.contains(&annotation.node) || subjects.contains(expr) {
                     // The expression's own dependencies too: `scope_closure`
                     // follows them on the read side, and a write that changes
                     // the rule's meaning is the same access (round 8, #4).
                     affected.extend(transitive(module, *expr, true));
                     affected.insert(*expr);
+                    affected.insert(annotation.node);
                 }
             }
         }
@@ -841,7 +891,7 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
     }
     let paths = active_infinity::interop::value_paths(module);
     let root = module.root();
-    if !affected.iter().all(|id| match paths.get(id) {
+    if !affected.iter().all(|id| match named_path(&paths, *id) {
         Some(path) => in_scope_path(module, *id, path, scope),
         // The module root is pathless by construction. Any other pathless node is
         // a floating value or an expression: it still travels in a cone and can be
@@ -945,7 +995,7 @@ fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &s
     }
     let paths = active_infinity::interop::value_paths(module);
     let root = module.root();
-    ids.iter().all(|id| match paths.get(id) {
+    ids.iter().all(|id| match named_path(&paths, *id) {
         Some(path) => in_scope_path(module, *id, path, scope),
         // The module root is pathless by construction; any other pathless node
         // is a floating value or an expression, and a scoped answer that dropped
@@ -995,11 +1045,12 @@ fn scope_closure(module: &InfinityModule, node: NodeId, scope: &str) -> (bool, b
         .iter()
         .any(|id| matches!(module.get(*id), Some(Inode::Env { .. })));
     let paths = active_infinity::interop::value_paths(module);
-    let outside = closure.iter().any(|id| match paths.get(id) {
+    let root = module.root();
+    let outside = closure.iter().any(|id| match named_path(&paths, *id) {
         Some(path) => !in_scope_path(module, *id, path, scope),
-        // A node no name reaches still travels in the cone: a floating value is
-        // out of scope by construction.
-        None => true,
+        // The module root is the module itself; any other pathless node still
+        // travels in the cone and is out of scope by construction.
+        None => Some(*id) != root,
     });
     (outside, environment)
 }
@@ -1014,13 +1065,22 @@ fn scoped_labels(
     module: &InfinityModule,
     ids: impl IntoIterator<Item = NodeId>,
     scope: Option<&str>,
+    redact: bool,
 ) -> Vec<String> {
     let ids: Vec<NodeId> = ids.into_iter().collect();
-    if scope.is_none() {
+    // A pathless node has no name a caller could use: under a scope the label
+    // would name a node the scope never granted, and under a redacting
+    // capability it names an arena position of a module the caller cannot read
+    // (round 9, #6). Round 4 fixed only the scoped half.
+    if scope.is_none() && !redact {
         return labels_for(module, ids);
     }
     let paths = active_infinity::interop::value_paths(module);
-    labels_for(module, ids.into_iter().filter(|id| paths.contains_key(id)))
+    labels_for(
+        module,
+        ids.into_iter()
+            .filter(|id| named_path(&paths, *id).is_some()),
+    )
 }
 
 /// Answer a metadata query under a redacting capability.
@@ -1079,9 +1139,13 @@ fn redacted_module_bytes(module: &InfinityModule) -> Result<Vec<u8>> {
 /// name that resolves to a node: both describe the cone, and the `annotations`
 /// method already hides them for a tainted node. Keeping them in the bytes while
 /// hiding them in the query made the two answers disagree (R-07 round 8, #3).
-fn redact_cone_metadata(module: &mut InfinityModule) {
-    keep_immutable_annotations(module);
-    let tainted = tainted_nodes(module);
+fn redact_cone_metadata(module: &mut InfinityModule, tainted: &BTreeSet<NodeId>) {
+    // Only a rule on a tainted node describes secret material. Dropping every
+    // rule made the cone disagree with the `annotations` method about a module
+    // the caller was granted, and silently removed the constraints a receiver
+    // should keep (round 9, #4). Annotation text that copies a secret literal is
+    // redacted by the encoder before the marker pass.
+    keep_annotations_outside(module, tainted);
     if tainted.is_empty() {
         return;
     }
@@ -1094,6 +1158,23 @@ fn redact_cone_metadata(module: &mut InfinityModule) {
     module.clear_bindings();
     for (name, id) in kept {
         module.bind(name, id);
+    }
+}
+
+/// Keep every annotation whose subject is not in the secret cone.
+fn keep_annotations_outside(module: &mut InfinityModule, tainted: &BTreeSet<NodeId>) {
+    let kept: Vec<(NodeId, AnnotationKind)> = module
+        .annotations()
+        .iter()
+        .filter(|annotation| !tainted.contains(&annotation.node))
+        .map(|annotation| (annotation.node, annotation.kind.clone()))
+        .collect();
+    if kept.len() == module.annotations().len() {
+        return;
+    }
+    module.clear_annotations();
+    for (node, kind) in kept {
+        module.annotate(node, kind);
     }
 }
 
@@ -1158,6 +1239,58 @@ fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
 ///
 /// The cone is closed under dependencies by construction, so every child
 /// reference stays inside the new arena.
+/// Evaluate a module for a caller, redacting first when the capability asks.
+///
+/// The engine has no notion of a secret literal: a plain `Str` that copies one
+/// is an ordinary value, and evaluating it handed the text to a redacting
+/// caller (R-07 round 9, high). The redacted copy is what a redacting caller
+/// may see, and it is the same rule the cone bytes and the projections apply.
+fn evaluate_for_caller(
+    source: &InfinityModule,
+    module: &InfinityModule,
+    budget: active_core::Budget,
+) -> std::result::Result<(active_core::Value, Vec<active_core::Diagnostic>), active_infinity::Error>
+{
+    // The `active-core` bridge refuses a module that holds secret material: it
+    // would have to hand the plaintext to every consumer (ADR-0010). So the
+    // engine always runs on the redacted copy, and a secret becomes a marker.
+    // A redacting capability and a plain one therefore see the same structure;
+    // the marker is content-free for both, and `VALUE_MARKER` maps it back to
+    // `Value::Secret` so the caller can tell it from data.
+    let redactor = security::redactor_for(source);
+    if redactor.is_empty() {
+        return active_infinity::interop::evaluate(module, budget);
+    }
+    let mut redacted = module.clone();
+    security::redact_derived(&mut redacted, &redactor)
+        .map_err(|error| active_infinity::Error::Encode(error.code()))?;
+    let (value, diagnostics) = active_infinity::interop::evaluate(&redacted, budget)?;
+    Ok((mark_secret_texts(value), diagnostics))
+}
+
+/// Replace a text equal to the redaction marker with the structural marker.
+///
+/// The engine has no secret value, so the marker comes back as text; a caller
+/// that reads a `Value::Secret` knows the field was secret, and a caller that
+/// reads `"***SECRET***"` might treat it as data.
+fn mark_secret_texts(value: active_core::Value) -> active_core::Value {
+    use active_core::Value as CoreValue;
+    let marker = active_infinity::interop::SECRET_MARKER;
+    match value {
+        CoreValue::String(text) if text == marker => CoreValue::Secret(marker.to_string()),
+        CoreValue::Array(items) => {
+            CoreValue::Array(items.into_iter().map(mark_secret_texts).collect())
+        }
+        CoreValue::Table(entries) => CoreValue::Table(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, mark_secret_texts(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn restrict(module: &InfinityModule, node: NodeId) -> Result<InfinityModule> {
     // A constraint is part of the rule, not decoration: its expression node
     // travels with the annotated node, or a projected module would state a

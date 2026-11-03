@@ -140,36 +140,42 @@ pub fn redact_value(value: Value) -> Value {
 /// One implementation for [`redact_value`] and the domain provider: two would
 /// drift, and the one that drifted would be the leak.
 pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
-    // The canonical encode runs *first*, while the secret nodes are still in the
-    // module. That is the only moment the codec can refuse free text (an
-    // annotation, provenance, a binding name) that carries a secret literal:
-    // replacing the nodes first empties the secret heap, so the same metadata
-    // would pass and be written into the output verbatim.
-    //
-    // A module the codec refuses here cannot be redacted safely, so the caller
-    // gets an error and [`redact_value`] collapses the whole value to the
-    // marker rather than handing the bytes back.
-    let canonical = active_infinity::encode(
-        &active_infinity::decode(bytes)
-            .map_err(|error| Error::Payload(error.code().to_string()))?,
-    )
-    .map_err(|error| Error::Payload(error.code().to_string()))?;
-    let mut module = active_infinity::decode(&canonical)
-        .map_err(|error| Error::Payload(error.code().to_string()))?;
-    for index in 0..module.node_count() {
-        let id = active_infinity::NodeId(index as u32);
-        let is_secret = module.get(id).map(|node| node.is_secret()).unwrap_or(false);
-        if is_secret {
-            *module
-                .node_mut(id)
-                .map_err(|error| Error::Payload(error.code().to_string()))? =
-                active_infinity::Inode::Str(SECRET_MARKER.to_string());
-        }
-    }
-    let redacted = active_infinity::encode(&module)
+    // One implementation, in the library that holds the secret heap: it
+    // canonicalizes first (so the codec can refuse free text or a binary copy
+    // that carries a secret literal, and can redact the metadata while the
+    // literals are still named), then rewrites the value plane, where a mere
+    // `Str`, `Ident`, `Env` name, field name or binding name can hold a copy.
+    // Active RPC cannot see an `Inode::Secret`'s bytes, so a local pass would
+    // miss every copy the library itself redacts in its projections.
+    let redacted = active_infinity::interop::redact_image(bytes)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     check_module_payload(&redacted)?;
     Ok(redacted)
+}
+
+/// A redactor for the literals `module` names.
+///
+/// A cone, a restricted subtree or a scoped evaluation no longer holds the
+/// secret node, so the redactor has to come from the module the capability was
+/// installed from. The handle carries the text; nothing here reads it back.
+pub fn redactor_for(
+    module: &active_infinity::InfinityModule,
+) -> active_infinity::interop::Redactor {
+    active_infinity::interop::Redactor::for_module(module)
+}
+
+/// Apply a redactor to a derived module (a cone, a restricted subtree).
+///
+/// The wire has no tag that carries secret bytes, so every cone is redacted: a
+/// plain `Str` that copies a secret literal is an ordinary node to the codec and
+/// used to travel verbatim (R-07 round 9, high).
+pub fn redact_derived(
+    module: &mut active_infinity::InfinityModule,
+    redactor: &active_infinity::interop::Redactor,
+) -> Result<()> {
+    redactor
+        .redact(module)
+        .map_err(|error| Error::Payload(error.code().to_string()))
 }
 
 /// True when a module holds a node marked secret.

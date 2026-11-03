@@ -72,6 +72,21 @@ pub fn value_to_json(value: &Value) -> Json {
     }
 }
 
+/// Whether a value carries a module payload anywhere in its shape.
+///
+/// A module's JSON form is its byte length, not its content, so any adapter
+/// that serialised one handed the peer a request the caller never made. The
+/// check is recursive: a map or a list is a legal body, and a module nested
+/// inside it would otherwise pass the top-level shape check (round 5, #2).
+fn contains_module(value: &Value) -> bool {
+    match value {
+        Value::Module(_) => true,
+        Value::List(items) => items.iter().any(contains_module),
+        Value::Map(entries) => entries.values().any(contains_module),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MCP
 // ---------------------------------------------------------------------------
@@ -395,6 +410,19 @@ impl DeadlineReader {
 
 /// A socket read that hit its timeout is the call's ceiling, not an I/O fault.
 fn map_http_read(error: std::io::Error) -> Error {
+    map_http_io(error, "read")
+}
+
+/// A socket write fault, named for the operation.
+///
+/// A retry policy keyed on `http/read` would retry a half-sent POST and
+/// duplicate its side effect, so the direction is part of the code
+/// (round 5, #3). A timeout is still the ceiling on both sides.
+fn map_http_write(error: std::io::Error) -> Error {
+    map_http_io(error, "write")
+}
+
+fn map_http_io(error: std::io::Error, direction: &'static str) -> Error {
     if matches!(
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
@@ -402,7 +430,7 @@ fn map_http_read(error: std::io::Error) -> Error {
         Error::Timeout
     } else {
         Error::Provider {
-            code: format!("http/read:{error}"),
+            code: format!("http/{direction}:{error}"),
         }
     }
 }
@@ -455,6 +483,13 @@ impl StdioTransport {
             command.process_group(0);
         }
         for (key, value) in env {
+            // `Command` panics on a NUL in a key or a value; a configuration
+            // typo must be a refusal, not an unwind.
+            if key.contains('\0') || value.contains('\0') {
+                return Err(Error::InvalidArgument(
+                    "an MCP environment entry contains a NUL byte",
+                ));
+            }
             command.env(key, value);
         }
         let mut child = command.spawn().map_err(|error| Error::Provider {
@@ -539,6 +574,15 @@ impl McpTransport for StdioTransport {
     }
 
     fn send_line_within(&mut self, line: &str, deadline: Option<std::time::Instant>) -> Result<()> {
+        // Check before enqueueing: a frame handed to the writer thread after
+        // the deadline returns `Timeout` but still reaches the wire, and the
+        // stream is then one request ahead of the session's state
+        // (round 5, #5).
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
+        }
         let (reply, outcome) = std::sync::mpsc::channel();
         self.writer
             .send((line.to_string(), reply))
@@ -747,10 +791,18 @@ impl<T: McpTransport> McpSession<T> {
                 "the MCP request exceeds the line ceiling",
             ));
         }
+        // A ceiling already spent means nothing has been written: the session
+        // stays usable, and the caller may retry (round 5, #5).
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
+        }
         if let Err(error) = self.transport.send_line_within(&line, deadline) {
             // A partial write desynchronises the stream: the next read could
             // answer this request with the previous call's remainder
-            // (round 3, #3).
+            // (round 3, #3). A timeout takes the same path, because a frame the
+            // writer thread already took may have reached the wire.
             self.poisoned = true;
             return Err(error);
         }
@@ -903,6 +955,13 @@ impl<T: McpTransport> Provider for McpSession<T> {
         for (index, arg) in call.args.iter().enumerate() {
             match arg {
                 Arg::Value(value) => {
+                    if contains_module(value) {
+                        // The JSON form is the byte length, so the peer would
+                        // act on a request the caller never made (round 5, #2).
+                        return Err(Error::InvalidArgument(
+                            "an MCP argument cannot carry a module",
+                        ));
+                    }
                     arguments.insert(format!("arg{index}"), value_to_json(value));
                 }
                 // A capability or a promise is authority, not JSON text: the
@@ -1077,7 +1136,7 @@ impl HttpTool {
                 None => Ok(()),
             })
             .and_then(|_| stream.flush())
-            .map_err(map_http_read)?;
+            .map_err(map_http_write)?;
         let mut reader = DeadlineReader::new(stream, deadline);
         // Every line is read under a cap, and the block has its own budget: a
         // hostile endpoint that streams headers would otherwise grow a `String`
@@ -1220,14 +1279,23 @@ impl Provider for HttpTool {
                 "a secret argument cannot be sent to an external peer",
             ));
         }
+        let takes_method_text = call.method == "request";
         for arg in &call.args {
             match arg {
                 // The request is built from a method text, a path and a body
                 // map; any other shape used to be dropped silently
                 // (round 4, #3).
-                Arg::Value(Value::Text(_))
-                | Arg::Value(Value::Path(_))
-                | Arg::Value(Value::Map(_)) => {}
+                Arg::Value(Value::Text(_)) if takes_method_text => {}
+                Arg::Value(Value::Text(_)) => {
+                    // `get` and `post` name their method in the capability:
+                    // a text argument reached them and was dropped, so the
+                    // peer acted without data the caller approved
+                    // (round 5, #1).
+                    return Err(Error::InvalidArgument(
+                        "get and post take no method text; use request",
+                    ));
+                }
+                Arg::Value(Value::Path(_)) | Arg::Value(Value::Map(_)) => {}
                 Arg::Value(_) | Arg::Cap(_) | Arg::Promise(_) => {
                     return Err(Error::InvalidArgument(
                         "an HTTP argument is a method text, a path or a body object",
@@ -1337,13 +1405,22 @@ impl Provider for HttpTool {
             ));
         }
         let body = if takes_request_body(&method) {
-            let body = serde_json::to_vec(
-                &bodies
-                    .first()
-                    .map(|entries| value_to_json(&Value::Map((*entries).clone())))
-                    .unwrap_or(Json::Null),
-            )
-            .unwrap_or_default();
+            // A bodyless POST used to send the four bytes `null` under
+            // `content-length: 4`: a lax peer then acted on a JSON null nobody
+            // wrote (round 5, #4). No body object means an empty body.
+            let body = match bodies.first() {
+                Some(entries) => {
+                    let value = Value::Map((*entries).clone());
+                    if contains_module(&value) {
+                        // The JSON form of a module is its length: the peer
+                        // would act on a body the caller never wrote
+                        // (round 5, #2).
+                        return Err(Error::InvalidArgument("an HTTP body cannot carry a module"));
+                    }
+                    serde_json::to_vec(&value_to_json(&value)).unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
             if body.len() > self.max_request {
                 return Err(Error::ToolPolicy("request too large"));
             }
@@ -1630,6 +1707,14 @@ impl Provider for LocalProcess {
                     "a process argument must be a text value",
                 ));
             };
+            // `Command` panics on an interior NUL: the kernel would catch the
+            // unwind, but a caller-supplied argument must not reach a panic at
+            // all (round 5, #6).
+            if text.contains('\0') {
+                return Err(Error::InvalidArgument(
+                    "a process argument contains a NUL byte",
+                ));
+            }
             if !self.permitted(text) {
                 return Err(Error::ToolPolicy("argument is not allowed"));
             }
@@ -1667,6 +1752,13 @@ impl Provider for LocalProcess {
             command.process_group(0);
         }
         for (key, value) in &self.env {
+            // Same panic rule as an argument: a configured key or value with a
+            // NUL would abort the dispatch thread instead of failing the call.
+            if key.contains('\0') || value.contains('\0') {
+                return Err(Error::InvalidArgument(
+                    "a process environment entry contains a NUL byte",
+                ));
+            }
             command.env(key, value);
         }
         let mut child = command.spawn().map_err(|error| Error::Provider {
