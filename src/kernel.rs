@@ -198,8 +198,13 @@ pub enum Event {
     },
     /// A lane was created.
     LaneCreated(LaneId),
-    /// A lane was destroyed.
-    LaneDestroyed(LaneId),
+    /// A lane was destroyed, with the number of queued jobs it dropped.
+    LaneDestroyed {
+        /// Lane that was removed.
+        lane: LaneId,
+        /// Queued jobs failed with it.
+        jobs: u64,
+    },
     /// A channel was created.
     ChannelCreated(ChannelId),
     /// A lane subscribed to a channel.
@@ -1812,8 +1817,14 @@ impl Agent {
             .map(|(id, _)| *id)
             .collect();
         kernel.queue.retain(|id| !doomed.contains(id));
+        let failed = doomed.len() as u64;
         for job_id in doomed {
-            kernel.fail_job(job_id, Error::UnknownLane(lane.0));
+            // Quiet: a destroyed lane can hold thousands of jobs, and one
+            // rejection + completion event each would evict the whole bounded
+            // tape (16 384 records) on a single legitimate operation. The
+            // receipts still record every refusal, and `LaneDestroyed` carries
+            // the count (round 4, #3).
+            kernel.fail_job(job_id, Error::UnknownLane(lane.0), false);
         }
         // `doomed` never holds a running job (its state is `Running`), so the
         // retain below keeps that one record until its dispatch settles it.
@@ -1832,7 +1843,7 @@ impl Agent {
             channel.subscribers.remove(&lane.0);
         }
         kernel.lanes.remove(&lane);
-        kernel.push_event(Event::LaneDestroyed(lane));
+        kernel.push_event(Event::LaneDestroyed { lane, jobs: failed });
         Ok(())
     }
 
@@ -1897,8 +1908,11 @@ impl Agent {
             .channels
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
+        let was_open = record.can_send();
         record.close();
-        kernel.push_event(Event::ChannelClosed(channel));
+        if was_open {
+            kernel.push_event(Event::ChannelClosed(channel));
+        }
         Ok(())
     }
 
@@ -1913,18 +1927,27 @@ impl Agent {
             .channels
             .get(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
-        if let Some(lane) = kernel.lanes.get_mut(&lane) {
-            if lane.channels.len() >= MAX_CHANNELS_PER_LANE && !lane.channels.contains(&channel.0) {
-                return Err(Error::BudgetExceeded("subscriptions"));
+        let inserted = match kernel.lanes.get_mut(&lane) {
+            Some(lane) => {
+                if lane.channels.len() >= MAX_CHANNELS_PER_LANE
+                    && !lane.channels.contains(&channel.0)
+                {
+                    return Err(Error::BudgetExceeded("subscriptions"));
+                }
+                lane.channels.insert(channel.0)
             }
-            lane.channels.insert(channel.0);
-        }
+            None => false,
+        };
         let record = kernel
             .channels
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
-        record.subscribers.insert(lane.0);
-        kernel.push_event(Event::ChannelSubscribed { lane, channel });
+        let subscribed = record.subscribers.insert(lane.0);
+        // A repeat subscription changes nothing, and an event per call would let
+        // a loop evict the tape (round 4, #2).
+        if inserted || subscribed {
+            kernel.push_event(Event::ChannelSubscribed { lane, channel });
+        }
         Ok(())
     }
 
@@ -1946,13 +1969,17 @@ impl Agent {
             .channels
             .get(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
-        if let Some(lane) = kernel.lanes.get_mut(&lane) {
-            lane.channels.remove(&channel.0);
+        let removed = match kernel.lanes.get_mut(&lane) {
+            Some(lane) => lane.channels.remove(&channel.0),
+            None => false,
+        };
+        let unsubscribed = match kernel.channels.get_mut(&channel) {
+            Some(record) => record.subscribers.remove(&lane.0),
+            None => false,
+        };
+        if removed || unsubscribed {
+            kernel.push_event(Event::ChannelUnsubscribed { lane, channel });
         }
-        if let Some(record) = kernel.channels.get_mut(&channel) {
-            record.subscribers.remove(&lane.0);
-        }
-        kernel.push_event(Event::ChannelUnsubscribed { lane, channel });
         Ok(())
     }
 
@@ -2580,6 +2607,11 @@ impl Agent {
                 "a method name must be at most 1024 bytes",
             ));
         }
+        // The wire bounds a message's argument list; an in-process caller is
+        // bounded here, before any per-argument walk (round 7, F4).
+        if args.len() > MAX_ARGS_PER_CALL {
+            return Err(Error::BudgetExceeded("args"));
+        }
         let mut kernel = self.cell.borrow_mut();
         // The expiry check below compares against `now_ms`. In wall-clock mode
         // that value only moves when someone refreshes it, so a capability whose
@@ -2857,7 +2889,7 @@ impl Agent {
                                 Some(job) => Error::UnknownCapability(cap_token(job.cap)),
                                 None => Error::PipelinedCycle,
                             };
-                            kernel.fail_job(job_id, error);
+                            kernel.fail_job(job_id, error, true);
                         }
                         continue;
                     }
@@ -2908,6 +2940,34 @@ impl Agent {
 
     /// Resolve a pending promise manually (used by peers that answer out of band).
     pub fn resolve(&self, promise: &PromiseHandle, value: Value) -> Result<()> {
+        let kernel = self.cell.borrow_mut();
+        // An out-of-band answer is authority-bearing data: the shape ceilings
+        // and the byte budget of the call it answers bind it exactly as they
+        // bind a provider's return value. Without this, `resolve` was a hole
+        // through every budget (round 7, F1).
+        let job = kernel
+            .jobs
+            .values()
+            .find(|job| job.promise == promise.id)
+            .cloned();
+        if let Some(job) = &job {
+            let budget = match kernel.lanes.get(&job.lane) {
+                Some(lane_record) => job.call.budget.intersect(&lane_record.budget),
+                None => job.call.budget,
+            };
+            if let Some(error) = shape_refusal(&value, &budget) {
+                return Err(error);
+            }
+        }
+        drop(kernel);
+        if let Some(job) = &job {
+            // Charged before the settlement: a value the grant cannot afford
+            // must not become the promise's answer. When the job is still in the
+            // queue it is removed below, so the dispatch egress charge cannot
+            // double-charge; a job already executing may be charged a second
+            // time, which errs on the refusing side.
+            self.charge_egress(job, value.wire_size())?;
+        }
         let mut kernel = self.cell.borrow_mut();
         let settled = {
             let record = kernel
@@ -3096,6 +3156,18 @@ impl Agent {
         payload_bytes: u64,
         key: &str,
     ) -> Result<PromiseHandle> {
+        // The method goes into the key map and the fingerprint, so its bound
+        // is checked before anything copies it (round 7, F3).
+        if method.len() > MAX_GRANTED_METHOD_BYTES {
+            let error = Error::InvalidArgument("a method name must be at most 1024 bytes");
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
+        }
+        if args.len() > MAX_ARGS_PER_CALL {
+            let error = Error::BudgetExceeded("args");
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
+        }
         if key.is_empty() {
             let error = Error::InvalidArgument("idempotency key is empty");
             self.record_refusal(lane, Some(cap.id()), &error);
@@ -3707,7 +3779,12 @@ impl Agent {
         }
         let mut kernel = self.cell.borrow_mut();
         if let Some(lane_record) = kernel.lanes.get(&lane) {
-            if lane_record.bytes.saturating_add(bytes) > lane_record.budget.max_bytes {
+            // `checked_add`: a saturated counter would pass every later check.
+            let total = lane_record
+                .bytes
+                .checked_add(bytes)
+                .ok_or(Error::BudgetExceeded("lane byte"))?;
+            if total > lane_record.budget.max_bytes {
                 return Err(Error::BudgetExceeded("lane byte"));
             }
         }
@@ -3796,6 +3873,7 @@ impl Agent {
                     Error::Provider {
                         code: "rpc/provider".to_string(),
                     },
+                    true,
                 );
             }
             return;
@@ -3825,10 +3903,27 @@ impl Agent {
                 for arg in &job.call.args {
                     match arg {
                         Arg::Promise(id) => match kernel.promises.get(id) {
-                            Some(record) if record.state.is_settled() => match record.value() {
-                                Ok(value) => args.push(Arg::Value(value)),
-                                Err(error) => {
-                                    failure = Some(error);
+                            Some(record) if record.state.is_settled() => match &record.state {
+                                crate::promise::PromiseState::Resolved(value) => {
+                                    // `Value::clone` recurses, so a deep value
+                                    // must be refused before the copy is made
+                                    // (round 7, F2).
+                                    if value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
+                                        failure = Some(Error::BudgetExceeded("depth"));
+                                        break;
+                                    }
+                                    args.push(Arg::Value(value.clone()));
+                                }
+                                crate::promise::PromiseState::Rejected(error) => {
+                                    failure = Some(error.clone());
+                                    break;
+                                }
+                                crate::promise::PromiseState::Cancelled => {
+                                    failure = Some(Error::PromiseCancelled(id.0));
+                                    break;
+                                }
+                                crate::promise::PromiseState::Pending => {
+                                    failure = Some(Error::UnresolvablePromise(id.0));
                                     break;
                                 }
                             },
@@ -4558,7 +4653,7 @@ impl Kernel {
         }
     }
 
-    fn fail_job(&mut self, job_id: u64, error: Error) {
+    fn fail_job(&mut self, job_id: u64, error: Error, events: bool) {
         // A job failed before dispatch (an unorderable pipeline, a provider that
         // vanished, a destroyed lane) still took a decision: record it, so an
         // auditor can tell "no call" from "refused and undocumented". A job that
@@ -4592,12 +4687,16 @@ impl Kernel {
                 // Only a settlement that happened is a rejection: a record that
                 // was already settled (cancelled, resolved out of band) must not
                 // appear as both settled and rejected.
-                self.push_event(Event::PromiseRejected { promise, code });
+                if events {
+                    self.push_event(Event::PromiseRejected { promise, code });
+                }
                 self.metrics.promises_rejected = self.metrics.promises_rejected.saturating_add(1);
                 self.record_settled(promise);
             }
             self.jobs.remove(&job_id);
-            self.push_event(Event::JobCompleted { job: job_id, lane });
+            if events {
+                self.push_event(Event::JobCompleted { job: job_id, lane });
+            }
         }
     }
 }
@@ -4619,7 +4718,7 @@ pub fn valid_topic(topic: &str) -> bool {
 fn check_topic(topic: &str) -> Result<()> {
     if !valid_topic(topic) {
         return Err(Error::InvalidArgument(
-            "a topic must be 1..=128 bytes without control characters",
+            "a topic must be 1..=128 bytes without control or reordering characters",
         ));
     }
     Ok(())
@@ -4631,6 +4730,13 @@ fn check_topic(topic: &str) -> Result<()> {
 /// not be able to tell it apart from one that does not exist, or the ids become
 /// a membership oracle.
 fn check_subscriber(kernel: &Kernel, lane: LaneId, channel: ChannelId) -> Result<()> {
+    // The lane's liveness comes first: every other operation answers
+    // `rpc/unknown-lane` for a lane that is gone, and a receive would otherwise
+    // report the channel class for a lane that no longer exists (round 4, #1).
+    let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+    if lane_record.closed {
+        return Err(Error::UnknownLane(lane.0));
+    }
     match kernel.channels.get(&channel) {
         Some(record) if record.subscribers.contains(&lane.0) => Ok(()),
         _ => Err(Error::UnknownChannel(channel.0)),
@@ -4699,6 +4805,13 @@ pub const MAX_METHOD_EVENT_BYTES: usize = 64;
 /// Largest method name a capability may grant, and therefore the largest one a
 /// call may name. `receipts::valid_method` enforces the same bound at mint.
 pub const MAX_GRANTED_METHOD_BYTES: usize = 1_024;
+
+/// Most arguments one call may carry.
+///
+/// The wire caps an envelope at 4 096 arguments, and the kernel holds an
+/// in-process caller to the same bound: every check on the call path walks the
+/// argument list, so an unbounded one makes a refusal cost its own length.
+pub const MAX_ARGS_PER_CALL: usize = 4_096;
 
 /// A log-safe, bounded label for a method name.
 fn method_event_label(method: &str) -> String {
@@ -4770,7 +4883,7 @@ fn check_method_names(attrs: &CapAttrs) -> Result<()> {
     if let Some(topics) = &attrs.topics {
         if topics.iter().any(|topic| !valid_topic(topic)) {
             return Err(Error::InvalidArgument(
-                "a topic must be 1..=128 bytes without control characters",
+                "a topic must be 1..=128 bytes without control or reordering characters",
             ));
         }
     }

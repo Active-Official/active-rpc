@@ -499,54 +499,6 @@ fn a_hostile_publish_is_refused_before_the_kernel_measures_it() {
 }
 
 #[test]
-fn a_promise_that_resolves_to_a_hostile_value_is_refused_at_dispatch() {
-    // Round 6 (#2): dispatch measured the substituted arguments and walked the
-    // path scope before the shape gate.
-    let fixture = fixture_with(budget(), Value::text("ok"));
-    let pending = fixture
-        .agent
-        .call(fixture.lane, &fixture.cap, "ping", Vec::new())
-        .expect("queued");
-    let dependent = fixture
-        .agent
-        .call(
-            fixture.lane,
-            &fixture.cap,
-            "ping",
-            vec![Arg::Promise(pending.id())],
-        )
-        .expect("dependent");
-    let wide: Vec<Value> = (0..3)
-        .map(|_| Value::list((0..500_000).map(|_| Value::Null)))
-        .collect();
-    fixture
-        .agent
-        .resolve(&pending, wide[0].clone())
-        .expect("resolve");
-
-    let mut full_walk = u128::MAX;
-    for _ in 0..3 {
-        let start = std::time::Instant::now();
-        assert_eq!(wide[0].shape().widest, 500_000);
-        full_walk = full_walk.min(start.elapsed().as_nanos());
-    }
-
-    let error = dependent
-        .value()
-        .expect_err("the resolved value is outside the grant");
-    assert_eq!(error.code(), "rpc/budget-exceeded");
-    assert_eq!(
-        fixture.calls.get(),
-        0,
-        "the provider ran for a value the dispatch gate refused"
-    );
-    // `full_walk` documents that the value is large; the dispatch clone of a
-    // resolved promise is itself a full walk, so this test asserts the refusal
-    // rather than a ratio.
-    assert!(full_walk > 0);
-}
-
-#[test]
 fn the_idempotent_gate_uses_the_lane_intersection() {
     // Round 6 (#4): the keyed path gated on the capability budget alone, so a
     // value the lane refuses was hashed first.
@@ -624,6 +576,86 @@ fn a_deep_path_nest_is_walked_iteratively() {
         )
         .expect("scoped cap");
     assert_eq!(refused(&fixture, value), "rpc/path-not-granted");
+}
+
+#[test]
+fn an_out_of_band_resolve_is_bound_by_the_grant() {
+    // Round 7 (F1): `resolve` stored any value with no shape or byte check,
+    // which was a hole through every budget the call path enforces.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    let promise = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, "ping", Vec::new())
+        .expect("queued");
+    let error = fixture
+        .agent
+        .resolve(&promise, Value::text("x".repeat(100)))
+        .expect_err("the size ceiling binds an out-of-band answer too");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert!(
+        !promise.is_settled(),
+        "a refused resolve settled the promise"
+    );
+}
+
+#[test]
+fn a_deep_resolved_value_is_refused_before_the_dispatch_clone() {
+    // Round 7 (F2): dispatch cloned a resolved value before any gate, and
+    // `Value::clone` recurses.
+    let fixture = fixture_with(Budget::default(), Value::text("ok"));
+    let pending = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, "ping", Vec::new())
+        .expect("queued");
+    let dependent = fixture
+        .agent
+        .call(
+            fixture.lane,
+            &fixture.cap,
+            "ping",
+            vec![Arg::Promise(pending.id())],
+        )
+        .expect("dependent");
+    // Inside the capability's depth ceiling (256) but past the wire's 64.
+    fixture
+        .agent
+        .resolve(&pending, nested(100))
+        .expect("resolve accepts a value inside the grant");
+    let error = dependent
+        .value()
+        .expect_err("the dispatch refuses a value deeper than the wire allows");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+}
+
+#[test]
+fn an_idempotent_call_bounds_its_method_before_copying_it() {
+    // Round 7 (F3): the key map held a copy of the method before any bound.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    let error = fixture
+        .agent
+        .call_idempotent(
+            fixture.lane,
+            &fixture.cap,
+            &"m".repeat(2_048),
+            Vec::new(),
+            "method-bound",
+        )
+        .expect_err("a method longer than a grant cannot be called");
+    assert_eq!(error.code(), "rpc/invalid-argument");
+}
+
+#[test]
+fn an_unbounded_argument_list_is_refused_before_any_walk() {
+    // Round 7 (F4): the wire caps a message at 4 096 arguments; an in-process
+    // caller could hand the kernel a vector of any length.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    let args: Vec<Arg> = (0..5_000).map(|_| Arg::Value(Value::Null)).collect();
+    let error = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, "ping", args)
+        .expect_err("the argument ceiling binds an in-process call");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert_eq!(fixture.calls.get(), 0);
 }
 
 #[test]

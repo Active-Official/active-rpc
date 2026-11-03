@@ -61,7 +61,7 @@ authority.
 | `cap.introduced` | `cap`, `identity` | a capability was bound to an authenticated peer |
 | `cap.transferred` | `cap`, `channel` | a capability travelled on a channel |
 | `lane.created` | `lane` | a lane was created |
-| `lane.destroyed` | `lane` | a lane was destroyed |
+| `lane.destroyed` | `lane`, `detail` | a lane was destroyed; `detail` is the number of queued jobs dropped with it (their per-job events are coalesced into this one, receipts still record each refusal) |
 | `call.queued` | `job`, `lane`, `cap` | a call entered the queue |
 | `call.refused` | `lane`, `cap`, `code` | a call was refused before a provider saw it |
 | `batch.dispatched` | `provider`, `detail` | one provider round-trip carrying a batch |

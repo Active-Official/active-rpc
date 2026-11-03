@@ -891,7 +891,7 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             event: "lane.created".into(),
             cap: None,
         },
-        Event::LaneDestroyed(_) => Trace {
+        Event::LaneDestroyed { .. } => Trace {
             event: "lane.destroyed".into(),
             cap: None,
         },

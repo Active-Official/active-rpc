@@ -20,6 +20,11 @@ struct Counting;
 
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
+/// The counter is process-wide, so the allocation tests take turns: another
+/// test's payload allocation on a parallel thread would land inside the window
+/// this file measures.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // SAFETY: every method forwards to the system allocator unchanged; the counters
 // are the only addition, and they are atomic.
 unsafe impl GlobalAlloc for Counting {
@@ -45,6 +50,7 @@ const PAYLOAD: usize = 1 << 20;
 
 #[test]
 fn a_kernel_send_does_not_copy_the_payload() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let mut channel = Channel::new(ChannelId(1), "copy", Direction::Both);
     // The payload exists before the measurement: only the send is timed.
     let payload = Value::Text("x".repeat(PAYLOAD));
@@ -90,6 +96,7 @@ impl Provider for Sink {
 
 #[test]
 fn a_publish_does_not_copy_the_payload() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     // Round 2 (#1): `publish` still went through `send_topic`, which clones the
     // message it queued. The kernel needs the sequence only.
     let agent = Agent::with_secret([0x7e; 32]);
@@ -123,6 +130,7 @@ fn a_publish_does_not_copy_the_payload() {
 
 #[test]
 fn a_direct_send_still_returns_the_queued_message() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let mut channel = Channel::new(ChannelId(2), "copy", Direction::Both);
     let message = channel
         .send(LaneId(2), Value::Int(7), Vec::new())

@@ -549,6 +549,85 @@ fn destroying_a_channel_reports_its_backlog() {
     );
 }
 
+#[test]
+fn receiving_on_a_destroyed_lane_is_unknown_lane() {
+    // Round 4 (#1): every other operation answers `rpc/unknown-lane` for a lane
+    // that is gone; a receive reported the channel class instead.
+    let (agent, _provider) = agent();
+    let lane = agent.create_lane("gone", Budget::default()).expect("lane");
+    let channel = agent
+        .create_channel("gone", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
+    agent.destroy_lane(lane).expect("destroy");
+    let error = agent
+        .recv(lane, channel)
+        .expect_err("a destroyed lane cannot receive");
+    assert_eq!(error.code(), "rpc/unknown-lane");
+}
+
+#[test]
+fn a_no_op_subscription_change_is_not_an_event() {
+    // Round 4 (#2): an event per call let a subscribe/unsubscribe loop evict the
+    // bounded tape.
+    let (agent, _provider) = agent();
+    let lane = agent.create_lane("quiet", Budget::default()).expect("lane");
+    let channel = agent
+        .create_channel("quiet", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
+    agent.subscribe(lane, channel).expect("resubscribe");
+    agent.unsubscribe(lane, channel).expect("unsubscribe");
+    agent.unsubscribe(lane, channel).expect("unsubscribe again");
+    let json = agent.trace_json();
+    assert_eq!(
+        json.matches("\"event\":\"channel.subscribed\"").count(),
+        1,
+        "a repeat subscription emitted another event: {json}"
+    );
+    assert_eq!(
+        json.matches("\"event\":\"channel.unsubscribed\"").count(),
+        1,
+        "a repeat unsubscribe emitted another event: {json}"
+    );
+}
+
+#[test]
+fn destroying_a_full_lane_does_not_flood_the_tape() {
+    // Round 4 (#3): a per-job event each meant one destroy could write tens of
+    // thousands of records and evict the whole tape.
+    let (agent, _provider) = agent();
+    let lane = agent.create_lane("flood", Budget::default()).expect("lane");
+    let channel = agent
+        .create_channel("flood", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    for _ in 0..2_000 {
+        agent.call(lane, &cap, "echo", Vec::new()).expect("queued");
+    }
+    let before = agent.total_events();
+    agent.destroy_lane(lane).expect("destroy");
+    let after = agent.total_events();
+    assert!(
+        after - before <= 3,
+        "destroying a lane of 2 000 jobs wrote {} events",
+        after - before
+    );
+    let json = agent.trace_json();
+    assert!(
+        json.contains("\"event\":\"lane.destroyed\""),
+        "the destroy is not on the tape: {json}"
+    );
+    assert!(
+        json.contains("\"detail\":\"2000\""),
+        "the dropped-job count is not on the tape: {json}"
+    );
+}
+
 /// Guard: the channel byte counter is exposed and exact.
 #[test]
 fn channel_bytes_are_exact() {

@@ -1053,6 +1053,39 @@ six round-2 fixes and found five more.
 
 Gate: 749 tests all-features, 0 failed; clippy and fmt clean.
 
+### R-06 budgets - 2026-11-02 (round 7)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `08896cd`. It verified the
+round-6 fixes and found two highs: the out-of-band resolve path and the dispatch
+clone.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `Agent::resolve` stored any value with no shape or byte check: a narrow grant could be answered with a 10 MiB value and no budget was charged | **fixed**: the out-of-band answer is gated against the answering call's `capability ∩ lane` budget and charged as egress before it becomes the promise's value; `an_out_of_band_resolve_is_bound_by_the_grant` |
+| F2 | high | dispatch cloned a resolved promise value before any gate, and `Value::clone` recurses | **fixed**: a value deeper than `MAX_VALUE_DEPTH` is refused before the clone (and F1 keeps such a value out of a promise in the first place); `a_deep_resolved_value_is_refused_before_the_dispatch_clone` |
+| F3 | medium | the idempotent path copied the method into its key map before the length bound | **fixed**: the bound (and `MAX_ARGS_PER_CALL`) runs at the top of the keyed entry; `an_idempotent_call_bounds_its_method_before_copying_it` |
+| F4 | medium | an in-process caller could hand the kernel an unbounded argument vector, making every refusal cost its own length | **fixed**: `MAX_ARGS_PER_CALL` (4 096, the wire's bound) at both entries; `an_unbounded_argument_list_is_refused_before_any_walk` |
+| F5 | low | the documented `Drop` residual omitted the derived `Clone`/`PartialEq` recursion | **documented**: the residual covers both, and F1/F2 gate the reachable paths |
+| F6 | low | lane byte accounting used `saturating_add`, so a saturated lane would pass forever | **fixed**: `checked_add` in the egress charge |
+
+Gate: 755 tests all-features, 0 failed; clippy/fmt/doc clean; negative controls
+9/9.
+
+### R-05 lanes / channels - 2026-11-02 (round 4)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `08896cd`. All five round-3
+fixes hold; five new defects.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `recv` reported `rpc/unknown-channel` for a destroyed lane, while every other operation says `rpc/unknown-lane` | **fixed**: `check_subscriber` checks the lane first; `receiving_on_a_destroyed_lane_is_unknown_lane` |
+| 2 | medium | `subscribe`/`unsubscribe`/`close_channel` pushed an event even when nothing changed, so a no-op loop could evict the bounded tape | **fixed**: an event only on a state change; `a_no_op_subscription_change_is_not_an_event` |
+| 3 | medium | `destroy_lane` pushed a rejection and a completion event per queued job: a full lane wrote tens of thousands of records and evicted the tape | **fixed**: the doomed jobs fail quietly, receipts still record each refusal, and `lane.destroyed` carries the count (now `{ lane, jobs }`); `destroying_a_full_lane_does_not_flood_the_tape` (2 000 jobs, at most 3 events) |
+| 4 | low | `charge_dispatch_delta`/`charge_egress` skip the lane when it was destroyed mid-call | **documented in code**: the capability chain is still charged in full and the lane no longer exists, so there is no lane grant left to exceed; erring the other way would refuse a call the provider already ran |
+| 5 | low | the topic refusal said "without control characters" while the rule also refuses reordering and invisible characters | **fixed**: one message for the one rule |
+
+Gate: 755 tests all-features, 0 failed; clippy/fmt/doc clean.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

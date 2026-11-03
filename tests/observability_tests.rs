@@ -59,7 +59,7 @@ fn every_event(cap: CapId) -> Vec<Event> {
         },
         Event::CapTransferred { cap, channel },
         Event::LaneCreated(lane),
-        Event::LaneDestroyed(lane),
+        Event::LaneDestroyed { lane, jobs: 3 },
         Event::CallQueued {
             job: 9,
             lane,

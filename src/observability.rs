@@ -216,9 +216,10 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.event = "lane.created";
             trace.lane = Some(lane.0);
         }
-        Event::LaneDestroyed(lane) => {
+        Event::LaneDestroyed { lane, jobs } => {
             trace.event = "lane.destroyed";
             trace.lane = Some(lane.0);
+            trace.detail = Some(jobs.to_string());
         }
         Event::CallQueued { job, lane, cap, .. } => {
             trace.event = "call.queued";
