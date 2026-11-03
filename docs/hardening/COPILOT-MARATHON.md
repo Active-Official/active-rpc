@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-9: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 findings; round-9 fixes green, confirmation round pending | 60 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-5: 15 + 16 + 9 + 6 + 6 findings; round-5 fixes green, confirmation round pending | 47 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-10: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 findings; round-10 fixes green, confirmation round pending | 69 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-6: 15 + 16 + 9 + 6 + 6 + 2 findings; round-6 fixes green, confirmation round pending | 49 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,51 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 10)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `ed6e888` on
+`active-infinity` 2.4.1. Six round-9 fixes held, three were partial; one
+critical, two highs, two mediums and four lows, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | critical | `install` stored the caller's arena while hashing the canonical image, so `annotations` served an intent/constraint source that copied a secret literal: the encoder had redacted it in the bytes but not in the stored module | **fixed**: `install` stores `decode(encode(module))`, so class and hash agree; `an_installed_annotation_copy_is_not_served` (both capability modes) |
+| 2 | high | `tainted_nodes` counted `children()` but walked `edges()`, which also carries constraint edges: a self-referential constraint re-enqueued forever and a butterfly DAG re-enqueued exponentially (3.2 s at depth 22) | **fixed**: a monotone worklist, O(V+E); `a_self_referential_constraint_terminates` (2 s bound) |
+| 3 | high | a binding can name the module root, its label resolves back to it, so a scoped `patch` replaced the whole module and deleted every outside subtree | **fixed**: a scoped patch refuses the root target; `a_scoped_patch_cannot_replace_the_module_root` |
+| 4 | medium | `@node[id]`/`@annotation[i]`/`@constraint[i]` labels survived redaction (a path-depth, budget or collision fallback) | **fixed**: a label must resolve back to its node; `a_redacting_answer_names_no_synthetic_label` (80-deep chain) |
+| 5 | medium | when a secret is a substring of the marker the redactor writes `""`, and only `***SECRET***` was mapped back, so an evaluated secret came back as ordinary empty text | **fixed**: the placeholder is read from the redacted module and mapped to `Value::Secret` (an empty placeholder over-redacts empty data, the fail-closed side); `a_marker_substring_secret_is_a_value_secret` |
+| 6 | low | a hidden annotation still reported its kind and count on the secret cone | **fixed**: the hidden set collapses to one marker entry with no node or kind; `a_redacting_annotation_answer_collapses_the_hidden_set` |
+| 7 | low | `install` served nodes the cached hash does not cover | **fixed** by #1 |
+| 8 | low | the last capability drop never reclaimed the module slot | **fixed**: `on_drop` removes the slot; a stale object is `unknown module` |
+| 9 | low | the wall ceiling was checked only after the walk | **partially addressed**: the walks are linear now (#2), so the exposure is the annotation-chain fixpoint; recorded as a residual |
+
+`stats.secrets` now reports the canonical count (two nodes for a promoted
+secret locator: the literal and its reference).
+
+Residuals recorded: an unscoped `evaluate` resolves host `Env` (tested as a
+design choice under I-11); literal-only redaction is recomposable by a module
+author; `content_hash` for a non-redacting capability stays a full-image oracle;
+a cone reply carries no redacted flag; `next_object` overflow is theoretical.
+
+Gate: 88 suites / 839 tests all-features, clippy/fmt/doc clean; negative
+controls 9/9; hardening status 13 invariants / 145 checks.
+
+### R-08 tools and MCP - 2026-11-03 (round 6)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `ed6e888`. All six round-5
+fixes verified in code; one was incomplete (NUL only) and one new medium.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | an empty or `=`-bearing env key reached `Command`: a spawn-time provider fault, or silent mangling on Windows | **fixed**: `valid_env_entry` refuses it in both adapters as `rpc/invalid-argument` |
+| 2 | medium | a non-finite float serialised to JSON `null`, so the peer acted on a null nobody wrote | **fixed**: refused like a module in both adapters |
+| 3 | low | a spent-deadline `Timeout` from the pre-check still poisons the session | **residual**: the pre-check makes it unreachable (nothing was enqueued); recorded |
+
+New coverage: env keys, non-finite arguments and bodies, nested module, spent
+handshake.
+
+Gate: as above (the same commit).
 
 ### R-07 domain operations - 2026-11-03 (round 9)
 

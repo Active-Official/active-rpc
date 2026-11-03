@@ -104,6 +104,14 @@ impl ModuleProvider {
             .map_err(|error| Error::Payload(error.code().to_string()))?;
         let hash = active_infinity::content_hash(&bytes)
             .map_err(|error| Error::Payload(error.code().to_string()))?;
+        // Store the canonical image, not the caller's arena: the encoder
+        // canonicalizes metadata prose (a secret copy in an intent or a
+        // constraint source becomes the marker), drops unreachable nodes and
+        // renumbers, so the arena the caller handed in is not what the hash
+        // describes. Serving it let `annotations` return raw secret copies
+        // (R-07 round 10, critical).
+        let module = active_infinity::decode(&bytes)
+            .map_err(|error| Error::Payload(error.code().to_string()))?;
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
@@ -363,6 +371,13 @@ impl ModuleProvider {
                 let (patched, bytes) = {
                     let module = &slot.module;
                     let (path, node) = self.resolve(module, call)?;
+                    if call.path_scope.is_some() && Some(node) == module.root() {
+                        // A binding can name the root, and a label resolves
+                        // back to it, so the scope checks would pass: replacing
+                        // the root deletes every outside subtree through a
+                        // write that never named one (R-07 round 10, #3).
+                        return Err(Error::PathNotGranted(path.clone()));
+                    }
                     if immutable_target(module, &path) || immutable_node(module, node) {
                         // `@ai_immutable: true` is the format's marker for a
                         // node no agent may rewrite. A shared DAG means the same
@@ -581,6 +596,7 @@ impl ModuleProvider {
                     BTreeSet::new()
                 };
                 let mut out = Vec::new();
+                let mut hidden_seen = false;
                 for annotation in module.annotations() {
                     let (kind, text) = match &annotation.kind {
                         AnnotationKind::Intent(text) => ("intent", text.clone()),
@@ -592,19 +608,22 @@ impl ModuleProvider {
                     // canonicalization already redacted.
                     let hidden = (call.redact && tainted_ids.contains(&annotation.node))
                         || text.contains(security::SECRET_MARKER);
-                    let text = if hidden {
-                        Value::Secret
-                    } else {
-                        Value::Text(text)
-                    };
-                    let mut entry: BTreeMap<String, Value> = BTreeMap::new();
-                    // A hidden annotation does not name its node: the id would
-                    // be a map of where the secret cone is.
-                    if !hidden {
-                        entry.insert("node".to_string(), Value::Int(annotation.node.0 as i64));
+                    if hidden {
+                        // One marker for the whole hidden set: a marker per
+                        // annotation would count the rules on the secret cone
+                        // and name their kinds (R-07 round 10, #6).
+                        hidden_seen = true;
+                        continue;
                     }
+                    let mut entry: BTreeMap<String, Value> = BTreeMap::new();
+                    entry.insert("node".to_string(), Value::Int(annotation.node.0 as i64));
                     entry.insert("kind".to_string(), Value::Text(kind.to_string()));
-                    entry.insert("text".to_string(), text);
+                    entry.insert("text".to_string(), Value::Text(text));
+                    out.push(Value::Map(entry));
+                }
+                if hidden_seen {
+                    let mut entry: BTreeMap<String, Value> = BTreeMap::new();
+                    entry.insert("text".to_string(), Value::Secret);
                     out.push(Value::Map(entry));
                 }
                 check_wall_budget(started, call)?;
@@ -681,6 +700,11 @@ impl Provider for ModuleProvider {
     }
 
     fn on_drop(&mut self, object: u64, cap: CapId) {
+        // The last capability on this object is gone: the module is no longer
+        // reachable through the provider, so retaining it retained every
+        // installed module for the life of the agent (R-07 round 10, #8). A
+        // later call or re-mint on the stale object is `unknown module`.
+        self.modules.remove(&object);
         // A diagnostic log, drained by `Agent::take_drops`; bound it so a long
         // mint/drop loop cannot grow memory without a caller asking for it.
         if self.drops.len() < MAX_DROP_LOG {
@@ -1076,10 +1100,15 @@ fn scoped_labels(
         return labels_for(module, ids);
     }
     let paths = active_infinity::interop::value_paths(module);
+    // Only a label that resolves back to the node is a name the caller may
+    // receive: `@node[7]`, `@annotation[0]` and a stale dotted binding label
+    // are arena positions (round 10, #4).
     labels_for(
         module,
-        ids.into_iter()
-            .filter(|id| named_path(&paths, *id).is_some()),
+        ids.into_iter().filter(|id| match named_path(&paths, *id) {
+            Some(path) => active_infinity::interop::resolve_path(module, path) == Some(*id),
+            None => false,
+        }),
     )
 }
 
@@ -1182,48 +1211,25 @@ fn keep_annotations_outside(module: &mut InfinityModule, tainted: &BTreeSet<Node
 fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
     let count = module.node_count();
     let (_, dependents) = adjacency(module);
-    // Kahn order: a node is processed only after every child, so one pass
-    // propagates the whole cone. The earlier fixpoint rescanned the arena once
-    // per level, which is quadratic on a deep chain.
-    let mut remaining: Vec<usize> = (0..count)
-        .map(|index| {
-            module
-                .nodes()
-                .get(index)
-                .map(|node| {
-                    // `dependents` is deduplicated, so a node that names one
-                    // child twice would never reach zero and its descendants
-                    // would never be decanted (round 8, #1).
-                    let mut children = node.children();
-                    children.sort_unstable();
-                    children.dedup();
-                    children.len()
-                })
-                .unwrap_or(0)
-        })
-        .collect();
+    // A monotone worklist: a node is tainted once, and taint only spreads to
+    // its dependents. The earlier Kahn pass counted `children()` but walked
+    // `edges()`, which also carries constraint edges, so a self-referential
+    // constraint never reached zero and re-enqueued forever; a butterfly DAG
+    // re-enqueued exponentially (R-07 round 10, high).
     let mut tainted = vec![false; count];
-    let mut queue: std::collections::VecDeque<usize> =
-        (0..count).filter(|index| remaining[*index] == 0).collect();
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     for (index, node) in module.nodes().iter().enumerate() {
         if node.is_secret() {
             tainted[index] = true;
+            queue.push_back(index);
         }
     }
     while let Some(index) = queue.pop_front() {
         for dependent in dependents.get(index).into_iter().flatten() {
             let target = dependent.index();
-            if target >= count {
-                continue;
-            }
-            if tainted[index] {
+            if target < count && !tainted[target] {
                 tainted[target] = true;
-            }
-            if let Some(left) = remaining.get_mut(target) {
-                *left = left.saturating_sub(1);
-                if *left == 0 {
-                    queue.push_back(target);
-                }
+                queue.push_back(target);
             }
         }
     }
@@ -1261,11 +1267,25 @@ fn evaluate_for_caller(
     if redactor.is_empty() {
         return active_infinity::interop::evaluate(module, budget);
     }
+    // The placeholder is not always `***SECRET***`: when a secret is a
+    // substring of the marker the redactor substitutes the empty string, and
+    // mapping only the marker left `Text("")` (round 10, #5). Read what the
+    // redactor actually wrote for a secret node.
+    let secret_node = (0..module.node_count())
+        .map(|index| NodeId(index as u32))
+        .find(|id| module.get(*id).is_some_and(|node| node.is_secret()));
     let mut redacted = module.clone();
     security::redact_derived(&mut redacted, &redactor)
         .map_err(|error| active_infinity::Error::Encode(error.code()))?;
+    let placeholder = secret_node.and_then(|id| match redacted.get(id) {
+        Some(Inode::Str(text)) => Some(text.clone()),
+        _ => None,
+    });
     let (value, diagnostics) = active_infinity::interop::evaluate(&redacted, budget)?;
-    Ok((mark_secret_texts(value), diagnostics))
+    Ok((
+        mark_secret_texts(value, placeholder.as_deref()),
+        diagnostics,
+    ))
 }
 
 /// Replace a text equal to the redaction marker with the structural marker.
@@ -1273,18 +1293,28 @@ fn evaluate_for_caller(
 /// The engine has no secret value, so the marker comes back as text; a caller
 /// that reads a `Value::Secret` knows the field was secret, and a caller that
 /// reads `"***SECRET***"` might treat it as data.
-fn mark_secret_texts(value: active_core::Value) -> active_core::Value {
+fn mark_secret_texts(value: active_core::Value, placeholder: Option<&str>) -> active_core::Value {
     use active_core::Value as CoreValue;
-    let marker = active_infinity::interop::SECRET_MARKER;
+    let Some(placeholder) = placeholder else {
+        return value;
+    };
     match value {
-        CoreValue::String(text) if text == marker => CoreValue::Secret(marker.to_string()),
-        CoreValue::Array(items) => {
-            CoreValue::Array(items.into_iter().map(mark_secret_texts).collect())
+        // The marker stands for the secret. When it is the empty string (a
+        // secret is a substring of the marker) every empty string collapses;
+        // that over-redacts ordinary empty data, the fail-closed side.
+        CoreValue::String(text) if text == placeholder => {
+            CoreValue::Secret(active_infinity::interop::SECRET_MARKER.to_string())
         }
+        CoreValue::Array(items) => CoreValue::Array(
+            items
+                .into_iter()
+                .map(|item| mark_secret_texts(item, Some(placeholder)))
+                .collect(),
+        ),
         CoreValue::Table(entries) => CoreValue::Table(
             entries
                 .into_iter()
-                .map(|(key, value)| (key, mark_secret_texts(value)))
+                .map(|(key, value)| (key, mark_secret_texts(value, Some(placeholder))))
                 .collect(),
         ),
         other => other,

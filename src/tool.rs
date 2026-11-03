@@ -103,10 +103,11 @@ fn contains_nonfinite(value: &Value) -> bool {
 
 /// Whether an environment entry reaches the child as written.
 ///
-/// An empty key, a `=` in a key, or a NUL on either side never does: it fails
-/// at spawn as a provider fault, or (a `=` on Windows) is silently mangled
-/// into another variable. A bad entry is refused here instead of reaching
-/// `Command` at all (round 6; round 5 covered NUL only).
+/// An empty key, a `=` in a key, or a NUL on either side never reaches the
+/// child as written: `Command` asserts on a NUL, and an empty or `=`-bearing
+/// key fails at spawn or is silently mangled into another variable. A bad entry
+/// is refused here instead of reaching `Command` at all (round 6; round 5
+/// covered NUL only).
 fn valid_env_entry(key: &str, value: &str) -> bool {
     !key.is_empty() && !key.contains('=') && !key.contains('\0') && !value.contains('\0')
 }
@@ -507,8 +508,8 @@ impl StdioTransport {
             command.process_group(0);
         }
         for (key, value) in env {
-            // `Command` never delivers a bad entry as written: an empty key, a
-            // `=` in a key, or a NUL on either side fails at spawn (or is
+            // A bad entry never reaches the child as written: `Command` asserts
+            // on a NUL, and an empty or `=`-bearing key fails at spawn (or is
             // silently mangled), so a configuration typo is refused here.
             if !valid_env_entry(key, value) {
                 return Err(Error::InvalidArgument(
@@ -1746,9 +1747,9 @@ impl Provider for LocalProcess {
                     "a process argument must be a text value",
                 ));
             };
-            // A NUL argument never reaches the child: it fails at spawn, so
-            // it is refused here with the argument's own code instead of a
-            // provider fault (round 5, #6).
+            // `Command` asserts on an interior NUL: the kernel would catch the
+            // unwind, but a caller-supplied argument must not reach a panic at
+            // all (round 5, #6).
             if text.contains('\0') {
                 return Err(Error::InvalidArgument(
                     "a process argument contains a NUL byte",

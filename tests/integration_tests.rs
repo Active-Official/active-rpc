@@ -99,7 +99,10 @@ fn stats_hash_and_metadata_are_served_through_capabilities() {
         other => panic!("expected nodes, got {other:?}"),
     };
     assert!(nodes > 10);
-    assert_eq!(map.get("secrets"), Some(&Value::Int(1)));
+    // The provider stores the canonical image, and canonicalization promotes a
+    // secret locator into a `Secret` node next to its `SecretRef`: both hold
+    // secret material, so the count is two (R-07 round 10).
+    assert_eq!(map.get("secrets"), Some(&Value::Int(2)));
 
     let hash = agent
         .call(lane, &cap, "content_hash", vec![])
