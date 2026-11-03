@@ -874,7 +874,10 @@ fn a_bodyless_post_sends_no_body() {
 fn a_spent_deadline_does_not_write_a_line() {
     use active_rpc::tool::{McpTransport, StdioTransport};
 
+    #[cfg(windows)]
     let mut env = std::collections::BTreeMap::new();
+    #[cfg(not(windows))]
+    let env = std::collections::BTreeMap::new();
     #[cfg(windows)]
     let (program, args) = (
         "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
