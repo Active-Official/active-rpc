@@ -17,9 +17,9 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-01 | wire ARP1 | `src/wire.rs` | CLEAN | 6 fixed, 2 rejected, 0 open | this commit |
 | R-02 | kernel dispatch | `src/kernel.rs` | CLEAN (rounds 1-3) | 24 fixed / 2 rejected / 2 low open (contract) | this commit |
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
-| R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
+| R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
-| R-06 | budget | `src/budget.rs` | rounds 1-9 (round 9 found two highs) | 44 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
+| R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-6: 12 + 8 + 9 + 8 + 1 + 4 findings | 42 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
@@ -1257,6 +1257,39 @@ Residuals, two closed here and one accepted:
   observability gap rather than smuggled into this round.
 
 Gate: 768 tests all-features, 0 failed; clippy/fmt/doc clean.
+
+### R-06 budgets - 2026-11-02 (round 13, second clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `92ca341`. **CLEAN** again,
+so the section closes per the loop's rule.
+
+Re-verified on the shipped path: the queue charges before work; dispatch
+re-gates under `capability ∩ lane(current)`; the promise-growth delta and the
+both-direction egress charge; lane cumulative bytes; monotone attenuation; a
+zero ceiling is refused; and `shape_exceeded` bounds every walk before a full
+measurement.
+
+Residuals (no action): a lifetime `max_bytes` naturally exhausts a long-lived
+lane, so operators mint fresh grants; over-narrow grants deny availability,
+which is the safe direction; `to_active_budget.max_keys` is tighter than either
+parent ceiling, also the safe direction.
+
+### R-04 promises / pipelining - 2026-11-02 (round 6, second clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `92ca341`. **CLEAN** again.
+It verified `src/promise.rs`, the dispatch/cancel/idempotency paths, ADR-0005,
+the wire spec's promise and cycle codes, and the 27 promise + 2 cancellation +
+3 idempotency tests.
+
+Checks held: lane-scoped dependencies, the envelope's authority refusal, the
+revoke/expiry/identity re-check at dispatch, the pre-work budget charge plus the
+dispatch delta and egress, single settlement with the cancelled and
+out-of-band guards, cycle detection, the secret-free fingerprint, and
+handle-pinned retention.
+
+Residuals (no action): the `u64` promise counter wraps only at 2⁶⁴; pinned
+handles plus the 1024 idempotency entries bound retention by design;
+cross-provider chains cost one batch per provider by design.
 
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
