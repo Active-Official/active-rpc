@@ -875,16 +875,19 @@ fn a_spent_deadline_does_not_write_a_line() {
     use active_rpc::tool::{McpTransport, StdioTransport};
 
     let mut env = std::collections::BTreeMap::new();
+    #[cfg(windows)]
+    let (program, args) = (
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 20"],
+    );
+    #[cfg(not(windows))]
+    let (program, args) = ("/bin/sh", vec!["-c", "sleep 20"]);
+    #[cfg(windows)]
     env.insert(
         "SystemRoot".to_string(),
         std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
     );
-    let mut transport = StdioTransport::spawn(
-        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-        &["-NoProfile", "-Command", "Start-Sleep -Seconds 20"],
-        &env,
-    )
-    .expect("spawn");
+    let mut transport = StdioTransport::spawn(program, &args, &env).expect("spawn");
     let error = transport
         .send_line_within("{\"jsonrpc\":\"2.0\"}", Some(std::time::Instant::now()))
         .expect_err("a spent deadline");
@@ -917,4 +920,124 @@ fn a_nul_argument_is_refused() {
     call.tool_allows_process = true;
     let error = tool.invoke(0, &call).expect_err("a NUL environment value");
     assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// `Command::env` rejects an empty key, a `=` in a key, or a NUL on either
+/// side. Round 5 refused the NUL cases; an empty or `=`-bearing key still
+/// reaches `Command` and fails at spawn as a provider fault (or, for `=` on
+/// Windows, is silently mangled into another variable) instead of being
+/// refused up front.
+#[test]
+fn an_invalid_environment_key_is_refused() {
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\cmd.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    for key in ["", "A=B"] {
+        let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+        tool.env.insert(key.to_string(), "x".to_string());
+        let mut call = Call::new("run", vec![Arg::text("echo")]);
+        call.tool_allows_process = true;
+        let error = tool.invoke(0, &call).expect_err("a bad environment key");
+        assert_eq!(error.code(), "rpc/invalid-argument", "{key:?}: {error}");
+    }
+
+    #[cfg(windows)]
+    {
+        use active_rpc::tool::StdioTransport;
+
+        for key in ["", "A=B"] {
+            let mut env = std::collections::BTreeMap::new();
+            env.insert(
+                "SystemRoot".to_string(),
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+            );
+            env.insert(key.to_string(), "x".to_string());
+            let result = StdioTransport::spawn(
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                &["-NoProfile", "-Command", "Start-Sleep -Seconds 20"],
+                &env,
+            );
+            let error = match result {
+                Ok(_) => panic!("a bad transport environment key must not spawn"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), "rpc/invalid-argument", "{key:?}: {error}");
+        }
+    }
+}
+
+/// `serde_json` has no non-finite numbers: `value_to_json` maps NaN and the
+/// infinities to `null`, so a peer would act on a null nobody wrote. The
+/// adapters refuse them like a module: same doctrine, same position.
+#[test]
+fn a_nonfinite_float_is_not_sent() {
+    use std::collections::BTreeMap;
+
+    for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut session = echo_session();
+        let mut call = Call::new("echo", vec![Arg::Value(Value::Float(number))]);
+        call.tool_allows_process = true;
+        let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+            .expect_err("a non-finite argument");
+        assert_eq!(error.code(), "rpc/invalid-argument", "{number:?}: {error}");
+
+        let mut entries = BTreeMap::new();
+        entries.insert("x".to_string(), Value::Float(number));
+        let mut tool = HttpTool::new("http://127.0.0.1:9", &[("POST", "/y")]);
+        let mut call = Call::new(
+            "post",
+            vec![
+                Arg::Value(Value::path("/y")),
+                Arg::Value(Value::Map(entries)),
+            ],
+        );
+        call.tool_allows_process = true;
+        let error = tool.invoke(0, &call).expect_err("a non-finite body");
+        assert_eq!(error.code(), "rpc/invalid-argument", "{number:?}: {error}");
+    }
+}
+
+/// Round 5 refuses a module recursively: a module nested in a list or a map
+/// argument must not reach the wire either.
+#[test]
+fn a_module_nested_in_a_container_is_not_sent() {
+    for value in [
+        Value::list([Value::Module(vec![1])]),
+        Value::map([("m".to_string(), Value::Module(vec![1]))]),
+        Value::map([(
+            "outer".to_string(),
+            Value::list([Value::map([("m".to_string(), Value::Module(vec![1]))])]),
+        )]),
+    ] {
+        let mut session = echo_session();
+        let mut call = Call::new("echo", vec![Arg::Value(value)]);
+        call.tool_allows_process = true;
+        let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+            .expect_err("a nested module");
+        assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+    }
+}
+
+/// A handshake against an already-spent ceiling refuses before any frame
+/// leaves (round 5, #5, session side).
+#[test]
+fn a_spent_handshake_deadline_sends_nothing() {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    let result = McpSession::handshake_within(
+        MemoryTransport::new(responses),
+        Some(std::time::Instant::now()),
+    );
+    let error = match result {
+        Ok(_) => panic!("a spent handshake must not succeed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
 }

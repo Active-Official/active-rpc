@@ -87,6 +87,30 @@ fn contains_module(value: &Value) -> bool {
     }
 }
 
+/// Whether a value carries a non-finite float anywhere in its shape.
+///
+/// JSON has no NaN or infinities: `value_to_json` maps them to `null`, so any
+/// adapter that serialised one handed the peer a null nobody wrote. Refused
+/// like a module (round 6): same doctrine, same position.
+fn contains_nonfinite(value: &Value) -> bool {
+    match value {
+        Value::Float(number) => !number.is_finite(),
+        Value::List(items) => items.iter().any(contains_nonfinite),
+        Value::Map(entries) => entries.values().any(contains_nonfinite),
+        _ => false,
+    }
+}
+
+/// Whether an environment entry reaches the child as written.
+///
+/// An empty key, a `=` in a key, or a NUL on either side never does: it fails
+/// at spawn as a provider fault, or (a `=` on Windows) is silently mangled
+/// into another variable. A bad entry is refused here instead of reaching
+/// `Command` at all (round 6; round 5 covered NUL only).
+fn valid_env_entry(key: &str, value: &str) -> bool {
+    !key.is_empty() && !key.contains('=') && !key.contains('\0') && !value.contains('\0')
+}
+
 // ---------------------------------------------------------------------------
 // MCP
 // ---------------------------------------------------------------------------
@@ -483,11 +507,12 @@ impl StdioTransport {
             command.process_group(0);
         }
         for (key, value) in env {
-            // `Command` panics on a NUL in a key or a value; a configuration
-            // typo must be a refusal, not an unwind.
-            if key.contains('\0') || value.contains('\0') {
+            // `Command` never delivers a bad entry as written: an empty key, a
+            // `=` in a key, or a NUL on either side fails at spawn (or is
+            // silently mangled), so a configuration typo is refused here.
+            if !valid_env_entry(key, value) {
                 return Err(Error::InvalidArgument(
-                    "an MCP environment entry contains a NUL byte",
+                    "an MCP environment entry is not a valid variable",
                 ));
             }
             command.env(key, value);
@@ -962,6 +987,13 @@ impl<T: McpTransport> Provider for McpSession<T> {
                             "an MCP argument cannot carry a module",
                         ));
                     }
+                    if contains_nonfinite(value) {
+                        // JSON has no NaN or infinities: serialising one hands
+                        // the peer a null nobody wrote (round 6).
+                        return Err(Error::InvalidArgument(
+                            "an MCP argument cannot carry a non-finite number",
+                        ));
+                    }
                     arguments.insert(format!("arg{index}"), value_to_json(value));
                 }
                 // A capability or a promise is authority, not JSON text: the
@@ -1417,6 +1449,13 @@ impl Provider for HttpTool {
                         // (round 5, #2).
                         return Err(Error::InvalidArgument("an HTTP body cannot carry a module"));
                     }
+                    if contains_nonfinite(&value) {
+                        // JSON has no NaN or infinities: serialising one hands
+                        // the peer a null nobody wrote (round 6).
+                        return Err(Error::InvalidArgument(
+                            "an HTTP body cannot carry a non-finite number",
+                        ));
+                    }
                     serde_json::to_vec(&value_to_json(&value)).unwrap_or_default()
                 }
                 None => Vec::new(),
@@ -1707,9 +1746,9 @@ impl Provider for LocalProcess {
                     "a process argument must be a text value",
                 ));
             };
-            // `Command` panics on an interior NUL: the kernel would catch the
-            // unwind, but a caller-supplied argument must not reach a panic at
-            // all (round 5, #6).
+            // A NUL argument never reaches the child: it fails at spawn, so
+            // it is refused here with the argument's own code instead of a
+            // provider fault (round 5, #6).
             if text.contains('\0') {
                 return Err(Error::InvalidArgument(
                     "a process argument contains a NUL byte",
@@ -1752,11 +1791,10 @@ impl Provider for LocalProcess {
             command.process_group(0);
         }
         for (key, value) in &self.env {
-            // Same panic rule as an argument: a configured key or value with a
-            // NUL would abort the dispatch thread instead of failing the call.
-            if key.contains('\0') || value.contains('\0') {
+            // Same rule as the transport: a bad entry never reaches `Command`.
+            if !valid_env_entry(key, value) {
                 return Err(Error::InvalidArgument(
-                    "a process environment entry contains a NUL byte",
+                    "a process environment entry is not a valid variable",
                 ));
             }
             command.env(key, value);
