@@ -1209,11 +1209,11 @@ impl PlaneCore {
                 detail: "capability reference changed".into(),
                 ..base
             },
-            Event::LaneDestroyed(lane) => UiEvent {
+            Event::LaneDestroyed { lane, jobs } => UiEvent {
                 category: category_for("lane_closed").into(),
                 kind: "lane_closed".into(),
                 lane: Some(format!("lane {}", lane.0)),
-                detail: "lane destroyed".into(),
+                detail: format!("lane destroyed, {jobs} queued job(s) dropped"),
                 ..base
             },
             Event::ChannelRecv { channel, sequence } => UiEvent {
