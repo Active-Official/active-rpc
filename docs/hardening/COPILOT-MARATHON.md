@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-21: ... + 5 findings; one more clean round closes it | 118 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-22: ... + 5 findings; one clean round closes it | 123 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-13: ... + 11 findings; one clean round closes it | 112 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,22 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 22)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `ffd7920`. Two mediums and
+three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the scoped-evaluate fix from round 21 landed in `resolve()` but not in the evaluate arm, so a scoped caller could tell a missing field from a confined one | **fixed**: one answer; `a_scoped_evaluate_hides_whether_a_name_exists` |
+| 2 | medium | the Connect client read a declared body under the per-read timeout, so a byte-per-period drip held it | **fixed**: the body is read in 8 KiB chunks with the deadline re-armed |
+| 3 | low | the client's connect was unbounded | **fixed**: `connect_timeout` under the same wait |
+| 4 | low | the client accepted `+25`, a repeated length and a `transfer-encoding` the server refuses | **fixed**: the same rules the server applies |
+| 5 | low | the egress asserts walked map values but not keys, while `redact_value` collapses on a marker key | **fixed**: both asserts inspect keys |
+
+Gate: 88 suites / 876 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 21)
 

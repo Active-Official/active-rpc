@@ -873,3 +873,41 @@ fn a_patch_that_orphans_a_secret_canonicalizes() {
     };
     assert!(hash.starts_with("blake3:"), "{hash}");
 }
+
+/// A scoped evaluate gives one answer whether the name is missing or confined
+/// (round 22, #1).
+#[test]
+fn a_scoped_evaluate_hides_whether_a_name_exists() {
+    let mut module = InfinityModule::new();
+    let outside = module.push(Inode::Str("OUTSIDE".to_string()));
+    let leaf = module.push(Inode::Str("in".to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![
+            ("y".to_string(), leaf),
+            // A reference that leaves the scope.
+            ("x".to_string(), outside),
+        ],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app), ("other".to_string(), outside)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], Some("app"), false);
+    let missing = {
+        let promise = agent
+            .call(lane, &cap, "evaluate", vec![path("app.missing")])
+            .expect("queued");
+        agent.run();
+        promise.value().expect_err("missing")
+    };
+    let outside = {
+        let promise = agent
+            .call(lane, &cap, "evaluate", vec![path("app.x")])
+            .expect("queued");
+        agent.run();
+        promise.value().expect_err("outside")
+    };
+    assert_eq!(missing.code(), outside.code(), "{missing} vs {outside}");
+    assert_eq!(missing.code(), "rpc/path-not-granted", "{missing}");
+}

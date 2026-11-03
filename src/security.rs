@@ -234,7 +234,17 @@ pub fn assert_no_structural_secrets(value: &Value) -> Result<()> {
     match value {
         Value::Secret => Ok(()),
         Value::List(items) => items.iter().try_for_each(assert_no_structural_secrets),
-        Value::Map(entries) => entries.values().try_for_each(assert_no_structural_secrets),
+        // A key is text the peer reads: `redact_value` collapses a map whose
+        // key carries the marker, so the door out must inspect keys too
+        // (round 22, #5).
+        Value::Map(entries) => {
+            if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
+                return Err(Error::Provider {
+                    code: "rpc/secret-material".to_string(),
+                });
+            }
+            entries.values().try_for_each(assert_no_structural_secrets)
+        }
         Value::Module(bytes) => {
             if module_has_secret(bytes)? {
                 return Err(Error::Provider {
@@ -259,7 +269,14 @@ pub fn assert_no_secret_material(value: &Value) -> Result<()> {
             code: "rpc/secret-material".to_string(),
         }),
         Value::List(items) => items.iter().try_for_each(assert_no_secret_material),
-        Value::Map(entries) => entries.values().try_for_each(assert_no_secret_material),
+        Value::Map(entries) => {
+            if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
+                return Err(Error::Provider {
+                    code: "rpc/secret-material".to_string(),
+                });
+            }
+            entries.values().try_for_each(assert_no_secret_material)
+        }
         // A module is bytes: it is the one variant that can carry a secret
         // without the value model noticing, so it is decoded and inspected.
         Value::Module(bytes) => {

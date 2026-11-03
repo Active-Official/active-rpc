@@ -21,7 +21,7 @@
 //! stack: it is the interoperability surface, not the hot path, and it stays
 //! dependency-free so the crate still builds on a bare toolchain.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 
 use crate::error::{Error, Result};
@@ -595,12 +595,23 @@ impl ConnectClient {
             "POST {PATH} HTTP/1.1\r\nhost: active-rpc\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
         );
-        let mut stream = TcpStream::connect(&self.address)
-            .map_err(|error| Error::Transport(format!("connect: {error}")))?;
+        // A black-hole peer must not hold a `with_deadline` client: the
+        // connect itself is bounded (round 22, #3).
+        let wait = self.deadline.unwrap_or(CONNECTION_WAIT);
+        use std::net::ToSocketAddrs;
+        let mut stream = TcpStream::connect_timeout(
+            &self
+                .address
+                .to_socket_addrs()
+                .map_err(|error| Error::Transport(format!("resolve: {error}")))?
+                .next()
+                .ok_or_else(|| Error::Transport("no address".to_string()))?,
+            wait,
+        )
+        .map_err(|error| Error::Transport(format!("connect: {error}")))?;
         // A client with no explicit deadline still has one: a peer that drips a
         // byte per timeout would hold it forever, and `read_head` was called
         // with `None` (round 21, #2).
-        let wait = self.deadline.unwrap_or(CONNECTION_WAIT);
         stream
             .set_read_timeout(Some(wait))
             .and_then(|()| stream.set_write_timeout(Some(wait)))
@@ -628,17 +639,37 @@ impl ConnectClient {
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|code| code.parse().ok())
             .ok_or(Error::Wire("malformed status line"))?;
-        let length: usize = head
-            .iter()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                if name.eq_ignore_ascii_case("content-length") {
-                    value.trim().parse().ok()
-                } else {
-                    None
+        // The server refuses `+25`, a duplicate length and a
+        // `transfer-encoding`; the client applies the same rules so an
+        // intermediary cannot desync the two (round 22, #4).
+        let mut lengths: Vec<usize> = Vec::new();
+        for line in &head {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err(Error::Wire("transfer-encoding is not accepted"));
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                let trimmed = value.trim();
+                if trimmed.is_empty()
+                    || trimmed.len() > 20
+                    || !trimmed.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(Error::Wire("malformed response length"));
                 }
-            })
-            .ok_or(Error::Wire("missing response length"))?;
+                lengths.push(
+                    trimmed
+                        .parse()
+                        .map_err(|_| Error::Wire("malformed response length"))?,
+                );
+            }
+        }
+        let length = match lengths.as_slice() {
+            [length] => *length,
+            [] => return Err(Error::Wire("missing response length")),
+            _ => return Err(Error::Wire("repeated response length")),
+        };
         if length > MAX_BODY.min(self.limits.max_bytes) {
             return Err(Error::Wire("response exceeds the ceiling"));
         }
@@ -646,12 +677,24 @@ impl ConnectClient {
         // announces 64 MiB and sends ten bytes must not cost a 64 MiB
         // allocation. `take` stops at the declared length.
         let mut response = Vec::with_capacity(length.min(64 * 1024));
-        let read = reader
-            .by_ref()
-            .take(length as u64)
-            .read_to_end(&mut response)
-            .map_err(|error| Error::Transport(format!("response: {error}")))?;
-        if read != length {
+        let mut chunk = [0u8; 8 * 1024];
+        while response.len() < length {
+            let left = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| Error::Transport("response body timed out".to_string()))?;
+            reader
+                .get_ref()
+                .set_read_timeout(Some(left))
+                .map_err(|error| Error::Transport(format!("response: {error}")))?;
+            let want = (length - response.len()).min(chunk.len());
+            let read = std::io::Read::read(&mut reader, &mut chunk[..want])
+                .map_err(|error| Error::Transport(format!("response: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+        }
+        if response.len() != length {
             return Err(Error::Transport(
                 "response body is shorter than declared".to_string(),
             ));

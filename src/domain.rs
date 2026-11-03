@@ -230,7 +230,16 @@ impl ModuleProvider {
                     Some(path) => {
                         let node = active_infinity::interop::resolve_path(&slot.module, &path)
                             .or_else(|| structural_resolve(&slot.module, &path))
-                            .ok_or(Error::InvalidArgument("path does not resolve"))?;
+                            // A scoped caller gets one answer for "not yours"
+                            // (round 22, #1): the two codes distinguished a
+                            // missing field from a confined one.
+                            .ok_or_else(|| {
+                                if call.path_scope.is_some() {
+                                    Error::PathNotGranted(path.clone())
+                                } else {
+                                    Error::InvalidArgument("path does not resolve")
+                                }
+                            })?;
                         // Evaluation follows references: a scoped capability
                         // must not read a value that is built from data outside
                         // its subtree.
