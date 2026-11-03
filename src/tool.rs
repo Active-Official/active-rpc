@@ -79,12 +79,19 @@ pub fn value_to_json(value: &Value) -> Json {
 /// check is recursive: a map or a list is a legal body, and a module nested
 /// inside it would otherwise pass the top-level shape check (round 5, #2).
 fn contains_module(value: &Value) -> bool {
-    match value {
-        Value::Module(_) => true,
-        Value::List(items) => items.iter().any(contains_module),
-        Value::Map(entries) => entries.values().any(contains_module),
-        _ => false,
+    // Iterative: a direct `Provider::invoke` bypasses the kernel's depth gate,
+    // and a recursive walk of a caller-built value aborts the stack
+    // (round 7, #1). Same doctrine as `Value::is_tainted`.
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Module(_) => return true,
+            Value::List(items) => stack.extend(items.iter()),
+            Value::Map(entries) => stack.extend(entries.values()),
+            _ => {}
+        }
     }
+    false
 }
 
 /// Whether a value carries a non-finite float anywhere in its shape.
@@ -93,12 +100,16 @@ fn contains_module(value: &Value) -> bool {
 /// adapter that serialised one handed the peer a null nobody wrote. Refused
 /// like a module (round 6): same doctrine, same position.
 fn contains_nonfinite(value: &Value) -> bool {
-    match value {
-        Value::Float(number) => !number.is_finite(),
-        Value::List(items) => items.iter().any(contains_nonfinite),
-        Value::Map(entries) => entries.values().any(contains_nonfinite),
-        _ => false,
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Float(number) if !number.is_finite() => return true,
+            Value::List(items) => stack.extend(items.iter()),
+            Value::Map(entries) => stack.extend(entries.values()),
+            _ => {}
+        }
     }
+    false
 }
 
 /// Whether an environment entry reaches the child as written.
@@ -729,15 +740,26 @@ impl<T: McpTransport> McpSession<T> {
         }
         let list = session.request_within("tools/list", json!({}), deadline)?;
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        if let Some(items) = list
+        let Some(items) = list
             .get("result")
             .and_then(|result| result.get("tools"))
             .and_then(Json::as_array)
+        else {
+            // A handshake that answers no tool array is malformed: an empty
+            // session hides it (round 7, #2).
+            return Err(Error::Provider {
+                code: "mcp/tools".to_string(),
+            });
+        };
         {
             for item in items {
                 let name = item.get("name").and_then(Json::as_str).unwrap_or("");
                 if name.is_empty() {
-                    continue;
+                    // A nameless entry cannot be granted, and skipping it made a
+                    // malformed list look usable (round 7, #2).
+                    return Err(Error::Provider {
+                        code: "mcp/tool-name".to_string(),
+                    });
                 }
                 // A tool name reaches an operator-facing allow-list and the
                 // method table, so it must be plain ASCII identifier text. A

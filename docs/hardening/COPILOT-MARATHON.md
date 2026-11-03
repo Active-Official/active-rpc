@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-10: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 findings; round-10 fixes green, confirmation round pending | 69 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-6: 15 + 16 + 9 + 6 + 6 + 2 findings; round-6 fixes green, confirmation round pending | 49 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-7: 15 + 16 + 9 + 6 + 6 + 2 + 2 findings; round-7 fixes green, confirmation round pending | 51 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -96,6 +96,17 @@ a cone reply carries no redacted flag; `next_object` overflow is theoretical.
 
 Gate: 88 suites / 839 tests all-features, clippy/fmt/doc clean; negative
 controls 9/9; hardening status 13 invariants / 145 checks.
+
+### R-08 tools and MCP - 2026-11-03 (round 7)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `5b3e567`. Both round-6
+fixes verified; three lows, two closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | `contains_module`/`contains_nonfinite` recursed: a direct `Provider::invoke` bypasses the kernel's depth gate, and a deeply nested value would abort the stack in the walk | **fixed**: both walks are iterative, like `Value::is_tainted`. A run-time test is not possible: dropping a 20 000-deep `Value` overflows the derived recursive `Drop` before the adapter sees it, so the recursion is closed by construction and the `Value` drop is recorded as a library-level residual |
+| 2 | low | a nameless `tools/list` entry was skipped and a non-array `tools` yielded an empty session: malformed handshake data looked usable | **fixed**: both refuse (`mcp/tool-name`, `mcp/tools`); `a_nameless_tool_entry_is_refused`, `a_hostile_tool_list_is_refused` |
+| 3 | low | `json_to_value` maps a u64-only JSON integer through `f64` (precision past 2^53) | **residual**: inbound fidelity only, no authority impact (call ids compare raw `Json`); recorded |
 
 ### R-08 tools and MCP - 2026-11-03 (round 6)
 

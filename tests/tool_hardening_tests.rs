@@ -1041,3 +1041,29 @@ fn a_spent_handshake_deadline_sends_nothing() {
     };
     assert_eq!(error.code(), "rpc/timeout", "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 7
+// ---------------------------------------------------------------------------
+
+/// A handshake that advertises a tool without a name is malformed, not empty.
+#[test]
+fn a_nameless_tool_entry_is_refused() {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"nameless"}]}}"#.to_string(),
+    );
+    let error = match McpSession::handshake(MemoryTransport::new(responses)) {
+        Ok(_) => panic!("a nameless tool is refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+}

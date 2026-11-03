@@ -168,11 +168,16 @@ fn a_tool_call_with_the_wrong_name_is_refused_before_the_wire() {
 }
 
 #[test]
-fn a_hostile_tool_list_does_not_break_the_handshake() {
+fn a_hostile_tool_list_is_refused() {
+    // A handshake that answers no tool array is malformed: an empty session
+    // hid it and looked usable (R-08 round 7, #2).
     let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
     let hostile = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":"not an array"}}"#;
-    let session = McpSession::handshake(Scripted::new(&[initialize, hostile])).expect("handshake");
-    assert!(session.tools().is_empty());
+    let error = match McpSession::handshake(Scripted::new(&[initialize, hostile])) {
+        Ok(_) => panic!("a non-array tool list is refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/provider", "{error}");
 }
 
 #[test]
