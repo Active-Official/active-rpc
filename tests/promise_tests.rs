@@ -928,3 +928,59 @@ fn a_record_that_disables_a_ceiling_is_a_durable_refusal() {
         .expect_err("a zero ceiling is refused");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }
+
+/// A cancelled promise is a caller decision, not a kernel fault: the dispatch
+/// that was already running discards its outcome without counting a double
+/// settlement (round 5, N4).
+#[test]
+fn cancelling_a_running_call_is_not_a_double_settlement() {
+    use std::cell::RefCell;
+
+    struct Canceller {
+        slot: Rc<RefCell<Option<active_rpc::PromiseHandle>>>,
+    }
+
+    impl Provider for Canceller {
+        fn name(&self) -> &'static str {
+            "canceller"
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["go".to_string()]
+        }
+
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            if let Some(handle) = self.slot.borrow().as_ref() {
+                let agent = handle.agent();
+                agent.cancel(handle).expect("cancel");
+            }
+            Ok(Response::Value(Value::text("discarded")))
+        }
+    }
+
+    let agent = Agent::with_secret([0x7d; 32]);
+    let slot: Rc<RefCell<Option<active_rpc::PromiseHandle>>> = Rc::new(RefCell::new(None));
+    let provider = agent.register(Box::new(Canceller {
+        slot: Rc::clone(&slot),
+    }));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["go"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("cancel", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "go", Vec::new()).expect("call");
+    *slot.borrow_mut() = Some(promise.clone());
+    agent.run();
+    let error = promise.value().expect_err("the call was cancelled");
+    assert_eq!(error.code(), "rpc/promise-cancelled");
+    assert_eq!(
+        agent.metrics().promises_double_settled,
+        0,
+        "a caller cancellation was counted as a kernel double settlement"
+    );
+}

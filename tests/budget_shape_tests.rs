@@ -338,6 +338,120 @@ fn a_violation_in_the_first_element_is_found_without_walking_the_rest() {
 }
 
 #[test]
+fn a_list_of_small_lists_is_refused_by_the_parent_ceiling() {
+    // Round 5 (N1): a child only counted against its parent when the parent
+    // folded, and that fold skipped the ceiling check, so a list of a hundred
+    // thousand one-element lists was built in full before the root refused.
+    let budget = Budget {
+        max_array_len: 200_000,
+        max_value_size: 1_024,
+        ..Budget::default()
+    };
+    let nested_lists = Value::list(
+        (0..100_000).map(|_| Value::list(std::iter::once(Value::text("x".repeat(32))))),
+    );
+
+    let mut full_walk = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert!(nested_lists.shape().size > 1_024);
+        full_walk = full_walk.min(start.elapsed().as_nanos());
+    }
+
+    let mut bounded = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(nested_lists.shape_exceeded(&budget), Some("value_size"));
+        bounded = bounded.min(start.elapsed().as_nanos());
+    }
+
+    assert!(
+        bounded.saturating_mul(10) < full_walk,
+        "the bounded check ({bounded} ns) walked the whole value ({full_walk} ns)"
+    );
+}
+
+#[test]
+fn a_hostile_value_is_refused_before_the_kernel_measures_it() {
+    // Round 5 (N2): the queue path measured the arguments with `wire_size()`
+    // (a full walk) before the shape gate, and the path-scope walk ran first
+    // too. The gate now comes before every traversal, so the refusal costs the
+    // ceiling and the provider never sees the call.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    // Three independent values, built outside the measurements: a `Value` clone
+    // is itself a full walk, and it would hide the kernel's own cost.
+    let wide: Vec<Value> = (0..3)
+        .map(|_| Value::list((0..500_000).map(|_| Value::Null)))
+        .collect();
+
+    let mut full_walk = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide[0].shape().widest, 500_000);
+        full_walk = full_walk.min(start.elapsed().as_nanos());
+    }
+
+    let mut refused_at = u128::MAX;
+    for value in wide {
+        let start = std::time::Instant::now();
+        let code = refused(&fixture, value);
+        refused_at = refused_at.min(start.elapsed().as_nanos());
+        assert_eq!(code, "rpc/budget-exceeded");
+    }
+
+    // The refusal also drops the value it was handed, and dropping a list is
+    // linear, so the comparison is against a walk that costs far more per
+    // element (3x headroom against ~10x measured). The round-4 order measured
+    // the value in full first, which put the refusal at or above `full_walk`.
+    assert!(
+        refused_at.saturating_mul(3) < full_walk,
+        "the refusal ({refused_at} ns) measured the whole value ({full_walk} ns)"
+    );
+    assert_eq!(fixture.calls.get(), 0);
+}
+
+#[test]
+fn an_idempotent_call_refuses_a_hostile_value_before_hashing_it() {
+    // Round 5 (N3): the idempotency fingerprint hashed the whole value before
+    // any shape check, so the key path had the same unbounded first walk.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    let wide: Vec<Value> = (0..3)
+        .map(|_| Value::list((0..500_000).map(|_| Value::Null)))
+        .collect();
+
+    let mut full_walk = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide[0].shape().widest, 500_000);
+        full_walk = full_walk.min(start.elapsed().as_nanos());
+    }
+
+    let mut refused_at = u128::MAX;
+    for (index, value) in wide.into_iter().enumerate() {
+        let key = format!("hostile-{index}");
+        let start = std::time::Instant::now();
+        let error = fixture
+            .agent
+            .call_idempotent(
+                fixture.lane,
+                &fixture.cap,
+                "ping",
+                vec![Arg::Value(value)],
+                &key,
+            )
+            .expect_err("the shape ceiling binds on the keyed path too");
+        refused_at = refused_at.min(start.elapsed().as_nanos());
+        assert_eq!(error.code(), "rpc/budget-exceeded");
+    }
+
+    assert!(
+        refused_at.saturating_mul(3) < full_walk,
+        "the refusal ({refused_at} ns) hashed the whole value ({full_walk} ns)"
+    );
+    assert_eq!(fixture.calls.get(), 0);
+}
+
+#[test]
 fn a_module_larger_than_max_value_size_is_refused() {
     let fixture = fixture_with(budget(), Value::text("ok"));
     assert_eq!(

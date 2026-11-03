@@ -10,7 +10,7 @@ use active_rpc::cap::CapAttrs;
 use active_rpc::channel::{Direction, MAX_QUEUED_BYTES};
 use active_rpc::kernel::{Provider, MAX_OBJECT_NAME_BYTES};
 use active_rpc::value::{Arg, Call, Response, Value};
-use active_rpc::{Agent, Budget, LaneId};
+use active_rpc::{Agent, Budget, LaneId, PromiseHandle};
 
 struct Echo;
 
@@ -361,6 +361,145 @@ fn destroying_a_lane_mid_batch_settles_its_running_call_once() {
         agent.metrics().promises_double_settled,
         0,
         "a running job's promise was settled twice"
+    );
+}
+
+/// Destroys its own lane while a dependent job is still queued, and records
+/// how many waiters the dependency had at that moment.
+struct ChainKiller {
+    agent: Rc<RefCell<Option<Agent>>>,
+    victim: Rc<Cell<Option<u64>>>,
+    dependency: Rc<RefCell<Option<PromiseHandle>>>,
+    observed: Rc<Cell<Option<u32>>>,
+}
+
+impl Provider for ChainKiller {
+    fn name(&self) -> &'static str {
+        "chain-killer"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["zero".to_string(), "first".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, call: &Call) -> active_rpc::Result<Response> {
+        if call.method == "first" {
+            let agent = self.agent.borrow();
+            let agent = agent.as_ref().expect("the agent is installed");
+            let lane = self.victim.get().expect("the lane is installed");
+            agent.destroy_lane(LaneId(lane)).expect("destroy the lane");
+            let dependency = self.dependency.borrow();
+            let dependency = dependency.as_ref().expect("the dependency is installed");
+            self.observed.set(Some(agent.promise_waiters(dependency)));
+        }
+        Ok(Response::Value(Value::text("ok")))
+    }
+}
+
+#[test]
+fn destroying_a_lane_does_not_release_a_running_jobs_dependency() {
+    // Round 2 (#2): the destroy swept the deps of every job on the lane,
+    // including the running one, and the dispatch then released them again at
+    // settlement. `saturating_sub` hid the second release, but the dependency's
+    // waiter count dropped to zero while a running job still needed it, which
+    // makes the record trim-eligible too early.
+    let agent = Agent::with_secret([0x7f; 32]);
+    let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
+    let victim = Rc::new(Cell::new(None));
+    let dependency: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
+    let observed = Rc::new(Cell::new(None));
+    let provider = agent.register(Box::new(ChainKiller {
+        agent: Rc::clone(&slot),
+        victim: Rc::clone(&victim),
+        dependency: Rc::clone(&dependency),
+        observed: Rc::clone(&observed),
+    }));
+    *slot.borrow_mut() = Some(agent.clone());
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["zero", "first"]))
+        .expect("cap");
+    let lane = agent.create_lane("chain", Budget::default()).expect("lane");
+    victim.set(Some(lane.0));
+    let zero = agent.call(lane, &cap, "zero", Vec::new()).expect("zero");
+    *dependency.borrow_mut() = Some(zero.clone());
+    // The second job holds the first job's promise as a dependency.
+    let _first = agent
+        .call(lane, &cap, "first", vec![Arg::Promise(zero.id())])
+        .expect("first");
+    agent.run();
+
+    assert_eq!(
+        observed.get(),
+        Some(1),
+        "the running job's dependency lost its waiter when the lane was destroyed"
+    );
+}
+
+#[test]
+fn lane_and_channel_names_are_validated_text() {
+    // Round 2 (#3): a lane name was checked for length only, while a channel
+    // name and a topic were checked as text. A name is a label an operator
+    // reads, and a control character or a line separator can forge a record.
+    let (agent, _provider) = agent();
+    assert!(agent.create_lane("", Budget::default()).is_err());
+    assert!(agent
+        .create_lane("bad\u{2028}name", Budget::default())
+        .is_err());
+    assert!(agent.create_lane("fine", Budget::default()).is_ok());
+}
+
+#[test]
+fn a_lane_can_release_a_subscription() {
+    // Round 2 (#4): subscriptions only grew, so a lane at the per-lane ceiling
+    // could never subscribe again, and read access could not be withdrawn.
+    let (agent, _provider) = agent();
+    let lane = agent
+        .create_lane("release", Budget::default())
+        .expect("lane");
+    let channel = agent
+        .create_channel("release", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
+    agent.unsubscribe(lane, channel).expect("unsubscribe");
+    assert_eq!(agent.channel(channel).expect("channel").subscribers, 0);
+    let error = agent
+        .recv(lane, channel)
+        .expect_err("the lane is no longer subscribed");
+    assert_eq!(error.code(), "rpc/unknown-channel");
+    // And the subscription slot is free again.
+    agent.subscribe(lane, channel).expect("resubscribe");
+}
+
+#[test]
+fn destroying_a_channel_reports_its_backlog() {
+    // Round 2 (#5): a destroy dropped queued messages with no event, so an
+    // operator could not tell a destroy with a backlog from an empty one.
+    let (agent, _provider) = agent();
+    let lane = agent
+        .create_lane("backlog", Budget::default())
+        .expect("lane");
+    let channel = agent
+        .create_channel("backlog", Direction::Both)
+        .expect("channel");
+    agent
+        .send(lane, channel, Value::text("one"), &[])
+        .expect("send");
+    agent
+        .send(lane, channel, Value::text("two"), &[])
+        .expect("send");
+    agent.destroy_channel(channel).expect("destroy");
+    let json = agent.trace_json();
+    assert!(
+        json.contains("\"event\":\"channel.destroyed\""),
+        "the destroy is not on the tape: {json}"
+    );
+    assert!(
+        json.contains("\"detail\":\"2\""),
+        "the dropped count is not on the tape: {json}"
     );
 }
 

@@ -200,6 +200,13 @@ pub enum Event {
     LaneCreated(LaneId),
     /// A lane was destroyed.
     LaneDestroyed(LaneId),
+    /// A channel was destroyed, with the number of messages it still held.
+    ChannelDestroyed {
+        /// Channel that was removed.
+        channel: ChannelId,
+        /// Messages dropped with it.
+        dropped: u64,
+    },
     /// A call was queued.
     CallQueued {
         /// Job id.
@@ -1733,8 +1740,13 @@ impl Agent {
     pub fn create_lane(&self, name: impl Into<String>, budget: Budget) -> Result<LaneId> {
         budget.check()?;
         let name = name.into();
-        if name.len() > MAX_OBJECT_NAME_BYTES {
-            return Err(Error::InvalidArgument("lane name is too long"));
+        // A lane name is a label an operator reads, so it follows the same rule
+        // as a channel name and a topic: non-empty, bounded, no control or
+        // reordering characters (round 2, #3).
+        if !crate::security::valid_text(&name, MAX_OBJECT_NAME_BYTES) {
+            return Err(Error::InvalidArgument(
+                "a lane name must be 1..=1024 bytes without control or reordering characters",
+            ));
         }
         let mut kernel = self.cell.borrow_mut();
         let open = kernel.lanes.values().filter(|lane| !lane.closed).count();
@@ -1791,13 +1803,10 @@ impl Agent {
         // a caller that holds a handle must still see the settled value (or a
         // rejected one) rather than an unrelated `unknown-promise`. The promise
         // ceiling bounds them; the kernel itself is the lifetime.
-        let orphaned: Vec<PromiseId> = kernel
-            .jobs
-            .values()
-            .filter(|job| job.lane == lane)
-            .flat_map(|job| job.deps.clone())
-            .collect();
-        Kernel::release_waiters(&mut kernel, &orphaned);
+        // No waiter sweep: `fail_job` already released the dependencies of
+        // every doomed job, and a running job (kept below) releases its own when
+        // its dispatch settles. A sweep released them a second time, which
+        // `saturating_sub` hid while the waiter count drifted (round 2, #2).
         kernel
             .jobs
             .retain(|_, job| job.lane != lane || job.state == JobState::Running);
@@ -1822,6 +1831,12 @@ impl Agent {
         for lane in kernel.lanes.values_mut() {
             lane.channels.remove(&channel.0);
         }
+        // A destroy can drop a backlog. Without an event an operator cannot tell
+        // "destroyed empty" from "destroyed with 4 000 messages".
+        kernel.push_event(Event::ChannelDestroyed {
+            channel,
+            dropped: removed.queued() as u64,
+        });
         Ok(())
     }
 
@@ -1889,6 +1904,26 @@ impl Agent {
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         record.subscribers.insert(lane.0);
+        Ok(())
+    }
+
+    /// Remove a lane's subscription to a channel.
+    ///
+    /// Subscriptions only grow otherwise (a destroy clears them), and a lane at
+    /// its subscription ceiling could never subscribe again even after it no
+    /// longer needed a channel. `Ok` when the lane was not subscribed.
+    pub fn unsubscribe(&self, lane: LaneId, channel: ChannelId) -> Result<()> {
+        let mut kernel = self.cell.borrow_mut();
+        let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+        if lane_record.closed {
+            return Err(Error::UnknownLane(lane.0));
+        }
+        if let Some(lane) = kernel.lanes.get_mut(&lane) {
+            lane.channels.remove(&channel.0);
+        }
+        if let Some(record) = kernel.channels.get_mut(&channel) {
+            record.subscribers.remove(&lane.0);
+        }
         Ok(())
     }
 
@@ -2271,17 +2306,16 @@ impl Agent {
             .channels
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
-        let message = record.send_topic(lane, Some(topic), payload, Vec::new())?;
+        // A publish needs the sequence, not the message: `send_topic` would
+        // copy the whole payload for a value this path discards (round 2, #1).
+        let sequence = record.send_topic_sequence(lane, topic, payload, Vec::new())?;
         kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(bytes);
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
             lane_record.bytes = lane_record.bytes.saturating_add(bytes);
             lane_record.completed = lane_record.completed.saturating_add(1);
         }
-        kernel.push_event(Event::ChannelSend {
-            channel,
-            sequence: message.sequence,
-        });
-        Ok(message.sequence)
+        kernel.push_event(Event::ChannelSend { channel, sequence });
+        Ok(sequence)
     }
 
     /// Receive the next message published on `topic`, as `lane`.
@@ -2573,6 +2607,18 @@ impl Agent {
         if record.attrs.read_only && provider.mutating(method) {
             return Err(Error::ReadOnly);
         }
+        let effective = record.attrs.budget.intersect(&lane_budget);
+        // The shape ceilings bound the work every later check does: the path
+        // walk, the tool ceiling and the byte measurement all traverse the
+        // value, so an oversized value is refused first, by the bounded walk.
+        // Measuring with `wire_size` before this point walked a hostile value in
+        // full (round 5, N2).
+        for arg in &args {
+            let Arg::Value(value) = arg else { continue };
+            if let Some(error) = shape_refusal(value, &effective) {
+                return Err(error);
+            }
+        }
         // Path scope is enforced here, before the provider sees the call. The
         // walk is recursive: a `Path` nested in a list or map is the same
         // argument to a provider that flattens it.
@@ -2601,20 +2647,8 @@ impl Agent {
             }
         }
         let call_bytes: u64 = args_bytes.saturating_add(payload_bytes);
-        let effective = record.attrs.budget.intersect(&lane_budget);
         if call_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
-        }
-        // The shape ceilings are part of the budget, not decoration: a caller
-        // could hand a provider a value 10 000 levels deep, or one list of a
-        // million elements, under a grant whose `max_depth`/`max_array_len` said
-        // otherwise. The wire refuses such a value from a peer, but an
-        // in-process caller never crosses the wire.
-        for arg in &args {
-            let Arg::Value(value) = arg else { continue };
-            if let Some(error) = shape_refusal(value, &effective) {
-                return Err(error);
-            }
         }
         // A lane's byte ceiling is cumulative, not a per-call limit: otherwise
         // any number of calls each just under it would pass.
@@ -3028,6 +3062,27 @@ impl Agent {
             let error = Error::InvalidArgument("idempotency key is too long");
             self.record_refusal(lane, Some(cap.id()), &error);
             return Err(error);
+        }
+        // The fingerprint hashes every byte of the arguments, so the shape
+        // ceilings gate the work before anything traverses the value. The
+        // capability's budget is the widest grant this call can run under; the
+        // lane intersection is re-checked on the queue path (round 5, N3).
+        {
+            let kernel = self.cell.borrow();
+            let budget = kernel
+                .caps
+                .get(&cap.id())
+                .ok_or(Error::UnknownCapability(cap_token(cap.id())))?
+                .attrs
+                .budget;
+            drop(kernel);
+            for arg in &args {
+                let Arg::Value(value) = arg else { continue };
+                if let Some(error) = shape_refusal(value, &budget) {
+                    self.record_refusal(lane, Some(cap.id()), &error);
+                    return Err(error);
+                }
+            }
         }
         let fingerprint = fingerprint_with_payload(&args, payload_bytes);
         // A replay is an exercise of authority in one lane: the key is scoped
@@ -3976,7 +4031,10 @@ impl Agent {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
                         if record.resolve(value.clone()).is_ok() {
                             settled_now = true;
-                        } else {
+                        } else if record.state != crate::promise::PromiseState::Cancelled {
+                            // A cancelled promise is a caller decision, not a
+                            // kernel double settlement: the outcome is
+                            // discarded on purpose (round 5, N4).
                             kernel.metrics.promises_double_settled =
                                 kernel.metrics.promises_double_settled.saturating_add(1);
                         }
@@ -3991,7 +4049,7 @@ impl Agent {
                     if let Some(record) = kernel.promises.get_mut(&job.promise) {
                         if record.reject(error.clone()).is_ok() {
                             settled_now = true;
-                        } else {
+                        } else if record.state != crate::promise::PromiseState::Cancelled {
                             kernel.metrics.promises_double_settled =
                                 kernel.metrics.promises_double_settled.saturating_add(1);
                         }

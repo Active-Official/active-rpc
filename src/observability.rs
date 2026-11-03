@@ -46,6 +46,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "promise.rejected",
     "channel.send",
     "channel.recv",
+    "channel.destroyed",
     "budget.exhausted",
     "receipts.dropped",
     "provider.panicked",
@@ -256,6 +257,11 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.event = "channel.send";
             trace.channel = Some(channel.0);
             trace.sequence_on_channel = Some(*sequence);
+        }
+        Event::ChannelDestroyed { channel, dropped } => {
+            trace.event = "channel.destroyed";
+            trace.channel = Some(channel.0);
+            trace.detail = Some(dropped.to_string());
         }
         Event::ChannelRecv { channel, sequence } => {
             trace.event = "channel.recv";

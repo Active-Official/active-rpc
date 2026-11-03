@@ -69,6 +69,7 @@ authority.
 | `promise.resolved` | `promise` | a promise settled with a value |
 | `promise.rejected` | `promise`, `code` | a promise settled with an error |
 | `channel.send` | `channel`, `channel_sequence` | a message was sent |
+| `channel.destroyed` | `channel`, `detail` | a channel was destroyed; `detail` is the number of messages dropped with it |
 | `channel.recv` | `channel`, `channel_sequence` | a message was received |
 | `budget.exhausted` | `cap`, `dimension` | a budget ceiling refused work |
 | `receipts.dropped` | `detail` | the receipt ring dropped records; `detail` carries the running total (evicted or cleared) |

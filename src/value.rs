@@ -89,13 +89,21 @@ impl Value {
     }
 
     /// True when this value or any descendant is a secret marker.
+    ///
+    /// Iterative like [`Value::shape`]: a caller can build a value deeper than
+    /// the Rust stack, and a public predicate over it must not be the thing that
+    /// overflows.
     pub fn is_tainted(&self) -> bool {
-        match self {
-            Value::Secret => true,
-            Value::List(items) => items.iter().any(Value::is_tainted),
-            Value::Map(entries) => entries.values().any(Value::is_tainted),
-            _ => false,
+        let mut stack = vec![self];
+        while let Some(value) = stack.pop() {
+            match value {
+                Value::Secret => return true,
+                Value::List(items) => stack.extend(items.iter()),
+                Value::Map(entries) => stack.extend(entries.values()),
+                _ => {}
+            }
         }
+        false
     }
 
     /// The first shape ceiling `budget` sets that this value exceeds, if any.
@@ -214,7 +222,15 @@ impl Value {
                 Work::Fold(constant) => {
                     let inner = open.pop().unwrap_or(0).saturating_add(constant);
                     match open.last_mut() {
-                        Some(top) => *top = top.saturating_add(inner),
+                        Some(top) => {
+                            *top = top.saturating_add(inner);
+                            // A completed child is part of its parent's size:
+                            // without this check a list of small lists is only
+                            // refused at the root, after every one was built.
+                            if *top > budget.max_value_size {
+                                return Some("value_size");
+                            }
+                        }
                         None => {
                             total = total.saturating_add(inner);
                             if total > budget.max_value_size {

@@ -97,7 +97,8 @@ pub struct Message {
 pub struct ChannelStats {
     /// Kernel-assigned identifier.
     pub id: ChannelId,
-    /// The name a peer subscribes by.
+    /// Operator-facing name. A channel is addressed by its id; names are not
+    /// unique and nothing looks a channel up by name.
     pub name: String,
     /// Which ways messages may flow.
     pub direction: Direction,
@@ -120,7 +121,8 @@ pub struct ChannelStats {
 pub struct Channel {
     /// Kernel-assigned identifier.
     pub id: ChannelId,
-    /// The name a peer subscribes by.
+    /// Operator-facing name. A channel is addressed by its id; names are not
+    /// unique and nothing looks a channel up by name.
     pub name: String,
     /// Which ways messages may flow.
     pub direction: Direction,
@@ -197,6 +199,20 @@ impl Channel {
         // kernel send has no use for it. At the frame ceiling that copy is
         // 64 MiB per send.
         self.enqueue(from, None, payload, caps, bytes)
+    }
+
+    /// Queue a message on a topic and return only its sequence.
+    ///
+    /// Like [`Channel::send_sequence`]: the queued message is the only copy.
+    pub fn send_topic_sequence(
+        &mut self,
+        from: LaneId,
+        topic: &str,
+        payload: Value,
+        caps: Vec<CapId>,
+    ) -> Result<u64> {
+        let bytes = queued_size(&payload, &caps, Some(topic));
+        self.enqueue(from, Some(topic), payload, caps, bytes)
     }
 
     /// Whether the channel could hold `bytes` more.

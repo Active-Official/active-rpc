@@ -89,6 +89,7 @@ that would violate one stops and needs an ADR.
 | A tool's output streams are mislabelled | each reader thread tags its stream, so `stdout` and `stderr` cannot swap when both pipes fill | `LocalProcess::invoke` |
 | A narrow lane sweeps the registry in one message | one message carries at most `MAX_CAPS_PER_MESSAGE = 1 024` handles; the ceiling is fixed, independent of a lane's budget, and duplicates are refused before any record is looked up | `Kernel::send`, `kernel::MAX_CAPS_PER_MESSAGE` |
 | A provider-local object number reads as authority | `object` is chosen by the provider that also serves it, and a capability names exactly one provider, so an object number means nothing across providers | `CapRecord`, `Provider::invoke` |
+| A holder of the Agent reads any channel | a receive must come from a subscribed lane (`rpc/unknown-channel` otherwise, the same answer as a missing id), but a subscription is kernel-local state, not authority: a holder of the `Agent` is trusted code that already mints capabilities, and untrusted code never holds one | `Kernel::recv`, ADR-0024 |
 | One lane fills the shared channel queue | `MAX_QUEUED_CHANNEL_BYTES` (256 MiB) is a kernel-wide ceiling across all channels, so a sender with a live channel can backpressure unrelated lanes until a receiver drains. It is fail-closed, and per-lane attribution is not meaningful while any subscribed lane may receive the message: the bytes belong to the channel, not the sender | `Kernel::send`, `kernel::MAX_QUEUED_CHANNEL_BYTES` |
 
 ## 4. Non-goals

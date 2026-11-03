@@ -18,8 +18,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-02 | kernel dispatch | `src/kernel.rs` | CLEAN (rounds 1-3) | 24 fixed / 2 rejected / 2 low open (contract) | this commit |
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
-| R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
-| R-06 | budget | `src/budget.rs` | rounds 1-4 (round 3 and 4 were confirmation passes) | 26 fixed / 0 rejected / 0 open (3 accepted designs documented) | this commit |
+| R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-2) | 16 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
+| R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-5; rounds 3-5 were confirmation passes) | 30 fixed / 0 rejected / 0 open (3 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-6: 12 + 8 + 9 + 8 + 1 + 4 findings | 42 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
@@ -976,6 +976,45 @@ message for a return value the kernel discards, so every send copied the payload
 fails against the old code.
 
 Gate: `cargo test --all-features` 733 passed, 0 failed; clippy and fmt clean.
+### R-06 budgets - 2026-11-02 (round 5)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `c62916e`. It confirmed F2-F6
+and found F1 partial plus three new defects; the runtime `Value` walk had one
+more unbounded case.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N1 | medium | a child folded into its parent without a ceiling check, so a list of a hundred thousand small lists was refused only at the root | **fixed**: the parent accumulator is compared on every fold; `a_list_of_small_lists_is_refused_by_the_parent_ceiling` |
+| N2 | high | the queue path measured the arguments with `wire_size()` (a full walk) and walked the path scope before the shape gate, so a hostile value cost its real size at the boundary the gate exists for | **fixed**: the shape gate runs before the path walk, the tool ceiling and the byte measurement; `a_hostile_value_is_refused_before_the_kernel_measures_it` (the refusal now also drops the value, which is linear, so the test holds 3× headroom against a walk that costs far more per element) |
+| N3 | medium | the idempotency fingerprint hashed the whole value before any shape check | **fixed**: the keyed path shape-checks against the capability's budget before hashing; `an_idempotent_call_refuses_a_hostile_value_before_hashing_it` |
+| N4 | low | cancelling a promise whose job was already running counted as a kernel double settlement, because phase 3 tried to settle a cancelled record | **fixed**: phase 3 recognises the cancelled state and does not count it; `cancelling_a_running_call_is_not_a_double_settlement` |
+
+Also fixed while in the file: `Value::is_tainted` was a public recursive walk
+with no depth bound, so a caller could overflow the stack through a predicate
+that only reads. It is iterative now, like `shape`.
+
+Gate: `cargo test --all-features` 742 passed, 0 failed; clippy and fmt clean;
+`negative_controls.py --check` 9/9 (two anchors retargeted after the meter and
+dispatch refactors).
+
+### R-05 lanes / channels - 2026-11-02 (round 2, confirmation)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `c62916e`. It verified all
+round-1 work (the 11 lane tests and the allocator test) and found six new
+defects; the carried item now has an ADR.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `publish` still went through `Channel::send_topic`, which clones the message for a return value the kernel discards: up to 64 MiB copied per publish | **fixed**: `Channel::send_topic_sequence` stores the only copy; `a_publish_does_not_copy_the_payload` (counting allocator) |
+| 2 | low | `destroy_lane` swept the dependencies of every job on the lane, including the running one kept by the round-4 fix, and the dispatch released them again at settlement: `saturating_sub` hid it while the dependency's waiter count dropped to zero under a running job (premature trim eligibility) | **fixed**: the sweep is gone; `fail_job` releases doomed jobs and a running job releases its own at settlement; `destroying_a_lane_does_not_release_a_running_jobs_dependency` (reads the waiter count from inside the provider; fails with the sweep restored) |
+| 3 | low | a lane name was checked for length only, while channel names and topics are validated text | **fixed**: `valid_text`; `lane_and_channel_names_are_validated_text` |
+| 4 | low | subscriptions only grew, so a lane at its ceiling could never subscribe again and read access could not be withdrawn | **fixed**: `Agent::unsubscribe`; `a_lane_can_release_a_subscription` |
+| 5 | low | `destroy_channel` dropped a backlog with no event | **fixed**: `channel.destroyed` with the dropped count, in the closed name set, the projection, the replay trace and the spec; `destroying_a_channel_reports_its_backlog` |
+| 6 | low | channel names are not unique and the docstrings said a peer subscribes by name | **fixed**: the docstrings say a channel is addressed by its id; names are operator labels |
+| 7 | carried | `recv` is ambient for a holder of the `Agent` | **ADR-0024**: a subscription is kernel-local state, not authority; the advisory gate stays, untrusted code never holds the `Agent`, and a capability-mediated receive is a future feature with its own ADR |
+
+Gate: `cargo test --all-features` 742 passed, 0 failed; clippy and fmt clean.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

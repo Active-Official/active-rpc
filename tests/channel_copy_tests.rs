@@ -9,9 +9,12 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use active_rpc::cap::CapAttrs;
 use active_rpc::channel::{Channel, ChannelId, Direction};
+use active_rpc::kernel::Provider;
 use active_rpc::lane::LaneId;
-use active_rpc::value::Value;
+use active_rpc::value::{Call, Response, Value};
+use active_rpc::{Agent, Budget};
 
 struct Counting;
 
@@ -62,6 +65,59 @@ fn a_kernel_send_does_not_copy_the_payload() {
     assert_eq!(
         channel.queued_bytes(),
         Channel::message_bytes(&channel.peek().expect("queued").payload, &[], None)
+    );
+}
+
+struct Sink;
+
+impl Provider for Sink {
+    fn name(&self) -> &'static str {
+        "sink"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["noop".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::text("ok")))
+    }
+}
+
+#[test]
+fn a_publish_does_not_copy_the_payload() {
+    // Round 2 (#1): `publish` still went through `send_topic`, which clones the
+    // message it queued. The kernel needs the sequence only.
+    let agent = Agent::with_secret([0x7e; 32]);
+    let provider = agent.register(Box::new(Sink));
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["noop"]).restrict_topics(&["t"]),
+        )
+        .expect("cap");
+    let lane = agent
+        .create_lane("publisher", Budget::default())
+        .expect("lane");
+    let channel = agent
+        .create_channel("publish", Direction::Both)
+        .expect("channel");
+    let payload = Value::Text("x".repeat(PAYLOAD));
+
+    let before = ALLOCATED.load(Ordering::SeqCst);
+    agent
+        .publish(lane, channel, &cap, "t", payload)
+        .expect("publish");
+    let during = ALLOCATED.load(Ordering::SeqCst).saturating_sub(before);
+
+    assert!(
+        during < PAYLOAD / 4,
+        "a publish allocated {during} bytes for a {PAYLOAD} byte payload"
     );
 }
 

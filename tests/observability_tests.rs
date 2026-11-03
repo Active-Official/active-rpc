@@ -91,6 +91,10 @@ fn every_event(cap: CapId) -> Vec<Event> {
             channel,
             sequence: 1,
         },
+        Event::ChannelDestroyed {
+            channel,
+            dropped: 2,
+        },
         Event::BudgetExhausted {
             cap: Some(cap),
             dimension: "call".to_string(),

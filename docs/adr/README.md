@@ -25,6 +25,7 @@
 | [0021](0021-durable-receipt-log.md) | Durable receipt log (`ARRL`) |
 | [0022](0022-clock-policy.md) | Clock policy: virtual default, wall clock on request |
 | [0023](0023-no-io-uring-backend.md) | No io_uring backend for TCP and QUIC I/O |
+| [0024](0024-subscriptions-are-not-authority.md) | Subscriptions are not authority |
 
 ## Reading order and supersessions
 
