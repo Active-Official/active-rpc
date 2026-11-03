@@ -188,7 +188,15 @@ impl ModuleProvider {
             // wrapper is a legitimate name the library resolver does not walk
             // (round 19, #2).
             .or_else(|| structural_resolve(module, &path))
-            .ok_or(Error::InvalidArgument("path does not resolve"))?;
+            // A scoped caller gets one answer for "not yours": the two codes
+            // enumerated which fields exist (round 21, #5).
+            .ok_or_else(|| {
+                if call.path_scope.is_some() {
+                    Error::PathNotGranted(path.clone())
+                } else {
+                    Error::InvalidArgument("path does not resolve")
+                }
+            })?;
         Ok((path, node))
     }
 
@@ -542,8 +550,20 @@ impl ModuleProvider {
                 // isolation is required. The cached hash no longer describes
                 // the module, so it is cleared.
                 check_wall_budget(started, call)?;
-                slot.module = patched;
-                slot.hash = None;
+                // Store the canonical form, as `install` does: a patch that
+                // replaces an ancestor orphans the old subtree, and an orphaned
+                // secret node made the module look secret forever while the
+                // canonical image was public (round 21, #3).
+                let canonical =
+                    encode(&patched).map_err(|error| Error::Payload(error.code().to_string()))?;
+                active_infinity::validate_canonical(&canonical, active_infinity::Limits::default())
+                    .map_err(|error| Error::Payload(error.code().to_string()))?;
+                slot.module = active_infinity::decode(&canonical)
+                    .map_err(|error| Error::Payload(error.code().to_string()))?;
+                slot.hash = Some(
+                    active_infinity::content_hash(&canonical)
+                        .map_err(|error| Error::Payload(error.code().to_string()))?,
+                );
                 Ok(Response::Module(bytes))
             }
             "dependents" => {
@@ -680,8 +700,15 @@ impl ModuleProvider {
                 check_node_budget(&slot.module, call)?;
                 let module = &slot.module;
                 let mut map = BTreeMap::new();
-                map.insert("nodes".to_string(), Value::Int(module.node_count() as i64));
-                map.insert("edges".to_string(), Value::Int(module.edges().len() as i64));
+                // A size is an oracle over the secret cone: a redacting caller
+                // learns whether a module holds one secret or many by counting
+                // nodes. A caller that may read the module already knows
+                // (round 21, #1).
+                let hides_size = call.redact;
+                if !hides_size {
+                    map.insert("nodes".to_string(), Value::Int(module.node_count() as i64));
+                    map.insert("edges".to_string(), Value::Int(module.edges().len() as i64));
+                }
                 // `security.md` promises a redacting capability learns that a
                 // cone is tainted, never how many secrets it holds.
                 if !call.redact {

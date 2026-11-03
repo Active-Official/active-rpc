@@ -597,12 +597,17 @@ impl ConnectClient {
         );
         let mut stream = TcpStream::connect(&self.address)
             .map_err(|error| Error::Transport(format!("connect: {error}")))?;
-        if let Some(deadline) = self.deadline {
-            stream
-                .set_read_timeout(Some(deadline))
-                .and_then(|()| stream.set_write_timeout(Some(deadline)))
-                .map_err(|error| Error::Transport(error.to_string()))?;
-        }
+        // A client with no explicit deadline still has one: a peer that drips a
+        // byte per timeout would hold it forever, and `read_head` was called
+        // with `None` (round 21, #2).
+        let wait = self.deadline.unwrap_or(CONNECTION_WAIT);
+        stream
+            .set_read_timeout(Some(wait))
+            .and_then(|()| stream.set_write_timeout(Some(wait)))
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        let deadline = std::time::Instant::now()
+            .checked_add(wait)
+            .unwrap_or_else(std::time::Instant::now);
         stream
             .write_all(head.as_bytes())
             .and_then(|_| stream.write_all(body))
@@ -613,7 +618,7 @@ impl ConnectClient {
         // never come (the client sends exactly `content-length`).
         let _ = stream.shutdown(std::net::Shutdown::Write);
         let mut reader = BufReader::new(stream);
-        let Some(head) = read_head(&mut reader, MAX_HEAD, None)? else {
+        let Some(head) = read_head(&mut reader, MAX_HEAD, Some(deadline))? else {
             return Err(Error::Transport(
                 "bridge closed without a response".to_string(),
             ));

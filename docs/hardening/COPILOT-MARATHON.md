@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-20: ... + 6 findings (rounds 18-20: no critical/high); one clean round closes it | 113 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-21: ... + 5 findings; one more clean round closes it | 118 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-12: ... + 13 findings (rounds 11-12: no critical/high); one clean round closes it | 101 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,27 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 21)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `f16fbe6`. One high, three
+mediums and one low.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a redacting `stats` answer still returned `nodes`/`edges`: a redacting caller could count the secret cone | **fixed**: a redacting answer omits the size; `a_redacting_stats_answer_hides_the_size` (a non-redacting caller still sees it, and knows the module anyway) |
+| 2 | high | the Connect client armed a socket timeout only when a deadline was given, and `read_head` got `None`: a compare-hold peer held it forever | **fixed**: a default `CONNECTION_WAIT` arms both timeouts and the head deadline |
+| 3 | medium | a patch stored its arena directly, so a replaced ancestor could orphan a secret node and the module looked secret forever | **fixed**: the patched module is canonicalized, validated and its hash re-seeded (`a_patch_that_orphans_a_secret_canonicalizes`) |
+| 4 | medium | metadata queries checked only the node count before a walk bounded by edges and array width | **accepted residual**: the walk is linear and the wall ceiling still refuses; an edge ceiling is tracked with the resource-bomb pass |
+| 5 | low | a scoped unresolvable path answered `rpc/invalid-argument` while an outside one answered `rpc/path-not-granted`: a field-existence oracle | **fixed**: a scoped caller gets one answer |
+
+Also: the stalled-head transport test now names a client deadline longer than the
+server's own window (the new default is shorter), and the MCP membership timing
+test uses a 1 s bound that still separates linear from quadratic on a loaded
+machine.
+
+Gate: 88 suites / 871 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9; hardening status clean.
 
 ### R-07 domain operations - 2026-11-03 (round 20)
 

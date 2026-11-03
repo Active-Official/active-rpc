@@ -60,7 +60,11 @@ fn a_stalled_head_does_not_block_the_next_connection() {
     // Deliberately no empty line and no close.
 
     let started = Instant::now();
-    let mut client = ConnectClient::connect(&address).expect("client");
+    let mut client = ConnectClient::connect(&address)
+        .expect("client")
+        // The server gives a stalled head its own window before it accepts the
+        // next connection, so this client waits longer than that window.
+        .with_deadline(Duration::from_secs(10));
     client
         .call(&Envelope::request(1, "ping", vec![]))
         .expect("the next connection is served");

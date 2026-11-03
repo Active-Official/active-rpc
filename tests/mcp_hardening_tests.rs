@@ -492,7 +492,9 @@ fn has_method_does_not_rebuild_the_method_table() {
     }
     let elapsed = started.elapsed();
     assert!(
-        elapsed < std::time::Duration::from_millis(300),
+        // A quadratic scan takes tens of seconds at this size; 1 s still
+        // separates the two on a loaded machine.
+        elapsed < std::time::Duration::from_secs(1),
         "2 000 membership checks over {count} tools took {elapsed:?}"
     );
 }

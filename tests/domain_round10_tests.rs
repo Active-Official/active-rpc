@@ -812,3 +812,64 @@ fn an_array_element_path_resolves() {
     let value = promise.value().expect("an array element is a name");
     assert_eq!(value, Value::text("second"));
 }
+
+/// A redacting stats answer hides the module's size (round 21, #1).
+#[test]
+fn a_redacting_stats_answer_hides_the_size() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let root = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module.clone(), &["stats"], None, true);
+    let promise = agent.call(lane, &cap, "stats", Vec::new()).expect("queued");
+    agent.run();
+    let value = promise.value().expect("stats");
+    let Value::Map(fields) = value else {
+        panic!("a map: {value:?}");
+    };
+    assert!(!fields.contains_key("nodes"), "{fields:?}");
+    assert!(!fields.contains_key("edges"), "{fields:?}");
+    assert!(!fields.contains_key("secrets"), "{fields:?}");
+}
+
+/// A patch that orphans a secret leaves a module that no longer holds one
+/// (round 21, #3).
+#[test]
+fn a_patch_that_orphans_a_secret_canonicalizes() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let subtree = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), subtree)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(
+        module,
+        &["patch", "provenance", "content_hash"],
+        None,
+        false,
+    );
+    let promise = agent
+        .call(lane, &cap, "patch", vec![path("app"), Arg::text("public")])
+        .expect("queued");
+    agent.run();
+    promise.value().expect("patch");
+
+    // The stored module is canonical: the orphaned secret is gone, so the raw
+    // hash is served again and the provenance is visible.
+    let promise = agent
+        .call(lane, &cap, "content_hash", Vec::new())
+        .expect("queued");
+    agent.run();
+    let hash = promise.value().expect("hash");
+    let Value::Text(hash) = hash else {
+        panic!("a hash: {hash:?}");
+    };
+    assert!(hash.starts_with("blake3:"), "{hash}");
+}

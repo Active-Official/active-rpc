@@ -211,10 +211,9 @@ fn patch_clears_the_cached_hash_and_advances_the_module() {
         stored.nodes().iter().any(|node| node.is_secret()),
         "the stored module keeps its secret"
     );
-    assert_eq!(
-        provider.cached_hash(object),
-        None,
-        "a patch invalidates the cached hash"
+    assert!(
+        provider.cached_hash(object).is_some(),
+        "a patch stores the new canonical hash, as `install` does"
     );
 
     let after = text(invoke(
