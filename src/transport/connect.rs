@@ -257,6 +257,7 @@ impl BridgeServer {
         let mut reader = BufReader::new(clone);
         if !arm_deadline(&stream, deadline) || !arm_deadline(reader.get_ref(), deadline) {
             let _ = write_http_response(&mut stream, 408, b"rpc/transport");
+            drain_before_close(&mut stream);
             return 0;
         }
         let head = match read_head(&mut reader, MAX_HEAD, Some(deadline)) {
@@ -285,6 +286,7 @@ impl BridgeServer {
         let target = parts.next().unwrap_or_default();
         if method != "POST" || target != PATH {
             let _ = write_http_response(&mut stream, 404, b"rpc/not-found");
+            drain_before_close(&mut stream);
             return 0;
         }
         // Content-Length must be unambiguous and Transfer-Encoding absent: a
@@ -309,12 +311,14 @@ impl BridgeServer {
                     || !trimmed.bytes().all(|byte| byte.is_ascii_digit())
                 {
                     let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                    drain_before_close(&mut stream);
                     return 0;
                 }
                 match trimmed.parse::<usize>() {
                     Ok(length) => lengths.push(length),
                     Err(_) => {
                         let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                        drain_before_close(&mut stream);
                         return 0;
                     }
                 }
@@ -322,6 +326,7 @@ impl BridgeServer {
         }
         if transfer_encoding || lengths.len() != 1 {
             let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            drain_before_close(&mut stream);
             return 0;
         }
         let content_length = lengths[0];
@@ -330,6 +335,7 @@ impl BridgeServer {
         let body_ceiling = MAX_BODY.min(self.limits.max_bytes);
         if content_length > body_ceiling {
             let _ = write_http_response(&mut stream, 413, b"rpc/wire");
+            drain_before_close(&mut stream);
             return 0;
         }
         let content_type = head
@@ -345,6 +351,7 @@ impl BridgeServer {
             .unwrap_or_default();
         if content_type != CONNECT_TYPE && content_type != GRPC_TYPE {
             let _ = write_http_response(&mut stream, 415, b"rpc/wire");
+            drain_before_close(&mut stream);
             return 0;
         }
         let mut body = Vec::with_capacity(content_length.min(64 * 1024));
@@ -355,23 +362,27 @@ impl BridgeServer {
             // buffer with the bytes that arrive means a header that announces
             // 64 MiB and sends ten bytes costs 64 KiB, not 64 MiB.
             let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            drain_before_close(&mut stream);
             return 0;
         }
         let (message, rest) = match grpc_unframe(&body) {
             Ok(parts) => parts,
             Err(error) => {
                 let _ = write_http_response(&mut stream, 400, error.code().as_bytes());
+                drain_before_close(&mut stream);
                 return 0;
             }
         };
         if !rest.is_empty() {
             let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            drain_before_close(&mut stream);
             return 0;
         }
         let envelope = match Envelope::decode_with(message, self.limits) {
             Ok(envelope) => envelope,
             Err(error) => {
                 let _ = write_http_response(&mut stream, 400, error.code().as_bytes());
+                drain_before_close(&mut stream);
                 return 0;
             }
         };
@@ -380,6 +391,7 @@ impl BridgeServer {
         // be able to smuggle one in.
         if envelope.kind != crate::wire::Kind::Request {
             let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            drain_before_close(&mut stream);
             return 0;
         }
         // A provider panic on hostile input must not take the bridge down: the
@@ -399,6 +411,7 @@ impl BridgeServer {
             Ok(bytes) => bytes,
             Err(error) => {
                 let _ = write_http_response(&mut stream, 500, error.code().as_bytes());
+                drain_before_close(&mut stream);
                 return 0;
             }
         };
@@ -468,6 +481,24 @@ fn read_head(
         head.push(String::from_utf8_lossy(body).into_owned());
     }
     Ok(Some(head))
+}
+
+/// Drain a peer that is still sending before the socket closes.
+///
+/// Closing a socket with unread data in its receive buffer makes the stack send
+/// a reset, which discards the response just written: the client sees a
+/// connection reset instead of the 400 (observed as a suite flake on Windows).
+fn drain_before_close(stream: &mut TcpStream) {
+    use std::io::Read;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+    let mut sink = [0u8; 4096];
+    for _ in 0..16 {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 fn write_http_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Result<()> {
@@ -570,6 +601,10 @@ impl ConnectClient {
             .and_then(|_| stream.write_all(body))
             .and_then(|_| stream.flush())
             .map_err(|error| Error::Transport(error.to_string()))?;
+        // Half-close: a body that stops short of its declared frame lets the
+        // server see EOF and answer instead of waiting for bytes that will
+        // never come (the client sends exactly `content-length`).
+        let _ = stream.shutdown(std::net::Shutdown::Write);
         let mut reader = BufReader::new(stream);
         let Some(head) = read_head(&mut reader, MAX_HEAD, None)? else {
             return Err(Error::Transport(

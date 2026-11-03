@@ -249,7 +249,13 @@ impl ModuleProvider {
                             "depth"
                         } else if kind.starts_with("wall") {
                             "wall"
+                        } else if kind.starts_with("array") {
+                            "array_len"
+                        } else if kind.starts_with("key") {
+                            "keys"
                         } else {
+                            // The provider's own vocabulary is closed; an
+                            // unknown dimension is the value budget.
                             "value"
                         };
                         Error::BudgetExceeded(kind)
@@ -1224,7 +1230,7 @@ fn structural_resolve(module: &InfinityModule, path: &str) -> Option<NodeId> {
             }
         }
         current = match module.get(node)? {
-            Inode::Table { fields } => fields
+            Inode::Table { fields } | Inode::SchemaTable { fields, .. } => fields
                 .iter()
                 .find(|(name, _)| name == segment)
                 .map(|(_, id)| *id)?,

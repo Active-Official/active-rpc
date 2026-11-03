@@ -696,3 +696,59 @@ fn a_displayed_path_cannot_forge_a_log_line() {
         assert!(!text.contains(hostile), "raw {hostile:?} in {text:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 18
+// ---------------------------------------------------------------------------
+
+/// The evaluator's ceiling names survive the mapping (round 18, #6).
+#[test]
+fn evaluator_limit_dimensions_are_preserved() {
+    let mut module = InfinityModule::new();
+    let mut current = module.push(Inode::Int(1));
+    for index in 0..40 {
+        current = module.push(Inode::Table {
+            fields: vec![(format!("f{index}"), current)],
+        });
+    }
+    module.set_root(Some(current));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let mut call = Call::new("evaluate", Vec::new());
+    call.budget = Budget {
+        max_nodes: 4,
+        ..Budget::default()
+    };
+    let error = active_rpc::kernel::Provider::invoke(&mut provider, object, &call)
+        .expect_err("the node budget is tiny");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert!(
+        error.to_string().contains("nodes"),
+        "the dimension is named: {error}"
+    );
+}
+
+/// The synthetic level of a duration counts against the wire ceiling
+/// (round 18, #7).
+#[test]
+fn the_synthetic_level_counts_against_the_ceiling() {
+    let mut module = InfinityModule::new();
+    let mut current = module.push(Inode::DurationMs(7));
+    for index in 0..63 {
+        current = module.push(Inode::Table {
+            fields: vec![(format!("f{index}"), current)],
+        });
+    }
+    module.set_root(Some(current));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], None, false);
+    let promise = agent
+        .call(lane, &cap, "evaluate", Vec::new())
+        .expect("queued");
+    agent.run();
+    let error = promise
+        .value()
+        .expect_err("the converted value is too deep");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}

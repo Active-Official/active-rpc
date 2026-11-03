@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-17: ... + 6 findings; round-17 fixes green, confirmation round pending | 102 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-18: ... + 5 findings (round 18: no critical/high/medium); one more clean round closes it | 107 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-10: ... + 10 findings; round-10 fixes green, confirmation round pending | 77 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,29 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 18)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `78c6396`. All five round-17
+fixes verified; five lows, **no critical/high/medium**.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | no test pinned the evaluator ceiling dimensions | **fixed**: `evaluator_limit_dimensions_are_preserved` (a tiny node budget answers `rpc/budget-exceeded` naming `nodes`) |
+| 2 | low | no boundary test for the synthetic level of a duration | **fixed**: `the_synthetic_level_counts_against_the_ceiling` (63 tables + a terminal duration is refused) |
+| 3 | low | `structural_resolve` handled a table and an array but not a `SchemaTable`, so a scoped schema field was refused | **fixed**: the same field walk applies |
+| 4 | low | the depth probe mixed `+ 1` with `saturating_add` | **fixed**: saturating throughout |
+| 5 | low | array and key ceilings collapsed to `"value"` while the kernel names `array_len` | **fixed**: `array*`/`key*` map to their own dimension |
+
+Also fixed this round, out of scope: the Connect bridge's refusal paths closed
+the socket with unread data in the receive buffer, which the stack answers with
+a reset that discards the 400 just written. Two integration tests flaked with
+`WSAECONNRESET` under load (1 in 5 suite runs). The server now half-closes and
+drains before closing, and the raw test client half-closes after its body:
+**6 of 6 full-suite runs clean** afterwards.
+
+Gate: 88 suites / 863 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9; hardening status clean.
 
 ### R-07 domain operations - 2026-11-03 (round 17)
 

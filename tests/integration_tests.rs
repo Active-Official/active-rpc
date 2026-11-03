@@ -541,6 +541,9 @@ fn connect_bridge_survives_a_request_without_content_length() {
     let mut raw = std::net::TcpStream::connect(&address).expect("connect");
     raw.write_all(b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: x\r\ncontent-type: application/connect+active-infinity\r\n\r\n")
         .expect("write");
+    // Half-close: the server reads a body to EOF when no length is declared,
+    // and a client that keeps its write side open makes the refusal a race.
+    raw.shutdown(std::net::Shutdown::Write).expect("shutdown");
     let mut reply = Vec::new();
     use std::io::Read;
     raw.read_to_end(&mut reply).expect("read");

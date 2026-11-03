@@ -32,10 +32,14 @@ pub fn active_value_too_deep(value: &active_core::Value, limit: usize) -> bool {
         }
         match value {
             ActiveValue::Array(items) => {
-                work.extend(items.iter().map(|item| (item, depth + 1)));
+                work.extend(items.iter().map(|item| (item, depth.saturating_add(1))));
             }
             ActiveValue::Table(entries) => {
-                work.extend(entries.iter().map(|(_, item)| (item, depth + 1)));
+                work.extend(
+                    entries
+                        .iter()
+                        .map(|(_, item)| (item, depth.saturating_add(1))),
+                );
             }
             // These two convert into a synthetic map, one level deeper than
             // the Active node itself (round 17, F5).
