@@ -1405,16 +1405,15 @@ fn a_request_without_a_method_is_refused() {
 /// (round 11, #3).
 #[test]
 fn a_json_integer_past_i64_is_not_rounded() {
-    let value = active_rpc::tool::json_to_value(&serde_json::json!({
-        "id": 18_446_744_073_709_551_615u64
-    }));
-    let active_rpc::Value::Map(fields) = value else {
-        panic!("a map: {value:?}");
-    };
+    let json = serde_json::json!({ "id": 18_446_744_073_709_551_615u64 });
     assert!(
-        !matches!(fields.get("id"), Some(active_rpc::Value::Float(_))),
-        "a rounded integer: {fields:?}"
+        active_rpc::tool::json_has_unrepresentable_number(&json),
+        "the adapter must refuse the answer"
     );
+    // Both signs: a negative value past `i64::MIN` has no form either.
+    let json: serde_json::Value =
+        serde_json::from_str(r#"{"debit": -9223372036854775809}"#).expect("parse");
+    assert!(active_rpc::tool::json_has_unrepresentable_number(&json));
 }
 
 /// A scoped wasm capability is refused (round 11, #13).

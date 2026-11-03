@@ -28,6 +28,29 @@ use crate::kernel::Provider;
 use crate::value::Response;
 use crate::value::{Arg, Call, Value};
 
+/// Whether a JSON tree holds a number neither `i64` nor `u64` can represent.
+///
+/// Such a number has no `Value` form; substituting `null` or a rounded float
+/// changes the meaning of a peer answer (round 12, F-1).
+pub fn json_has_unrepresentable_number(value: &Json) -> bool {
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Json::Number(number) => {
+                // `Value` has an `i64` only: a u64 past it and a negative past
+                // `i64::MIN` are both unrepresentable.
+                if number.as_i64().is_none() {
+                    return true;
+                }
+            }
+            Json::Array(items) => stack.extend(items.iter()),
+            Json::Object(map) => stack.extend(map.values()),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Convert JSON into an RPC value.
 pub fn json_to_value(value: &Json) -> Value {
     match value {
@@ -162,6 +185,9 @@ pub trait McpTransport {
         self.recv_line()
     }
 }
+
+/// Largest child output this adapter will buffer.
+const MAX_OUTPUT_BYTES: usize = 16 << 20;
 
 /// Largest HTTP response body this adapter will buffer.
 ///
@@ -1161,6 +1187,11 @@ impl<T: McpTransport> Provider for McpSession<T> {
             });
         }
         let result = response.get("result").cloned().unwrap_or(Json::Null);
+        if json_has_unrepresentable_number(&result) {
+            return Err(Error::Provider {
+                code: "mcp/bad-number".to_string(),
+            });
+        }
         Ok(Response::Value(json_to_value(&result)))
     }
 }
@@ -1316,6 +1347,9 @@ impl HttpTool {
         let status: u16 = status_line
             .split_whitespace()
             .nth(1)
+            // Exactly three digits: `+200` and `000200` are not statuses
+            // (round 12, F-8).
+            .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
             .and_then(|code| code.parse().ok())
             .ok_or(Error::Provider {
                 code: "http/status".to_string(),
@@ -1423,7 +1457,11 @@ impl HttpTool {
                 // sane ceiling would turn it into an allocation abort
                 // (round 11, #14).
                 if length > MAX_RESPONSE_BYTES || length > self.max_body {
-                    return Err(Error::ToolPolicy("response too large"));
+                    // The same code as the read-to-end arm: a peer must not
+                    // choose the code by choosing a framing (round 12, F-5).
+                    return Err(Error::Provider {
+                        code: "http/body-too-large".to_string(),
+                    });
                 }
                 reader.body_exact(length)?
             }
@@ -1638,15 +1676,28 @@ impl Provider for HttpTool {
         };
         let (status, response) =
             self.perform(&method, &path, body.as_deref(), call.budget.max_wall_ms)?;
-        if status >= 400 {
+        if !(200..300).contains(&status) {
+            // A 3xx is not a completed call: the adapter does not follow
+            // redirects, so a caller that saw `Ok` would believe a mutating
+            // request ran (round 12, F-7).
             return Err(Error::Provider {
                 code: format!("http/{status}"),
             });
         }
-        let text = String::from_utf8_lossy(&response).to_string();
-        let value = serde_json::from_str::<Json>(&text)
-            .map(|json| json_to_value(&json))
-            .unwrap_or(Value::Text(text));
+        // A binary answer is not text: transcoding it inserts replacement
+        // characters the peer never wrote (round 12, F-6).
+        let Ok(text) = String::from_utf8(response.clone()) else {
+            return Ok(Response::Value(Value::Module(response)));
+        };
+        let value = match serde_json::from_str::<Json>(&text) {
+            Ok(json) if json_has_unrepresentable_number(&json) => {
+                return Err(Error::Provider {
+                    code: "http/bad-number".to_string(),
+                })
+            }
+            Ok(json) => json_to_value(&json),
+            Err(_) => Value::Text(text),
+        };
         Ok(Response::Value(value))
     }
 }
@@ -2000,7 +2051,10 @@ impl Provider for LocalProcess {
         // descendant that inherited the pipe keeps it open after the child
         // exits, and joining a thread that is blocked in `read_to_end` would
         // exceed the wall ceiling without any way to interrupt it.
-        let ceiling = (self.max_output as u64).saturating_add(1);
+        // A caller-set ceiling feeds the reader's allocation, so it is clamped
+        // at use (round 12, F-2).
+        let max_output = self.max_output.min(MAX_OUTPUT_BYTES);
+        let ceiling = (max_output as u64).saturating_add(1);
         // `(stream, bytes)`: 1 is stdout and 2 is stderr. Two threads sharing
         // one channel report in completion order, and a child that writes both
         // pipes quickly would otherwise have its streams swapped.
@@ -2075,7 +2129,7 @@ impl Provider for LocalProcess {
                         } else {
                             stderr = buffer;
                         }
-                        if stdout.len() > self.max_output || stderr.len() > self.max_output {
+                        if stdout.len() > max_output || stderr.len() > max_output {
                             kill_process_tree(&mut child);
                             return Err(Error::ToolPolicy("output too large"));
                         }
@@ -2117,7 +2171,7 @@ impl Provider for LocalProcess {
                     // A descendant that outlives the leader can flood after it
                     // exits; refuse at the same ceiling instead of waiting out
                     // the grant (round 11, #2).
-                    if stdout.len() > self.max_output || stderr.len() > self.max_output {
+                    if stdout.len() > max_output || stderr.len() > max_output {
                         kill_process_tree(&mut child);
                         return Err(Error::ToolPolicy("output too large"));
                     }
@@ -2128,7 +2182,7 @@ impl Provider for LocalProcess {
                 }
             }
         }
-        if stdout.len() > self.max_output || stderr.len() > self.max_output {
+        if stdout.len() > max_output || stderr.len() > max_output {
             return Err(Error::ToolPolicy("output too large"));
         }
         let mut map = BTreeMap::new();

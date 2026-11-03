@@ -496,7 +496,9 @@ fn drain_before_close(stream: &mut TcpStream) {
     // Bounded by time, not by iterations: a 1 MiB body arriving in 4 KiB
     // segments is 256 reads, and stopping at 16 let the close reset it and
     // discard the refusal (round 19, #4).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    // Within the documented connection budget (2 s): the head already used
+    // part of it, so the drain adds at most 100 ms (round 20, #5).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
     let mut sink = [0u8; 16 * 1024];
     while std::time::Instant::now() < deadline {
         match stream.read(&mut sink) {
@@ -632,7 +634,7 @@ impl ConnectClient {
                 }
             })
             .ok_or(Error::Wire("missing response length"))?;
-        if length > MAX_BODY {
+        if length > MAX_BODY.min(self.limits.max_bytes) {
             return Err(Error::Wire("response exceeds the ceiling"));
         }
         // Grow with the bytes that actually arrive: a hostile server that

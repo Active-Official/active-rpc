@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-18: ... + 5 findings (round 18: no critical/high/medium); one more clean round closes it | 107 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-11: ... + 14 findings (round 11: no critical/high); one more clean round closes it | 89 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-20: ... + 6 findings (rounds 18-20: no critical/high); one clean round closes it | 113 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-12: ... + 13 findings (rounds 11-12: no critical/high); one clean round closes it | 101 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,46 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 20)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `4f96b57`. Six findings; the
+dimension claim was a false positive (the test now asserts the string), the rest
+are closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the evaluator dimension was claimed lost | **false positive**: `active/X004-array-length` contains `array`; the test now asserts `array_len` in `Display` |
+| 2 | medium | `SchemaArray` joined `structural_resolve` but not `in_scope_node` | **fixed**: the subtree walk follows it |
+| 3 | low | `immutable_target` used the library resolver only | **fixed**: it falls back to the structural walk |
+| 4 | medium | the Connect client ignored its own `limits.max_bytes` when sizing a response | **fixed**: `min(MAX_BODY, limits.max_bytes)` |
+| 5 | low | the drain could add 500 ms past the connection budget | **fixed**: 100 ms, inside the documented 2 s |
+| 6 | low | a `SchemaArray` element accepted any segment, and the public helpers disagreed with the capability resolver | **fixed**: only index `0`; the helpers fall back to the structural walk |
+
+Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 12)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `4f96b57`.
+One medium and twelve lows; no authority escalation.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a JSON number past `i64` on either sign was substituted (`null` or a rounded float) | **fixed**: `json_has_unrepresentable_number` refuses it in both adapters (`http/bad-number`, `mcp/bad-number`); both signs are tested |
+| 2 | low | `max_output` was unclamped at the reader | **fixed**: clamped to 16 MiB at use |
+| 3 | low | `wire.md` still said the deadline covers resolution | **fixed** |
+| 4 | low | the `rpc/budget-exceeded` row named the output ceiling, which answers `rpc/tool-policy` | **fixed** |
+| 5 | low | the two body ceilings answered different codes | **fixed**: `http/body-too-large` for both framings |
+| 6 | low | a binary body was transcoded with replacement characters | **fixed**: a non-UTF-8 HTTP body is a module payload |
+| 7 | low | 3xx was reported as a successful call | **fixed**: only 2xx succeeds |
+| 8 | low | the status accepted `+200`/`000200` | **fixed**: exactly three digits |
+| 9 | low | `value_to_json` recurses under an iterative guard | **recorded**: the kernel gates a dispatched call; the adapters refuse a module/non-finite shape first |
+| 10 | low | the `from_bytes` doc claimed WAT support | **fixed** (doc) |
+| 11 | low | the workdir is absolute-checked, not canonicalised | **fixed** in the spec text |
+| 12 | low | `security.md` overstated the tool-policy gating | **fixed**: `allow_process` gates `LocalProcess`; HTTP and MCP do not need it |
+
+Gate: as above (the same commit).
 
 ### R-07 domain operations - 2026-11-03 (round 19)
 

@@ -781,6 +781,10 @@ fn an_evaluator_array_ceiling_is_a_budget_refusal() {
     let error = active_rpc::kernel::Provider::invoke(&mut provider, object, &call)
         .expect_err("the array ceiling trips");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert!(
+        error.to_string().contains("array_len"),
+        "the dimension is named: {error}"
+    );
 }
 
 /// A dotted path into an array resolves for a scoped capability (round 19, #2).

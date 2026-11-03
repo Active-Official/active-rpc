@@ -248,7 +248,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/interim` | a 1xx interim response arrived; the adapter does not follow it |
 | `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared |
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
-| `http/body-too-large` | the response body exceeded `max_body` |
+| `http/body-too-large` | the response body exceeded `max_body`, by its declared length or by its stream |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
@@ -273,7 +273,7 @@ interpolated into the request line.
 | `process/wait:<err>` | waiting for the child failed |
 | `process/cwd` | the working directory could not be pinned at construction |
 | `process/thread:<err>` | a pipe reader thread could not start; the child is killed |
-| `rpc/budget-exceeded` | the wall grant is zero, or the output ceiling was passed |
+| `rpc/budget-exceeded` | the wall grant is zero |
 | `rpc/timeout` | the call exceeded the effective wall ceiling; the whole process group was killed |
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
 | `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, the output exceeded `max_output`, or process execution was not granted |

@@ -984,7 +984,9 @@ fn immutable_target(module: &InfinityModule, path: &str) -> bool {
             prefix.push('.');
         }
         prefix.push_str(segment);
-        if let Some(id) = active_infinity::interop::resolve_path(module, &prefix) {
+        if let Some(id) = active_infinity::interop::resolve_path(module, &prefix)
+            .or_else(|| structural_resolve(module, &prefix))
+        {
             if immutable.contains(&id) {
                 return true;
             }
@@ -1198,6 +1200,7 @@ fn in_scope_node(module: &InfinityModule, id: NodeId, scope: &str) -> bool {
                 stack.extend(fields.iter().map(|(_, child)| *child));
             }
             Some(Inode::Array { elements }) => stack.extend(elements.iter().copied()),
+            Some(Inode::SchemaArray { element }) => stack.push(*element),
             Some(Inode::Semantic { inner, .. }) => stack.push(*inner),
             _ => {}
         }
@@ -1269,7 +1272,13 @@ fn structural_resolve(module: &InfinityModule, path: &str) -> Option<NodeId> {
                 let index: usize = segment.parse().ok()?;
                 *elements.get(index)?
             }
-            Inode::SchemaArray { element } => *element,
+            Inode::SchemaArray { element } => {
+                // The only name a schema array element has is index 0.
+                if segment != "0" {
+                    return None;
+                }
+                *element
+            }
             _ => return None,
         };
     }
@@ -1834,6 +1843,7 @@ pub fn module_from_source(source: &str, name: &str) -> Result<InfinityModule> {
 /// Resolve a dotted path in a module (test and example helper).
 pub fn resolve_path(module: &InfinityModule, path: &str) -> Option<NodeId> {
     active_infinity::interop::resolve_path(module, path)
+        .or_else(|| structural_resolve(module, path))
 }
 
 /// Node ids in a module's dependency cone, for tests.
