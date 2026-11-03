@@ -14,8 +14,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 
 | ID | Section | Paths | State | Findings (fixed / rejected / open) | Commits |
 |----|---------|-------|-------|------------------------------------|---------|
-| R-01 | wire ARP1 | `src/wire.rs` | CLEAN | 6 fixed, 2 rejected, 0 open | this commit |
-| R-02 | kernel dispatch | `src/kernel.rs` | CLEAN (rounds 1-3) | 24 fixed / 2 rejected / 2 low open (contract) | this commit |
+| R-01 | wire ARP1 | `src/wire.rs` | `CLEAN` (rounds 1-5; rounds 4 and 5 clean) | 20 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-02 | kernel dispatch | `src/kernel.rs` | `CLEAN` (rounds 1-10; rounds 9 and 10 clean) | 40 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
@@ -1445,6 +1445,34 @@ running-cancel seals a receipt but no `call.refused` (the provider already ran),
 and a stuck pipeline reports the cycle before the authority refusal.
 
 Gate: 790 tests all-features, 0 failed; clippy/fmt/doc clean.
+
+### R-02 kernel dispatch - 2026-11-02 (round 10, second clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `7258f47`. **CLEAN** again,
+so R-02 closes per the loop's rule. It verified the settled-job skip, the
+revoke/expiry/binding/lane re-checks, the gate and effective budget plus
+`charge_dispatch_delta`/`charge_egress` before settlement, the secret
+redact/assert, one receipt with `calls_refused`/`call.refused`, no double
+settlement on the cancel/resolve race, and the panic guards; the 11 dispatch
+tests and the full suite pass.
+
+Residuals, no action: `order_candidates` is quadratic for a 100 000-job batch
+(bounded by the job ceiling and a pathological shape); `fail_job` and a dispatch
+provider refusal count differently by design (one never ran, the other did);
+`Arg::Cap` is a bearer transfer by ADR-0004.
+
+### R-01 wire ARP1 - 2026-11-02 (round 5, second clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `7258f47`. **CLEAN** again,
+so R-01 closes. It probed `wire.rs`, `value.rs`, the round-2 tests and the wire
+spec: fail-closed decode with the `rpc/wire` / `rpc/capability-table` split,
+canonical map and method order, the arena and depth ceilings, bit-exact floats,
+and no secret bytes on the wire.
+
+Residuals, no action: the `as u32` length casts are unreachable without an OOM
+first; `with_capacity` is bounded by the receiver's limits; a duplicate added
+descriptor is refused by `apply_to` rather than decode (same class); `Value::Path`
+and `Module` are bounded by the envelope and the dispatch budget.
 
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
