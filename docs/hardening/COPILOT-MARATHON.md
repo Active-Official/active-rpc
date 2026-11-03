@@ -18,8 +18,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-02 | kernel dispatch | `src/kernel.rs` | CLEAN (rounds 1-3) | 24 fixed / 2 rejected / 2 low open (contract) | this commit |
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
-| R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-2) | 16 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
-| R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-5; rounds 3-5 were confirmation passes) | 30 fixed / 0 rejected / 0 open (3 accepted designs documented) | this commit |
+| R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
+| R-06 | budget | `src/budget.rs` | rounds 1-9 (round 9 found two highs) | 44 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-6: 12 + 8 + 9 + 8 + 1 + 4 findings | 42 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
@@ -1121,6 +1121,30 @@ entry-point refusals with pre-dispatch drops visible in receipts, and the topic
 message exists as two literals (kernel and channel).
 
 Gate: 760 tests all-features, 0 failed; clippy/fmt/doc clean.
+
+### R-06 budgets - 2026-11-02 (round 9)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `15ff0f9`. It verified all
+seven round-8 claims and found two highs in the two paths the round had just
+touched.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | the queued-argument gate is budget-relative, so a lane whose budget allows a deep value still reached the substitution loop, where the recursive `Value::clone` aborts the process | **fixed**: the absolute wire depth ceiling (`MAX_VALUE_DEPTH`) binds the queued path too; `a_deep_queued_value_is_refused_before_the_dispatch_clone` |
+| F2 | high | `resolve` took no peer and never checked `bound_to`, so an out-of-band answer settled a call dispatch would have refused for the wrong identity | **fixed**: `Agent::resolve_as(peer, …)` presents the verified identity and compares the binding; `resolve` presents none and refuses a bound call with `rpc/identity`; `a_bound_capability_needs_its_peer_to_resolve` |
+| F3 | medium | `resolve` compared an expiry against a clock it never refreshed in wall-clock mode | **fixed**: `refresh_clock` at entry; `a_wall_clock_expiry_binds_an_out_of_band_resolve` |
+| F4 | medium | `call_idempotent_as_with_body` charged for the body but delivered an empty payload to the provider on the miss path | **fixed**: the miss call carries the bytes (`call_with_origin_payload`); `an_idempotent_body_reaches_the_provider` |
+| F5 | low | the queue byte sums still saturated (a `u64::MAX` ceiling would pass exactly at `MAX`) | **fixed**: `checked_add` for the argument fold, `args + payload` and the publish `payload + topic` |
+| F6 | low | the spec's `dimension` list omitted `args` although the kernel emits it | **fixed**: the table names it |
+
+The control-plane crate also had to follow the round-4 `LaneDestroyed { lane,
+jobs }` shape change: the CI run for `174bb7d` was red on `E0164` in
+`control-plane/src/plane.rs`, fixed in `ee4fbf1` (the dashboard record now names
+the job count). The lesson is recorded in the workspace memory: an event-shape
+change is a workspace-wide grep, not a kernel-only edit.
+
+Gate: 764 tests all-features, 0 failed; control-plane 28 + 11 + 7 pass;
+clippy/fmt/doc clean; negative controls 9/9.
 
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 

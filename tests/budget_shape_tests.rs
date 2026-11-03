@@ -751,6 +751,144 @@ fn an_idempotent_body_is_fingerprinted_by_content() {
 }
 
 #[test]
+fn a_deep_queued_value_is_refused_before_the_dispatch_clone() {
+    // Round 9 (F1): the queue-time gate is budget-relative, and a lane may allow
+    // a depth that the derived `Clone` cannot survive. The absolute wire ceiling
+    // binds the queued path too.
+    let fixture = fixture_parts(
+        Budget {
+            max_depth: 100_000,
+            max_value_size: 10_000_000,
+            ..Budget::default()
+        },
+        Budget {
+            max_depth: 100_000,
+            max_value_size: 10_000_000,
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    let promise = fixture
+        .agent
+        .call(
+            fixture.lane,
+            &fixture.cap,
+            "ping",
+            vec![Arg::Value(nested(2_000))],
+        )
+        .expect("queued");
+    let error = promise
+        .value()
+        .expect_err("a value deeper than the wire allows is refused");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert_eq!(fixture.calls.get(), 0);
+}
+
+#[test]
+fn a_bound_capability_needs_its_peer_to_resolve() {
+    // Round 9 (F2): `resolve` had no peer, so it settled a call dispatch would
+    // have refused for the wrong identity.
+    let agent = Agent::with_secret([0x81; 32]);
+    let provider = agent.register(Box::new(Reply {
+        calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+        reply: Value::text("ok"),
+    }));
+    let owner = active_rpc::identity::IdentityPolicy::default()
+        .admit(
+            Some(&active_rpc::identity::PeerIdentity::from_certificate(
+                b"owner",
+            )),
+            true,
+        )
+        .expect("admit");
+    let cap = agent
+        .mint_bound(&owner, provider, 0, CapAttrs::new(&["ping"]))
+        .expect("bound cap");
+    let lane = agent.create_lane("bound", Budget::default()).expect("lane");
+    let promise = agent
+        .call_as(Some(owner.identity()), lane, &cap, "ping", Vec::new())
+        .expect("queued by the bound peer");
+    let error = agent
+        .resolve(&promise, Value::Int(1))
+        .expect_err("a bound capability cannot be answered anonymously");
+    assert_eq!(error.code(), "rpc/identity");
+    agent
+        .resolve_as(Some(owner.identity()), &promise, Value::Int(1))
+        .expect("the bound peer can answer");
+    assert_eq!(promise.value().expect("settled"), Value::Int(1));
+}
+
+#[test]
+fn a_wall_clock_expiry_binds_an_out_of_band_resolve() {
+    // Round 9 (F3): resolve compared against a stale clock in wall-clock mode.
+    let agent = Agent::with_secret([0x82; 32]);
+    agent.use_wall_clock(true);
+    let provider = agent.register(Box::new(Reply {
+        calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+        reply: Value::text("ok"),
+    }));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["ping"]).with_ttl_ms(30))
+        .expect("cap");
+    let lane = agent.create_lane("ttl", Budget::default()).expect("lane");
+    let promise = agent.call(lane, &cap, "ping", Vec::new()).expect("queued");
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let error = agent
+        .resolve(&promise, Value::Int(1))
+        .expect_err("the ttl elapsed");
+    assert_eq!(error.code(), "rpc/revoked");
+}
+
+#[test]
+fn an_idempotent_body_reaches_the_provider() {
+    // Round 9 (F4): the body-aware entry charged for the body but delivered an
+    // empty payload on the miss path.
+    struct PayloadLen;
+
+    impl Provider for PayloadLen {
+        fn name(&self) -> &'static str {
+            "payload-len"
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["len".to_string()]
+        }
+
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+
+        fn invoke(&mut self, _object: u64, call: &Call) -> active_rpc::Result<Response> {
+            Ok(Response::Value(Value::Int(call.payload.len() as i64)))
+        }
+    }
+
+    let agent = Agent::with_secret([0x83; 32]);
+    let provider = agent.register(Box::new(PayloadLen));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["len"]))
+        .expect("cap");
+    let lane = agent.create_lane("body", Budget::default()).expect("lane");
+    let promise = agent
+        .call_idempotent_as_with_body(
+            None,
+            lane,
+            &cap,
+            "len",
+            Vec::new(),
+            b"payload-body",
+            "body-delivery",
+        )
+        .expect("queued");
+    agent.run();
+    assert_eq!(
+        promise.value().expect("value"),
+        Value::Int(12),
+        "the provider did not receive the body the call was charged for"
+    );
+}
+
+#[test]
 fn a_module_larger_than_max_value_size_is_refused() {
     let fixture = fixture_with(budget(), Value::text("ok"));
     assert_eq!(

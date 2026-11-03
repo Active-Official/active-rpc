@@ -2332,7 +2332,10 @@ impl Agent {
         // The topic name is metadata the channel stores and forwards, so it is
         // payload as far as the grant is concerned: charging only the value let
         // a 1 KiB topic ride through a 32-byte budget.
-        let bytes = payload.wire_size().saturating_add(topic.len() as u64);
+        let bytes = payload
+            .wire_size()
+            .checked_add(topic.len() as u64)
+            .ok_or(Error::BudgetExceeded("byte"))?;
         // Channel capacity comes before the charge: a publish the channel would
         // refuse must not spend the grant or queue nothing silently.
         {
@@ -2726,10 +2729,12 @@ impl Agent {
             }
         }
         // Tool policy is enforced here too.
-        let args_bytes: u64 = args
-            .iter()
-            .map(Arg::wire_size)
-            .fold(0u64, u64::saturating_add);
+        let mut args_bytes = 0u64;
+        for arg in &args {
+            args_bytes = args_bytes
+                .checked_add(Arg::wire_size(arg))
+                .ok_or(Error::BudgetExceeded("byte"))?;
+        }
         if let Some(policy) = &record.attrs.tool_policy {
             if !policy.allowed.contains(method) {
                 return Err(Error::ToolPolicy("tool not allowed"));
@@ -2740,7 +2745,9 @@ impl Agent {
                 return Err(Error::ToolPolicy("argument too large"));
             }
         }
-        let call_bytes: u64 = args_bytes.saturating_add(payload_bytes);
+        let call_bytes: u64 = args_bytes
+            .checked_add(payload_bytes)
+            .ok_or(Error::BudgetExceeded("byte"))?;
         if call_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
@@ -2967,21 +2974,37 @@ impl Agent {
     }
 
     /// Resolve a pending promise manually (used by peers that answer out of band).
+    ///
+    /// A capability bound to a peer can only be answered by that peer; use
+    /// [`Agent::resolve_as`] from a transport, which presents the verified
+    /// identity. This entry point presents none, so it refuses a bound call.
     pub fn resolve(&self, promise: &PromiseHandle, value: Value) -> Result<()> {
-        let kernel = self.cell.borrow_mut();
-        // An out-of-band answer is authority-bearing data: the shape ceilings
-        // and the byte budget of the call it answers bind it exactly as they
-        // bind a provider's return value. Without this, `resolve` was a hole
-        // through every budget (round 7, F1).
+        self.resolve_as(None, promise, value)
+    }
+
+    /// [`Agent::resolve`] on behalf of the peer the transport authenticated.
+    ///
+    /// An out-of-band answer settles the same call dispatch would have run, so
+    /// it is held to the same authority: the capability must be live and
+    /// unexpired, the lane must exist, the peer binding must match, and the
+    /// value is charged and shape-checked against the call's grant (round 7 F1,
+    /// round 8 #2, round 9 F2/F3).
+    pub fn resolve_as(
+        &self,
+        peer: Option<&PeerIdentity>,
+        promise: &PromiseHandle,
+        value: Value,
+    ) -> Result<()> {
+        let mut kernel = self.cell.borrow_mut();
+        // The expiry comparison below is against `now_ms`, which only moves when
+        // it is refreshed in wall-clock mode (round 9, F3).
+        refresh_clock(&mut kernel);
         let job = kernel
             .jobs
             .values()
             .find(|job| job.promise == promise.id)
             .cloned();
         if let Some(job) = &job {
-            // Dispatch re-checks revocation, expiry and the lane before the
-            // provider runs; an out-of-band answer answers the same call and is
-            // held to the same authority (round 8, #2).
             let lane_budget = match kernel.caps.get(&job.cap) {
                 Some(record) if record.revoked => return Err(Error::Revoked(cap_token(job.cap))),
                 Some(record)
@@ -2991,10 +3014,22 @@ impl Agent {
                 {
                     return Err(Error::Revoked(cap_token(job.cap)))
                 }
-                Some(_) => match kernel.lanes.get(&job.lane) {
-                    Some(lane_record) if !lane_record.closed => lane_record.budget,
-                    _ => return Err(Error::UnknownLane(job.lane.0)),
-                },
+                Some(record) => {
+                    if let Some(bound) = record.attrs.bound_to {
+                        if !crate::identity::matches(
+                            crate::identity::presented_fingerprint(peer),
+                            bound,
+                        ) {
+                            return Err(Error::Identity(
+                                "a bound capability's promise can only be answered by its peer",
+                            ));
+                        }
+                    }
+                    match kernel.lanes.get(&job.lane) {
+                        Some(lane_record) if !lane_record.closed => lane_record.budget,
+                        _ => return Err(Error::UnknownLane(job.lane.0)),
+                    }
+                }
                 None => return Err(Error::UnknownCapability(cap_token(job.cap))),
             };
             let budget = job.call.budget.intersect(&lane_budget);
@@ -3405,7 +3440,21 @@ impl Agent {
             self.record_refusal(lane, Some(cap.id()), &error);
             return Err(error);
         }
-        let promise = self.call_as_with_payload(peer, lane, cap, method, args, payload_bytes)?;
+        let promise = match body {
+            Some(bytes) => self.call_with_origin_payload(
+                peer,
+                lane,
+                cap,
+                method,
+                args,
+                payload_bytes,
+                bytes.to_vec(),
+                false,
+            )?,
+            // A size-only caller has no body to deliver: the charge is the only
+            // thing it can account for, and its doc says so.
+            None => self.call_as_with_payload(peer, lane, cap, method, args, payload_bytes)?,
+        };
         let id = promise.id();
         let mut kernel = self.cell.borrow_mut();
         kernel.idempotency.insert(
@@ -4010,6 +4059,13 @@ impl Agent {
                 let mut failure = None;
                 for arg in &job.call.args {
                     let Arg::Value(value) = arg else { continue };
+                    // Budget-relative ceilings are not enough here: a lane may
+                    // allow a depth the derived `Clone` cannot survive, and the
+                    // substitution loop below copies every value (round 9, F1).
+                    if value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
+                        failure = Some(Error::BudgetExceeded("depth"));
+                        break;
+                    }
                     if let Some(error) = shape_refusal(value, &gate_budget) {
                         failure = Some(error);
                         break;
