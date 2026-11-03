@@ -54,11 +54,11 @@ that would violate one stops and needs an ADR.
 | Read-only bypass | mutating methods refused before the provider sees the call | `Kernel::call` |
 | Path escape | path arguments checked against the capability scope before dispatch, and a module provider refuses a path outside the scope as well as a pathless form under one (it would return the whole module) | `Kernel::call`, `ModuleProvider::serve` |
 | Confused deputy across providers | a capability names one provider and one object; method sets do not travel between them | `CapRecord`, `Provider` |
-| Secret leakage | values carry `Value::Secret` markers; evaluation, annotations and provenance never carry secret bytes (provider text is redacted through the library's own rule); envelope has no secret-bytes tag | `security`, `wire`, `domain` |
+| Secret leakage | values carry `Value::Secret` markers; evaluation, annotations and provenance never carry secret bytes. The domain provider redacts through `active-infinity`'s `interop::Redactor` (the projection rule applied to the image), so a plain string that copies a secret literal is treated as the secret too, in an answer, a cone or an evaluated value; envelope has no secret-bytes tag | `security`, `wire`, `domain` |
 | Agent-immutable node rewritten | a patch refuses a target under `@ai_immutable: true`, and a scoped patch refuses a write whose named dependents leave the scope | `ModuleProvider::serve` |
 | Revoked capability still usable | revocation marks the record and every descendant; the check runs at queue time **and again at dispatch** | `Agent::revoke`, `Kernel::dispatch` |
 | Cancelled / destroyed work still runs | a queued job is removed on cancel or lane destruction | `Agent::cancel`, `Agent::destroy_lane` |
-| Secret bytes in a module result | `subgraph`/`patch` return a **redacted** module: every secret node becomes the marker before encoding | `domain::redacted_module_bytes` |
+| Secret bytes in a module result | `subgraph`/`patch` return a **redacted** module: every secret node and every text that copies a secret literal becomes the marker before encoding, using the literal set of the module the capability was installed from | `domain::redacted_module_bytes`, `security::redact_derived` |
 | Guessable capability ids | the kernel secret comes from the OS CSPRNG | `Agent::new` |
 | Byte budget bypass | arguments and payload are measured and charged per call, then intersected with the lane budget | `Arg::wire_size`, `Kernel::call` |
 | Lane budget bypass by queueing | capacity counts pending calls as well as completed ones | `Lane::has_capacity` |
@@ -157,6 +157,7 @@ Rules the tests enforce:
   `rpc/revoked` (`revocation_kills_the_capability_and_its_children`).
 - A capability minted in another kernel is unknown here; ids are derived from a
   per-kernel secret (`capability_ids_are_unforgeable`, H2.42).
+- A redacting evaluation answers `Value::Secret` for a secret: the `active-core` bridge refuses a secret-bearing module (it would export the plaintext), so the engine runs on the redacted copy and the marker maps back to the structural value. A non-redacting caller sees the same marker, because the bridge has no other safe form.
 - Secret-bearing subgraphs are redacted per capability, so one worker's
   read-only view does not expose another's secret (`redteam_tests`
   secret-export cases, H2.43).
