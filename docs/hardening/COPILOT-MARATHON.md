@@ -1416,6 +1416,36 @@ lows.
 
 Gate: 790 tests all-features, 0 failed; clippy/fmt/doc clean.
 
+### R-01 wire ARP1 - 2026-11-02 (round 4, first clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `283d803`. **CLEAN** — the
+delta counts and their bounds, the strictly increasing map keys and descriptor
+methods, `max_path` (1024 default, 128 strict), and the one-frame-per-container
+walks in `is_tainted`/`shape`/`shape_exceeded` all verified on the shipped path.
+
+Two of its residuals are closed here: the argument wire size now counts the tag
+byte (an argument was undercharged by one byte), and a truncated capability
+count is `rpc/capability-table` like the rest of the table. The rest are
+documented: the wire accepts method and scope text the mint refuses (the call
+path refuses it, and a refusal event must be able to carry any name); the
+capability-table order is not enforced (the delta base is a hash of the exact
+bytes by design); kind-specific body shapes are the transport's check.
+
+### R-02 kernel dispatch - 2026-11-02 (round 9, first clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `283d803`. **CLEAN** — the
+`cancel_tree` Queued classification, the current-grant dispatch gate and the
+`fail_job` settlement rule verified, with 11/11 dispatch tests.
+
+Two of its residuals are closed here: the promise substitution now shape-gates a
+resolved value before copying it (an over-grant value doubled its memory before
+the refusal), and `cancel_tree` on a cancelled root answers
+`rpc/promise-cancelled` like `resolve`. The remaining two are by design: a
+running-cancel seals a receipt but no `call.refused` (the provider already ran),
+and a stuck pipeline reports the cycle before the authority refusal.
+
+Gate: 790 tests all-features, 0 failed; clippy/fmt/doc clean.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

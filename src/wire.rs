@@ -462,7 +462,8 @@ impl Envelope {
         }
         let payload = bytes[cursor..payload_end].to_vec();
         cursor = payload_end;
-        let cap_count = read_u32(bytes, &mut cursor)?;
+        let cap_count = read_u32(bytes, &mut cursor)
+            .map_err(|_| Error::CapabilityTable("truncated capability table"))?;
         if cap_count > limits.max_caps {
             return Err(Error::CapabilityTable("too many descriptors"));
         }

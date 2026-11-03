@@ -3737,14 +3737,17 @@ impl Agent {
             return Err(Error::UnknownPromise(promise.id.0));
         }
         let mut kernel = self.cell.borrow_mut();
-        let root_pending = kernel
+        let root_state = kernel
             .promises
             .get(&promise.id)
             .ok_or(Error::UnknownPromise(promise.id.0))?
             .state
-            == PromiseState::Pending;
-        if !root_pending {
-            return Err(Error::PromiseAlreadyResolved(promise.id.0));
+            .clone();
+        if root_state != PromiseState::Pending {
+            return Err(match root_state {
+                PromiseState::Cancelled => Error::PromiseCancelled(promise.id.0),
+                _ => Error::PromiseAlreadyResolved(promise.id.0),
+            });
         }
 
         // One reverse index instead of a scan per target: a deep chain is the
@@ -4358,9 +4361,16 @@ impl Agent {
                                     crate::promise::PromiseState::Resolved(value) => {
                                         // `Value::clone` recurses, so a deep value
                                         // must be refused before the copy is made
-                                        // (round 7, F2).
+                                        // (round 7, F2). The shape ceiling is
+                                        // checked here too: copying a value the
+                                        // grant refuses doubles its memory before
+                                        // the refusal.
                                         if value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
                                             failure = Some(Error::BudgetExceeded("depth"));
+                                            break;
+                                        }
+                                        if let Some(error) = shape_refusal(value, &gate_budget) {
+                                            failure = Some(error);
                                             break;
                                         }
                                         args.push(Arg::Value(value.clone()));

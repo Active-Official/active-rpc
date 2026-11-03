@@ -434,10 +434,13 @@ impl Arg {
 
     /// Bytes this argument occupies on the wire (used for budget accounting).
     pub fn wire_size(&self) -> u64 {
+        // The tag byte is part of the wire size: an argument is a tag and then
+        // its body, and a budget that counts one and not the other undercharges
+        // every argument by a byte.
         match self {
-            Arg::Value(value) => value.wire_size(),
-            Arg::Promise(_) => 8,
-            Arg::Cap(_) => 16,
+            Arg::Value(value) => value.wire_size().saturating_add(1),
+            Arg::Promise(_) => 9,
+            Arg::Cap(_) => 17,
         }
     }
 }
