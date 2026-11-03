@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-14: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 + 5 + 5 findings; round-14 fixes green, confirmation round pending | 87 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-15: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 + 5 + 5 + 6 findings; round-15 fixes green, confirmation round pending | 92 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-8: 15 + 16 + 9 + 6 + 6 + 2 + 2 + 9 findings; round-8 fixes green, confirmation round pending | 60 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,28 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 15)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `b4d3cbf`. The semantic
+walk fix had not landed (the edit was lost when a later assertion failed in the
+same batch) and a declassifying patch still served a hash entry.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `structural_resolve` still sliced the full path by the current segment's length and skipped a segment: a single-segment path over a semantic root panicked, and a legal nested name was refused; the round-14 test used no scope so it never reached the code | **fixed**: the wrapper is unwrapped inline before each step (no slicing, no skipped segment); `a_scoped_semantic_wrapper_resolves` installs with a scope |
+| 2 | high | a patch that removed the last secret kept the `Hash` provenance entries, which name the pre-patch image | **fixed**: a secret-bearing history drops hash-valued entries alongside `parent`; `a_patch_removing_the_last_secret_drops_hash_entries` |
+| 3 | medium | the over-deep evaluate refusal had no test | **fixed**: `an_over_deep_evaluation_is_a_budget_refusal` |
+| 4 | low | the `provenance: None` arm skipped the wall check | **fixed**: every arm charges it |
+| 5 | low | `redact_value`'s map-key collapse was unpinned | **recorded**: fail-closed, no behavior change |
+| 6 | low | the empty-placeholder over-collapse was unpinned, and the placeholder set was read from the cone instead of the source | **fixed**: the set comes from a redacted copy of the source; `an_empty_placeholder_collapses_public_empty_text` pins both halves |
+
+Also: a pathless node inside the scope's subtree (behind a semantic wrapper or
+an array) is now inside for every scope check, and a synthetic label falls back
+to a subtree walk instead of being treated as outside.
+
+Gate: 88 suites / 852 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 14)
 
