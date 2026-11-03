@@ -157,6 +157,15 @@ pub trait McpTransport {
     }
 }
 
+/// Default ceiling for a handshake that names none.
+const DEFAULT_HANDSHAKE_MS: u64 = 10_000;
+
+/// Lines the reader thread may hold while the session is busy.
+///
+/// The session consumes at most one answer per request, so a peer that streams
+/// notifications would otherwise fill host memory at pipe speed.
+pub const MAX_MCP_QUEUED_LINES: usize = 64;
+
 /// Largest JSON-RPC line a session accepts, in bytes.
 ///
 /// One MiB matches the default MCP argument policy. A server that needs more
@@ -444,6 +453,37 @@ impl DeadlineReader {
     }
 }
 
+/// Write `bytes` under one deadline.
+///
+/// Each syscall is bounded by the time left, and a short write costs one loop
+/// iteration with a fresh timeout: a peer that accepts a byte at a time cannot
+/// stretch the phase past the ceiling.
+fn write_within(
+    stream: &mut std::net::TcpStream,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Result<()> {
+    const CHUNK: usize = 4 << 10;
+    let mut sent = 0usize;
+    while sent < bytes.len() {
+        stream
+            .set_write_timeout(Some(remaining_until(deadline)?))
+            .map_err(|_| Error::Timeout)?;
+        let end = (sent + CHUNK).min(bytes.len());
+        match std::io::Write::write(stream, &bytes[sent..end]) {
+            Ok(0) => {
+                return Err(Error::Provider {
+                    code: "http/write:short write".to_string(),
+                })
+            }
+            Ok(written) => sent += written,
+            Err(error) => return Err(map_http_write(error)),
+        }
+        remaining_until(deadline)?;
+    }
+    Ok(())
+}
+
 /// A socket read that hit its timeout is the call's ceiling, not an I/O fault.
 fn map_http_read(error: std::io::Error) -> Error {
     map_http_io(error, "read")
@@ -476,7 +516,7 @@ pub struct StdioTransport {
     child: Child,
     /// Lines handed to the writer thread, each with the channel its outcome goes
     /// back on.
-    writer: std::sync::mpsc::Sender<(String, std::sync::mpsc::Sender<Result<()>>)>,
+    writer: std::sync::mpsc::SyncSender<(String, std::sync::mpsc::Sender<Result<()>>)>,
     /// Lines read by the reader thread. Reading on a thread is what makes a
     /// deadline possible: a child pipe has no portable read timeout, and a
     /// silent server would otherwise block the single-threaded kernel for as
@@ -499,6 +539,13 @@ impl StdioTransport {
     /// The working directory is pinned to this process's current directory
     /// instead of being inherited when the child is spawned.
     pub fn spawn(program: &str, args: &[&str], env: &BTreeMap<String, String>) -> Result<Self> {
+        // A NUL never reaches an exec: `Command` reports it as an OS error, a
+        // peer fault for what is a configuration mistake (round 8, F5).
+        if program.contains('\0') || args.iter().any(|arg| arg.contains('\0')) {
+            return Err(Error::InvalidArgument(
+                "an MCP program or argument contains a NUL byte",
+            ));
+        }
         let program = pin_program(program, "an MCP server")?;
         let workdir = std::env::current_dir().map_err(|_| Error::Provider {
             code: "mcp/cwd".to_string(),
@@ -538,7 +585,9 @@ impl StdioTransport {
         let stdout = child.stdout.take().ok_or(Error::Provider {
             code: "mcp/stdout".to_string(),
         })?;
-        let (sender, lines) = std::sync::mpsc::channel();
+        // A bounded queue: a server that streams frames forever must fill the
+        // pipe and block, not grow the host's memory (round 8, F1).
+        let (sender, lines) = std::sync::mpsc::sync_channel(MAX_MCP_QUEUED_LINES);
         std::thread::Builder::new()
             .name("active-rpc-mcp-stdio".to_string())
             .spawn(move || {
@@ -573,8 +622,10 @@ impl StdioTransport {
         // The writer runs on its own thread for the same reason the reader
         // does: a server that stops reading fills the pipe and a blocking write
         // would hold the kernel past every ceiling (round 3, #2).
+        // One command in flight: the caller owns the deadline, and the writer
+        // never holds a backlog (round 8, F1).
         let (writer, commands) =
-            std::sync::mpsc::channel::<(String, std::sync::mpsc::Sender<Result<()>>)>();
+            std::sync::mpsc::sync_channel::<(String, std::sync::mpsc::Sender<Result<()>>)>(1);
         std::thread::Builder::new()
             .name("active-rpc-mcp-writer".to_string())
             .spawn(move || {
@@ -717,6 +768,11 @@ impl<T: McpTransport> McpSession<T> {
     /// a server that answers `initialize` and then stalls on the list is just
     /// as stuck as one that never answers.
     pub fn handshake_within(transport: T, deadline: Option<std::time::Instant>) -> Result<Self> {
+        // A handshake without a ceiling would hold the dispatch thread for as
+        // long as a silent server stays silent (round 8, F8).
+        let deadline = Some(deadline.unwrap_or_else(|| {
+            std::time::Instant::now() + std::time::Duration::from_millis(DEFAULT_HANDSHAKE_MS)
+        }));
         let mut session = McpSession {
             transport,
             tools: Vec::new(),
@@ -945,7 +1001,9 @@ impl<T: McpTransport> McpSession<T> {
         for tool in &self.tools {
             policy.allowed.insert(tool.name.clone());
         }
-        policy.max_arg_bytes = 1 << 20;
+        // A frame ceiling minus the JSON envelope: an argument exactly at the
+        // advertised size would be refused after being charged (round 8, F9).
+        policy.max_arg_bytes = (MAX_MCP_LINE_BYTES as u64).saturating_sub(256);
         policy
     }
 }
@@ -1096,7 +1154,8 @@ impl HttpTool {
                 .iter()
                 .map(|method| method.to_string())
                 .collect(),
-            max_arg_bytes: self.max_request as u64,
+            // The serialised body adds keys, quotes and escaping.
+            max_arg_bytes: (self.max_request as u64).saturating_sub(256),
             allow_process: false,
         }
     }
@@ -1170,6 +1229,10 @@ impl HttpTool {
         stream
             .set_write_timeout(Some(remaining_until(deadline)?))
             .map_err(|_| Error::Timeout)?;
+        // The timeout above is per write syscall. A peer that reads one byte
+        // per (ceiling - epsilon) makes every write return `Ok(1)`, so the phase
+        // would cost body_len * interval; the deadline is re-armed and re-checked
+        // per chunk instead (round 8, F3).
         let head = {
             // A method defined without content sends no `content-length` and no
             // body. A GET that carries one makes simple servers and
@@ -1184,14 +1247,11 @@ impl HttpTool {
             head.push_str("\r\n");
             head
         };
-        stream
-            .write_all(head.as_bytes())
-            .and_then(|_| match body {
-                Some(body) => stream.write_all(body),
-                None => Ok(()),
-            })
-            .and_then(|_| stream.flush())
-            .map_err(map_http_write)?;
+        write_within(&mut stream, head.as_bytes(), deadline)?;
+        if let Some(body) = body {
+            write_within(&mut stream, body, deadline)?;
+        }
+        stream.flush().map_err(map_http_write)?;
         let mut reader = DeadlineReader::new(stream, deadline);
         // Every line is read under a cap, and the block has its own budget: a
         // hostile endpoint that streams headers would otherwise grow a `String`
@@ -1246,6 +1306,15 @@ impl HttpTool {
                     code: "http/headers".to_string(),
                 });
             };
+            // A space before the colon is obsolete line folding syntax that
+            // some peers accept: `transfer-encoding : chunked` used to slip past
+            // the check below and the caller received chunk framing
+            // (round 8, F2). A field name is an RFC 9110 token.
+            if name.is_empty() || !name.bytes().all(is_http_token) {
+                return Err(Error::Provider {
+                    code: "http/headers".to_string(),
+                });
+            }
             {
                 if name.eq_ignore_ascii_case("transfer-encoding")
                     && !value.trim().eq_ignore_ascii_case("identity")
@@ -1260,7 +1329,14 @@ impl HttpTool {
                     // A repeated or unparsable length is a framing ambiguity:
                     // silently switching to read-to-end would let the peer
                     // choose how the message is delimited.
-                    let value: usize = value.trim().parse().map_err(|_| Error::Provider {
+                    // Digits only: `+2`, `0x2` and a sign are not a length.
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err(Error::Provider {
+                            code: "http/headers".to_string(),
+                        });
+                    }
+                    let value: usize = trimmed.parse().map_err(|_| Error::Provider {
                         code: "http/headers".to_string(),
                     })?;
                     if content_length.replace(value).is_some() {
@@ -1479,7 +1555,8 @@ impl Provider for HttpTool {
                             "an HTTP body cannot carry a non-finite number",
                         ));
                     }
-                    serde_json::to_vec(&value_to_json(&value)).unwrap_or_default()
+                    serde_json::to_vec(&value_to_json(&value))
+                        .map_err(|_| Error::InvalidArgument("the HTTP body cannot be serialised"))?
                 }
                 None => Vec::new(),
             };
@@ -1796,6 +1873,15 @@ impl Provider for LocalProcess {
         // The policy in the capability must have granted process execution.
         if !call.tool_allows_process {
             return Err(Error::ToolPolicy("process execution not granted"));
+        }
+        // The fields are public, so the pinning is checked again here: a caller
+        // that assigned a relative directory would have it resolved against the
+        // process's current directory, which is what `with_current_dir`
+        // refuses (round 8, F6).
+        if !self.workdir.is_absolute() {
+            return Err(Error::InvalidArgument(
+                "a process working directory must be absolute",
+            ));
         }
         let mut command = Command::new(&self.resolved);
         command

@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-13: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 + 5 findings; round-13 fixes green, confirmation round pending | 82 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-7: 15 + 16 + 9 + 6 + 6 + 2 + 2 findings; round-7 fixes green, confirmation round pending | 51 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-14: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 + 5 + 5 findings; round-14 fixes green, confirmation round pending | 87 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-8: 15 + 16 + 9 + 6 + 6 + 2 + 2 + 9 findings; round-8 fixes green, confirmation round pending | 60 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,44 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 14)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `349cc67`. Four of five
+round-13 fixes held; the semantic-wrapper walk was broken and a patch-history
+oracle remained.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a patch that replaced the last secret cleared the `holds_secret` flag, so the cone and the stored provenance still carried the raw pre-patch content address | **fixed**: the pre-patch secret set decides, the cone drops provenance, and a secret-bearing history records no `parent`; `a_patch_removing_the_last_secret_serves_no_parent` |
+| 2 | high | the semantic-wrapper branch sliced the full path and skipped a segment: a single-segment path over a semantic root panicked (index out of bounds) | **fixed**: the wrapper is unwrapped inline before each step, no slicing; `a_semantic_wrapper_is_transparent_to_the_scope` |
+| 3 | medium | the same branch consumed a segment, so a legal `Table -> Semantic -> Table` name was refused | **fixed** by the same rewrite |
+| 4 | low | provenance text was stripped only when it *started* with `blake3:` | **fixed**: an embedded address is dropped too; `an_embedded_content_address_is_dropped` |
+| 5 | low | the depth refusal on the evaluate path mapped to `rpc/payload` instead of `rpc/budget-exceeded` | **fixed**: the value returns unmarked and the caller's own gate answers |
+| 6 | low | an empty placeholder (a marker-substring secret) collapses every empty string | **accepted**: content-free and fail-closed on the category; recorded rather than special-cased |
+
+Gate: 88 suites / 848 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 8)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `349cc67`.
+All round-7 fixes held in code; one high, two mediums and seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the MCP reader thread fed an unbounded channel: a server streaming frames grew host memory at pipe speed | **fixed**: `sync_channel(64)` for lines and 1 for the writer, so the child blocks on its pipe, which the deadline already bounds |
+| 2 | medium | a space before a header colon hid `transfer-encoding`/`content-length` from every framing check | **fixed**: the name must be an RFC 9110 token and a length must be digits; `a_header_name_is_a_token_and_a_length_is_digits` (three probes) |
+| 3 | medium | the HTTP write phase armed one per-syscall timeout, so a peer reading a byte at a time stretched it past the ceiling | **fixed**: `write_within` re-arms and re-checks the deadline every 4 KiB |
+| 4 | low | a body serialisation fault silently sent an empty body | **fixed**: the call is refused |
+| 5 | low | a NUL in an MCP program or argument surfaced as `mcp/spawn:<os text>` | **fixed**: `rpc/invalid-argument`; `a_nul_in_an_mcp_spawn_is_refused` |
+| 6 | low | the public `workdir` field could be set relative after construction | **fixed**: `invoke` re-checks the absolute path; `a_relative_workdir_is_refused_at_invoke` |
+| 7 | low | the round-7 test asserted only `rpc/provider`, not the subcodes | **fixed**: `provider_code()` is asserted (`mcp/tool-name`, `mcp/tools`) |
+| 8 | low | `handshake_within(t, None)` had no ceiling | **fixed**: a 10 s default |
+| 9 | low | the advertised `max_arg_bytes` equalled the frame/request cap, so an argument at the advertised size was refused | **fixed**: 256 bytes are reserved for the envelope |
+| 10 | low | u64-only JSON integers round through `f64` | **recorded** (round-7 #3), no authority impact |
+
+Gate: as above (the same commit).
 
 ### R-07 domain operations - 2026-11-03 (round 13)
 

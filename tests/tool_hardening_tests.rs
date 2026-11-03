@@ -1068,5 +1068,89 @@ fn a_nameless_tool_entry_is_refused() {
         Ok(_) => panic!("a nameless tool is refused"),
         Err(error) => error,
     };
-    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("mcp/tool-name"),
+        "the refusal names the list fault: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 8
+// ---------------------------------------------------------------------------
+
+/// An obsolete-space header name used to slip past the framing checks: the name
+/// is a token, and a length is digits (round 8, F2).
+#[test]
+fn a_header_name_is_a_token_and_a_length_is_digits() {
+    for answer in [
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding : chunked\r\n\r\n".as_slice(),
+        b"HTTP/1.1 200 OK\r\ncontent-length : 5\r\n\r\nhello".as_slice(),
+        b"HTTP/1.1 200 OK\r\ncontent-length: +2\r\n\r\nok".as_slice(),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut scratch = [0u8; 4096];
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .ok();
+            let _ = socket.read(&mut scratch);
+            let _ = socket.write_all(answer);
+            let _ = socket.flush();
+        });
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/x")]);
+        let mut call = http_get("/x", 1_000);
+        call.tool_allows_process = true;
+        let error = tool
+            .invoke(0, &call)
+            .expect_err("a hidden framing field is refused");
+        assert!(
+            error.code() == "rpc/provider" || error.code() == "rpc/tool-policy",
+            "unexpected refusal: {error}"
+        );
+    }
+}
+
+/// A caller-supplied working directory cannot become relative after
+/// construction (round 8, F6).
+#[test]
+fn a_relative_workdir_is_refused_at_invoke() {
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\cmd.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    let mut tool = LocalProcess::new(program, &["/C", "echo"]).expect("an absolute program");
+    tool.workdir = std::path::PathBuf::from("relative");
+    let mut call = Call::new("run", vec![Arg::text("/C"), Arg::text("echo")]);
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("a relative directory");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// A NUL in an MCP program or argument is a configuration refusal, not a
+/// spawn-time provider fault (round 8, F5).
+#[test]
+fn a_nul_in_an_mcp_spawn_is_refused() {
+    use active_rpc::tool::StdioTransport;
+
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\cmd.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    let env = std::collections::BTreeMap::new();
+    let error = match StdioTransport::spawn(program, &["a\0b"], &env) {
+        Ok(_) => panic!("a NUL argument is refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+    let error = match StdioTransport::spawn("a\0b", &[], &env) {
+        Ok(_) => panic!("a NUL program is refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
 }

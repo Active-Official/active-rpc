@@ -177,7 +177,11 @@ fn a_hostile_tool_list_is_refused() {
         Ok(_) => panic!("a non-array tool list is refused"),
         Err(error) => error,
     };
-    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("mcp/tools"),
+        "the refusal names the list fault: {error}"
+    );
 }
 
 #[test]

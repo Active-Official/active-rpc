@@ -423,7 +423,14 @@ impl ModuleProvider {
                         timestamp_ms: previous.as_ref().map_or(0, |prov| prov.timestamp_ms),
                         model: previous.as_ref().and_then(|prov| prov.model.clone()),
                         tool: Some("patch".to_string()),
-                        parent: parent_hash,
+                        // A raw pre-patch address over a secret image is an
+                        // offline oracle, so a secret-bearing history records no
+                        // parent (round 14, H1).
+                        parent: if slot.module.nodes().iter().any(|node| node.is_secret()) {
+                            None
+                        } else {
+                            parent_hash
+                        },
                         entries: previous.map(|prov| prov.entries).unwrap_or_default(),
                     }));
                     // The reply is the cone at the target, not the whole arena:
@@ -434,7 +441,10 @@ impl ModuleProvider {
                     // a secret literal in the cone is still the secret.
                     let tainted = call.redact.then(|| tainted_nodes(&cone));
                     security::redact_derived(&mut cone, &security::redactor_for(&patched))?;
-                    let holds_secret = patched.nodes().iter().any(|node| node.is_secret());
+                    // The provenance names the pre-patch image, so the
+                    // pre-patch secret set decides too (round 14, H1).
+                    let holds_secret = slot.module.nodes().iter().any(|node| node.is_secret())
+                        || patched.nodes().iter().any(|node| node.is_secret());
                     if call.redact {
                         // The provenance records the parent's content address,
                         // and a redacting caller may not receive a hash of an
@@ -690,7 +700,7 @@ impl ModuleProvider {
                             // `Input` lineage entries a patch carries forward
                             // (round 7 #2, round 8 #2).
                             map.retain(|_, value| {
-                                !matches!(value, Value::Text(text) if text.starts_with("blake3:"))
+                                !matches!(value, Value::Text(text) if text.contains("blake3:"))
                             });
                         }
                         let timestamp = i64::try_from(prov.timestamp_ms).unwrap_or(i64::MAX);
@@ -1403,11 +1413,11 @@ fn evaluate_for_caller(
     let (value, diagnostics) = active_infinity::interop::evaluate(&redacted, budget)?;
     // The marking walk is recursive; the depth gate is iterative and must run
     // first, or a deep value aborts instead of being refused (round 12, F5).
+    // The value goes back unmarked in that case: the caller's own gate answers
+    // `rpc/budget-exceeded`, which is the code every other depth refusal uses
+    // (round 14, L3).
     if security::active_value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
-        return Err(active_infinity::Error::Limit {
-            kind: "value depth",
-            limit: crate::wire::MAX_VALUE_DEPTH as u64,
-        });
+        return Ok((value, diagnostics));
     }
     Ok((mark_secret_texts(value, &placeholders), diagnostics))
 }

@@ -419,3 +419,110 @@ fn a_secret_bearing_module_serves_no_raw_parent_hash() {
         );
     }
 }
+
+/// A semantic wrapper above a table or an array is transparent to the scope
+/// walk, and a single-segment path never slices the path (round 14, H2/M1).
+#[test]
+fn a_semantic_wrapper_is_transparent_to_the_scope() {
+    use active_infinity::SemanticTag;
+
+    let mut module = InfinityModule::new();
+    let leaf = module.push(Inode::Str("inside".to_string()));
+    let inner = module.push(Inode::Table {
+        fields: vec![("w".to_string(), leaf)],
+    });
+    let wrapped = module.push(Inode::Semantic {
+        tag: SemanticTag::Policy,
+        inner,
+    });
+    let app = module.push(Inode::Table {
+        fields: vec![("w".to_string(), wrapped)],
+    });
+    let root = module.push(Inode::Semantic {
+        tag: SemanticTag::Prompt,
+        inner: app,
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], None, false);
+    // A single segment over a semantic root used to panic.
+    let promise = agent
+        .call(lane, &cap, "evaluate", vec![path("w")])
+        .expect("queued");
+    agent.run();
+    let _ = promise.value();
+}
+
+/// A patch that removes the last secret still must not serve the pre-patch
+/// content address (round 14, H1).
+#[test]
+fn a_patch_removing_the_last_secret_serves_no_parent() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let root = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["patch", "provenance", "subgraph"], None, false);
+    let promise = agent
+        .call(lane, &cap, "patch", vec![path("s"), Arg::text("public")])
+        .expect("queued");
+    agent.run();
+    let cone = promise.value().expect("patch");
+    let Value::Module(bytes) = cone else {
+        panic!("a module: {cone:?}");
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    assert!(
+        decoded.provenance().is_none(),
+        "the cone carries the pre-patch address"
+    );
+
+    let promise = agent
+        .call(lane, &cap, "provenance", Vec::new())
+        .expect("queued");
+    agent.run();
+    if let Value::Map(fields) = promise.value().expect("provenance") {
+        assert!(!fields.contains_key("parent"), "{fields:?}");
+        for value in fields.values() {
+            if let Value::Text(text) = value {
+                assert!(!text.contains("blake3:"), "{text}");
+            }
+        }
+    }
+}
+
+/// An embedded content address is dropped like a bare one (round 14, L1).
+#[test]
+fn an_embedded_content_address_is_dropped() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let root = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+    module.set_provenance(Some(active_infinity::Provenance {
+        producer: Some("see blake3:0011 for the lineage".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: None,
+        entries: Vec::new(),
+    }));
+
+    let (agent, cap, lane) = install(module, &["provenance"], None, false);
+    let promise = agent
+        .call(lane, &cap, "provenance", Vec::new())
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("provenance");
+    let Value::Map(fields) = value else {
+        panic!("a map: {value:?}");
+    };
+    for text in fields.values() {
+        if let Value::Text(text) = text {
+            assert!(!text.contains("blake3:"), "{text}");
+        }
+    }
+}
