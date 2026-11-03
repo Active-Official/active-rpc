@@ -328,3 +328,69 @@ fn a_restored_capability_keeps_the_original_deadline() {
         .expect_err("the record's deadline passed");
     assert!(matches!(record_error, Error::Persistence(_)));
 }
+
+/// A borrowed handle names a capability this kernel minted for someone else.
+/// It must not attenuate (a grant laundered out of a borrow, with the owner's
+/// record pinned alive) or revoke (any receiver killing the sender).
+#[test]
+fn a_borrowed_handle_neither_attenuates_nor_revokes() {
+    let (agent, _provider, cap) = durable_agent();
+    let borrowed = agent.import(cap.id());
+    assert!(!borrowed.is_owning());
+
+    let error = agent
+        .attenuate(&borrowed, CapAttrs::new(&["echo"]))
+        .expect_err("a borrowed handle cannot attenuate");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+
+    let error = agent
+        .revoke(&borrowed)
+        .expect_err("a borrowed handle cannot revoke");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+
+    // The owner can still do both.
+    let child = agent
+        .attenuate(&cap, CapAttrs::new(&["echo"]))
+        .expect("the owner attenuates");
+    agent.revoke(&child).expect("the owner revokes");
+}
+
+/// The binding is reported before the tombstone: a wrong peer learns nothing
+/// about which record ids were revoked.
+#[test]
+fn a_tombstoned_record_reports_the_binding_first() {
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    agent.revoke(&cap).expect("revoke");
+    let error = agent
+        .restore_capability(&record, &admitted(b"someone-else"))
+        .expect_err("the wrong peer cannot probe the tombstone");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+    let error = agent
+        .restore_capability(&record, &admitted(b"durable-owner"))
+        .expect_err("the owner reaches the tombstone");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+/// An export of an expired capability says so on the tape, like every other
+/// expiry path.
+#[test]
+fn an_expired_export_is_an_expiry_event() {
+    let agent = Agent::with_secret([0x73; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x93; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let attrs = CapAttrs::new(&["echo"]).durable().with_ttl_ms(0);
+    let cap = agent
+        .mint_bound(&admitted(b"durable-owner"), provider, 0, attrs)
+        .expect("cap");
+    let error = agent
+        .export_capability(&cap)
+        .expect_err("an expired capability cannot be exported");
+    assert_eq!(error.code(), "rpc/revoked");
+    let json = agent.trace_json();
+    assert!(
+        json.contains("\"event\":\"cap.expired\""),
+        "the export refusal is not an expiry event: {json}"
+    );
+}

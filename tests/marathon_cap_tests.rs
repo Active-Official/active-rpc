@@ -234,8 +234,10 @@ fn a_revoked_durable_capability_cannot_be_restored() {
     let cap = durable_cap(&agent, provider);
     let record = agent.export_capability(&cap).expect("export");
     agent.revoke(&cap).expect("revoke");
+    // The record belongs to `owner`; the binding is reported before the
+    // tombstone, so the restore must present that peer to reach the tombstone.
     let error = agent
-        .restore_capability(&record, &admitted(b"revive"))
+        .restore_capability(&record, &admitted(b"owner"))
         .expect_err("a revoked record must not restore");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }

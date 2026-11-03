@@ -56,30 +56,30 @@ fn durable_cap(agent: &Agent, provider: ProviderId) -> active_rpc::CapHandle {
 }
 
 /// F1: a record that cannot be read back costs nothing.
+///
+/// Since R-03 round 4 the mint applies the record format's path-scope rule, so
+/// the capability that could never be exported is never created; the export
+/// gap this test was written for can no longer be reached.
 #[test]
 fn an_unexportable_record_costs_no_authority() {
     let (agent, provider) = durable_agent();
-    // A scope the parser refuses (over 1 KiB), which mint does not validate.
     let mut attrs = CapAttrs::new(&["echo"]).with_path("p".repeat(2_000));
     attrs.persistence = CapPersistence::Durable;
-    let cap = agent
+    let error = agent
         .mint_bound(&admitted(b"owner"), provider, 0, attrs)
-        .expect("cap");
-    let first = agent
-        .export_capability(&cap)
-        .expect_err("the record is unreadable");
-    assert_eq!(first.code(), "rpc/persistence");
-    // Nothing was burned: the same error again, from the build, not "already
-    // consumed", and the grant is still usable.
-    let second = agent.export_capability(&cap).expect_err("still unreadable");
-    assert_eq!(
-        second.to_string(),
-        first.to_string(),
-        "the second attempt reports the build error, not a consumed record"
-    );
-    // The grant is intact: the capability is still in the registry and the
-    // revocation path still reaches it.
-    agent.revoke(&cap).expect("the capability is still live");
+        .expect_err("a scope the record format cannot hold is refused at the mint");
+    assert_eq!(error.code(), "rpc/invalid-argument");
+
+    // Nothing was burned: a valid durable capability still mints and revokes.
+    let cap = agent
+        .mint_bound(
+            &admitted(b"owner"),
+            provider,
+            0,
+            CapAttrs::new(&["echo"]).durable(),
+        )
+        .expect("a valid durable cap");
+    agent.revoke(&cap).expect("the capability is live");
 }
 
 /// F4: a lease without a deadline would restore as unbounded.

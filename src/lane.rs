@@ -76,7 +76,7 @@ impl Lane {
 
     /// Record a completed call against the lane.
     pub fn complete(&mut self) {
-        self.completed += 1;
+        self.completed = self.completed.saturating_add(1);
         self.pending = self.pending.saturating_sub(1);
     }
 

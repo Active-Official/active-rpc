@@ -259,7 +259,7 @@ fn a_cancelled_call_is_recorded_as_a_refusal() {
 }
 
 #[test]
-fn an_out_of_band_resolve_is_recorded_as_a_refusal() {
+fn an_out_of_band_resolve_seals_an_admission() {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
     let (cap, lane) = ready(&agent);
@@ -269,10 +269,10 @@ fn an_out_of_band_resolve_is_recorded_as_a_refusal() {
         .expect("answer out of band");
     let receipts = agent.receipts();
     assert_eq!(receipts.len(), 1);
-    assert_eq!(
-        receipts[0].decision,
-        Decision::Refused("rpc/promise-resolved".to_string())
-    );
+    // The caller holds the answered value, so the decision is an admission.
+    // It used to be a refusal recorded by the dispatch that lost the race
+    // (R-02 round 4 #1).
+    assert_eq!(receipts[0].decision, Decision::Admitted);
 }
 
 // ---------------------------------------------------------------------------

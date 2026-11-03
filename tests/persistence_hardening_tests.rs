@@ -160,28 +160,27 @@ fn an_unsealed_record_parses_but_never_restores() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_export_that_would_be_unreadable_is_refused_before_it_costs_anything() {
+fn an_unreadable_path_scope_is_refused_at_mint() {
     let (agent, provider) = durable_agent();
-    // The parser refuses a path scope over 1024 bytes; a capability minted with
-    // one must not export, and the refusal must not burn the grant.
+    // The parser refuses a path scope over 1024 bytes. Since R-03 round 4 the
+    // mint applies the same rule, so a capability that could never be exported
+    // or restored is never created. (Before that round the mint accepted it and
+    // the export refused, leaving an unusable capability behind.)
     let mut attrs = CapAttrs::new(&["metadata"]);
     attrs.persistence = CapPersistence::Durable;
     attrs.path_scope = Some("p".repeat(2_000));
-    let cap = agent
-        .mint_bound(&admitted(b"owner"), provider, 0, attrs)
-        .expect("mint");
     let error = agent
-        .export_capability(&cap)
-        .expect_err("an unreadable record is refused");
-    assert_eq!(error.code(), "rpc/persistence");
-    // The grant is intact: a second export is refused for the same reason, not
-    // because the first reserved the meter.
-    let again = agent.export_capability(&cap).expect_err("still unreadable");
-    assert_eq!(again.code(), "rpc/persistence");
-    assert!(
-        !format!("{again}").contains("committed"),
-        "the first attempt must not have reserved the grant: {again}"
-    );
+        .mint_bound(&admitted(b"owner"), provider, 0, attrs)
+        .expect_err("an unreadable path scope is refused at the mint");
+    assert_eq!(error.code(), "rpc/invalid-argument");
+
+    // A control character in the scope is refused the same way.
+    let mut attrs = CapAttrs::new(&["metadata"]);
+    attrs.path_scope = Some("a\u{2028}b".to_string());
+    let error = agent
+        .mint(provider, 0, attrs)
+        .expect_err("a scope with a reordering character is refused");
+    assert_eq!(error.code(), "rpc/invalid-argument");
 }
 
 // ---------------------------------------------------------------------------

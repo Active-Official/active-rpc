@@ -701,6 +701,40 @@ struct DispatchGuard<'a> {
     provider: Option<Box<dyn Provider>>,
 }
 
+/// Fails the jobs of a batch that a panic prevented from running.
+///
+/// Provider code is contained by `catch_unwind`, but a panic in phase 1 (a
+/// substitution) or phase 3 (a settlement) would unwind past the batch and
+/// leave the remaining jobs dequeued and never scheduled: pending forever. The
+/// guard fails them on the way out.
+struct BatchGuard<'a> {
+    agent: &'a Agent,
+    pending: BTreeSet<u64>,
+}
+
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let ids = std::mem::take(&mut self.pending);
+        let Ok(mut kernel) = self.agent.cell.try_borrow_mut() else {
+            return;
+        };
+        for id in ids {
+            if kernel.jobs.contains_key(&id) {
+                kernel.fail_job(
+                    id,
+                    Error::Provider {
+                        code: "rpc/provider".to_string(),
+                    },
+                    true,
+                );
+            }
+        }
+    }
+}
+
 impl DispatchGuard<'_> {
     fn provider_mut(&mut self) -> &mut Box<dyn Provider> {
         self.provider
@@ -1033,6 +1067,7 @@ impl Agent {
         }
         if let Some(expires_at) = record.expires_at {
             if kernel.now_ms >= expires_at {
+                kernel.push_event(Event::CapExpired(cap.id()));
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
         }
@@ -1209,14 +1244,10 @@ impl Agent {
                 "the record is not sealed by this deployment",
             ));
         }
-        {
-            let kernel = self.cell.borrow();
-            if kernel.revoked_records.contains(&record.record_id) {
-                return Err(Error::Revoked(record_token(&record.record_id)));
-            }
-        }
         // The binding is about the caller, so it is reported before any state
-        // of this kernel. A record that names no peer would restore for anyone.
+        // of this kernel: a wrong peer learns nothing about whether a record id
+        // was tombstoned (round 4, #3). A record that names no peer would
+        // restore for anyone.
         let Some(bound) = record.bound_to else {
             return Err(Error::Identity("the record names no peer"));
         };
@@ -1225,6 +1256,12 @@ impl Agent {
             bound,
         ) {
             return Err(Error::Identity("the record is bound to a different peer"));
+        }
+        {
+            let kernel = self.cell.borrow();
+            if kernel.revoked_records.contains(&record.record_id) {
+                return Err(Error::Revoked(record_token(&record.record_id)));
+            }
         }
         {
             let kernel = self.cell.borrow();
@@ -1585,6 +1622,14 @@ impl Agent {
 
     /// Attenuate a capability. Refuses any widening.
     pub fn attenuate(&self, parent: &CapHandle, attrs: CapAttrs) -> Result<CapHandle> {
+        // A borrowed (imported) handle names a capability this kernel minted for
+        // someone else: attenuating it would launder a grant out of a borrow and
+        // pin the owner's record alive through `descendants` (round 4, #1).
+        if !parent.is_owning() {
+            return Err(Error::Identity(
+                "an imported handle cannot attenuate authority",
+            ));
+        }
         let parent_id = parent.id();
         let mut kernel = self.cell.borrow_mut();
         refresh_clock(&mut kernel);
@@ -1685,6 +1730,14 @@ impl Agent {
     /// linear walk. Each doomed record also tombstones its durable record id,
     /// so a record exported before the revocation cannot restore the authority.
     pub fn revoke(&self, cap: &CapHandle) -> Result<()> {
+        // Revocation is an owner action: a borrowed handle travels on a channel,
+        // and any receiver holding one could otherwise kill the sender's grant
+        // (round 4, #2).
+        if !cap.is_owning() {
+            return Err(Error::Identity(
+                "an imported handle cannot revoke authority",
+            ));
+        }
         let mut kernel = self.cell.borrow_mut();
         let id = cap.id();
         if !kernel.caps.contains_key(&id) {
@@ -3128,6 +3181,14 @@ impl Agent {
                 kernel.metrics.promises_double_settled.saturating_add(1);
         }
         settled.0?;
+        // The answer is the decision: mark the job receipted before the
+        // queued-job cleanup, which would otherwise seal a refusal for a call
+        // that was answered (R-02 round 4 #1).
+        if let Some(job) = &job {
+            if let Some(stored) = kernel.jobs.get_mut(&job.id) {
+                stored.receipted = true;
+            }
+        }
         // A promise answered out of band must not still run its provider: the
         // side effect would happen after the caller already has the answer.
         if let Some(job_id) = kernel
@@ -3157,6 +3218,13 @@ impl Agent {
         kernel.push_event(Event::PromiseResolved(promise.id));
         kernel.metrics.promises_resolved = kernel.metrics.promises_resolved.saturating_add(1);
         kernel.record_settled(promise.id);
+        drop(kernel);
+        if let Some(job) = &job {
+            // The caller holds this value: seal the decision here, so a later
+            // dispatch cannot seal a `Refused` receipt for a call that was
+            // answered (round 4, #1).
+            self.record_receipt(job, None);
+        }
         Ok(())
     }
 
@@ -3188,13 +3256,9 @@ impl Agent {
         cap: &CapHandle,
         envelope: &crate::wire::Envelope,
     ) -> Result<PromiseHandle> {
-        for arg in &envelope.args {
-            if matches!(arg, Arg::Promise(_) | Arg::Cap(_)) {
-                return Err(Error::Wire(
-                    "an envelope cannot carry a promise or capability argument",
-                ));
-            }
-        }
+        // The authority-argument guard is `call_with_origin_payload`'s, with
+        // `from_peer` set: one choke point instead of a copy that a new entry
+        // point can forget (round 4, #7).
         self.call_with_origin_payload(
             peer,
             lane,
@@ -3203,7 +3267,7 @@ impl Agent {
             envelope.args.clone(),
             envelope.payload.len() as u64,
             envelope.payload.clone(),
-            false,
+            true,
         )
     }
 
@@ -4054,15 +4118,16 @@ impl Agent {
             return Ok(());
         }
         let mut kernel = self.cell.borrow_mut();
-        if let Some(lane_record) = kernel.lanes.get(&lane) {
-            // `checked_add`: a saturated counter would pass every later check.
-            let total = lane_record
-                .bytes
-                .checked_add(bytes)
-                .ok_or(Error::BudgetExceeded("lane byte"))?;
-            if total > lane_record.budget.max_bytes {
-                return Err(Error::BudgetExceeded("lane byte"));
-            }
+        // A lane that no longer exists cannot bound the response: fail closed
+        // rather than deliver it against the capability alone (round 4, #2).
+        let lane_record = kernel.lanes.get(&lane).ok_or(Error::UnknownLane(lane.0))?;
+        // `checked_add`: a saturated counter would pass every later check.
+        let total = lane_record
+            .bytes
+            .checked_add(bytes)
+            .ok_or(Error::BudgetExceeded("lane byte"))?;
+        if total > lane_record.budget.max_bytes {
+            return Err(Error::BudgetExceeded("lane byte"));
         }
         let mut chain: Vec<CapId> = kernel
             .caps
@@ -4112,12 +4177,6 @@ impl Agent {
         // Each phase takes a short borrow and returns owned data.
         let (provider_id, provider, now_ms) = {
             let mut kernel = self.cell.borrow_mut();
-            kernel.metrics.round_trips += 1;
-            kernel.now_ms = if kernel.wall_clock {
-                kernel.now_ms.max(wall_now_ms())
-            } else {
-                kernel.now_ms.saturating_add(kernel.latency_ms)
-            };
             let Some(first) = batch.first().and_then(|id| kernel.jobs.get(id)) else {
                 return;
             };
@@ -4126,16 +4185,27 @@ impl Agent {
                 .get(&first.cap)
                 .map(|record| record.provider)
                 .unwrap_or(ProviderId(u64::MAX));
-            let lane_count: usize = batch
-                .iter()
-                .filter_map(|id| kernel.jobs.get(id).map(|job| job.lane.0))
-                .collect::<BTreeSet<u64>>()
-                .len();
-            kernel.push_event(Event::BatchDispatched {
-                provider: provider_id,
-                jobs: batch.len(),
-                lane_count,
-            });
+            // A batch whose provider has vanished is not a round trip: it used
+            // to advance the counter and emit `BatchDispatched` before failing
+            // every job (round 4, #6).
+            if kernel.providers.contains_key(&provider_id) {
+                kernel.metrics.round_trips += 1;
+                kernel.now_ms = if kernel.wall_clock {
+                    kernel.now_ms.max(wall_now_ms())
+                } else {
+                    kernel.now_ms.saturating_add(kernel.latency_ms)
+                };
+                let lane_count: usize = batch
+                    .iter()
+                    .filter_map(|id| kernel.jobs.get(id).map(|job| job.lane.0))
+                    .collect::<BTreeSet<u64>>()
+                    .len();
+                kernel.push_event(Event::BatchDispatched {
+                    provider: provider_id,
+                    jobs: batch.len(),
+                    lane_count,
+                });
+            }
             kernel.dispatching = true;
             let provider = kernel.providers.remove(&provider_id);
             // Captured with the provider so phase 2 (which holds no borrow) can
@@ -4166,6 +4236,12 @@ impl Agent {
             provider: Some(provider),
         };
         let mut first_panic: Option<Box<dyn std::any::Any + Send>> = None;
+        // Dropped after `guard`, so a panic in any phase fails the jobs that
+        // have not run yet instead of stranding them.
+        let mut batch_guard = BatchGuard {
+            agent: self,
+            pending: batch.iter().copied().collect(),
+        };
 
         for job_id in &batch {
             // Phase 1: decide, under a read borrow.
@@ -4508,7 +4584,9 @@ impl Agent {
             // will see: a refusal after that point (an egress budget, a module
             // carrying secret material) used to be sealed as `Admitted`, so the
             // audit artifact disagreed with the metric and the caller.
-            self.record_receipt(&job, outcome.as_ref().err());
+            if !resolved_out_of_band {
+                self.record_receipt(&job, outcome.as_ref().err());
+            }
 
             // Phase 3: settle under a write borrow.
             let mut kernel = self.cell.borrow_mut();
@@ -4621,6 +4699,7 @@ impl Agent {
                 job: *job_id,
                 lane: job.lane,
             });
+            batch_guard.pending.remove(job_id);
         }
 
         // Restore the kernel, then deliver the drops that happened during the
@@ -5016,6 +5095,25 @@ impl Kernel {
         // already has a receipt (admitted or refused at dispatch) is not
         // recorded twice.
         self.record_queued_refusal(job_id, &error);
+        // A job that never ran is still a refused call: the counters say so, and
+        // the tape too unless the caller coalesced a mass destroy
+        // (round 4, #3).
+        self.metrics.calls_refused = self.metrics.calls_refused.saturating_add(1);
+        if let Error::Identity(_) = &error {
+            self.metrics.identity_refusals = self.metrics.identity_refusals.saturating_add(1);
+        }
+        if events {
+            if let Some(job) = self.jobs.get(&job_id) {
+                let lane = job.lane;
+                let cap = job.cap;
+                let code = error.code().to_string();
+                self.push_event(Event::CallRefused {
+                    lane,
+                    cap: Some(cap),
+                    code,
+                });
+            }
+        }
         let deps = self
             .jobs
             .get(&job_id)
@@ -5243,8 +5341,34 @@ fn check_method_names(attrs: &CapAttrs) -> Result<()> {
             ));
         }
     }
+    // A path scope reaches the same surfaces (an event, an error message, the
+    // sealed record), and an empty scope is the one `from_json` refuses: a
+    // capability that cannot be exported or restored is a mint that should have
+    // failed (round 4, #6).
+    if let Some(scope) = &attrs.path_scope {
+        if !crate::security::valid_text(scope, MAX_PATH_SCOPE_BYTES) {
+            return Err(Error::InvalidArgument(
+                "a path scope must be 1..=1024 bytes without control or reordering characters",
+            ));
+        }
+    }
+    // A tool name is a method name on the other side of the policy.
+    if let Some(policy) = &attrs.tool_policy {
+        if policy
+            .allowed
+            .iter()
+            .any(|name| !crate::receipts::valid_method(name))
+        {
+            return Err(Error::InvalidArgument(
+                "a tool name must be 1..=1024 bytes without control characters",
+            ));
+        }
+    }
     Ok(())
 }
+
+/// Longest path scope a capability may carry.
+pub const MAX_PATH_SCOPE_BYTES: usize = 1_024;
 
 /// Refuse a binding that names no real peer.
 ///

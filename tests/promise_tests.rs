@@ -800,43 +800,38 @@ fn a_restored_child_cannot_outspend_its_parent() {
 /// stays with the capability and the record id is not burned, or a deployment
 /// that presents one malformed field loses both.
 #[test]
-fn a_refused_export_keeps_the_grant_and_the_record() {
+fn an_empty_path_scope_is_refused_at_the_mint() {
     let (agent, provider) = durable_agent();
     let owner = admitted(b"owner");
-    let caller = PeerIdentity::from_certificate(b"owner");
-    // `from_json` refuses an empty path scope, so this record could never be
-    // restored; the export refuses it at the source.
+    // `from_json` refuses an empty path scope, so such a record could never be
+    // restored. Since R-03 round 4 the mint applies the same rule, so the
+    // capability is never created and no authority is left unusable.
     let mut attrs = CapAttrs::new(&["echo"])
         .with_budget(Budget::calls(2))
         .with_path("");
     attrs.persistence = CapPersistence::Durable;
-    let cap = agent.mint_bound(&owner, provider, 0, attrs).expect("cap");
-
-    let refused = agent
-        .export_capability(&cap)
-        .expect_err("empty scope refused");
-    assert_eq!(refused.code(), "rpc/persistence", "{refused}");
-
-    // The grant did not move: both calls are still here.
-    let lane = agent.create_lane("kept", Budget::default()).expect("lane");
-    for _ in 0..2 {
-        let promise = agent
-            .call_as(Some(&caller), lane, &cap, "echo", Vec::new())
-            .expect("the refused export burned the grant");
-        agent.run();
-        promise.value().expect("value");
-    }
     let error = agent
-        .call_as(Some(&caller), lane, &cap, "echo", Vec::new())
-        .expect_err("the grant is spent by calls, not by the refusal");
-    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect_err("an empty scope is refused at the mint");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
 
-    // And the refusal is still the empty scope, not "already exported".
-    let again = agent.export_capability(&cap).expect_err("still refused");
-    assert!(
-        again.to_string().contains("empty path scope"),
-        "the record id was consumed by the refused export: {again}"
-    );
+    // A valid durable capability still mints, exports once, and is consumed.
+    let cap = agent
+        .mint_bound(
+            &owner,
+            provider,
+            0,
+            CapAttrs::new(&["echo"])
+                .with_budget(Budget::calls(2))
+                .durable(),
+        )
+        .expect("cap");
+    let record = agent.export_capability(&cap).expect("export");
+    let again = agent
+        .export_capability(&cap)
+        .expect_err("a record is exported once");
+    assert_eq!(again.code(), "rpc/persistence", "{again}");
+    assert_eq!(record.methods.len(), 1);
 }
 
 /// A tombstone is a kill switch: a capability restored from the record before

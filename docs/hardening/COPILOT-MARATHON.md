@@ -1291,6 +1291,41 @@ Residuals (no action): the `u64` promise counter wraps only at 2⁶⁴; pinned
 handles plus the 1024 idempotency entries bound retention by design;
 cross-provider chains cost one batch per provider by design.
 
+### R-03 capabilities - 2026-11-02 (round 4, confirmation)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `d4a40bc`. It verified the
+round-1..3 invariants (monotone attenuation on every field including the clock
+domain, no escalation through introduction or restore, revocation reaching
+descendants and tombstones, export carrying the remainder) and found two highs
+in the handle API.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `attenuate` accepted a borrowed/imported handle: a borrow laundered a grant and pinned the owner's record alive through `descendants` | **fixed**: an imported handle is `rpc/identity` (the owner attenuates); `a_borrowed_handle_neither_attenuates_nor_revokes` |
+| 2 | high | `revoke` accepted a borrowed handle, so any channel receiver holding an id could kill the sender's grant | **fixed**: the same ownership guard on `revoke` |
+| 3 | medium | `restore` checked the tombstone before the binding, contradicting its own ordering comment: a wrong peer could probe which record ids were revoked | **fixed**: binding first, then the tombstone; `a_tombstoned_record_reports_the_binding_first`; the two older tests now present the record's peer |
+| 4 | low | an expired export returned `Revoked` with no `cap.expired` event | **fixed**: the event, like every other expiry path; `an_expired_export_is_an_expiry_event` |
+| 5 | low | `Lane::complete` used an unchecked increment | **fixed**: `saturating_add` |
+| 6 | low | `path_scope` and tool-policy names were not validated as text at mint, while the record parser refuses them: a mint could produce an unexportable capability | **fixed**: `MAX_PATH_SCOPE_BYTES` and the method-name rule in `check_method_names`; the two tests that relied on the mint accepting an unreadable scope now assert the mint refuses it |
+| 7 | low | `from_peer` was never `true`, so the envelope authority guard existed twice and the generic choke point never fired | **fixed**: `call_from_envelope` passes `from_peer=true` and its duplicate loop is gone |
+
+### R-02 kernel dispatch - 2026-11-02 (round 4, confirmation)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `d4a40bc`. Rounds 1-3 hold;
+two highs and three mediums.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | an out-of-band resolve sealed no receipt, so the losing dispatch sealed `Refused` while the caller held a value | **fixed**: the resolve marks the job receipted before its cleanup and seals `Admitted`; a discarded dispatch outcome seals nothing; `an_out_of_band_resolve_seals_an_admission` |
+| 2 | high | egress skipped the lane leg when the lane was gone (a provider that destroyed its own lane mid-call could return a huge value unbilled) | **fixed**: a missing lane is `rpc/unknown-lane`; the mid-batch test now expects the running call's response to be refused |
+| 3 | medium | `fail_job` never counted `calls_refused` and emitted no `CallRefused`, so a destroyed lane's jobs were invisible to the counters | **fixed**: the counter always, the event unless the destroy is coalescing |
+| 4 | medium | a cached replay is served with no egress charge | **rejected with reasoning**: a replay performs no new delivery and no new provider work — that is the property the key exists for (R-04 round 2 #9), and charging it would make a retry fail exactly when the grant is tight |
+| 5 | medium | a panic in phase 1 or phase 3 stranded the rest of the batch (already dequeued, never scheduled) | **fixed**: `BatchGuard` fails any batch job still present on the way out |
+| 6 | low | a batch for a provider that vanished still emitted `BatchDispatched` and advanced the round-trip counter | **fixed**: the counter and the event come after the provider check |
+
+Gate: 771 tests all-features, 0 failed; control-plane green; clippy/fmt/doc
+clean; negative controls 9/9.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

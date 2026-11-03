@@ -343,11 +343,13 @@ fn destroying_a_lane_mid_batch_settles_its_running_call_once() {
     let queued_work = agent.call(lane, &cap, "work", Vec::new()).expect("work");
     agent.run();
 
-    assert_eq!(
-        kill.value()
-            .expect("the running call keeps its own outcome"),
-        Value::text("killed")
-    );
+    // The provider ran and destroyed its own lane, so the response cannot be
+    // delivered: egress is charged to the lane, and the lane no longer exists
+    // (R-02 round 4 #2). The promise is settled once, by its own dispatch.
+    let error = kill
+        .value()
+        .expect_err("a destroyed lane cannot deliver the response");
+    assert_eq!(error.code(), "rpc/unknown-lane");
     let error = queued_work
         .value()
         .expect_err("queued work on a destroyed lane is refused");
