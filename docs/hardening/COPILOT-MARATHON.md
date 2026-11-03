@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-22: ... + 5 findings; one clean round closes it | 123 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-13: ... + 11 findings; one clean round closes it | 112 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-14: ... + 9 findings; one clean round closes it | 119 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -121,6 +121,26 @@ are closed.
 | 6 | low | a `SchemaArray` element accepted any segment, and the public helpers disagreed with the capability resolver | **fixed**: only index `0`; the helpers fall back to the structural walk |
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 14)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `eb4fa43`.
+Two highs (one a round-13 regression) and two mediums, plus five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | an integer past `u64::MAX` or below `i64::MIN` is parsed as a float, so the round-13 check never saw it and two answers differed only by a value nobody wrote | **fixed**: `serde_json/arbitrary_precision` keeps the literal, so an integer with no fraction or exponent that does not fit `i64` is refused; the deleted cases are restored |
+| 2 | high | the node ceiling ran after the tree was decoded: a 64 MiB flat array allocated ~3.5 GiB before the refusal | **fixed**: a string-aware pass counts structural tokens before parsing and refuses `http/too-complex` |
+| 3 | medium | the receive line cap counted the delimiter while the send cap did not | **fixed**: the receive comparison allows the two delimiter bytes |
+| 4 | medium | `HTTP/1.<digit>` was a prefix, so `HTTP/1.1x 200` passed | **fixed**: the version is `HTTP/1.<digit>` followed by a space |
+| 5 | low | the process code table had a paragraph inside it and the new codes were undocumented | **fixed**: the table is whole; `*-too-complex` and the 16 MiB per-stream ceiling are documented |
+| 6 | low | a `setsid` descendant keeps the drain threads alive | **recorded** |
+| 7 | low | the 5 ms poll makes a short grant overshoot | **recorded** |
+| 8 | low | the wasm 128 KiB minimum is checked after the run | **recorded** for the ABI pass |
+| 9 | low | the fuel-per-memory prose was off | **recorded** |
+
+Gate: 88 suites / 878 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 13)

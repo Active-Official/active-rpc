@@ -32,6 +32,42 @@ use crate::value::{Arg, Call, Value};
 ///
 /// Such a number has no `Value` form; substituting `null` or a rounded float
 /// changes the meaning of a peer answer (round 12, F-1).
+/// Whether a JSON text has more structural tokens than the adapter will parse.
+///
+/// `serde_json` allocates the whole tree before any post-parse check can run,
+/// so the node ceiling has to be enforced on the text: counting the separators
+/// outside strings is O(bytes), allocation-free, and exceeds the node count
+/// (each element or field costs at least one) (round 14, F-2).
+pub fn json_text_too_complex(text: &str, limit: usize) -> bool {
+    let mut tokens = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b',' | b':' => {
+                tokens = tokens.saturating_add(1);
+                if tokens > limit {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a decoded tree holds a number with no `Value` form or too many nodes.
 pub fn json_has_unrepresentable_number(value: &Json) -> bool {
     let mut stack = vec![value];
     let mut nodes = 0usize;
@@ -45,10 +81,14 @@ pub fn json_has_unrepresentable_number(value: &Json) -> bool {
         }
         match value {
             Json::Number(number) => {
-                // `Value::Int` holds an `i64` and `Value::Float` an `f64`, so a
-                // float is representable. Only a u64 past `i64::MAX` has no
-                // form (round 13, F-1).
-                if number.as_i64().is_none() && number.as_u64().is_some() {
+                // With `arbitrary_precision` a number keeps its literal, so
+                // an integer too large for `i64` *and* `u64` is visible as one
+                // (round 14, F-1). A literal with a fraction or an exponent is
+                // a float, and `Value::Float` is its form.
+                let literal = number.to_string();
+                let integer =
+                    !literal.contains('.') && !literal.contains('e') && !literal.contains('E');
+                if integer && number.as_i64().is_none() {
                     return true;
                 }
             }
@@ -661,7 +701,7 @@ impl StdioTransport {
                         Ok(0) => Err(Error::Provider {
                             code: "mcp/eof".to_string(),
                         }),
-                        Ok(read) if read > MAX_MCP_LINE_BYTES => Err(Error::Provider {
+                        Ok(read) if read > MAX_MCP_LINE_BYTES + 2 => Err(Error::Provider {
                             code: "mcp/line-too-long".to_string(),
                         }),
                         Ok(_) => Ok(line.trim_end().to_string()),
@@ -1373,10 +1413,12 @@ impl HttpTool {
             .ok_or(Error::Provider {
                 code: "http/status".to_string(),
             })?;
-        let version_ok = status_line
-            .strip_prefix("HTTP/1.")
-            .and_then(|rest| rest.as_bytes().first())
-            .is_some_and(|byte| byte.is_ascii_digit());
+        // `HTTP/1.<digit>` followed by a space: a prefix check accepted
+        // `HTTP/1.1x 200` and `HTTP/1.12 200` (round 14, F-4).
+        let bytes = status_line.as_bytes();
+        let version_ok = bytes.starts_with(b"HTTP/1.")
+            && bytes.get(7).is_some_and(u8::is_ascii_digit)
+            && bytes.get(8) == Some(&b' ');
         if !version_ok {
             return Err(Error::Provider {
                 code: "http/status".to_string(),
@@ -1710,6 +1752,11 @@ impl Provider for HttpTool {
         let Ok(text) = String::from_utf8(response.clone()) else {
             return Ok(Response::Value(Value::Module(response)));
         };
+        if json_text_too_complex(&text, MAX_JSON_NODES) {
+            return Err(Error::Provider {
+                code: "http/too-complex".to_string(),
+            });
+        }
         let value = match serde_json::from_str::<Json>(&text) {
             Ok(json) if json_has_unrepresentable_number(&json) => {
                 return Err(Error::Provider {

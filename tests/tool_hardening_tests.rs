@@ -1410,6 +1410,18 @@ fn a_json_integer_past_i64_is_not_rounded() {
         active_rpc::tool::json_has_unrepresentable_number(&json),
         "a u64 past i64::MAX has no Value form"
     );
+    // Past `u64::MAX` and below `i64::MIN` serde keeps the literal, so the
+    // integer is still visible (round 14, F-1).
+    for literal in [
+        r#"{"debit": -9223372036854775809}"#,
+        r#"{"amount": 18446744073709551617}"#,
+    ] {
+        let json: serde_json::Value = serde_json::from_str(literal).expect("parse");
+        assert!(
+            active_rpc::tool::json_has_unrepresentable_number(&json),
+            "{literal}"
+        );
+    }
     // An ordinary decimal is representable: `Value::Float` is its form.
     let json = serde_json::json!({ "price": 9.99, "scaled": 1e3 });
     assert!(!active_rpc::tool::json_has_unrepresentable_number(&json));

@@ -211,7 +211,8 @@ session:
 | `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer |
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |
 | `mcp/desync` | more than `MAX_MCP_NOTIFICATIONS` notification frames arrived for one request, or the session was already poisoned |
-| `mcp/bad-number` | a result holds a JSON number with no `Value` form |
+| `mcp/bad-number` | a result holds a JSON integer with no `Value` form |
+| `mcp/too-complex` | a result tree holds more nodes than the adapter decodes (2^20) |
 | `mcp/initialize` | the server answered `initialize` with an error |
 | `mcp/tool-name` | an advertised tool name is absent or empty, is not `[A-Za-z0-9_.-]{1,128}`, or two tools share a name |
 | `mcp/tools` | the handshake result carries no `tools` array |
@@ -249,7 +250,8 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/interim` | a 1xx interim response arrived; the adapter does not follow it |
 | `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared |
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
-| `http/bad-number` | a JSON number is a u64 past `i64::MAX` (it has no `Value` form) |
+| `http/bad-number` | a JSON integer has no `Value` form (a literal without a fraction or exponent that is outside `i64`) |
+| `http/too-complex` | the answer's JSON has more structural tokens than the adapter decodes (2^20) |
 | `http/body-too-large` | the response body exceeded `max_body`, by its declared length or by its stream |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
@@ -276,11 +278,12 @@ interpolated into the request line.
 | `process/cwd` | the working directory could not be pinned at construction |
 | `process/thread:<err>` | a pipe reader thread could not start; the child is killed |
 | `rpc/budget-exceeded` | the wall grant is zero |
-
-The effective output ceiling is the smaller of `max_output` and 16 MiB.
 | `rpc/timeout` | the call exceeded the effective wall ceiling; the whole process group was killed |
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
-| `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, the output exceeded `max_output`, or process execution was not granted |
+| `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, the output exceeded the effective ceiling, or process execution was not granted |
+
+The effective output ceiling is the smaller of `max_output` and 16 MiB per
+stream.
 
 `LocalProcess::new` requires an absolute program path. A bare name would be
 resolved from the parent's `PATH`, which is ambient authority: anything that can
