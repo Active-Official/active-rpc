@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-18: ... + 5 findings (round 18: no critical/high/medium); one more clean round closes it | 107 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-10: ... + 10 findings; round-10 fixes green, confirmation round pending | 77 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-11: ... + 14 findings (round 11: no critical/high); one more clean round closes it | 89 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,47 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 19)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `b1a331f`. Two highs and two
+mediums; the round-18 test only tripped the provider gate.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the engine reports its ceilings as evaluation codes (`active/X001..X006`), so a budget refusal answered `rpc/domain` and the `Limit` arm was dead | **fixed**: those codes map to `rpc/budget-exceeded` with their dimension; `an_evaluator_array_ceiling_is_a_budget_refusal` (200k elements) |
+| 2 | high | two resolvers: the provider's `resolve` walked tables only, so a dotted array path (`app.0`) or a semantic wrapper answered `rpc/invalid-argument` | **fixed**: both resolution sites fall back to `structural_resolve`; `an_array_element_path_resolves` |
+| 3 | medium | the Connect head-error refusal did not drain before closing (the other 13 did) | **fixed** |
+| 4 | medium | the drain stopped after 16 reads, so a 1 MiB body still ended in a reset that discarded the 413 | **fixed**: time-bounded, 16 KiB chunks |
+| 5 | low | `SchemaArray` was missing from both walkers | **fixed** |
+| 6 | low | bridge and projection depth ceilings collapsed to `"value"` | **fixed**: prefix-matched |
+
+Gate: 88 suites / 866 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 11)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `b1a331f`.
+No criticals or highs; two mediums and twelve lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the send deadline did not cover the enqueue: a full capacity-1 writer queue made the next send wait forever | **fixed**: `try_send` under the deadline, 1 ms polls, `Timeout` on expiry |
+| 2 | medium | the flood refusal covered the wait loop but not the post-exit reader wait, so a descendant that outlived the leader still burned the grant | **fixed**: the same ceiling in that arm |
+| 3 | low | a JSON integer past `i64::MAX` was rounded through `f64` | **fixed**: it answers `null`, never a different number; `a_json_integer_past_i64_is_not_rounded` |
+| 4 | low | lossy UTF-8 transcoding handed the caller bytes the peer never wrote | **recorded**: the adapters are text protocols; a binary result needs a module payload, tracked with the tool policy |
+| 5 | low | a `request` with no method guessed `GET` | **fixed**: refused; `a_request_without_a_method_is_refused` |
+| 6 | low | the process code table lacked `process/thread` and `rpc/budget-exceeded` | **fixed** |
+| 7 | low | `security.md` still said the deadline covers resolution | **fixed** |
+| 8 | low | the `mcp/bad-response` row did not describe a malformed `error` | **fixed** |
+| 9 | low | the workdir stays absolute-checked rather than canonicalised | **recorded** in both specs |
+| 10 | low | the wall ceiling starts after the spawn | **recorded** |
+| 11 | low | wasm memory grown inside `run` is not fuel-charged | **recorded**: the store ceiling still fails closed |
+| 12 | low | a dead statement from round 10 | **fixed** |
+| 13 | low | the wasm scope refusal had no test | **fixed**: `a_scoped_wasm_call_is_refused` |
+| 14 | low | public `max_body`/`max_request` fed an allocation | **fixed**: clamped to 64 MiB at use |
+
+Gate: as above (the same commit).
 
 ### R-07 domain operations - 2026-11-03 (round 18)
 

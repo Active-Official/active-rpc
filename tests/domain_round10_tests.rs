@@ -752,3 +752,59 @@ fn the_synthetic_level_counts_against_the_ceiling() {
         .expect_err("the converted value is too deep");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 19
+// ---------------------------------------------------------------------------
+
+/// The evaluator's own ceilings are budget refusals, not domain faults
+/// (round 19, #1).
+#[test]
+fn an_evaluator_array_ceiling_is_a_budget_refusal() {
+    let mut module = InfinityModule::new();
+    let value = module.push(Inode::Int(1));
+    let elements: Vec<active_infinity::NodeId> = vec![value; 200_000];
+    let array = module.push(Inode::Array { elements });
+    let root = module.push(Inode::Table {
+        fields: vec![("a".to_string(), array)],
+    });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let mut call = Call::new("evaluate", vec![path("a")]);
+    call.budget = Budget {
+        max_nodes: 1_000_000,
+        max_array_len: 16,
+        ..Budget::default()
+    };
+    let error = active_rpc::kernel::Provider::invoke(&mut provider, object, &call)
+        .expect_err("the array ceiling trips");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A dotted path into an array resolves for a scoped capability (round 19, #2).
+#[test]
+fn an_array_element_path_resolves() {
+    let mut module = InfinityModule::new();
+    let first = module.push(Inode::Str("first".to_string()));
+    let second = module.push(Inode::Str("second".to_string()));
+    let array = module.push(Inode::Array {
+        elements: vec![first, second],
+    });
+    let app = module.push(Inode::Table {
+        fields: vec![("list".to_string(), array)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], Some("app"), false);
+    let promise = agent
+        .call(lane, &cap, "evaluate", vec![path("app.list.1")])
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("an array element is a name");
+    assert_eq!(value, Value::text("second"));
+}

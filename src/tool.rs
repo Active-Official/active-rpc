@@ -34,6 +34,12 @@ pub fn json_to_value(value: &Json) -> Value {
         Json::Null => Value::Null,
         Json::Bool(flag) => Value::Bool(*flag),
         Json::Number(number) => {
+            // A u64 past `i64::MAX` has no `Value` form; rounding it through
+            // `f64` handed the caller a number the peer never wrote
+            // (round 11, #3).
+            if number.as_i64().is_none() && number.as_u64().is_some() {
+                return Value::Null;
+            }
             if let Some(int) = number.as_i64() {
                 Value::Int(int)
             } else {
@@ -156,6 +162,12 @@ pub trait McpTransport {
         self.recv_line()
     }
 }
+
+/// Largest HTTP response body this adapter will buffer.
+///
+/// A public `max_body` past this is clamped: the peer names the length, and an
+/// unbounded buffer is an allocation abort (round 11, #14).
+const MAX_RESPONSE_BYTES: usize = 64 << 20;
 
 /// Default ceiling for a handshake that names none.
 const DEFAULT_HANDSHAKE_MS: u64 = DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS;
@@ -682,11 +694,30 @@ impl McpTransport for StdioTransport {
             }
         }
         let (reply, outcome) = std::sync::mpsc::channel();
-        self.writer
-            .send((line.to_string(), reply))
-            .map_err(|_| Error::Provider {
-                code: "mcp/write:closed".to_string(),
-            })?;
+        // A blocking `send` on the capacity-1 queue has no ceiling: a writer
+        // stuck in `write_all` leaves the queue full and the next send waits
+        // forever (round 11, #1). `try_send` under the deadline keeps the
+        // promise the trait makes.
+        let mut command = (line.to_string(), reply);
+        loop {
+            match self.writer.try_send(command) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(Error::Provider {
+                        code: "mcp/write:closed".to_string(),
+                    })
+                }
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    command = returned;
+                    if let Some(deadline) = deadline {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(Error::Timeout);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
         match deadline {
             None => outcome.recv().map_err(|_| Error::Provider {
                 code: "mcp/write:closed".to_string(),
@@ -932,7 +963,6 @@ impl<T: McpTransport> McpSession<T> {
                     // flight: retrying would read it as the next answer while
                     // the peer has already run the (possibly mutating) tool
                     // (round 10, F-3).
-                    let _ = matches!(error, Error::Timeout);
                     self.poisoned = true;
                     return Err(error);
                 }
@@ -1389,13 +1419,16 @@ impl HttpTool {
         }
         let body = match content_length {
             Some(length) => {
-                if length > self.max_body {
+                // The peer names this length; a caller-set `max_body` past a
+                // sane ceiling would turn it into an allocation abort
+                // (round 11, #14).
+                if length > MAX_RESPONSE_BYTES || length > self.max_body {
                     return Err(Error::ToolPolicy("response too large"));
                 }
                 reader.body_exact(length)?
             }
             None => {
-                let rest = reader.body_rest(self.max_body)?;
+                let rest = reader.body_rest(self.max_body.min(MAX_RESPONSE_BYTES))?;
                 if rest.len() > self.max_body {
                     return Err(Error::ToolPolicy("response too large"));
                 }
@@ -1489,7 +1522,9 @@ impl Provider for HttpTool {
                 requested
                     .first()
                     .map(|text| text.to_ascii_uppercase())
-                    .unwrap_or_else(|| "GET".to_string())
+                    // Guessing `GET` would act on a method the caller never
+                    // named (round 11, #5).
+                    .ok_or(Error::InvalidArgument("an HTTP request names one method"))?
             }
             other => {
                 return Err(Error::MethodNotGranted {
@@ -2078,6 +2113,13 @@ impl Provider for LocalProcess {
                         stdout = buffer;
                     } else {
                         stderr = buffer;
+                    }
+                    // A descendant that outlives the leader can flood after it
+                    // exits; refuse at the same ceiling instead of waiting out
+                    // the grant (round 11, #2).
+                    if stdout.len() > self.max_output || stderr.len() > self.max_output {
+                        kill_process_tree(&mut child);
+                        return Err(Error::ToolPolicy("output too large"));
                     }
                 }
                 Err(_) => {

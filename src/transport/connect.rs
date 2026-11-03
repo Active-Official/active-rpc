@@ -277,6 +277,7 @@ impl BridgeServer {
                     b"rpc/wire"
                 };
                 let _ = write_http_response(&mut stream, status, body);
+                drain_before_close(&mut stream);
                 return 0;
             }
         };
@@ -491,9 +492,13 @@ fn read_head(
 fn drain_before_close(stream: &mut TcpStream) {
     use std::io::Read;
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-    let mut sink = [0u8; 4096];
-    for _ in 0..16 {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+    // Bounded by time, not by iterations: a 1 MiB body arriving in 4 KiB
+    // segments is 256 reads, and stopping at 16 let the close reset it and
+    // discard the refusal (round 19, #4).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut sink = [0u8; 16 * 1024];
+    while std::time::Instant::now() < deadline {
         match stream.read(&mut sink) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}

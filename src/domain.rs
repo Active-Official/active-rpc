@@ -184,6 +184,10 @@ impl ModuleProvider {
         let path =
             Self::path_arg(call).ok_or(Error::InvalidArgument("a path argument is required"))?;
         let node = active_infinity::interop::resolve_path(module, &path)
+            // A dotted path into an array (`app.0`) or through a semantic
+            // wrapper is a legitimate name the library resolver does not walk
+            // (round 19, #2).
+            .or_else(|| structural_resolve(module, &path))
             .ok_or(Error::InvalidArgument("path does not resolve"))?;
         Ok((path, node))
     }
@@ -217,6 +221,7 @@ impl ModuleProvider {
                 let (value, _diagnostics) = match Self::path_arg(call) {
                     Some(path) => {
                         let node = active_infinity::interop::resolve_path(&slot.module, &path)
+                            .or_else(|| structural_resolve(&slot.module, &path))
                             .ok_or(Error::InvalidArgument("path does not resolve"))?;
                         // Evaluation follows references: a scoped capability
                         // must not read a value that is built from data outside
@@ -235,6 +240,26 @@ impl ModuleProvider {
                     None => evaluate_for_caller(&slot.module, &slot.module, budget),
                 }
                 .map_err(|error| match &error {
+                    active_infinity::Error::Evaluation(code) if code.starts_with("active/X00") => {
+                        // The engine reports its ceilings as evaluation codes
+                        // (X001 nodes .. X006 value size); a caller branches on
+                        // them and must not be told this is a domain fault
+                        // (round 19, #1).
+                        let kind = if code.contains("node") {
+                            "nodes"
+                        } else if code.contains("wall") {
+                            "wall"
+                        } else if code.contains("depth") {
+                            "depth"
+                        } else if code.contains("array") {
+                            "array_len"
+                        } else if code.contains("keys") {
+                            "keys"
+                        } else {
+                            "value"
+                        };
+                        Error::BudgetExceeded(kind)
+                    }
                     active_infinity::Error::Evaluation(code) => Error::Domain(code),
                     // A resource ceiling the evaluator hit is this provider's
                     // budget refusal, not a payload fault: a caller branches on
@@ -253,6 +278,10 @@ impl ModuleProvider {
                             "array_len"
                         } else if kind.starts_with("key") {
                             "keys"
+                        } else if kind.contains("depth") {
+                            "depth"
+                        } else if kind.contains("node") {
+                            "nodes"
                         } else {
                             // The provider's own vocabulary is closed; an
                             // unknown dimension is the value budget.
@@ -1240,6 +1269,7 @@ fn structural_resolve(module: &InfinityModule, path: &str) -> Option<NodeId> {
                 let index: usize = segment.parse().ok()?;
                 *elements.get(index)?
             }
+            Inode::SchemaArray { element } => *element,
             _ => return None,
         };
     }
