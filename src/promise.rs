@@ -83,6 +83,10 @@ impl PromiseRecord {
                 self.state = PromiseState::Resolved(value);
                 Ok(())
             }
+            // A cancelled promise is not "already resolved": a caller that
+            // branches on the code would retry a call the caller cancelled
+            // (round 7, #4).
+            PromiseState::Cancelled => Err(Error::PromiseCancelled(self.id.0)),
             _ => Err(Error::PromiseAlreadyResolved(self.id.0)),
         }
     }
@@ -94,6 +98,7 @@ impl PromiseRecord {
                 self.state = PromiseState::Rejected(error);
                 Ok(())
             }
+            PromiseState::Cancelled => Err(Error::PromiseCancelled(self.id.0)),
             _ => Err(Error::PromiseAlreadyResolved(self.id.0)),
         }
     }

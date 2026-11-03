@@ -3213,6 +3213,10 @@ impl Agent {
                 if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
                     lane_record.complete();
                 }
+                // The answered job never ran, but a tape that ends at
+                // `call.queued` cannot tell that from a stranded job
+                // (round 7, #3).
+                kernel.push_event(Event::JobCompleted { job: job_id, lane });
             }
         }
         kernel.push_event(Event::PromiseResolved(promise.id));
@@ -3776,14 +3780,14 @@ impl Agent {
 
         let targets_set: BTreeSet<PromiseId> = seen;
         let queued_ids: BTreeSet<u64> = kernel.queue.iter().copied().collect();
-        let queued: Vec<(u64, PromiseId, u64)> = kernel
+        let queued: Vec<(u64, PromiseId, u64, CapId)> = kernel
             .jobs
             .iter()
             .filter(|(id, job)| queued_ids.contains(id) && targets_set.contains(&job.promise))
-            .map(|(id, job)| (*id, job.promise, job.lane.0))
+            .map(|(id, job)| (*id, job.promise, job.lane.0, job.cap))
             .collect();
         let mut queued_promises: BTreeSet<PromiseId> = BTreeSet::new();
-        for (job_id, promise_id, lane) in queued {
+        for (job_id, promise_id, lane, cap) in queued {
             kernel.record_queued_refusal(job_id, &Error::PromiseCancelled(promise_id.0));
             kernel.queue.retain(|queued_id| *queued_id != job_id);
             let deps = kernel
@@ -3798,7 +3802,7 @@ impl Agent {
             kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
             kernel.push_event(Event::CallRefused {
                 lane: LaneId(lane),
-                cap: None,
+                cap: Some(cap),
                 code: "rpc/promise-cancelled".to_string(),
             });
             if let Some(lane_record) = kernel.lanes.get_mut(&LaneId(lane)) {
@@ -3819,6 +3823,18 @@ impl Agent {
         for id in &cancelled {
             if !queued_promises.contains(id) {
                 kernel.record_settled(*id);
+                // The target's job is in the current batch and its provider is
+                // running. Its dispatch will discard the outcome, so without a
+                // receipt here the executed work leaves no decision on the tape
+                // (round 7, #1).
+                if let Some(job) = kernel.jobs.values().find(|job| job.promise == *id).cloned() {
+                    if !job.receipted && kernel.receipts_enabled {
+                        kernel.seal_receipt(&job, Some(&Error::PromiseCancelled(id.0)));
+                    }
+                    if let Some(stored) = kernel.jobs.get_mut(&job.id) {
+                        stored.receipted = true;
+                    }
+                }
             }
         }
         // The caller gets the promises this call cancelled, not every dependent

@@ -254,6 +254,14 @@ pub struct WireLimits {
     pub max_caps: u32,
     /// Maximum methods per descriptor.
     pub max_methods: u32,
+    /// Maximum values one envelope may decode to, cumulatively.
+    ///
+    /// A frame is bounded by bytes, but a byte can be a whole value (`Null`),
+    /// so a 64 MiB frame of nulls is 64 million `Value`s. This ceiling bounds
+    /// the decoded arena, not the frame.
+    pub max_values: u32,
+    /// Maximum elements in one list or map.
+    pub max_array_len: u32,
 }
 
 impl Default for WireLimits {
@@ -265,6 +273,8 @@ impl Default for WireLimits {
             max_payload: 32 << 20,
             max_caps: 1 << 8,
             max_methods: 64,
+            max_values: 1 << 20,
+            max_array_len: 1 << 20,
         }
     }
 }
@@ -279,6 +289,8 @@ impl WireLimits {
             max_payload: 1 << 20,
             max_caps: 16,
             max_methods: 16,
+            max_values: 1 << 16,
+            max_array_len: 1 << 12,
         }
     }
 }
@@ -425,8 +437,14 @@ impl Envelope {
             return Err(Error::Wire("argument count exceeds the ceiling"));
         }
         let mut args = Vec::with_capacity(arg_count as usize);
+        let mut remaining_values = limits.max_values;
         for _ in 0..arg_count {
-            args.push(read_arg(bytes, &mut cursor)?);
+            args.push(read_arg(
+                bytes,
+                &mut cursor,
+                &mut remaining_values,
+                limits.max_array_len,
+            )?);
         }
         let payload_len = read_u32(bytes, &mut cursor)?;
         if payload_len > limits.max_payload {
@@ -445,12 +463,20 @@ impl Envelope {
             return Err(Error::CapabilityTable("too many descriptors"));
         }
         let mut caps = Vec::with_capacity(cap_count as usize);
+        let mut seen: BTreeSet<[u8; 16]> = BTreeSet::new();
         for _ in 0..cap_count {
-            caps.push(read_cap(bytes, &mut cursor, limits.max_methods)?);
+            let descriptor = read_cap(bytes, &mut cursor, &limits)?;
+            if !seen.insert(descriptor.id.0) {
+                // The same id twice with different descriptors would make the
+                // table's meaning depend on import order (the delta path already
+                // refuses this).
+                return Err(Error::CapabilityTable("duplicate capability id"));
+            }
+            caps.push(descriptor);
         }
         let cap_delta = if flags & FLAG_CAP_DELTA != 0 {
             if cursor + 32 > bytes.len() {
-                return Err(Error::Wire("truncated cap-table delta"));
+                return Err(Error::CapabilityTable("truncated cap-table delta"));
             }
             let mut base = [0u8; 32];
             base.copy_from_slice(&bytes[cursor..cursor + 32]);
@@ -462,7 +488,7 @@ impl Envelope {
             let mut removed = Vec::with_capacity(removed_count as usize);
             for _ in 0..removed_count {
                 if cursor + 16 > bytes.len() {
-                    return Err(Error::Wire("truncated delta id"));
+                    return Err(Error::CapabilityTable("truncated delta id"));
                 }
                 let mut id = [0u8; 16];
                 id.copy_from_slice(&bytes[cursor..cursor + 16]);
@@ -475,7 +501,7 @@ impl Envelope {
             }
             let mut added = Vec::with_capacity(added_count as usize);
             for _ in 0..added_count {
-                added.push(read_cap(bytes, &mut cursor, limits.max_methods)?);
+                added.push(read_cap(bytes, &mut cursor, &limits)?);
             }
             Some(CapTableDelta {
                 base,
@@ -552,6 +578,16 @@ fn write_arg(out: &mut Vec<u8>, arg: &Arg) -> Result<()> {
 }
 
 fn write_value(out: &mut Vec<u8>, value: &Value) -> Result<()> {
+    write_value_at(out, value, 0)
+}
+
+fn write_value_at(out: &mut Vec<u8>, value: &Value, depth: usize) -> Result<()> {
+    // The decoder refuses a value deeper than the ceiling, so the encoder must
+    // too: recursing first would overflow the stack on a value the kernel would
+    // never accept (round 2, #2).
+    if depth > MAX_VALUE_DEPTH {
+        return Err(Error::Wire("value nesting exceeds the ceiling"));
+    }
     match value {
         Value::Null => out.push(0),
         Value::Bool(flag) => {
@@ -574,7 +610,7 @@ fn write_value(out: &mut Vec<u8>, value: &Value) -> Result<()> {
             out.push(5);
             out.extend_from_slice(&(items.len() as u32).to_le_bytes());
             for item in items {
-                write_value(out, item)?;
+                write_value_at(out, item, depth + 1)?;
             }
         }
         Value::Map(entries) => {
@@ -582,7 +618,7 @@ fn write_value(out: &mut Vec<u8>, value: &Value) -> Result<()> {
             out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
             for (key, value) in entries {
                 write_str(out, key)?;
-                write_value(out, value)?;
+                write_value_at(out, value, depth + 1)?;
             }
         }
         Value::Secret => out.push(7),
@@ -678,10 +714,20 @@ fn read_opt_str(bytes: &[u8], cursor: &mut usize, max: u32) -> Result<Option<Str
     }
 }
 
-fn read_arg(bytes: &[u8], cursor: &mut usize) -> Result<Arg> {
+fn read_arg(
+    bytes: &[u8],
+    cursor: &mut usize,
+    remaining_values: &mut u32,
+    max_array_len: u32,
+) -> Result<Arg> {
     let tag = read_u8(bytes, cursor)?;
     match tag {
-        0 => Ok(Arg::Value(read_value(bytes, cursor)?)),
+        0 => Ok(Arg::Value(read_value(
+            bytes,
+            cursor,
+            remaining_values,
+            max_array_len,
+        )?)),
         1 => {
             let id = read_u64(bytes, cursor)?;
             Ok(Arg::Promise(PromiseId(id)))
@@ -702,14 +748,38 @@ fn read_arg(bytes: &[u8], cursor: &mut usize) -> Result<Arg> {
 /// Deepest value nesting an envelope may carry.
 pub const MAX_VALUE_DEPTH: usize = 64;
 
-fn read_value(bytes: &[u8], cursor: &mut usize) -> Result<Value> {
-    read_value_at(bytes, cursor, 0, bytes.len())
+fn read_value(
+    bytes: &[u8],
+    cursor: &mut usize,
+    remaining_values: &mut u32,
+    max_array_len: u32,
+) -> Result<Value> {
+    read_value_at(
+        bytes,
+        cursor,
+        0,
+        bytes.len(),
+        remaining_values,
+        max_array_len,
+    )
 }
 
-fn read_value_at(bytes: &[u8], cursor: &mut usize, depth: usize, budget: usize) -> Result<Value> {
+fn read_value_at(
+    bytes: &[u8],
+    cursor: &mut usize,
+    depth: usize,
+    budget: usize,
+    remaining_values: &mut u32,
+    max_array_len: u32,
+) -> Result<Value> {
     if depth > MAX_VALUE_DEPTH {
         return Err(Error::Wire("value nesting exceeds the ceiling"));
     }
+    // One byte can decode to one value, so the byte ceiling alone does not bound
+    // the arena: a 64 MiB frame of nulls is 64 million `Value`s.
+    *remaining_values = remaining_values
+        .checked_sub(1)
+        .ok_or(Error::Wire("value count exceeds the ceiling"))?;
     let tag = read_u8(bytes, cursor)?;
     let value = match tag {
         0 => Value::Null,
@@ -729,11 +799,21 @@ fn read_value_at(bytes: &[u8], cursor: &mut usize, depth: usize, budget: usize) 
             if count as usize > budget {
                 return Err(Error::Wire("list too long"));
             }
+            if count > max_array_len {
+                return Err(Error::Wire("list is wider than the ceiling"));
+            }
             // Never preallocate from an untrusted count: the loop grows the
             // vector and stops when the input runs out.
             let mut items = Vec::with_capacity((count as usize).min(1024));
             for _ in 0..count {
-                items.push(read_value_at(bytes, cursor, depth + 1, budget)?);
+                items.push(read_value_at(
+                    bytes,
+                    cursor,
+                    depth + 1,
+                    budget,
+                    remaining_values,
+                    max_array_len,
+                )?);
             }
             Value::List(items)
         }
@@ -742,10 +822,20 @@ fn read_value_at(bytes: &[u8], cursor: &mut usize, depth: usize, budget: usize) 
             if count as usize > budget {
                 return Err(Error::Wire("map too large"));
             }
+            if count > max_array_len {
+                return Err(Error::Wire("map is wider than the ceiling"));
+            }
             let mut entries = std::collections::BTreeMap::new();
             for _ in 0..count {
                 let key = read_str(bytes, cursor, budget as u32)?;
-                let value = read_value_at(bytes, cursor, depth + 1, budget)?;
+                let value = read_value_at(
+                    bytes,
+                    cursor,
+                    depth + 1,
+                    budget,
+                    remaining_values,
+                    max_array_len,
+                )?;
                 if entries.insert(key, value).is_some() {
                     // A duplicate key decodes to one entry and re-encodes shorter,
                     // so two byte images would name one value.
@@ -788,7 +878,7 @@ fn read_budget(bytes: &[u8], cursor: &mut usize) -> Result<Budget> {
     })
 }
 
-fn read_cap(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<CapDescriptor> {
+fn read_cap(bytes: &[u8], cursor: &mut usize, limits: &WireLimits) -> Result<CapDescriptor> {
     // Every fault inside a descriptor is a capability-table fault (§3.1), so the
     // scalar readers are mapped here instead of leaking `rpc/wire`.
     let table = |error: Error| match error {
@@ -798,10 +888,10 @@ fn read_cap(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<CapDes
         Error::Wire(message) => Error::CapabilityTable(message),
         _ => Error::CapabilityTable("malformed capability descriptor"),
     };
-    read_cap_inner(bytes, cursor, max_methods).map_err(table)
+    read_cap_inner(bytes, cursor, limits).map_err(table)
 }
 
-fn read_cap_inner(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<CapDescriptor> {
+fn read_cap_inner(bytes: &[u8], cursor: &mut usize, limits: &WireLimits) -> Result<CapDescriptor> {
     let mut id = [0u8; 16];
     if *cursor + 16 > bytes.len() {
         return Err(Error::CapabilityTable("truncated capability id"));
@@ -812,7 +902,7 @@ fn read_cap_inner(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<
         return Err(Error::CapabilityTable("zero capability id"));
     }
     let count = read_u32(bytes, cursor)?;
-    if count > max_methods {
+    if count > limits.max_methods {
         return Err(Error::CapabilityTable("too many methods"));
     }
     if count == 0 {
@@ -822,7 +912,10 @@ fn read_cap_inner(bytes: &[u8], cursor: &mut usize, max_methods: u32) -> Result<
     }
     let mut methods = BTreeSet::new();
     for _ in 0..count {
-        let method = read_str(bytes, cursor, 256)?;
+        // The method bound is the caller's profile, not a constant: a strict
+        // peer refused 100-byte methods at the envelope but accepted them in a
+        // descriptor (round 2, #6).
+        let method = read_str(bytes, cursor, limits.max_method)?;
         if !methods.insert(method) {
             // A duplicate would decode to a smaller set than the bytes encode,
             // so re-encoding would not reproduce the frame and a delta base
@@ -874,8 +967,13 @@ pub fn decode_capability_table_with(
         return Err(Error::CapabilityTable("too many descriptors"));
     }
     let mut caps = Vec::with_capacity((count as usize).min(64));
+    let mut seen: BTreeSet<[u8; 16]> = BTreeSet::new();
     for _ in 0..count {
-        caps.push(read_cap(bytes, &mut cursor, limits.max_methods)?);
+        let descriptor = read_cap(bytes, &mut cursor, limits)?;
+        if !seen.insert(descriptor.id.0) {
+            return Err(Error::CapabilityTable("duplicate capability id"));
+        }
+        caps.push(descriptor);
     }
     if cursor != bytes.len() {
         return Err(Error::CapabilityTable("trailing bytes"));

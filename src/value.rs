@@ -20,7 +20,7 @@ use crate::cap::CapId;
 use crate::promise::PromiseId;
 
 /// A value crossing the RPC boundary.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     /// Absent value.
     Null,
@@ -330,6 +330,30 @@ impl Value {
         }
         shape.size = total;
         shape
+    }
+}
+
+impl PartialEq for Value {
+    /// Structural equality with bit-exact floats.
+    ///
+    /// The derived implementation answered `NaN != NaN`, so two identical wire
+    /// images compared unequal (an idempotency and replay bypass) and `0.0`
+    /// equalled `-0.0` although the bytes differ. Comparing the bit pattern is
+    /// the only equality consistent with the codec (round 2, #3).
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(left), Value::Bool(right)) => left == right,
+            (Value::Int(left), Value::Int(right)) => left == right,
+            (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
+            (Value::Text(left), Value::Text(right)) => left == right,
+            (Value::Path(left), Value::Path(right)) => left == right,
+            (Value::Module(left), Value::Module(right)) => left == right,
+            (Value::Secret, Value::Secret) => true,
+            (Value::List(left), Value::List(right)) => left == right,
+            (Value::Map(left), Value::Map(right)) => left == right,
+            _ => false,
+        }
     }
 }
 

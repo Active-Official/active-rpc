@@ -624,8 +624,30 @@ fn review_wire_rejects_deep_value_nesting() {
         value = Value::list(vec![value]);
     }
     let envelope = Envelope::request(1, "ping", vec![Arg::Value(value)]);
-    let bytes = envelope.encode().expect("encode");
-    let error = Envelope::decode(&bytes).unwrap_err();
+    // The encoder refuses it as well as the decoder: recursing first would
+    // overflow the stack on a value the kernel would never accept.
+    let error = envelope.encode().expect_err("the encoder refuses it");
+    assert_eq!(error.code(), "rpc/wire");
+
+    // Splice the same shape into a valid frame and decode it: the decoder's own
+    // depth gate must refuse it, not just the encoder's.
+    let shallow = Envelope::request(1, "p", vec![Arg::Value(Value::Null)])
+        .encode()
+        .expect("encode");
+    // 16 header + 4 method length + 1 method byte + 4 argument count + 1 tag.
+    let offset = 16 + 4 + 1 + 4 + 1;
+    assert_eq!(shallow[offset], 0, "a Null value tag");
+    let mut deep = Vec::new();
+    for _ in 0..80 {
+        deep.extend_from_slice(&[5, 1, 0, 0, 0]);
+    }
+    deep.push(2);
+    deep.extend_from_slice(&1i64.to_le_bytes());
+    let mut spliced = Vec::new();
+    spliced.extend_from_slice(&shallow[..offset]);
+    spliced.extend_from_slice(&deep);
+    spliced.extend_from_slice(&shallow[offset + 1..]);
+    let error = Envelope::decode(&spliced).expect_err("the decoder refuses it");
     assert_eq!(error.code(), "rpc/wire");
 }
 

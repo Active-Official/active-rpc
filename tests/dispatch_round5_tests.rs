@@ -359,3 +359,99 @@ fn a_dispatch_budget_refusal_is_a_refused_call() {
     let json = agent.trace_json();
     assert!(json.contains("\"event\":\"call.refused\""), "{json}");
 }
+
+struct TreeCanceller {
+    agent: Rc<RefCell<Option<Agent>>>,
+    own: Rc<RefCell<Option<PromiseHandle>>>,
+    runs: Rc<Cell<usize>>,
+}
+
+impl Provider for TreeCanceller {
+    fn name(&self) -> &'static str {
+        "tree-canceller"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["go".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        let agent = self.agent.borrow();
+        let agent = agent.as_ref().expect("agent installed");
+        if let Some(handle) = self.own.borrow().as_ref() {
+            agent.cancel_tree(handle).expect("cancel its own tree");
+        }
+        self.runs.set(self.runs.get() + 1);
+        Ok(Response::Value(Value::text("ok")))
+    }
+}
+
+#[test]
+fn cancelling_a_running_tree_is_on_the_tape() {
+    // Round 7 (#1): `cancel_tree` only recorded the settled state for a running
+    // target, so executed work left no decision in the receipts.
+    let agent = Agent::with_secret([0x95; 32]);
+    agent.enable_receipts(true);
+    let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
+    let own: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
+    let runs = Rc::new(Cell::new(0usize));
+    let provider = agent.register(Box::new(TreeCanceller {
+        agent: Rc::clone(&slot),
+        own: Rc::clone(&own),
+        runs: Rc::clone(&runs),
+    }));
+    *slot.borrow_mut() = Some(agent.clone());
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["go"]))
+        .expect("cap");
+    let lane = agent.create_lane("tree", Budget::default()).expect("lane");
+    let promise = agent.call(lane, &cap, "go", Vec::new()).expect("call");
+    *own.borrow_mut() = Some(promise.clone());
+    agent.run();
+    assert_eq!(runs.get(), 1, "the provider ran");
+    assert_eq!(
+        promise.value().expect_err("cancelled").code(),
+        "rpc/promise-cancelled"
+    );
+    assert_eq!(
+        agent.receipts().len(),
+        1,
+        "the executed work has no decision"
+    );
+}
+
+#[test]
+fn answering_a_queued_job_completes_it_on_the_tape() {
+    // Round 7 (#3): the tape ended at `call.queued`.
+    let (agent, cap, runs) = worker_agent();
+    let lane = agent
+        .create_lane("answer", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "work", Vec::new()).expect("call");
+    agent
+        .resolve(&promise, Value::text("answered"))
+        .expect("answer");
+    let json = agent.trace_json();
+    assert!(json.contains("\"event\":\"job.completed\""), "{json}");
+    assert_eq!(runs.get(), 0, "the provider did not run");
+}
+
+#[test]
+fn resolving_a_cancelled_job_says_cancelled() {
+    // Round 7 (#4): the record reported "already resolved", which invites a
+    // retry of a call the caller cancelled.
+    let (agent, cap, _runs) = worker_agent();
+    let lane = agent
+        .create_lane("cancelled", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "work", Vec::new()).expect("call");
+    agent.cancel(&promise).expect("cancel");
+    let error = agent
+        .resolve(&promise, Value::text("late"))
+        .expect_err("a cancelled promise cannot be answered");
+    assert_eq!(error.code(), "rpc/promise-cancelled");
+}
