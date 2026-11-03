@@ -3660,13 +3660,14 @@ impl Agent {
                 .ok_or(Error::UnknownPromise(promise.id.0))?;
             record.cancel()?;
         }
-        // A job in the current dispatch batch is no longer in the queue, so it
-        // cannot be stopped and must not be completed here: its settlement path
-        // owns the lane accounting.
+        // A job whose provider is running cannot be stopped; a job that is in
+        // the batch but has not started yet still can, and removing it is the
+        // point of `cancel` (its provider would otherwise run after the caller
+        // was told the call was cancelled).
         let queued: Option<u64> = kernel
             .jobs
             .iter()
-            .find(|(id, job)| job.promise == promise.id && kernel.queue.contains(id))
+            .find(|(_, job)| job.promise == promise.id && job.state == JobState::Queued)
             .map(|(id, _)| *id);
         if let Some(job_id) = queued {
             kernel.record_queued_refusal(job_id, &Error::PromiseCancelled(promise.id.0));
@@ -3685,11 +3686,24 @@ impl Agent {
                     lane_record.complete();
                 }
             }
-        } else if kernel.jobs.values().any(|job| job.promise == promise.id) {
-            // The job is in the current batch. Its phase 3 cannot settle a
-            // cancelled record, so nothing would ever make it trim-eligible:
-            // record the terminal state here.
+        } else if let Some(job) = kernel
+            .jobs
+            .values()
+            .find(|job| job.promise == promise.id)
+            .cloned()
+        {
+            // The job is in the current batch and its provider is running (or
+            // about to). Its phase 3 cannot settle a cancelled record, so record
+            // the terminal state here, and seal the decision: the provider may
+            // have run, and a receipt that says nothing hides that
+            // (round 5, #2).
             kernel.record_settled(promise.id);
+            if kernel.receipts_enabled {
+                kernel.seal_receipt(&job, Some(&Error::PromiseCancelled(promise.id.0)));
+            }
+            if let Some(stored) = kernel.jobs.get_mut(&job.id) {
+                stored.receipted = true;
+            }
         }
         Ok(())
     }
@@ -4259,7 +4273,20 @@ impl Agent {
                 let gate_budget = kernel.lanes.get(&job.lane).map_or(job.call.budget, |lane| {
                     job.call.budget.intersect(&lane.budget)
                 });
-                let mut failure = None;
+                // The caller may have cancelled or answered this job after the
+                // batch was chosen. It must not run: the provider side effect
+                // would land after the caller was told the call would not run
+                // (round 5, #1).
+                let mut failure = match kernel.promises.get(&job.promise) {
+                    Some(record) if record.state.is_settled() => Some(match &record.state {
+                        crate::promise::PromiseState::Cancelled => {
+                            Error::PromiseCancelled(job.promise.0)
+                        }
+                        _ => Error::PromiseAlreadyResolved(job.promise.0),
+                    }),
+                    None => Some(Error::UnknownPromise(job.promise.0)),
+                    Some(_) => None,
+                };
                 for arg in &job.call.args {
                     let Arg::Value(value) = arg else { continue };
                     if let Some(error) = shape_refusal(value, &gate_budget) {
@@ -4670,7 +4697,15 @@ impl Agent {
                             }
                             Error::Revoked(_)
                             | Error::UnknownCapability(_)
-                            | Error::UnknownLane(_) => {
+                            | Error::UnknownLane(_)
+                            | Error::PathNotGranted(_)
+                            | Error::MethodNotGranted { .. }
+                            | Error::ReadOnly
+                            | Error::TopicNotGranted(_)
+                            | Error::UnknownPromise(_)
+                            | Error::UnresolvablePromise(_)
+                            | Error::PromiseCancelled(_)
+                            | Error::PromiseAlreadyResolved(_) => {
                                 kernel.metrics.calls_refused =
                                     kernel.metrics.calls_refused.saturating_add(1);
                                 kernel.push_event(Event::CallRefused {

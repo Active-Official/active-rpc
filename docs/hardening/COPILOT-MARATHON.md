@@ -1326,6 +1326,36 @@ two highs and three mediums.
 Gate: 771 tests all-features, 0 failed; control-plane green; clippy/fmt/doc
 clean; negative controls 9/9.
 
+### R-03 capabilities - 2026-11-02 (round 5, first clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `69415e0`. **CLEAN** — every
+round-4 fix verified on the shipped path: the ownership guards on
+`attenuate`/`revoke`, the restore order (seal, binding, tombstone), the
+`cap.expired` event on an expired export, the mint's `path_scope`/tool-name
+text rules, the single `from_peer` guard, and the saturating lane counter.
+
+Residuals (low, no action): the record parser defers scope control characters
+and tool names to `mint_restored`'s `check_method_names`, so the error class is
+`rpc/invalid-argument` rather than `rpc/persistence` (the record still needs a
+valid seal to get that far); `CapAttrs` can express `topics=Some` with
+`publish=false`, an incoherent but non-escalating grant; `is_attenuation_of`
+answers "a child must not add a binding" by relying on `attenuate`'s inherit,
+which is documented; the record-id sets fail closed at their ceiling.
+
+### R-02 kernel dispatch - 2026-11-02 (round 5)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `69415e0`. Round-4 fixes
+verified; two highs and one medium, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `cancel` treated a batched-but-not-started job as "running" (its lookup was queue membership, and the batch dequeues), and dispatch never re-checked the promise, so a cancelled or answered job still ran its provider | **fixed**: `cancel` removes a job whose state is `Queued` wherever it is, and dispatch phase 1 refuses to run a job whose promise is already settled; `a_batched_job_cancelled_by_an_earlier_call_does_not_run`, `a_batched_job_answered_by_an_earlier_call_does_not_run` |
+| 2 | high | cancelling a running job sealed no receipt, so executed work had no decision on the tape | **fixed**: `cancel` seals `Refused("rpc/promise-cancelled")` and marks the job receipted; `cancelling_itself_is_on_the_tape` |
+| 3 | medium | a dispatch-only `PathNotGranted` (a pipelined value escaping the scope) bumped no counter and emitted no event | **fixed**: the dispatch accounting arm covers path, method, read-only, topic, promise and settlement classes; `a_dispatch_time_path_refusal_is_counted` |
+
+Gate: 775 tests all-features, 0 failed; control-plane green; clippy/fmt/doc
+clean; negative controls 9/9.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

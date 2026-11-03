@@ -1,0 +1,238 @@
+//! R-02 dispatch round 5: a batch must not run work the caller already
+//! cancelled or answered, cancellations must be on the tape, and every
+//! dispatch-time refusal must be counted.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use active_rpc::cap::CapAttrs;
+use active_rpc::kernel::Provider;
+use active_rpc::value::{Arg, Call, Response, Value};
+use active_rpc::{Agent, Budget, PromiseHandle};
+
+struct Worker {
+    agent: Rc<RefCell<Option<Agent>>>,
+    victim: Rc<RefCell<Option<PromiseHandle>>>,
+    self_handle: Rc<RefCell<Option<PromiseHandle>>>,
+    runs: Rc<Cell<usize>>,
+}
+
+impl Provider for Worker {
+    fn name(&self) -> &'static str {
+        "worker"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec![
+            "kill".to_string(),
+            "resolve-next".to_string(),
+            "self-cancel".to_string(),
+            "work".to_string(),
+        ]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, call: &Call) -> active_rpc::Result<Response> {
+        let agent = self.agent.borrow();
+        let agent = agent.as_ref().expect("agent installed");
+        match call.method.as_str() {
+            "kill" => {
+                if let Some(handle) = self.victim.borrow().as_ref() {
+                    agent.cancel(handle).expect("cancel the queued job");
+                }
+            }
+            "resolve-next" => {
+                if let Some(handle) = self.victim.borrow().as_ref() {
+                    agent
+                        .resolve(handle, Value::text("answered"))
+                        .expect("resolve");
+                }
+            }
+            "self-cancel" => {
+                if let Some(handle) = self.self_handle.borrow().as_ref() {
+                    agent.cancel(handle).expect("cancel itself");
+                }
+                self.runs.set(self.runs.get() + 1);
+            }
+            _ => {
+                self.runs.set(self.runs.get() + 1);
+            }
+        }
+        Ok(Response::Value(Value::text("ok")))
+    }
+}
+
+fn worker_agent() -> (Agent, active_rpc::CapHandle, Rc<Cell<usize>>) {
+    let agent = Agent::with_secret([0x91; 32]);
+    let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
+    let victim: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
+    let self_handle: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
+    let runs = Rc::new(Cell::new(0usize));
+    let provider = agent.register(Box::new(Worker {
+        agent: Rc::clone(&slot),
+        victim: Rc::clone(&victim),
+        self_handle: Rc::clone(&self_handle),
+        runs: Rc::clone(&runs),
+    }));
+    *slot.borrow_mut() = Some(agent.clone());
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["kill", "resolve-next", "self-cancel", "work"]),
+        )
+        .expect("cap");
+    // The provider reads the handles through these cells; the test fills them
+    // between queueing and running.
+    AGENT_SLOT.with(|slot| *slot.borrow_mut() = Some(agent.clone()));
+    VICTIM.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&victim)));
+    SELF.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&self_handle)));
+    (agent, cap, runs)
+}
+
+thread_local! {
+    static AGENT_SLOT: RefCell<Option<Agent>> = const { RefCell::new(None) };
+    static VICTIM: RefCell<Option<Rc<RefCell<Option<PromiseHandle>>>>> = const { RefCell::new(None) };
+    static SELF: RefCell<Option<Rc<RefCell<Option<PromiseHandle>>>>> = const { RefCell::new(None) };
+}
+
+#[test]
+fn a_batched_job_cancelled_by_an_earlier_call_does_not_run() {
+    let (agent, cap, runs) = worker_agent();
+    let lane = agent.create_lane("batch", Budget::default()).expect("lane");
+    let first = agent.call(lane, &cap, "kill", Vec::new()).expect("first");
+    let second = agent.call(lane, &cap, "work", Vec::new()).expect("second");
+    VICTIM.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .replace(second.clone())
+    });
+    agent.run();
+    assert_eq!(
+        runs.get(),
+        0,
+        "the provider ran a job the caller cancelled before it started"
+    );
+    assert_eq!(
+        second.value().expect_err("cancelled").code(),
+        "rpc/promise-cancelled"
+    );
+    first.value().expect("the cancelling call settles");
+}
+
+#[test]
+fn a_batched_job_answered_by_an_earlier_call_does_not_run() {
+    let (agent, cap, runs) = worker_agent();
+    let lane = agent.create_lane("batch", Budget::default()).expect("lane");
+    let first = agent
+        .call(lane, &cap, "resolve-next", Vec::new())
+        .expect("first");
+    let second = agent.call(lane, &cap, "work", Vec::new()).expect("second");
+    VICTIM.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .replace(second.clone())
+    });
+    agent.run();
+    assert_eq!(
+        runs.get(),
+        0,
+        "the provider ran a job the kernel had already answered out of band"
+    );
+    assert_eq!(second.value().expect("answered"), Value::text("answered"));
+    first.value().expect("the answering call settles");
+}
+
+#[test]
+fn cancelling_itself_is_on_the_tape() {
+    let (agent, cap, runs) = worker_agent();
+    agent.enable_receipts(true);
+    let lane = agent.create_lane("self", Budget::default()).expect("lane");
+    let promise = agent
+        .call(lane, &cap, "self-cancel", Vec::new())
+        .expect("call");
+    SELF.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .replace(promise.clone())
+    });
+    agent.run();
+    assert_eq!(runs.get(), 1, "the provider ran");
+    assert_eq!(
+        promise.value().expect_err("cancelled").code(),
+        "rpc/promise-cancelled"
+    );
+    let receipts = agent.receipts();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "the executed-then-cancelled call has no receipt"
+    );
+    assert_eq!(
+        receipts[0].decision,
+        active_rpc::receipts::Decision::Refused("rpc/promise-cancelled".to_string())
+    );
+}
+
+/// A pipeline whose producer answers with a path outside the capability's scope
+/// is refused at dispatch; the refusal must be counted and traced.
+#[test]
+fn a_dispatch_time_path_refusal_is_counted() {
+    struct Leaker;
+    impl Provider for Leaker {
+        fn name(&self) -> &'static str {
+            "leaker"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["leak".to_string(), "echo".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, call: &Call) -> active_rpc::Result<Response> {
+            if call.method == "leak" {
+                Ok(Response::Value(Value::path("secret/x")))
+            } else {
+                Ok(Response::Value(Value::text("ok")))
+            }
+        }
+    }
+
+    let agent = Agent::with_secret([0x92; 32]);
+    let provider = agent.register(Box::new(Leaker));
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["leak", "echo"]).with_path("allowed"),
+        )
+        .expect("cap");
+    let lane = agent.create_lane("pipe", Budget::default()).expect("lane");
+    let producer = agent.call(lane, &cap, "leak", Vec::new()).expect("leak");
+    let consumer = agent
+        .call(lane, &cap, "echo", vec![Arg::Promise(producer.id())])
+        .expect("consumer");
+    let before = agent.metrics().calls_refused;
+    agent.run();
+    let error = consumer.value().expect_err("the path is outside the scope");
+    assert_eq!(error.code(), "rpc/path-not-granted");
+    assert_eq!(
+        agent.metrics().calls_refused,
+        before + 1,
+        "the dispatch refusal was not counted"
+    );
+    let json = agent.trace_json();
+    assert!(
+        json.contains("\"event\":\"call.refused\""),
+        "the dispatch refusal is not on the tape: {json}"
+    );
+}
