@@ -244,7 +244,8 @@ impl ModuleProvider {
                         // must not read a value that is built from data outside
                         // its subtree.
                         if let Some(scope) = &call.path_scope {
-                            let (outside, environment) = scope_closure(&slot.module, node, scope);
+                            let (outside, environment) =
+                                scope_closure(&slot.module, node, scope, started, call)?;
                             if outside || environment {
                                 return Err(Error::PathNotGranted(path));
                             }
@@ -328,7 +329,8 @@ impl ModuleProvider {
                 // out-of-scope data would return it under the labels of a walk
                 // the capability was never granted.
                 if let Some(scope) = &call.path_scope {
-                    let (outside, environment) = scope_closure(&slot.module, node, scope);
+                    let (outside, environment) =
+                        scope_closure(&slot.module, node, scope, started, call)?;
                     if outside || environment {
                         return Err(Error::PathNotGranted(path));
                     }
@@ -379,7 +381,8 @@ impl ModuleProvider {
                 check_node_budget(&slot.module, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
                 if let Some(scope) = &call.path_scope {
-                    let (outside, environment) = scope_closure(&slot.module, node, scope);
+                    let (outside, environment) =
+                        scope_closure(&slot.module, node, scope, started, call)?;
                     if outside || environment {
                         return Err(Error::PathNotGranted(path));
                     }
@@ -889,6 +892,13 @@ fn check_node_budget(module: &InfinityModule, call: &Call) -> Result<()> {
     if module.node_count() as u64 > call.budget.max_nodes {
         return Err(Error::BudgetExceeded("nodes"));
     }
+    // Annotations are extra records, each carrying text the metadata walks and
+    // the scope closure scan; they are charged against the same node ceiling
+    // so a module with one per node cannot make one charged call quadratic
+    // (round 23, #5).
+    if module.annotations().len() as u64 > call.budget.max_nodes {
+        return Err(Error::BudgetExceeded("annotations"));
+    }
     Ok(())
 }
 
@@ -1328,12 +1338,21 @@ fn structural_resolve(module: &InfinityModule, path: &str) -> Option<NodeId> {
 /// the cone carries, so it joins the closure here. `Env` resolves against the
 /// process environment at evaluation time and has no path at all, so a scope
 /// always refuses it.
-fn scope_closure(module: &InfinityModule, node: NodeId, scope: &str) -> (bool, bool) {
+fn scope_closure(
+    module: &InfinityModule,
+    node: NodeId,
+    scope: &str,
+    started: std::time::Instant,
+    call: &Call,
+) -> Result<(bool, bool)> {
     let mut closure = transitive(module, node, true);
     closure.insert(node);
     // A constraint chain can be arbitrarily deep, so iterate until nothing new
-    // arrives; the closure is bounded by the node count.
+    // arrives; the closure is bounded by the node count, and every round is
+    // charged against the wall ceiling because each one scans every annotation
+    // (round 23, #5).
     loop {
+        check_wall_budget(started, call)?;
         let before = closure.len();
         let subjects = closure.clone();
         for annotation in module.annotations() {
@@ -1360,7 +1379,7 @@ fn scope_closure(module: &InfinityModule, node: NodeId, scope: &str) -> (bool, b
         // wrapper or an array has no dotted name of its own) (round 15, #1).
         None => Some(*id) != root && !in_scope_node(module, *id, scope),
     });
-    (outside, environment)
+    Ok((outside, environment))
 }
 
 /// Labels for a set of node ids under an optional scope.

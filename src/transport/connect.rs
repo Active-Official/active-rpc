@@ -286,7 +286,7 @@ impl BridgeServer {
         let method = parts.next().unwrap_or_default();
         let target = parts.next().unwrap_or_default();
         if method != "POST" || target != PATH {
-            let _ = write_http_response(&mut stream, 404, b"rpc/not-found");
+            let _ = write_http_response(&mut stream, 404, b"rpc/wire");
             drain_before_close(&mut stream);
             return 0;
         }
@@ -431,9 +431,9 @@ impl BridgeServer {
 /// `read_line` into a `String` grows until the peer sends a newline, so the
 /// ceiling was only checked after the allocation. This reads bytes into a
 /// fixed buffer bounded by what is left of the budget, and a line that does not
-/// fit is refused without growing. Bytes are decoded lossily: a header value is
-/// not required to be UTF-8, and a non-UTF-8 byte must not be able to end the
-/// server.
+/// fit is refused without growing. A line that is not UTF-8 is a wire fault:
+/// decoding it lossily would compare a header name the peer did not send
+/// (round 23, #4).
 fn read_head(
     reader: &mut BufReader<TcpStream>,
     max: usize,
@@ -479,7 +479,14 @@ fn read_head(
         if body.is_empty() {
             break;
         }
-        head.push(String::from_utf8_lossy(body).into_owned());
+        // An HTTP/1.1 field is an ASCII token plus a UTF-8 value. A lossy
+        // decode turned an invalid byte into U+FFFD, so a `transfer-encoding`
+        // name carrying one was not the name the peer sent and slipped past
+        // the refusal (round 23, #4).
+        let Ok(line) = String::from_utf8(body.to_vec()) else {
+            return Err(Error::Wire("request head line is not UTF-8"));
+        };
+        head.push(line);
     }
     Ok(Some(head))
 }
@@ -513,6 +520,7 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Resu
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         _ => "Internal Server Error",
@@ -526,6 +534,43 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Resu
         .and_then(|_| stream.write_all(body))
         .and_then(|_| stream.flush())
         .map_err(|error| Error::Transport(error.to_string()))
+}
+
+/// Time left before `deadline`, or a transport timeout.
+fn remaining(deadline: std::time::Instant) -> Result<std::time::Duration> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| Error::Transport("deadline elapsed".to_string()))
+}
+
+/// Resolve `address` within the time left before `deadline`.
+///
+/// `to_socket_addrs` calls the system resolver, which has no timeout of its
+/// own; a resolver that never answers would hold a `with_deadline` client past
+/// its deadline (round 23, #3). The lookup runs on a detached thread: a hung
+/// resolver leaks that thread, while the call returns its transport refusal.
+fn resolve_within(
+    address: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let target = address.to_string();
+    std::thread::Builder::new()
+        .name("active-rpc-resolve".to_string())
+        .spawn(move || {
+            let result = target
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>());
+            let _ = sender.send(result);
+        })
+        .map_err(|error| Error::Transport(format!("resolve thread: {error}")))?;
+    match receiver.recv_timeout(remaining(deadline)?) {
+        Ok(Ok(addresses)) => Ok(addresses),
+        Ok(Err(error)) => Err(Error::Transport(format!("resolve: {error}"))),
+        Err(_) => Err(Error::Transport("resolve timed out".to_string())),
+    }
 }
 
 /// A Connect/gRPC bridge client.
@@ -596,19 +641,18 @@ impl ConnectClient {
             body.len()
         );
         // A black-hole peer must not hold a `with_deadline` client: the
-        // connect itself is bounded (round 22, #3).
+        // connect itself is bounded (round 22, #3), and so is the resolve that
+        // precedes it (round 23, #3).
         let wait = self.deadline.unwrap_or(CONNECTION_WAIT);
-        use std::net::ToSocketAddrs;
-        let mut stream = TcpStream::connect_timeout(
-            &self
-                .address
-                .to_socket_addrs()
-                .map_err(|error| Error::Transport(format!("resolve: {error}")))?
-                .next()
-                .ok_or_else(|| Error::Transport("no address".to_string()))?,
-            wait,
-        )
-        .map_err(|error| Error::Transport(format!("connect: {error}")))?;
+        let deadline = std::time::Instant::now()
+            .checked_add(wait)
+            .unwrap_or_else(std::time::Instant::now);
+        let address = resolve_within(&self.address, deadline)?
+            .first()
+            .copied()
+            .ok_or_else(|| Error::Transport("no address".to_string()))?;
+        let mut stream = TcpStream::connect_timeout(&address, remaining(deadline)?)
+            .map_err(|error| Error::Transport(format!("connect: {error}")))?;
         // A client with no explicit deadline still has one: a peer that drips a
         // byte per timeout would hold it forever, and `read_head` was called
         // with `None` (round 21, #2).
@@ -616,9 +660,6 @@ impl ConnectClient {
             .set_read_timeout(Some(wait))
             .and_then(|()| stream.set_write_timeout(Some(wait)))
             .map_err(|error| Error::Transport(error.to_string()))?;
-        let deadline = std::time::Instant::now()
-            .checked_add(wait)
-            .unwrap_or_else(std::time::Instant::now);
         stream
             .write_all(head.as_bytes())
             .and_then(|_| stream.write_all(body))

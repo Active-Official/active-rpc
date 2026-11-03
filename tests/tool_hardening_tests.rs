@@ -113,6 +113,21 @@ fn a_get_request_has_no_body() {
     }
 }
 
+/// The allowlist stores methods in the case the request is compared in
+/// (round 16, F-8): a lowercase entry used to match nothing.
+#[test]
+fn a_lowercase_allowlist_entry_matches() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = record_one_request(listener);
+
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("get", "/safe")]);
+    let call = Call::new("get", vec![Arg::Value(Value::path("/safe"))]);
+    tool.invoke(0, &call).expect("a lowercase entry matches");
+    let (head, _) = server.join().expect("server thread");
+    assert!(head.to_ascii_lowercase().starts_with("get /safe"), "{head}");
+}
+
 #[test]
 fn a_post_carries_its_body_and_length() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -344,6 +359,10 @@ fn a_json_body_with_an_unrepresentable_number_is_refused() {
         r#"{"amount": 1e400}"#,
         r#"{"amount": 18446744073709551617}"#,
         r#"{"debit": -9223372036854775809}"#,
+        // A bare scalar is still JSON: it must not be downgraded to text
+        // (round 16, F-1).
+        "1e400",
+        " -1e400 ",
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("address");
@@ -381,6 +400,111 @@ fn a_json_body_with_an_unrepresentable_number_is_refused() {
             other => panic!("unexpected response {other:?}"),
         }
     }
+}
+
+/// Accept one connection, read the head, then write `response` in one call.
+///
+/// `slow_response` writes a byte per iteration, which is deliberate for the
+/// ceiling tests and far too slow for a multi-megabyte body.
+fn fixed_response(listener: TcpListener, response: Vec<u8>) {
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+
+        let Ok((mut socket, _)) = listener.accept() else {
+            return;
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .ok();
+        let mut scratch = [0u8; 4096];
+        let _ = socket.read(&mut scratch);
+        let _ = socket.write_all(&response);
+    });
+}
+
+/// A JSON body past the token ceiling is `http/too-complex`; a large body that
+/// is not an object or an array stays text (round 15, F-5/F-6).
+#[test]
+fn a_json_body_past_the_token_ceiling_is_too_complex() {
+    let mut body = String::with_capacity(2 << 20);
+    body.push('[');
+    for _ in 0..((1usize << 20) + 8) {
+        body.push_str("0,");
+    }
+    body.push('0');
+    body.push(']');
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    fixed_response(listener, response.into_bytes());
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/big")]);
+    tool.max_body = 4 << 20;
+    let error = tool
+        .invoke(0, &http_get("/big", 20_000))
+        .expect_err("a body past the token ceiling is refused");
+    assert_eq!(error.provider_code(), Some("http/too-complex"), "{error}");
+
+    // A CSV report is not JSON: its commas do not make it a JSON tree.
+    let mut csv = String::with_capacity(2 << 20);
+    for _ in 0..((1usize << 20) / 2) {
+        csv.push_str("a,b;");
+        if csv.len() >= (1 << 20) + 64 {
+            break;
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{csv}",
+        csv.len()
+    );
+    fixed_response(listener, response.into_bytes());
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/csv")]);
+    tool.max_body = 4 << 20;
+    let response = tool
+        .invoke(0, &http_get("/csv", 20_000))
+        .expect("a CSV answer is text");
+    match response {
+        Response::Value(Value::Text(text)) => assert_eq!(text.len(), csv.len()),
+        other => panic!("a CSV answer became {other:?}"),
+    }
+}
+
+/// A body shorter than its declared length, and a head that never ends, keep
+/// their own codes (round 15, F-10).
+#[test]
+fn a_truncated_head_or_body_has_its_own_code() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    fixed_response(
+        listener,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\nconnection: close\r\n\r\nabc".to_vec(),
+    );
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/short")]);
+    let error = tool
+        .invoke(0, &http_get("/short", 2_000))
+        .expect_err("a short body is refused");
+    assert_eq!(
+        error.provider_code(),
+        Some("http/read:truncated-body"),
+        "{error}"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    fixed_response(listener, b"HTTP/1.1 200".to_vec());
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/head")]);
+    let error = tool
+        .invoke(0, &http_get("/head", 2_000))
+        .expect_err("a truncated head is refused");
+    assert_eq!(
+        error.provider_code(),
+        Some("http/read:truncated"),
+        "{error}"
+    );
 }
 
 /// A repeated `content-length` is a framing ambiguity; the adapter refuses the
@@ -968,6 +1092,64 @@ fn a_bodyless_post_sends_no_body() {
     assert_eq!(body, 0, "a bodyless POST carried bytes: {head}");
 }
 
+/// The reader hands back a line of exactly the cap and refuses one that fills
+/// the read window without a newline; trimming alone would accept an overlong
+/// frame and leave its tail in the pipe (round 16, F-7).
+#[test]
+fn the_stdio_reader_bounds_one_line() {
+    use active_rpc::tool::{McpTransport, StdioTransport, MAX_MCP_LINE_BYTES};
+
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    #[cfg(windows)]
+    let mut env = std::collections::BTreeMap::new();
+    #[cfg(windows)]
+    env.insert(
+        "SystemRoot".to_string(),
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+    );
+    #[cfg(not(windows))]
+    let env = std::collections::BTreeMap::new();
+
+    #[cfg(windows)]
+    let exact = format!(
+        "$m={MAX_MCP_LINE_BYTES}; [Console]::Out.Write('a' * $m); [Console]::Out.Write([char]10); [Console]::Out.Flush(); Start-Sleep -Seconds 10"
+    );
+    #[cfg(not(windows))]
+    let exact =
+        format!("head -c {MAX_MCP_LINE_BYTES} /dev/zero | tr '\\0' a; printf '\\n'; sleep 10");
+    #[cfg(windows)]
+    let args = vec!["-NoProfile", "-Command", exact.as_str()];
+    #[cfg(not(windows))]
+    let args = vec!["-c", exact.as_str()];
+    let mut transport = StdioTransport::spawn(program, &args, &env).expect("spawn");
+    let line = transport.recv_line().expect("an exact-cap line arrives");
+    assert_eq!(line.len(), MAX_MCP_LINE_BYTES, "the cap is inclusive");
+    drop(transport);
+
+    #[cfg(windows)]
+    let over = format!(
+        "$m={}; [Console]::Out.Write('b' * ($m + 2)); [Console]::Out.Flush(); Start-Sleep -Seconds 10",
+        MAX_MCP_LINE_BYTES
+    );
+    #[cfg(not(windows))]
+    let over = format!(
+        "head -c {} /dev/zero | tr '\\0' b; sleep 10",
+        MAX_MCP_LINE_BYTES + 2
+    );
+    #[cfg(windows)]
+    let args = vec!["-NoProfile", "-Command", over.as_str()];
+    #[cfg(not(windows))]
+    let args = vec!["-c", over.as_str()];
+    let mut transport = StdioTransport::spawn(program, &args, &env).expect("spawn");
+    let error = transport
+        .recv_line()
+        .expect_err("an unterminated line past the cap");
+    assert_eq!(error.provider_code(), Some("mcp/line-too-long"), "{error}");
+}
+
 /// A ceiling already spent writes nothing: the transport stays usable instead
 /// of the next call reading the previous answer.
 #[test]
@@ -1542,10 +1724,12 @@ fn a_json_integer_past_i64_is_not_rounded() {
         Value::Map(entries) => assert_eq!(entries.len(), 1),
         other => panic!("the magic key became {other:?}"),
     }
-    // A flat array past the node ceiling is refused (a wide tree, not a deep
-    // one: doubling would build 2^40 values).
+    // A flat array past the node ceiling is refused by the size predicate, not
+    // by the number predicate (a wide tree, not a deep one: doubling would
+    // build 2^40 values) (round 16, F-2).
     let wide = serde_json::Value::Array(vec![serde_json::Value::from(0); 1_100_000]);
-    assert!(active_rpc::tool::json_has_unrepresentable_number(&wide));
+    assert!(active_rpc::tool::json_too_many_nodes(&wide));
+    assert!(!active_rpc::tool::json_has_unrepresentable_number(&wide));
 }
 
 /// A scoped wasm capability is refused (round 11, #13).

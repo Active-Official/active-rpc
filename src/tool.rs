@@ -28,10 +28,6 @@ use crate::kernel::Provider;
 use crate::value::Response;
 use crate::value::{Arg, Call, Value};
 
-/// Whether a JSON tree holds a number neither `i64` nor `u64` can represent.
-///
-/// Such a number has no `Value` form; substituting `null` or a rounded float
-/// changes the meaning of a peer answer (round 12, F-1).
 /// Whether a JSON text has more structural tokens than the adapter will parse.
 ///
 /// `serde_json` allocates the whole tree before any post-parse check can run,
@@ -67,7 +63,7 @@ pub fn json_text_too_complex(text: &str, limit: usize) -> bool {
     false
 }
 
-/// Whether a decoded tree holds a number with no `Value` form or too many nodes.
+/// Whether a decoded tree holds a number with no `Value` form.
 ///
 /// This sees only what the decoder kept. A literal that overflowed `i64` or a
 /// float is validated on the text by [`json_text_bad_number`] before or beside
@@ -75,15 +71,7 @@ pub fn json_text_too_complex(text: &str, limit: usize) -> bool {
 /// an overflowing float outright (round 11, #3; round 15, F-1).
 pub fn json_has_unrepresentable_number(value: &Json) -> bool {
     let mut stack = vec![value];
-    let mut nodes = 0usize;
     while let Some(value) = stack.pop() {
-        // The decoded tree is far larger than the body: a 1 MiB array of zeros
-        // is half a million values. Bound the node count, not just the bytes
-        // (round 13, F-8).
-        nodes = nodes.saturating_add(1);
-        if nodes > MAX_JSON_NODES {
-            return true;
-        }
         match value {
             Json::Number(number) => {
                 // A non-negative integer past `i64::MAX` has no `Value` form,
@@ -143,7 +131,12 @@ fn bad_number_spans(text: &str) -> Vec<(usize, usize)> {
                 {
                     index += 1;
                 }
-                if literal_has_no_value_form(&text[start..index]) {
+                let literal = &text[start..index];
+                // A lone `-` outside a string is not a number: a plain-text
+                // answer that opens with one must stay text (round 16, F-1).
+                if literal.bytes().any(|byte| byte.is_ascii_digit())
+                    && literal_has_no_value_form(literal)
+                {
                     spans.push((start, index));
                 }
             }
@@ -176,7 +169,13 @@ pub fn json_text_bad_number(text: &str) -> bool {
 /// carrying a bad number (round 15, F-1).
 fn text_fails_only_on_a_number(text: &str) -> bool {
     let trimmed = text.trim_start();
-    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+    // A document that opens as an object, an array or a number is JSON; plain
+    // text that happens to hold a stray minus or digits is not re-examined
+    // (round 16, F-1: a bare `1e400` answer was downgraded to text).
+    let json_start = trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with(|c: char| c == '-' || c.is_ascii_digit());
+    if !json_start {
         return false;
     }
     let spans = bad_number_spans(text);
@@ -192,6 +191,32 @@ fn text_fails_only_on_a_number(text: &str) -> bool {
     }
     repaired.push_str(&text[cursor..]);
     serde_json::from_str::<Json>(&repaired).is_ok()
+}
+
+/// Whether a decoded tree holds more nodes than the adapter accepts.
+///
+/// The token gate refuses a huge body before parsing; this is the second line
+/// for a shape whose token count understates its node count (a chain of
+/// single-element arrays adds a node without adding a token), and it reports
+/// the size refusal under its own code (round 16, F-2).
+pub fn json_too_many_nodes(value: &Json) -> bool {
+    let mut stack = vec![value];
+    let mut nodes = 0usize;
+    while let Some(value) = stack.pop() {
+        // The decoded tree is far larger than the body: a 1 MiB array of zeros
+        // is half a million values. Bound the node count, not just the bytes
+        // (round 13, F-8).
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_JSON_NODES {
+            return true;
+        }
+        match value {
+            Json::Array(items) => stack.extend(items.iter()),
+            Json::Object(map) => stack.extend(map.values()),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Convert JSON into an RPC value.
@@ -791,10 +816,12 @@ impl StdioTransport {
                 let mut reader = BufReader::new(stdout);
                 loop {
                     let mut line = String::new();
-                    // The take() bounds the read itself, so a line past the cap
-                    // arrives here truncated and unterminated; the caller's
-                    // length check refuses it as `mcp/line-too-long` before the
-                    // poison flag stops the session (round 13, F-9).
+                    // The take() allows the two delimiter bytes, so a read
+                    // that fills it without a newline is a line past the cap:
+                    // trimming it would accept an overlong frame and leave
+                    // its tail in the pipe for the next request
+                    // (round 16, F-7). The caller's length check stays as the
+                    // second line of defence (round 13, F-9).
                     let read = reader
                         .by_ref()
                         .take((MAX_MCP_LINE_BYTES + 2) as u64)
@@ -803,6 +830,11 @@ impl StdioTransport {
                         Ok(0) => Err(Error::Provider {
                             code: "mcp/eof".to_string(),
                         }),
+                        Ok(read) if read == MAX_MCP_LINE_BYTES + 2 && !line.ends_with('\n') => {
+                            Err(Error::Provider {
+                                code: "mcp/line-too-long".to_string(),
+                            })
+                        }
                         Ok(_) => Ok(line.trim_end().to_string()),
                         Err(error) => Err(Error::Provider {
                             code: format!("mcp/read:{error}"),
@@ -1398,7 +1430,10 @@ impl HttpTool {
             base: base.into(),
             allow: allow
                 .iter()
-                .map(|(method, path)| (method.to_string(), path.to_string()))
+                // `invoke` uppercases the requested method, so a lowercase
+                // allowlist entry used to match nothing and the capability was
+                // permanently dead (round 16, F-8).
+                .map(|(method, path)| (method.to_ascii_uppercase(), path.to_string()))
                 .collect(),
             max_body: 1 << 20,
             max_request: 1 << 20,
@@ -1430,6 +1465,14 @@ impl HttpTool {
             .base
             .strip_prefix("http://")
             .ok_or(Error::ToolPolicy("only http:// endpoints are supported"))?;
+        // Resolution is not peer-controlled: the base URL is the operator's
+        // endpoint, so the system resolver's own timeout applies here and its
+        // time is not charged against the grant (round 16, F-3).
+        let addresses: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(base)
+            .map_err(|error| Error::Provider {
+                code: format!("http/resolve:{error}"),
+            })?
+            .collect();
         // The adapter's fixed ten seconds and the capability's wall ceiling both
         // bound the wait; the smaller one wins. This is one deadline for the
         // whole exchange, not a per-syscall timeout: a timeout bounds one
@@ -1441,15 +1484,6 @@ impl HttpTool {
                     .min(std::time::Duration::from_secs(10)),
             )
             .unwrap_or_else(std::time::Instant::now);
-        // Resolution is not peer-controlled: the base URL is the operator's
-        // endpoint, so the system resolver's own timeout applies here. The
-        // peer's part of the exchange (connect, write, read) is under
-        // `deadline`.
-        let addresses: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(base)
-            .map_err(|error| Error::Provider {
-                code: format!("http/resolve:{error}"),
-            })?
-            .collect();
         let mut connected = None;
         let mut last = None;
         for address in addresses {
@@ -1874,13 +1908,18 @@ impl Provider for HttpTool {
         // (round 15, F-5).
         let trimmed = text.trim_start();
         if (trimmed.starts_with('{') || trimmed.starts_with('['))
-            && json_text_too_complex(&text, MAX_JSON_NODES - 2)
+            && json_text_too_complex(&text, MAX_JSON_NODES)
         {
             return Err(Error::Provider {
                 code: "http/too-complex".to_string(),
             });
         }
         let value = match serde_json::from_str::<Json>(&text) {
+            Ok(json) if json_too_many_nodes(&json) => {
+                return Err(Error::Provider {
+                    code: "http/too-complex".to_string(),
+                })
+            }
             Ok(json) if json_has_unrepresentable_number(&json) || json_text_bad_number(&text) => {
                 return Err(Error::Provider {
                     code: "http/bad-number".to_string(),

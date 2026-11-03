@@ -608,6 +608,48 @@ fn a_patch_removing_the_last_secret_drops_hash_entries() {
     }
 }
 
+/// Annotations are records every metadata walk scans, and a module may hold
+/// more of them than it holds nodes: a flood is refused before the walk
+/// against the same ceiling, not measured after it (round 23, #5).
+#[test]
+fn an_annotation_flood_is_refused_by_the_node_ceiling() {
+    let mut module = InfinityModule::new();
+    let field = module.push(Inode::Int(1));
+    let root = module.push(Inode::Table {
+        fields: vec![("a".to_string(), field)],
+    });
+    module.set_root(Some(root));
+    for index in 0..4 {
+        module.annotate(field, AnnotationKind::Intent(format!("note {index}")));
+    }
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x72; 32]);
+    let id = agent.register(Box::new(provider));
+    let cap = agent
+        .mint(id, object, CapAttrs::new(&["why"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane(
+            "r23-annotations",
+            Budget {
+                max_nodes: 3,
+                ..Budget::default()
+            },
+        )
+        .expect("lane");
+    let promise = agent
+        .call(lane, &cap, "why", vec![path("a")])
+        .expect("queued");
+    agent.run();
+    let error = promise
+        .value()
+        .expect_err("four annotations over three nodes");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert!(format!("{error}").contains("annotations"), "{error}");
+}
+
 /// An over-deep evaluation result is refused with the depth code every other
 /// depth refusal uses (round 15, #3).
 #[test]

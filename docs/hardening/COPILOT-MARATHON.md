@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-22: ... + 5 findings; one clean round closes it | 123 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-15: ... + 10 findings; round 16 is the confirmation | 129 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-23; 23 was clean, its five lows closed; round 24 is the confirmation | 128 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-16: ... + 8 findings; round 17 is the confirmation | 137 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,22 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 23 residuals)
+
+Round 23 (reviewer: DeepSeek through the Copilot CLI, `xhigh`) found no
+critical, high or medium defect and five lows. All five are closed here.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the bridge's 408 said `Internal Server Error` | **fixed**: `Request Timeout`; `a_stalled_head_is_408_request_timeout` |
+| 2 | low | the 404 body `rpc/not-found` is not a class `Error::code` can return, so `refusal()` flattened it to `rpc/provider` | **fixed**: a method or path this service does not serve is `rpc/wire`, a registered class; the HTTP/2 and HTTP/1.1 bridges and their tests agree; `a_wrong_target_is_a_wire_refusal` |
+| 3 | low | the Connect client resolved outside its deadline, so a hung resolver held a `with_deadline` call | **fixed**: the lookup runs on a helper thread and waits only the remaining grant; `resolve_within` |
+| 4 | low | the head was decoded lossily, so a `transfer-encoding` name with an invalid byte was not the name the peer sent | **fixed**: a head line that is not UTF-8 is `rpc/wire`; `a_non_utf8_head_line_is_a_400` |
+| 5 | low | a huge annotation count made the scope closure scan quadratic before the wall check | **fixed**: annotations are charged against `max_nodes`, and the closure checks the wall every round; `an_annotation_flood_is_refused_by_the_node_ceiling` |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt clean; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 22)
 
@@ -122,6 +138,32 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 16)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `10be022`.
+Eight of the ten round-15 fixes held; one medium (a bare scalar bad number
+downgraded to text), one false claim (the node band), and three paths shipped
+without a covering test.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a body that is only a number (`1e400`) failed to parse and was downgraded to text, while the spec promises a refusal | **fixed**: the discriminator admits a leading `-` or digit, and only a literal that holds a digit counts as a bad number, so `- not json` stays text; `a_json_body_with_an_unrepresentable_number_is_refused` |
+| 2 | low | the `MAX_JSON_NODES - 2` arithmetic assumed a tree has at most two more nodes than tokens; a chain of single-element arrays has more, so a size refusal still surfaced as `http/bad-number` | **fixed**: the node ceiling is its own predicate, `json_too_many_nodes`, answered as `http/too-complex` before the number check; the token gate is back at `MAX_JSON_NODES`; `a_json_body_past_the_token_ceiling_is_too_complex` |
+| 3 | low | the spec and `security.md` said resolution precedes the deadline while the code started the deadline first | **fixed**: the deadline binding moved below `to_socket_addrs`, matching both specs |
+| 4 | low | an orphaned doc paragraph documented the token counter as a number check | **fixed**: deleted |
+| 5 | low | the `http/too-complex` row named the wrong constant and scope | **fixed**: tokens in an object/array body, or decoded nodes |
+| 6 | low | `json_text_too_complex`, the `{`/`[`-only rule, both truncation codes and the reader window had no test | **fixed**: HTTP tests for a >2^20-token body, a >1 MiB CSV answer (stays text), a short body and a truncated head; a real `StdioTransport` child for an exact-cap line and an unterminated overlong one |
+| 7 | low | the reader accepted an overlong line whose tail was whitespace and left the tail in the pipe | **fixed**: `read == MAX + 2 && !line.ends_with('\n')` is `mcp/line-too-long`, with the caller's check as the second line |
+| 8 | low | a lowercase allowlist entry never matched because `invoke` uppercases | **fixed**: `HttpTool::new` stores uppercase; `a_lowercase_allowlist_entry_matches` |
+
+Residuals recorded: resolution has no ceiling of its own in the HTTP adapter
+(operator endpoint, now stated in both specs); the MCP reader queue is
+count-bounded at 64 x (1 MiB + 2); `json_to_value` keeps
+`as_f64().unwrap_or(0.0)` although no current representation can reach it.
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt clean; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 15)
 

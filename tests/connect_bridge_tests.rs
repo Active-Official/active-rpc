@@ -229,6 +229,122 @@ fn a_revoked_capability_is_refused_over_the_bridge() {
     assert_eq!(response.method, "rpc/revoked");
 }
 
+/// A head that stalls past the connection budget is a timeout, and the status
+/// line names it (round 23, #1: the catch-all arm said `Internal Server
+/// Error`).
+#[test]
+fn a_stalled_head_is_408_request_timeout() {
+    use std::io::{Read, Write};
+
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+        // A request line and one header, then silence: the head never ends.
+        stream
+            .write_all(b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: active-rpc\r\n")
+            .expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    });
+
+    let mut served = 0;
+    server
+        .serve(1, |envelope| {
+            served += 1;
+            Envelope::error(
+                envelope.request_id,
+                &Error::Transport("unreachable".to_string()),
+            )
+        })
+        .expect("serve");
+    let response = client.join().expect("client");
+    assert!(
+        response.starts_with("HTTP/1.1 408 Request Timeout"),
+        "expected a 408 with its reason, got {response:?}"
+    );
+    assert_eq!(served, 0);
+}
+
+/// A head line that is not UTF-8 is a wire fault, not text to decode lossily:
+/// a `transfer-encoding` name carrying an invalid byte must not slip past the
+/// refusal (round 23, #4).
+#[test]
+fn a_non_utf8_head_line_is_a_400() {
+    use std::io::{Read, Write};
+
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+        stream
+            .write_all(b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: active-rpc\r\ntransfer-enc\xffoding: chunked\r\n\r\n")
+            .expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    });
+
+    let mut served = 0;
+    server
+        .serve(1, |envelope| {
+            served += 1;
+            Envelope::error(
+                envelope.request_id,
+                &Error::Transport("unreachable".to_string()),
+            )
+        })
+        .expect("serve");
+    let response = client.join().expect("client");
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "expected a 400, got {response:?}"
+    );
+    assert!(response.contains("rpc/wire"), "{response}");
+    assert_eq!(served, 0);
+}
+
+/// A request that does not name this service is refused with a class the
+/// closed registry holds, so a client can branch on it (round 23, #2). The
+/// bridge answered `rpc/not-found`, which is not a kernel class.
+#[test]
+fn a_wrong_target_is_a_wire_refusal() {
+    use std::io::{Read, Write};
+
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+        stream
+            .write_all(
+                b"POST /not-the-service HTTP/1.1\r\nhost: active-rpc\r\ncontent-type: application/connect+active-infinity\r\ncontent-length: 0\r\n\r\n",
+            )
+            .expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    });
+
+    let mut served = 0;
+    server
+        .serve(1, |envelope| {
+            served += 1;
+            Envelope::error(
+                envelope.request_id,
+                &Error::Transport("unreachable".to_string()),
+            )
+        })
+        .expect("serve");
+    let response = client.join().expect("client");
+    assert!(
+        response.starts_with("HTTP/1.1 404 Not Found"),
+        "expected a 404, got {response:?}"
+    );
+    assert!(response.ends_with("rpc/wire"), "{response}");
+    assert_eq!(served, 0);
+}
+
 /// A truncated body is one bad connection: the bridge answers 400 and keeps
 /// accepting. Before this, the read error aborted `serve`, so one hostile
 /// connection could refuse service to every later caller.

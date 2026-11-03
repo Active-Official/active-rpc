@@ -28,7 +28,11 @@ content-length: <n>
 
 The response repeats the framing with the response or error envelope. Other
 content types are `415`; a malformed prefix or envelope is `400` with an
-`rpc/...` code in the body; bodies over `MAX_BODY` (64 MiB) are `413`.
+`rpc/...` code in the body; bodies over `MAX_BODY` (64 MiB) are `413`; a method
+or path this service does not serve is `404` with `rpc/wire` (the request does
+not name this protocol, and `rpc/wire` is a class the closed registry holds);
+a head or body that runs past the connection budget is `408` with
+`rpc/transport`.
 `BridgeServer` accepts a fixed number of requests and `ConnectClient` can post
 raw bodies (`post_raw`) or a chosen content type (`post_typed`) for negative
 tests.

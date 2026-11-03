@@ -80,7 +80,7 @@ fn http2_rejects_a_wrong_path_a_wrong_media_type_and_a_malformed_body() {
         .request_raw("/not-the-service", CONTENT_TYPE, b"\x00")
         .expect("wrong path");
     assert_eq!(status.as_u16(), 404);
-    assert_eq!(body, b"rpc/not-found");
+    assert_eq!(body, b"rpc/wire");
 
     let (status, body) = client
         .request_raw(PATH, "text/plain", b"\x00")

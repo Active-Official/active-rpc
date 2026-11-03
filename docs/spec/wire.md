@@ -250,7 +250,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared |
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
 | `http/bad-number` | a JSON number has no `Value` form: an integer outside `i64`, or a float that is not finite (a literal with a fraction or an exponent that overflows `f64`) |
-| `http/too-complex` | the answer's JSON has more structural tokens than the adapter decodes (2^20) |
+| `http/too-complex` | an object or array body has more than 2^20 structural tokens before parsing, or the decoded tree has more than 2^20 nodes |
 | `http/body-too-large` | the response body exceeded `max_body`, by its declared length or by its stream |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |

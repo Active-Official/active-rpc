@@ -351,14 +351,10 @@ where
         );
     }
     if request.method() != Method::POST {
-        return respond_status(
-            &mut respond,
-            StatusCode::METHOD_NOT_ALLOWED,
-            b"rpc/not-found",
-        );
+        return respond_status(&mut respond, StatusCode::METHOD_NOT_ALLOWED, b"rpc/wire");
     }
     if request.uri().path() != PATH {
-        return respond_status(&mut respond, StatusCode::NOT_FOUND, b"rpc/not-found");
+        return respond_status(&mut respond, StatusCode::NOT_FOUND, b"rpc/wire");
     }
     let media_type = request
         .headers()
