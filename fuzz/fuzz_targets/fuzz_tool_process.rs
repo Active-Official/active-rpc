@@ -6,11 +6,11 @@
 //!
 //! 1. An argument outside the process allow-list is refused before spawn.
 //! 2. A method other than `run` is refused.
-//! 3. A non-existent program fails as a clean provider error, not a panic.
+//! 3. A non-existent program is refused at construction, not a panic.
 //! 4. The adapter policy is a valid attenuation of a wider parent.
 //!
-//! The configured program does not exist, so even an allowed argument cannot
-//! execute anything.
+//! The program is a real shell but the allow-list admits only `ok`, so no
+//! argument the target produces can run anything.
 //!
 //! Run with `cargo +nightly fuzz run fuzz_tool_process -- -runs=200000`.
 
@@ -34,8 +34,9 @@ fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
-    let tool =
-        LocalProcess::new("/nonexistent-active-fuzz-binary", &["ok"]).expect("an absolute program");
+    // A program that does not resolve is refused at construction (round 17).
+    assert!(LocalProcess::new("/nonexistent-active-fuzz-binary", &["ok"]).is_err());
+    let tool = LocalProcess::new("/bin/sh", &["ok"]).expect("an absolute program");
     assert!(policy().is_attenuation_of(&tool.policy()));
 
     let agent = common::agent(data);
