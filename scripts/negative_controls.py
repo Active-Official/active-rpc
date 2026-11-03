@@ -98,8 +98,8 @@ CONTROLS = [
             },
             {
                 "file": "src/kernel.rs",
-                "find": "        meter.charge(call_bytes)?;\n",
-                "replace": "        meter.charge(0)?;\n",
+                "find": "                meter.charge(call_bytes)?;\n",
+                "replace": "                meter.charge(0)?;\n",
             },
             {
                 "file": "src/kernel.rs",
@@ -111,7 +111,7 @@ CONTROLS = [
                 # third guard: without it a mutated build still refuses the call
                 # and the control proves nothing.
                 "file": "src/kernel.rs",
-                "find": 'if failure.is_none() && resolved_bytes > job.call.budget.max_bytes {\n                            failure = Some(Error::BudgetExceeded("byte"));\n                        }\n',
+                "find": 'if failure.is_none() && resolved_bytes > effective_budget.max_bytes {\n                            failure = Some(Error::BudgetExceeded("byte"));\n                        }\n',
                 "replace": 'if false {\n                            failure = Some(Error::BudgetExceeded("byte"));\n                        }\n',
             },
         ],
