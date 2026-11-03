@@ -2834,7 +2834,7 @@ impl Agent {
         kernel.next_job += 1;
         for dep in &deps {
             if let Some(record) = kernel.promises.get_mut(dep) {
-                record.waiters += 1;
+                record.waiters = record.waiters.saturating_add(1);
             }
         }
         let call = Call {
@@ -3032,6 +3032,19 @@ impl Agent {
             .values()
             .find(|job| job.promise == promise.id)
             .cloned();
+        if job.is_none() {
+            // A pending promise always has a job. One without a job is already
+            // settled (the settle below reports that); a pending one is a broken
+            // invariant, and an answer with no job has no grant to be checked
+            // against, so it fails closed.
+            let pending = kernel
+                .promises
+                .get(&promise.id)
+                .is_some_and(|record| record.state == crate::promise::PromiseState::Pending);
+            if pending {
+                return Err(Error::UnresolvablePromise(promise.id.0));
+            }
+        }
         if let Some(job) = &job {
             let lane_budget = match kernel.caps.get(&job.cap) {
                 Some(record) if record.revoked => return Err(Error::Revoked(cap_token(job.cap))),

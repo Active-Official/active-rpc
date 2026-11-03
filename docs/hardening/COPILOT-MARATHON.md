@@ -1222,6 +1222,42 @@ provider's outcome).
 
 Gate: 768 tests all-features, 0 failed; clippy/fmt/doc clean.
 
+### R-06 budgets - 2026-11-02 (round 12, first clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `9335f7e`. **CLEAN** — every
+budget gate verified on the shipped path, `resolve_as owns_promise` present with
+its test, `cancel_tree` recording settled once.
+
+Residuals it recorded, all accepted or closed here:
+
+- A resolve that races a dispatch may still charge egress on the loser's side
+  (fail-closed: it drains the caller's own grant, never over-delivers).
+- `Budget::check` allows a `u64::MAX` ceiling, so a minter can authorize a very
+  large shape walk against itself. A minter is trusted; the walk is bounded by
+  the value it built.
+- `send` charges the lane only: a channel is not a capability (ADR-0024).
+- An unknown budget dimension maps to `other` for the event label while the wire
+  code stays `rpc/budget-exceeded`.
+
+### R-04 promises / pipelining - 2026-11-02 (round 5, first clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `9335f7e`. **CLEAN** —
+`resolve_as` enforces `owns_promise`, `cancel_tree` records settled once and
+returns only the promises it cancelled.
+
+Residuals, two closed here and one accepted:
+
+- `waiters += 1` is now `saturating_add` (release was already saturating).
+- `resolve_as` with no matching job now fails closed for a pending promise
+  (`rpc/unresolvable-promise`) instead of skipping every gate; a settled one
+  still reports `rpc/promise-resolved`.
+- Cancellations have no event of their own (the queued-refusal receipt records
+  them when receipts are enabled). Adding a `promise.cancelled` event is a
+  schema change with no security dimension; it is left as a documented
+  observability gap rather than smuggled into this round.
+
+Gate: 768 tests all-features, 0 failed; clippy/fmt/doc clean.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`
