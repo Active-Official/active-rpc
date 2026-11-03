@@ -6,7 +6,8 @@ use std::collections::BTreeSet;
 use active_rpc::cap::CapId;
 use active_rpc::value::{Arg, Value};
 use active_rpc::wire::{
-    decode_capability_table_with, encode_capability_table, CapDescriptor, Envelope, WireLimits,
+    decode_capability_table_with, encode_capability_table, CapDescriptor, CapTableDelta, Envelope,
+    WireLimits,
 };
 use active_rpc::Budget;
 
@@ -96,4 +97,107 @@ fn the_encoder_refuses_a_value_deeper_than_the_wire() {
         .encode()
         .expect_err("the encoder refuses a value the decoder would");
     assert_eq!(error.code(), "rpc/wire", "{error}");
+}
+
+#[test]
+fn a_truncated_delta_is_a_capability_table_fault() {
+    // Every fault inside the delta region is a table fault: a peer that branches
+    // on the class must not read "framing" and resynchronize on a table attack.
+    let mut envelope = Envelope::request(1, "p", Vec::new());
+    envelope.cap_delta = Some(CapTableDelta {
+        base: [0x22; 32],
+        removed: Vec::new(),
+        added: Vec::new(),
+    });
+    let bytes = envelope.encode().expect("encode");
+    // Cut two bytes out of `removed_count` (4 bytes) and out of `added_count`.
+    for cut in [2usize, 6] {
+        let truncated = &bytes[..bytes.len() - cut];
+        let error = Envelope::decode(truncated).expect_err("truncated delta");
+        assert_eq!(error.code(), "rpc/capability-table", "cut {cut}: {error}");
+    }
+}
+
+#[test]
+fn a_non_canonical_map_is_refused() {
+    // Keys must be strictly increasing: `{"b":null,"a":null}` decoded to a
+    // sorted map and re-encoded differently, so two byte images named one value.
+    let mut value = vec![6, 2, 0, 0, 0];
+    value.extend_from_slice(&1u32.to_le_bytes());
+    value.push(b'b');
+    value.push(0);
+    value.extend_from_slice(&1u32.to_le_bytes());
+    value.push(b'a');
+    value.push(0);
+
+    let shallow = Envelope::request(1, "p", vec![Arg::Value(Value::Null)])
+        .encode()
+        .expect("encode");
+    let offset = 16 + 4 + 1 + 4 + 1;
+    let mut spliced = Vec::new();
+    spliced.extend_from_slice(&shallow[..offset]);
+    spliced.extend_from_slice(&value);
+    spliced.extend_from_slice(&shallow[offset + 1..]);
+    let error = Envelope::decode(&spliced).expect_err("out of order");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+
+    // The canonical order for the same value is accepted and re-encodes to the
+    // same bytes.
+    let mut canonical = vec![6, 2, 0, 0, 0];
+    canonical.extend_from_slice(&1u32.to_le_bytes());
+    canonical.push(b'a');
+    canonical.push(0);
+    canonical.extend_from_slice(&1u32.to_le_bytes());
+    canonical.push(b'b');
+    canonical.push(0);
+    let mut spliced = Vec::new();
+    spliced.extend_from_slice(&shallow[..offset]);
+    spliced.extend_from_slice(&canonical);
+    spliced.extend_from_slice(&shallow[offset + 1..]);
+    let decoded = Envelope::decode(&spliced).expect("canonical");
+    assert_eq!(decoded.encode().expect("re-encode"), spliced);
+}
+
+#[test]
+fn a_strict_profile_bounds_the_path_scope() {
+    let descriptor = CapDescriptor {
+        id: CapId([0x33; 16]),
+        methods: BTreeSet::from(["echo".to_string()]),
+        budget: Budget::default(),
+        read_only: false,
+        redact: false,
+        path_scope: Some("p".repeat(512)),
+    };
+    let bytes = encode_capability_table(&[descriptor]).expect("encode");
+    // The default profile allows a 1 KiB scope; strict allows 128 bytes.
+    decode_capability_table_with(&bytes, &WireLimits::default()).expect("default");
+    let error = decode_capability_table_with(&bytes, &WireLimits::strict())
+        .expect_err("strict bounds the scope");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+}
+
+#[test]
+fn a_non_canonical_method_order_is_refused() {
+    // Two methods in descending order decode to a sorted set and re-encode
+    // differently, so the bytes are not a fixed point.
+    let canonical = CapDescriptor {
+        id: CapId([0x44; 16]),
+        methods: BTreeSet::from(["a".to_string(), "b".to_string()]),
+        budget: Budget::default(),
+        read_only: false,
+        redact: false,
+        path_scope: None,
+    };
+    let bytes = encode_capability_table(&[canonical]).expect("encode");
+    // Find the method block: count(4) then "a" (4+1) then "b" (4+1).
+    let count_at = 4usize;
+    let first_len_at = count_at + 4 + 16;
+    let second_len_at = first_len_at + 4 + 1;
+    let mut swapped = bytes.clone();
+    // Swap the two one-byte names and their lengths.
+    swapped[first_len_at] = b'b';
+    swapped[second_len_at] = b'a';
+    let error = decode_capability_table_with(&swapped, &WireLimits::default())
+        .expect_err("descending method order is refused");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
 }

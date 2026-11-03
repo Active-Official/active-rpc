@@ -103,16 +103,39 @@ impl Value {
     /// the Rust stack, and a public predicate over it must not be the thing that
     /// overflows.
     pub fn is_tainted(&self) -> bool {
-        let mut stack = vec![self];
-        while let Some(value) = stack.pop() {
-            match value {
-                Value::Secret => return true,
-                Value::List(items) => stack.extend(items.iter()),
-                Value::Map(entries) => stack.extend(entries.values()),
-                _ => {}
+        enum Work<'a> {
+            Visit(&'a Value),
+            NextList(std::slice::Iter<'a, Value>),
+            NextMap(std::collections::btree_map::Iter<'a, String, Value>),
+        }
+
+        let mut work = vec![Work::Visit(self)];
+        loop {
+            let Some(item) = work.pop() else {
+                return false;
+            };
+            match item {
+                Work::Visit(Value::Secret) => return true,
+                Work::Visit(Value::List(items)) => work.push(Work::NextList(items.iter())),
+                Work::Visit(Value::Map(entries)) => work.push(Work::NextMap(entries.iter())),
+                Work::Visit(_) => {}
+                // One frame per open container, like `shape`: pushing every child
+                // of a wide value first costs the width before the first element
+                // is looked at (round 3, #4).
+                Work::NextList(mut items) => {
+                    if let Some(item) = items.next() {
+                        work.push(Work::NextList(items));
+                        work.push(Work::Visit(item));
+                    }
+                }
+                Work::NextMap(mut entries) => {
+                    if let Some((_, item)) = entries.next() {
+                        work.push(Work::NextMap(entries));
+                        work.push(Work::Visit(item));
+                    }
+                }
             }
         }
-        false
     }
 
     /// The first shape ceiling `budget` sets that this value exceeds, if any.
@@ -262,6 +285,10 @@ impl Value {
     pub fn shape(&self) -> Shape {
         enum Work<'a> {
             Visit(&'a Value, u64),
+            /// The next element of a list, at its child depth.
+            NextList(std::slice::Iter<'a, Value>, u64),
+            /// The next entry of a map, at its child depth.
+            NextMap(std::collections::btree_map::Iter<'a, String, Value>, u64),
             /// A container finished: fold its size into its parent.
             Fold(u64),
         }
@@ -298,25 +325,32 @@ impl Value {
                     match value {
                         Value::List(items) => {
                             shape.widest = shape.widest.max(items.len() as u64);
-                            for item in items {
-                                work.push(Work::Visit(item, depth + 1));
-                            }
+                            work.push(Work::NextList(items.iter(), depth + 1));
                         }
                         Value::Map(entries) => {
                             shape.widest = shape.widest.max(entries.len() as u64);
-                            for (key, item) in entries {
-                                // A key is payload too: a grant that bounds the
-                                // size of a value must bound the name it arrives
-                                // under.
-                                let key_size = 5u64.saturating_add(key.len() as u64);
-                                match open.last_mut() {
-                                    Some(top) => *top = top.saturating_add(key_size),
-                                    None => total = total.saturating_add(key_size),
-                                }
-                                work.push(Work::Visit(item, depth + 1));
-                            }
+                            work.push(Work::NextMap(entries.iter(), depth + 1));
                         }
                         _ => unreachable!("only containers open an accumulator"),
+                    }
+                }
+                Work::NextList(mut items, depth) => {
+                    if let Some(item) = items.next() {
+                        work.push(Work::NextList(items, depth));
+                        work.push(Work::Visit(item, depth));
+                    }
+                }
+                Work::NextMap(mut entries, depth) => {
+                    if let Some((key, item)) = entries.next() {
+                        // A key is payload too: a grant that bounds the size of a
+                        // value must bound the name it arrives under.
+                        let key_size = 5u64.saturating_add(key.len() as u64);
+                        match open.last_mut() {
+                            Some(top) => *top = top.saturating_add(key_size),
+                            None => total = total.saturating_add(key_size),
+                        }
+                        work.push(Work::NextMap(entries, depth));
+                        work.push(Work::Visit(item, depth));
                     }
                 }
                 Work::Fold(constant) => {

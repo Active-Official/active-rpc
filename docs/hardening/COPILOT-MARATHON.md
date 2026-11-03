@@ -1384,6 +1384,38 @@ one low; three fixed, one documented.
 Gate: 778 tests all-features, 0 failed; clippy/fmt/doc clean; negative controls
 9/9.
 
+### R-01 wire ARP1 - 2026-11-02 (round 3)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `e346633`. It verified the
+round-2 ceilings and found three mediums and one low.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the delta's two count fields returned `rpc/wire` on truncation while the base and the ids were `rpc/capability-table` | **fixed**: both counts map to the table class; `a_truncated_delta_is_a_capability_table_fault` |
+| 2 | medium | a non-canonical map accepted descending keys (and a descriptor descending methods): decode sorted the map, re-encode differed, so two images named one value and the raw-hash agreement a replay relies on broke | **fixed**: map keys and descriptor methods must be strictly increasing; `a_non_canonical_map_is_refused`, `a_non_canonical_method_order_is_refused` |
+| 3 | low | the descriptor path scope was a hardcoded 1024 bytes, so a strict peer still accepted a 512-byte scope | **fixed**: `WireLimits.max_path` (1024 default, 128 strict); `a_strict_profile_bounds_the_path_scope` |
+| 4 | medium | `Value::shape`/`wire_size`/`is_tainted` pushed every child of a container before visiting any, so a standalone caller of `wire_size` on a hostile wide value allocated one work item per element | **fixed**: one frame per open container in all three, like `shape_exceeded`; the kernel's gates were already bounded, this closes the direct-call path |
+
+Residual: the report's own note that `wire_size` remains O(n) for an admitted
+value — it is a measurement, and every caller that must refuse chooses
+`shape_exceeded` first.
+
+Gate: 790 tests all-features, 0 failed; clippy/fmt/doc clean; control-plane
+green; negative controls 9/9.
+
+### R-02 kernel dispatch - 2026-11-02 (round 8)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `e346633`. One medium and two
+lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `cancel_tree` treated a batch job that had not started as a running one, so it sealed a receipt but counted nothing and emitted no `call.refused` (the `cancel` path did both) | **fixed**: a job whose state is `Queued` is cancellable wherever the batch put it; `a_tree_cancel_of_a_not_yet_started_job_counts_it` |
+| 2 | low | the pre-substitution gate used the budget copy taken at queue time, so a capability or lane attenuated in between let the value be cloned before the refusal | **fixed**: the gate uses the capability's current budget intersected with the lane's |
+| 3 | low | `fail_job` counted a promise answered out of band as a double settlement (it excluded only `Cancelled`) | **fixed**: a failed reject means the promise was already settled by a caller decision or a repeated failure, and neither is a kernel double settlement |
+
+Gate: 790 tests all-features, 0 failed; clippy/fmt/doc clean.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

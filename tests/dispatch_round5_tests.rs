@@ -25,6 +25,7 @@ impl Provider for Worker {
     fn methods(&self) -> Vec<String> {
         vec![
             "kill".to_string(),
+            "tree-kill".to_string(),
             "resolve-next".to_string(),
             "self-cancel".to_string(),
             "work".to_string(),
@@ -42,6 +43,11 @@ impl Provider for Worker {
             "kill" => {
                 if let Some(handle) = self.victim.borrow().as_ref() {
                     agent.cancel(handle).expect("cancel the queued job");
+                }
+            }
+            "tree-kill" => {
+                if let Some(handle) = self.victim.borrow().as_ref() {
+                    agent.cancel_tree(handle).expect("cancel the tree");
                 }
             }
             "resolve-next" => {
@@ -82,7 +88,7 @@ fn worker_agent() -> (Agent, active_rpc::CapHandle, Rc<Cell<usize>>) {
         .mint(
             provider,
             0,
-            CapAttrs::new(&["kill", "resolve-next", "self-cancel", "work"]),
+            CapAttrs::new(&["kill", "tree-kill", "resolve-next", "self-cancel", "work"]),
         )
         .expect("cap");
     // The provider reads the handles through these cells; the test fills them
@@ -454,4 +460,44 @@ fn resolving_a_cancelled_job_says_cancelled() {
         .resolve(&promise, Value::text("late"))
         .expect_err("a cancelled promise cannot be answered");
     assert_eq!(error.code(), "rpc/promise-cancelled");
+}
+
+#[test]
+fn a_tree_cancel_of_a_not_yet_started_job_counts_it() {
+    // Round 8 (#1): `cancel_tree` treated a batch job that had not started as
+    // one that had, so it sealed a receipt but counted nothing and emitted no
+    // `call.refused`.
+    let (agent, cap, runs) = worker_agent();
+    let lane = agent
+        .create_lane("tree-batch", Budget::default())
+        .expect("lane");
+    let first = agent
+        .call(lane, &cap, "tree-kill", Vec::new())
+        .expect("first");
+    let second = agent.call(lane, &cap, "work", Vec::new()).expect("second");
+    VICTIM.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .replace(second.clone())
+    });
+    let before = agent.metrics().calls_refused;
+    agent.run();
+    assert_eq!(runs.get(), 0, "the cancelled job never ran");
+    assert_eq!(
+        agent.metrics().calls_refused,
+        before + 1,
+        "the cancelled job was not counted"
+    );
+    let json = agent.trace_json();
+    assert!(
+        json.contains("\"event\":\"call.refused\""),
+        "the tree cancellation is not on the tape: {json}"
+    );
+    assert_eq!(
+        second.value().expect_err("cancelled").code(),
+        "rpc/promise-cancelled"
+    );
+    first.value().expect("the cancelling call settles");
 }

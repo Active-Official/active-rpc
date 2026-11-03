@@ -262,6 +262,8 @@ pub struct WireLimits {
     pub max_values: u32,
     /// Maximum elements in one list or map.
     pub max_array_len: u32,
+    /// Maximum path-scope bytes in a capability descriptor.
+    pub max_path: u32,
 }
 
 impl Default for WireLimits {
@@ -275,6 +277,7 @@ impl Default for WireLimits {
             max_methods: 64,
             max_values: 1 << 20,
             max_array_len: 1 << 20,
+            max_path: 1_024,
         }
     }
 }
@@ -291,6 +294,7 @@ impl WireLimits {
             max_methods: 16,
             max_values: 1 << 16,
             max_array_len: 1 << 12,
+            max_path: 128,
         }
     }
 }
@@ -481,7 +485,8 @@ impl Envelope {
             let mut base = [0u8; 32];
             base.copy_from_slice(&bytes[cursor..cursor + 32]);
             cursor += 32;
-            let removed_count = read_u32(bytes, &mut cursor)?;
+            let removed_count = read_u32(bytes, &mut cursor)
+                .map_err(|_| Error::CapabilityTable("truncated cap-table delta"))?;
             if removed_count > limits.max_caps {
                 return Err(Error::CapabilityTable("too many delta removals"));
             }
@@ -495,7 +500,8 @@ impl Envelope {
                 cursor += 16;
                 removed.push(CapId(id));
             }
-            let added_count = read_u32(bytes, &mut cursor)?;
+            let added_count = read_u32(bytes, &mut cursor)
+                .map_err(|_| Error::CapabilityTable("truncated cap-table delta"))?;
             if added_count > limits.max_caps {
                 return Err(Error::CapabilityTable("too many delta additions"));
             }
@@ -836,11 +842,19 @@ fn read_value_at(
                     remaining_values,
                     max_array_len,
                 )?;
-                if entries.insert(key, value).is_some() {
-                    // A duplicate key decodes to one entry and re-encodes shorter,
-                    // so two byte images would name one value.
-                    return Err(Error::Wire("duplicate map key"));
+                // Keys are strictly increasing. A duplicate decodes to one
+                // entry, and an out-of-order map re-encodes sorted: either way
+                // two byte images would name one value and the raw-hash
+                // agreement a replay package relies on would break (§8.5).
+                if let Some(last) = entries.keys().next_back() {
+                    if key == *last {
+                        return Err(Error::Wire("duplicate map key"));
+                    }
+                    if key < *last {
+                        return Err(Error::Wire("map keys are not in canonical order"));
+                    }
                 }
+                entries.insert(key, value);
             }
             Value::Map(entries)
         }
@@ -916,12 +930,20 @@ fn read_cap_inner(bytes: &[u8], cursor: &mut usize, limits: &WireLimits) -> Resu
         // peer refused 100-byte methods at the envelope but accepted them in a
         // descriptor (round 2, #6).
         let method = read_str(bytes, cursor, limits.max_method)?;
-        if !methods.insert(method) {
-            // A duplicate would decode to a smaller set than the bytes encode,
-            // so re-encoding would not reproduce the frame and a delta base
-            // negotiated on raw bytes would diverge.
-            return Err(Error::CapabilityTable("duplicate method name"));
+        // Strictly increasing, like a map's keys: a duplicate or a reordered set
+        // would decode to a smaller or sorted set and re-encode differently,
+        // diverging from a delta base negotiated on raw bytes.
+        if let Some(last) = methods.last() {
+            if method == *last {
+                return Err(Error::CapabilityTable("duplicate method name"));
+            }
+            if method < *last {
+                return Err(Error::CapabilityTable(
+                    "method names are not in canonical order",
+                ));
+            }
         }
+        methods.insert(method);
     }
     let budget = read_budget(bytes, cursor)?;
     budget
@@ -937,7 +959,7 @@ fn read_cap_inner(bytes: &[u8], cursor: &mut usize, limits: &WireLimits) -> Resu
         1 => true,
         _ => return Err(Error::CapabilityTable("redact is not 0 or 1")),
     };
-    let path_scope = read_opt_str(bytes, cursor, 1024)?;
+    let path_scope = read_opt_str(bytes, cursor, limits.max_path)?;
     Ok(CapDescriptor {
         id: CapId(id),
         methods,

@@ -3779,11 +3779,14 @@ impl Agent {
         }
 
         let targets_set: BTreeSet<PromiseId> = seen;
-        let queued_ids: BTreeSet<u64> = kernel.queue.iter().copied().collect();
+        // A job the current batch has dequeued but not started still has state
+        // `Queued`: it can be cancelled for real, exactly as `cancel` does, so it
+        // is counted and traced rather than treated as a provider that already
+        // ran (round 8, #1).
         let queued: Vec<(u64, PromiseId, u64, CapId)> = kernel
             .jobs
             .iter()
-            .filter(|(id, job)| queued_ids.contains(id) && targets_set.contains(&job.promise))
+            .filter(|(_, job)| job.state == JobState::Queued && targets_set.contains(&job.promise))
             .map(|(id, job)| (*id, job.promise, job.lane.0, job.cap))
             .collect();
         let mut queued_promises: BTreeSet<PromiseId> = BTreeSet::new();
@@ -4309,9 +4312,16 @@ impl Agent {
                 // anything: a `Value` clone recurses, and the substituted copy
                 // below is the one that must not happen for a value the current
                 // grant refuses (round 8, #1).
-                let gate_budget = kernel.lanes.get(&job.lane).map_or(job.call.budget, |lane| {
-                    job.call.budget.intersect(&lane.budget)
-                });
+                // The grant as it is now: the capability's current budget
+                // intersected with the lane's. The copy on the job is the one
+                // taken at queue time, and an attenuation between queue and
+                // dispatch would otherwise let a value the current grant refuses
+                // be cloned before the refusal (round 8, #2).
+                let gate_budget = match (kernel.caps.get(&job.cap), kernel.lanes.get(&job.lane)) {
+                    (Some(record), Some(lane)) => record.attrs.budget.intersect(&lane.budget),
+                    (Some(record), None) => record.attrs.budget,
+                    (None, _) => job.call.budget,
+                };
                 // The caller may have cancelled or answered this job after the
                 // batch was chosen. It must not run: the provider side effect
                 // would land after the caller was told the call would not run
@@ -5217,10 +5227,11 @@ impl Kernel {
             if let Some(record) = self.promises.get_mut(&promise) {
                 if record.reject(error).is_ok() {
                     settled_now = true;
-                } else if record.state != crate::promise::PromiseState::Cancelled {
-                    self.metrics.promises_double_settled =
-                        self.metrics.promises_double_settled.saturating_add(1);
                 }
+                // A failed reject means the promise was already settled (a
+                // cancel, an out-of-band answer, a duplicate failure). That is a
+                // caller decision or a repeated failure, not a kernel double
+                // settlement (round 8, #3).
             }
             if let Some(lane_record) = self.lanes.get_mut(&lane) {
                 lane_record.complete();
