@@ -193,7 +193,10 @@ impl Channel {
     /// at the frame ceiling).
     pub fn send_sequence(&mut self, from: LaneId, payload: Value, caps: Vec<CapId>) -> Result<u64> {
         let bytes = queued_size(&payload, &caps, None);
-        Ok(self.push(from, None, payload, caps, bytes)?.sequence)
+        // No clone: `push` copies the message for its return value, and a
+        // kernel send has no use for it. At the frame ceiling that copy is
+        // 64 MiB per send.
+        self.enqueue(from, None, payload, caps, bytes)
     }
 
     /// Whether the channel could hold `bytes` more.
@@ -214,6 +217,26 @@ impl Channel {
         caps: Vec<CapId>,
         bytes: u64,
     ) -> Result<Message> {
+        self.enqueue(from, topic, payload, caps, bytes)?;
+        // The queued copy is the only one worth keeping: returning it costs one
+        // clone, and a direct `Channel` caller is the only caller that wants a
+        // `Message` back.
+        Ok(self
+            .queue
+            .back()
+            .cloned()
+            .expect("a message was just queued"))
+    }
+
+    /// Queue one message and return its sequence, without copying it.
+    fn enqueue(
+        &mut self,
+        from: LaneId,
+        topic: Option<&str>,
+        payload: Value,
+        caps: Vec<CapId>,
+        bytes: u64,
+    ) -> Result<u64> {
         if let Some(topic) = topic {
             // The type boundary enforces the same rule the kernel does: a
             // directly driven `Channel` cannot store a topic the kernel would
@@ -249,11 +272,12 @@ impl Channel {
             topic: topic.map(str::to_string),
             sequence: self.next_sequence,
         };
+        let sequence = self.next_sequence;
         self.next_sequence += 1;
         self.sent += 1;
         self.queued_bytes = self.queued_bytes.saturating_add(bytes);
-        self.queue.push_back(message.clone());
-        Ok(message)
+        self.queue.push_back(message);
+        Ok(sequence)
     }
 
     /// Take the oldest message.

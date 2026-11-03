@@ -55,6 +55,31 @@ fn the_default_clock_is_virtual_and_advances_by_one_round_trip() {
 }
 
 #[test]
+fn a_ttl_that_elapses_between_calls_is_refused_at_the_queue() {
+    // Round 4 (R-06 F5): the queue path checked `now_ms` without refreshing it,
+    // so in wall-clock mode an expired capability was queued and charged, and
+    // refused only at dispatch.
+    let agent = Agent::with_secret([0x6d; 32]);
+    agent.use_wall_clock(true);
+    let provider = agent.register(Box::new(Echo));
+    let lane = agent.create_lane("clock", Budget::default()).expect("lane");
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]).with_ttl_ms(30))
+        .expect("cap");
+    std::thread::sleep(std::time::Duration::from_millis(80));
+
+    let error = agent
+        .call(lane, &cap, "echo", Vec::new())
+        .expect_err("the ttl elapsed before the call");
+    assert_eq!(error.code(), "rpc/revoked");
+    assert_eq!(
+        agent.metrics().calls_queued,
+        0,
+        "a refused call charged the queue"
+    );
+}
+
+#[test]
 fn wall_clock_mode_tracks_the_system_clock() {
     let agent = Agent::with_secret([0x62; 32]);
     let before = wall_ms();

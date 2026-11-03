@@ -270,6 +270,74 @@ fn a_million_wide_list_is_refused_without_a_full_walk() {
 }
 
 #[test]
+fn a_nested_accumulator_over_the_size_ceiling_is_refused_early() {
+    // Round 4: the size ceiling was compared only when a container folded into
+    // its parent, so a list of a million 32-byte texts under a 1 KiB ceiling was
+    // walked in full first. A container's accumulator only grows, so it is
+    // refused as soon as it passes the ceiling.
+    let budget = Budget {
+        max_array_len: 2_000_000,
+        max_value_size: 1_024,
+        ..Budget::default()
+    };
+    let wide = Value::list((0..1_000_000).map(|_| Value::text("x".repeat(32))));
+
+    let mut full_walk = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert!(wide.shape().size > 1_024);
+        full_walk = full_walk.min(start.elapsed().as_nanos());
+    }
+
+    let mut bounded = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide.shape_exceeded(&budget), Some("value_size"));
+        bounded = bounded.min(start.elapsed().as_nanos());
+    }
+
+    assert!(
+        bounded.saturating_mul(10) < full_walk,
+        "the bounded check ({bounded} ns) walked the whole value ({full_walk} ns)"
+    );
+}
+
+#[test]
+fn a_violation_in_the_first_element_is_found_without_walking_the_rest() {
+    // Round 4: every child of a container was pushed before any was visited and
+    // the stack popped last-first, so a violation in element 0 was the last
+    // thing checked. The walk now visits elements in order, one frame per open
+    // container.
+    let budget = Budget {
+        max_depth: 2,
+        max_array_len: 2_000_000,
+        ..Budget::default()
+    };
+    let mut items = vec![nested(5)];
+    items.extend((0..1_000_000).map(|_| Value::Null));
+    let wide = Value::list(items);
+
+    let mut full_walk = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide.shape().depth, 6);
+        full_walk = full_walk.min(start.elapsed().as_nanos());
+    }
+
+    let mut bounded = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide.shape_exceeded(&budget), Some("depth"));
+        bounded = bounded.min(start.elapsed().as_nanos());
+    }
+
+    assert!(
+        bounded.saturating_mul(10) < full_walk,
+        "the bounded check ({bounded} ns) walked the whole value ({full_walk} ns)"
+    );
+}
+
+#[test]
 fn a_module_larger_than_max_value_size_is_refused() {
     let fixture = fixture_with(budget(), Value::text("ok"));
     assert_eq!(

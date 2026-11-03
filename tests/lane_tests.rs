@@ -3,11 +3,14 @@
 //!
 //! Every test here fails against the tree before its fix.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use active_rpc::cap::CapAttrs;
 use active_rpc::channel::{Direction, MAX_QUEUED_BYTES};
 use active_rpc::kernel::{Provider, MAX_OBJECT_NAME_BYTES};
 use active_rpc::value::{Arg, Call, Response, Value};
-use active_rpc::{Agent, Budget};
+use active_rpc::{Agent, Budget, LaneId};
 
 struct Echo;
 
@@ -277,6 +280,87 @@ fn refusals_are_counted() {
         agent.metrics().calls_refused,
         before + 1,
         "a refused send is not counted"
+    );
+}
+
+/// Destroys its own lane from inside a call, then counts any work that still
+/// runs on that lane.
+struct Killer {
+    agent: Rc<RefCell<Option<Agent>>>,
+    victim: Rc<Cell<Option<u64>>>,
+    work: Rc<Cell<usize>>,
+}
+
+impl Provider for Killer {
+    fn name(&self) -> &'static str {
+        "killer"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["kill".to_string(), "work".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, call: &Call) -> active_rpc::Result<Response> {
+        if call.method == "kill" {
+            let agent = self.agent.borrow();
+            let agent = agent.as_ref().expect("the agent is installed");
+            let lane = self.victim.get().expect("the lane is installed");
+            agent.destroy_lane(LaneId(lane)).expect("destroy the lane");
+            Ok(Response::Value(Value::text("killed")))
+        } else {
+            self.work.set(self.work.get() + 1);
+            Ok(Response::Value(Value::text("worked")))
+        }
+    }
+}
+
+#[test]
+fn destroying_a_lane_mid_batch_settles_its_running_call_once() {
+    let agent = Agent::with_secret([0x7c; 32]);
+    let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
+    let victim = Rc::new(Cell::new(None));
+    let work = Rc::new(Cell::new(0usize));
+    let provider = agent.register(Box::new(Killer {
+        agent: Rc::clone(&slot),
+        victim: Rc::clone(&victim),
+        work: Rc::clone(&work),
+    }));
+    *slot.borrow_mut() = Some(agent.clone());
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["kill", "work"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("victim", Budget::default())
+        .expect("lane");
+    victim.set(Some(lane.0));
+
+    // Both jobs land in one batch: the first destroys the lane as it runs.
+    let kill = agent.call(lane, &cap, "kill", Vec::new()).expect("kill");
+    let queued_work = agent.call(lane, &cap, "work", Vec::new()).expect("work");
+    agent.run();
+
+    assert_eq!(
+        kill.value()
+            .expect("the running call keeps its own outcome"),
+        Value::text("killed")
+    );
+    let error = queued_work
+        .value()
+        .expect_err("queued work on a destroyed lane is refused");
+    assert_eq!(error.code(), "rpc/unknown-lane");
+    assert_eq!(
+        work.get(),
+        0,
+        "the provider ran work on a lane destroyed before its job"
+    );
+    assert_eq!(
+        agent.metrics().promises_double_settled,
+        0,
+        "a running job's promise was settled twice"
     );
 }
 

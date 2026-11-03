@@ -112,8 +112,15 @@ impl Value {
     /// violation the full walk would accept: sizes only accumulate here, so an
     /// accumulator that is already over the ceiling stays over it.
     pub fn shape_exceeded(&self, budget: &crate::budget::Budget) -> Option<&'static str> {
+        use std::collections::btree_map;
+
+        /// Where the walk is inside a container.
         enum Work<'a> {
             Visit(&'a Value, u64),
+            /// The next element of a list, at its child depth.
+            NextList(std::slice::Iter<'a, Value>, u64),
+            /// The next entry of a map, at its child depth.
+            NextMap(btree_map::Iter<'a, String, Value>, u64),
             /// A container finished: fold its size into its parent.
             Fold(u64),
         }
@@ -121,7 +128,8 @@ impl Value {
         let mut work = vec![Work::Visit(self, 0)];
         let mut open: Vec<u64> = Vec::new();
         let mut total = 0u64;
-        while let Some(item) = work.pop() {
+        loop {
+            let item = work.pop()?;
             match item {
                 Work::Visit(value, depth) => {
                     let scalar = match value {
@@ -136,45 +144,71 @@ impl Value {
                     };
                     if let Some(size) = scalar {
                         match open.last_mut() {
-                            Some(top) => *top = top.saturating_add(size),
-                            None => total = total.saturating_add(size),
-                        }
-                        if total > budget.max_value_size {
-                            return Some("value_size");
+                            Some(top) => {
+                                *top = top.saturating_add(size);
+                                // The accumulator is part of the value's size
+                                // and only grows, so a container that is over
+                                // the ceiling is refused before its parent
+                                // folds it: waiting for the fold would visit
+                                // every element of a hostile list first.
+                                if *top > budget.max_value_size {
+                                    return Some("value_size");
+                                }
+                            }
+                            None => {
+                                total = total.saturating_add(size);
+                                if total > budget.max_value_size {
+                                    return Some("value_size");
+                                }
+                            }
                         }
                         continue;
                     }
                     if depth + 1 > budget.max_depth {
                         return Some("depth");
                     }
-                    open.push(0);
-                    work.push(Work::Fold(5));
                     match value {
                         Value::List(items) => {
                             if items.len() as u64 > budget.max_array_len {
                                 return Some("array_len");
                             }
-                            for item in items {
-                                work.push(Work::Visit(item, depth + 1));
-                            }
+                            open.push(0);
+                            work.push(Work::Fold(5));
+                            // One frame per open container, visited in order:
+                            // pushing every child up front would make a wide
+                            // list cost its width before the first element was
+                            // looked at.
+                            work.push(Work::NextList(items.iter(), depth + 1));
                         }
                         Value::Map(entries) => {
                             if entries.len() as u64 > budget.max_array_len {
                                 return Some("array_len");
                             }
-                            for (key, item) in entries {
-                                let key_size = 5u64.saturating_add(key.len() as u64);
-                                match open.last_mut() {
-                                    Some(top) => *top = top.saturating_add(key_size),
-                                    None => total = total.saturating_add(key_size),
-                                }
-                                if total > budget.max_value_size {
-                                    return Some("value_size");
-                                }
-                                work.push(Work::Visit(item, depth + 1));
-                            }
+                            open.push(0);
+                            work.push(Work::Fold(5));
+                            work.push(Work::NextMap(entries.iter(), depth + 1));
                         }
                         _ => unreachable!("only containers open an accumulator"),
+                    }
+                }
+                Work::NextList(mut items, depth) => {
+                    if let Some(item) = items.next() {
+                        work.push(Work::NextList(items, depth));
+                        work.push(Work::Visit(item, depth));
+                    }
+                }
+                Work::NextMap(mut entries, depth) => {
+                    if let Some((key, item)) = entries.next() {
+                        // A key is payload too, and it is charged to the map
+                        // that holds it.
+                        if let Some(top) = open.last_mut() {
+                            *top = top.saturating_add(5u64.saturating_add(key.len() as u64));
+                            if *top > budget.max_value_size {
+                                return Some("value_size");
+                            }
+                        }
+                        work.push(Work::NextMap(entries, depth));
+                        work.push(Work::Visit(item, depth));
                     }
                 }
                 Work::Fold(constant) => {
@@ -191,7 +225,6 @@ impl Value {
                 }
             }
         }
-        None
     }
 
     /// Measure the shape of this value in one iterative pass.

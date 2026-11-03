@@ -19,7 +19,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-03 | capabilities | `src/cap.rs` | CLEAN (rounds 1-3) | 36 fixed / 0 rejected / 0 open | this commit |
 | R-04 | promises / pipeline | `src/promise.rs` | CLEAN (rounds 1-2) | 24 fixed / 0 rejected / 3 low open (logged) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | round 1: 9 fixed, 1 carried | 9 fixed / 0 rejected / 1 open (ADR) | this commit |
-| R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-3; round 3 was the confirmation pass) | 20 fixed / 0 rejected / 0 open (2 accepted designs documented) | this commit |
+| R-06 | budget | `src/budget.rs` | rounds 1-4 (round 3 and 4 were confirmation passes) | 26 fixed / 0 rejected / 0 open (3 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-6: 12 + 8 + 9 + 8 + 1 + 4 findings | 42 fixed / 0 rejected / 0 open (1 residual: a binding DoSes scoped reads) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | round 1: 10 fixed, 5 carried; round 2: 5 carried closed, 3 highs + 6 mediums + 7 lows fixed | 24 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
@@ -953,6 +953,29 @@ verdict was not CLEAN because of the new defects below and five open items.
 Gate after these fixes: `cargo test --all-features` (all green, see below);
 clippy and fmt clean on both feature sets.
 
+### R-06 budgets - 2026-11-02 (round 4, the confirmation re-audit)
+
+Reviewer: Muse (DeepSeek V4.1 Flash was unavailable behind its proxy) through the
+Copilot CLI, `xhigh`, at `3146200`. Verdict: **NOT CLEAN** — the five round-3
+claims held, with two incomplete, and it found six new defects (one high).
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `shape_exceeded` compared the size ceiling only when a container folded into its parent, so a list of a million texts under a 1 KiB ceiling was walked in full | **fixed**: the per-container accumulator is compared after every scalar and every map key, and it only grows, so a container over the ceiling is refused before its parent folds it; `a_nested_accumulator_over_the_size_ceiling_is_refused_early` (10× headroom against `shape()`) |
+| F2 | medium | every child of a container was pushed before any was visited and the stack popped last-first, so a violation in element 0 was checked last | **fixed**: one frame per open container (`NextList`/`NextMap` iterators), children visited in order; `a_violation_in_the_first_element_is_found_without_walking_the_rest` |
+| F3 | medium | the export path still skipped a meterless ancestor (the fail-open the round closed everywhere else) | **fixed**: the ancestor clamp and both export loops require a meter; `an_export_with_a_meterless_ancestor_is_refused` |
+| F4 | medium | a provider destroying its own lane mid-batch rejected the promise of the job it was running, and the same dispatch then settled it again: two events, a refusal receipt for a call that ran, a double-settle counter | **fixed**: `JobState::Running` is set before the provider runs; `destroy_lane` fails only `Queued` jobs and keeps a running job's record so its own dispatch settles it once; `destroying_a_lane_mid_batch_settles_its_running_call_once` |
+| F5 | low | `call_inner_payload` never refreshed the clock, so in wall-clock mode an expired capability was queued and charged and refused only at dispatch | **fixed**: refresh at the queue and on the idempotent replay path; `a_ttl_that_elapses_between_calls_is_refused_at_the_queue` |
+| F6 | low | argument byte sums wrapped in release instead of saturating | **fixed**: `fold(0u64, u64::saturating_add)` at the queue and dispatch sites |
+| F7 | residual | the global channel byte ceiling lets one lane backpressure unrelated lanes | **documented** in the security model: the bytes belong to the channel, not the sender, and per-lane attribution is not meaningful while any subscribed lane may receive |
+
+The same pass found a copy in `Channel::send_sequence`: `push` cloned the whole
+message for a return value the kernel discards, so every send copied the payload
+(64 MiB at the frame ceiling). The queue now stores the only copy;
+`a_kernel_send_does_not_copy_the_payload` measures with a counting allocator and
+fails against the old code.
+
+Gate: `cargo test --all-features` 733 passed, 0 failed; clippy and fmt clean.
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

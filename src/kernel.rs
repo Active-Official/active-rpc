@@ -357,6 +357,11 @@ pub struct Metrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobState {
     Queued,
+    /// The job is in the current batch and its provider may be running right
+    /// now. A lane destroyed at this point must not settle its promise: this
+    /// dispatch owns the settlement, and a rejection here would disagree with
+    /// the receipt the same dispatch seals.
+    Running,
     Done,
 }
 
@@ -1058,10 +1063,13 @@ impl Agent {
         let mut remaining_calls = own_calls;
         let mut remaining_bytes = own_bytes;
         for ancestor in &record.lineage {
-            if let Some(parent_meter) = kernel.meters.get(ancestor) {
-                remaining_calls = remaining_calls.min(parent_meter.remaining_calls());
-                remaining_bytes = remaining_bytes.min(parent_meter.remaining_bytes());
-            }
+            // An export hands out the grant the whole chain still has. A
+            // skipped ancestor would let the record carry more than that
+            // ancestor allows, so a missing meter fails the export (round 4).
+            let parent_meter = meter_for(&kernel, *ancestor)?
+                .ok_or(Error::Persistence("the capability has no meter"))?;
+            remaining_calls = remaining_calls.min(parent_meter.remaining_calls());
+            remaining_bytes = remaining_bytes.min(parent_meter.remaining_bytes());
         }
         if remaining_calls == 0 || remaining_bytes == 0 {
             return Err(Error::persistence("the capability's grant is spent"));
@@ -1069,11 +1077,11 @@ impl Agent {
         let mut chain: Vec<CapId> = record.lineage.clone();
         chain.push(record.id);
         for id in &chain {
-            if let Some(meter) = meter_for(&kernel, *id)? {
-                meter
-                    .check_reserve(remaining_calls, remaining_bytes)
-                    .map_err(|_| Error::persistence("the grant is already committed"))?;
-            }
+            let meter = meter_for(&kernel, *id)?
+                .ok_or(Error::Persistence("the capability has no meter"))?;
+            meter
+                .check_reserve(remaining_calls, remaining_bytes)
+                .map_err(|_| Error::persistence("the grant is already committed"))?;
         }
         let mut record = crate::persistence::CapabilityRecord {
             provider: provider_name,
@@ -1107,11 +1115,11 @@ impl Agent {
         // capability now fails with its authority intact.
         crate::persistence::CapabilityRecord::from_json(&record.to_json())?;
         for id in &chain {
-            if let Some(meter) = meter_mut_for(&mut kernel, *id)? {
-                meter
-                    .reserve(remaining_calls, remaining_bytes)
-                    .map_err(|_| Error::persistence("the grant is already committed"))?;
-            }
+            let meter = meter_mut_for(&mut kernel, *id)?
+                .ok_or(Error::Persistence("the capability has no meter"))?;
+            meter
+                .reserve(remaining_calls, remaining_bytes)
+                .map_err(|_| Error::persistence("the grant is already committed"))?;
         }
         kernel.consumed_records.insert(record.record_id);
         kernel.push_event(Event::CapExported(cap.id()));
@@ -1777,6 +1785,8 @@ impl Agent {
         for job_id in doomed {
             kernel.fail_job(job_id, Error::UnknownLane(lane.0));
         }
+        // `doomed` never holds a running job (its state is `Running`), so the
+        // retain below keeps that one record until its dispatch settles it.
         // Reclaim the dispatch records this lane owns. Promise records stay:
         // a caller that holds a handle must still see the settled value (or a
         // rejected one) rather than an unrelated `unknown-promise`. The promise
@@ -1788,7 +1798,9 @@ impl Agent {
             .flat_map(|job| job.deps.clone())
             .collect();
         Kernel::release_waiters(&mut kernel, &orphaned);
-        kernel.jobs.retain(|_, job| job.lane != lane);
+        kernel
+            .jobs
+            .retain(|_, job| job.lane != lane || job.state == JobState::Running);
         for channel in kernel.channels.values_mut() {
             channel.subscribers.remove(&lane.0);
         }
@@ -2494,6 +2506,11 @@ impl Agent {
         payload: Vec<u8>,
     ) -> Result<PromiseHandle> {
         let mut kernel = self.cell.borrow_mut();
+        // The expiry check below compares against `now_ms`. In wall-clock mode
+        // that value only moves when someone refreshes it, so a capability whose
+        // TTL elapsed since the last call used to be queued (and charged) and
+        // refused only at dispatch.
+        refresh_clock(&mut kernel);
         let cap_id = cap.id();
         let record = kernel
             .caps
@@ -2569,7 +2586,10 @@ impl Agent {
             }
         }
         // Tool policy is enforced here too.
-        let args_bytes: u64 = args.iter().map(Arg::wire_size).sum();
+        let args_bytes: u64 = args
+            .iter()
+            .map(Arg::wire_size)
+            .fold(0u64, u64::saturating_add);
         if let Some(policy) = &record.attrs.tool_policy {
             if !policy.allowed.contains(method) {
                 return Err(Error::ToolPolicy("tool not allowed"));
@@ -3030,6 +3050,9 @@ impl Agent {
         let map_key = (cap.id(), lane, method.to_string(), key.to_string());
         {
             let mut kernel = self.cell.borrow_mut();
+            // A replay re-uses a cached promise; the capability it names must
+            // still be live now, not as of the last refresh.
+            refresh_clock(&mut kernel);
             if let Some((id, stored_args, stored_peer)) = kernel.idempotency.get(&map_key).copied()
             {
                 if stored_args != fingerprint {
@@ -3770,7 +3793,10 @@ impl Agent {
                 // queued. Its value is authority-bearing too, so the path
                 // scope, the tool ceiling and the byte budget are re-checked
                 // against what the provider is about to receive.
-                let resolved_bytes: u64 = args.iter().map(Arg::wire_size).sum();
+                let resolved_bytes: u64 = args
+                    .iter()
+                    .map(Arg::wire_size)
+                    .fold(0u64, u64::saturating_add);
                 if failure.is_none() {
                     if let Some(record) = &record {
                         if let Some(scope) = &record.attrs.path_scope {
@@ -3826,6 +3852,12 @@ impl Agent {
             else {
                 continue;
             };
+            // The job is executing from here: a provider may destroy the lane it
+            // is running on, and the promise then belongs to this dispatch until
+            // the outcome is recorded.
+            if let Some(entry) = self.cell.borrow_mut().jobs.get_mut(&job.id) {
+                entry.state = JobState::Running;
+            }
             if expired {
                 self.cell
                     .borrow_mut()
@@ -5082,6 +5114,39 @@ mod fail_closed_tests {
         let error = agent
             .publish(lane, channel, &cap, "t", Value::Int(1))
             .expect_err("a publish through a capability with no meter must fail");
+        assert!(
+            error.to_string().ends_with("has no meter"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// An export hands out what the whole chain still has. An ancestor whose
+    /// meter is gone must fail the export rather than be skipped, or the record
+    /// would carry more authority than that ancestor allows (round 4, F3).
+    #[test]
+    fn an_export_with_a_meterless_ancestor_is_refused() {
+        let agent = Agent::with_secret([0x5c; 32]);
+        agent.set_durable_capabilities(true);
+        agent.set_record_seal_key([0x92; 32]);
+        let provider = agent.register(Box::new(Ping));
+        let owner = crate::identity::IdentityPolicy::default()
+            .admit(
+                Some(&crate::identity::PeerIdentity::from_certificate(
+                    b"meter-owner",
+                )),
+                true,
+            )
+            .expect("admit");
+        let parent = agent
+            .mint_bound(&owner, provider, 0, CapAttrs::new(&["ping"]).durable())
+            .expect("parent");
+        let child = agent
+            .attenuate(&parent, CapAttrs::new(&["ping"]).durable())
+            .expect("child");
+        agent.cell.borrow_mut().meters.remove(&parent.id());
+        let error = agent
+            .export_capability(&child)
+            .expect_err("an export must not skip a meterless ancestor");
         assert!(
             error.to_string().ends_with("has no meter"),
             "unexpected refusal: {error}"
