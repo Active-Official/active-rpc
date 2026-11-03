@@ -236,3 +236,126 @@ fn a_dispatch_time_path_refusal_is_counted() {
         "the dispatch refusal is not on the tape: {json}"
     );
 }
+
+struct Failing {
+    agent: Rc<RefCell<Option<Agent>>>,
+    own: Rc<RefCell<Option<PromiseHandle>>>,
+}
+
+impl Provider for Failing {
+    fn name(&self) -> &'static str {
+        "failing"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["go".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        let agent = self.agent.borrow();
+        let agent = agent.as_ref().expect("agent installed");
+        if let Some(handle) = self.own.borrow().as_ref() {
+            agent.cancel(handle).expect("cancel itself");
+        }
+        Err(active_rpc::Error::ToolPolicy("refused after cancel"))
+    }
+}
+
+#[test]
+fn a_cancelled_running_job_seals_one_receipt_even_when_it_fails() {
+    // Round 6 (#1): the out-of-band flag was set only on the success branch, so
+    // a self-cancelling provider that then failed sealed a second receipt and
+    // counted a double settlement.
+    let agent = Agent::with_secret([0x93; 32]);
+    agent.enable_receipts(true);
+    let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
+    let own: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
+    let provider = agent.register(Box::new(Failing {
+        agent: Rc::clone(&slot),
+        own: Rc::clone(&own),
+    }));
+    *slot.borrow_mut() = Some(agent.clone());
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["go"]))
+        .expect("cap");
+    let lane = agent.create_lane("fail", Budget::default()).expect("lane");
+    let promise = agent.call(lane, &cap, "go", Vec::new()).expect("call");
+    *own.borrow_mut() = Some(promise.clone());
+    agent.run();
+    assert_eq!(
+        promise.value().expect_err("cancelled").code(),
+        "rpc/promise-cancelled"
+    );
+    assert_eq!(agent.receipts().len(), 1, "one decision, one receipt");
+    assert_eq!(
+        agent.metrics().promises_double_settled,
+        0,
+        "the discarded outcome was counted as a double settlement"
+    );
+}
+
+#[test]
+fn cancelling_a_queued_job_is_an_event_and_a_refusal() {
+    // Round 6 (#2): the tape ended at `call.queued` and the counter was flat.
+    let (agent, cap, _runs) = worker_agent();
+    let lane = agent
+        .create_lane("cancel", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "work", Vec::new()).expect("call");
+    let before = agent.metrics().calls_refused;
+    agent.cancel(&promise).expect("cancel");
+    assert_eq!(agent.metrics().calls_refused, before + 1);
+    let json = agent.trace_json();
+    assert!(json.contains("\"event\":\"call.refused\""), "{json}");
+    assert!(json.contains("\"event\":\"job.completed\""), "{json}");
+}
+
+#[test]
+fn a_dispatch_budget_refusal_is_a_refused_call() {
+    // Round 6 (#3): the budget arms bumped the dimension counter only.
+    struct Big;
+    impl Provider for Big {
+        fn name(&self) -> &'static str {
+            "big"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["go".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Ok(Response::Value(Value::text("x".repeat(4_096))))
+        }
+    }
+
+    let agent = Agent::with_secret([0x94; 32]);
+    let provider = agent.register(Box::new(Big));
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["go"]).with_budget(active_rpc::Budget {
+                max_value_size: 128,
+                ..active_rpc::Budget::default()
+            }),
+        )
+        .expect("cap");
+    let lane = agent
+        .create_lane("egress", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "go", Vec::new()).expect("call");
+    let before = agent.metrics().calls_refused;
+    agent.run();
+    assert_eq!(
+        promise.value().expect_err("too large").code(),
+        "rpc/budget-exceeded"
+    );
+    assert_eq!(agent.metrics().calls_refused, before + 1);
+    let json = agent.trace_json();
+    assert!(json.contains("\"event\":\"call.refused\""), "{json}");
+}

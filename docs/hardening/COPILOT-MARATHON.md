@@ -1356,6 +1356,34 @@ verified; two highs and one medium, all closed.
 Gate: 775 tests all-features, 0 failed; control-plane green; clippy/fmt/doc
 clean; negative controls 9/9.
 
+### R-03 capabilities - 2026-11-02 (round 6, second clean pass)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `79a54bc`. **CLEAN** again,
+so R-03 closes per the loop's rule. It reports no bug, race, panic, exhaustion,
+escalation, oracle, wire or error-code defect in `src/cap.rs` or the kernel's
+capability paths.
+
+Residuals (no action): transferring a token through the CLI's `hex()` is a
+deliberate authority transfer; `next_serial` wraps only after 2⁶⁴ mints with the
+live set capped; a wall-clock restore relies on the deployment's clock setting
+and refuses a mismatch; ancestor `descendants` counters saturate, bounded by
+`MAX_LINEAGE_DEPTH`.
+
+### R-02 kernel dispatch - 2026-11-02 (round 6)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `79a54bc`. Three mediums and
+one low; three fixed, one documented.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the out-of-band flag was set only on the success branch, so a running job settled out of band (cancel or resolve) whose provider then failed sealed a second receipt and counted a double settlement | **fixed**: the flag is the promise's state, computed once before either branch; `a_cancelled_running_job_seals_one_receipt_even_when_it_fails` |
+| 2 | medium | cancelling a queued job sealed a receipt but bumped no counter and emitted no `call.refused`/`job.completed`: the tape ended at `call.queued` | **fixed**: the counters and both events, in `cancel` and in `cancel_tree`; `cancelling_a_queued_job_is_an_event_and_a_refusal` |
+| 3 | medium | a dispatch `BudgetExceeded`/`ToolPolicy` bumped only its dimension counter, so `call.refused` alerts missed it | **fixed**: both arms count `calls_refused` and emit `CallRefused`; `a_dispatch_budget_refusal_is_a_refused_call` |
+| 4 | low | dispatch does not re-check the method grant, read-only or the tool allow-list | **documented**: capability attributes are immutable after the mint except the binding, which dispatch does re-check; the arms exist for a future attenuation of a live capability |
+
+Gate: 778 tests all-features, 0 failed; clippy/fmt/doc clean; negative controls
+9/9.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

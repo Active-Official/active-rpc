@@ -3673,6 +3673,18 @@ impl Agent {
             kernel.record_queued_refusal(job_id, &Error::PromiseCancelled(promise.id.0));
             kernel.queue.retain(|id| *id != job_id);
             let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
+            let cap = kernel.jobs.get(&job_id).map(|job| job.cap);
+            // A cancelled job never ran: count and trace the refusal exactly as
+            // `fail_job` does, so the tape does not end at `call.queued`
+            // (round 6, #2).
+            kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
+            if let Some(lane) = lane {
+                kernel.push_event(Event::CallRefused {
+                    lane,
+                    cap,
+                    code: "rpc/promise-cancelled".to_string(),
+                });
+            }
             let deps = kernel
                 .jobs
                 .get(&job_id)
@@ -3685,6 +3697,7 @@ impl Agent {
                 if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
                     lane_record.complete();
                 }
+                kernel.push_event(Event::JobCompleted { job: job_id, lane });
             }
         } else if let Some(job) = kernel
             .jobs
@@ -3782,9 +3795,19 @@ impl Agent {
             kernel.jobs.remove(&job_id);
             kernel.record_settled(promise_id);
             queued_promises.insert(promise_id);
+            kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
+            kernel.push_event(Event::CallRefused {
+                lane: LaneId(lane),
+                cap: None,
+                code: "rpc/promise-cancelled".to_string(),
+            });
             if let Some(lane_record) = kernel.lanes.get_mut(&LaneId(lane)) {
                 lane_record.complete();
             }
+            kernel.push_event(Event::JobCompleted {
+                job: job_id,
+                lane: LaneId(lane),
+            });
         }
         // A promise cancelled while its job is in the current batch is removed
         // by that dispatch, which cannot settle a cancelled record: without this
@@ -4543,10 +4566,18 @@ impl Agent {
                 }
             };
 
-            // Set when an out-of-band answer settled the promise while the
-            // provider was running: phase 3 then discards this outcome, which is
-            // not a kernel double settlement.
-            let mut resolved_out_of_band = false;
+            // Set when an out-of-band answer or a cancellation settled the
+            // promise while the provider was running: phase 3 then discards this
+            // outcome, which is not a kernel double settlement, and the decision
+            // already sealed (by the resolve or the cancel) stands. It is the
+            // promise's state that decides, not which branch of the outcome
+            // produced it (round 6, #1).
+            let resolved_out_of_band = self
+                .cell
+                .borrow()
+                .promises
+                .get(&job.promise)
+                .is_some_and(|record| record.state.is_settled());
             // Egress is charged before settlement: a response larger than the
             // remaining grant never leaves the kernel.
             let outcome = match outcome {
@@ -4583,14 +4614,7 @@ impl Agent {
                                 // A resolve that won the race already delivered
                                 // its value; charging this one would bill twice
                                 // for a value the caller never sees (round 3, F4).
-                                let already = self
-                                    .cell
-                                    .borrow()
-                                    .promises
-                                    .get(&job.promise)
-                                    .is_some_and(|record| record.state.is_settled());
-                                if already {
-                                    resolved_out_of_band = true;
+                                if resolved_out_of_band {
                                     Ok(value)
                                 } else {
                                     match self.charge_egress(&job, value.wire_size()) {
@@ -4665,6 +4689,13 @@ impl Agent {
                         // budget, and the dimension was lost.
                         match error {
                             Error::BudgetExceeded(_) => {
+                                kernel.metrics.calls_refused =
+                                    kernel.metrics.calls_refused.saturating_add(1);
+                                kernel.push_event(Event::CallRefused {
+                                    lane: job.lane,
+                                    cap: Some(job.cap),
+                                    code: error.code().to_string(),
+                                });
                                 kernel.metrics.budget_exhaustions =
                                     kernel.metrics.budget_exhaustions.saturating_add(1);
                                 kernel.push_event(Event::BudgetExhausted {
@@ -4673,6 +4704,13 @@ impl Agent {
                                 });
                             }
                             Error::ToolPolicy(_) => {
+                                kernel.metrics.calls_refused =
+                                    kernel.metrics.calls_refused.saturating_add(1);
+                                kernel.push_event(Event::CallRefused {
+                                    lane: job.lane,
+                                    cap: Some(job.cap),
+                                    code: error.code().to_string(),
+                                });
                                 kernel.metrics.tool_refusals =
                                     kernel.metrics.tool_refusals.saturating_add(1);
                                 kernel.push_event(Event::ToolRefused {
