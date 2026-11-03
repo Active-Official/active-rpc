@@ -49,6 +49,9 @@ pub const CONTENT_TYPE: &str = "application/arp1";
 /// Largest request body the transport accepts.
 pub const MAX_BODY: usize = 64 << 20;
 
+/// Budget for the TCP connect and the HTTP/2 preface.
+pub const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Largest decoded header list, in RFC 9113 field bytes (name + value + 32 each).
 ///
 /// An HPACK block can expand far beyond the bytes on the wire — one 100-byte
@@ -629,7 +632,10 @@ impl Http2Client {
             .build()
             .map_err(|error| Error::Transport(format!("runtime: {error}")))?;
         let target = address.to_string();
-        let (sender, task) = runtime.block_on(async move {
+        // A peer that accepts the socket and then says nothing used to park
+        // the caller (`with_deadline` cannot apply before the client exists);
+        // connect and the preface share a fixed budget (round 25, #3).
+        let exchange = async move {
             let stream = tokio::net::TcpStream::connect(&target)
                 .await
                 .map_err(|error| Error::Transport(format!("connect: {error}")))?;
@@ -654,6 +660,11 @@ impl Http2Client {
                 let _ = connection.await;
             });
             Ok::<_, Error>((sender, task))
+        };
+        let (sender, task) = runtime.block_on(async move {
+            tokio::time::timeout(CONNECT_WAIT, exchange)
+                .await
+                .map_err(|_| Error::Transport("connect timed out".to_string()))?
         })?;
         Ok(Self {
             runtime,
@@ -767,12 +778,9 @@ impl Http2Client {
                         .collect::<Vec<_>>(),
                 )
             };
-            match deadline {
-                Some(limit) => tokio::time::timeout(limit, exchange)
-                    .await
-                    .map_err(|_| Error::Transport("HTTP/2 call_many timed out".to_string()))?,
-                None => exchange.await,
-            }
+            tokio::time::timeout(wait_for(deadline), exchange)
+                .await
+                .map_err(|_| Error::Transport("HTTP/2 call_many timed out".to_string()))?
         })?;
         responses.into_iter().collect()
     }
@@ -837,12 +845,12 @@ impl Http2Client {
                     .map_err(|error| Error::Transport(format!("response: {error}")))?;
                 read_response(response, limits.max_bytes.min(MAX_BODY), deadline).await
             };
-            match deadline {
-                Some(limit) => tokio::time::timeout(limit, exchange)
-                    .await
-                    .map_err(|_| Error::Transport("HTTP/2 request timed out".to_string()))?,
-                None => exchange.await,
-            }
+            // `wait_for` keeps the caller's deadline and replaces "none" with
+            // the inactivity default, so a peer that never sends HEADERS times
+            // out instead of parking the thread (round 25, #3).
+            tokio::time::timeout(wait_for(deadline), exchange)
+                .await
+                .map_err(|_| Error::Transport("HTTP/2 request timed out".to_string()))?
         })
     }
 }
@@ -851,6 +859,11 @@ impl Drop for Http2Client {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// Wait for a whole exchange: the caller's deadline, or 30 s.
+fn wait_for(deadline: Option<std::time::Duration>) -> std::time::Duration {
+    deadline.unwrap_or(std::time::Duration::from_secs(30))
 }
 
 async fn read_response(

@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-24: 24 found 2 highs + 4 mediums, fixed; round 25 is the confirmation | 139 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-25: 25 found 1 high + 3 mediums, fixed; round 26 is the confirmation | 145 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-18: ... + 7 findings; round 19 is the confirmation | 149 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,28 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 25)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `527b121`.
+All eleven round-24 fixes verified. One high, three mediums, two lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `restrict` re-ran `interop::subgraph` per fixpoint round with no wall check; the reviewer read `InfinityModule::edges` (which does list constraint edges) and concluded one pass suffices | **fixed**: one BFS over `domain::adjacency`, which reads `edges`, so a whole constraint chain lands in the cone. The fixpoint existed because `interop::subgraph`'s own adjacency reads only value children — verified by probe (`cone nodes=1` before, `200` after); `a_constraint_chain_is_inside_one_cone` |
+| 2 | medium | response writes were bounded per syscall, so a reader taking a byte just inside the timeout held the serial bridge | **fixed**: `write_all_before` re-arms from the time left with a 250 ms hard grace past the deadline (a refusal owed at the deadline still reaches the peer); `a_dripping_reader_cannot_hold_the_bridge_response` |
+| 3 | medium | `Http2Client` await of the response headers had no default bound; `with_deadline` could not cover connect | **fixed**: the whole exchange always runs under `wait_for(deadline)` (30 s default), and connect plus the preface share `CONNECT_WAIT`. A probe showed the client preface does not wait for the peer's settings, so the header wait is the real bound; `a_silent_h2_server_fails_the_call_within_the_deadline` |
+| 4 | medium | a redacting `annotations` answer still carried the node arena index, the size `stats` hides | **fixed**: the index is omitted for a redacting caller; `a_redacting_annotation_answer_names_no_arena_index` |
+| 5 | low | `grpc_frame` cast the payload length with `as u32`, and the client never bounded an outgoing body | **fixed**: both callers bound to `MAX_BODY` (client `rpc/wire` before writing), so the length fits; `an_oversized_post_is_refused_before_framing` |
+| 6 | low | a repeated `content-type` and a request line with a fourth token or another version were accepted | **fixed**: both are `400 rpc/wire`; `an_ambiguous_head_is_refused` |
+
+Residuals recorded: `patch` runs one linear encode/hash pass after its last
+wall check; `scope_closure`'s final `outside` scan is uncharged per pathless
+node; `LIVE_RESOLVERS` is process-global (64 hung lookups disable resolution
+until exit); an h2 connection-level accept error aborts sibling streams.
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt clean; negative
+controls 9/9; red-team battery green.
 
 ### R-07 domain operations - 2026-11-03 (round 24)
 

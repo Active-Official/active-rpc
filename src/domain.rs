@@ -776,7 +776,12 @@ impl ModuleProvider {
                         continue;
                     }
                     let mut entry: BTreeMap<String, Value> = BTreeMap::new();
-                    entry.insert("node".to_string(), Value::Int(annotation.node.0 as i64));
+                    // A node id is an arena position: `stats` hides the size
+                    // from a redacting caller, and naming an index handed the
+                    // count back (round 25, #4).
+                    if !call.redact {
+                        entry.insert("node".to_string(), Value::Int(annotation.node.0 as i64));
+                    }
                     entry.insert("kind".to_string(), Value::Text(kind.to_string()));
                     entry.insert("text".to_string(), Value::Text(text));
                     out.push(Value::Map(entry));
@@ -1700,24 +1705,24 @@ fn mark_secret_texts(
 fn restrict(module: &InfinityModule, node: NodeId) -> Result<InfinityModule> {
     // A constraint is part of the rule, not decoration: its expression node
     // travels with the annotated node, or a projected module would state a
-    // constraint whose expression is missing. The roots grow until no
-    // in-cone constraint points outside the cone.
-    let mut roots = vec![node];
-    let cone = loop {
-        let cone: BTreeSet<NodeId> = subgraph(module, &roots).into_iter().collect();
-        let mut extended = false;
-        for annotation in module.annotations() {
-            if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
-                if cone.contains(&annotation.node) && !cone.contains(expr) {
-                    roots.push(*expr);
-                    extended = true;
-                }
-            }
+    // constraint whose expression is missing. `InfinityModule::edges` lists
+    // each expression as a dependency of its subject, and `adjacency` reads
+    // those edges, so one BFS covers the whole chain. `interop::subgraph` is
+    // deliberately not used: its adjacency reads only value children, so it
+    // dropped every expression and the old code compensated with a fixpoint
+    // that rebuilt that adjacency per newly discovered root with no ceiling
+    // (round 25, #1).
+    let (dependencies, _) = adjacency(module);
+    let mut cone: BTreeSet<NodeId> = BTreeSet::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if !cone.insert(current) {
+            continue;
         }
-        if !extended {
-            break cone;
+        if let Some(next) = dependencies.get(current.index()) {
+            stack.extend(next.iter().copied());
         }
-    };
+    }
     let cone: Vec<NodeId> = cone.into_iter().collect();
     let mut sub = InfinityModule::new();
     // Allocate the destination ids first, then copy each reachable node once

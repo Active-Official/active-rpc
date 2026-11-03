@@ -82,6 +82,90 @@ fn an_installed_annotation_copy_is_not_served() {
     }
 }
 
+/// A redacting caller never receives an arena index: `stats` hides the size,
+/// and a node number handed it back (round 25, #4).
+#[test]
+fn a_redacting_annotation_answer_names_no_arena_index() {
+    let mut module = InfinityModule::new();
+    let leaf = module.push(Inode::Int(5));
+    let root = module.push(Inode::Table {
+        fields: vec![("a".to_string(), leaf)],
+    });
+    module.set_root(Some(root));
+    module.annotate(leaf, AnnotationKind::Intent("visible".to_string()));
+
+    for redact in [false, true] {
+        let (agent, cap, lane) = install(module.clone(), &["annotations"], None, redact);
+        let mut call = Call::new("annotations", Vec::new());
+        call.redact = redact;
+        let promise = agent
+            .call(lane, &cap, "annotations", Vec::new())
+            .expect("call");
+        agent.run();
+        let value = promise.value().expect("annotations");
+        let Value::List(entries) = value else {
+            panic!("a list: {value:?}");
+        };
+        for entry in entries {
+            if let Value::Map(fields) = entry {
+                assert_eq!(
+                    fields.contains_key("node"),
+                    !redact,
+                    "an arena index leaked (redact={redact}): {fields:?}"
+                );
+            }
+        }
+    }
+}
+
+/// One subgraph pass follows a whole constraint chain: `edges()` lists every
+/// expression as a dependency of its subject, so the old fixpoint was
+/// redundant work, not a correctness requirement (round 25, #1).
+#[test]
+fn a_constraint_chain_is_inside_one_cone() {
+    let mut module = InfinityModule::new();
+    let first = module.push(Inode::Int(0));
+    let mut previous = first;
+    for index in 1..200 {
+        let node = module.push(Inode::Int(index));
+        module.annotate(
+            previous,
+            AnnotationKind::Constraint {
+                source: format!("rule {index}"),
+                expr: node,
+            },
+        );
+        previous = node;
+    }
+    let app = module.push(Inode::Table {
+        fields: vec![("a".to_string(), first)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["subgraph"], None, false);
+    let promise = agent
+        .call(lane, &cap, "subgraph", vec![path("app.a")])
+        .expect("queued");
+    agent.run();
+    match promise.value().expect("a cone") {
+        Value::Module(bytes) => {
+            let cone = active_infinity::decode(&bytes).expect("the cone decodes");
+            let tail = cone
+                .nodes()
+                .iter()
+                .any(|node| matches!(node, Inode::Int(value) if *value == 199));
+            assert!(
+                tail,
+                "the last constraint expression is missing from the cone"
+            );
+        }
+        other => panic!("a module: {other:?}"),
+    }
+}
+
 /// A constraint whose expression is its own subject used to re-enqueue forever:
 /// the walk must terminate.
 #[test]

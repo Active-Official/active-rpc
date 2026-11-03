@@ -125,6 +125,34 @@ fn a_silent_connection_is_dropped_at_the_deadline() {
     drop(quiet);
 }
 
+/// A server that accepts, takes the preface and never answers cannot park the
+/// call: the exchange has a deadline even when the caller set none
+/// (round 25, #3). The client preface itself does not wait for the peer's
+/// settings, so the bound is the header wait, not the connect.
+#[test]
+fn a_silent_h2_server_fails_the_call_within_the_deadline() {
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let hold = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        std::thread::sleep(Duration::from_secs(4));
+        drop(stream);
+    });
+    let mut client = Http2Client::connect(&address).expect("the preface does not wait");
+    client = client.with_deadline(Duration::from_millis(200));
+    let started = Instant::now();
+    let error = client.call(&sample_envelope(1)).expect_err("a silent peer");
+    assert_eq!(error.code(), "rpc/transport", "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the call waited {:?}",
+        started.elapsed()
+    );
+    hold.join().ok();
+}
+
 #[test]
 fn http2_enforces_wire_limits_from_the_server_side() {
     let server = Http2Server::bind_loopback()

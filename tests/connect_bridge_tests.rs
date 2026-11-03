@@ -448,6 +448,109 @@ fn a_non_three_digit_status_is_a_wire_fault() {
     server.join().expect("server");
 }
 
+/// A reader that consumes a byte just inside the write timeout cannot hold the
+/// serial bridge: every write is bounded by the connection deadline
+/// (round 25, #2).
+#[test]
+fn a_dripping_reader_cannot_hold_the_bridge_response() {
+    use active_rpc::transport::connect::{grpc_frame, CONNECT_TYPE, PATH};
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let body = grpc_frame(&request(29, "echo", Vec::new()).encode().expect("encode"));
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+        let head = format!(
+            "POST {PATH} HTTP/1.1\r\nhost: active-rpc\r\ncontent-type: {CONNECT_TYPE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).expect("head");
+        stream.write_all(&body).expect("body");
+        // One byte per 1.5 s: each read resets the socket timeout the client
+        // does not have, and each write is a little progress.
+        let mut one = [0u8; 1];
+        let until = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < until {
+            if stream.read(&mut one).unwrap_or(0) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    });
+
+    let started = Instant::now();
+    let mut served = 0;
+    server
+        .serve(1, |envelope| {
+            served += 1;
+            Envelope::response(envelope.request_id, Value::text("x".repeat(200_000)))
+        })
+        .expect("serve");
+    let elapsed = started.elapsed();
+    assert_eq!(served, 1, "the call reached the handler");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a dripping reader held the bridge for {elapsed:?}"
+    );
+    client.join().expect("client");
+}
+
+/// A body the bridge can only refuse is refused before the write
+/// (round 25, #5).
+#[test]
+fn an_oversized_post_is_refused_before_framing() {
+    let client = ConnectClient::connect("127.0.0.1:9")
+        .expect("connect")
+        .with_limits(active_rpc::WireLimits::strict());
+    let mut client = client;
+    let body = vec![0u8; 2 << 20];
+    let error = client.post_raw(&body).expect_err("over the ceiling");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+}
+
+/// A repeated `content-type` and a request line with a fourth token are
+/// ambiguities a proxy may resolve differently (round 25, #6).
+#[test]
+fn an_ambiguous_head_is_refused() {
+    use std::io::{Read, Write};
+
+    let cases: [&[u8]; 3] = [
+        b"POST /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: active-rpc\r\ncontent-type: application/connect+active-infinity\r\ncontent-type: application/connect+active-infinity\r\ncontent-length: 0\r\n\r\n",
+        b"POST /active.rpc.v1.Agent/Call HTTP/1.1 extra\r\nhost: active-rpc\r\ncontent-type: application/connect+active-infinity\r\ncontent-length: 0\r\n\r\n",
+        b"POST /active.rpc.v1.Agent/Call HTTP/1.0\r\nhost: active-rpc\r\ncontent-type: application/connect+active-infinity\r\ncontent-length: 0\r\n\r\n",
+    ];
+    for request in cases {
+        let server = BridgeServer::bind_loopback().expect("bind");
+        let address = server.address().to_string();
+        let bytes = request.to_vec();
+        let client = thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+            stream.write_all(&bytes).expect("write");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read");
+            response
+        });
+        let mut served = 0;
+        server
+            .serve(1, |envelope| {
+                served += 1;
+                Envelope::error(
+                    envelope.request_id,
+                    &Error::Transport("unreachable".to_string()),
+                )
+            })
+            .expect("serve");
+        let response = client.join().expect("client");
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "expected a 400, got {response:?}"
+        );
+        assert_eq!(served, 0);
+    }
+}
+
 /// A truncated body is one bad connection: the bridge answers 400 and keeps
 /// accepting. Before this, the read error aborted `serve`, so one hostile
 /// connection could refuse service to every later caller.

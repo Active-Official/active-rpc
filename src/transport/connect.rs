@@ -48,6 +48,9 @@ pub const CONNECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Frame one message with the gRPC 5-byte prefix.
 pub fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+    // Both callers bound the payload to `MAX_BODY` first, so the length fits
+    // `u32`; an unbounded caller used to wrap it and the peer read the tail as
+    // a second message (round 25, #5).
     let mut out = Vec::with_capacity(5 + payload.len());
     out.push(0);
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -256,7 +259,7 @@ impl BridgeServer {
         };
         let mut reader = BufReader::new(clone);
         if !arm_deadline(&stream, deadline) || !arm_deadline(reader.get_ref(), deadline) {
-            let _ = write_http_response(&mut stream, 408, b"rpc/transport");
+            let _ = write_http_response(&mut stream, 408, b"rpc/transport", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
@@ -276,7 +279,7 @@ impl BridgeServer {
                 } else {
                     b"rpc/wire"
                 };
-                let _ = write_http_response(&mut stream, status, body);
+                let _ = write_http_response(&mut stream, status, body, deadline);
                 drain_before_close(&mut stream);
                 return 0;
             }
@@ -285,8 +288,16 @@ impl BridgeServer {
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or_default();
         let target = parts.next().unwrap_or_default();
+        let version = parts.next().unwrap_or_default();
+        // A fourth token or another version is a request a proxy may read
+        // differently; this bridge serves exactly one shape (round 25, #6).
+        if parts.next().is_some() || version != "HTTP/1.1" {
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
+            drain_before_close(&mut stream);
+            return 0;
+        }
         if method != "POST" || target != PATH {
-            let _ = write_http_response(&mut stream, 404, b"rpc/wire");
+            let _ = write_http_response(&mut stream, 404, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
@@ -304,12 +315,12 @@ impl BridgeServer {
             // unparsable line or a name that is not a token is a refusal, not
             // something to skip (round 24, F3).
             let Some((name, value)) = line.split_once(':') else {
-                let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
                 drain_before_close(&mut stream);
                 return 0;
             };
             if name.is_empty() || !name.bytes().all(crate::tool::is_http_token) {
-                let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
                 drain_before_close(&mut stream);
                 return 0;
             }
@@ -325,14 +336,14 @@ impl BridgeServer {
                     || trimmed.len() > 20
                     || !trimmed.bytes().all(|byte| byte.is_ascii_digit())
                 {
-                    let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                    let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
                     drain_before_close(&mut stream);
                     return 0;
                 }
                 match trimmed.parse::<usize>() {
                     Ok(length) => lengths.push(length),
                     Err(_) => {
-                        let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                        let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
                         drain_before_close(&mut stream);
                         return 0;
                     }
@@ -340,7 +351,7 @@ impl BridgeServer {
             }
         }
         if transfer_encoding || lengths.len() != 1 {
-            let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
@@ -349,23 +360,32 @@ impl BridgeServer {
         // strict server must not read 64 MiB to discover it refuses the frame.
         let body_ceiling = MAX_BODY.min(self.limits.max_bytes);
         if content_length > body_ceiling {
-            let _ = write_http_response(&mut stream, 413, b"rpc/wire");
+            let _ = write_http_response(&mut stream, 413, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
-        let content_type = head
+        let content_types: Vec<&str> = head
             .iter()
-            .find_map(|line| {
+            .filter_map(|line| {
                 let (name, value) = line.split_once(':')?;
                 if name.eq_ignore_ascii_case("content-type") {
-                    Some(value.trim().to_string())
+                    Some(value.trim())
                 } else {
                     None
                 }
             })
-            .unwrap_or_default();
+            .collect();
+        if content_types.len() > 1 {
+            // Two `content-type` lines leave the framing ambiguous; a proxy
+            // that joins or takes the last value disagrees with this server
+            // (round 25, #6).
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
+            drain_before_close(&mut stream);
+            return 0;
+        }
+        let content_type = content_types.first().copied().unwrap_or_default();
         if content_type != CONNECT_TYPE && content_type != GRPC_TYPE {
-            let _ = write_http_response(&mut stream, 415, b"rpc/wire");
+            let _ = write_http_response(&mut stream, 415, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
@@ -379,9 +399,9 @@ impl BridgeServer {
             // ran out of time is a timeout instead, the same discrimination
             // the head path makes (round 24, F4).
             if std::time::Instant::now() >= deadline {
-                let _ = write_http_response(&mut stream, 408, b"rpc/transport");
+                let _ = write_http_response(&mut stream, 408, b"rpc/transport", deadline);
             } else {
-                let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+                let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
             }
             drain_before_close(&mut stream);
             return 0;
@@ -389,20 +409,20 @@ impl BridgeServer {
         let (message, rest) = match grpc_unframe(&body) {
             Ok(parts) => parts,
             Err(error) => {
-                let _ = write_http_response(&mut stream, 400, error.code().as_bytes());
+                let _ = write_http_response(&mut stream, 400, error.code().as_bytes(), deadline);
                 drain_before_close(&mut stream);
                 return 0;
             }
         };
         if !rest.is_empty() {
-            let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
         let envelope = match Envelope::decode_with(message, self.limits) {
             Ok(envelope) => envelope,
             Err(error) => {
-                let _ = write_http_response(&mut stream, 400, error.code().as_bytes());
+                let _ = write_http_response(&mut stream, 400, error.code().as_bytes(), deadline);
                 drain_before_close(&mut stream);
                 return 0;
             }
@@ -411,7 +431,7 @@ impl BridgeServer {
         // kind contract at the transport boundary, where a relay would otherwise
         // be able to smuggle one in.
         if envelope.kind != crate::wire::Kind::Request {
-            let _ = write_http_response(&mut stream, 400, b"rpc/wire");
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
@@ -431,18 +451,23 @@ impl BridgeServer {
         let bytes = match response.encode() {
             Ok(bytes) => bytes,
             Err(error) => {
-                let _ = write_http_response(&mut stream, 500, error.code().as_bytes());
+                let _ = write_http_response(&mut stream, 500, error.code().as_bytes(), deadline);
                 drain_before_close(&mut stream);
                 return 0;
             }
         };
+        if bytes.len() > MAX_BODY {
+            let _ = write_http_response(&mut stream, 413, b"rpc/wire", deadline);
+            drain_before_close(&mut stream);
+            return 0;
+        }
         let framed = grpc_frame(&bytes);
         // The read deadline's remainder may be milliseconds after a body that
         // landed just in time; give the response its own budget.
         let _ = stream.set_write_timeout(Some(CONNECTION_WAIT));
         // A peer that never read the response was not served; counting it would
         // make --limit and the served metric lie.
-        u64::from(write_http_response(&mut stream, 200, &framed).is_ok())
+        u64::from(write_http_response(&mut stream, 200, &framed, deadline).is_ok())
     }
 }
 
@@ -549,7 +574,46 @@ fn drain_before_close(stream: &mut TcpStream) {
     }
 }
 
-fn write_http_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Result<()> {
+/// Write every byte of `bytes` before `deadline`.
+///
+/// A per-syscall timeout bounds one `write`, so a peer that reads one byte
+/// just inside it keeps making progress forever. The timeout is re-armed from
+/// the time left before each write, which is what makes the connection budget
+/// a budget for the write side too (round 25, #2).
+fn write_all_before(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Result<()> {
+    // A refusal owed at the deadline still gets a short grace to reach the
+    // peer; the grace is a hard stop, so a drip-reader cannot extend it.
+    let hard = deadline + std::time::Duration::from_millis(250);
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let now = std::time::Instant::now();
+        if now >= hard {
+            return Err(Error::Transport("write timed out".to_string()));
+        }
+        let left = hard.saturating_duration_since(now);
+        stream
+            .set_write_timeout(Some(left.max(std::time::Duration::from_millis(1))))
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Err(Error::Transport("write made no progress".to_string())),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(Error::Transport(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &[u8],
+    deadline: std::time::Instant,
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -563,11 +627,13 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> Resu
         "HTTP/1.1 {status} {reason}\r\ncontent-type: {CONNECT_TYPE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
-    stream
-        .write_all(head.as_bytes())
-        .and_then(|_| stream.write_all(body))
-        .and_then(|_| stream.flush())
-        .map_err(|error| Error::Transport(error.to_string()))
+    write_all_before(stream, head.as_bytes(), deadline)
+        .and_then(|()| write_all_before(stream, body, deadline))
+        .and_then(|()| {
+            stream
+                .flush()
+                .map_err(|error| Error::Transport(error.to_string()))
+        })
 }
 
 /// Time left before `deadline`, or a transport timeout.
@@ -691,6 +757,11 @@ impl ConnectClient {
     }
 
     fn post(&mut self, body: &[u8], content_type: &str) -> Result<(u16, Vec<u8>)> {
+        if body.len() > MAX_BODY.min(self.limits.max_bytes) {
+            // Framing a body the bridge can only refuse wastes the write and
+            // could wrap the 32-bit frame length (round 25, #5).
+            return Err(Error::Wire("request exceeds the ceiling"));
+        }
         let head = format!(
             "POST {PATH} HTTP/1.1\r\nhost: active-rpc\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
@@ -723,10 +794,10 @@ impl ConnectClient {
             .set_read_timeout(Some(wait))
             .and_then(|()| stream.set_write_timeout(Some(wait)))
             .map_err(|error| Error::Transport(error.to_string()))?;
+        write_all_before(&mut stream, head.as_bytes(), deadline)?;
+        write_all_before(&mut stream, body, deadline)?;
         stream
-            .write_all(head.as_bytes())
-            .and_then(|_| stream.write_all(body))
-            .and_then(|_| stream.flush())
+            .flush()
             .map_err(|error| Error::Transport(error.to_string()))?;
         // Half-close: a body that stops short of its declared frame lets the
         // server see EOF and answer instead of waiting for bytes that will
