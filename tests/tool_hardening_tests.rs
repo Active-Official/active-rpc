@@ -333,6 +333,56 @@ fn a_head_response_has_no_body() {
     }
 }
 
+/// A JSON answer whose only fault is a number with no `Value` form is refused
+/// as `http/bad-number`; an answer that is not JSON at all stays text
+/// (round 15, F-1).
+#[test]
+fn a_json_body_with_an_unrepresentable_number_is_refused() {
+    use std::time::Duration;
+
+    for body in [
+        r#"{"amount": 1e400}"#,
+        r#"{"amount": 18446744073709551617}"#,
+        r#"{"debit": -9223372036854775809}"#,
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        slow_response(listener, response.into_bytes(), Duration::ZERO);
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/number")]);
+        let error = tool
+            .invoke(0, &http_get("/number", 2_000))
+            .expect_err("a number with no Value form is refused");
+        assert_eq!(
+            error.provider_code(),
+            Some("http/bad-number"),
+            "{body}: {error}"
+        );
+    }
+
+    // A plain-text body that happens to look like a lone minus sign is text.
+    for body in ["-", "- not json"] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        slow_response(listener, response.into_bytes(), Duration::ZERO);
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/text")]);
+        let response = tool
+            .invoke(0, &http_get("/text", 2_000))
+            .expect("plain text answers");
+        match response {
+            Response::Value(Value::Text(text)) => assert_eq!(text, body),
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+}
+
 /// A repeated `content-length` is a framing ambiguity; the adapter refuses the
 /// message instead of picking one.
 #[test]
@@ -800,6 +850,56 @@ fn echo_session() -> active_rpc::tool::McpSession<active_rpc::tool::MemoryTransp
             .to_string(),
     );
     McpSession::handshake(MemoryTransport::new(responses)).expect("handshake")
+}
+
+/// An MCP result whose number has no `Value` form is `mcp/bad-number` and
+/// poisons the session: the next line would belong to an answer already
+/// abandoned (round 15, F-1).
+#[test]
+fn an_mcp_result_with_an_unrepresentable_number_is_refused() {
+    use active_rpc::tool::{McpSession, McpTransport};
+
+    /// Answers each sent line with the next canned line, byte for byte.
+    ///
+    /// `MemoryTransport` re-encodes a response to echo the request id, which
+    /// would rewrite the very literal under test: the point here is the raw
+    /// bytes a server emits.
+    struct RawLines(std::collections::VecDeque<String>);
+
+    impl McpTransport for RawLines {
+        fn send_line(&mut self, _line: &str) -> active_rpc::error::Result<()> {
+            Ok(())
+        }
+
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.0.pop_front().ok_or(active_rpc::error::Error::Timeout)
+        }
+    }
+
+    for literal in ["1e400", "18446744073709551617", "-9223372036854775809"] {
+        let mut lines = std::collections::VecDeque::new();
+        lines.push_back(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+                .to_string(),
+        );
+        lines.push_back(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+                .to_string(),
+        );
+        lines.push_back(format!(
+            r#"{{"jsonrpc":"2.0","id":3,"result":{{"value":{literal}}}}}"#
+        ));
+        let mut session = McpSession::handshake(RawLines(lines)).expect("handshake");
+        let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+        call.tool_allows_process = true;
+        let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+            .expect_err("a number with no Value form is refused");
+        assert_eq!(
+            error.provider_code(),
+            Some("mcp/bad-number"),
+            "{literal}: {error}"
+        );
+    }
 }
 
 /// `get` and `post` name their method in the capability. A text argument used to
@@ -1410,21 +1510,38 @@ fn a_json_integer_past_i64_is_not_rounded() {
         active_rpc::tool::json_has_unrepresentable_number(&json),
         "a u64 past i64::MAX has no Value form"
     );
-    // Past `u64::MAX` and below `i64::MIN` serde keeps the literal, so the
-    // integer is still visible (round 14, F-1).
+    // Past `u64::MAX` and below `i64::MIN` the decoder rounds or refuses, so
+    // the literal is checked on the text, before and beside the decode
+    // (round 14, F-1; round 15, F-1). An overflowing float is in the same
+    // class: `f64` has no finite value for it.
     for literal in [
         r#"{"debit": -9223372036854775809}"#,
         r#"{"amount": 18446744073709551617}"#,
+        r#"{"amount": 1e400}"#,
     ] {
-        let json: serde_json::Value = serde_json::from_str(literal).expect("parse");
+        assert!(active_rpc::tool::json_text_bad_number(literal), "{literal}");
+    }
+    // The scan runs outside strings only, and an ordinary decimal is
+    // representable: `Value::Float` is its form.
+    for literal in [r#"{"price": 9.99, "scaled": 1e3}"#, r#"["-", 0]"#] {
         assert!(
-            active_rpc::tool::json_has_unrepresentable_number(&json),
+            !active_rpc::tool::json_text_bad_number(literal),
             "{literal}"
         );
     }
-    // An ordinary decimal is representable: `Value::Float` is its form.
     let json = serde_json::json!({ "price": 9.99, "scaled": 1e3 });
     assert!(!active_rpc::tool::json_has_unrepresentable_number(&json));
+
+    // `serde_json/arbitrary_precision` makes this key decode to a number and
+    // would let a peer choose the type of its answer; the feature stays off
+    // (round 15, F-2).
+    let magic: serde_json::Value =
+        serde_json::from_str(r#"{"$serde_json::private::Number":"7"}"#).expect("parse");
+    assert!(magic.is_object(), "{magic}");
+    match active_rpc::tool::json_to_value(&magic) {
+        Value::Map(entries) => assert_eq!(entries.len(), 1),
+        other => panic!("the magic key became {other:?}"),
+    }
     // A flat array past the node ceiling is refused (a wide tree, not a deep
     // one: doubling would build 2^40 values).
     let wide = serde_json::Value::Array(vec![serde_json::Value::from(0); 1_100_000]);

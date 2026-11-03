@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-22: ... + 5 findings; one clean round closes it | 123 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-14: ... + 9 findings; one clean round closes it | 119 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-15: ... + 10 findings; round 16 is the confirmation | 129 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -122,6 +122,35 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 15)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `38294cf`.
+One high and one medium, both introduced by the round-14
+`serde_json/arbitrary_precision` switch, plus eight lows. The feature is
+reverted: number exactness is enforced on the text, where the literal still
+exists.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `arbitrary_precision` kept `1e400` as a literal with no finite `f64`, and `json_to_value`'s `as_f64().unwrap_or(0.0)` invented `0.0` (sign lost) | **fixed**: the feature is gone; a string-aware scanner validates every literal before or beside the decode — a float must parse finite, an integer must fit `i64`/`u64`; `{"amount":1e400}`, `-1e400` and the past-`u64` integers are refused end to end; `a_json_body_with_an_unrepresentable_number_is_refused`, `an_mcp_result_with_an_unrepresentable_number_is_refused` |
+| 2 | medium | the `$serde_json::private::Number` magic key decoded a peer object as a number in both directions | **fixed** with the same revert; a regression test pins the key as an ordinary map entry |
+| 3 | low | the reader's line-cap arm was unreachable, so a truncated overlong line was handed back as a line | **fixed**: the dead arm is gone and the truncation contract is documented at the read; the session's inclusive cap is pinned by an exact-cap test and one byte over |
+| 4 | low | `mcp/too-complex` was documented and emitted by no path | **fixed**: the row is gone; the MCP line cap (1 MiB) cannot build 2^20 nodes |
+| 5 | low | between the token gate and the tree ceiling a size refusal was reported as `http/bad-number` | **fixed**: the token gate runs at `MAX_JSON_NODES - 2`, so a tree that passes it cannot trip the node arm |
+| 6 | low | the complexity gate judged non-JSON bodies (CSV, log text) and mislabelled them | **fixed**: it runs only for a body that opens as an object or an array |
+| 7 | low | the spec said the deadline covers resolution; the code starts it after resolution | **fixed**: the spec says resolution uses the resolver's own timeout because the endpoint is the operator's |
+| 8 | low | the `## 6. Transports` heading was merged into the table header row | **fixed**: heading and header are separate lines |
+| 9 | low | `json_to_value` substituted `Null` for a `u64` past `i64::MAX` and said so nowhere | **fixed**: the doc states the one partial case and that both adapters gate it; no peer answer reaches it |
+| 10 | low | `http/read:truncated body` carried a space | **fixed**: `http/read:truncated-body`, documented with `http/read:truncated` |
+
+Residuals recorded: `json_to_value` stays infallible (a `Result` would be a
+public break; the predicate is the gate); the reader still drops the rest of an
+overlong line, which the session refuses before parsing; resolution has no
+ceiling of its own (operator endpoint).
+
+Gate: 86 suites; 865 tests all-features and 795 no-default-features, all pass;
+clippy/fmt clean; negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 14)
 

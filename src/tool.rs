@@ -68,6 +68,11 @@ pub fn json_text_too_complex(text: &str, limit: usize) -> bool {
 }
 
 /// Whether a decoded tree holds a number with no `Value` form or too many nodes.
+///
+/// This sees only what the decoder kept. A literal that overflowed `i64` or a
+/// float is validated on the text by [`json_text_bad_number`] before or beside
+/// this check: `serde_json` rounds a past-`i64` integer to an `f64` and refuses
+/// an overflowing float outright (round 11, #3; round 15, F-1).
 pub fn json_has_unrepresentable_number(value: &Json) -> bool {
     let mut stack = vec![value];
     let mut nodes = 0usize;
@@ -81,14 +86,12 @@ pub fn json_has_unrepresentable_number(value: &Json) -> bool {
         }
         match value {
             Json::Number(number) => {
-                // With `arbitrary_precision` a number keeps its literal, so
-                // an integer too large for `i64` *and* `u64` is visible as one
-                // (round 14, F-1). A literal with a fraction or an exponent is
-                // a float, and `Value::Float` is its form.
-                let literal = number.to_string();
-                let integer =
-                    !literal.contains('.') && !literal.contains('e') && !literal.contains('E');
-                if integer && number.as_i64().is_none() {
+                // A non-negative integer past `i64::MAX` has no `Value` form,
+                // and `Value::Float` is a form only for a finite float
+                // (round 11, #3).
+                let representable = number.as_i64().is_some()
+                    || (number.is_f64() && number.as_f64().is_some_and(f64::is_finite));
+                if !representable {
                     return true;
                 }
             }
@@ -100,7 +103,104 @@ pub fn json_has_unrepresentable_number(value: &Json) -> bool {
     false
 }
 
+/// Spans of numeric literals in `text` that no `Value` form represents.
+///
+/// The scan runs bytewise outside strings. A literal with a fraction or an
+/// exponent must parse to a finite `f64`; an integer must parse to `i64` or
+/// `u64` (a `u64` past `i64::MAX` is caught by
+/// [`json_has_unrepresentable_number`] on the decoded tree). Scanning the text
+/// is what sees a literal the decoder would round, turn into an infinity, or
+/// refuse before any tree exists (round 15, F-1).
+fn bad_number_spans(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' => {
+                in_string = true;
+                index += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    index += 1;
+                }
+                if literal_has_no_value_form(&text[start..index]) {
+                    spans.push((start, index));
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    spans
+}
+
+/// Whether one JSON numeric literal has no `Value` form.
+fn literal_has_no_value_form(literal: &str) -> bool {
+    let is_float = literal.contains('.') || literal.contains('e') || literal.contains('E');
+    if is_float {
+        return !matches!(literal.parse::<f64>(), Ok(value) if value.is_finite());
+    }
+    literal.parse::<i64>().is_err() && literal.parse::<u64>().is_err()
+}
+
+/// Whether a JSON text holds a numeric literal with no `Value` form.
+pub fn json_text_bad_number(text: &str) -> bool {
+    !bad_number_spans(text).is_empty()
+}
+
+/// Whether text that failed to parse would parse once each unrepresentable
+/// literal is replaced by `0`.
+///
+/// This separates "the answer is JSON and one of its numbers is out of range"
+/// from "the answer is not JSON at all": only a document that opens as an
+/// object or an array is re-examined, so a plain-text body is never accused of
+/// carrying a bad number (round 15, F-1).
+fn text_fails_only_on_a_number(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return false;
+    }
+    let spans = bad_number_spans(text);
+    if spans.is_empty() {
+        return false;
+    }
+    let mut repaired = String::with_capacity(text.len().saturating_sub(spans.len()));
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        repaired.push_str(&text[cursor..start]);
+        repaired.push('0');
+        cursor = end;
+    }
+    repaired.push_str(&text[cursor..]);
+    serde_json::from_str::<Json>(&repaired).is_ok()
+}
+
 /// Convert JSON into an RPC value.
+///
+/// The conversion is partial for one class: a JSON integer past `i64::MAX` has
+/// no `Int` form, and it becomes `Value::Null` because no float is that
+/// integer. Both adapters refuse such a tree first with
+/// [`json_has_unrepresentable_number`] or [`json_text_bad_number`], so no peer
+/// answer is ever converted this way; a direct caller must run the same gate.
 pub fn json_to_value(value: &Json) -> Value {
     match value {
         Json::Null => Value::Null,
@@ -512,7 +612,7 @@ impl DeadlineReader {
                 .map_err(map_http_read)?;
             if read == 0 {
                 return Err(Error::Provider {
-                    code: "http/read:truncated body".to_string(),
+                    code: "http/read:truncated-body".to_string(),
                 });
             }
             filled += read;
@@ -691,18 +791,17 @@ impl StdioTransport {
                 let mut reader = BufReader::new(stdout);
                 loop {
                     let mut line = String::new();
+                    // The take() bounds the read itself, so a line past the cap
+                    // arrives here truncated and unterminated; the caller's
+                    // length check refuses it as `mcp/line-too-long` before the
+                    // poison flag stops the session (round 13, F-9).
                     let read = reader
                         .by_ref()
-                        // One extra byte for the delimiter: a line of exactly
-                        // the cap plus `\n` is legal (round 13, F-9).
                         .take((MAX_MCP_LINE_BYTES + 2) as u64)
                         .read_line(&mut line);
                     let outcome = match read {
                         Ok(0) => Err(Error::Provider {
                             code: "mcp/eof".to_string(),
-                        }),
-                        Ok(read) if read > MAX_MCP_LINE_BYTES + 2 => Err(Error::Provider {
-                            code: "mcp/line-too-long".to_string(),
                         }),
                         Ok(_) => Ok(line.trim_end().to_string()),
                         Err(error) => Err(Error::Provider {
@@ -1059,7 +1158,24 @@ impl<T: McpTransport> McpSession<T> {
                 });
             }
             let response: Json = match serde_json::from_str(&line) {
+                // A number the decoder rounded or an overflowing float is not
+                // the answer the server wrote (round 15, F-1).
+                Ok(response)
+                    if json_text_bad_number(&line)
+                        || json_has_unrepresentable_number(&response) =>
+                {
+                    self.poisoned = true;
+                    return Err(Error::Provider {
+                        code: "mcp/bad-number".to_string(),
+                    });
+                }
                 Ok(response) => response,
+                Err(_) if text_fails_only_on_a_number(&line) => {
+                    self.poisoned = true;
+                    return Err(Error::Provider {
+                        code: "mcp/bad-number".to_string(),
+                    });
+                }
                 Err(_) => {
                     self.poisoned = true;
                     return Err(Error::Provider {
@@ -1245,12 +1361,9 @@ impl<T: McpTransport> Provider for McpSession<T> {
                 code: format!("mcp/{code}"),
             });
         }
+        // `request_within` already refused a response whose tree or text holds
+        // a number with no `Value` form, so the result is representable here.
         let result = response.get("result").cloned().unwrap_or(Json::Null);
-        if json_has_unrepresentable_number(&result) {
-            return Err(Error::Provider {
-                code: "mcp/bad-number".to_string(),
-            });
-        }
         Ok(Response::Value(json_to_value(&result)))
     }
 }
@@ -1752,18 +1865,33 @@ impl Provider for HttpTool {
         let Ok(text) = String::from_utf8(response.clone()) else {
             return Ok(Response::Value(Value::Module(response)));
         };
-        if json_text_too_complex(&text, MAX_JSON_NODES) {
+        // Only an object or an array can hold more nodes than the ceiling (a
+        // top-level scalar is one node), so a large non-JSON body — a CSV or a
+        // log extract — is left as text (round 15, F-6). The gate's limit is
+        // two below the tree ceiling because a tree has at most two more
+        // nodes than it has structural tokens, so a tree that passes the gate
+        // can never be refused later as `http/bad-number` for its size
+        // (round 15, F-5).
+        let trimmed = text.trim_start();
+        if (trimmed.starts_with('{') || trimmed.starts_with('['))
+            && json_text_too_complex(&text, MAX_JSON_NODES - 2)
+        {
             return Err(Error::Provider {
                 code: "http/too-complex".to_string(),
             });
         }
         let value = match serde_json::from_str::<Json>(&text) {
-            Ok(json) if json_has_unrepresentable_number(&json) => {
+            Ok(json) if json_has_unrepresentable_number(&json) || json_text_bad_number(&text) => {
                 return Err(Error::Provider {
                     code: "http/bad-number".to_string(),
                 })
             }
             Ok(json) => json_to_value(&json),
+            Err(_) if text_fails_only_on_a_number(&text) => {
+                return Err(Error::Provider {
+                    code: "http/bad-number".to_string(),
+                })
+            }
             Err(_) => Value::Text(text),
         };
         Ok(Response::Value(value))

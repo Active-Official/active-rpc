@@ -211,8 +211,7 @@ session:
 | `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer |
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |
 | `mcp/desync` | more than `MAX_MCP_NOTIFICATIONS` notification frames arrived for one request, or the session was already poisoned |
-| `mcp/bad-number` | a result holds a JSON integer with no `Value` form |
-| `mcp/too-complex` | a result tree holds more nodes than the adapter decodes (2^20) |
+| `mcp/bad-number` | a response line holds a numeric literal with no `Value` form: an integer outside `i64`, or a float that is not finite |
 | `mcp/initialize` | the server answered `initialize` with an error |
 | `mcp/tool-name` | an advertised tool name is absent or empty, is not `[A-Za-z0-9_.-]{1,128}`, or two tools share a name |
 | `mcp/tools` | the handshake result carries no `tools` array |
@@ -250,12 +249,13 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/interim` | a 1xx interim response arrived; the adapter does not follow it |
 | `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared |
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
-| `http/bad-number` | a JSON integer has no `Value` form (a literal without a fraction or exponent that is outside `i64`) |
+| `http/bad-number` | a JSON number has no `Value` form: an integer outside `i64`, or a float that is not finite (a literal with a fraction or an exponent that overflows `f64`) |
 | `http/too-complex` | the answer's JSON has more structural tokens than the adapter decodes (2^20) |
 | `http/body-too-large` | the response body exceeded `max_body`, by its declared length or by its stream |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
+| `http/read:truncated`, `http/read:truncated-body` | the peer closed before a full line or body arrived |
 | `http/<status>` | the endpoint answered a status outside 2xx (3xx included: the adapter does not follow redirects) |
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
@@ -263,8 +263,11 @@ The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `PATCH`). A GET sends no body: the request is complete at the empty line, and
 extra bytes make simple servers and intermediaries reset the connection instead
 of answering. The `max_wall_ms` grant (clamped to 10 s) is **one deadline** for
-the whole exchange — resolve, connect, write, every header line and the body —
-so a server that drips a byte per timeout period cannot stretch it. A HEAD,
+the exchange from connect onward: connect, write, every header line and the body.
+Resolution of the base URL happens before the deadline starts and uses the
+system resolver’s own timeout, because the endpoint is the operator’s, not the
+peer’s. A server that drips a byte per timeout period cannot stretch the
+ceiling. A HEAD,
 204 or 304 reply is read as bodyless whatever its headers say. A path is
 refused if it contains a byte below `0x21` or `0x7f`, because it is
 interpolated into the request line.
@@ -344,7 +347,9 @@ transport must preserve when it forwards one:
 
 ---
 
-## 6. Transports| Transport | Framing | Notes |
+## 6. Transports
+
+| Transport | Framing | Notes |
 |-----------|---------|-------|
 | in-process | none | envelopes move by value; `bytes_written() == 0` |
 | TCP | `u32` length + envelope | cross-process, `MAX_FRAME_BYTES` = 64 MiB |

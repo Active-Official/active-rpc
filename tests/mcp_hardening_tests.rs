@@ -122,6 +122,37 @@ fn an_oversized_line_is_rejected_before_it_is_parsed() {
     assert_eq!(code(session), "mcp/line-too-long");
 }
 
+/// The cap is inclusive: a line of exactly `MAX_MCP_LINE_BYTES` bytes is a
+/// legal answer, and one byte more is refused before parsing
+/// (round 15, F-3).
+#[test]
+fn the_line_cap_is_inclusive_and_one_byte_over_is_refused() {
+    let head = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"padding":""#;
+    let tail = r#""}}"#;
+    let fill = MAX_MCP_LINE_BYTES - head.len() - tail.len();
+    let build = |padding: usize| format!("{head}{}{tail}", "a".repeat(padding));
+
+    let exact = build(fill);
+    assert_eq!(exact.len(), MAX_MCP_LINE_BYTES);
+    // The padded line answers `initialize`; the list answers `tools/list`.
+    let mut lines = vec![exact];
+    lines.push(handshake_responses().1);
+    // The padded initialize still parses: the cap is about size, not shape.
+    let session = McpSession::handshake(Scripted::new(
+        &lines.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    assert!(
+        session.is_ok(),
+        "an exact-cap line must be accepted: {:?}",
+        session.err()
+    );
+
+    let over = build(fill + 1);
+    assert_eq!(over.len(), MAX_MCP_LINE_BYTES + 1);
+    let session = McpSession::handshake(Scripted::new(&[over.as_str()]));
+    assert_eq!(code(session), "mcp/line-too-long");
+}
+
 fn handshake_responses() -> (String, String) {
     (
         r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#
