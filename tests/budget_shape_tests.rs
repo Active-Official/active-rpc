@@ -918,6 +918,14 @@ fn a_promise_handle_names_its_own_kernel() {
             .code(),
         "rpc/unknown-promise"
     );
+    assert_eq!(
+        second
+            .agent
+            .resolve_as(None, &promise, Value::text("forged"))
+            .expect_err("a foreign handle cannot be answered with a peer")
+            .code(),
+        "rpc/unknown-promise"
+    );
     first.agent.run();
     assert_eq!(promise.value().expect("own kernel"), Value::text("first"));
 }

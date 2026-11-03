@@ -1185,6 +1185,43 @@ inside a borrow; rare), and `PipelinedCycle` is a dead fail-closed arm.
 Gate: 768 tests all-features, 0 failed; clippy/fmt/doc clean; negative controls
 9/9.
 
+### R-06 budgets - 2026-11-02 (round 11)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `aa7a955`. Every round-10
+claim held except one hole, which the same pass in R-04 found independently.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `resolve_as` did not check that the handle belongs to this kernel, while every other handle entry does: a handle from another agent could settle a job with the same numeric id | **fixed**: `owns_promise` at the top of `resolve_as`; `a_promise_handle_names_its_own_kernel` (covered through `resolve`, `resolve_as` and `cancel`) |
+
+Residual risks it recorded and this commit closes or accepts: the keyed hit
+re-checks shape but not the absolute depth of the cached value (unreachable — a
+cache entry is only created from an admitted, gated call); `resolve_as` with no
+matching job skips the gates (unreachable — a pending promise always has a
+job); `Channel::send*` is public without a shape gate (the kernel gates before
+it calls); the `next_promise`/`next_job` counters wrap only at 2⁶⁴.
+
+Gate: 768 tests all-features, 0 failed; clippy/fmt/doc clean.
+
+### R-04 promises / pipelining - 2026-11-02 (round 4)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `aa7a955`. One high (the
+same `resolve_as` gap), one medium and two lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `resolve_as` accepted a foreign handle | **fixed** with R-06 round 11 #1 |
+| 2 | medium | `cancel_tree` recorded settled promises twice (queued targets in both loops, already-settled dependents re-recorded), inflating the settled size and evicting live records early | **fixed**: the walk collects the promises it actually cancelled, the queued loop records them, and the final loop records only cancelled-minus-queued, once |
+| 3 | low | the idempotent hit's `UnknownCapability` arms return without the refusal accounting | **accepted**: the keyed entry pre-checks and records the capability before the hit block, so those arms are unreachable; a comment in the code says so |
+| 4 | low | `cancel_tree` returned every dependent it walked as if it had cancelled it | **fixed**: it returns the cancelled set, and the doc says so |
+
+Residuals: `waiters += 1` is non-saturating (bounded by the job ceiling); a
+cancelled in-flight job can seal an `Admitted` receipt for a value never
+delivered (the caller sees `rpc/promise-cancelled`, the receipt records the
+provider's outcome).
+
+Gate: 768 tests all-features, 0 failed; clippy/fmt/doc clean.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

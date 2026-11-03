@@ -3020,6 +3020,9 @@ impl Agent {
         promise: &PromiseHandle,
         value: Value,
     ) -> Result<()> {
+        if !self.owns_promise(promise) {
+            return Err(Error::UnknownPromise(promise.id.0));
+        }
         let mut kernel = self.cell.borrow_mut();
         // The expiry comparison below is against `now_ms`, which only moves when
         // it is refreshed in wall-clock mode (round 9, F3).
@@ -3619,7 +3622,8 @@ impl Agent {
     /// The tree walk follows queued job dependencies. A dependent whose job is
     /// still queued is removed before dispatch, so a cancellation prevents the
     /// provider call and its side effects. An already-settled root is refused;
-    /// dependent promises that already settled are left untouched.
+    /// dependent promises that already settled are left untouched. The returned
+    /// list holds the promises this call cancelled.
     pub fn cancel_tree(&self, promise: &PromiseHandle) -> Result<Vec<PromiseId>> {
         if !self.owns_promise(promise) {
             return Err(Error::UnknownPromise(promise.id.0));
@@ -3644,6 +3648,7 @@ impl Agent {
             }
         }
         let mut targets = vec![promise.id];
+        let mut cancelled: Vec<PromiseId> = Vec::new();
         let mut seen: BTreeSet<PromiseId> = BTreeSet::new();
         seen.insert(promise.id);
         let mut index = 0;
@@ -3652,6 +3657,7 @@ impl Agent {
             if let Some(record) = kernel.promises.get_mut(&id) {
                 if record.state == PromiseState::Pending {
                     record.cancel()?;
+                    cancelled.push(id);
                 }
             }
             if let Some(dependents) = dependents_of.get(&id) {
@@ -3672,6 +3678,7 @@ impl Agent {
             .filter(|(id, job)| queued_ids.contains(id) && targets_set.contains(&job.promise))
             .map(|(id, job)| (*id, job.promise, job.lane.0))
             .collect();
+        let mut queued_promises: BTreeSet<PromiseId> = BTreeSet::new();
         for (job_id, promise_id, lane) in queued {
             kernel.record_queued_refusal(job_id, &Error::PromiseCancelled(promise_id.0));
             kernel.queue.retain(|queued_id| *queued_id != job_id);
@@ -3683,18 +3690,26 @@ impl Agent {
             Kernel::release_waiters(&mut kernel, &deps);
             kernel.jobs.remove(&job_id);
             kernel.record_settled(promise_id);
+            queued_promises.insert(promise_id);
             if let Some(lane_record) = kernel.lanes.get_mut(&LaneId(lane)) {
                 lane_record.complete();
             }
         }
-        // A target whose job is already in the current batch is removed by its
-        // dispatch, which cannot settle a cancelled record: without this the
-        // record is never evictable and repeated cancellations wedge the
-        // promise ceiling (round 3, F3). `record_settled` is idempotent.
-        for id in &targets_set {
-            kernel.record_settled(*id);
+        // A promise cancelled while its job is in the current batch is removed
+        // by that dispatch, which cannot settle a cancelled record: without this
+        // the record is never evictable and repeated cancellations wedge the
+        // promise ceiling (round 3, F3). Only a promise this call cancelled is
+        // recorded, and only once: `record_settled` pushes to its deque on every
+        // call, so a second record would inflate the settled size and evict live
+        // records early (round 4, #2).
+        for id in &cancelled {
+            if !queued_promises.contains(id) {
+                kernel.record_settled(*id);
+            }
         }
-        Ok(targets)
+        // The caller gets the promises this call cancelled, not every dependent
+        // it walked: an already-settled dependent was left untouched.
+        Ok(cancelled)
     }
 
     /// Reference a promise record from a handle.
