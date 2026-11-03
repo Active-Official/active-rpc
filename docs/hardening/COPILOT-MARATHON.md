@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-11: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 findings; round-11 fixes green, confirmation round pending | 72 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-12: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 findings; round-12 fixes green, confirmation round pending | 77 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-7: 15 + 16 + 9 + 6 + 6 + 2 + 2 findings; round-7 fixes green, confirmation round pending | 51 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,29 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 12)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `a9a6ec8`. It found that the
+round-11 scope fix had not landed (the edit was lost when a later assertion in
+the same batch failed), plus three more highs/mediums.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | no `structural_resolve` existed: `in_scope_path`, the label filter, entry resolution and the immutability check all followed bindings, so an undotted or dotted `bind("app", outside)` still widened the scope (the round-11 test passed on a `value_paths` tie-break, not on a guarantee) | **fixed**: `structural_resolve` walks table fields from the root (no bindings, no annotations, empty/`..` segments refused) and backs `in_scope_path` and the label filter; `an_undotted_binding_alias_does_not_widen_the_scope` passes for the right reason |
+| 2 | high | one placeholder from the first secret node: a module with a normal secret and a marker-substring secret mapped only the first form, so the second came back as `Text("")` | **fixed**: the set of every redacted `Str` for a secret node is mapped, with the marker as the fallback; `a_marker_substring_secret_is_a_value_secret` now runs both orders |
+| 3 | medium | per-call walk amplification (adjacency and `value_paths` rebuilt several times, wall checked only at the end) | **accepted residual**: linear per build and bounded by `max_nodes`; one adjacency + one path map per call and an edge ceiling are tracked for the resource-bomb pass |
+| 4 | high | a non-redacting `content_hash` served the raw hash over the secret heap: an offline brute-force oracle over a low-entropy secret | **fixed**: a secret-bearing module is hashed in redacted form for every capability; the slot cache still holds the raw canonical hash (the module's identity and a patch's parent); `a_secret_bearing_module_is_hashed_redacted_for_every_caller` |
+| 5 | medium | `mark_secret_texts` ran before the depth gate, so a deep value aborted instead of being refused | **fixed**: the iterative depth check runs first and refuses `infinity/limit` |
+| 6 | low | `mark_secret_texts` left a marker in a table key or a quantity unit, while `redact_value` collapses such a map | **fixed**: a table whose key matches a placeholder collapses to `Value::Secret` |
+
+Observed once: `connect_bridge_moves_a_module_and_rejects_bad_frames` failed on
+the first `--no-default-features` run (the malformed-frame post) and passed on
+the rerun and in isolation; recorded as a flake to watch, no code change (the
+bridge is untouched by this round).
+
+Gate: 88 suites / 843 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 11)
 

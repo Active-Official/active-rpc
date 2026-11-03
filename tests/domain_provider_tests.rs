@@ -52,6 +52,21 @@ fn invoke(provider: &mut ModuleProvider, object: u64, call: &Call) -> Response {
     provider.invoke(object, call).expect("call succeeds")
 }
 
+/// The hash the provider serves: the canonical image, redacted when the module
+/// holds a secret (a raw hash over the secret heap is an offline oracle).
+fn served_hash(module: &active_infinity::InfinityModule) -> String {
+    let bytes = active_infinity::encode(module).expect("encode");
+    let bytes = if module.nodes().iter().any(|node| node.is_secret()) {
+        active_rpc::security::redact_module(&bytes).expect("redact")
+    } else {
+        bytes
+    };
+    format!(
+        "blake3:{}",
+        active_infinity::ir::hash_hex(&active_infinity::content_hash(&bytes).expect("hash"))
+    )
+}
+
 fn text(response: Response) -> String {
     match response {
         Response::Value(Value::Text(text)) => text,
@@ -91,10 +106,7 @@ fn content_hash_is_computed_once_and_cached() {
         cached, expected,
         "the cached hash is the canonical hash of the module"
     );
-    assert_eq!(
-        first,
-        format!("blake3:{}", active_infinity::ir::hash_hex(&cached))
-    );
+    assert_eq!(first, served_hash(provider.module(object).expect("module")));
 
     let second = text(invoke(
         &mut provider,
@@ -133,7 +145,7 @@ fn install_canonical_image_seeds_the_cache_without_encoding() {
     ));
     assert_eq!(
         answered,
-        format!("blake3:{}", active_infinity::ir::hash_hex(&seeded))
+        served_hash(provider.module(object).expect("module"))
     );
     assert_eq!(
         provider.module(object).expect("module"),
@@ -290,14 +302,7 @@ fn root_evaluate_answers_from_the_stored_module() {
         object,
         &Call::new("content_hash", vec![]),
     ));
-    let expected = active_infinity::content_hash(
-        &active_infinity::encode(provider.module(object).expect("module")).expect("encode"),
-    )
-    .expect("hash");
-    assert_eq!(
-        hash,
-        format!("blake3:{}", active_infinity::ir::hash_hex(&expected))
-    );
+    assert_eq!(hash, served_hash(provider.module(object).expect("module")));
 }
 
 #[test]

@@ -522,18 +522,16 @@ impl ModuleProvider {
                 // caller that may not read the module is an equality oracle over
                 // secret material (compare one guess, or brute-force a short
                 // value). The redacted hash still proves structural identity.
-                if call.redact {
-                    let bytes = encode(&slot.module)
-                        .map_err(|error| Error::Payload(error.code().to_string()))?;
-                    let redacted = crate::security::redact_module(&bytes)?;
-                    let hash = active_infinity::content_hash(&redacted)
-                        .map_err(|error| Error::Payload(error.code().to_string()))?;
-                    check_wall_budget(started, call)?;
-                    return Ok(Response::Value(Value::Text(format!(
-                        "blake3:{}",
-                        hex32(&hash)
-                    ))));
-                }
+                // A module that holds a secret is hashed in redacted form for
+                // every capability: the canonical hash covers the secret heap,
+                // so the raw value is an offline equality oracle over a
+                // low-entropy secret even for a caller that cannot read the
+                // bytes. The redacted hash still proves structural identity
+                // (round 12, F4).
+                let holds_secret = slot.module.nodes().iter().any(|node| node.is_secret());
+                // Fill the slot cache first: it holds the raw canonical hash,
+                // which is the module's identity and the parent of a later
+                // patch. The answer below may be the redacted one.
                 let hash = match slot.hash {
                     Some(hash) => hash,
                     None => {
@@ -545,6 +543,24 @@ impl ModuleProvider {
                         hash
                     }
                 };
+                if call.redact || holds_secret {
+                    // A module that holds a secret is hashed in redacted form
+                    // for every capability: the raw hash covers the secret heap
+                    // and is an offline equality oracle over a low-entropy
+                    // secret, even for a caller that cannot read the bytes. The
+                    // redacted hash still proves structural identity
+                    // (round 12, F4).
+                    let bytes = encode(&slot.module)
+                        .map_err(|error| Error::Payload(error.code().to_string()))?;
+                    let redacted = crate::security::redact_module(&bytes)?;
+                    let redacted_hash = active_infinity::content_hash(&redacted)
+                        .map_err(|error| Error::Payload(error.code().to_string()))?;
+                    check_wall_budget(started, call)?;
+                    return Ok(Response::Value(Value::Text(format!(
+                        "blake3:{}",
+                        hex32(&redacted_hash)
+                    ))));
+                }
                 check_wall_budget(started, call)?;
                 Ok(Response::Value(Value::Text(format!(
                     "blake3:{}",
@@ -1034,8 +1050,33 @@ fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &s
 /// present an outside node under an in-scope-looking name. A name that does not
 /// resolve back is not confinement.
 fn in_scope_path(module: &InfinityModule, id: NodeId, path: &str, scope: &str) -> bool {
-    crate::cap::is_path_prefix(scope, path)
-        && active_infinity::interop::resolve_path(module, path) == Some(id)
+    crate::cap::is_path_prefix(scope, path) && structural_resolve(module, path) == Some(id)
+}
+
+/// Resolve a dotted path through table fields from the module root.
+///
+/// No bindings and no annotations: exactly the tree a scoped capability was
+/// granted. `bind("app", outside)` used to present an outside node as in-scope,
+/// because `value_paths` labels the binding and `resolve_path` follows it
+/// (R-07 round 11, #1; round 12, F1).
+fn structural_resolve(module: &InfinityModule, path: &str) -> Option<NodeId> {
+    let mut current = module.root()?;
+    if path.is_empty() {
+        return Some(current);
+    }
+    for segment in path.split('.') {
+        if segment.is_empty() || segment == ".." {
+            return None;
+        }
+        let Some(Inode::Table { fields }) = module.get(current) else {
+            return None;
+        };
+        current = fields
+            .iter()
+            .find(|(name, _)| name == segment)
+            .map(|(_, id)| *id)?;
+    }
+    Some(current)
 }
 
 /// Whether a scoped read closure reaches a node named outside `scope`, and
@@ -1106,7 +1147,7 @@ fn scoped_labels(
     labels_for(
         module,
         ids.into_iter().filter(|id| match named_path(&paths, *id) {
-            Some(path) => active_infinity::interop::resolve_path(module, path) == Some(*id),
+            Some(path) => structural_resolve(module, path) == Some(*id),
             None => false,
         }),
     )
@@ -1271,22 +1312,38 @@ fn evaluate_for_caller(
     // substring of the marker the redactor substitutes the empty string, and
     // mapping only the marker left `Text("")` (round 10, #5). Read what the
     // redactor actually wrote for a secret node.
-    let secret_node = (0..module.node_count())
-        .map(|index| NodeId(index as u32))
-        .find(|id| module.get(*id).is_some_and(|node| node.is_secret()));
     let mut redacted = module.clone();
     security::redact_derived(&mut redacted, &redactor)
         .map_err(|error| active_infinity::Error::Encode(error.code()))?;
-    let placeholder = secret_node
-        .and_then(|id| match redacted.get(id) {
+    // Every text the redactor wrote for a secret node: the marker for a normal
+    // secret, the empty string when a secret is a substring of the marker. One
+    // placeholder from the first secret missed the second case when a module
+    // held both (round 12, F2).
+    let placeholders: BTreeSet<String> = (0..module.node_count())
+        .map(|index| NodeId(index as u32))
+        .filter(|id| module.get(*id).is_some_and(|node| node.is_secret()))
+        .filter_map(|id| match redacted.get(id) {
             Some(Inode::Str(text)) => Some(text.clone()),
             _ => None,
         })
-        // The redactor always writes a `Str` for a secret node; keep the marker
-        // as the fallback so the mapping never silently stops (round 11, #2).
-        .unwrap_or_else(|| active_infinity::interop::SECRET_MARKER.to_string());
+        .collect();
+    let placeholders = if placeholders.is_empty() {
+        [active_infinity::interop::SECRET_MARKER.to_string()]
+            .into_iter()
+            .collect()
+    } else {
+        placeholders
+    };
     let (value, diagnostics) = active_infinity::interop::evaluate(&redacted, budget)?;
-    Ok((mark_secret_texts(value, &placeholder), diagnostics))
+    // The marking walk is recursive; the depth gate is iterative and must run
+    // first, or a deep value aborts instead of being refused (round 12, F5).
+    if security::active_value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
+        return Err(active_infinity::Error::Limit {
+            kind: "value depth",
+            limit: crate::wire::MAX_VALUE_DEPTH as u64,
+        });
+    }
+    Ok((mark_secret_texts(value, &placeholders), diagnostics))
 }
 
 /// Replace a text equal to the redaction marker with the structural marker.
@@ -1294,25 +1351,35 @@ fn evaluate_for_caller(
 /// The engine has no secret value, so the marker comes back as text; a caller
 /// that reads a `Value::Secret` knows the field was secret, and a caller that
 /// reads `"***SECRET***"` might treat it as data.
-fn mark_secret_texts(value: active_core::Value, placeholder: &str) -> active_core::Value {
+fn mark_secret_texts(
+    value: active_core::Value,
+    placeholders: &BTreeSet<String>,
+) -> active_core::Value {
     use active_core::Value as CoreValue;
     match value {
-        // The marker stands for the secret. When it is the empty string (a
-        // secret is a substring of the marker) every empty string collapses;
-        // that over-redacts ordinary empty data, the fail-closed side.
-        CoreValue::String(text) if text == placeholder => {
+        // Any placeholder stands for a secret. A key that matches means the
+        // table's shape itself was secret-derived, so the whole table collapses
+        // like a value that carries one (round 12, F6).
+        CoreValue::Table(entries)
+            if entries
+                .iter()
+                .any(|(key, _)| placeholders.contains(key.as_str())) =>
+        {
+            CoreValue::Secret(active_infinity::interop::SECRET_MARKER.to_string())
+        }
+        CoreValue::Table(entries) => CoreValue::Table(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key, mark_secret_texts(value, placeholders)))
+                .collect(),
+        ),
+        CoreValue::String(text) if placeholders.contains(text.as_str()) => {
             CoreValue::Secret(active_infinity::interop::SECRET_MARKER.to_string())
         }
         CoreValue::Array(items) => CoreValue::Array(
             items
                 .into_iter()
-                .map(|item| mark_secret_texts(item, placeholder))
-                .collect(),
-        ),
-        CoreValue::Table(entries) => CoreValue::Table(
-            entries
-                .into_iter()
-                .map(|(key, value)| (key, mark_secret_texts(value, placeholder)))
+                .map(|item| mark_secret_texts(item, placeholders))
                 .collect(),
         ),
         other => other,

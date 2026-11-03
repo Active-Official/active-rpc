@@ -367,12 +367,12 @@ fn the_fixture_source_parses() {
 /// A redacting capability gets the hash of the redacted image.
 ///
 /// `content_hash` covers the secret heap, so the canonical hash is an equality
-/// oracle over secret material for a capability that may not read the module:
-/// compare one guess, or brute-force a short value. The redacted hash still
-/// proves structural identity, and the two differ exactly when the module has a
-/// secret.
+/// oracle over secret material for any capability: compare one guess, or
+/// brute-force a short value. A secret-bearing module is therefore hashed in
+/// redacted form for every caller; the redacted hash still proves structural
+/// identity.
 #[test]
-fn a_redacting_capability_hashes_the_redacted_image() {
+fn a_secret_bearing_module_is_hashed_redacted_for_every_caller() {
     let mut provider = ModuleProvider::new();
     let object = install_source(
         &mut provider,
@@ -386,9 +386,18 @@ fn a_redacting_capability_hashes_the_redacted_image() {
             .invoke(object, &Call::new("content_hash", vec![]))
             .expect("full"),
     );
-    assert_ne!(
+    assert_eq!(
         redacted_hash, full_hash,
-        "a redacting capability must not learn the hash of the secret heap"
+        "every capability sees the redacted hash of a secret-bearing module"
+    );
+    let raw = active_infinity::encode(provider.module(object).expect("module")).expect("encode");
+    let raw = format!(
+        "blake3:{}",
+        active_infinity::ir::hash_hex(&active_infinity::content_hash(&raw).expect("hash"))
+    );
+    assert_ne!(
+        full_hash, raw,
+        "the raw image hash (which covers the secret heap) must not leave"
     );
 
     // The redacted answer is the hash of the redacted image, so it is stable and
