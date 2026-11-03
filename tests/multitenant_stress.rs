@@ -136,8 +136,8 @@ fn one_kernel_keeps_sixteen_tenants_apart_under_interleaving() {
             .expect("recv")
         {
             assert_eq!(message.topic.as_deref(), Some(tenant.topic.as_str()));
-            match message.payload {
-                Value::Text(text) => seen.push(text),
+            match &message.payload {
+                Value::Text(text) => seen.push(text.clone()),
                 other => panic!("unexpected payload {other:?}"),
             }
         }

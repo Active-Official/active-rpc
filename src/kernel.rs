@@ -77,7 +77,7 @@ pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 pub const MAX_QUEUED_CHANNEL_BYTES: u64 = 256 << 20;
 
 /// Largest lane or channel name accepted, in bytes.
-pub const MAX_OBJECT_NAME_BYTES: usize = 256;
+pub const MAX_OBJECT_NAME_BYTES: usize = 128;
 
 /// Channels one lane may subscribe to.
 pub const MAX_CHANNELS_PER_LANE: usize = 1_024;
@@ -200,6 +200,24 @@ pub enum Event {
     LaneCreated(LaneId),
     /// A lane was destroyed.
     LaneDestroyed(LaneId),
+    /// A channel was created.
+    ChannelCreated(ChannelId),
+    /// A lane subscribed to a channel.
+    ChannelSubscribed {
+        /// Subscribing lane.
+        lane: LaneId,
+        /// Channel it may now receive from.
+        channel: ChannelId,
+    },
+    /// A lane released its subscription to a channel.
+    ChannelUnsubscribed {
+        /// Lane that withdrew.
+        lane: LaneId,
+        /// Channel it no longer receives from.
+        channel: ChannelId,
+    },
+    /// A channel was closed to further sends.
+    ChannelClosed(ChannelId),
     /// A channel was destroyed, with the number of messages it still held.
     ChannelDestroyed {
         /// Channel that was removed.
@@ -1745,7 +1763,7 @@ impl Agent {
         // reordering characters (round 2, #3).
         if !crate::security::valid_text(&name, MAX_OBJECT_NAME_BYTES) {
             return Err(Error::InvalidArgument(
-                "a lane name must be 1..=1024 bytes without control or reordering characters",
+                "a lane name must be 1..=128 bytes without control or reordering characters",
             ));
         }
         let mut kernel = self.cell.borrow_mut();
@@ -1852,7 +1870,7 @@ impl Agent {
         // as two records or as a different name.
         if !crate::security::valid_text(&name, MAX_OBJECT_NAME_BYTES) {
             return Err(Error::InvalidArgument(
-                "a channel name must be 1..=1024 bytes without control or reordering characters",
+                "a channel name must be 1..=128 bytes without control or reordering characters",
             ));
         }
         let mut kernel = self.cell.borrow_mut();
@@ -1864,6 +1882,7 @@ impl Agent {
         kernel
             .channels
             .insert(id, Channel::new(id, name, direction));
+        kernel.push_event(Event::ChannelCreated(id));
         Ok(id)
     }
 
@@ -1879,6 +1898,7 @@ impl Agent {
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         record.close();
+        kernel.push_event(Event::ChannelClosed(channel));
         Ok(())
     }
 
@@ -1904,6 +1924,7 @@ impl Agent {
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         record.subscribers.insert(lane.0);
+        kernel.push_event(Event::ChannelSubscribed { lane, channel });
         Ok(())
     }
 
@@ -1918,12 +1939,20 @@ impl Agent {
         if lane_record.closed {
             return Err(Error::UnknownLane(lane.0));
         }
+        // The channel must exist: silently accepting a destroyed id would hide
+        // a use-after-destroy, and every other channel operation answers
+        // `rpc/unknown-channel` for one.
+        kernel
+            .channels
+            .get(&channel)
+            .ok_or(Error::UnknownChannel(channel.0))?;
         if let Some(lane) = kernel.lanes.get_mut(&lane) {
             lane.channels.remove(&channel.0);
         }
         if let Some(record) = kernel.channels.get_mut(&channel) {
             record.subscribers.remove(&lane.0);
         }
+        kernel.push_event(Event::ChannelUnsubscribed { lane, channel });
         Ok(())
     }
 
@@ -2256,6 +2285,13 @@ impl Agent {
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("channel queue ceiling reached"));
         }
+        let effective = record.attrs.budget.intersect(&lane_budget);
+        // The shape gate runs before the measurement, exactly as on the call
+        // path: `wire_size` walks the whole value, and a publish that the ceiling
+        // refuses must not pay that walk first (round 6, #1).
+        if let Some(error) = shape_refusal(&payload, &effective) {
+            return Err(error);
+        }
         // The topic name is metadata the channel stores and forwards, so it is
         // payload as far as the grant is concerned: charging only the value let
         // a 1 KiB topic ride through a 32-byte budget.
@@ -2277,10 +2313,6 @@ impl Agent {
             kernel.metrics.backpressure_refusals =
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("the kernel's channel byte ceiling"));
-        }
-        let effective = record.attrs.budget.intersect(&lane_budget);
-        if let Some(error) = shape_refusal(&payload, &effective) {
-            return Err(error);
         }
         if bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
@@ -2539,6 +2571,15 @@ impl Agent {
         payload_bytes: u64,
         payload: Vec<u8>,
     ) -> Result<PromiseHandle> {
+        // A method name is caller-controlled text that reaches a refusal
+        // message, an event and a receipt. A granted name is bounded at mint
+        // (1..=1024 bytes), so a longer one cannot be granted and is refused
+        // before anything clones or walks it (round 6, #6).
+        if method.len() > MAX_GRANTED_METHOD_BYTES {
+            return Err(Error::InvalidArgument(
+                "a method name must be at most 1024 bytes",
+            ));
+        }
         let mut kernel = self.cell.borrow_mut();
         // The expiry check below compares against `now_ms`. In wall-clock mode
         // that value only moves when someone refreshes it, so a capability whose
@@ -2873,13 +2914,15 @@ impl Agent {
                 .promises
                 .get_mut(&promise.id)
                 .ok_or(Error::UnknownPromise(promise.id.0))?;
-            record.resolve(value)
+            let cancelled = record.state == crate::promise::PromiseState::Cancelled;
+            (record.resolve(value), cancelled)
         };
-        if settled.is_err() {
+        if settled.0.is_err() && !settled.1 {
+            // A cancelled promise is a caller decision (round 6, #5).
             kernel.metrics.promises_double_settled =
                 kernel.metrics.promises_double_settled.saturating_add(1);
         }
-        settled?;
+        settled.0?;
         // A promise answered out of band must not still run its provider: the
         // side effect would happen after the caller already has the answer.
         if let Some(job_id) = kernel
@@ -3069,12 +3112,19 @@ impl Agent {
         // lane intersection is re-checked on the queue path (round 5, N3).
         {
             let kernel = self.cell.borrow();
-            let budget = kernel
+            let cap_budget = kernel
                 .caps
                 .get(&cap.id())
                 .ok_or(Error::UnknownCapability(cap_token(cap.id())))?
                 .attrs
                 .budget;
+            // The lane may be narrower than the capability: gating on the cap
+            // alone would let a wide capability hash a value that the lane will
+            // refuse (round 6, #4).
+            let budget = match kernel.lanes.get(&lane) {
+                Some(lane_record) => cap_budget.intersect(&lane_record.budget),
+                None => cap_budget,
+            };
             drop(kernel);
             for arg in &args {
                 let Arg::Value(value) = arg else { continue };
@@ -3837,21 +3887,49 @@ impl Agent {
                 // capability's grant intersected with the lane's *current*
                 // grant; the copy taken at queue time would let a call queued
                 // under a wide lane run after the lane narrowed.
-                let effective_budget = match (record.as_ref(), kernel.lanes.get(&job.lane)) {
-                    (Some(record), Some(lane_record)) => {
-                        record.attrs.budget.intersect(&lane_record.budget)
-                    }
-                    (Some(record), None) => record.attrs.budget,
-                    (None, _) => job.call.budget,
+                // A missing lane is a refusal, not a wider grant: using the
+                // capability's budget alone would dispatch work whose lane no
+                // longer exists under a ceiling that no longer exists either
+                // (round 3, F3). `destroy_lane` also fails queued jobs, so this
+                // is the belt to that brace.
+                let (effective_budget, lane_live) = match kernel.lanes.get(&job.lane) {
+                    Some(lane_record) => (
+                        record.as_ref().map_or(job.call.budget, |record| {
+                            record.attrs.budget.intersect(&lane_record.budget)
+                        }),
+                        !lane_record.closed,
+                    ),
+                    None => (
+                        record
+                            .as_ref()
+                            .map_or(job.call.budget, |record| record.attrs.budget),
+                        false,
+                    ),
                 };
+                if !lane_live && failure.is_none() {
+                    failure = Some(Error::UnknownLane(job.lane.0));
+                }
                 // A promise argument was a placeholder when the call was
-                // queued. Its value is authority-bearing too, so the path
-                // scope, the tool ceiling and the byte budget are re-checked
-                // against what the provider is about to receive.
-                let resolved_bytes: u64 = args
-                    .iter()
-                    .map(Arg::wire_size)
-                    .fold(0u64, u64::saturating_add);
+                // queued. Its value is authority-bearing too, so the shape
+                // ceilings gate the work first: the byte measurement and the
+                // path walk both traverse the value, and the gate is the
+                // bounded walk (round 6, #2).
+                if failure.is_none() {
+                    for arg in &args {
+                        let Arg::Value(value) = arg else { continue };
+                        if let Some(error) = shape_refusal(value, &effective_budget) {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+                let resolved_bytes: u64 = if failure.is_none() {
+                    args.iter()
+                        .map(Arg::wire_size)
+                        .fold(0u64, u64::saturating_add)
+                } else {
+                    0
+                };
                 if failure.is_none() {
                     if let Some(record) = &record {
                         if let Some(scope) = &record.attrs.path_scope {
@@ -3873,18 +3951,6 @@ impl Agent {
                         }
                         if failure.is_none() && resolved_bytes > effective_budget.max_bytes {
                             failure = Some(Error::BudgetExceeded("byte"));
-                        }
-                        // A promise was a placeholder at queue time; what it
-                        // resolved into is measured now, because the shape
-                        // ceilings are as much part of the grant as the bytes.
-                        if failure.is_none() {
-                            for arg in &args {
-                                let Arg::Value(value) = arg else { continue };
-                                if let Some(error) = shape_refusal(value, &effective_budget) {
-                                    failure = Some(error);
-                                    break;
-                                }
-                            }
                         }
                     }
                 }
@@ -4514,7 +4580,7 @@ impl Kernel {
             if let Some(record) = self.promises.get_mut(&promise) {
                 if record.reject(error).is_ok() {
                     settled_now = true;
-                } else {
+                } else if record.state != crate::promise::PromiseState::Cancelled {
                     self.metrics.promises_double_settled =
                         self.metrics.promises_double_settled.saturating_add(1);
                 }
@@ -4629,6 +4695,10 @@ fn durable_ceiling_reached(kernel: &Kernel) -> bool {
 /// longer than this is represented by an escaped prefix plus a digest tail, so
 /// two long names that share a prefix still differ.
 pub const MAX_METHOD_EVENT_BYTES: usize = 64;
+
+/// Largest method name a capability may grant, and therefore the largest one a
+/// call may name. `receipts::valid_method` enforces the same bound at mint.
+pub const MAX_GRANTED_METHOD_BYTES: usize = 1_024;
 
 /// A log-safe, bounded label for a method name.
 fn method_event_label(method: &str) -> String {
@@ -5088,22 +5158,24 @@ pub fn promise_state(agent: &Agent, id: PromiseId) -> Option<PromiseState> {
 
 /// The first path in `value` (at any depth) that is outside `scope`.
 fn path_outside_scope(value: &Value, scope: &str) -> Option<String> {
-    match value {
-        Value::Path(path) => {
-            if crate::cap::is_path_prefix(scope, path) {
-                None
-            } else {
-                Some(path.clone())
+    // Iterative, for the same reason `shape` and `is_tainted` are: a value can
+    // be nested deeper than the Rust stack, and this walk runs on the way in to
+    // every scoped call, so a recursion here is an abort a caller can choose
+    // (round 6, #3).
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Path(path) => {
+                if !crate::cap::is_path_prefix(scope, path) {
+                    return Some(path.clone());
+                }
             }
+            Value::List(items) => stack.extend(items.iter().rev()),
+            Value::Map(map) => stack.extend(map.values().rev()),
+            _ => {}
         }
-        Value::List(items) => items
-            .iter()
-            .find_map(|item| path_outside_scope(item, scope)),
-        Value::Map(map) => map
-            .values()
-            .find_map(|item| path_outside_scope(item, scope)),
-        _ => None,
     }
+    None
 }
 
 #[cfg(test)]

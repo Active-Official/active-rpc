@@ -66,10 +66,13 @@ impl Provider for EchoProvider {
             })
             .unwrap_or(Value::Null);
         let out = match call.method.as_str() {
-            "upper" => Value::Text(match value {
-                Value::Text(text) => text.to_uppercase(),
-                other => format!("{other:?}").to_uppercase(),
-            }),
+            "upper" => {
+                let upper = match &value {
+                    Value::Text(text) => text.to_uppercase(),
+                    other => format!("{other:?}").to_uppercase(),
+                };
+                Value::Text(upper)
+            }
             _ => value,
         };
         Ok(Response::Value(out))

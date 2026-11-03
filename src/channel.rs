@@ -289,8 +289,14 @@ impl Channel {
             sequence: self.next_sequence,
         };
         let sequence = self.next_sequence;
-        self.next_sequence += 1;
-        self.sent += 1;
+        // A sequence is a u64 a subscriber pages with. Overflow is unreachable
+        // in practice, but a wrap would silently reuse 0 and a debug build would
+        // panic in the kernel: refuse instead.
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(Error::Backpressure("channel sequence space exhausted"))?;
+        self.sent = self.sent.saturating_add(1);
         self.queued_bytes = self.queued_bytes.saturating_add(bytes);
         self.queue.push_back(message);
         Ok(sequence)

@@ -450,6 +450,52 @@ fn lane_and_channel_names_are_validated_text() {
         .create_lane("bad\u{2028}name", Budget::default())
         .is_err());
     assert!(agent.create_lane("fine", Budget::default()).is_ok());
+    // The refusal names the bound the constant actually enforces.
+    let error = agent
+        .create_lane("n".repeat(MAX_OBJECT_NAME_BYTES + 1), Budget::default())
+        .expect_err("an over-long name is refused");
+    assert!(
+        error.to_string().contains("1..=128"),
+        "unexpected refusal: {error}"
+    );
+}
+
+#[test]
+fn unsubscribing_from_a_missing_channel_is_refused() {
+    let (agent, _provider) = agent();
+    let lane = agent.create_lane("gone", Budget::default()).expect("lane");
+    let channel = agent
+        .create_channel("gone", Direction::Both)
+        .expect("channel");
+    agent.destroy_channel(channel).expect("destroy");
+    let error = agent
+        .unsubscribe(lane, channel)
+        .expect_err("a destroyed channel cannot be unsubscribed");
+    assert_eq!(error.code(), "rpc/unknown-channel");
+}
+
+#[test]
+fn subscription_lifecycle_is_on_the_tape() {
+    let (agent, _provider) = agent();
+    let lane = agent.create_lane("tape", Budget::default()).expect("lane");
+    let channel = agent
+        .create_channel("tape", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
+    agent.unsubscribe(lane, channel).expect("unsubscribe");
+    agent.close_channel(channel).expect("close");
+    let json = agent.trace_json();
+    for event in [
+        "channel.created",
+        "channel.subscribed",
+        "channel.unsubscribed",
+        "channel.closed",
+    ] {
+        assert!(
+            json.contains(&format!("\"event\":\"{event}\"")),
+            "{event} is not on the tape: {json}"
+        );
+    }
 }
 
 #[test]

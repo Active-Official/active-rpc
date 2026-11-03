@@ -1015,6 +1015,44 @@ defects; the carried item now has an ADR.
 
 Gate: `cargo test --all-features` 742 passed, 0 failed; clippy and fmt clean.
 
+### R-06 budgets - 2026-11-02 (round 6)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `3e31202`. It verified N1-N4
+and `is_tainted`, and found five siblings of the patterns the previous rounds
+fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `publish` measured the payload with `wire_size` before the shape gate (the call path's round-5 sibling) | **fixed**: the gate runs before the measurement; `a_hostile_publish_is_refused_before_the_kernel_measures_it` |
+| 2 | medium | dispatch computed the resolved argument bytes and walked the path scope before the shape gate | **fixed**: the gate runs first over the substituted arguments; `a_promise_that_resolves_to_a_hostile_value_is_refused_at_dispatch` |
+| 3 | high | `path_outside_scope` was recursive, so a deep value could abort the process in the check that exists to refuse it | **fixed**: iterative with an explicit stack; `a_deep_path_nest_is_walked_iteratively` |
+| 4 | low | the idempotency gate used the capability budget alone, and the method name was cloned into the key before any bound | **fixed**: the gate intersects the lane budget; a method longer than a grant is `rpc/invalid-argument` before anything copies it (`MAX_GRANTED_METHOD_BYTES`); `the_idempotent_gate_uses_the_lane_intersection`, `an_oversized_method_name_is_refused_before_it_is_copied` |
+| 5 | low | `fail_job` and `Agent::resolve` still counted a cancelled promise as a double settlement | **fixed**: both check the cancelled state, like phase 3 |
+
+Residual, documented in the security model: `Value` has a derived destructor, so
+a value nested tens of thousands deep overflows the stack when dropped. Every
+wire path bounds depth at 64 and every kernel walk is iterative; only in-process
+code that builds such a value can reach it, and an iterative destructor would
+forbid destructuring the crate's primary data type by value. Tracked for a major
+version.
+
+Gate: 749 tests all-features, 0 failed; clippy and fmt clean.
+
+### R-05 lanes / channels - 2026-11-02 (round 3)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `3e31202`. It verified all
+six round-2 fixes and found five more.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | medium | the lane/channel name error said `1..=1024 bytes`, the constant was 256, and the spec said 128 (the topic rule) | **fixed**: one bound (128 everywhere), messages name it, and the test checks the message |
+| F2 | medium | `unsubscribe` answered `Ok` for a destroyed channel while every other channel operation answers `rpc/unknown-channel` | **fixed**: the channel is looked up first; `unsubscribing_from_a_missing_channel_is_refused` |
+| F3 | high | at dispatch, a job whose lane record was gone fell back to the capability budget: a wider grant in exactly the case that should fail closed | **fixed**: a missing or closed lane is `rpc/unknown-lane`; the budget is still intersected when the lane is live |
+| F4 | low | `subscribe`, `unsubscribe` and `close_channel` were silent, so the tape did not show who gained read access or when sends stopped | **fixed**: `channel.created`, `channel.subscribed`, `channel.unsubscribed`, `channel.closed` in the closed set, the projection, the replay trace and the spec; `subscription_lifecycle_is_on_the_tape` |
+| F5 | low | the channel sequence counter used `+= 1` (debug panic at the wrap) | **fixed**: `checked_add`, refused as backpressure |
+
+Gate: 749 tests all-features, 0 failed; clippy and fmt clean.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

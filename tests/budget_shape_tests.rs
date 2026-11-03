@@ -52,6 +52,7 @@ impl Provider for Reply {
 struct Fixture {
     agent: Agent,
     calls: std::rc::Rc<std::cell::Cell<usize>>,
+    provider: active_rpc::ProviderId,
     cap: active_rpc::CapHandle,
     lane: active_rpc::LaneId,
 }
@@ -74,6 +75,7 @@ fn fixture_parts(cap_budget: Budget, lane_budget: Budget, reply: Value) -> Fixtu
     Fixture {
         agent,
         calls,
+        provider,
         cap,
         lane,
     }
@@ -449,6 +451,179 @@ fn an_idempotent_call_refuses_a_hostile_value_before_hashing_it() {
         "the refusal ({refused_at} ns) hashed the whole value ({full_walk} ns)"
     );
     assert_eq!(fixture.calls.get(), 0);
+}
+
+#[test]
+fn a_hostile_publish_is_refused_before_the_kernel_measures_it() {
+    // Round 6 (#1): publish measured the payload with `wire_size` before the
+    // shape gate, the same order the call path had already fixed.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    let channel = fixture
+        .agent
+        .create_channel("gate", Direction::Both)
+        .expect("channel");
+    let publisher = fixture
+        .agent
+        .mint(
+            fixture.provider,
+            0,
+            CapAttrs::new(&["ping", "publish"]).restrict_topics(&["t"]),
+        )
+        .expect("publisher");
+    let wide: Vec<Value> = (0..3)
+        .map(|_| Value::list((0..500_000).map(|_| Value::Null)))
+        .collect();
+
+    let mut full_walk = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide[0].shape().widest, 500_000);
+        full_walk = full_walk.min(start.elapsed().as_nanos());
+    }
+
+    let mut refused_at = u128::MAX;
+    for value in wide {
+        let start = std::time::Instant::now();
+        let error = fixture
+            .agent
+            .publish(fixture.lane, channel, &publisher, "t", value)
+            .expect_err("the shape ceiling binds on publish");
+        refused_at = refused_at.min(start.elapsed().as_nanos());
+        assert_eq!(error.code(), "rpc/budget-exceeded");
+    }
+
+    assert!(
+        refused_at.saturating_mul(3) < full_walk,
+        "the refusal ({refused_at} ns) measured the whole payload ({full_walk} ns)"
+    );
+}
+
+#[test]
+fn a_promise_that_resolves_to_a_hostile_value_is_refused_at_dispatch() {
+    // Round 6 (#2): dispatch measured the substituted arguments and walked the
+    // path scope before the shape gate.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    let pending = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, "ping", Vec::new())
+        .expect("queued");
+    let dependent = fixture
+        .agent
+        .call(
+            fixture.lane,
+            &fixture.cap,
+            "ping",
+            vec![Arg::Promise(pending.id())],
+        )
+        .expect("dependent");
+    let wide: Vec<Value> = (0..3)
+        .map(|_| Value::list((0..500_000).map(|_| Value::Null)))
+        .collect();
+    fixture
+        .agent
+        .resolve(&pending, wide[0].clone())
+        .expect("resolve");
+
+    let mut full_walk = u128::MAX;
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        assert_eq!(wide[0].shape().widest, 500_000);
+        full_walk = full_walk.min(start.elapsed().as_nanos());
+    }
+
+    let error = dependent
+        .value()
+        .expect_err("the resolved value is outside the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert_eq!(
+        fixture.calls.get(),
+        0,
+        "the provider ran for a value the dispatch gate refused"
+    );
+    // `full_walk` documents that the value is large; the dispatch clone of a
+    // resolved promise is itself a full walk, so this test asserts the refusal
+    // rather than a ratio.
+    assert!(full_walk > 0);
+}
+
+#[test]
+fn the_idempotent_gate_uses_the_lane_intersection() {
+    // Round 6 (#4): the keyed path gated on the capability budget alone, so a
+    // value the lane refuses was hashed first.
+    let fixture = fixture_parts(
+        Budget::default(),
+        Budget {
+            max_value_size: 1_024,
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    let value = Value::text("x".repeat(4_096));
+    let error = fixture
+        .agent
+        .call_idempotent(
+            fixture.lane,
+            &fixture.cap,
+            "ping",
+            vec![Arg::Value(value)],
+            "lane-gate",
+        )
+        .expect_err("the lane ceiling binds on the keyed path");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert_eq!(fixture.calls.get(), 0);
+}
+
+#[test]
+fn an_oversized_method_name_is_refused_before_it_is_copied() {
+    // Round 6 (#6): a method that cannot be granted was still cloned into the
+    // refusal, so its length was unbounded work outside every budget.
+    let fixture = fixture_with(budget(), Value::text("ok"));
+    let error = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, &"m".repeat(2_048), Vec::new())
+        .expect_err("a method longer than a grant cannot be called");
+    assert_eq!(error.code(), "rpc/invalid-argument");
+}
+
+#[test]
+fn a_deep_path_nest_is_walked_iteratively() {
+    // Round 6 (#3): the path-scope walk recursed, so a deep value could abort
+    // the process in the check that exists to refuse it. The depth is two
+    // thousand, well past the wire's 64: `Value` is a public type with a derived
+    // (recursive) destructor, so a deeper value would also overflow while this
+    // test's own temporary is dropped.
+    let mut value = Value::path("secret/leaf");
+    for _ in 0..2_000 {
+        value = Value::list(std::iter::once(value));
+    }
+    let mut fixture = fixture_parts(
+        Budget {
+            max_depth: 3_000,
+            max_value_size: 10_000_000,
+            ..Budget::default()
+        },
+        Budget {
+            max_depth: 3_000,
+            max_value_size: 10_000_000,
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    let wide = Budget {
+        max_depth: 3_000,
+        max_value_size: 10_000_000,
+        ..Budget::default()
+    };
+    fixture.cap = fixture
+        .agent
+        .attenuate(
+            &fixture.cap,
+            CapAttrs::new(&["ping"])
+                .with_budget(wide)
+                .with_path("allowed"),
+        )
+        .expect("scoped cap");
+    assert_eq!(refused(&fixture, value), "rpc/path-not-granted");
 }
 
 #[test]

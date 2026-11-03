@@ -234,8 +234,12 @@ fn a_bulk_transfer_through_the_kernel_assembles_the_body() {
             .call_from_envelope(None, lane, &cap, &envelope)
             .expect("queued");
         agent.run();
-        match promise.value().expect("settled") {
-            Value::Map(entries) => entries.into_iter().collect(),
+        let reply = promise.value().expect("settled");
+        match &reply {
+            Value::Map(entries) => entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             other => panic!("unexpected reply {other:?}"),
         }
     };

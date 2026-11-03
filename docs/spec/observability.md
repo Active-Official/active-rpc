@@ -69,6 +69,10 @@ authority.
 | `promise.resolved` | `promise` | a promise settled with a value |
 | `promise.rejected` | `promise`, `code` | a promise settled with an error |
 | `channel.send` | `channel`, `channel_sequence` | a message was sent |
+| `channel.created` | `channel` | a channel was created |
+| `channel.subscribed` | `lane`, `channel` | a lane gained read access to a channel |
+| `channel.unsubscribed` | `lane`, `channel` | a lane withdrew its read access |
+| `channel.closed` | `channel` | a channel stopped accepting sends; queued messages stay receivable |
 | `channel.destroyed` | `channel`, `detail` | a channel was destroyed; `detail` is the number of messages dropped with it |
 | `channel.recv` | `channel`, `channel_sequence` | a message was received |
 | `budget.exhausted` | `cap`, `dimension` | a budget ceiling refused work |

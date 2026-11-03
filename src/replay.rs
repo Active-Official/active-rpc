@@ -933,6 +933,22 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             event: "channel.send".into(),
             cap: None,
         },
+        Event::ChannelCreated(_) => Trace {
+            event: "channel.created".into(),
+            cap: None,
+        },
+        Event::ChannelSubscribed { .. } => Trace {
+            event: "channel.subscribed".into(),
+            cap: None,
+        },
+        Event::ChannelUnsubscribed { .. } => Trace {
+            event: "channel.unsubscribed".into(),
+            cap: None,
+        },
+        Event::ChannelClosed(_) => Trace {
+            event: "channel.closed".into(),
+            cap: None,
+        },
         Event::ChannelDestroyed { .. } => Trace {
             event: "channel.destroyed".into(),
             cap: None,

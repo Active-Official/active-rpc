@@ -91,6 +91,10 @@ fn every_event(cap: CapId) -> Vec<Event> {
             channel,
             sequence: 1,
         },
+        Event::ChannelCreated(channel),
+        Event::ChannelSubscribed { lane, channel },
+        Event::ChannelUnsubscribed { lane, channel },
+        Event::ChannelClosed(channel),
         Event::ChannelDestroyed {
             channel,
             dropped: 2,

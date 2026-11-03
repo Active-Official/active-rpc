@@ -325,8 +325,9 @@ fn binary_output_travels_as_a_module_value() {
         .call(lane, &cap, "run", vec![Arg::text("")])
         .expect("queued");
     agent.run();
-    match promise.value().expect("value") {
-        Value::Module(bytes) => assert_eq!(bytes, vec![0xff, 0xfe]),
+    let reply = promise.value().expect("value");
+    match &reply {
+        Value::Module(bytes) => assert_eq!(bytes.as_slice(), [0xff, 0xfe]),
         other => panic!("binary output must not be lossy text: {other:?}"),
     }
 }
