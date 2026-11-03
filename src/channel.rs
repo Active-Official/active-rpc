@@ -314,6 +314,13 @@ impl Channel {
         if !self.direction.can_receive() {
             return Err(Error::InvalidArgument("channel is send-only"));
         }
+        // The same rule a publish enforces: a filter the channel could never
+        // hold is invalid text, not "no message".
+        if !crate::kernel::valid_topic(topic) {
+            return Err(Error::InvalidArgument(
+                "a topic must be 1..=128 bytes without control or reordering characters",
+            ));
+        }
         let index = self
             .queue
             .iter()

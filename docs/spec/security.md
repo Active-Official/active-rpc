@@ -106,14 +106,17 @@ that would violate one stops and needs an ADR.
   process and can do anything the process can. Tools are sandboxed at the
   adapter level (no shell, scrubbed environment, allowlists), not by the kernel.
 - **A `Value` the caller nested deeper than the stack.** `Value` is a public
-  enum with a derived destructor, so a value nested tens of thousands deep
-  overflows the stack when it is dropped, and the kernel drops a value it
-  refuses. Every wire path bounds depth at 64 before a value is built, and every
-  kernel walk over a value is iterative (`shape`, `shape_exceeded`, `is_tainted`,
-  `path_outside_scope`), so this is only reachable by in-process code that builds
-  such a value itself. Making `Value`'s destructor iterative would forbid
-  destructuring the crate's primary data type by value, which is a breaking
-  change to the public API; it is tracked as a future major-version item.
+  enum whose derived `Drop`, `Clone` and `PartialEq` all recurse, so a value
+  nested tens of thousands deep overflows the stack when it is copied, compared
+  or dropped, and the kernel drops a value it refuses. Every wire path bounds
+  depth at 64 before a value is built, every kernel walk over a value is
+  iterative (`shape`, `shape_exceeded`, `is_tainted`, `path_outside_scope`), and
+  the two kernel paths that copy a caller's value (dispatch substitution and an
+  out-of-band resolve) refuse a value deeper than the wire limit first. This is
+  only reachable by in-process code that builds such a value and then copies,
+  compares or drops it itself. Making the three derived implementations
+  iterative would forbid destructuring the crate's primary data type by value,
+  which is a breaking change; it is tracked as a future major-version item.
 - **Pre-emption of a provider's own loop.** `max_wall_ms` binds every adapter
   that can measure time (local process, HTTP, MCP, WASM fuel, the domain
   evaluator), and `Call::budget` hands the ceiling to the provider. A custom

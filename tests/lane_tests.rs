@@ -628,6 +628,51 @@ fn destroying_a_full_lane_does_not_flood_the_tape() {
     );
 }
 
+#[test]
+fn closing_a_receive_only_channel_is_an_event() {
+    // Round 5 (#1): the event was gated on `can_send()`, which is false from the
+    // start for a receive-only channel, so its close changed the stats silently.
+    let (agent, _provider) = agent();
+    let lane = agent.create_lane("ro", Budget::default()).expect("lane");
+    let channel = agent
+        .create_channel("ro", Direction::Receive)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
+    agent.close_channel(channel).expect("close");
+    assert!(agent.channel(channel).expect("channel").closed);
+    let json = agent.trace_json();
+    assert!(
+        json.contains("\"event\":\"channel.closed\""),
+        "closing a receive-only channel is not on the tape: {json}"
+    );
+}
+
+#[test]
+fn a_receive_filter_is_validated_text() {
+    // Round 5 (#2): `recv_topic` answered `Ok(None)` for a filter the channel
+    // could never hold, while publish refuses the same text.
+    let (agent, _provider) = agent();
+    let lane = agent
+        .create_lane("filter", Budget::default())
+        .expect("lane");
+    let channel = agent
+        .create_channel("filter", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe");
+    for filter in ["", "bad\u{2028}topic"] {
+        let error = agent
+            .recv_topic(lane, channel, filter)
+            .expect_err("an invalid filter is refused");
+        assert_eq!(error.code(), "rpc/invalid-argument");
+    }
+    assert_eq!(
+        agent
+            .recv_topic(lane, channel, "absent")
+            .expect("no message"),
+        None
+    );
+}
+
 /// Guard: the channel byte counter is exposed and exact.
 #[test]
 fn channel_bytes_are_exact() {

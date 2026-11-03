@@ -1086,6 +1086,42 @@ fixes hold; five new defects.
 
 Gate: 755 tests all-features, 0 failed; clippy/fmt/doc clean.
 
+### R-06 budgets - 2026-11-02 (round 8)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `174bb7d`. It verified F1-F5
+of round 7 and found two mediums and six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | dispatch cloned the queued arguments before any gate, so a value queued under a wide lane and then narrowed was copied first (a `Value` clone recurses) | **fixed**: the queue-time arguments are shape-gated against the lane's current budget before the substitution loop copies anything; `a_value_queued_under_a_wide_lane_is_gated_after_attenuation` |
+| 2 | medium | `resolve` settled a promise whose capability was revoked or whose lane was gone, while dispatch refuses both | **fixed**: the out-of-band answer re-checks the capability (live, unexpired) and the lane before it settles; `an_out_of_band_resolve_rechecks_the_authority` |
+| 3 | low | `value_too_deep` pushed every child of a wide value before refusing | **fixed**: it is the bounded `shape_exceeded` probe with the other ceilings disabled |
+| 4 | low | the lane byte checks still used `saturating_add` in five places | **fixed**: one checked form at every site, refused as `rpc/budget-exceeded` |
+| 5 | low | `BudgetExceeded("args")` mapped to the `other` dimension | **fixed**: `budget_dimension` and the spec's dimension list name `args` |
+| 6 | low | the `Value` depth residual did not mention the derived `Clone`/`PartialEq` recursion | **documented**: the security model and the `value` module docs state all three |
+| 7 | low | `send` charges the lane, not a capability meter | **documented design**: a channel is not a capability (ADR-0024), so the lane is the only budget a send can be charged to; the security model says so |
+| 8 | low | the keyed entry that takes a payload *size* cannot tell two same-length bodies apart | **fixed**: `call_idempotent_as_with_body` fingerprints the content, domain-separated from the size form, whose doc now states the limitation; `an_idempotent_body_is_fingerprinted_by_content` |
+
+Gate: 760 tests all-features, 0 failed; clippy/fmt/doc clean; negative controls
+9/9.
+
+### R-05 lanes / channels - 2026-11-02 (round 5)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `174bb7d`. **No critical,
+high or medium findings**; two lows, both fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | closing an open receive-only channel changed its stats with no `channel.closed` event, because the event was gated on `can_send()` | **fixed**: the gate is the channel's `closed` flag; `closing_a_receive_only_channel_is_an_event` |
+| 2 | low | `recv_topic` answered `Ok(None)` for a filter the channel could never hold, while publish refuses the same text | **fixed**: `check_topic` after the subscriber check (order preserves the no-oracle rule) and the same rule in `Channel::recv_topic`; `a_receive_filter_is_validated_text` |
+
+Residual risks it recorded, none a defect: subscriptions are ambient by design
+(ADR-0024), ids are monotonic and never reused, `calls_refused` counts
+entry-point refusals with pre-dispatch drops visible in receipts, and the topic
+message exists as two literals (kernel and channel).
+
+Gate: 760 tests all-features, 0 failed; clippy/fmt/doc clean.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

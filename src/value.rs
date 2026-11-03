@@ -4,6 +4,15 @@
 //! tools need, and it never carries secret material. A secret is represented as
 //! [`Value::Secret`] — a marker — so no code path in this crate can put secret
 //! bytes on the wire.
+//!
+//! # Depth
+//!
+//! `Value` is recursive and its derived `Drop`, `Clone` and `PartialEq`
+//! recurse once per level, so a value nested beyond the stack overflows when
+//! it is copied, compared or dropped. Construction from the wire is bounded
+//! (`wire::MAX_VALUE_DEPTH`); an in-process caller that builds a deeper value
+//! owns that hazard, and every kernel walk over a value is iterative. See the
+//! security model's non-goals.
 
 use std::collections::BTreeMap;
 

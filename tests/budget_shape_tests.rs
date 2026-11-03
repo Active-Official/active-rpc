@@ -659,6 +659,98 @@ fn an_unbounded_argument_list_is_refused_before_any_walk() {
 }
 
 #[test]
+fn a_value_queued_under_a_wide_lane_is_gated_after_attenuation() {
+    // Round 8 (#1): dispatch cloned the queued arguments before any gate, so a
+    // value queued under a wide lane and then narrowed was copied first.
+    let fixture = fixture_with(Budget::default(), Value::text("ok"));
+    let wide = Value::list((0..64).map(Value::Int));
+    let promise = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, "ping", vec![Arg::Value(wide)])
+        .expect("queued under the wide lane");
+    fixture
+        .agent
+        .attenuate_lane(
+            fixture.lane,
+            Budget {
+                max_array_len: 3,
+                ..Budget::default()
+            },
+        )
+        .expect("attenuate");
+    let error = promise
+        .value()
+        .expect_err("the narrowed lane binds the queued value");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert_eq!(fixture.calls.get(), 0);
+}
+
+#[test]
+fn an_out_of_band_resolve_rechecks_the_authority() {
+    // Round 8 (#2): resolve settled a promise whose capability was revoked or
+    // whose lane was gone, while dispatch refuses both.
+    let revoked = fixture_with(Budget::default(), Value::text("ok"));
+    let promise = revoked
+        .agent
+        .call(revoked.lane, &revoked.cap, "ping", Vec::new())
+        .expect("queued");
+    revoked.agent.revoke(&revoked.cap).expect("revoke");
+    let error = revoked
+        .agent
+        .resolve(&promise, Value::Int(1))
+        .expect_err("a revoked capability cannot answer out of band");
+    assert_eq!(error.code(), "rpc/revoked");
+
+    let gone = fixture_with(Budget::default(), Value::text("ok"));
+    let promise = gone
+        .agent
+        .call(gone.lane, &gone.cap, "ping", Vec::new())
+        .expect("queued");
+    gone.agent.destroy_lane(gone.lane).expect("destroy");
+    let error = gone
+        .agent
+        .resolve(&promise, Value::Int(1))
+        .expect_err("a destroyed lane cannot answer out of band");
+    // `destroy_lane` already rejected the queued job, so the answer cannot
+    // replace it; the lane check itself covers a job that is still running.
+    assert_eq!(error.code(), "rpc/promise-resolved");
+}
+
+#[test]
+fn an_idempotent_body_is_fingerprinted_by_content() {
+    // Round 8 (#8): the keyed entry with a payload size could not tell two
+    // same-length bodies apart; the body-aware entry hashes the content.
+    let fixture = fixture_with(Budget::default(), Value::text("ok"));
+    let first = fixture
+        .agent
+        .call_idempotent_as_with_body(
+            None,
+            fixture.lane,
+            &fixture.cap,
+            "ping",
+            Vec::new(),
+            b"body-a",
+            "body-key",
+        )
+        .expect("first body");
+    fixture.agent.run();
+    first.value().expect("value");
+    let error = fixture
+        .agent
+        .call_idempotent_as_with_body(
+            None,
+            fixture.lane,
+            &fixture.cap,
+            "ping",
+            Vec::new(),
+            b"body-b",
+            "body-key",
+        )
+        .expect_err("a different body under the same key is a different call");
+    assert_eq!(error.code(), "rpc/invalid-argument");
+}
+
+#[test]
 fn a_module_larger_than_max_value_size_is_refused() {
     let fixture = fixture_with(budget(), Value::text("ok"));
     assert_eq!(

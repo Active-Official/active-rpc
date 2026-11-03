@@ -1908,7 +1908,10 @@ impl Agent {
             .channels
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
-        let was_open = record.can_send();
+        // `closed` is the state the event reports, so a receive-only channel
+        // that is open still changes: `can_send` was false from the start and
+        // the event would be lost.
+        let was_open = !record.is_closed();
         record.close();
         if was_open {
             kernel.push_event(Event::ChannelClosed(channel));
@@ -2155,7 +2158,11 @@ impl Agent {
         if bytes > lane_budget.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
-        if lane_bytes.saturating_add(bytes) > lane_budget.max_bytes {
+        if lane_bytes
+            .checked_add(bytes)
+            .ok_or(Error::BudgetExceeded("lane byte"))?
+            > lane_budget.max_bytes
+        {
             return Err(Error::BudgetExceeded("lane byte"));
         }
         // Channel capacity is checked before the lane and the meters are
@@ -2177,7 +2184,10 @@ impl Agent {
         let sequence = record.send_sequence(lane, payload, cap_ids.clone())?;
         kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(bytes);
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
-            lane_record.bytes = lane_record.bytes.saturating_add(bytes);
+            lane_record.bytes = lane_record
+                .bytes
+                .checked_add(bytes)
+                .ok_or(Error::BudgetExceeded("lane byte"))?;
             lane_record.completed = lane_record.completed.saturating_add(1);
         }
         kernel.push_event(Event::ChannelSend { channel, sequence });
@@ -2344,7 +2354,11 @@ impl Agent {
         if bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
-        if lane_bytes.saturating_add(bytes) > lane_budget.max_bytes {
+        if lane_bytes
+            .checked_add(bytes)
+            .ok_or(Error::BudgetExceeded("lane byte"))?
+            > lane_budget.max_bytes
+        {
             return Err(Error::BudgetExceeded("lane byte"));
         }
         // A publish is a call through the capability and through every
@@ -2370,7 +2384,10 @@ impl Agent {
         let sequence = record.send_topic_sequence(lane, topic, payload, Vec::new())?;
         kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(bytes);
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
-            lane_record.bytes = lane_record.bytes.saturating_add(bytes);
+            lane_record.bytes = lane_record
+                .bytes
+                .checked_add(bytes)
+                .ok_or(Error::BudgetExceeded("lane byte"))?;
             lane_record.completed = lane_record.completed.saturating_add(1);
         }
         kernel.push_event(Event::ChannelSend { channel, sequence });
@@ -2392,6 +2409,10 @@ impl Agent {
     ) -> Result<Option<Message>> {
         let mut kernel = self.cell.borrow_mut();
         check_subscriber(&kernel, lane, channel)?;
+        // A topic the channel could never hold is invalid text, not "no
+        // message". The subscriber check comes first so an unsubscribed lane
+        // still cannot tell an invalid topic from a valid one.
+        check_topic(topic)?;
         let record = kernel
             .channels
             .get_mut(&channel)
@@ -2725,7 +2746,11 @@ impl Agent {
         }
         // A lane's byte ceiling is cumulative, not a per-call limit: otherwise
         // any number of calls each just under it would pass.
-        if lane_bytes.saturating_add(call_bytes) > lane_budget.max_bytes {
+        if lane_bytes
+            .checked_add(call_bytes)
+            .ok_or(Error::BudgetExceeded("lane byte"))?
+            > lane_budget.max_bytes
+        {
             return Err(Error::BudgetExceeded("lane byte"));
         }
         // Every dependency must exist before anything is charged, recorded or
@@ -2769,7 +2794,10 @@ impl Agent {
             }
         }
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
-            lane_record.bytes = lane_record.bytes.saturating_add(call_bytes);
+            lane_record.bytes = lane_record
+                .bytes
+                .checked_add(call_bytes)
+                .ok_or(Error::BudgetExceeded("lane byte"))?;
         }
 
         let promise_id = PromiseId(kernel.next_promise);
@@ -2951,10 +2979,25 @@ impl Agent {
             .find(|job| job.promise == promise.id)
             .cloned();
         if let Some(job) = &job {
-            let budget = match kernel.lanes.get(&job.lane) {
-                Some(lane_record) => job.call.budget.intersect(&lane_record.budget),
-                None => job.call.budget,
+            // Dispatch re-checks revocation, expiry and the lane before the
+            // provider runs; an out-of-band answer answers the same call and is
+            // held to the same authority (round 8, #2).
+            let lane_budget = match kernel.caps.get(&job.cap) {
+                Some(record) if record.revoked => return Err(Error::Revoked(cap_token(job.cap))),
+                Some(record)
+                    if record
+                        .expires_at
+                        .is_some_and(|expires_at| kernel.now_ms >= expires_at) =>
+                {
+                    return Err(Error::Revoked(cap_token(job.cap)))
+                }
+                Some(_) => match kernel.lanes.get(&job.lane) {
+                    Some(lane_record) if !lane_record.closed => lane_record.budget,
+                    _ => return Err(Error::UnknownLane(job.lane.0)),
+                },
+                None => return Err(Error::UnknownCapability(cap_token(job.cap))),
             };
+            let budget = job.call.budget.intersect(&lane_budget);
             if let Some(error) = shape_refusal(&value, &budget) {
                 return Err(error);
             }
@@ -3142,9 +3185,11 @@ impl Agent {
 
     /// [`Agent::call_idempotent_as`] for a call that carries `payload_bytes`.
     ///
-    /// The payload size is part of the fingerprint: replaying a key with a
-    /// different body is a different call and is refused, and the bytes are
-    /// charged exactly as a non-idempotent call would charge them.
+    /// Only the payload **size** is part of the fingerprint, because this entry
+    /// point never sees the body: two payloads of the same length under one key
+    /// are the same call to it. A caller that holds the body uses
+    /// [`Agent::call_idempotent_as_with_body`], which fingerprints its content.
+    /// The bytes are charged exactly as a non-idempotent call would charge them.
     #[allow(clippy::too_many_arguments)]
     pub fn call_idempotent_as_with_payload(
         &self,
@@ -3154,6 +3199,50 @@ impl Agent {
         method: &str,
         args: Vec<Arg>,
         payload_bytes: u64,
+        key: &str,
+    ) -> Result<PromiseHandle> {
+        self.call_idempotent_inner(peer, lane, cap, method, args, payload_bytes, None, key)
+    }
+
+    /// [`Agent::call_idempotent_as`] for a call that carries a `body`.
+    ///
+    /// The body's content is part of the fingerprint, so two same-length
+    /// payloads are different calls and a replay with an edited body is
+    /// refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_idempotent_as_with_body(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        body: &[u8],
+        key: &str,
+    ) -> Result<PromiseHandle> {
+        self.call_idempotent_inner(
+            peer,
+            lane,
+            cap,
+            method,
+            args,
+            body.len() as u64,
+            Some(body),
+            key,
+        )
+    }
+
+    /// The shared body of the keyed entries.
+    #[allow(clippy::too_many_arguments)]
+    fn call_idempotent_inner(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        method: &str,
+        args: Vec<Arg>,
+        payload_bytes: u64,
+        body: Option<&[u8]>,
         key: &str,
     ) -> Result<PromiseHandle> {
         // The method goes into the key map and the fingerprint, so its bound
@@ -3206,7 +3295,7 @@ impl Agent {
                 }
             }
         }
-        let fingerprint = fingerprint_with_payload(&args, payload_bytes);
+        let fingerprint = fingerprint_with_payload(&args, payload_bytes, body);
         // A replay is an exercise of authority in one lane: the key is scoped
         // to it, and the lane must still exist and have capacity, exactly as a
         // fresh call requires.
@@ -3726,7 +3815,12 @@ impl Agent {
         }
         let mut kernel = self.cell.borrow_mut();
         if let Some(lane_record) = kernel.lanes.get(&job.lane) {
-            if lane_record.bytes.saturating_add(extra) > lane_record.budget.max_bytes {
+            if lane_record
+                .bytes
+                .checked_add(extra)
+                .ok_or(Error::BudgetExceeded("lane byte"))?
+                > lane_record.budget.max_bytes
+            {
                 return Err(Error::BudgetExceeded("lane byte"));
             }
         }
@@ -3747,7 +3841,10 @@ impl Agent {
             }
         }
         if let Some(lane_record) = kernel.lanes.get_mut(&job.lane) {
-            lane_record.bytes = lane_record.bytes.saturating_add(extra);
+            lane_record.bytes = lane_record
+                .bytes
+                .checked_add(extra)
+                .ok_or(Error::BudgetExceeded("lane byte"))?;
         }
         Ok(())
     }
@@ -3805,7 +3902,10 @@ impl Agent {
             }
         }
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
-            lane_record.bytes = lane_record.bytes.saturating_add(bytes);
+            lane_record.bytes = lane_record
+                .bytes
+                .checked_add(bytes)
+                .ok_or(Error::BudgetExceeded("lane byte"))?;
         }
         Ok(())
     }
@@ -3899,44 +3999,61 @@ impl Agent {
                     continue;
                 }
                 let mut args = Vec::with_capacity(job.call.args.len());
+                // The arguments were authorized when they were queued, possibly
+                // under a wider lane. Gate them before this loop copies
+                // anything: a `Value` clone recurses, and the substituted copy
+                // below is the one that must not happen for a value the current
+                // grant refuses (round 8, #1).
+                let gate_budget = kernel.lanes.get(&job.lane).map_or(job.call.budget, |lane| {
+                    job.call.budget.intersect(&lane.budget)
+                });
                 let mut failure = None;
                 for arg in &job.call.args {
-                    match arg {
-                        Arg::Promise(id) => match kernel.promises.get(id) {
-                            Some(record) if record.state.is_settled() => match &record.state {
-                                crate::promise::PromiseState::Resolved(value) => {
-                                    // `Value::clone` recurses, so a deep value
-                                    // must be refused before the copy is made
-                                    // (round 7, F2).
-                                    if value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
-                                        failure = Some(Error::BudgetExceeded("depth"));
+                    let Arg::Value(value) = arg else { continue };
+                    if let Some(error) = shape_refusal(value, &gate_budget) {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+                if failure.is_none() {
+                    for arg in &job.call.args {
+                        match arg {
+                            Arg::Promise(id) => match kernel.promises.get(id) {
+                                Some(record) if record.state.is_settled() => match &record.state {
+                                    crate::promise::PromiseState::Resolved(value) => {
+                                        // `Value::clone` recurses, so a deep value
+                                        // must be refused before the copy is made
+                                        // (round 7, F2).
+                                        if value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
+                                            failure = Some(Error::BudgetExceeded("depth"));
+                                            break;
+                                        }
+                                        args.push(Arg::Value(value.clone()));
+                                    }
+                                    crate::promise::PromiseState::Rejected(error) => {
+                                        failure = Some(error.clone());
                                         break;
                                     }
-                                    args.push(Arg::Value(value.clone()));
-                                }
-                                crate::promise::PromiseState::Rejected(error) => {
-                                    failure = Some(error.clone());
-                                    break;
-                                }
-                                crate::promise::PromiseState::Cancelled => {
-                                    failure = Some(Error::PromiseCancelled(id.0));
-                                    break;
-                                }
-                                crate::promise::PromiseState::Pending => {
+                                    crate::promise::PromiseState::Cancelled => {
+                                        failure = Some(Error::PromiseCancelled(id.0));
+                                        break;
+                                    }
+                                    crate::promise::PromiseState::Pending => {
+                                        failure = Some(Error::UnresolvablePromise(id.0));
+                                        break;
+                                    }
+                                },
+                                Some(_) => {
                                     failure = Some(Error::UnresolvablePromise(id.0));
                                     break;
                                 }
+                                None => {
+                                    failure = Some(Error::UnknownPromise(id.0));
+                                    break;
+                                }
                             },
-                            Some(_) => {
-                                failure = Some(Error::UnresolvablePromise(id.0));
-                                break;
-                            }
-                            None => {
-                                failure = Some(Error::UnknownPromise(id.0));
-                                break;
-                            }
-                        },
-                        other => args.push(other.clone()),
+                            other => args.push(other.clone()),
+                        }
                     }
                 }
                 // Authority is re-checked at dispatch: a capability revoked or
@@ -4773,6 +4890,7 @@ fn budget_dimension(error: &Error) -> &'static str {
             "array_len" => "array_len",
             "value_size" => "value_size",
             "caps per message" => "caps per message",
+            "args" => "args",
             "channel queue" => "channel queue",
             _ => "other",
         },
@@ -4984,11 +5102,24 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
 /// An idempotency key must not answer a *different* request, so the cache
 /// compares this before returning the stored promise. A secret contributes its
 /// marker and size only: hashing its content would be an oracle.
-fn fingerprint_with_payload(args: &[Arg], payload_bytes: u64) -> [u8; 32] {
+fn fingerprint_with_payload(args: &[Arg], payload_bytes: u64, body: Option<&[u8]>) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"active-rpc/idempotency-payload/v1\0");
     hasher.update(&args_fingerprint(args));
     hasher.update(&payload_bytes.to_le_bytes());
+    // A body is fingerprinted by content. The size is all a caller that passes
+    // only a length can offer, and the two forms are domain-separated so a
+    // size-only key can never match a content key for the same length.
+    match body {
+        Some(bytes) => {
+            hasher.update(b"body");
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update(b"size");
+        }
+    }
     *hasher.finalize().as_bytes()
 }
 
@@ -5135,20 +5266,16 @@ fn shape_refusal(value: &Value, budget: &Budget) -> Option<Error> {
 }
 
 fn value_too_deep(value: &Value, limit: usize) -> bool {
-    let mut stack: Vec<(&Value, usize)> = vec![(value, 1)];
-    while let Some((value, depth)) = stack.pop() {
-        if depth > limit {
-            return true;
-        }
-        match value {
-            Value::List(items) => stack.extend(items.iter().map(|item| (item, depth + 1))),
-            Value::Map(entries) => {
-                stack.extend(entries.values().map(|item| (item, depth + 1)));
-            }
-            _ => {}
-        }
-    }
-    false
+    // A bounded depth probe: `shape_exceeded` stops at the first violation
+    // instead of pushing every child of a wide value first (round 8, #3). The
+    // other ceilings are disabled by construction: this asks about depth alone.
+    let budget = crate::budget::Budget {
+        max_depth: limit as u64,
+        max_array_len: u64::MAX,
+        max_value_size: u64::MAX,
+        ..crate::budget::Budget::default()
+    };
+    value.shape_exceeded(&budget).is_some()
 }
 
 /// Advance the wall clock before an authority check.
