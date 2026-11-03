@@ -757,3 +757,114 @@ fn a_scoped_cone_keeps_the_immutability_guard() {
         AnnotationKind::AiImmutable(true)
     ));
 }
+
+/// The constraint tail is a fixpoint, not one pass: with the annotations
+/// recorded in reverse order, a single scan missed the links after the first
+/// and let a scoped write through that the forward order refused.
+#[test]
+fn a_reverse_order_constraint_chain_is_followed_to_its_end() {
+    let mut module = InfinityModule::new();
+    let outside = module.push(Inode::Str(OUTSIDE.to_string()));
+    let inside = module.push(Inode::Str("in".to_string()));
+    let app = module.push(Inode::Table {
+        fields: vec![("y".to_string(), inside)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+    let mut chain = Vec::new();
+    for _ in 0..10 {
+        chain.push(module.push(Inode::Str("link".to_string())));
+    }
+    // Record the chain from the tail backwards: the annotation that connects
+    // `app` is seen last, after the links it reaches were already scanned.
+    module.annotate(
+        chain[9],
+        AnnotationKind::Constraint {
+            source: "tail".to_string(),
+            expr: outside,
+        },
+    );
+    for index in (0..9).rev() {
+        module.annotate(
+            chain[index],
+            AnnotationKind::Constraint {
+                source: "next".to_string(),
+                expr: chain[index + 1],
+            },
+        );
+    }
+    module.annotate(
+        app,
+        AnnotationKind::Constraint {
+            source: "e1".to_string(),
+            expr: chain[0],
+        },
+    );
+
+    let agent = Agent::with_secret([0x83; 32]);
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["subgraph", "patch"]);
+    attrs.path_scope = Some("app".to_string());
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("reverse", Budget::default())
+        .expect("lane");
+    let fixture = Fixture { agent };
+
+    // A read of the cone refuses (the chain reaches outside) ...
+    let result = call(&fixture, lane, &cap, "subgraph", vec![path("app")]);
+    assert_eq!(
+        result.as_ref().err().map(active_rpc::Error::code),
+        Some("rpc/path-not-granted"),
+        "{result:?}"
+    );
+    // ... and so does a write, whatever order the annotations were recorded in.
+    let result = call(
+        &fixture,
+        lane,
+        &cap,
+        "patch",
+        vec![path("app.y"), Arg::text("changed")],
+    );
+    assert_eq!(
+        result.as_ref().err().map(active_rpc::Error::code),
+        Some("rpc/path-not-granted"),
+        "{result:?}"
+    );
+}
+
+/// A redacting caller never receives a content address: the parent hash in the
+/// provenance compares equal to the full image's hash, which is an equality
+/// oracle over secret material.
+#[test]
+fn a_redacting_patch_cone_carries_no_provenance() {
+    let mut module = hostile_module();
+    module.set_provenance(Some(active_infinity::Provenance {
+        producer: Some("test".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: Some([0x44; 32]),
+        entries: Vec::new(),
+    }));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let mut call = active_rpc::value::Call::new("patch", vec![path("app.y"), Arg::text("changed")]);
+    call.redact = true;
+    let response =
+        active_rpc::kernel::Provider::invoke(&mut provider, object, &call).expect("patch reply");
+    let active_rpc::value::Response::Module(bytes) = response else {
+        panic!("a patch answers a module: {response:?}");
+    };
+    let decoded = active_infinity::decode(&bytes).expect("decode");
+    assert_eq!(
+        decoded.provenance().and_then(|prov| prov.parent),
+        None,
+        "the cone carries the parent hash a redacting caller may not see"
+    );
+}

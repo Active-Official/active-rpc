@@ -435,3 +435,213 @@ fn stdout_and_stderr_are_not_swapped() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// R-08 round 3: a drip cannot stretch the body, a stalled pipe cannot block the
+// send, and a request that cannot be delivered is refused instead of dropped.
+// ---------------------------------------------------------------------------
+
+/// Headers at once, then the declared body one byte per `gap`: the old reader
+/// armed the socket timeout once and each byte reset it, so a 150 ms grant could
+/// be held for minutes.
+#[test]
+fn a_dripping_body_cannot_stretch_the_wall_ceiling() {
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+
+        let Ok((mut socket, _)) = listener.accept() else {
+            return;
+        };
+        let mut scratch = [0u8; 4096];
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
+        let _ = socket.read(&mut scratch);
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2000\r\nconnection: close\r\n\r\n");
+        let _ = socket.flush();
+        for _ in 0..2000 {
+            if socket.write_all(b"x").is_err() {
+                return;
+            }
+            let _ = socket.flush();
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/drip")]);
+    let mut call = http_get("/drip", 150);
+    call.tool_allows_process = true;
+    let started = Instant::now();
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the body never arrives in time");
+    let elapsed = started.elapsed();
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a 150 ms grant took {elapsed:?} to refuse a dripping body"
+    );
+}
+
+/// A server that stops reading fills the pipe; the send must not block the
+/// kernel past the ceiling.
+#[test]
+fn a_stalled_mcp_reader_cannot_block_the_send() {
+    use std::time::{Duration, Instant};
+
+    use active_rpc::tool::{McpTransport, StdioTransport};
+
+    #[cfg(windows)]
+    let (program, args, env) = {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let mut env = std::collections::BTreeMap::new();
+        // The transport clears the environment; a Windows child without
+        // `SystemRoot` exits at once.
+        env.insert("SystemRoot".to_string(), root.clone());
+        (
+            format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+            vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 30"],
+            env,
+        )
+    };
+    #[cfg(not(windows))]
+    let (program, args, env) = (
+        "/bin/sh".to_string(),
+        vec!["-c", "sleep 30"],
+        std::collections::BTreeMap::new(),
+    );
+    let mut transport = StdioTransport::spawn(&program, &args, &env).expect("spawn");
+    // Larger than any pipe buffer, so the writer blocks on a child that never
+    // reads.
+    let line = "x".repeat(1 << 20);
+    let started = Instant::now();
+    let error = transport
+        .send_line_within(&line, Some(Instant::now() + Duration::from_millis(200)))
+        .expect_err("the write never completes");
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a 200 ms write deadline took {:?}",
+        started.elapsed()
+    );
+}
+
+/// `to_uppercase` maps `ß` to `SS`, so a lower-case name could alias an
+/// allowlisted method; the RFC 9110 token set also admits `M-SEARCH`.
+#[test]
+fn the_http_method_is_ascii_and_a_token() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("SS", "/x"), ("M-SEARCH", "/y")]);
+    let mut call = Call::new(
+        "request",
+        vec![Arg::text("\u{00df}"), Arg::Value(Value::path("/x"))],
+    );
+    call.tool_allows_process = true;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a non-ASCII method is refused");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+
+    // Two method arguments cannot mean two methods.
+    let mut call = Call::new(
+        "request",
+        vec![
+            Arg::text("GET"),
+            Arg::text("POST"),
+            Arg::Value(Value::path("/x")),
+        ],
+    );
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("one method");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// A body map on a method defined without content, and an envelope payload,
+/// used to be dropped silently: the caller believed data was delivered.
+#[test]
+fn an_undeliverable_request_is_refused() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x"), ("POST", "/y")]);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("a".to_string(), Value::Int(1));
+    let mut call = Call::new(
+        "get",
+        vec![
+            Arg::Value(Value::path("/x")),
+            Arg::Value(Value::Map(entries)),
+        ],
+    );
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("a GET carries no body");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/x"))]);
+    call.tool_allows_process = true;
+    call.payload = b"a payload this adapter cannot send".to_vec();
+    let error = tool.invoke(0, &call).expect_err("the payload is refused");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// A secret travels as the marker, which is not the value: an external peer that
+/// acts on it acts on data the caller never approved.
+#[test]
+fn a_secret_argument_is_not_sent_to_a_peer() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/x"))]);
+    call.args.push(Arg::Value(Value::Secret));
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("a secret is refused");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// A status outside 200..=599 and a header line without a colon are framing
+/// faults, not a success and a skipped line.
+#[test]
+fn a_malformed_http_answer_is_refused() {
+    fn answer(response: &'static [u8]) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut scratch = [0u8; 4096];
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .ok();
+            let _ = socket.read(&mut scratch);
+            let _ = socket.write_all(response);
+            let _ = socket.flush();
+        });
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/x")]);
+        let mut call = http_get("/x", 1_000);
+        call.tool_allows_process = true;
+        tool.invoke(0, &call).expect_err("malformed").code().len() as u16
+    }
+    // Both are refused; the code is the adapter's, not a transport failure.
+    assert!(answer(b"HTTP/1.1 099 Odd\r\ncontent-length: 0\r\n\r\n") > 0);
+    assert!(answer(b"HTTP/1.1 200 OK\r\nnot-a-header\r\ncontent-length: 2\r\n\r\nok") > 0);
+}
+
+/// Glob, brace and tilde expansion are shell syntax too: with a prefix grant
+/// `echo /*` lists the filesystem through stdout.
+#[test]
+fn a_prefix_argument_cannot_expand_a_glob() {
+    #[cfg(windows)]
+    let (program, flag) = ("C:\\Windows\\System32\\cmd.exe", "/C");
+    #[cfg(not(windows))]
+    let (program, flag) = ("/bin/sh", "-c");
+    let mut tool = LocalProcess::new(program, &[flag, "echo*"]).expect("an absolute program");
+    for injected in ["echo /*", "echo ~", "echo a{b,c}", "echo #x"] {
+        let mut call = Call::new("run", vec![Arg::text(flag), Arg::text(injected)]);
+        call.tool_allows_process = true;
+        let error = tool
+            .invoke(0, &call)
+            .expect_err("expansion syntax is not an argument");
+        assert_eq!(error.code(), "rpc/tool-policy", "{injected:?}: {error}");
+    }
+}

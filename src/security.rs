@@ -17,6 +17,32 @@ use crate::value::Value;
 /// Marker used wherever a secret would otherwise appear.
 pub const SECRET_MARKER: &str = "***SECRET***";
 
+/// True when an evaluator value is deeper than `limit`.
+///
+/// [`from_active_value`] recurses, so a result the wire could never carry is
+/// refused before the conversion: the evaluator's own ceiling can be larger than
+/// the wire's, and converting first would walk (and possibly overflow on) a value
+/// that can never leave the kernel (R-07 round 7, #4).
+pub fn active_value_too_deep(value: &active_core::Value, limit: usize) -> bool {
+    use active_core::Value as ActiveValue;
+    let mut work = vec![(value, 1usize)];
+    while let Some((value, depth)) = work.pop() {
+        if depth > limit {
+            return true;
+        }
+        match value {
+            ActiveValue::Array(items) => {
+                work.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            ActiveValue::Table(entries) => {
+                work.extend(entries.iter().map(|(_, item)| (item, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Convert an evaluated Active value into an RPC value.
 ///
 /// Secrets and tainted blobs collapse to [`Value::Secret`]: the RPC layer never

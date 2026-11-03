@@ -228,6 +228,13 @@ impl ModuleProvider {
                     active_infinity::Error::Evaluation(code) => Error::Domain(code),
                     other => Error::Payload(other.code().to_string()),
                 })?;
+                check_wall_budget(started, call)?;
+                // The conversion recurses; a result deeper than the wire can
+                // carry can never be returned, so it is refused before the walk
+                // (round 7, #4).
+                if security::active_value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
+                    return Err(Error::BudgetExceeded("depth"));
+                }
                 Ok(Response::Value(security::from_active_value(&value)))
             }
             "why" => {
@@ -367,6 +374,13 @@ impl ModuleProvider {
                     // a scoped writer must not receive the rest of the module
                     // back, and the bytes stay bounded by the write.
                     let mut cone = restrict(&patched, node)?;
+                    if call.redact {
+                        // The provenance records the parent's content address,
+                        // and a redacting caller may not receive a hash of an
+                        // image it cannot read: comparing it with a guessed hash
+                        // is an equality oracle over secrets (round 7, #2).
+                        cone.set_provenance(None);
+                    }
                     if let Some(scope) = &call.path_scope {
                         // The same rule as `subgraph`: a scoped cone reply is the
                         // subtree's data, not the module's history.
@@ -444,7 +458,6 @@ impl ModuleProvider {
                 if let Some(scope) = &call.path_scope {
                     return Err(Error::PathNotGranted(scope.clone()));
                 }
-                check_wall_budget(started, call)?;
                 // A redacting capability gets the hash of the *redacted* image:
                 // the canonical hash covers the secret heap, so handing it to a
                 // caller that may not read the module is an equality oracle over
@@ -456,6 +469,7 @@ impl ModuleProvider {
                     let redacted = crate::security::redact_module(&bytes)?;
                     let hash = active_infinity::content_hash(&redacted)
                         .map_err(|error| Error::Payload(error.code().to_string()))?;
+                    check_wall_budget(started, call)?;
                     return Ok(Response::Value(Value::Text(format!(
                         "blake3:{}",
                         hex32(&hash)
@@ -472,6 +486,7 @@ impl ModuleProvider {
                         hash
                     }
                 };
+                check_wall_budget(started, call)?;
                 Ok(Response::Value(Value::Text(format!(
                     "blake3:{}",
                     hex32(&hash)
@@ -487,7 +502,6 @@ impl ModuleProvider {
             }
             "stats" => {
                 check_node_budget(&slot.module, call)?;
-                check_wall_budget(started, call)?;
                 let module = &slot.module;
                 let mut map = BTreeMap::new();
                 map.insert("nodes".to_string(), Value::Int(module.node_count() as i64));
@@ -510,11 +524,11 @@ impl ModuleProvider {
                     "has_provenance".to_string(),
                     Value::Bool(module.provenance().is_some()),
                 );
+                check_wall_budget(started, call)?;
                 Ok(Response::Value(Value::Map(map)))
             }
             "annotations" => {
                 check_node_budget(&slot.module, call)?;
-                check_wall_budget(started, call)?;
                 let module = &slot.module;
                 // The taint walk is only needed when the capability redacts.
                 let tainted_ids = if call.redact {
@@ -549,11 +563,11 @@ impl ModuleProvider {
                     entry.insert("text".to_string(), text);
                     out.push(Value::Map(entry));
                 }
+                check_wall_budget(started, call)?;
                 Ok(Response::Value(Value::List(out)))
             }
             "provenance" => {
                 check_node_budget(&slot.module, call)?;
-                check_wall_budget(started, call)?;
                 Ok(match slot.module.provenance() {
                     None => Response::Value(Value::Null),
                     Some(prov) => {
@@ -562,8 +576,15 @@ impl ModuleProvider {
                         // string is replaced by the marker instead of leaving as
                         // ordinary text.
                         let mut map = provenance_map(&slot.module);
+                        if call.redact {
+                            // The parent is a content address: under a redacting
+                            // capability it is an equality oracle over an image
+                            // the caller may not read (round 7, #2).
+                            map.remove("parent");
+                        }
                         let timestamp = i64::try_from(prov.timestamp_ms).unwrap_or(i64::MAX);
                         map.insert("timestamp_ms".to_string(), Value::Int(timestamp));
+                        check_wall_budget(started, call)?;
                         Response::Value(Value::Map(map))
                     }
                 })
@@ -773,12 +794,21 @@ fn effects_within_scope(module: &InfinityModule, node: NodeId, scope: &str) -> b
     affected.insert(node);
     // A constraint's expression is part of the validation of its subject: a
     // scoped write may not change the meaning of a rule that watches data
-    // outside the scope.
-    for annotation in module.annotations() {
-        if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
-            if affected.contains(&annotation.node) {
-                affected.insert(*expr);
+    // outside the scope. A constraint on a constraint is the same rule again, so
+    // this runs to a fixpoint: one pass left the tail order-dependent, and a
+    // reversed annotation order let a write through that the forward order
+    // refused (round 7, #1).
+    loop {
+        let before = affected.len();
+        for annotation in module.annotations() {
+            if let AnnotationKind::Constraint { expr, .. } = &annotation.kind {
+                if affected.contains(&annotation.node) {
+                    affected.insert(*expr);
+                }
             }
+        }
+        if affected.len() == before {
+            break;
         }
     }
     let paths = active_infinity::interop::value_paths(module);

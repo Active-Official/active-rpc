@@ -1474,6 +1474,41 @@ first; `with_capacity` is bounded by the receiver's limits; a duplicate added
 descriptor is refused by `apply_to` rather than decode (same class); `Value::Path`
 and `Module` are bounded by the envelope and the dispatch budget.
 
+### R-07 domain operations - 2026-11-02 (round 7)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `79b6c8c`. Rounds 1-6 stand;
+two highs and two mediums, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `effects_within_scope` followed constraint expressions in a single pass, so with the annotations recorded in reverse order the tail was missed and a scoped write went through that the forward order refused | **fixed**: the walk is a fixpoint, like `scope_closure`; `a_reverse_order_constraint_chain_is_followed_to_its_end` |
+| 2 | high | a redacting caller could compare the `parent` content address in the provenance (on a patch cone and in the `provenance` answer) with a guessed hash: an equality oracle over secrets | **fixed**: a redacting patch cone carries no provenance, and a redacting `provenance` answer omits `parent`; `a_redacting_patch_cone_carries_no_provenance` |
+| 3 | medium | the wall ceiling was measured before the metadata work (so it always passed) and the scoped evaluate path never checked it | **fixed**: the check runs after the answer is built, and evaluate measures its own work |
+| 4 | medium | the evaluator's depth ceiling is larger than the wire's, so its answer was converted (recursively) before the wire could refuse it | **fixed**: an iterative `active_value_too_deep` gate refuses a result deeper than `MAX_VALUE_DEPTH` before the conversion |
+
+Gate: 799 tests all-features, 0 failed; clippy/fmt/doc clean; control-plane green;
+negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-02 (round 3)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `79b6c8c`. The 24 earlier
+fixes hold; two highs and four mediums, plus three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the HTTP reader armed the socket timeout once and each byte reset it: a peer dripping one byte per period could hold a 150 ms grant for minutes | **fixed**: lines and bodies are read in chunks with the socket re-armed and the deadline re-checked per chunk; `a_dripping_body_cannot_stretch_the_wall_ceiling` |
+| 2 | high | `StdioTransport::send_line` blocked with no deadline: a server that stops reading plus a large frame wedged the dispatch thread | **fixed**: a writer thread, `send_line_within(deadline)`, and the session passes its deadline; `a_stalled_mcp_reader_cannot_block_the_send` |
+| 3 | medium | a failed send left the stream desynchronised without poisoning the session | **fixed**: poison before returning, like a framing error |
+| 4 | medium | the shell metacharacter set missed glob, brace, tilde and comment syntax, so a prefix grant plus a shell listed the filesystem through stdout | **fixed**: `* ? [ ] { } ~ # !` added (backslash stays legal: it is a path separator on Windows); `a_prefix_argument_cannot_expand_a_glob` |
+| 5 | medium | `to_uppercase` mapped `ß` to `SS` (an alias of an allowlisted method) while the token check refused legal `M-SEARCH` | **fixed**: ASCII uppercase and the RFC 9110 token set; `the_http_method_is_ascii_and_a_token` |
+| 6 | medium | several adapters silently dropped part of a request (a second text or path, a body on a bodyless method, an envelope payload) | **fixed**: one method, one path, one body object; a body on a bodyless method and a payload the adapter cannot send are `rpc/invalid-argument`; `an_undeliverable_request_is_refused` |
+| 7 | low | a secret argument travelled to an external peer as `***SECRET***` | **fixed**: MCP and HTTP refuse a tainted argument with `rpc/tool-policy`; `a_secret_argument_is_not_sent_to_a_peer` |
+| 8 | low | the HTTP parse accepted a status below 100 as success, ignored a colon-less header line, and never validated the base | **fixed**: 200..=599 only, colon-less lines refused, base and path must be printable ASCII; `a_malformed_http_answer_is_refused` |
+| 9 | low | a failed `set_read_timeout`/`set_write_timeout` was swallowed, falling back to blocking I/O | **fixed**: both are `rpc/timeout` |
+
+Gate: 799 tests all-features, 0 failed; clippy/fmt/doc clean; control-plane green;
+negative controls 9/9.
+
 ### R-08 tools / MCP - 2026-11-01 (round 1)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `0953e7a`

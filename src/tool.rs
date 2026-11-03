@@ -83,6 +83,17 @@ pub trait McpTransport {
     /// Read one JSON line (blocking).
     fn recv_line(&mut self) -> Result<String>;
 
+    /// Send one JSON line, giving up at `deadline`.
+    ///
+    /// The default ignores the deadline: an in-memory transport answers at once.
+    /// A transport that writes to another process overrides this, because a
+    /// server that stops reading fills the pipe and blocks the writer
+    /// (round 3, #2).
+    fn send_line_within(&mut self, line: &str, deadline: Option<std::time::Instant>) -> Result<()> {
+        let _ = deadline;
+        self.send_line(line)
+    }
+
     /// Read one JSON line, giving up at `deadline`.
     ///
     /// The default ignores the deadline: an in-memory transport answers at
@@ -289,50 +300,95 @@ impl DeadlineReader {
     }
 
     /// Arm the socket with the time that is left.
+    ///
+    /// A failure to set the timeout is a failure to bound the call: reporting it
+    /// beats reading with no ceiling at all (round 3, #9).
     fn arm(&self) -> Result<()> {
         let left = remaining_until(self.deadline)?;
-        self.reader.get_ref().set_read_timeout(Some(left)).ok();
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(left))
+            .map_err(|_| Error::Timeout)?;
         Ok(())
     }
 
     /// Read one line under a byte cap and the wall deadline.
+    ///
+    /// One `fill_buf` is at most one syscall, and the deadline is re-checked
+    /// after every chunk: a peer that drips a byte per read timeout used to keep
+    /// a multi-kilobyte line alive long past the ceiling, because `read_line`
+    /// loops internally and each byte resets the socket timeout (round 3, #1).
     fn line(&mut self, cap: usize) -> Result<String> {
-        self.arm()?;
-        let mut line = String::new();
-        let read = self
-            .reader
-            .by_ref()
-            .take((cap + 1) as u64)
-            .read_line(&mut line)
-            .map_err(map_http_read)?;
-        if read > cap {
-            return Err(Error::Provider {
-                code: "http/line-too-long".to_string(),
-            });
+        let mut line = Vec::new();
+        loop {
+            self.arm()?;
+            let available = self.reader.fill_buf().map_err(map_http_read)?;
+            if available.is_empty() {
+                return Err(Error::Provider {
+                    code: "http/read:truncated".to_string(),
+                });
+            }
+            let (take, done) = match available.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (index + 1, true),
+                None => (available.len(), false),
+            };
+            if line.len() + take > cap {
+                return Err(Error::Provider {
+                    code: "http/line-too-long".to_string(),
+                });
+            }
+            line.extend_from_slice(&available[..take]);
+            self.reader.consume(take);
+            remaining_until(self.deadline)?;
+            if done {
+                break;
+            }
         }
-        remaining_until(self.deadline)?;
-        Ok(line)
+        String::from_utf8(line).map_err(|_| Error::Provider {
+            code: "http/header-not-utf8".to_string(),
+        })
     }
 
     /// Read exactly `length` body bytes under the wall deadline.
     fn body_exact(&mut self, length: usize) -> Result<Vec<u8>> {
-        self.arm()?;
         let mut body = vec![0u8; length];
-        self.reader.read_exact(&mut body).map_err(map_http_read)?;
-        remaining_until(self.deadline)?;
+        let mut filled = 0usize;
+        while filled < length {
+            self.arm()?;
+            let want = (length - filled).min(4_096);
+            let read = self
+                .reader
+                .read(&mut body[filled..filled + want])
+                .map_err(map_http_read)?;
+            if read == 0 {
+                return Err(Error::Provider {
+                    code: "http/read:truncated body".to_string(),
+                });
+            }
+            filled += read;
+            remaining_until(self.deadline)?;
+        }
         Ok(body)
     }
 
     /// Read the rest of the body under a byte cap and the wall deadline.
     fn body_rest(&mut self, cap: usize) -> Result<Vec<u8>> {
-        self.arm()?;
         let mut rest = Vec::new();
-        self.reader
-            .by_ref()
-            .take(cap as u64 + 1)
-            .read_to_end(&mut rest)
-            .map_err(map_http_read)?;
-        remaining_until(self.deadline)?;
+        let mut chunk = [0u8; 4_096];
+        loop {
+            self.arm()?;
+            let read = self.reader.read(&mut chunk).map_err(map_http_read)?;
+            if read == 0 {
+                break;
+            }
+            if rest.len().saturating_add(read) > cap {
+                return Err(Error::Provider {
+                    code: "http/body-too-large".to_string(),
+                });
+            }
+            rest.extend_from_slice(&chunk[..read]);
+            remaining_until(self.deadline)?;
+        }
         Ok(rest)
     }
 }
@@ -354,7 +410,9 @@ fn map_http_read(error: std::io::Error) -> Error {
 /// A child-process MCP transport speaking JSON-RPC over stdin/stdout.
 pub struct StdioTransport {
     child: Child,
-    stdin: std::process::ChildStdin,
+    /// Lines handed to the writer thread, each with the channel its outcome goes
+    /// back on.
+    writer: std::sync::mpsc::Sender<(String, std::sync::mpsc::Sender<Result<()>>)>,
     /// Lines read by the reader thread. Reading on a thread is what makes a
     /// deadline possible: a child pipe has no portable read timeout, and a
     /// silent server would otherwise block the single-threaded kernel for as
@@ -440,9 +498,36 @@ impl StdioTransport {
             .map_err(|error| Error::Provider {
                 code: format!("mcp/thread:{error}"),
             })?;
+        // The writer runs on its own thread for the same reason the reader
+        // does: a server that stops reading fills the pipe and a blocking write
+        // would hold the kernel past every ceiling (round 3, #2).
+        let (writer, commands) =
+            std::sync::mpsc::channel::<(String, std::sync::mpsc::Sender<Result<()>>)>();
+        std::thread::Builder::new()
+            .name("active-rpc-mcp-writer".to_string())
+            .spawn(move || {
+                let mut stdin = stdin;
+                while let Ok((line, reply)) = commands.recv() {
+                    let outcome = stdin
+                        .write_all(line.as_bytes())
+                        .and_then(|_| stdin.write_all(b"\n"))
+                        .and_then(|_| stdin.flush())
+                        .map_err(|error| Error::Provider {
+                            code: format!("mcp/write:{error}"),
+                        });
+                    let failed = outcome.is_err();
+                    let _ = reply.send(outcome);
+                    if failed {
+                        return;
+                    }
+                }
+            })
+            .map_err(|error| Error::Provider {
+                code: format!("mcp/thread:{error}"),
+            })?;
         Ok(Self {
             child,
-            stdin,
+            writer,
             lines,
         })
     }
@@ -450,13 +535,32 @@ impl StdioTransport {
 
 impl McpTransport for StdioTransport {
     fn send_line(&mut self, line: &str) -> Result<()> {
-        self.stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
-            .map_err(|error| Error::Provider {
-                code: format!("mcp/write:{error}"),
-            })
+        self.send_line_within(line, None)
+    }
+
+    fn send_line_within(&mut self, line: &str, deadline: Option<std::time::Instant>) -> Result<()> {
+        let (reply, outcome) = std::sync::mpsc::channel();
+        self.writer
+            .send((line.to_string(), reply))
+            .map_err(|_| Error::Provider {
+                code: "mcp/write:closed".to_string(),
+            })?;
+        match deadline {
+            None => outcome.recv().map_err(|_| Error::Provider {
+                code: "mcp/write:closed".to_string(),
+            })?,
+            Some(deadline) => {
+                let left = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .ok_or(Error::Timeout)?;
+                outcome.recv_timeout(left).map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => Error::Provider {
+                        code: "mcp/write:closed".to_string(),
+                    },
+                })?
+            }
+        }
     }
 
     fn recv_line(&mut self) -> Result<String> {
@@ -643,7 +747,13 @@ impl<T: McpTransport> McpSession<T> {
                 "the MCP request exceeds the line ceiling",
             ));
         }
-        self.transport.send_line(&line)?;
+        if let Err(error) = self.transport.send_line_within(&line, deadline) {
+            // A partial write desynchronises the stream: the next read could
+            // answer this request with the previous call's remainder
+            // (round 3, #3).
+            self.poisoned = true;
+            return Err(error);
+        }
         let mut skipped = 0usize;
         loop {
             let line = self.transport.recv_line_within(deadline)?;
@@ -752,6 +862,19 @@ impl<T: McpTransport> Provider for McpSession<T> {
 
     fn invoke(&mut self, object: u64, call: &Call) -> Result<Response> {
         self.calls += 1;
+        if !call.payload.is_empty() {
+            // The adapter builds `arguments` from the arguments; an envelope
+            // payload would be dropped without the caller knowing
+            // (round 3, #6).
+            return Err(Error::InvalidArgument(
+                "the MCP adapter does not accept an envelope payload",
+            ));
+        }
+        if args_contain_secret(&call.args) {
+            return Err(Error::ToolPolicy(
+                "a secret argument cannot be sent to an external peer",
+            ));
+        }
         let tool = self
             .tools
             .get(object as usize)
@@ -894,7 +1017,7 @@ impl HttpTool {
         })?;
         stream
             .set_write_timeout(Some(remaining_until(deadline)?))
-            .ok();
+            .map_err(|_| Error::Timeout)?;
         let head = {
             // A method defined without content sends no `content-length` and no
             // body. A GET that carries one makes simple servers and
@@ -941,6 +1064,14 @@ impl HttpTool {
                 code: "http/interim".to_string(),
             });
         }
+        if !(200..=599).contains(&status) {
+            // A three-digit status outside the defined ranges is a malformed
+            // answer, not a success: `099` used to be read as one
+            // (round 3, #8).
+            return Err(Error::Provider {
+                code: "http/status".to_string(),
+            });
+        }
         status_line.clear();
         let mut content_length: Option<usize> = None;
         let mut header_bytes = 0usize;
@@ -957,7 +1088,15 @@ impl HttpTool {
                     code: "http/headers".to_string(),
                 });
             }
-            if let Some((name, value)) = line.split_once(':') {
+            let Some((name, value)) = line.split_once(':') else {
+                // A header line without a colon is a framing fault: ignoring it
+                // let a peer hide a field from the check that follows
+                // (round 3, #8).
+                return Err(Error::Provider {
+                    code: "http/headers".to_string(),
+                });
+            };
+            {
                 if name.eq_ignore_ascii_case("transfer-encoding")
                     && !value.trim().eq_ignore_ascii_case("identity")
                 {
@@ -1025,17 +1164,44 @@ impl Provider for HttpTool {
 
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
         self.calls += 1;
+        if !call.payload.is_empty() {
+            // This adapter sends the body it builds from the arguments; an
+            // envelope payload would be silently dropped (round 3, #6).
+            return Err(Error::InvalidArgument(
+                "the HTTP adapter does not accept an envelope payload",
+            ));
+        }
+        if args_contain_secret(&call.args) {
+            // The placeholder is not the value: an external peer that acts on
+            // `***SECRET***` acts on data the caller never approved
+            // (round 3, #7).
+            return Err(Error::ToolPolicy(
+                "a secret argument cannot be sent to an external peer",
+            ));
+        }
         let method: String = match call.method.as_str() {
             "get" => "GET".to_string(),
             "post" => "POST".to_string(),
-            "request" => call
-                .args
-                .iter()
-                .find_map(|arg| match arg {
-                    Arg::Value(Value::Text(text)) => Some(text.to_uppercase()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "GET".to_string()),
+            "request" => {
+                let requested: Vec<&str> = call
+                    .args
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        Arg::Value(Value::Text(text)) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                // One method, and only ASCII: `to_uppercase` maps `ß` to `SS`,
+                // which aliases an allowlisted method into another one
+                // (round 3, #5).
+                if requested.len() > 1 {
+                    return Err(Error::InvalidArgument("an HTTP request names one method"));
+                }
+                requested
+                    .first()
+                    .map(|text| text.to_ascii_uppercase())
+                    .unwrap_or_else(|| "GET".to_string())
+            }
             other => {
                 return Err(Error::MethodNotGranted {
                     method: other.to_string(),
@@ -1044,44 +1210,81 @@ impl Provider for HttpTool {
         };
         // The method text is interpolated into the request line, where only
         // token characters are legal: anything else would split the request.
-        if !method.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        // RFC 9110 token characters, not "A-Z only": `M-SEARCH` and the digits
+        // in a vendor method are legal, and anything outside the token set
+        // splits the request line.
+        if method.is_empty() || !method.bytes().all(is_http_token) {
             return Err(Error::ToolPolicy("the HTTP method is not a token"));
         }
         // The path is a `Value::Path` and nothing else. Accepting a text
         // argument that starts with `/` would give a caller a second, invisible
         // route to the path: the kernel's path scope walks `Value::Path`, so a
         // text path would reach the adapter without ever being checked.
-        let path = call
+        let paths: Vec<&String> = call
             .args
             .iter()
-            .find_map(|arg| match arg {
-                Arg::Value(Value::Path(path)) => Some(path.clone()),
+            .filter_map(|arg| match arg {
+                Arg::Value(Value::Path(path)) => Some(path),
                 _ => None,
             })
+            .collect();
+        if paths.len() > 1 {
+            // The adapter used to take the first and drop the rest, so a caller
+            // could hand it two paths and believe both were used
+            // (round 3, #6).
+            return Err(Error::InvalidArgument("an HTTP request names one path"));
+        }
+        let path = paths
+            .first()
+            .map(|path| (*path).clone())
             .ok_or(Error::InvalidArgument("an HTTP path argument is required"))?;
         // The path reaches the request line verbatim. The allowlist gates it,
         // but a configuration entry that contains a control character would be
         // request splitting, so refuse the bytes outright.
-        if path.bytes().any(|byte| byte < 0x21 || byte == 0x7f) {
+        if path.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+            // Control characters split the request; bytes above ASCII are not
+            // percent-encoded by this adapter and would reach the wire as
+            // non-ASCII in a request line (round 3, #8).
             return Err(Error::ToolPolicy(
-                "a path argument contains a control character",
+                "a path argument must be printable ASCII without spaces",
+            ));
+        }
+        // The base is the operator's endpoint, but a control character in it is a
+        // request split waiting for a configuration mistake (round 3, #8).
+        if self.base.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+            return Err(Error::ToolPolicy(
+                "the HTTP base contains whitespace or a control character",
             ));
         }
         if !self.allow.contains(&(method.to_string(), path.clone())) {
             return Err(Error::ToolPolicy("path is not on the allowlist"));
         }
+        let bodies: Vec<&std::collections::BTreeMap<String, Value>> = call
+            .args
+            .iter()
+            .filter_map(|arg| match arg {
+                Arg::Value(Value::Map(entries)) => Some(entries),
+                _ => None,
+            })
+            .collect();
+        if bodies.len() > 1 {
+            return Err(Error::InvalidArgument(
+                "an HTTP request names one body object",
+            ));
+        }
+        if !takes_request_body(&method) && !bodies.is_empty() {
+            // A body on a method defined without content is dropped by the old
+            // adapter: the caller believes it sent data that never left
+            // (round 3, #6).
+            return Err(Error::InvalidArgument(
+                "this HTTP method does not carry a body",
+            ));
+        }
         let body = if takes_request_body(&method) {
             let body = serde_json::to_vec(
-                &call
-                    .args
-                    .iter()
-                    .filter_map(|arg| match arg {
-                        Arg::Value(Value::Map(entries)) => {
-                            Some(value_to_json(&Value::Map(entries.clone())))
-                        }
-                        _ => None,
-                    })
-                    .next()
+                &bodies
+                    .first()
+                    .map(|entries| value_to_json(&Value::Map((*entries).clone())))
                     .unwrap_or(Json::Null),
             )
             .unwrap_or_default();
@@ -1114,7 +1317,42 @@ impl Provider for HttpTool {
 /// A newline or NUL ends the line outright.
 const SHELL_METACHARACTERS: &[char] = &[
     '&', '|', '<', '>', '^', '(', ')', ';', '"', '\'', '$', '`', '%', '\n', '\r', '\u{0}',
+    // Globs, braces, tilde and the comment character are expansion syntax too:
+    // `echo /*` lists the filesystem through a prefix grant (round 3, #4).
+    '*', '?', '[', ']', '{', '}', '~', '#', '!',
 ];
+
+/// RFC 9110 token characters, the only bytes legal in a request method.
+fn is_http_token(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+    )
+}
+
+/// Whether any argument carries a secret marker.
+fn args_contain_secret(args: &[Arg]) -> bool {
+    args.iter().any(|arg| match arg {
+        Arg::Value(value) => value.is_tainted(),
+        Arg::Promise(_) | Arg::Cap(_) => false,
+    })
+}
 
 /// End a child's whole process tree and reap the leader.
 ///
@@ -1311,6 +1549,11 @@ impl Provider for LocalProcess {
 
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
         self.calls += 1;
+        if !call.payload.is_empty() {
+            return Err(Error::InvalidArgument(
+                "the process adapter does not accept an envelope payload",
+            ));
+        }
         if call.method != "run" {
             return Err(Error::MethodNotGranted {
                 method: call.method.clone(),
