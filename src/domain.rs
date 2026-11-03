@@ -236,6 +236,16 @@ impl ModuleProvider {
                 }
                 .map_err(|error| match &error {
                     active_infinity::Error::Evaluation(code) => Error::Domain(code),
+                    // A resource ceiling the evaluator hit is this provider's
+                    // budget refusal, not a payload fault: a caller branches on
+                    // the two differently (round 16, #1).
+                    active_infinity::Error::Limit { kind, .. } => {
+                        // The variants name the ceiling; the provider's own
+                        // vocabulary is a closed set, so an evaluator ceiling is
+                        // the value budget.
+                        let _ = kind;
+                        Error::BudgetExceeded("value")
+                    }
                     other => Error::Payload(other.code().to_string()),
                 })?;
                 // The conversion recurses; a result deeper than the wire can
@@ -1192,8 +1202,16 @@ fn structural_resolve(module: &InfinityModule, path: &str) -> Option<NodeId> {
         // a single-segment path and refused a legal nested name
         // (round 14 H2/M1, round 15 #1).
         let mut node = current;
-        while let Some(Inode::Semantic { inner, .. }) = module.get(node) {
-            node = *inner;
+        // Bounded: a hand-built `Semantic { inner: self }` would otherwise hang
+        // the scope check (round 16, #2).
+        for _ in 0..module.node_count().max(1) {
+            match module.get(node) {
+                Some(Inode::Semantic { inner, .. }) => node = *inner,
+                _ => break,
+            }
+            if node == current {
+                return None;
+            }
         }
         current = match module.get(node)? {
             Inode::Table { fields } => fields

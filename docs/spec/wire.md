@@ -212,11 +212,14 @@ session:
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |
 | `mcp/desync` | more than `MAX_MCP_NOTIFICATIONS` notification frames arrived for one request, or the session was already poisoned |
 | `mcp/initialize` | the server answered `initialize` with an error |
-| `mcp/tool-name` | an advertised tool name is not `[A-Za-z0-9_.-]{1,128}`, or two tools share a name |
+| `mcp/tool-name` | an advertised tool name is absent or empty, is not `[A-Za-z0-9_.-]{1,128}`, or two tools share a name |
+| `mcp/tools` | the handshake result carries no `tools` array |
 | `mcp/tool-count` | the server advertised more than `MAX_MCP_TOOLS` (4 096) tools |
 | `mcp/spawn:<err>` | the child process could not be started |
 | `mcp/cwd` | the working directory could not be pinned |
 | `mcp/read:<err>`, `mcp/write:<err>`, `mcp/stdin`, `mcp/stdout` | transport I/O failed |
+| `mcp/write:closed` | the server closed its input while a line was being sent |
+| `mcp/thread:<err>` | a reader or writer thread could not start |
 | `mcp/<code>` | the server returned a JSON-RPC error; `<code>` is its numeric code |
 
 A tool name is validated because it becomes an allow-list entry and a method
@@ -243,7 +246,9 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/connect` | no address accepted the connection inside the ceiling |
 | `http/status` | the status line is not `HTTP/1.x` with a numeric code |
 | `http/interim` | a 1xx interim response arrived; the adapter does not follow it |
-| `http/headers` | the header block exceeded 64 KiB or 128 fields, or a `content-length` was repeated or unparsable |
+| `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared |
+| `http/header-not-utf8` | a header line is not UTF-8 |
+| `http/body-too-large` | the response body exceeded `max_body` |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>`, `http/body:<err>` | socket I/O failed |

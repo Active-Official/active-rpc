@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-15: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 + 5 + 5 + 6 findings; round-15 fixes green, confirmation round pending | 92 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-8: 15 + 16 + 9 + 6 + 6 + 2 + 2 + 9 findings; round-8 fixes green, confirmation round pending | 60 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-16: 12 + 8 + 9 + 8 + 1 + 4 + 4 + 7 + 7 + 9 + 5 + 6 + 5 + 5 + 6 + 4 findings; round-16 fixes green, confirmation round pending | 96 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-9: 15 + 16 + 9 + 6 + 6 + 2 + 2 + 9 + 8 findings; round-9 fixes green, confirmation round pending | 68 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,43 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 16)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `7aff2d2`. All six round-15
+fixes verified; two mediums and two lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | an evaluator resource ceiling surfaced as `rpc/payload` instead of `rpc/budget-exceeded` | **fixed**: a `Limit` from the engine is the provider's value budget |
+| 2 | medium | the semantic unwrap loop was unbounded: a hand-built `Semantic { inner: self }` would hang the scope check | **fixed**: bounded by the node count with a self-reference guard |
+| 3 | low | `DurationMs(u64)` cast to `i64` wrapped negative | **fixed**: saturated |
+| 4 | low | a path or method with a newline or bidi override reached `Display` verbatim (log forging) | **fixed**: caller text is escaped in `Display` (`PathNotGranted`, `TopicNotGranted`, `MethodNotGranted`) |
+
+Gate: 88 suites / 856 tests all-features and no-default-features, clippy/fmt/doc
+clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 9)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `7aff2d2`.
+All round-8 fixes held; three mediums and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `path_scope` was silently inert on the text-only adapters: the kernel inspects `Value::Path`, and a process/MCP argument is text | **fixed**: both refuse a scoped call with `rpc/tool-policy`; `a_scoped_process_or_mcp_call_is_refused` |
+| 2 | medium | the advertised `max_arg_bytes` was the frame size, while JSON escaping is up to six-fold | **fixed**: the cap is a sixth of the frame/request minus the envelope; `the_advertised_cap_leaves_escaping_room` |
+| 3 | medium | a whitespace-only line ended the header block, so a field written after it became payload | **fixed**: only an empty line ends the block; a folded line is `http/headers`; `a_whitespace_only_line_does_not_end_the_headers` |
+| 4 | low | `max_output as u64 + 1` overflowed on a caller-set `usize::MAX` | **fixed**: saturating |
+| 5 | low | a failed helper-thread spawn leaked the child process | **fixed**: the tree is killed before the error returns |
+| 6 | low | two handshake ceilings and the spec named the unused one | **fixed**: one 5 s constant; the spec names it |
+| 7 | low | a NUL in a program path or workdir surfaced as a spawn fault | **fixed**: `pin_program` refuses it at construction |
+| 8 | low | the provider error-code table was out of step with the code | **fixed**: `mcp/tools`, `mcp/thread`, `mcp/write:closed`, `http/header-not-utf8`, `http/body-too-large` documented; `http/body:<err>` removed; the header conditions named |
+
+Also observed: `has_method_does_not_rebuild_the_method_table` flaked once under
+build load (2 000 lookups over 4 096 tools in <300 ms) and passed on rerun and in
+isolation.
+
+Gate: as above (the same commit).
 
 ### R-07 domain operations - 2026-11-03 (round 15)
 

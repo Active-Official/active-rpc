@@ -190,15 +190,44 @@ pub const ERROR_CODES: &[&str] = &[
     "rpc/wire",
 ];
 
+/// Escape a caller-supplied string for one log line.
+///
+/// A method, path or topic reaches `Display`; a newline or a bidi override in
+/// one would forge a log line or reorder it when read (round 16, #4).
+fn escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control()
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c) =>
+            {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::UnknownCapability(id) => write!(f, "unknown capability {id}"),
-            Error::MethodNotGranted { method } => write!(f, "method {method} is not granted"),
+            Error::MethodNotGranted { method } => {
+                write!(f, "method {} is not granted", escaped(method))
+            }
             Error::Escalation(what) => write!(f, "attenuation would widen authority: {what}"),
             Error::ReadOnly => write!(f, "capability is read-only"),
-            Error::PathNotGranted(path) => write!(f, "path {path} is outside the capability"),
-            Error::TopicNotGranted(topic) => write!(f, "topic {topic} is outside the capability"),
+            Error::PathNotGranted(path) => {
+                write!(f, "path {} is outside the capability", escaped(path))
+            }
+            Error::TopicNotGranted(topic) => {
+                write!(f, "topic {} is outside the capability", escaped(topic))
+            }
             Error::ToolPolicy(what) => write!(f, "tool policy rejects the call: {what}"),
             Error::Revoked(id) => write!(f, "capability {id} is revoked"),
             Error::BudgetExceeded(kind) => write!(f, "{kind} budget exhausted"),

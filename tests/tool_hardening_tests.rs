@@ -1154,3 +1154,105 @@ fn a_nul_in_an_mcp_spawn_is_refused() {
     };
     assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 9
+// ---------------------------------------------------------------------------
+
+/// A text-only adapter cannot enforce a path scope (round 9, F-1).
+#[test]
+fn a_scoped_process_or_mcp_call_is_refused() {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\cmd.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    let mut call = Call::new("run", Vec::new());
+    call.tool_allows_process = true;
+    call.path_scope = Some("srv/allowed".to_string());
+    let error = tool.invoke(0, &call).expect_err("a scope is inert here");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
+    let mut call = Call::new("echo", Vec::new());
+    call.tool_allows_process = true;
+    call.path_scope = Some("srv".to_string());
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("a scope is inert here");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// A whitespace-only line is obsolete folding, not the end of the header block
+/// (round 9, F-3).
+#[test]
+fn a_whitespace_only_line_does_not_end_the_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let Ok((mut socket, _)) = listener.accept() else {
+            return;
+        };
+        let mut scratch = [0u8; 4096];
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .ok();
+        let _ = socket.read(&mut scratch);
+        let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nx: 1\r\n \r\ncontent-length: 5\r\n\r\nhello");
+        let _ = socket.flush();
+    });
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/x")]);
+    let mut call = http_get("/x", 1_000);
+    call.tool_allows_process = true;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a folded line is a framing fault");
+    assert_eq!(error.provider_code(), Some("http/headers"), "{error}");
+}
+
+/// A NUL in a program path is a construction refusal for both adapters
+/// (round 9, F-7).
+#[test]
+fn a_nul_program_is_refused() {
+    let error = LocalProcess::new("C:\\a\0b.exe", &[]).expect_err("a NUL program");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// The advertised argument cap is a deliverable wire size, not a frame size
+/// (round 9, F-2).
+#[test]
+fn the_advertised_cap_leaves_escaping_room() {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
+    let policy = session.policy();
+    assert!(
+        policy.max_arg_bytes <= (active_rpc::tool::MAX_MCP_LINE_BYTES as u64) / 6,
+        "the cap must survive JSON escaping: {}",
+        policy.max_arg_bytes
+    );
+}

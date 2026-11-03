@@ -158,7 +158,7 @@ pub trait McpTransport {
 }
 
 /// Default ceiling for a handshake that names none.
-const DEFAULT_HANDSHAKE_MS: u64 = 10_000;
+const DEFAULT_HANDSHAKE_MS: u64 = 5_000;
 
 /// Lines the reader thread may hold while the session is busy.
 ///
@@ -616,8 +616,13 @@ impl StdioTransport {
                     }
                 }
             })
-            .map_err(|error| Error::Provider {
-                code: format!("mcp/thread:{error}"),
+            .map_err(|error| {
+                // `Child`'s Drop neither kills nor reaps: the server would
+                // outlive the error return (round 9, F-5).
+                kill_process_tree(&mut child);
+                Error::Provider {
+                    code: format!("mcp/thread:{error}"),
+                }
             })?;
         // The writer runs on its own thread for the same reason the reader
         // does: a server that stops reading fills the pipe and a blocking write
@@ -1003,7 +1008,10 @@ impl<T: McpTransport> McpSession<T> {
         }
         // A frame ceiling minus the JSON envelope: an argument exactly at the
         // advertised size would be refused after being charged (round 8, F9).
-        policy.max_arg_bytes = (MAX_MCP_LINE_BYTES as u64).saturating_sub(256);
+        // A JSON frame escapes a control character six-fold, so the
+        // deliverable size is a sixth of the frame minus the envelope
+        // (round 9, F-2).
+        policy.max_arg_bytes = (MAX_MCP_LINE_BYTES as u64 / 6).saturating_sub(256);
         policy
     }
 }
@@ -1046,6 +1054,13 @@ impl<T: McpTransport> Provider for McpSession<T> {
         if args_contain_secret(&call.args) {
             return Err(Error::ToolPolicy(
                 "a secret argument cannot be sent to an external peer",
+            ));
+        }
+        if call.path_scope.is_some() {
+            // JSON arguments are not `Value::Path`: the kernel cannot check
+            // them, so a scope here would be inert (round 9, F-1).
+            return Err(Error::ToolPolicy(
+                "this adapter cannot enforce a path scope",
             ));
         }
         let tool = self
@@ -1154,8 +1169,8 @@ impl HttpTool {
                 .iter()
                 .map(|method| method.to_string())
                 .collect(),
-            // The serialised body adds keys, quotes and escaping.
-            max_arg_bytes: (self.max_request as u64).saturating_sub(256),
+            // The serialised body adds keys, quotes and up to six-fold escaping.
+            max_arg_bytes: (self.max_request as u64 / 6).saturating_sub(256),
             allow_process: false,
         }
     }
@@ -1288,8 +1303,16 @@ impl HttpTool {
         let mut fields = 0usize;
         loop {
             let line = reader.line(MAX_HTTP_HEADER_LINE)?;
-            if line.trim().is_empty() {
+            if line == "\r\n" || line == "\n" {
                 break;
+            }
+            if line.trim().is_empty() {
+                // A whitespace-only line is obsolete line folding, not the end
+                // of the block: accepting it let a field written after it reach
+                // the caller as body (round 9, F-3).
+                return Err(Error::Provider {
+                    code: "http/headers".to_string(),
+                });
             }
             header_bytes = header_bytes.saturating_add(line.len());
             fields += 1;
@@ -1682,6 +1705,11 @@ fn kill_process_tree(child: &mut Child) {
 /// exec. A path that does not exist yet keeps its absolute form and fails at
 /// spawn with the operating system's own error.
 fn pin_program(program: &str, refusal: &'static str) -> Result<PathBuf> {
+    // A NUL never reaches an exec, and `canonicalize` would fail into a raw
+    // path and a spawn-time provider fault (round 9, F-7).
+    if program.contains('\0') {
+        return Err(Error::InvalidArgument("a program path contains a NUL byte"));
+    }
     if !Path::new(program).is_absolute() {
         return Err(Error::InvalidArgument(refusal));
     }
@@ -1874,6 +1902,14 @@ impl Provider for LocalProcess {
         if !call.tool_allows_process {
             return Err(Error::ToolPolicy("process execution not granted"));
         }
+        if call.path_scope.is_some() {
+            // Every process argument is text and the kernel only inspects
+            // `Value::Path`: a scope attached here would read as confinement
+            // while enforcing nothing (round 9, F-1). Fail closed.
+            return Err(Error::ToolPolicy(
+                "this adapter cannot enforce a path scope",
+            ));
+        }
         // The fields are public, so the pinning is checked again here: a caller
         // that assigned a relative directory would have it resolved against the
         // process's current directory, which is what `with_current_dir`
@@ -1918,7 +1954,7 @@ impl Provider for LocalProcess {
         // descendant that inherited the pipe keeps it open after the child
         // exits, and joining a thread that is blocked in `read_to_end` would
         // exceed the wall ceiling without any way to interrupt it.
-        let ceiling = self.max_output as u64 + 1;
+        let ceiling = (self.max_output as u64).saturating_add(1);
         // `(stream, bytes)`: 1 is stdout and 2 is stderr. Two threads sharing
         // one channel report in completion order, and a child that writes both
         // pipes quickly would otherwise have its streams swapped.
