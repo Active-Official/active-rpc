@@ -570,6 +570,20 @@ impl Provider for WasmTool {
                 "the wasm adapter reads its input from a single argument, not a payload",
             ));
         }
+        // Budget refusals come before any policy or argument rule, as in the
+        // other adapters: a zero wall or byte grant does no work, and a scope
+        // or a malformed argument must not mask it (round 26, #5; round 28,
+        // #4 put this above the policy checks).
+        let granted = call.budget.max_wall_ms.saturating_mul(FUEL_PER_MS);
+        let fuel = self.limits.fuel.min(granted);
+        if fuel == 0 {
+            return Err(Error::BudgetExceeded("wall"));
+        }
+        if call.budget.max_bytes == 0 {
+            // An empty answer still costs a run; a zero-byte grant does no
+            // work (round 22, F-B).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         if call.path_scope.is_some() {
             // The input is bytes and the kernel inspects only `Value::Path`: a
             // scope attached here would read as confinement while enforcing
@@ -583,19 +597,6 @@ impl Provider for WasmTool {
             // not granted; the text adapters report it the same way
             // (round 21, F5).
             return Err(Error::ToolPolicy("a secret is not a wasm argument"));
-        }
-        // Budget refusals come before any argument rule, as in the other
-        // adapters: a zero wall or byte grant does no work, and a malformed
-        // argument must not mask it (round 26, #5).
-        let granted = call.budget.max_wall_ms.saturating_mul(FUEL_PER_MS);
-        let fuel = self.limits.fuel.min(granted);
-        if fuel == 0 {
-            return Err(Error::BudgetExceeded("wall"));
-        }
-        if call.budget.max_bytes == 0 {
-            // An empty answer still costs a run; a zero-byte grant does no
-            // work (round 22, F-B).
-            return Err(Error::BudgetExceeded("byte"));
         }
         // Borrow the argument first: the byte grant bounds the input, and the
         // copy must happen only after every check (round 24, #5).
@@ -647,11 +648,16 @@ impl Provider for WasmTool {
         let share = grant.saturating_sub(input.len());
         let output_grant_bound = limits.max_output_bytes > share;
         limits.max_output_bytes = limits.max_output_bytes.min(share);
+        // The guest log is provider-side state that the host buffers, so the
+        // grant bounds it too: a one-byte grant used to buy a 64 KiB log
+        // (round 28, #3).
+        let mut host = self.host;
+        host.max_log_bytes = host.max_log_bytes.min(share);
         let mut tool = WasmTool {
             engine: self.engine.clone(),
             module: self.module.clone(),
             limits,
-            host: self.host,
+            host,
             log: Vec::new(),
             now_ms: call.now_ms,
         };

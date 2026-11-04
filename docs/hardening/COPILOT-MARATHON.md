@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-34: round 34 found 3 mediums and 5 lows, all fixed or documented; rounds 35-36 must be clean | 205 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-27: round 27 found 2 mediums and 4 lows, all fixed; rounds 28-29 must be clean | 214 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-28: round 28 found 2 highs, 2 mediums and 1 low, all fixed; rounds 29-30 must be clean | 218 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -385,6 +385,22 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 28)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `761964f`. All six round-27
+dispositions verified. Two **highs**, two mediums, one low.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the ambiguous-path refusal missed a single `.` segment | **fixed**: `.` and `..` are both refused; the test list includes `/safe/./secret` |
+| 2 | high | the MCP *answer* path checked the static ceiling before the grant, so a peer-chosen 2 MiB line under a 512 KiB grant poisoned a session that only lacked budget | **fixed**: the grant is checked first when it is tighter, and a grant refusal does not poison; a line past only the static ceiling still does. The request path uses the same rule, so `mcp_hardening_tests` keeps its `line-too-long` cases |
+| 3 | medium | the guest log is host state the grant never bounded: a one-byte grant bought a 64 KiB log | **fixed**: `max_log_bytes` is intersected with the grant share |
+| 4 | medium | the wasm grant checks sat after the scope and secret checks, contradicting the other adapters | **fixed**: the wall/byte refusals precede every policy rule; `a_zero_wall_grant_precedes_the_wasm_policy_checks` |
+| 5 | low | nine length prefixes still cast `usize` to `u32`, which wraps past 4 GiB | **fixed**: one `put_len` helper refuses with `rpc/wire` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 27)
 

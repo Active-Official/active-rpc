@@ -1208,14 +1208,14 @@ impl<T: McpTransport> McpSession<T> {
             "params": params,
         });
         let line = payload.to_string();
-        if line.len() > max_line {
-            // The grant comes first: a request past both ceilings is a budget
+        if max_line < MAX_MCP_LINE_BYTES && line.len() > max_line {
+            // The grant is the tighter bound: a request past it is a budget
             // exhaustion (round 26, #4).
             return Err(Error::BudgetExceeded("byte"));
         }
         if line.len() > MAX_MCP_LINE_BYTES {
-            // Past the static ceiling but inside the grant: no budget can make
-            // this line legal, so it is a bad argument (round 27, #1).
+            // Past the static ceiling: no budget can make this line legal, so
+            // it is a bad argument (round 27, #1).
             return Err(Error::InvalidArgument(
                 "the MCP request exceeds the line ceiling",
             ));
@@ -1249,17 +1249,20 @@ impl<T: McpTransport> McpSession<T> {
                     return Err(error);
                 }
             };
+            if max_line < MAX_MCP_LINE_BYTES && line.len() > max_line {
+                // The capability's byte grant bounds what this call may buffer,
+                // not only what it may return (round 19, M2). The line was
+                // consumed, so the session stays in step, and a grant refusal
+                // does not poison it (round 28, #2).
+                return Err(Error::BudgetExceeded("byte"));
+            }
             if line.len() > MAX_MCP_LINE_BYTES {
+                // Past the static ceiling: the peer wrote a line no budget can
+                // legalise, so the session is desynced.
                 self.poisoned = true;
                 return Err(Error::Provider {
                     code: "mcp/line-too-long".to_string(),
                 });
-            }
-            if line.len() > max_line {
-                // The capability's byte grant bounds what this call may buffer,
-                // not only what it may return (round 19, M2). The line was
-                // consumed, so the session stays in step.
-                return Err(Error::BudgetExceeded("byte"));
             }
             let response: Json = match serde_json::from_str(&line) {
                 // A number the decoder rounded or an overflowing float is not
@@ -2028,7 +2031,9 @@ impl Provider for HttpTool {
             || path.contains('?')
             || path.contains('#')
             || path.contains("//")
-            || path.split('/').any(|segment| segment == "..");
+            || path
+                .split('/')
+                .any(|segment| segment == ".." || segment == ".");
         if ambiguous {
             return Err(Error::ToolPolicy(
                 "a path with a dot segment, escape, query or fragment is refused",

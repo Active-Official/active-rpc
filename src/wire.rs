@@ -299,6 +299,16 @@ impl WireLimits {
     }
 }
 
+/// Write a length prefix, refusing a value the wire cannot carry.
+///
+/// Every length in this format is a `u32`; a cast wrapped past 4 GiB instead
+/// of refusing, which breaks the re-encode-stability rule (round 28, #5).
+fn put_len(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    let len = u32::try_from(len).map_err(|_| Error::Wire("length exceeds the wire"))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
 impl Envelope {
     /// A request envelope.
     pub fn request(request_id: u64, method: impl Into<String>, args: Vec<Arg>) -> Self {
@@ -411,26 +421,26 @@ impl Envelope {
         if self.args.len() > u32::MAX as usize {
             return Err(Error::Wire("too many arguments"));
         }
-        out.extend_from_slice(&(self.args.len() as u32).to_le_bytes());
+        put_len(&mut out, self.args.len())?;
         for arg in &self.args {
             write_arg(&mut out, arg)?;
         }
         if self.payload.len() > u32::MAX as usize {
             return Err(Error::Wire("payload too large"));
         }
-        out.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        put_len(&mut out, self.payload.len())?;
         out.extend_from_slice(&self.payload);
-        out.extend_from_slice(&(self.caps.len() as u32).to_le_bytes());
+        put_len(&mut out, self.caps.len())?;
         for cap in &self.caps {
             write_cap(&mut out, cap)?;
         }
         if let Some(delta) = &self.cap_delta {
             out.extend_from_slice(&delta.base);
-            out.extend_from_slice(&(delta.removed.len() as u32).to_le_bytes());
+            put_len(&mut out, delta.removed.len())?;
             for id in &delta.removed {
                 out.extend_from_slice(&id.0);
             }
-            out.extend_from_slice(&(delta.added.len() as u32).to_le_bytes());
+            put_len(&mut out, delta.added.len())?;
             for cap in &delta.added {
                 write_cap(&mut out, cap)?;
             }
@@ -573,7 +583,7 @@ fn write_str(out: &mut Vec<u8>, text: &str) -> Result<()> {
     if text.len() > u32::MAX as usize {
         return Err(Error::Wire("string too large"));
     }
-    out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+    put_len(out, text.len())?;
     out.extend_from_slice(text.as_bytes());
     Ok(())
 }
@@ -661,7 +671,7 @@ fn write_value_at(out: &mut Vec<u8>, value: &Value, depth: usize) -> Result<()> 
         Value::Secret => out.push(7),
         Value::Module(bytes) => {
             out.push(8);
-            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            put_len(out, bytes.len())?;
             out.extend_from_slice(bytes);
         }
         Value::Path(path) => {
@@ -674,7 +684,7 @@ fn write_value_at(out: &mut Vec<u8>, value: &Value, depth: usize) -> Result<()> 
 
 fn write_cap(out: &mut Vec<u8>, cap: &CapDescriptor) -> Result<()> {
     out.extend_from_slice(&cap.id.0);
-    out.extend_from_slice(&(cap.methods.len() as u32).to_le_bytes());
+    put_len(out, cap.methods.len())?;
     for method in &cap.methods {
         write_str(out, method)?;
     }
@@ -1050,7 +1060,7 @@ pub fn decode_capability_table_with(
 /// Encode a capability table on its own.
 pub fn encode_capability_table(caps: &[CapDescriptor]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(caps.len() as u32).to_le_bytes());
+    put_len(&mut out, caps.len())?;
     for cap in caps {
         write_cap(&mut out, cap)?;
     }

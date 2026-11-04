@@ -448,3 +448,20 @@ fn a_zero_wall_grant_precedes_the_argument_rules() {
         active_rpc::kernel::Provider::invoke(&mut tool, 0, &call).expect_err("a zero wall grant");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
+
+/// A zero wall budget is refused before the scope or secret checks: the grant
+/// is the first authority, as in the other adapters (round 28, #4).
+#[test]
+fn a_zero_wall_grant_precedes_the_wasm_policy_checks() {
+    let mut tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
+    let mut call = Call::new("run", vec![Arg::value(Value::Secret)]);
+    call.tool_allows_process = true;
+    call.path_scope = Some("app".to_string());
+    call.budget = Budget {
+        max_wall_ms: 0,
+        ..Budget::default()
+    };
+    let error =
+        active_rpc::kernel::Provider::invoke(&mut tool, 0, &call).expect_err("a zero wall grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}

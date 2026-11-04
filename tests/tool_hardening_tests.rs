@@ -2311,6 +2311,7 @@ fn a_missing_process_grant_precedes_the_argument_allowlist() {
 fn an_ambiguous_http_path_is_refused() {
     for path in [
         "/safe/../secret",
+        "/safe/./secret",
         "/a%2fb",
         "/a//b",
         "/safe?x=1",

@@ -221,8 +221,10 @@ evaluator failed, and `rpc/budget-exceeded` with the dimension it measured
 
 An `McpSession` reports adapter failures as `rpc/provider` with one of these
 inner codes. Every one is a fail-closed refusal; none is retryable without a new
-session. The capability's byte grant is checked before the static 1 MiB line
-ceiling, so a request past both is a budget refusal.
+session. The byte grant is checked first when it is the tighter bound, so a line
+past the grant is `rpc/budget-exceeded` and does not poison the session; a line
+past only the static 1 MiB ceiling is `rpc/invalid-argument` (a request) or
+`mcp/line-too-long` (an answer, which poisons the session).
 
 | Code | Condition |
 |------|-----------|
