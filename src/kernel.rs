@@ -1163,6 +1163,15 @@ impl Agent {
                 "the record was already exported and consumed",
             ));
         }
+        if kernel.restored_records.contains(&record.record_id) {
+            // A restored capability carries the record id it came from. Sealing
+            // it again would mint a second artifact under one credential id,
+            // visible only to a deployment with a shared `RecordStore`
+            // (round 42, F5).
+            return Err(Error::persistence(
+                "the record was already restored; export the new grant instead",
+            ));
+        }
         if kernel.revoked_records.contains(&record.record_id) {
             // A restarted kernel with the same secret re-issues serials, so a
             // fresh capability can carry an id a replayed kill list already
@@ -1663,9 +1672,9 @@ impl Agent {
                 .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
             (
                 record.revoked,
-                record
-                    .expires_at
-                    .is_some_and(|expires_at| kernel.now_ms >= expires_at),
+                record.expires_at.is_some_and(|expires_at| {
+                    kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+                }),
                 record.attrs.bound_to,
             )
         };
@@ -1693,11 +1702,7 @@ impl Agent {
                 // A revoked or expired record is dead authority: its binding is
                 // history, and letting it block the introduction would make a
                 // dead child permanent denial of service on a live capability.
-                if child.revoked
-                    || child
-                        .expires_at
-                        .is_some_and(|expires_at| kernel.now_ms >= expires_at)
-                {
+                if child.revoked || is_expired(&kernel, child) {
                     continue;
                 }
                 if let Some(bound) = child.attrs.bound_to {
@@ -1731,10 +1736,14 @@ impl Agent {
     /// rotated successor certificate.
     ///
     /// A fingerprint is the whole DER, so a leaf renewal invalidated every
-    /// binding at once (audit AR-04). The caller proves it holds the old peer
-    /// — it presents the `PeerIdentity` whose fingerprint matches the current
-    /// binding — and names the new admitted peer. Authority does not change:
-    /// the same records, budgets, expiry and policy move to the new binding.
+    /// binding at once (audit AR-04). The caller owns the handle and presents
+    /// the binding's fingerprint: this is knowledge of the fingerprint
+    /// (`PeerIdentity::from_certificate` is public), not a proof that the old
+    /// peer agreed. The move is owner-scoped, so a third party gains nothing;
+    /// an operator that needs the stronger guarantee takes the new peer's
+    /// consent out of band. The caller names the new admitted peer, and
+    /// authority does not change: the same records, budgets, expiry and policy
+    /// move to the new binding.
     pub fn reintroduce_to(
         &self,
         cap: &CapHandle,
@@ -1762,9 +1771,9 @@ impl Agent {
                 .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
             (
                 record.revoked,
-                record
-                    .expires_at
-                    .is_some_and(|expires_at| kernel.now_ms >= expires_at),
+                record.expires_at.is_some_and(|expires_at| {
+                    kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+                }),
                 record.attrs.bound_to,
             )
         };
@@ -1783,11 +1792,7 @@ impl Agent {
         let subtree = descendants_of(&kernel.children, cap.id());
         for id in &subtree {
             if let Some(child) = kernel.caps.get(id) {
-                if child.revoked
-                    || child
-                        .expires_at
-                        .is_some_and(|expires_at| kernel.now_ms >= expires_at)
-                {
+                if child.revoked || is_expired(&kernel, child) {
                     continue;
                 }
                 // A descendant bound to a different peer is somebody else's
@@ -1810,17 +1815,13 @@ impl Agent {
         // reports a refusal must leave the subtree bound to the old peer
         // (round 40, R-07-1).
         let in_subtree: Vec<CapId> = std::iter::once(cap.id()).chain(subtree).collect();
-        let mut records: Vec<[u8; 32]> = in_subtree
-            .iter()
-            .filter_map(|id| kernel.caps.get(id).map(|record| record.record_id))
-            .filter(|record_id| kernel.record_pins.contains_key(record_id))
-            .collect();
+        // A rotation to the peer that already holds the binding removes
+        // nothing, so it must tombstone nothing: collecting outside this guard
+        // destroyed the subtree's own restorable records (round 42, F3). Every
+        // exported capability is bound, and the lineage selector below covers
+        // the whole subtree, including a capability whose handle is gone.
+        let mut records: Vec<[u8; 32]> = Vec::new();
         if from_fingerprint != to_fingerprint {
-            // Only records whose exporting capability, or one of its
-            // ancestors, is in the rotated subtree: a sibling capability bound
-            // to the same peer is not this rotation's authority, and retiring
-            // its record stranded a capability the new peer could not use
-            // either (round 41, F2).
             let rotated: std::collections::BTreeSet<CapId> = in_subtree.iter().copied().collect();
             records.extend(kernel.record_pins.iter().filter_map(|(record_id, pin)| {
                 let inside = rotated.contains(&pin.cap)
@@ -1888,10 +1889,10 @@ impl Agent {
         if record.revoked {
             return Err(Error::Revoked(cap_token(parent_id)));
         }
-        if record
-            .expires_at
-            .is_some_and(|expires_at| kernel.now_ms >= expires_at)
-        {
+        if record.wall_clock == kernel.wall_clock && is_expired(&kernel, &record) {
+            // Only a deadline this clock can read is "expired"; a deadline from
+            // the other domain is the dedicated refusal below, which names the
+            // mismatch instead of reporting a revocation (round 42, F4).
             kernel.push_event(Event::CapExpired(parent_id));
             return Err(Error::Revoked(cap_token(parent_id)));
         }
@@ -2426,10 +2427,9 @@ impl Agent {
             if record.revoked {
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
-            if record
-                .expires_at
-                .is_some_and(|expires_at| kernel.now_ms >= expires_at)
-            {
+            if record.expires_at.is_some_and(|expires_at| {
+                kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+            }) {
                 kernel.push_event(Event::CapExpired(cap.id()));
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
@@ -2577,10 +2577,9 @@ impl Agent {
         if record.revoked {
             return Err(Error::Revoked(cap_token(cap.id())));
         }
-        if record
-            .expires_at
-            .is_some_and(|expires_at| kernel.now_ms >= expires_at)
-        {
+        if record.expires_at.is_some_and(|expires_at| {
+            kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+        }) {
             kernel.push_event(Event::CapExpired(cap.id()));
             return Err(Error::Revoked(cap_token(cap.id())));
         }
@@ -2962,10 +2961,9 @@ impl Agent {
         if record.revoked {
             return Err(Error::Revoked(cap_token(cap_id)));
         }
-        if record
-            .expires_at
-            .is_some_and(|expires_at| kernel.now_ms >= expires_at)
-        {
+        if record.expires_at.is_some_and(|expires_at| {
+            kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+        }) {
             // An expired capability is refused exactly like a revoked one. The
             // event lets an operator see the difference.
             kernel.push_event(Event::CapExpired(cap_id));
@@ -3354,9 +3352,9 @@ impl Agent {
             let lane_budget = match kernel.caps.get(&job.cap) {
                 Some(record) if record.revoked => return Err(Error::Revoked(cap_token(job.cap))),
                 Some(record)
-                    if record
-                        .expires_at
-                        .is_some_and(|expires_at| kernel.now_ms >= expires_at) =>
+                    if record.expires_at.is_some_and(|expires_at| {
+                        kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+                    }) =>
                 {
                     return Err(Error::Revoked(cap_token(job.cap)))
                 }
@@ -3814,10 +3812,9 @@ impl Agent {
                         Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
                         return Err(error);
                     }
-                    if record
-                        .expires_at
-                        .is_some_and(|expires_at| kernel.now_ms >= expires_at)
-                    {
+                    if record.expires_at.is_some_and(|expires_at| {
+                        kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+                    }) {
                         kernel.push_event(Event::CapExpired(cap.id()));
                         let error = Error::Revoked(cap_token(cap.id()));
                         Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
@@ -4716,10 +4713,9 @@ impl Agent {
                     None => Some(Error::UnknownCapability(cap_token(job.cap))),
                     Some(record) if record.revoked => Some(Error::Revoked(cap_token(record.id))),
                     Some(record) => {
-                        if record
-                            .expires_at
-                            .is_some_and(|expires_at| kernel.now_ms >= expires_at)
-                        {
+                        if record.expires_at.is_some_and(|expires_at| {
+                            kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+                        }) {
                             expired = true;
                             Some(Error::Revoked(cap_token(record.id)))
                         } else {
@@ -5760,6 +5756,21 @@ fn budget_dimension(error: &Error) -> &'static str {
 
 fn pad128(id: CapId) -> [u8; 16] {
     id.0
+}
+
+/// True when a capability's deadline has passed, or when it cannot be read in
+/// this kernel's clock domain at all.
+///
+/// A deadline is an absolute number in the domain it was minted in. After a
+/// `use_wall_clock` switch, comparing it with the other clock either extends a
+/// lease by decades or truncates it to nothing; the virtual clock with
+/// `set_latency(0)` does not advance at all, so a wall-clock deadline became
+/// unbounded at dispatch even though export and restore refuse the same
+/// mismatch (round 42, F4).
+fn is_expired(kernel: &Kernel, record: &CapRecord) -> bool {
+    record.expires_at.is_some_and(|expires_at| {
+        kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
+    })
 }
 
 /// True when the durable grant budget is used up: every tombstone plus every

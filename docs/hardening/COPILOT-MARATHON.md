@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-41: round 41 found 2 mediums and 5 lows, all fixed; round 42 must be clean | 250 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-42: round 42 found 4 mediums, 2 lows and a doc fix, all fixed; rounds 43-44 must be clean | 257 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-35: round 35 found 2 mediums and 1 low, all fixed; rounds 36-37 must be clean | 256 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-8: round 8 found 1 medium and 4 lows, all fixed; round 9 must be clean | 78 fixed / 0 rejected / 0 open | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -474,6 +474,25 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-07 domain operations - 2026-11-04 (round 42)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
+`ff1d455`. Round-41 claims: five HOLD, one PARTIAL (nested record fields). Four
+mediums, two lows and one documentation fix.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `tool_policy.allowed` was parsed into a set with no order check, and unknown nested keys parsed, so two texts shared one record and one seal | **fixed**: `allowed` uses the canonical-list rule and `budget`/`tool_policy` refuse an unknown key; `a_record_with_a_nested_extra_or_a_reordered_allow_list_is_refused` |
+| 2 | medium | `encode_capability_table` emitted duplicate ids and tables past the descriptor ceiling that its own reader refused; the table ceiling and the per-envelope ceiling disagreed | **fixed**: one table ceiling (`MAX_CAP_TABLE`) on both sides plus the duplicate check; `a_table_encoder_refuses_duplicate_ids_and_an_over_count` |
+| 3 | medium | the subtree record selector sat outside the `from != to` guard, so rotating to the peer that already held the binding tombstoned the subtree's own records | **fixed**: nothing is collected when the fingerprints match; `a_rotation_to_the_same_peer_tombstones_nothing` |
+| 4 | medium | dispatch compared a deadline with `now_ms` without the clock-domain check that attenuate and restore apply, and `set_latency(0)` freezes the virtual clock, so a wall-clock deadline never expired | **fixed**: every expiry predicate includes `record.wall_clock != kernel.wall_clock`; `is_expired` is one helper, and attenuate keeps its dedicated mode-mismatch refusal; `a_wall_clock_deadline_does_not_survive_a_switch_to_virtual` |
+| 5 | low | a restored capability could be exported again, minting a second sealed record with the same credential id (visible across kernels) | **fixed**: export refuses a restored record id; `a_restored_capability_cannot_be_exported_again` |
+| 6 | low | `restrict` dropped a constraint annotation whose expression was outside the cone, shipping a subject without its rule | **fixed**: the projection refuses `annotation escaped the cone` |
+| 7 | doc | the rotation doc claimed the caller "proves it holds the old peer" | **fixed**: it says the owner presents the binding's fingerprint, which is knowledge, not possession |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Four new behavioural tests fail against the pre-fix tree.
 
 ### R-09 transports - 2026-11-04 (round 8)
 

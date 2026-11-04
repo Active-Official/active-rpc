@@ -140,6 +140,40 @@ const RECORD_KEYS: &[&str] = &[
     "seal",
 ];
 
+/// The fields a record's `budget` object may carry.
+const BUDGET_KEYS: &[&str] = &[
+    "calls",
+    "bytes",
+    "wall_ms",
+    "nodes",
+    "depth",
+    "array_len",
+    "value_size",
+];
+
+/// The fields a record's `tool_policy` object may carry.
+const TOOL_POLICY_KEYS: &[&str] = &["allowed", "max_arg_bytes", "allow_process"];
+
+/// Refuse a nested object key the format does not define.
+///
+/// The outer record map is checked; a nested extra key used to parse and seal,
+/// so the text had a meaning the writer never produces (round 42, F1).
+fn refuse_unknown_keys(
+    object: &serde_json::Map<String, Json>,
+    allowed: &[&str],
+    what: &'static str,
+) -> Result<()> {
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(Error::persistence(match what {
+                "budget" => "the record's budget has an unknown field",
+                _ => "the record's tool policy has an unknown field",
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a record whose text is not the canonical rendering of its value.
 ///
 /// The seal is computed over the parsed value, so the *text* must have exactly
@@ -389,6 +423,10 @@ impl CapabilityRecord {
             .get("budget")
             .and_then(Json::as_object)
             .ok_or_else(|| Error::persistence("missing budget"))?;
+        // A nested key this format does not define is a text no writer
+        // produces: the outer map is checked against `RECORD_KEYS`, and a
+        // nested extra used to ride along under a valid seal (round 42, F1).
+        refuse_unknown_keys(budget, BUDGET_KEYS, "budget")?;
         let number = |key: &str| -> Result<u64> {
             budget
                 .get(key)
@@ -453,22 +491,21 @@ impl CapabilityRecord {
         let tool_policy = match value.get("tool_policy") {
             None | Some(Json::Null) => None,
             Some(Json::Object(policy)) => {
-                let allowed = policy
-                    .get("allowed")
-                    .and_then(Json::as_array)
+                refuse_unknown_keys(policy, TOOL_POLICY_KEYS, "tool policy")?;
+                // The same canonical list rule as `methods` and `topics`: a
+                // reordered or duplicated allow-list used to parse into the
+                // same set, so a sealed text did not have one meaning
+                // (round 42, F1).
+                let policy_value = Json::Object(policy.clone());
+                let names = string_set(&policy_value, "allowed")?
                     .ok_or_else(|| Error::persistence("tool allow-list is missing"))?;
-                let mut names = BTreeSet::new();
-                for item in allowed {
-                    let name = item
-                        .as_str()
-                        .ok_or_else(|| Error::persistence("tool name is not a string"))?;
+                for name in &names {
                     if !crate::receipts::valid_method(name) {
                         // The mint refuses such a name with `rpc/invalid-argument`
                         // after the store claim is spent; a record is checked
                         // against the same rule here (round 38, F6).
                         return Err(Error::persistence("a record names a malformed tool"));
                     }
-                    names.insert(name.to_string());
                 }
                 Some(ToolPolicy {
                     allowed: names,

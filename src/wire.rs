@@ -1189,7 +1189,10 @@ pub fn decode_capability_table_with(
 ) -> Result<Vec<CapDescriptor>> {
     let mut cursor = 0usize;
     let count = read_u32(bytes, &mut cursor)?;
-    if count > limits.max_caps {
+    // A negotiated table is bounded by its own ceiling, not by the per-envelope
+    // descriptor ceiling: `MAX_CAP_TABLE` is what `apply_to` grows to, and the
+    // reader must accept a table the writer can produce (round 42, F2).
+    if count as usize > MAX_CAP_TABLE {
         return Err(Error::CapabilityTable("too many descriptors"));
     }
     let mut caps = Vec::with_capacity((count as usize).min(64));
@@ -1210,9 +1213,21 @@ pub fn decode_capability_table_with(
 /// Encode a capability table on its own.
 pub fn encode_capability_table(caps: &[CapDescriptor]) -> Result<Vec<u8>> {
     let limits = WireLimits::default();
+    // The reader refuses a table past its descriptor ceiling or with a
+    // repeated id, and a table this crate produced for a delta base or a
+    // side channel must be one a peer can read. The ceiling is the table's own
+    // (`MAX_CAP_TABLE`), the same one `apply_to` grows against; the
+    // per-envelope `max_caps` is checked by `check_limits` (round 42, F2).
+    if caps.len() > MAX_CAP_TABLE {
+        return Err(Error::CapabilityTable("too many descriptors"));
+    }
+    let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     put_len(&mut out, caps.len())?;
     for cap in caps {
+        if !seen.insert(cap.id.0) {
+            return Err(Error::CapabilityTable("duplicate capability id"));
+        }
         check_descriptor(cap, &limits)?;
         write_cap(&mut out, cap)?;
     }

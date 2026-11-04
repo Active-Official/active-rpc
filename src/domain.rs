@@ -2021,8 +2021,13 @@ fn restrict(module: &InfinityModule, node: NodeId) -> Result<InfinityModule> {
         let kind = match &annotation.kind {
             AnnotationKind::Intent(text) => AnnotationKind::Intent(text.clone()),
             AnnotationKind::Constraint { source, expr } => {
+                // The annotated node is in the cone but its expression is not:
+                // shipping the subject without its rule is a fail-open
+                // projection. `adjacency` follows the constraint edge, so this
+                // only happens for an arena whose mirror edge is missing
+                // (round 42, F6).
                 let Some(expr) = map.get(expr).copied() else {
-                    continue;
+                    return Err(Error::Payload("annotation escaped the cone".to_string()));
                 };
                 AnnotationKind::Constraint {
                     source: source.clone(),

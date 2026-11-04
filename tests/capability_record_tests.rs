@@ -877,3 +877,135 @@ fn a_record_with_a_coerced_field_or_an_unsorted_list_is_refused() {
         assert_eq!(error.code(), "rpc/persistence", "{error}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 42
+// ---------------------------------------------------------------------------
+
+/// A record's nested objects are part of its format: an extra key and a
+/// reordered allow-list are texts no writer produces, and both used to parse
+/// under a valid seal (round 42, F1).
+#[test]
+fn a_record_with_a_nested_extra_or_a_reordered_allow_list_is_refused() {
+    // Mint a capability with a tool policy so the record carries one.
+    let owner = admitted(b"durable-owner");
+    let with_policy = {
+        let agent = Agent::with_secret([0x71; 32]);
+        agent.set_durable_capabilities(true);
+        agent.set_record_seal_key([0x91; 32]);
+        let provider = agent.register(Box::new(Echo));
+        let mut attrs = CapAttrs::new(&["echo"]);
+        attrs.persistence = CapPersistence::Durable;
+        attrs.tool_policy = Some(active_rpc::cap::ToolPolicy {
+            allowed: ["echo".to_string(), "stats".to_string()]
+                .into_iter()
+                .collect(),
+            max_arg_bytes: 64,
+            allow_process: false,
+        });
+        let cap = agent
+            .mint_bound(&owner, provider, 0, attrs)
+            .expect("durable cap");
+        agent.export_capability(&cap).expect("export")
+    };
+    let text = with_policy.to_json();
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    value["tool_policy"]["allowed"] = serde_json::json!(["stats", "echo"]);
+    let reordered = serde_json::to_string(&value).expect("serialize");
+    let error = CapabilityRecord::from_json(&reordered).expect_err("unsorted allow-list");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    value["tool_policy"]["bogus"] = serde_json::json!(1);
+    let extra = serde_json::to_string(&value).expect("serialize");
+    let error = CapabilityRecord::from_json(&extra).expect_err("unknown nested key");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    value["budget"]["bogus"] = serde_json::json!(1);
+    let extra = serde_json::to_string(&value).expect("serialize");
+    let error = CapabilityRecord::from_json(&extra).expect_err("unknown budget key");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+}
+
+/// A rotation to the peer that already holds the binding changes nothing, so
+/// it must tombstone nothing: the subtree's own records stay restorable
+/// (round 42, F3).
+#[test]
+fn a_rotation_to_the_same_peer_tombstones_nothing() {
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    let owner = peer(b"durable-owner");
+    let same = admitted(b"durable-owner");
+    agent
+        .reintroduce_to(&cap, &owner, &same)
+        .expect("a no-op rotation succeeds");
+    assert!(
+        !agent.record_is_tombstoned(&record.record_id),
+        "nothing changed, so nothing was retired"
+    );
+    drop(cap);
+    agent.run();
+    agent
+        .restore_capability(&record, &same)
+        .expect("the record is still restorable");
+}
+
+/// A restored capability carries the record id it came from: exporting it
+/// again would mint a second artifact under one credential id
+/// (round 42, F5).
+#[test]
+fn a_restored_capability_cannot_be_exported_again() {
+    // The duplicate appears across kernels: the restorer never exported the
+    // record, so its own `consumed` set is empty.
+    let secret = [0x71; 32];
+    let (source, _provider, cap) = durable_agent();
+    let record = source.export_capability(&cap).expect("export");
+    drop(cap);
+    source.run();
+
+    let target = Agent::with_secret(secret);
+    target.set_durable_capabilities(true);
+    target.set_record_seal_key([0x91; 32]);
+    target.register(Box::new(Echo));
+    let restored = target
+        .restore_capability(&record, &admitted(b"durable-owner"))
+        .expect("restore");
+    let error = target
+        .export_capability(&restored)
+        .expect_err("the record id is already spent");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+}
+
+/// A deadline is absolute in the clock domain it was minted in: after a switch
+/// to the virtual clock the capability is refused instead of outliving its
+/// lease (round 42, F4).
+#[test]
+fn a_wall_clock_deadline_does_not_survive_a_switch_to_virtual() {
+    let agent = Agent::with_secret([0x5b; 32]);
+    agent.use_wall_clock(true);
+    let provider = agent.register(Box::new(Echo));
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.ttl_ms = Some(60_000);
+    let cap = agent.mint(provider, 0, attrs).expect("mint");
+
+    // The virtual clock with zero latency does not advance at all, so the
+    // wall-clock deadline must not be compared with it.
+    agent.use_wall_clock(false);
+    agent.set_latency(0);
+    let lane = agent
+        .create_lane("switch", Budget::default())
+        .expect("lane");
+    // The refusal may come at queue time or at dispatch; both are the same
+    // authority decision.
+    let error = match agent.call_as(None, lane, &cap, "echo", Vec::new()) {
+        Err(error) => error,
+        Ok(promise) => {
+            agent.run();
+            promise
+                .value()
+                .expect_err("the deadline cannot be read in this domain")
+        }
+    };
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}

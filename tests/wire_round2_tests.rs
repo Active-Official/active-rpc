@@ -50,15 +50,26 @@ fn a_wide_list_is_refused_by_the_decode_arena_ceiling() {
 
 #[test]
 fn a_duplicate_capability_id_in_a_full_table_is_refused() {
-    let descriptor = CapDescriptor {
-        id: CapId([0x11; 16]),
+    let descriptor = |id: u8| CapDescriptor {
+        id: CapId([id; 16]),
         methods: BTreeSet::from(["echo".to_string()]),
         budget: Budget::default(),
         read_only: false,
         redact: false,
         path_scope: None,
     };
-    let bytes = encode_capability_table(&[descriptor.clone(), descriptor]).expect("encode");
+    // The writer refuses the duplicate, so the reader is exercised with a
+    // table whose second id was patched to the first (round 42, F2).
+    let error = encode_capability_table(&[descriptor(0x11), descriptor(0x11)])
+        .expect_err("the writer refuses a repeated id");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+
+    let mut bytes = encode_capability_table(&[descriptor(0x11), descriptor(0x22)]).expect("encode");
+    let at = bytes
+        .windows(16)
+        .position(|window| window == [0x22; 16])
+        .expect("the second descriptor is in the frame");
+    bytes[at..at + 16].copy_from_slice(&[0x11; 16]);
     let error = decode_capability_table_with(&bytes, &WireLimits::default())
         .expect_err("the same id twice makes the table order-dependent");
     assert_eq!(error.code(), "rpc/capability-table", "{error}");

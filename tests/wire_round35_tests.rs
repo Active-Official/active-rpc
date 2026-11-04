@@ -45,3 +45,32 @@ fn a_delta_addition_obeys_the_descriptor_ceilings() {
     let table = delta.apply_to(&base).expect("a legal addition");
     assert_eq!(table.len(), 2);
 }
+
+/// The table encoder emits only tables its own reader accepts: a repeated id
+/// and a table past the descriptor ceiling are refused (round 42, F2).
+#[test]
+fn a_table_encoder_refuses_duplicate_ids_and_an_over_count() {
+    use active_rpc::wire::{encode_capability_table, WireLimits};
+
+    let one = descriptor(1, BTreeSet::from(["echo".to_string()]));
+    let error =
+        encode_capability_table(&[one.clone(), one]).expect_err("the same id twice is not a table");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+
+    let limits = WireLimits::default();
+    let mut many = Vec::with_capacity(limits.max_caps as usize + 1);
+    for index in 0..=limits.max_caps {
+        let mut id = [0u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        many.push(CapDescriptor {
+            id: CapId(id),
+            methods: BTreeSet::from(["echo".to_string()]),
+            budget: Budget::default(),
+            read_only: false,
+            redact: false,
+            path_scope: None,
+        });
+    }
+    let error = encode_capability_table(&many).expect_err("past the descriptor ceiling");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+}
