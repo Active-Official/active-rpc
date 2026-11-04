@@ -74,7 +74,10 @@ fn replay_answers(count: usize) -> String {
             let encoded = active_rpc::wire::Envelope::response(9999, active_rpc::Value::text("ok"))
                 .encode()
                 .expect("encode");
-            if stream.write_all(&(encoded.len() as u32).to_le_bytes()).is_err() {
+            if stream
+                .write_all(&(encoded.len() as u32).to_le_bytes())
+                .is_err()
+            {
                 return;
             }
             if stream.write_all(&encoded).is_err() {
@@ -142,7 +145,7 @@ fn a_false_boolean_is_false() {
         "--addr",
         &address,
         "--cap",
-        &"0".repeat(32),
+        &"1".repeat(32),
         "--emit-cap-hex=false",
     ]);
     // `call` has no `--emit-cap-hex`; it is a usage error there, and the point is
@@ -165,12 +168,15 @@ fn a_false_boolean_is_false() {
 #[test]
 fn a_replayed_answer_is_not_a_pipeline_success() {
     let address = replay_answers(3);
+    // A zero capability id is not a capability, and the encoder refuses it
+    // before the frame leaves (round 33, M4); this fixture stands in for an id
+    // the kernel never minted, so it must be a well-formed one.
     let output = run(&[
         "pipeline",
         "--addr",
         &address,
         "--cap",
-        &"0".repeat(32),
+        &"1".repeat(32),
         "--calls",
         "3",
     ]);
@@ -195,7 +201,7 @@ fn a_silent_peer_is_a_deadline_on_every_transport() {
             "--transport",
             transport,
             "--cap",
-            &"0".repeat(32),
+            &"1".repeat(32),
             "--timeout-ms",
             "400",
         ]);
@@ -298,7 +304,7 @@ fn a_certificate_needs_quic() {
             "--transport",
             transport,
             "--cap",
-            &"0".repeat(32),
+            &"1".repeat(32),
             "--cert",
             "C:\\definitely\\missing.pem",
         ]);
@@ -319,7 +325,7 @@ fn a_pipeline_of_zero_calls_is_a_usage_error() {
         "--addr",
         "127.0.0.1:1",
         "--cap",
-        &"0".repeat(32),
+        &"1".repeat(32),
         "--calls",
         "0",
     ]);
@@ -333,7 +339,7 @@ fn a_capability_file_works_and_the_hint_is_not_a_cap_line() {
     let dir = std::env::temp_dir().join(format!("cli-r18-cap-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("dir");
     let cap_file = dir.join("cap.hex");
-    std::fs::write(&cap_file, format!("{}\r\n", "0".repeat(32))).expect("write");
+    std::fs::write(&cap_file, format!("{}\r\n", "1".repeat(32))).expect("write");
 
     let address = answer_with(|id| {
         active_rpc::wire::Envelope::response(id, active_rpc::Value::text("ok"))

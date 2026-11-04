@@ -56,7 +56,7 @@ fn a_reply_that_is_not_a_response_is_a_refusal() {
             .encode()
             .expect("encode")
     });
-    let output = run(&["call", "--addr", &address, "--cap", &"0".repeat(32)]);
+    let output = run(&["call", "--addr", &address, "--cap", &"1".repeat(32)]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("did not answer"),
@@ -73,7 +73,7 @@ fn a_reply_for_another_request_is_a_refusal() {
             .encode()
             .expect("encode")
     });
-    let output = run(&["call", "--addr", &address, "--cap", &"0".repeat(32)]);
+    let output = run(&["call", "--addr", &address, "--cap", &"1".repeat(32)]);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("instead of 42"),
