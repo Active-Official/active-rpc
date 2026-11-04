@@ -989,7 +989,9 @@ fn a_promise_record_refuses_a_second_settlement() {
     use active_rpc::promise::{PromiseId, PromiseRecord, PromiseState};
 
     let mut record = PromiseRecord::new(PromiseId(1), 0);
-    record.resolve(Value::text("one")).expect("the first settlement");
+    record
+        .resolve(Value::text("one"))
+        .expect("the first settlement");
     let error = record
         .resolve(Value::text("two"))
         .expect_err("a second settlement");
