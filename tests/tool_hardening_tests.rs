@@ -2014,7 +2014,8 @@ fn a_secret_process_argument_is_a_policy_refusal() {
 #[cfg(unix)]
 #[test]
 fn a_signalled_child_is_a_provider_fault() {
-    let mut tool = LocalProcess::new("/bin/sh", &["*"]).expect("an absolute program");
+    let mut tool =
+        LocalProcess::new("/bin/sh", &["-c", "kill -TERM $$"]).expect("an absolute program");
     tool.timeout_ms = 5_000;
     let mut call = Call::new(
         "run",
