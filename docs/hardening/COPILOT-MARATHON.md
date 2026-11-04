@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-34: round 34 found 3 mediums and 5 lows, all fixed or documented; rounds 35-36 must be clean | 205 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-35: round 35 found 2 mediums and 3 lows, all fixed or documented; rounds 36-37 must be clean | 209 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-28: round 28 found 2 highs, 2 mediums and 1 low, all fixed; rounds 29-30 must be clean | 218 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,23 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 35)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `761964f`.
+Round-34 fixes verified (one partial). Two mediums, three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the round-34 wall check counted kept labels, so a run of ids whose labels never resolve (distinct constraint expressions) walked the arena unchecked: 1.17 s under a 5 ms grant | **fixed**: the check counts every id walked |
+| 2 | medium | the final scope scans in `scope_closure` and `effects_within_scope` ran inside `Iterator::any`/`all` with no periodic check: a 60 000-element array took 245 ms under a 5 ms grant | **fixed**: both are loops that check the wall every 64 ids |
+| 3 | low | bindings were not charged against the node ceiling: 200 000 names on a two-node module bought a 508 ms call | **fixed**: the binding table is charged like annotations; `a_binding_heavy_module_is_refused_against_the_node_ceiling` |
+| 4 | low | `Envelope::encode` truncated a module length | **already fixed** by round 28's `put_len` |
+| 5 | low | `redact_answer` collapses on label strings, so a pathless tainted dependency yields no marker | **recorded**: STATUS 15; the disclosure fails open and no secret material moves |
+| 6 | low | the `take` doc still said `unknown module` | **fixed** |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-04 (round 34)
 

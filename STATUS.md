@@ -109,4 +109,10 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
     cancelled promise, which is deliberately retryable, and eviction at
     `MAX_IDEMPOTENCY` starts a fresh call: at-most-once holds for a settled
     withheld reply, not across a cancel or an eviction (round 34, L-6).
+15. **A redacted `why`/`impact` answer can miss the taint marker for a pathless
+    dependency.** `redact_answer` collapses on label strings, and `scoped_labels`
+    drops a pathless id, so a tainted dependent with no dotted path yields the
+    ordinary label list instead of the marker. No secret material moves; the
+    disclosure fails open, so a caller cannot rely on "no marker" meaning "no
+    tainted dependency" (round 35, L-5).
 

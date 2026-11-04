@@ -189,6 +189,7 @@ impl ModuleProvider {
     /// Taking the slot by value avoids a full deep clone for every read-only
     /// method (`stats`, `why`, `subgraph`, …). The module is re-inserted on
     /// every path, including errors, so a failed call never drops the object.
+    /// A later call or re-mint on a stale object is `provider/object`.
     fn take(&mut self, object: u64) -> Result<ModuleSlot> {
         self.modules.remove(&object).ok_or(Error::Provider {
             // The object is provider state, not a caller argument: a record
@@ -987,6 +988,12 @@ fn check_node_budget(module: &InfinityModule, call: &Call) -> Result<()> {
     if module.annotations().len() as u64 > call.budget.max_nodes {
         return Err(Error::BudgetExceeded("nodes"));
     }
+    // A binding is not a node, but every label and metadata pass walks the
+    // table: 200 000 names on a two-node module bought a ~500 ms call under a
+    // five-millisecond grant (round 35, L-3).
+    if module.bindings().len() as u64 > call.budget.max_nodes {
+        return Err(Error::BudgetExceeded("nodes"));
+    }
     Ok(())
 }
 
@@ -1217,15 +1224,23 @@ fn effects_within_scope(
     }
     let paths = active_infinity::interop::value_paths(module);
     let root = module.root();
-    if !affected.iter().all(|id| match named_path(&paths, *id) {
-        Some(path) => in_scope_path(module, *id, path, scope),
-        // The module root is pathless by construction. A pathless node inside
-        // the scope's subtree is part of the scope; any other is a floating
-        // value or an expression, and an affected one makes the write
-        // unconfined (round 15, #1).
-        None => Some(*id) == root || in_scope_node(module, *id, scope),
-    }) {
-        return Ok(false);
+    for (index, id) in affected.iter().enumerate() {
+        let inside = match named_path(&paths, *id) {
+            Some(path) => in_scope_path(module, *id, path, scope),
+            // The module root is pathless by construction. A pathless node
+            // inside the scope's subtree is part of the scope; any other is a
+            // floating value or an expression, and an affected one makes the
+            // write unconfined (round 15, #1).
+            None => Some(*id) == root || in_scope_node(module, *id, scope),
+        };
+        if !inside {
+            return Ok(false);
+        }
+        // `in_scope_node` walks the scope subtree for a pathless id, so a large
+        // array is O(n^2) without an interim ceiling (round 35, M-2).
+        if index % 64 == 63 {
+            check_wall_budget(started, call)?;
+        }
     }
     // A binding is a name for a node: if a dependent is bound outside the
     // scope, changing the node changes what that name resolves to.
@@ -1524,13 +1539,26 @@ fn scope_closure(
         .any(|id| matches!(module.get(*id), Some(Inode::Env { .. })));
     let paths = active_infinity::interop::value_paths(module);
     let root = module.root();
-    let outside = closure.iter().any(|id| match named_path(&paths, *id) {
-        Some(path) => !in_scope_path(module, *id, path, scope),
-        // The module root is the module itself. A pathless node is inside only
-        // when the scope's own subtree reaches it (a node behind a semantic
-        // wrapper or an array has no dotted name of its own) (round 15, #1).
-        None => Some(*id) != root && !in_scope_node(module, *id, scope),
-    });
+    let mut outside = false;
+    for (index, id) in closure.iter().enumerate() {
+        let confined = match named_path(&paths, *id) {
+            Some(path) => in_scope_path(module, *id, path, scope),
+            // The module root is the module itself. A pathless node is inside
+            // only when the scope's own subtree reaches it (a node behind a
+            // semantic wrapper or an array has no dotted name of its own)
+            // (round 15, #1).
+            None => Some(*id) == root || in_scope_node(module, *id, scope),
+        };
+        if !confined {
+            outside = true;
+            break;
+        }
+        // `in_scope_node` walks the scope subtree for a pathless id, so a large
+        // array is O(n^2) without an interim ceiling (round 35, M-2).
+        if index % 64 == 63 {
+            check_wall_budget(started, call)?;
+        }
+    }
     Ok((outside, environment))
 }
 
@@ -1565,7 +1593,7 @@ fn scoped_labels(
     // receive: `@node[7]`, `@annotation[0]` and a stale dotted binding label
     // are arena positions (round 10, #4).
     let mut kept = Vec::new();
-    for id in ids {
+    for (index, id) in ids.into_iter().enumerate() {
         let named = match named_path(&paths, id) {
             Some(path) => structural_resolve(module, path)
                 .is_some_and(|resolved| same_place(module, resolved, id)),
@@ -1576,8 +1604,10 @@ fn scoped_labels(
         }
         // Resolving one label walks the arena: a wide table of aliases made
         // this O(ids x nodes) with no interim ceiling, on the dispatch thread
-        // (round 34, M-1). Mirror `nodes_within_scope`.
-        if kept.len() % 64 == 63 {
+        // (round 34, M-1). Count every id walked, not every label kept: the
+        // hostile case is a run of ids whose labels do not resolve
+        // (round 35, M-1).
+        if index % 64 == 63 {
             check_wall_budget(started, call)?;
         }
     }

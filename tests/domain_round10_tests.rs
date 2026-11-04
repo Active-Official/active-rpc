@@ -1544,3 +1544,34 @@ fn a_withheld_reply_is_not_re_executed_by_its_key() {
         ]
     );
 }
+
+/// Bindings are charged against the node ceiling: a two-node module with a
+/// thousand names would otherwise make every label pass walk the table inside
+/// one charged call (round 35, L-3).
+#[test]
+fn a_binding_heavy_module_is_refused_against_the_node_ceiling() {
+    let mut module = InfinityModule::new();
+    let root = module.push(Inode::Str("app".to_string()));
+    module.set_root(Some(root));
+    for index in 0..1000 {
+        module.bind(format!("alias{index}"), root);
+    }
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x77; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.budget.max_nodes = 32;
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("r10-bindings", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "stats", Vec::new()).expect("queued");
+    agent.run();
+    let error = promise
+        .value()
+        .expect_err("the binding table is over the node ceiling");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert!(format!("{error}").contains("nodes"), "{error}");
+}
