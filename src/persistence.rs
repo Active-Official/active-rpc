@@ -47,18 +47,16 @@ pub trait RecordStore {
 
     /// Atomically take ownership of a record id.
     ///
-    /// The default is check-then-mark, which races between two processes. A
-    /// store with an atomic insert-if-absent (a unique key, a conditional
-    /// write) overrides this, and the kernel calls it after the seal and the
-    /// binding are verified and before the grant is minted.
-    fn claim(&mut self, record_id: &[u8; 32]) -> Result<()> {
-        if self.is_restored(record_id) {
-            return Err(Error::persistence(
-                "the record was already restored by this deployment",
-            ));
-        }
-        self.mark_restored(record_id)
-    }
+    /// Required, with no default: a check-then-mark implementation races
+    /// between two processes, and both would mint a grant for one record
+    /// (audit ARPC-010). An implementation over shared storage must do an
+    /// insert-if-absent (a unique key, a conditional write, a compare-and-swap)
+    /// in one step, in the same transactional domain as its tombstones.
+    /// [`MemoryRecordStore`] is atomic in one process only.
+    ///
+    /// The kernel calls this after the seal and the binding are verified and
+    /// before the grant is minted.
+    fn claim(&mut self, record_id: &[u8; 32]) -> Result<()>;
 }
 
 /// An in-memory [`RecordStore`], for tests and single-process deployments.
@@ -102,6 +100,13 @@ impl RecordStore for MemoryRecordStore {
                 "the record was already restored by this deployment",
             ))
         }
+    }
+
+    fn claim(&mut self, record_id: &[u8; 32]) -> Result<()> {
+        // `insert` is the check and the write in one step. The store is
+        // single-process by construction; a multi-process deployment must
+        // implement `claim` over its own storage.
+        self.mark_restored(record_id)
     }
 }
 

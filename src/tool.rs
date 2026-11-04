@@ -1665,9 +1665,11 @@ impl HttpTool {
                 code: "http/status".to_string(),
             });
         }
+        // The status line is part of the head the grant pays for
+        // (round 23, #2).
+        let mut header_bytes = status_line.len();
         status_line.clear();
         let mut content_length: Option<usize> = None;
-        let mut header_bytes = 0usize;
         let mut fields = 0usize;
         loop {
             let line = reader.line(MAX_HTTP_HEADER_LINE.min(header_cap).max(1))?;
@@ -2097,25 +2099,24 @@ pub(crate) fn args_contain_secret(args: &[Arg]) -> bool {
     })
 }
 
-/// End a child's whole process tree and reap the leader.
+/// End a child's process tree and reap the leader.
 ///
-/// On Windows `taskkill /T` walks the tree, with the executable resolved from
-/// the system directory rather than `PATH` (the same ambient-authority argument
-/// as the program itself). On Unix the caller puts the child in its own process
-/// group, so one signal reaches every descendant it started. `/bin/kill` and
-/// `/usr/bin/kill` are tried because this crate forbids `unsafe` and std has no
-/// signal API; a platform with neither still loses the leader.
+/// On Unix the caller puts the child in its own process group, so one signal
+/// reaches every descendant it started. `/bin/kill` and `/usr/bin/kill` are
+/// tried because this crate forbids `unsafe` and std has no signal API; a
+/// platform with neither still loses the leader.
+///
+/// On Windows only the leader is killed. The previous implementation spawned
+/// `%SystemRoot%\System32\taskkill.exe`, and `SystemRoot` is a mutable process
+/// environment value: a poisoned environment chose the binary that ran during
+/// every error path (audit ARPC-004). A job object is the complete fix and
+/// needs `unsafe` FFI, which this crate forbids; until that lands, a descendant
+/// that outlives its leader is a recorded residual (STATUS.md), and no helper
+/// executable is ever launched.
 fn kill_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
-        let root = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
-        let _ = Command::new(root.join("System32").join("taskkill.exe"))
-            .args(["/T", "/F", "/PID", &child.id().to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = child.kill();
     }
     #[cfg(unix)]
     {
@@ -2188,9 +2189,11 @@ pub struct LocalProcess {
     pub allow_args: Vec<String>,
     /// Environment variables the child inherits.
     pub env: BTreeMap<String, String>,
-    /// Directory the child runs in. Pinned at construction and never inherited
-    /// at spawn time, so a later `chdir` in this process cannot move the child.
-    pub workdir: PathBuf,
+    /// Directory the child runs in. Pinned at construction (canonicalised) and
+    /// never inherited at spawn time, so a later `chdir` in this process cannot
+    /// move the child. Private: an in-process assignment cannot repoint it
+    /// (audit ARPC-005); see [`LocalProcess::working_directory`].
+    workdir: PathBuf,
     /// Maximum output bytes.
     pub max_output: usize,
     /// Maximum wall-clock time one invocation may take before the child is
@@ -2217,6 +2220,10 @@ impl LocalProcess {
         let workdir = std::env::current_dir().map_err(|_| Error::Provider {
             code: "process/cwd".to_string(),
         })?;
+        // Canonical now, so a symlink swapped in later does not change what the
+        // stored path names (audit ARPC-005). A directory that cannot be
+        // canonicalised keeps its absolute form; `invoke` re-checks it.
+        let workdir = std::fs::canonicalize(&workdir).unwrap_or(workdir);
         Ok(Self {
             program,
             allow_args: allow_args.iter().map(|arg| arg.to_string()).collect(),
@@ -2245,8 +2252,19 @@ impl LocalProcess {
                 "a process working directory contains a NUL byte",
             ));
         }
+        // Resolve now: the stored path is what the child gets, and an
+        // unresolvable directory is refused at construction rather than at
+        // spawn (audit ARPC-005).
+        let directory = std::fs::canonicalize(&directory).map_err(|_| {
+            Error::InvalidArgument("the process working directory does not resolve")
+        })?;
         self.workdir = directory;
         Ok(self)
+    }
+
+    /// The working directory this tool pins.
+    pub fn working_directory(&self) -> &Path {
+        &self.workdir
     }
 
     /// Set the per-invocation wall-clock ceiling.
@@ -2366,8 +2384,9 @@ impl Provider for LocalProcess {
             return Err(Error::BudgetExceeded("byte"));
         }
         if args_contain_secret(&call.args) {
-            // Authority this adapter was not granted; the other text adapters
-            // report it the same way (round 22, F-H).
+            // Before the shape loop: `Value::Secret` used to be reported as a
+            // malformed argument there, so the policy branch below never ran
+            // (round 23, #1).
             return Err(Error::ToolPolicy(
                 "a secret argument cannot be passed to a process",
             ));

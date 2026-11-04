@@ -70,6 +70,9 @@ fn a_store_that_cannot_remember_refuses_and_revokes_the_grant() {
         fn mark_restored(&mut self, _id: &[u8; 32]) -> active_rpc::Result<()> {
             Err(Error::persistence("the store is read-only"))
         }
+        fn claim(&mut self, id: &[u8; 32]) -> active_rpc::Result<()> {
+            self.mark_restored(id)
+        }
     }
 
     let (agent, provider) = durable_agent();

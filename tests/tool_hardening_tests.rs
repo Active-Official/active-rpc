@@ -37,7 +37,11 @@ fn a_bare_program_name_is_refused() {
     // too: a relative one would resolve against whatever the parent's directory
     // happens to be at spawn time.
     let tool = LocalProcess::new(absolute_shell(), &[]).expect("an absolute program");
-    assert!(tool.workdir.is_absolute(), "{:?}", tool.workdir);
+    assert!(
+        tool.working_directory().is_absolute(),
+        "{:?}",
+        tool.working_directory()
+    );
     let error = tool
         .with_current_dir("relative")
         .expect_err("a relative working directory must be refused");
@@ -571,7 +575,7 @@ fn a_truncated_head_or_body_has_its_own_code() {
 fn a_response_past_the_byte_grant_is_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
-    let body = "x".repeat(64);
+    let body = "x".repeat(128);
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
@@ -579,8 +583,8 @@ fn a_response_past_the_byte_grant_is_refused() {
     fixed_response(listener, response.into_bytes());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/big")]);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/big"))]);
-    // The head (~39 bytes) fits; the 64-byte body does not.
-    call.budget.max_bytes = 48;
+    // The head (~56 bytes) fits; the 128-byte body does not.
+    call.budget.max_bytes = 64;
     let error = tool.invoke(0, &call).expect_err("past the grant");
     assert_eq!(
         error.provider_code(),
@@ -1355,13 +1359,17 @@ fn a_nul_working_directory_is_refused() {
     let error = tool.with_current_dir(bad).expect_err("a NUL directory");
     assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
 
-    // The field is public: a caller that assigns it directly is refused at
-    // invoke.
-    let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
-    tool.workdir = std::path::PathBuf::from(bad);
-    let mut call = Call::new("run", vec![Arg::text("echo")]);
-    call.tool_allows_process = true;
-    let error = tool.invoke(0, &call).expect_err("a NUL directory");
+    // A directory that does not exist is refused at construction rather than
+    // at spawn, and the field is private so it cannot be repointed later
+    // (audit ARPC-005).
+    let tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    #[cfg(windows)]
+    let missing = "C:\\nonexistent-active-rpc-directory";
+    #[cfg(not(windows))]
+    let missing = "/nonexistent-active-rpc-directory";
+    let error = tool
+        .with_current_dir(missing)
+        .expect_err("a missing directory");
     assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
 }
 
@@ -1620,20 +1628,22 @@ fn a_header_name_is_a_token_and_a_length_is_digits() {
     }
 }
 
-/// A caller-supplied working directory cannot become relative after
-/// construction (round 8, F6).
+/// A relative working directory is refused at construction; the field is
+/// private, so no in-process assignment can repoint it (audit ARPC-005).
 #[test]
-fn a_relative_workdir_is_refused_at_invoke() {
+fn a_relative_workdir_is_refused_at_construction() {
     #[cfg(windows)]
     let program = "C:\\Windows\\System32\\cmd.exe";
     #[cfg(not(windows))]
     let program = "/bin/sh";
-    let mut tool = LocalProcess::new(program, &["/C", "echo"]).expect("an absolute program");
-    tool.workdir = std::path::PathBuf::from("relative");
-    let mut call = Call::new("run", vec![Arg::text("/C"), Arg::text("echo")]);
-    call.tool_allows_process = true;
-    let error = tool.invoke(0, &call).expect_err("a relative directory");
+    let tool = LocalProcess::new(program, &["/C", "echo"]).expect("an absolute program");
+    let error = tool
+        .with_current_dir("relative")
+        .expect_err("a relative directory");
     assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+    // The pinned directory is canonical: an absolute path, no dot segments.
+    let tool = LocalProcess::new(program, &["/C", "echo"]).expect("an absolute program");
+    assert!(tool.working_directory().is_absolute());
 }
 
 /// A NUL in an MCP program or argument is a configuration refusal, not a

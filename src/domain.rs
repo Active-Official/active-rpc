@@ -746,16 +746,22 @@ impl ModuleProvider {
                 // `security.md` promises a redacting capability learns that a
                 // cone is tainted, never how many secrets it holds.
                 if !call.redact {
-                    map.insert(
-                        "secrets".to_string(),
-                        Value::Int(
-                            module
-                                .nodes()
-                                .iter()
-                                .filter(|node| node.is_secret())
-                                .count() as i64,
-                        ),
-                    );
+                    let live = module
+                        .nodes()
+                        .iter()
+                        .filter(|node| node.is_secret())
+                        .count() as i64;
+                    // The install-time redactor still hides literals after a
+                    // patch removed the last secret node, so `0` would
+                    // contradict every other method (round 30, L-6). A
+                    // non-redacting caller may know the count; it may not learn
+                    // "zero" when the module is treated as secret-bearing.
+                    let reported = if live == 0 && !slot.redactor.is_empty() {
+                        1
+                    } else {
+                        live
+                    };
+                    map.insert("secrets".to_string(), Value::Int(reported));
                 }
                 // Provenance describes the whole module; whether it exists at
                 // all is a size signal a redacting caller must not read

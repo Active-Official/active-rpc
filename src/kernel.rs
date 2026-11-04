@@ -189,6 +189,22 @@ pub enum Event {
     CapExported(CapId),
     /// A sealed durable record was restored as a live capability.
     CapRestored(CapId),
+    /// A capability bound to one peer was rebound to its rotated successor.
+    CapRebound {
+        /// Capability whose binding moved.
+        cap: CapId,
+        /// Fingerprint it was bound to before the rotation.
+        from: [u8; FINGERPRINT_LEN],
+        /// Fingerprint it is bound to now.
+        to: [u8; FINGERPRINT_LEN],
+    },
+    /// The last live handle of an *exported* durable capability was dropped.
+    ///
+    /// The sealed record can still be restored; a deployment that treats a
+    /// dropped handle as a dead credential must tombstone it (STATUS.md,
+    /// residual). The event exists so the window is observable
+    /// (audit AR-03).
+    CapRecordOrphaned(CapId),
     /// A capability was introduced to an authenticated peer and bound to it.
     CapIntroduced {
         /// Introduced capability.
@@ -1616,6 +1632,101 @@ impl Agent {
         kernel.push_event(Event::CapIntroduced {
             cap: introduced,
             fingerprint,
+        });
+        Ok(descriptor)
+    }
+
+    /// Move a peer-bound capability (and its live subtree) to the peer's
+    /// rotated successor certificate.
+    ///
+    /// A fingerprint is the whole DER, so a leaf renewal invalidated every
+    /// binding at once (audit AR-04). The caller proves it holds the old peer
+    /// — it presents the `PeerIdentity` whose fingerprint matches the current
+    /// binding — and names the new admitted peer. Authority does not change:
+    /// the same records, budgets, expiry and policy move to the new binding.
+    pub fn reintroduce_to(
+        &self,
+        cap: &CapHandle,
+        from: &crate::identity::PeerIdentity,
+        to: &AdmittedIdentity,
+    ) -> Result<crate::wire::CapDescriptor> {
+        if !cap.is_owning() {
+            return Err(Error::Identity(
+                "an imported handle cannot rebind authority",
+            ));
+        }
+        if !to.can_bind() {
+            return Err(Error::Identity(
+                "cannot rebind a capability to an unauthenticated peer",
+            ));
+        }
+        let from_fingerprint = from.fingerprint();
+        let to_fingerprint = to.fingerprint();
+        let mut kernel = self.cell.borrow_mut();
+        refresh_clock(&mut kernel);
+        let (revoked, expired, bound) = {
+            let record = kernel
+                .caps
+                .get(&cap.id())
+                .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+            (
+                record.revoked,
+                record
+                    .expires_at
+                    .is_some_and(|expires_at| kernel.now_ms >= expires_at),
+                record.attrs.bound_to,
+            )
+        };
+        if revoked {
+            return Err(Error::Revoked(cap_token(cap.id())));
+        }
+        if expired {
+            kernel.push_event(Event::CapExpired(cap.id()));
+            return Err(Error::Revoked(cap_token(cap.id())));
+        }
+        if bound != Some(from_fingerprint) {
+            return Err(Error::Identity(
+                "the capability is not bound to the peer being rotated",
+            ));
+        }
+        let subtree = descendants_of(&kernel.children, cap.id());
+        for id in &subtree {
+            if let Some(child) = kernel.caps.get(id) {
+                if child.revoked
+                    || child
+                        .expires_at
+                        .is_some_and(|expires_at| kernel.now_ms >= expires_at)
+                {
+                    continue;
+                }
+                // A descendant bound to a different peer is somebody else's
+                // authority; moving it would hand them a rotated identity.
+                if child
+                    .attrs
+                    .bound_to
+                    .is_some_and(|other| other != from_fingerprint)
+                {
+                    return Err(Error::Identity("a descendant is bound to another peer"));
+                }
+            }
+        }
+        for id in std::iter::once(cap.id()).chain(subtree) {
+            if let Some(child) = kernel.caps.get_mut(&id) {
+                if child.attrs.bound_to == Some(from_fingerprint) {
+                    child.attrs.bound_to = Some(to_fingerprint);
+                }
+            }
+        }
+        let record = kernel
+            .caps
+            .get(&cap.id())
+            .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+        let descriptor = crate::wire::CapDescriptor::from_attrs(record.id, &record.attrs);
+        let rebound = record.id;
+        kernel.push_event(Event::CapRebound {
+            cap: rebound,
+            from: from_fingerprint,
+            to: to_fingerprint,
         });
         Ok(descriptor)
     }
@@ -3158,6 +3269,36 @@ impl Agent {
             }
             None => value,
         };
+        // Eligibility first: a cancelled or already-settled promise must not
+        // debit the chain for a value the caller will never receive
+        // (audit AR-02).
+        {
+            let state = {
+                let kernel = self.cell.borrow();
+                match kernel.promises.get(&promise.id) {
+                    Some(record) => record.state.clone(),
+                    None => return Err(Error::UnknownPromise(promise.id.0)),
+                }
+            };
+            match state {
+                crate::promise::PromiseState::Cancelled => {
+                    return Err(Error::PromiseCancelled(promise.id.0));
+                }
+                crate::promise::PromiseState::Resolved(_)
+                | crate::promise::PromiseState::Rejected(_) => {
+                    // The refusal is counted, as the settle path counted it:
+                    // an operator must see the attempt even though nothing was
+                    // charged for it.
+                    {
+                        let mut kernel = self.cell.borrow_mut();
+                        kernel.metrics.promises_double_settled =
+                            kernel.metrics.promises_double_settled.saturating_add(1);
+                    }
+                    return Err(Error::PromiseAlreadyResolved(promise.id.0));
+                }
+                _ => {}
+            }
+        }
         if let Some(job) = &job {
             // Charged before the settlement: a value the grant cannot afford
             // must not become the promise's answer. When the job is still in the
@@ -3962,6 +4103,26 @@ impl Agent {
     }
 
     /// Point-in-time counters. Contains no capability ids or payloads.
+    /// Bytes this capability's own meter has left.
+    ///
+    /// The meter's ceiling, not an ancestor's: a caller that needs the
+    /// intersected figure can compare with its lane. Exposed so an operator
+    /// (and the audit regression) can prove a refused out-of-band resolve
+    /// charged nothing (audit AR-02).
+    pub fn remaining_bytes(&self, cap: &CapHandle) -> Result<u64> {
+        let kernel = self.cell.borrow();
+        let record = kernel
+            .caps
+            .get(&cap.id())
+            .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+        Ok(kernel
+            .meters
+            .get(&record.id)
+            .map(|meter| meter.remaining_bytes())
+            .unwrap_or(record.attrs.budget.max_bytes))
+    }
+
+    /// Counters and gauges for this kernel.
     pub fn metrics(&self) -> Metrics {
         let kernel = self.cell.borrow();
         let mut metrics = kernel.metrics;
@@ -4514,8 +4675,21 @@ impl Agent {
                                 }
                             }
                         }
-                        if failure.is_none() && resolved_bytes > effective_budget.max_bytes {
-                            failure = Some(Error::BudgetExceeded("byte"));
+                        if failure.is_none() {
+                            // The *complete* delivered request: a payload queued
+                            // under a wide grant must not ride in when the lane
+                            // or capability was narrowed afterwards
+                            // (audit ARPC-001).
+                            let payload = job.call.payload.len() as u64;
+                            match resolved_bytes.checked_add(payload) {
+                                Some(delivered) if delivered <= effective_budget.max_bytes => {}
+                                Some(_) => {
+                                    failure = Some(Error::BudgetExceeded("byte"));
+                                }
+                                None => {
+                                    failure = Some(Error::BudgetExceeded("byte"));
+                                }
+                            }
                         }
                     }
                 }
@@ -4617,39 +4791,45 @@ impl Agent {
             // Egress is charged before settlement: a response larger than the
             // remaining grant never leaves the kernel.
             let outcome = match outcome {
-                Ok(value) => {
-                    // The redaction policy is enforced here, not left to the
-                    // provider: a redacting call gets a redacted value, and a
-                    // call that did not ask for redaction must not receive a
-                    // module that still carries structural secrets.
-                    // The policy decodes `Value::Module` bytes, and those may be
-                    // chosen by remote code (a WASM guest's output). The codec is
-                    // fail-closed by contract, but a panic here would unwind
-                    // outside the provider's `catch_unwind`, so it is contained
-                    // and reported as a provider fault.
-                    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if job.call.redact {
-                            Ok(crate::security::redact_value(value))
-                        } else {
-                            crate::security::assert_no_structural_secrets(&value).map(|()| value)
-                        }
-                    }))
-                    .unwrap_or_else(|_| {
-                        Err(Error::Provider {
-                            code: "wasm/trap".to_string(),
-                        })
-                    });
-                    match checked {
-                        Err(error) => Err(error),
-                        // The grant bounds what comes back as much as what went
-                        // in: a provider returning a list far wider than the
-                        // grant's `max_array_len` would otherwise be admitted.
-                        Ok(value) => match shape_refusal(&value, &effective_budget) {
-                            Some(error) => Err(error),
-                            None => {
-                                // A resolve that won the race already delivered
-                                // its value; charging this one would bill twice
-                                // for a value the caller never sees (round 3, F4).
+                Ok(value) => match shape_refusal(&value, &effective_budget) {
+                    Some(error) => Err(error),
+                    // The ceilings come before the policy walk: `redact_value`
+                    // and `assert_no_structural_secrets` recurse, and a value
+                    // deeper than the stack aborts the process where
+                    // `catch_unwind` cannot help (round 30, L-8).
+                    None if value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) => {
+                        Err(Error::BudgetExceeded("depth"))
+                    }
+                    None => {
+                        // The redaction policy is enforced here, not left to the
+                        // provider: a redacting call gets a redacted value, and a
+                        // call that did not ask for redaction must not receive a
+                        // module that still carries structural secrets.
+                        // The policy decodes `Value::Module` bytes, and those may be
+                        // chosen by remote code (a WASM guest's output). The codec is
+                        // fail-closed by contract, but a panic here would unwind
+                        // outside the provider's `catch_unwind`, so it is contained
+                        // and reported as a provider fault.
+                        let checked =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if job.call.redact {
+                                    Ok(crate::security::redact_value(value))
+                                } else {
+                                    crate::security::assert_no_structural_secrets(&value)
+                                        .map(|()| value)
+                                }
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(Error::Provider {
+                                    code: "wasm/trap".to_string(),
+                                })
+                            });
+                        match checked {
+                            Err(error) => Err(error),
+                            Ok(value) => {
+                                // A resolve that won the race already delivered its
+                                // value; charging this one would bill twice for a
+                                // value the caller never sees (round 3, F4).
                                 if resolved_out_of_band {
                                     Ok(value)
                                 } else {
@@ -4659,9 +4839,9 @@ impl Agent {
                                     }
                                 }
                             }
-                        },
+                        }
                     }
-                }
+                },
                 Err(error) => Err(error),
             };
 
@@ -4914,6 +5094,12 @@ impl Kernel {
             };
             kernel.meters.remove(&id);
             kernel.push_event(Event::CapDropped(id));
+            if kernel.consumed_records.contains(&record.record_id) {
+                // Exported and now unreferenced: the record is still
+                // restorable, which an operator must be able to see
+                // (audit AR-03).
+                kernel.push_event(Event::CapRecordOrphaned(id));
+            }
             // `on_drop` means "the last capability that referenced this object
             // is gone": a provider may use it to reclaim per-object state. It
             // used to fire for every capability, so a provider that freed the
@@ -5098,34 +5284,67 @@ impl Kernel {
     /// same batch are returned; the rest stay queued for a later batch (their
     /// producer may be queued on another provider).
     fn order_candidates(&self, candidates: &[u64]) -> Vec<u64> {
-        let mut ordered: Vec<u64> = Vec::new();
-        let mut produced: BTreeSet<PromiseId> = BTreeSet::new();
-        let mut pending: Vec<u64> = candidates.to_vec();
-        let mut progress = true;
-        while progress && !pending.is_empty() {
-            progress = false;
-            let mut index = 0;
-            while index < pending.len() {
-                let id = pending[index];
-                let ready = match self.jobs.get(&id) {
-                    Some(job) => job.deps.iter().all(|dep| {
-                        // Resolved already, or produced earlier in this batch.
-                        match self.promises.get(dep) {
-                            Some(record) if record.state.is_settled() => true,
-                            _ => produced.contains(dep),
-                        }
-                    }),
-                    None => true,
+        // Kahn's algorithm in waves: each wave emits, in candidate order, every
+        // job whose remaining dependencies were produced by earlier waves. That
+        // is the same output order as the old scan-and-remove loop, but linear
+        // in the batch (audit AR-01; the old `pending.remove(index)` was
+        // quadratic and stalled dispatch on a large queue).
+        let count = candidates.len();
+        let mut position: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::with_capacity(count);
+        for (index, id) in candidates.iter().enumerate() {
+            position.insert(*id, index);
+        }
+        let mut producers: std::collections::HashMap<PromiseId, usize> =
+            std::collections::HashMap::with_capacity(count);
+        for (index, id) in candidates.iter().enumerate() {
+            if let Some(job) = self.jobs.get(id) {
+                producers.insert(job.promise, index);
+            }
+        }
+        let mut indegree = vec![0usize; count];
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); count];
+        // A dependency produced outside this batch that is not settled yet can
+        // never be satisfied here: such a job is left out, as before.
+        let mut blocked = vec![false; count];
+        for (index, id) in candidates.iter().enumerate() {
+            let Some(job) = self.jobs.get(id) else {
+                continue;
+            };
+            for dep in &job.deps {
+                let settled = match self.promises.get(dep) {
+                    Some(record) => record.state.is_settled(),
+                    None => false,
                 };
-                if ready {
-                    if let Some(job) = self.jobs.get(&id) {
-                        produced.insert(job.promise);
+                if settled {
+                    continue;
+                }
+                match producers.get(dep) {
+                    Some(producer) => {
+                        indegree[index] += 1;
+                        dependents[*producer].push(index);
                     }
-                    ordered.push(id);
-                    pending.remove(index);
-                    progress = true;
-                } else {
-                    index += 1;
+                    None => blocked[index] = true,
+                }
+            }
+        }
+        let mut ready: BTreeSet<usize> = (0..count)
+            .filter(|index| indegree[*index] == 0 && !blocked[*index])
+            .collect();
+        let mut ordered = Vec::with_capacity(count);
+        while !ready.is_empty() {
+            // The wave is the ready set at its start: a job that becomes ready
+            // while this wave emits belongs to the next one, which is what the
+            // old per-pass scan did.
+            let wave: Vec<usize> = ready.iter().copied().collect();
+            ready.clear();
+            for index in wave {
+                ordered.push(candidates[index]);
+                for dependent in &dependents[index] {
+                    indegree[*dependent] = indegree[*dependent].saturating_sub(1);
+                    if indegree[*dependent] == 0 && !blocked[*dependent] {
+                        ready.insert(*dependent);
+                    }
                 }
             }
         }

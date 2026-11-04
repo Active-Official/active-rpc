@@ -846,12 +846,34 @@ impl ConnectClient {
                 addresses
             }
         };
-        let address = addresses
-            .first()
-            .copied()
-            .ok_or_else(|| Error::Transport("no address".to_string()))?;
-        let mut stream = TcpStream::connect_timeout(&address, remaining(deadline)?)
-            .map_err(|error| Error::Transport(format!("connect: {error}")))?;
+        if addresses.is_empty() {
+            return Err(Error::Transport("no address".to_string()));
+        }
+        // Every address, not only the first: a resolver may list `::1` ahead of
+        // `127.0.0.1`, and a single-address cache made that failure permanent
+        // (round 30, L-9).
+        let mut connected = None;
+        let mut last = None;
+        for address in &addresses {
+            match TcpStream::connect_timeout(address, remaining(deadline)?) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        let mut stream = match connected {
+            Some(stream) => stream,
+            None => {
+                // The cache may describe a peer that moved; resolve next time.
+                self.resolved = None;
+                match last {
+                    Some(error) => return Err(Error::Transport(format!("connect: {error}"))),
+                    None => return Err(Error::Transport("no address".to_string())),
+                }
+            }
+        };
         // A client with no explicit deadline still has one: a peer that drips a
         // byte per timeout would hold it forever, and `read_head` was called
         // with `None` (round 21, #2).

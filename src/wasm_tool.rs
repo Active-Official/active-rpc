@@ -358,10 +358,10 @@ impl WasmTool {
                         // that loops would otherwise make the host work far past
                         // the wall grant it paid for.
                         let used = caller.data().random_used;
-                        if used.saturating_add(len as usize) > caller.data().max_random {
+                        let next = used.saturating_add(len as usize);
+                        if next > caller.data().max_random {
                             return -1;
                         }
-                        caller.data_mut().random_used = used.saturating_add(len as usize);
                         let Some(memory) = caller
                             .get_export("memory")
                             .and_then(|export| export.into_memory())
@@ -381,6 +381,10 @@ impl WasmTool {
                             return -1;
                         }
                         data[start..end].copy_from_slice(&buffer);
+                        // Charged only after the copy: a refused pointer must
+                        // not burn the call's entropy budget
+                        // (round 23, #4).
+                        caller.data_mut().random_used = next;
                         0
                     },
                 )
@@ -615,6 +619,14 @@ impl Provider for WasmTool {
             // work (round 22, F-B).
             return Err(Error::BudgetExceeded("byte"));
         }
+        let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+        if let Some(Arg::Value(Value::Text(text))) = call.args.first() {
+            if text.len() > grant {
+                // Before the copy: the grant bounds the input too
+                // (round 23, #3).
+                return Err(Error::BudgetExceeded("byte"));
+            }
+        }
         let mut limits = self.limits;
         limits.fuel = fuel;
         let mut tool = WasmTool {
@@ -625,9 +637,7 @@ impl Provider for WasmTool {
             log: Vec::new(),
             now_ms: call.now_ms,
         };
-        let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
-        let input_grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
-        if input.len() > input_grant {
+        if input.len() > grant {
             // The guest must not run on data the grant cannot carry
             // (round 22, F-G).
             return Err(Error::BudgetExceeded("byte"));
@@ -638,9 +648,9 @@ impl Provider for WasmTool {
         // can only hold this call's bytes.
         self.log = std::mem::take(&mut tool.log);
         let output = result?;
-        if output.len() > grant {
-            // The guest ran for an answer the grant cannot carry; every other
-            // adapter pre-caps by the grant (round 21, F6).
+        // Input and output share the grant, as the process and HTTP adapters
+        // charge one budget (round 23, #3).
+        if output.len() > grant.saturating_sub(input.len()) {
             return Err(Error::BudgetExceeded("byte"));
         }
         // Guest output is bytes: a lossy UTF-8 conversion would hand the caller

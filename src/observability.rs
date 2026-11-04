@@ -202,6 +202,15 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.event = "cap.restored";
             trace.cap = Some(cap.correlation_id());
         }
+        Event::CapRecordOrphaned(cap) => {
+            trace.event = "cap.record-orphaned";
+            trace.cap = Some(cap.correlation_id());
+        }
+        Event::CapRebound { cap, from, to } => {
+            trace.event = "cap.rebound";
+            trace.cap = Some(cap.correlation_id());
+            trace.identity = Some(format!("{}->{}", hex(from), hex(to)));
+        }
         Event::CapIntroduced { cap, fingerprint } => {
             trace.event = "cap.introduced";
             trace.cap = Some(cap.correlation_id());

@@ -68,6 +68,48 @@ the codec is fine, the **oracle** was not.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
 
+### Audit remediation (2026-11-03 auditors) - 2026-11-04
+
+The independent audits (`G:\AUDIT`) and the architect's remediation package
+(`G:\AUDIT\audit-remediation`) were checked against this tree. Every P0 and P1
+was real here; each is fixed with a regression.
+
+| ID | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| ARPC-004 | P0 | Windows cleanup spawned `%SystemRoot%\System32\taskkill.exe`, and `SystemRoot` is a mutable environment value | **fixed**: no helper is launched; the leader is killed and a descendant that outlives it is a recorded residual (a job object needs `unsafe`, which this crate forbids); `a_poisoned_system_root_does_not_run_a_planted_helper` |
+| ARPC-001 | P1 | dispatch re-checked only resolved args, so a payload queued under a wide grant rode in after the lane was narrowed | **fixed**: the complete delivered request is compared; `a_narrowed_lane_refuses_a_queued_payload` fails pre-fix |
+| ARPC-010 | P1 | `RecordStore::claim` had a check-then-mark default | **fixed**: `claim` is required, `MemoryRecordStore` claims atomically, and a two-contender test pins one winner |
+| AR-02 | P1 | `resolve_as` charged egress before the settle outcome | **fixed**: eligibility is checked first and a settled promise is counted without a charge; `Agent::remaining_bytes` makes the meter observable |
+| ARPC-006 | P1 | QUIC `max_calls` counted after the handler | **fixed**: admission reserves the slot by compare-exchange before the handler |
+| ARPC-005 | P2 | `workdir` was a public, non-canonical path | **fixed**: private and canonicalised; `working_directory()` is the accessor |
+| AR-01 | P2 | `order_candidates` was O(n²) | **fixed**: Kahn waves in candidate order (same output order, linear) |
+| AR-03 | P2 | dropping the last handle of an exported durable record was silent | **fixed**: `Event::CapRecordOrphaned` reports it; the restore window is a STATUS residual |
+| AR-04 | P2 | a certificate renewal broke every binding | **fixed**: `Agent::reintroduce_to` moves a bound subtree to the rotated peer and emits `CapRebound` |
+| ARPC-003 | P2 | the control plane's worker and `/health` held different heartbeat `Arc`s | **fixed**: one Arc is created before the thread and shared |
+| ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
+| ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
+| Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-03 (round 30)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `dd5ed9f`.
+All round-29 fixes verified; **no critical or high**. Two mediums, seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `response.encode()` ran outside the handler lock and before the in-flight reservation, so worker threads could materialise many responses first | **fixed**: the handler and the encode share the lock |
+| 2 | medium | a response over the in-flight budget answered `429 rpc/backpressure` after the handler ran, inviting a retry of a call that already took effect | **fixed**: `500 rpc/transport` on that path; 429 stays pre-handler |
+| 3 | low | `Reservation::reserve(0)` could fail on a concurrent transient overshoot | **fixed**: zero is free, and the counter moves by compare-exchange |
+| 4 | low | the client's response `content-length` parse accepted `+N`, a duplicate and an overflow | **fixed**: one value, ASCII digits, at most 20 |
+| 5 | low | `serve` never reaped completed connection tasks | **fixed**: `try_join_next` at the top of the accept loop |
+| 6 | low | `stats.secrets` reported 0 after a declassifying patch while every other method treated the module as secret-bearing | **fixed**: at least 1 while the install-time redactor is non-empty |
+| 7 | low | the five round-29 fixes had no regression tests | **fixed**: forged h2 answer ids/kinds, the four invisible characters, `provider/secret-material` and the exact-ceiling gRPC body are covered |
+| 8 | low | the dispatch settlement walked a provider value recursively before the depth ceiling | **fixed**: `shape_refusal` and `value_too_deep` run first |
+| 9 | low | the Connect client dialled only the first resolved address, cached forever | **fixed**: every address is tried and a failed connect clears the cache |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
+
 ### R-07 domain operations - 2026-11-03 (round 29)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `bbd53c1`.
@@ -266,6 +308,22 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 23)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `dd5ed9f`. Round-22 fixes
+verified; one medium (the process secret branch was dead) and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the argument loop refused `Value::Secret` as a malformed argument before the policy check, so the promised `rpc/tool-policy` never fired | **fixed**: the secret check runs before the loop |
+| 2 | low | the status line was not counted in the head bytes the grant pays for | **fixed**: `header_bytes` starts at its length |
+| 3 | low | the wasm input was cloned before the grant check, and input plus output could each use the full grant | **fixed**: the check precedes the copy and the output cap is the remainder |
+| 4 | low | entropy was charged before the pointer check, so a refused call burned the budget | **fixed**: charged after a successful copy |
+| 5 | low | the process paragraph owned an HTTP sentence and the grant refusals were undocumented | **fixed**: `wire.md` updated |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 22)
 

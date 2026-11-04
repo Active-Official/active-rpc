@@ -981,3 +981,22 @@ fn cancelling_a_running_call_is_not_a_double_settlement() {
         "a caller cancellation was counted as a kernel double settlement"
     );
 }
+
+/// The record itself refuses a second settlement, whoever reaches it: the
+/// kernel's early guards are additional, not the only line (C-1).
+#[test]
+fn a_promise_record_refuses_a_second_settlement() {
+    use active_rpc::promise::{PromiseId, PromiseRecord, PromiseState};
+
+    let mut record = PromiseRecord::new(PromiseId(1), 0);
+    record.resolve(Value::text("one")).expect("the first settlement");
+    let error = record
+        .resolve(Value::text("two"))
+        .expect_err("a second settlement");
+    assert_eq!(error.code(), "rpc/promise-resolved", "{error}");
+    assert_eq!(
+        record.state,
+        PromiseState::Resolved(Value::text("one")),
+        "the first value stays"
+    );
+}

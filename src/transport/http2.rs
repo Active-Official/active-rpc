@@ -201,6 +201,12 @@ impl Http2Server {
             let mut active = tokio::task::JoinSet::new();
             let mut refused = 0u32;
             while accepted < connection_budget {
+                // A JoinSet holds a completed task until joined; one entry per
+                // finished connection is small but unbounded in `connections`
+                // (round 30, L-5).
+                while let Some(done) = active.try_join_next() {
+                    let _ = done;
+                }
                 let (stream, _) = match listener.accept().await {
                     Ok(pair) => {
                         refused = 0;
@@ -510,15 +516,17 @@ where
         return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
     }
     let request_id = envelope.request_id;
-    let response = {
-        // A kernel handler is single-threaded and may block on the kernel
-        // loop; `block_in_place` moves the runtime worker aside instead of
-        // stalling every other stream on this runtime.
-        tokio::task::block_in_place(|| {
-            let mut handler = match handler.lock() {
-                Ok(handler) => handler,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+    // The handler and the encode run under one lock: a response is
+    // materialised for one stream at a time, so the in-flight budget bounds the
+    // peak instead of `worker_threads` responses existing before it is
+    // consulted (round 30, M-1). A kernel handler may block on the kernel
+    // loop; `block_in_place` moves the runtime worker aside.
+    let encoded = tokio::task::block_in_place(|| {
+        let mut handler = match handler.lock() {
+            Ok(handler) => handler,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let response =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(envelope))) {
                 Ok(response) => response,
                 Err(_) => Envelope::error(
@@ -527,10 +535,10 @@ where
                         code: "rpc/provider".to_string(),
                     },
                 ),
-            }
-        })
-    };
-    let encoded = match response.encode() {
+            };
+        response.encode()
+    });
+    let encoded = match encoded {
         Ok(encoded) => encoded,
         Err(error) => {
             return respond_status(
@@ -546,10 +554,13 @@ where
     // keeps its body charged (round 29, high).
     let held = reservation.held();
     if !reservation.reserve(encoded.len().saturating_sub(held), inflight_budget) {
+        // The handler has run and the kernel charged it; a retryable class
+        // would tell the caller to repeat a call that already took effect
+        // (round 30, M-2). `rpc/transport` is not retried.
         return respond_status(
             &mut respond,
-            StatusCode::TOO_MANY_REQUESTS,
-            b"rpc/backpressure",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"rpc/transport",
         );
     }
     if encoded.len() > MAX_BODY {
@@ -580,14 +591,33 @@ impl Reservation {
     }
 
     /// Reserve `bytes` if the connection stays under `limit`.
+    ///
+    /// A compare-exchange loop: `fetch_add` followed by a rollback let another
+    /// stream observe a transient overshoot and refuse a healthy reservation,
+    /// and a zero-byte reservation must never fail (round 30, L-3).
     fn reserve(&mut self, bytes: usize, limit: usize) -> bool {
-        let total = self.budget.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        if total > limit {
-            self.budget.fetch_sub(bytes, Ordering::Relaxed);
-            return false;
+        if bytes == 0 {
+            return true;
         }
-        self.held += bytes;
-        true
+        let mut current = self.budget.load(Ordering::SeqCst);
+        loop {
+            let Some(total) = current.checked_add(bytes) else {
+                return false;
+            };
+            if total > limit {
+                return false;
+            }
+            match self
+                .budget
+                .compare_exchange(current, total, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => {
+                    self.held = self.held.saturating_add(bytes);
+                    return true;
+                }
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
@@ -1009,11 +1039,27 @@ async fn read_response(
             .saturating_mul(8)
             .min(std::time::Duration::from_secs(30));
     let status = response.status();
-    let declared: Option<usize> = response
+    let mut lengths = response
         .headers()
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|text| text.parse().ok());
+        .get_all(http::header::CONTENT_LENGTH)
+        .iter();
+    let declared: Option<usize> = match lengths.next() {
+        Some(value) => {
+            let text = value.to_str().unwrap_or_default();
+            if lengths.next().is_some()
+                || text.is_empty()
+                || text.len() > 20
+                || !text.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(Error::Wire("malformed response length"));
+            }
+            match text.parse::<usize>() {
+                Ok(length) => Some(length),
+                Err(_) => return Err(Error::Wire("malformed response length")),
+            }
+        }
+        None => None,
+    };
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     loop {

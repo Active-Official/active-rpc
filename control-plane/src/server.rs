@@ -122,6 +122,11 @@ pub fn spawn_worker(read_only: bool) -> AppState {
     // an initial value.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Arc<Mutex<Snapshot>>>();
     let broadcast_thread = broadcast.clone();
+    // One heartbeat, shared with `/health`: the worker used to build its own
+    // and the API built a second, so the endpoint never advanced
+    // (audit ARPC-003).
+    let heartbeat: Arc<Mutex<Heartbeat>> = Arc::new(Mutex::new(Heartbeat::new(0)));
+    let heartbeat_worker = Arc::clone(&heartbeat);
     std::thread::Builder::new()
         .name("active-kernel".into())
         .spawn(move || {
@@ -129,8 +134,10 @@ pub fn spawn_worker(read_only: bool) -> AppState {
             core.set_mode(if read_only { "read-only" } else { "demo" });
             let first = core.snapshot();
             let latest: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(first.clone()));
-            let heartbeat: Arc<Mutex<Heartbeat>> =
-                Arc::new(Mutex::new(Heartbeat::new(first.uptime_ms)));
+            let heartbeat = heartbeat_worker;
+            if let Ok(mut beat) = heartbeat.lock() {
+                beat.observe(first.uptime_ms);
+            }
             let _ = broadcast_thread.send(first);
             if ready_tx.send(Arc::clone(&latest)).is_err() {
                 // The caller went away before the first snapshot; nothing to
@@ -260,13 +267,12 @@ pub fn spawn_worker(read_only: bool) -> AppState {
         .expect("the worker's first snapshot");
     // Seed the heartbeat from the first snapshot so a fresh process does not
     // read as stale before the first tick.
-    let uptime = latest.lock().map(|guard| guard.uptime_ms).unwrap_or(0);
     AppState {
         tx,
         latest,
         broadcast,
         read_only,
-        heartbeat: Arc::new(Mutex::new(Heartbeat::new(uptime))),
+        heartbeat,
     }
 }
 

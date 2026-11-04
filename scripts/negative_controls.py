@@ -107,12 +107,12 @@ CONTROLS = [
                 "replace": "                meter.check(0)?;\n",
             },
             {
-                # The dispatch-time re-check of a resolved argument list is the
-                # third guard: without it a mutated build still refuses the call
-                # and the control proves nothing.
+                # The dispatch-time re-check of the complete delivered request
+                # is the fourth guard: without it a mutated build still refuses
+                # the call and the control proves nothing.
                 "file": "src/kernel.rs",
-                "find": 'if failure.is_none() && resolved_bytes > effective_budget.max_bytes {\n                            failure = Some(Error::BudgetExceeded("byte"));\n                        }\n',
-                "replace": 'if false {\n                            failure = Some(Error::BudgetExceeded("byte"));\n                        }\n',
+                "find": "Some(delivered) if delivered <= effective_budget.max_bytes => {}",
+                "replace": "Some(delivered) if delivered <= u64::MAX => {}",
             },
         ],
         "suite": "redteam_tests",
@@ -135,8 +135,8 @@ CONTROLS = [
         "file": "src/promise.rs",
         "find": "    pub fn resolve(&mut self, value: Value) -> Result<()> {\n        match self.state {\n            PromiseState::Pending => {\n                self.state = PromiseState::Resolved(value);\n                Ok(())\n            }",
         "replace": "    pub fn resolve(&mut self, value: Value) -> Result<()> {\n        match self.state {\n            PromiseState::Pending => {\n                self.state = PromiseState::Resolved(value);\n                Ok(())\n            }\n            // no second settlement\n            _ => Ok(()),",
-        "suite": "unit_tests",
-        "test": "promise_can_be_cancelled_or_resolved_once",
+        "suite": "promise_tests",
+        "test": "a_promise_record_refuses_a_second_settlement",
         "why": "A promise accepts a second settlement, so the second resolve no longer errors.",
     },
 ]

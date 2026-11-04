@@ -74,4 +74,21 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 7. **Facade crates** (`active-rpc-*` 0.1.x) pin the kernel with a caret range and
    are released separately.
 8. **Benchmarks are single-host**; the tables record the methodology.
+9. **Windows process trees are killed leader-first.** The cleanup path no longer
+   spawns `taskkill` (whose path came from the mutable `SystemRoot`), so a
+   descendant that outlives its leader survives the kill. A job object is the
+   complete fix and needs `unsafe` FFI, which the crate forbids; the Unix path
+   still kills the whole process group.
+10. **Dropping the last handle of an exported durable capability does not
+    tombstone its record.** The sealed record stays restorable by design (an
+    operator may export for later restore); `Event::CapRecordOrphaned` reports
+    the window, and a deployment that treats drop as revocation must tombstone.
+11. **A durable record names a provider-local object id.** Restoring after a
+    provider rebuild can bind the record to a different logical object. The fix
+    needs a record-format version plus a provider epoch/stable-key callback
+    (audit ARPC-009); the seal and peer binding are enforced, semantic object
+    identity is not.
+12. **The wasm clock ADR is being aligned with the code** (`env.clock_ms` is the
+    kernel/embedder `now_ms`). Recorded until the ADR-0019 edit lands with the
+    documentation batch.
 

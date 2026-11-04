@@ -639,6 +639,29 @@ async fn serve_stream<H>(
         }
         _ => {}
     }
+    // Admission control: count the slot before the handler runs. Counting
+    // afterwards let concurrent streams all observe `served == 0` and overshoot
+    // `max_calls` (audit ARPC-006).
+    if max_calls != 0 {
+        let mut current = served.load(Ordering::SeqCst);
+        loop {
+            if current >= max_calls {
+                let error = Error::Transport("the server has served its calls".to_string());
+                reply(&mut send, &Envelope::error(envelope.request_id, &error)).await;
+                endpoint.close(0u32.into(), b"served");
+                return;
+            }
+            match served.compare_exchange(
+                current,
+                current.saturating_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
     let request_id = envelope.request_id;
     let response = {
         let mut handler = match handler.lock() {
@@ -659,18 +682,12 @@ async fn serve_stream<H>(
     // it grants parks `write_all` forever without this deadline. Reset the
     // stream instead of holding the task.
     reply(&mut send, &response).await;
-    if exhausted(&served, max_calls) {
+    if max_calls != 0 && served.load(Ordering::SeqCst) >= max_calls {
         // Give the peer a moment to drain the stream before the endpoint
         // closes; closing first would abort the response.
         let _ = tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped()).await;
         endpoint.close(0u32.into(), b"served");
     }
-}
-
-/// Count one served call and report whether the server's budget is spent.
-fn exhausted(served: &AtomicUsize, max_calls: usize) -> bool {
-    let total = served.fetch_add(1, Ordering::SeqCst) + 1;
-    max_calls != 0 && total >= max_calls
 }
 
 /// The authenticated identity of a QUIC peer, when the session carried a
