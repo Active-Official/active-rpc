@@ -598,20 +598,17 @@ fn both_process_streams_share_the_byte_grant() {
     #[cfg(not(windows))]
     let program = "/bin/sh";
     #[cfg(windows)]
-    let allowed = ["-NoProfile", "-Command", "*"];
-    #[cfg(not(windows))]
-    let allowed = ["-c", "*"];
-    #[cfg(windows)]
-    let argv = [
-        "-NoProfile",
-        "-Command",
-        "for /L %i in (1,1,64) do @echo a; for /L %j in (1,1,64) do @echo b 1>&2",
-    ];
+    let argv = ["-NoProfile", "-Command", "for /L %i in (1,1,64) do @echo a"];
     #[cfg(not(windows))]
     let argv = [
         "-c",
         "i=0; while [ $i -lt 64 ]; do echo a; echo b 1>&2; i=$((i+1)); done",
     ];
+    // Exact rules: a prefix rule would refuse the script's shell syntax before
+    // the output ceiling was ever reached. The script prints about 256 bytes
+    // between the two streams, more than the grant below, while the argument
+    // line itself fits.
+    let allowed = argv;
     #[cfg(windows)]
     let mut env = std::collections::BTreeMap::new();
     #[cfg(windows)]
