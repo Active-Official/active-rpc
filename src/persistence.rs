@@ -420,9 +420,14 @@ impl CapabilityRecord {
             .ok_or_else(|| Error::persistence("missing redact"))?;
         let path_scope = match value.get("path_scope") {
             None | Some(Json::Null) => None,
-            Some(Json::String(scope)) if !scope.is_empty() && scope.len() <= 1024 => {
+            Some(Json::String(scope))
+                if crate::security::valid_text(scope, crate::kernel::MAX_PATH_SCOPE_BYTES) =>
+            {
                 Some(scope.clone())
             }
+            // The mint refuses a scope that cannot be logged; refusing it here
+            // makes the fault `rpc/persistence` before the store is claimed
+            // (round 38, F6).
             Some(_) => return Err(Error::persistence("path scope is malformed")),
         };
         let topics = string_set(&value, "topics")?;
@@ -452,6 +457,12 @@ impl CapabilityRecord {
                     let name = item
                         .as_str()
                         .ok_or_else(|| Error::persistence("tool name is not a string"))?;
+                    if !crate::receipts::valid_method(name) {
+                        // The mint refuses such a name with `rpc/invalid-argument`
+                        // after the store claim is spent; a record is checked
+                        // against the same rule here (round 38, F6).
+                        return Err(Error::persistence("a record names a malformed tool"));
+                    }
                     names.insert(name.to_string());
                 }
                 Some(ToolPolicy {

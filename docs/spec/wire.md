@@ -186,7 +186,7 @@ a message.
 | `rpc/persistence` | a durable capability record is unsealed, already restored, bound to another peer, or names a provider this kernel does not have |
 | `rpc/unresolvable-promise` | the promise can never settle |
 | `rpc/provider` | the provider failed the call |
-| `rpc/domain` | an Active or Infinity domain operation failed; the Active class (e.g. `X001`) is carried in the local `Display` and trace only, not in the error envelope |
+| `rpc/domain` | an Active or Infinity domain operation failed; the Active class (e.g. `X001`) is carried in the local `Display` only, not on the wire or in the trace |
 | `rpc/payload` | a payload is not a valid Active Infinity image |
 | `rpc/wire` | the envelope is malformed or exceeds a limit |
 | `rpc/capability-table` | the capability table is malformed or disables a ceiling |

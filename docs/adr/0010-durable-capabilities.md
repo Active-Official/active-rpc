@@ -93,9 +93,11 @@ resurrection:
 
   `Agent::restore_capability_with(record, peer, Some(&mut store))` takes a
   [`crate::persistence::RecordStore`]: the deployment keeps the restored ids next
-  to its kill list, and a record is single-use across processes. The store is
-  marked only after the mint succeeds; a store that cannot write refuses the
-  restore and the minted capability is revoked. Without a store the record is a
+  to its kill list, and a record is single-use across processes. The record is
+  claimed **before** the mint: `claim` is the atomic check-and-mark, so a failed
+  mint leaves the claim spent (fail-closed: a retry is refused and the operator
+  reconciles) rather than allowing two processes to mint from one record.
+  Without a store the record is a
   single-use token **per process**, which is the fail-closed default for a
   deployment that has not built persistent storage yet.
 

@@ -482,12 +482,16 @@ pub struct Kernel {
     /// every capability to answer that was quadratic: dropping 20k capabilities
     /// took 1.33 s in a release build.
     object_records: BTreeMap<(ProviderId, u64), usize>,
-    /// Objects held alive by an exported, not-yet-restored durable record.
+    /// Objects held alive by an exported, not-yet-restored durable record,
+    /// keyed by record id.
     ///
     /// A record names its object, so the provider must not reclaim it while the
-    /// record is restorable. Kept apart from `object_records`, which mirrors the
-    /// live capability registry exactly (round 32, #3).
-    record_pins: BTreeMap<(ProviderId, u64), usize>,
+    /// record is restorable. The key is the record, not the object: two
+    /// deployment records can name the same provider object, and releasing by
+    /// object let an unrelated restore (or revoke) drop another record's pin
+    /// (round 32, #3; round 38, F1-F3). Kept apart from `object_records`,
+    /// which mirrors the live capability registry exactly.
+    record_pins: BTreeMap<[u8; 32], (ProviderId, u64)>,
     /// Reference operations that arrived while the kernel was borrowed.
     ///
     /// Shared with the handle control, which cannot borrow the kernel from a
@@ -1136,6 +1140,13 @@ impl Agent {
                 "the record was already exported and consumed",
             ));
         }
+        if kernel.revoked_records.contains(&record.record_id) {
+            // A restarted kernel with the same secret re-issues serials, so a
+            // fresh capability can carry an id a replayed kill list already
+            // holds: exporting it would burn the grant and hand out a dead
+            // credential (round 38, F2).
+            return Err(Error::Revoked(record_token(&record.record_id)));
+        }
         // The mark set is bounded: past the ceiling a new export is refused
         // rather than letting a long-lived kernel remember ids forever.
         if kernel.consumed_records.len() >= kernel.record_id_ceiling {
@@ -1214,7 +1225,7 @@ impl Agent {
                 .map_err(|_| Error::persistence("the grant is already committed"))?;
         }
         kernel.consumed_records.insert(record.record_id);
-        *kernel.record_pins.entry(pinned).or_insert(0) += 1;
+        kernel.record_pins.insert(record.record_id, pinned);
         kernel.push_event(Event::CapExported(cap.id()));
         Ok(record)
     }
@@ -1385,18 +1396,9 @@ impl Agent {
             .restored_records
             .insert(record.record_id);
         // The record is spent and the restored capability now holds the object:
-        // release the pin export took (round 32, #3). A failed mint above left
-        // the pin in place, which is the fail-closed side.
-        {
-            let mut kernel = self.cell.borrow_mut();
-            let key = (provider, record.object);
-            if let Some(count) = kernel.record_pins.get_mut(&key) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    kernel.record_pins.remove(&key);
-                }
-            }
-        }
+        // release exactly this record's pin (round 32, #3; round 38, F1). A
+        // failed mint above left the pin in place, the fail-closed side.
+        self.cell.borrow_mut().record_pins.remove(&record.record_id);
         // Keep the record identity: a revocation that reaches this capability
         // must tombstone the same record id the credential carries.
         if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {
@@ -1901,7 +1903,14 @@ impl Agent {
         {
             return Err(Error::BudgetExceeded("tombstones"));
         }
-        kernel.revoked_records.insert(record_id);
+        let newly = kernel.revoked_records.insert(record_id);
+        if newly {
+            // A tombstoned record can never be restored, and the documented
+            // orphan workflow drops the handle before the tombstone, so no live
+            // capability may be left to revoke: release the pin here
+            // (round 38, F3).
+            kernel.record_pins.remove(&record_id);
+        }
         let live: Vec<CapId> = kernel
             .caps
             .iter()
@@ -5179,12 +5188,14 @@ impl Kernel {
             // used to fire for every capability, so a provider that freed the
             // object when its first capability was dropped would free it while
             // a sibling could still call it.
+            let pinned = kernel
+                .record_pins
+                .values()
+                .any(|(provider, object)| *provider == record.provider && *object == record.object);
             if !kernel
                 .object_records
                 .contains_key(&(record.provider, record.object))
-                && !kernel
-                    .record_pins
-                    .contains_key(&(record.provider, record.object))
+                && !pinned
             {
                 kernel.queue_provider_drop(record.provider, record.object, id);
             }
@@ -5864,19 +5875,7 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
             let pinned_here = kernel.consumed_records.contains(&record_id)
                 && !kernel.restored_records.contains(&record_id);
             if newly && pinned_here {
-                if let Some(record) = kernel.caps.get(&id) {
-                    let key = (record.provider, record.object);
-                    let release = match kernel.record_pins.get_mut(&key) {
-                        Some(count) => {
-                            *count = count.saturating_sub(1);
-                            *count == 0
-                        }
-                        None => false,
-                    };
-                    if release {
-                        kernel.record_pins.remove(&key);
-                    }
-                }
+                kernel.record_pins.remove(&record_id);
             }
         }
         // A second revoke of the same capability is authority-correct but is

@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-37: round 37 found 1 high, 1 medium and 3 lows, all fixed; rounds 38-39 must be clean | 219 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-38: round 38 found 2 mediums and 6 lows, all fixed; rounds 39-40 must be clean | 227 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-31: round 31 found 8 lows, all fixed or shown not to hold; rounds 32-33 must be clean | 235 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,25 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 38)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `3bde2f3`.
+Round-37 fixes verified (three partial). Two mediums, six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the export pin was keyed by object, so restoring a different sealed record naming the same provider/object released another record's pin and the provider could reclaim a restorable object | **fixed**: `record_pins` is keyed by record id and every path (export, restore, revoke, tombstone) releases exactly its own record |
+| 2 | medium | export accepted a record id a replayed kill list already held, burning the grant and handing out a dead credential | **fixed**: export refuses `rpc/revoked` before any reserve |
+| 3 | low | tombstoning a record whose handle was already dropped never released its pin | **fixed**: `tombstone_record` releases by record id on the first insert |
+| 4 | low | a dotted or empty field name made a label resolve to a different node | **fixed**: field names may not be empty or contain `.`; binding names keep the dotted-path form and only the printability rule |
+| 5 | low | ADR-0010 described the store claim as after the mint | **fixed**: the ADR states the claim-before-mint fail-closed rule |
+| 6 | low | `from_json` accepted a scope or tool name the mint refuses, spending the store claim first | **fixed**: `valid_text`/`valid_method` at parse time, so the fault is `rpc/persistence` before the claim |
+| 7 | low | `wire.md` said the Active class reaches the trace | **fixed**: local `Display` only |
+| 8 | low | `observability::label`'s fast path missed invisible/reordering characters | **fixed**: it uses the crate's one rule |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-04 (round 37)
 

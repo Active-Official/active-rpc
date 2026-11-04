@@ -447,7 +447,15 @@ pub const MAX_LABEL_BYTES: usize = 128;
 /// character: the ellipsis is reserved for out of the budget, so the bound is
 /// the constant and not the constant plus three.
 pub fn label(text: &str) -> String {
-    if text.len() <= MAX_LABEL_BYTES && !text.chars().any(char::is_control) {
+    // The crate's one rule for text that must not reach a line log: control
+    // characters and invisible/reordering ones. The fast path used to check
+    // only `is_control`, so U+2028 and bidi overrides passed through
+    // (round 38, F8).
+    if text.len() <= MAX_LABEL_BYTES
+        && !text.chars().any(|character| {
+            character.is_control() || crate::security::is_invisible_or_reordering(character)
+        })
+    {
         return text.to_string();
     }
     let budget = MAX_LABEL_BYTES - '…'.len_utf8();

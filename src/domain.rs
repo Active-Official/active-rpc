@@ -1711,15 +1711,21 @@ fn redaction_fault(error: Error) -> Error {
 /// label is not an option (it must stay resolvable), so the module is refused
 /// at install (round 37, C).
 fn check_names(module: &InfinityModule) -> Result<()> {
-    let bad = |text: &str| {
-        text.chars().any(|character| {
-            character.is_control() || security::is_invisible_or_reordering(character)
-        })
+    let unprintable = |text: &str| {
+        text.is_empty()
+            || text.chars().any(|character| {
+                character.is_control() || security::is_invisible_or_reordering(character)
+            })
     };
+    // The label format joins field names with `.`, so a dotted field name makes
+    // a label name a different node than the one it describes (round 38, F4).
+    // A binding name is a dotted path by design, so only the printability rule
+    // applies to it.
+    let bad_field = |text: &str| unprintable(text) || text.contains('.');
     for node in module.nodes() {
         match node {
             Inode::Table { fields } | Inode::SchemaTable { fields, .. }
-                if fields.iter().any(|(name, _)| bad(name)) =>
+                if fields.iter().any(|(name, _)| bad_field(name)) =>
             {
                 return Err(Error::Payload(
                     "a module field name is not printable text".to_string(),
@@ -1728,7 +1734,7 @@ fn check_names(module: &InfinityModule) -> Result<()> {
             _ => {}
         }
     }
-    if module.bindings().iter().any(|(name, _)| bad(name)) {
+    if module.bindings().iter().any(|(name, _)| unprintable(name)) {
         return Err(Error::Payload(
             "a module binding name is not printable text".to_string(),
         ));

@@ -10,6 +10,11 @@ on:
 jobs:
   gates:
     runs-on: ubuntu-latest
+    env:
+      # Two concurrent rustc/link jobs instead of one per core: the runner's
+      # lld died with a bus error while linking ~90 test binaries at full
+      # parallelism (2026-11-04, twice). The suite is not the bottleneck.
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
