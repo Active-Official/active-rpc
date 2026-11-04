@@ -1720,3 +1720,20 @@ fn a_field_name_that_cannot_be_logged_is_refused_at_install() {
         .expect_err("a control character in a field name is refused");
     assert_eq!(error.code(), "rpc/payload", "{error}");
 }
+
+/// A dotted field name is refused: labels join fields with `.` and a dotted
+/// field would make a label name a different node (round 38, F4).
+#[test]
+fn a_dotted_field_name_is_refused_at_install() {
+    let mut module = InfinityModule::new();
+    let leaf = module.push(Inode::Int(1));
+    let root = module.push(Inode::Table {
+        fields: vec![("a.b".to_string(), leaf)],
+    });
+    module.set_root(Some(root));
+    let mut provider = ModuleProvider::new();
+    let error = provider
+        .install(module)
+        .expect_err("a dotted field name is ambiguous");
+    assert_eq!(error.code(), "rpc/payload", "{error}");
+}

@@ -407,6 +407,10 @@ impl Envelope {
 
     /// Serialize.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        // Encoding is documented as the inverse of decoding: a frame this
+        // crate would refuse must be refused locally, not by the peer
+        // (round 39, L-7).
+        self.check_limits(&WireLimits::default())?;
         let mut out = Vec::with_capacity(32 + self.payload.len());
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
@@ -451,7 +455,50 @@ impl Envelope {
                 write_cap(&mut out, cap)?;
             }
         }
+        if out.len() > WireLimits::default().max_bytes {
+            return Err(Error::Wire("envelope exceeds the size ceiling"));
+        }
         Ok(out)
+    }
+
+    /// Refuse an envelope this crate's own decoder would refuse.
+    fn check_limits(&self, limits: &WireLimits) -> Result<()> {
+        if self.method.len() > limits.max_method as usize {
+            return Err(Error::Wire("method name exceeds the ceiling"));
+        }
+        if self.args.len() > limits.max_args as usize {
+            return Err(Error::Wire("argument count exceeds the ceiling"));
+        }
+        if self.payload.len() > limits.max_payload as usize {
+            return Err(Error::Payload("payload exceeds the ceiling".to_string()));
+        }
+        if self.caps.len() > limits.max_caps as usize {
+            return Err(Error::CapabilityTable("too many descriptors"));
+        }
+        for cap in self
+            .caps
+            .iter()
+            .chain(self.cap_delta.iter().flat_map(|delta| delta.added.iter()))
+        {
+            if cap.methods.len() > limits.max_methods as usize {
+                return Err(Error::CapabilityTable("too many methods"));
+            }
+            if cap
+                .path_scope
+                .as_deref()
+                .is_some_and(|path| path.len() > limits.max_path as usize)
+            {
+                return Err(Error::CapabilityTable("path scope exceeds the ceiling"));
+            }
+        }
+        if let Some(delta) = &self.cap_delta {
+            if delta.removed.len() > limits.max_caps as usize
+                || delta.added.len() > limits.max_caps as usize
+            {
+                return Err(Error::CapabilityTable("delta exceeds the ceiling"));
+            }
+        }
+        Ok(())
     }
 
     /// Parse with default limits.

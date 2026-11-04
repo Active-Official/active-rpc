@@ -522,6 +522,12 @@ impl CapabilityRecord {
                 "a record carries a lease without a deadline",
             ));
         }
+        // The mirror shape: restore always refuses a bounded record with no
+        // lease (`a bounded record carries no lease`), so the parser must not
+        // advertise it (round 39, L-5).
+        if expires_at.is_some() && lease_ms.is_none() {
+            return Err(Error::persistence("a bounded record carries no lease"));
+        }
         let record_id = match value.get("record_id") {
             Some(Json::String(text)) => parse_hex32(text)?,
             _ => return Err(Error::persistence("missing record id")),

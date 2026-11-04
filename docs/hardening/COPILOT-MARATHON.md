@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-38: round 38 found 2 mediums and 6 lows, all fixed; rounds 39-40 must be clean | 227 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-39: round 39 found 2 mediums and 7 lows, all fixed; rounds 40-41 must be clean | 236 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-32: round 32 found 1 high, 2 mediums and 1 low, all fixed; rounds 33-34 must be clean | 239 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,27 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 39)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `fe885eb`
+(and the uncommitted pin follow-up). Round-38 fixes verified. Two mediums,
+seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | tombstoning an orphaned export removed the pin but never queued the provider drop | **fixed** in the follow-up commit; `a_tombstone_after_the_handle_is_dropped_releases_the_pin` fails against the round-38 kernel |
+| 2 | medium | rotating a capability to a new peer did not invalidate records exported for the old peer: a restorer that still admits the old certificate minted fresh authority | **fixed**: `reintroduce_to` tombstones every exported, unrestored record in the subtree (fail-closed on the tombstone ceiling); `a_rotation_tombstones_the_records_of_the_old_peer` fails pre-fix |
+| 3 | low | `drop_record` scanned every pin per drop | **fixed**: a `pin_counts` map keyed by object, maintained by the one release helper |
+| 4 | low | several round-38 fixes had no regression test | **fixed**: the replayed-tombstone export, the tombstone-after-drop, the dotted field name and the label rule all have tests now |
+| 5 | low | `from_json` accepted a deadline without a lease that restore always refuses | **fixed**: the mirror rule; `a_record_with_a_deadline_but_no_lease_is_refused_by_the_parser` |
+| 6 | low | `walk_weight` ignored provenance entries, and the provenance redaction runs before the wall check | **fixed**: provenance entries are part of the weight (the library's redaction budget bounds the rest) |
+| 7 | low | `Envelope::encode` could emit a frame its decoder refuses | **fixed**: `encode` validates against `WireLimits::default()` (methods, args, payload, caps, path, delta) and the red-team table bomb is now refused locally |
+| 8 | low | `RecordStore::is_restored`/`mark_restored` are dead and their docs implied the kernel reads them | **fixed**: both are documented as advisory; only `claim` is consulted, and the restore docstring matches |
+| 9 | low | `provider/redaction` was reported for a bridge `Encode` fault | **fixed**: a bare `Encode` is `rpc/domain` (`active/encode`); the redaction sites raise `provider/redaction` themselves |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-04 (round 38)
 

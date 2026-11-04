@@ -418,3 +418,13 @@ fn a_label_never_exceeds_its_declared_ceiling() {
     assert_eq!(label("rpc/budget-exceeded"), "rpc/budget-exceeded");
     assert!(label(&"x".repeat(1_000)).ends_with('…'));
 }
+
+/// The label rule covers invisible and reordering characters, not only
+/// control characters (round 38, F8).
+#[test]
+fn a_label_escapes_invisible_and_reordering_characters() {
+    let label = active_rpc::observability::label("a\u{2028}b\u{202e}c");
+    for hostile in ['\u{2028}', '\u{202e}'] {
+        assert!(!label.contains(hostile), "raw {hostile:?} in {label:?}");
+    }
+}

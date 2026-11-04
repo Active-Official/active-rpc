@@ -342,12 +342,12 @@ impl ModuleProvider {
                         };
                         Error::BudgetExceeded(kind)
                     }
-                    // The evaluator encodes the redacted copy itself; a failure
-                    // there is the provider's, not the caller's payload
-                    // (round 34, M-2).
-                    active_infinity::Error::Encode(_) => Error::Provider {
-                        code: "provider/redaction".to_string(),
-                    },
+                    // The evaluator's own encode failure is a bridge fault (a
+                    // schema type the Active core cannot represent, secret
+                    // material it refuses), not a redaction collision; the
+                    // redaction sites above raise `provider/redaction`
+                    // themselves (round 39, L-2).
+                    active_infinity::Error::Encode(_) => Error::Domain("active/encode"),
                     other => Error::Payload(other.code().to_string()),
                 })?;
                 // The conversion recurses; a result deeper than the wire can
@@ -1018,6 +1018,13 @@ fn walk_weight(module: &InfinityModule) -> u64 {
         .saturating_add(references.saturating_sub(nodes))
         .saturating_add(module.annotations().len() as u64)
         .saturating_add(module.bindings().len() as u64)
+        // Provenance text is redacted against every secret literal, so its
+        // entry count belongs to the same walk weight (round 39, L-6).
+        .saturating_add(
+            module
+                .provenance()
+                .map_or(0, |provenance| provenance.entries.len() as u64),
+        )
 }
 
 /// Refuse a metadata query that has run past the capability's wall ceiling.

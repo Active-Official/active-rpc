@@ -572,3 +572,49 @@ fn an_export_refuses_a_tombstoned_record_id() {
     assert_eq!(error.code(), "rpc/revoked", "{error}");
     let _ = provider;
 }
+
+/// Rotating a capability's peer invalidates any exported record for the old
+/// peer: the credential was bound to the identity the rotation removes
+/// (round 39, M-2).
+#[test]
+fn a_rotation_tombstones_the_records_of_the_old_peer() {
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    let old = peer(b"durable-owner");
+    let new = admitted(b"rotated-owner");
+    agent
+        .reintroduce_to(&cap, &old, &new)
+        .expect("rotate the binding");
+    let error = agent
+        .restore_capability(&record, &admitted(b"durable-owner"))
+        .expect_err("the old peer's record is tombstoned");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+/// The parser refuses a record with a deadline but no lease, the shape restore
+/// always refuses: it must not advertise a record it can never serve
+/// (round 39, L-5).
+#[test]
+fn a_record_with_a_deadline_but_no_lease_is_refused_by_the_parser() {
+    let agent = Agent::with_secret([0x71; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x97; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    attrs.ttl_ms = Some(60_000);
+    let owner = admitted(b"durable-owner");
+    let cap = agent
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect("durable cap");
+    let record = agent.export_capability(&cap).expect("export");
+    let mut value: serde_json::Value = serde_json::from_str(&record.to_json()).expect("json");
+    value["lease_ms"] = serde_json::Value::Null;
+    assert!(
+        value["expires_at"].is_number(),
+        "the fixture has a deadline"
+    );
+    let text = serde_json::to_string(&value).expect("serialize");
+    let error = CapabilityRecord::from_json(&text).expect_err("no lease");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+}

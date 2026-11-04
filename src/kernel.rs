@@ -492,6 +492,9 @@ pub struct Kernel {
     /// (round 32, #3; round 38, F1-F3). Kept apart from `object_records`,
     /// which mirrors the live capability registry exactly.
     record_pins: BTreeMap<[u8; 32], (ProviderId, u64, CapId)>,
+    /// How many pins name each object: `drop_record` must not scan the map on
+    /// the unbudgeted drop path (round 39, L-3).
+    pin_counts: BTreeMap<(ProviderId, u64), usize>,
     /// Reference operations that arrived while the kernel was borrowed.
     ///
     /// Shared with the handle control, which cannot borrow the kernel from a
@@ -859,6 +862,7 @@ impl Agent {
             children: BTreeMap::new(),
             object_records: BTreeMap::new(),
             record_pins: BTreeMap::new(),
+            pin_counts: BTreeMap::new(),
             deferred_refops: Rc::clone(&deferred_refops),
         };
         let cell: KernelCell = Rc::new(RefCell::new(kernel));
@@ -1228,6 +1232,7 @@ impl Agent {
         kernel
             .record_pins
             .insert(record.record_id, (pinned.0, pinned.1, cap.id()));
+        *kernel.pin_counts.entry(pinned).or_insert(0) += 1;
         kernel.push_event(Event::CapExported(cap.id()));
         Ok(record)
     }
@@ -1259,9 +1264,10 @@ impl Agent {
     /// [`crate::persistence::RecordStore`] here, so the record is single-use
     /// across kernels and restarts.
     ///
-    /// The store is marked only after the mint succeeds; if marking fails the
-    /// minted capability is revoked and the refusal returned, so a store that
-    /// cannot remember never leaves a usable grant behind.
+    /// The record is claimed atomically before the mint: `claim` is the
+    /// check-and-mark step, so a failed mint leaves the claim spent rather than
+    /// letting a second process restore the same record (fail-closed, ADR-0010;
+    /// round 39, L-1).
     pub fn restore_capability_with(
         &self,
         record: &crate::persistence::CapabilityRecord,
@@ -1400,7 +1406,7 @@ impl Agent {
         // The record is spent and the restored capability now holds the object:
         // release exactly this record's pin (round 32, #3; round 38, F1). A
         // failed mint above left the pin in place, the fail-closed side.
-        self.cell.borrow_mut().record_pins.remove(&record.record_id);
+        release_pin(&mut self.cell.borrow_mut(), record.record_id);
         // Keep the record identity: a revocation that reaches this capability
         // must tombstone the same record id the credential carries.
         if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {
@@ -1747,6 +1753,27 @@ impl Agent {
                 }
             }
         }
+        // A credential exported for the old peer is authority the rotation
+        // exists to remove: tombstone every exported, unrestored record in the
+        // subtree (round 39, M-2). The kill set is bounded, and a full set
+        // fails the rotation closed.
+        let mut records: Vec<[u8; 32]> = std::iter::once(cap.id())
+            .chain(descendants_of(&kernel.children, cap.id()))
+            .filter_map(|id| kernel.caps.get(&id).map(|record| record.record_id))
+            .filter(|record_id| kernel.record_pins.contains_key(record_id))
+            .collect();
+        records.sort_unstable();
+        records.dedup();
+        let fresh = records
+            .iter()
+            .filter(|record_id| !kernel.revoked_records.contains(*record_id))
+            .count();
+        if kernel.revoked_records.len().saturating_add(fresh) > MAX_TOMBSTONES {
+            return Err(Error::BudgetExceeded("tombstones"));
+        }
+        for record_id in records {
+            mark_tombstoned(&mut kernel, record_id);
+        }
         let record = kernel
             .caps
             .get(&cap.id())
@@ -1905,23 +1932,12 @@ impl Agent {
         {
             return Err(Error::BudgetExceeded("tombstones"));
         }
-        let newly = kernel.revoked_records.insert(record_id);
-        if newly {
-            // A tombstoned record can never be restored, and the documented
-            // orphan workflow drops the handle before the tombstone, so no live
-            // capability may be left to revoke: release the pin here and, when
-            // nothing else names the object, let the provider reclaim it
-            // (round 38, F3).
-            if let Some((provider, object, cap)) = kernel.record_pins.remove(&record_id) {
-                let still_pinned = kernel
-                    .record_pins
-                    .values()
-                    .any(|(other, target, _)| *other == provider && *target == object);
-                if !still_pinned && !kernel.object_records.contains_key(&(provider, object)) {
-                    kernel.queue_provider_drop(provider, object, cap);
-                }
-            }
-        }
+        // A tombstoned record can never be restored, and the documented
+        // orphan workflow drops the handle before the tombstone, so no live
+        // capability may be left to revoke: the helper releases the pin and,
+        // when nothing else names the object, lets the provider reclaim it
+        // (round 38, F3).
+        mark_tombstoned(&mut kernel, record_id);
         let live: Vec<CapId> = kernel
             .caps
             .iter()
@@ -5199,9 +5215,9 @@ impl Kernel {
             // used to fire for every capability, so a provider that freed the
             // object when its first capability was dropped would free it while
             // a sibling could still call it.
-            let pinned = kernel.record_pins.values().any(|(provider, object, _)| {
-                *provider == record.provider && *object == record.object
-            });
+            let pinned = kernel
+                .pin_counts
+                .contains_key(&(record.provider, record.object));
             if !kernel
                 .object_records
                 .contains_key(&(record.provider, record.object))
@@ -5885,7 +5901,10 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
             let pinned_here = kernel.consumed_records.contains(&record_id)
                 && !kernel.restored_records.contains(&record_id);
             if newly && pinned_here {
-                kernel.record_pins.remove(&record_id);
+                // The tombstone makes the record unrestorable, so the pin must
+                // go with it, and the object is reclaimed when nothing else
+                // names it (round 37, A; round 39, L-3 keeps the count).
+                release_pin(kernel, record_id);
             }
         }
         // A second revoke of the same capability is authority-correct but is
@@ -5896,6 +5915,37 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
             kernel.metrics.revocations = kernel.metrics.revocations.saturating_add(1);
         }
     }
+}
+
+/// Release a record's export pin and, when no other pin and no live capability
+/// names the object, let its provider reclaim it.
+///
+/// A restore calls this because the restored capability now holds the object; a
+/// tombstone because the record can never be restored (round 38, F3).
+fn release_pin(kernel: &mut Kernel, record_id: [u8; 32]) {
+    let Some((provider, object, cap)) = kernel.record_pins.remove(&record_id) else {
+        return;
+    };
+    let key = (provider, object);
+    if let Some(count) = kernel.pin_counts.get_mut(&key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            kernel.pin_counts.remove(&key);
+        }
+    }
+    if !kernel.pin_counts.contains_key(&key) && !kernel.object_records.contains_key(&key) {
+        kernel.queue_provider_drop(provider, object, cap);
+    }
+}
+
+/// Insert a tombstone and release its pin; `false` when it was already
+/// tombstoned.
+fn mark_tombstoned(kernel: &mut Kernel, record_id: [u8; 32]) -> bool {
+    let newly = kernel.revoked_records.insert(record_id);
+    if newly {
+        release_pin(kernel, record_id);
+    }
+    newly
 }
 
 /// Fingerprint of an argument list: shape and content, no secret bytes.

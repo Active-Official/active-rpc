@@ -12,7 +12,7 @@ use active_rpc::kernel::{Event, Provider};
 use active_rpc::transport::shm::{SharedMemoryTransport, SharedSegment};
 use active_rpc::transport::Transport;
 use active_rpc::value::{Arg, Call, Response, Value};
-use active_rpc::wire::{CapDescriptor, Envelope, WireLimits};
+use active_rpc::wire::{CapDescriptor, Envelope};
 use active_rpc::{Agent, Budget};
 
 const SOURCE: &str = r#"
@@ -296,12 +296,12 @@ fn threat_malformed_frames_and_bombs() {
     }];
     caps[0].methods = (0..1000).map(|index| format!("m{index}")).collect();
     let envelope = Envelope::request(1, "stats", vec![]).with_caps(caps);
-    let bytes = envelope.encode().unwrap();
-    let error = Envelope::decode_with(&bytes, WireLimits::strict()).unwrap_err();
-    assert!(
-        error.code() == "rpc/capability-table" || error.code() == "rpc/wire",
-        "unexpected {error:?}"
-    );
+    // The encoder refuses a table its own decoder would refuse, so the bomb is
+    // stopped locally instead of at the peer (round 39, L-7).
+    let error = envelope
+        .encode()
+        .expect_err("the descriptor is over the method ceiling");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
 
     // A shared-memory frame that is not an envelope is refused.
     let segment = SharedSegment::new(1024);
