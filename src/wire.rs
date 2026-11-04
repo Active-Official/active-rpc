@@ -349,7 +349,13 @@ impl Envelope {
     pub const MAX_ENVELOPE_PROVIDER_CODE: usize = 64;
 
     fn bounded_provider_code(code: &str) -> &str {
-        if code.len() <= Self::MAX_ENVELOPE_PROVIDER_CODE && code.is_ascii() {
+        // ASCII, bounded, and free of control or reordering characters: a
+        // provider code may embed OS text, and a newline would forge a line in
+        // the peer's error log (round 37, D).
+        let clean = code.chars().all(|character| {
+            !character.is_control() && !crate::security::is_invisible_or_reordering(character)
+        });
+        if code.len() <= Self::MAX_ENVELOPE_PROVIDER_CODE && code.is_ascii() && clean {
             code
         } else {
             "rpc/provider"

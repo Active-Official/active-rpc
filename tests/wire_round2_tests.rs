@@ -267,3 +267,17 @@ fn an_overlong_provider_code_falls_back_to_the_class() {
     );
     assert_eq!(short.method, "provider/object");
 }
+
+/// A provider code carrying a control character falls back to the class: a
+/// newline in an OS-derived code would forge a line in the peer's log
+/// (round 37, D).
+#[test]
+fn a_provider_code_cannot_carry_a_control_character() {
+    let envelope = Envelope::error(
+        7,
+        &active_rpc::Error::Provider {
+            code: "process/spawn:bad\nFAKE rpc/read-only".to_string(),
+        },
+    );
+    assert_eq!(envelope.method, "rpc/provider");
+}

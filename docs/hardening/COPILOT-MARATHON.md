@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-36: round 36 found 1 medium and 4 lows, all fixed or documented; rounds 37-38 must be clean | 214 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-37: round 37 found 1 high, 1 medium and 3 lows, all fixed; rounds 38-39 must be clean | 219 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-30: round 30 found 1 medium and 5 lows, all fixed, rejected with evidence, or recorded; rounds 31-32 must be clean | 228 fixed / 2 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,22 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 37)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `aeba3f2`.
+Round-36 fixes verified (one partial). One **high**, one medium, three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the round-36 pin release ran for every revoked durable capability, not once per export: a repeated revoke, an unexported sibling, a restored record or a replayed tombstone released another record's pin, so a restorable record could lose its object | **fixed**: only the first tombstone of a record this kernel exported and never restored releases the pin; `a_sibling_revoke_does_not_release_an_export_pin` fails pre-fix and the dead drop-queue branch is gone |
+| 2 | medium | a redacted `subgraph`/`patch` cone dropped `@ai_immutable`, the one guard the cone is supposed to keep | **fixed**: `keep_annotations_outside` keeps an immutable flag (it names no content); `a_redacting_cone_keeps_the_immutability_guard` fails pre-fix |
+| 3 | low | a module field or binding name carrying a control character was served verbatim in a dotted label | **fixed**: `check_names` refuses it at install (`rpc/payload`); a label must stay resolvable, so it is not scrubbed |
+| 4 | low | a provider code could carry a control character into the error envelope | **fixed**: `bounded_provider_code` also rejects control and invisible/reordering characters; `a_provider_code_cannot_carry_a_control_character` |
+| 5 | low | `wire.md` said `rpc/domain` carries the Active class, which the envelope has no field for | **fixed**: the doc says the class is local to `Display` and the trace |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-04 (round 36)
 

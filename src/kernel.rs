@@ -5855,24 +5855,26 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
             None => None,
         };
         if let Some(record_id) = record_id {
-            kernel.revoked_records.insert(record_id);
-            // A tombstoned record can never be restored, so its object pin can
-            // never be released by a restore: release it here and let the
-            // provider reclaim the object once no live capability names it
-            // (round 36, L-3).
-            if let Some(record) = kernel.caps.get(&id) {
-                let key = (record.provider, record.object);
-                let release = match kernel.record_pins.get_mut(&key) {
-                    Some(count) => {
-                        *count = count.saturating_sub(1);
-                        *count == 0
-                    }
-                    None => false,
-                };
-                if release {
-                    kernel.record_pins.remove(&key);
-                    if !kernel.object_records.contains_key(&key) {
-                        kernel.queue_provider_drop(key.0, key.1, id);
+            let newly = kernel.revoked_records.insert(record_id);
+            // Only the *first* tombstone of a record this kernel exported and
+            // never restored releases an export pin. A repeated revoke, a
+            // sibling revoke or a replayed tombstone must not release a pin
+            // that belongs to another restorable record (round 37, A); the
+            // object then stays alive until `drop_record` sees it unpinned.
+            let pinned_here = kernel.consumed_records.contains(&record_id)
+                && !kernel.restored_records.contains(&record_id);
+            if newly && pinned_here {
+                if let Some(record) = kernel.caps.get(&id) {
+                    let key = (record.provider, record.object);
+                    let release = match kernel.record_pins.get_mut(&key) {
+                        Some(count) => {
+                            *count = count.saturating_sub(1);
+                            *count == 0
+                        }
+                        None => false,
+                    };
+                    if release {
+                        kernel.record_pins.remove(&key);
                     }
                 }
             }

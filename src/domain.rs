@@ -131,6 +131,7 @@ impl ModuleProvider {
         // (R-07 round 10, critical).
         let module = active_infinity::decode(&bytes)
             .map_err(|error| Error::Payload(error.code().to_string()))?;
+        check_names(&module)?;
         let redactor = security::redactor_for(&module);
         let walk_weight = walk_weight(&module);
         Ok(self.install_slot(ModuleSlot {
@@ -153,6 +154,7 @@ impl ModuleProvider {
             .map_err(|error| Error::Payload(error.code().to_string()))?;
         let module = active_infinity::decode(bytes)
             .map_err(|error| Error::Payload(error.code().to_string()))?;
+        check_names(&module)?;
         let hash = active_infinity::content_hash(bytes)
             .map_err(|error| Error::Payload(error.code().to_string()))?;
         let redactor = security::redactor_for(&module);
@@ -1701,6 +1703,39 @@ fn redaction_fault(error: Error) -> Error {
 /// so a module returned by `subgraph` or `patch` is a redacted projection: the
 /// structure survives, the material does not. A caller that needs the raw module
 /// moves it through a transport payload, not through a capability result.
+/// Refuse a module whose field or binding name cannot be logged safely.
+///
+/// A field or binding name reaches a caller as a dotted label, and every other
+/// caller-controlled name in the crate is bounded and de-formatted; one that
+/// carries a newline could forge a log line at the receiver. Scrubbing the
+/// label is not an option (it must stay resolvable), so the module is refused
+/// at install (round 37, C).
+fn check_names(module: &InfinityModule) -> Result<()> {
+    let bad = |text: &str| {
+        text.chars().any(|character| {
+            character.is_control() || security::is_invisible_or_reordering(character)
+        })
+    };
+    for node in module.nodes() {
+        match node {
+            Inode::Table { fields } | Inode::SchemaTable { fields, .. }
+                if fields.iter().any(|(name, _)| bad(name)) =>
+            {
+                return Err(Error::Payload(
+                    "a module field name is not printable text".to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if module.bindings().iter().any(|(name, _)| bad(name)) {
+        return Err(Error::Payload(
+            "a module binding name is not printable text".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn redacted_module_bytes(module: &InfinityModule) -> Result<Vec<u8>> {
     // One implementation, shared with the security helpers: a second copy of
     // the redactor would drift, and the one that drifted would be the leak.
@@ -1745,7 +1780,13 @@ fn keep_annotations_outside(module: &mut InfinityModule, tainted: &BTreeSet<Node
     let kept: Vec<(NodeId, AnnotationKind)> = module
         .annotations()
         .iter()
-        .filter(|annotation| !tainted.contains(&annotation.node))
+        .filter(|annotation| {
+            // `@ai_immutable` is a boolean guard, not content: a redacted cone
+            // must keep it, or the recipient may rewrite a node the module
+            // marked immutable (round 37, B).
+            matches!(annotation.kind, AnnotationKind::AiImmutable(_))
+                || !tainted.contains(&annotation.node)
+        })
         .map(|annotation| (annotation.node, annotation.kind.clone()))
         .collect();
     if kept.len() == module.annotations().len() {

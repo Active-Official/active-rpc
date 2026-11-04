@@ -1620,3 +1620,103 @@ fn a_wide_table_is_refused_against_the_node_ceiling_before_the_walk() {
         );
     }
 }
+
+/// Revoking a sibling durable capability must not release the export pin of a
+/// restorable record on the same object: the provided object must stay alive
+/// for the restore (round 37, A).
+#[test]
+fn a_sibling_revoke_does_not_release_an_export_pin() {
+    let mut module = InfinityModule::new();
+    let root = module.push(Inode::Str("app".to_string()));
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x79; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x95; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.persistence = active_rpc::CapPersistence::Durable;
+    let owner = active_rpc::IdentityPolicy::default()
+        .admit(
+            Some(&active_rpc::PeerIdentity::from_certificate(b"pin-owner")),
+            true,
+        )
+        .expect("admitted");
+    let exported = agent
+        .mint_bound(&owner, id, object, attrs.clone())
+        .expect("cap A");
+    let sibling = agent.mint_bound(&owner, id, object, attrs).expect("cap B");
+    let record = agent.export_capability(&exported).expect("export A");
+    // B is durable but was never exported; revoking it must not touch A's pin.
+    agent.revoke(&sibling).expect("revoke B");
+    drop(sibling);
+    drop(exported);
+    let drops = agent.take_drops(id);
+    assert!(
+        drops.is_empty(),
+        "the restorable record lost its object: {drops:?}"
+    );
+    let restored = agent
+        .restore_capability(&record, &owner)
+        .expect("restore A");
+    let lane = agent
+        .create_lane("r10-pin", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(Some(owner.identity()), lane, &restored, "stats", Vec::new())
+        .expect("queued");
+    agent.run();
+    promise.value().expect("the object is still served");
+}
+
+/// A redacted cone keeps `@ai_immutable`: the flag is a guard, not content
+/// (round 37, B).
+#[test]
+fn a_redacting_cone_keeps_the_immutability_guard() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let root = module.push(Inode::Table {
+        fields: vec![("pw".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+    module.annotate(secret, AnnotationKind::AiImmutable(true));
+
+    let (agent, cap, lane) = install(module, &["subgraph"], None, true);
+    let promise = agent
+        .call(lane, &cap, "subgraph", vec![path("pw")])
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("subgraph");
+    let Value::Module(bytes) = value else {
+        panic!("subgraph returns a module: {value:?}");
+    };
+    let cone = active_rpc::domain::decode_module(&bytes).expect("decode");
+    assert!(
+        cone.annotations()
+            .iter()
+            .any(|annotation| matches!(annotation.kind, AnnotationKind::AiImmutable(_))),
+        "the guard was dropped: {:?}",
+        cone.annotations()
+    );
+}
+
+/// A field name that cannot be logged safely is refused at install: a label is
+/// a dotted path and must stay resolvable, so it is refused instead of
+/// scrubbed (round 37, C).
+#[test]
+fn a_field_name_that_cannot_be_logged_is_refused_at_install() {
+    let mut module = InfinityModule::new();
+    let leaf = module.push(Inode::Int(1));
+    let root = module.push(Inode::Table {
+        fields: vec![("a\nFAKE rpc/admitted".to_string(), leaf)],
+    });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let error = provider
+        .install(module)
+        .expect_err("a control character in a field name is refused");
+    assert_eq!(error.code(), "rpc/payload", "{error}");
+}

@@ -186,7 +186,7 @@ a message.
 | `rpc/persistence` | a durable capability record is unsealed, already restored, bound to another peer, or names a provider this kernel does not have |
 | `rpc/unresolvable-promise` | the promise can never settle |
 | `rpc/provider` | the provider failed the call |
-| `rpc/domain` | an Active or Infinity domain operation failed (the message carries the Active class, e.g. `X001`) |
+| `rpc/domain` | an Active or Infinity domain operation failed; the Active class (e.g. `X001`) is carried in the local `Display` and trace only, not in the error envelope |
 | `rpc/payload` | a payload is not a valid Active Infinity image |
 | `rpc/wire` | the envelope is malformed or exceeds a limit |
 | `rpc/capability-table` | the capability table is malformed or disables a ceiling |
@@ -213,8 +213,8 @@ otherwise, so the destination field stays decodable under the strict profile.
 | `provider/redaction` | the provider could not build its redacted projection (an encode fault in its own reply) |
 | `provider/object` | the capability names an object the provider no longer holds |
 
-The domain provider reports `rpc/domain` with the Active class where the
-evaluator failed, and `rpc/budget-exceeded` with the dimension it measured
+The domain provider reports `rpc/domain` where the evaluator failed (the Active
+class stays local) and `rpc/budget-exceeded` with the dimension it measured
 (`nodes`, `keys`, `value`, `depth`, `wall`, `array_len`).
 
 ### MCP adapter codes
