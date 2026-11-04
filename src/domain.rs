@@ -60,6 +60,9 @@ pub const METHODS: &[&str] = &[
 struct ModuleSlot {
     module: InfinityModule,
     hash: Option<[u8; 32]>,
+    /// Work a metadata walk may do: nodes, excess references, annotations and
+    /// bindings (see [`walk_weight`]).
+    walk_weight: u64,
     /// Cached hash of the redacted projection.
     ///
     /// A secret-bearing module is hashed in redacted form on every
@@ -129,9 +132,11 @@ impl ModuleProvider {
         let module = active_infinity::decode(&bytes)
             .map_err(|error| Error::Payload(error.code().to_string()))?;
         let redactor = security::redactor_for(&module);
+        let walk_weight = walk_weight(&module);
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
+            walk_weight,
             redacted_hash: None,
             redactor,
         }))
@@ -151,9 +156,11 @@ impl ModuleProvider {
         let hash = active_infinity::content_hash(bytes)
             .map_err(|error| Error::Payload(error.code().to_string()))?;
         let redactor = security::redactor_for(&module);
+        let walk_weight = walk_weight(&module);
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
+            walk_weight,
             redacted_hash: None,
             redactor,
         }))
@@ -251,7 +258,7 @@ impl ModuleProvider {
         let started = std::time::Instant::now();
         match call.method.as_str() {
             "evaluate" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 let budget = call.budget.to_active_budget();
                 let (value, _diagnostics) = match Self::path_arg(call) {
                     Some(path) => {
@@ -354,7 +361,7 @@ impl ModuleProvider {
                 Ok(Response::Value(converted))
             }
             "why" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
                 let dependencies = transitive(&slot.module, node, true);
                 // A scoped answer describes the scope. Following a reference to
@@ -382,7 +389,7 @@ impl ModuleProvider {
                 Ok(Response::Labels(answer))
             }
             "impact" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
                 let dependents = transitive(&slot.module, node, false);
                 if let Some(scope) = &call.path_scope {
@@ -410,7 +417,7 @@ impl ModuleProvider {
                 Ok(Response::Labels(answer))
             }
             "subgraph" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
                 if let Some(scope) = &call.path_scope {
                     let (outside, environment) =
@@ -464,7 +471,7 @@ impl ModuleProvider {
                 if call.read_only {
                     return Err(Error::ReadOnly);
                 }
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 // The parent hash is the pre-patch content address: it is what
                 // the new provenance records as its parent, so the lineage of an
                 // audited module survives a write.
@@ -625,15 +632,17 @@ impl ModuleProvider {
                     .map_err(|error| Error::Payload(error.code().to_string()))?;
                 let hash = active_infinity::content_hash(&canonical)
                     .map_err(|error| Error::Payload(error.code().to_string()))?;
+                let weight = walk_weight(&decoded);
                 slot.module = decoded;
                 slot.hash = Some(hash);
+                slot.walk_weight = weight;
                 // The reply changed, and the redacted projection is derived
                 // from it (round 32, #8).
                 slot.redacted_hash = None;
                 Ok(Response::Module(bytes))
             }
             "dependents" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
                 // The entry node is part of the answer's meaning: an alias can
                 // name an outside node, and checking only the result set let a
@@ -669,7 +678,7 @@ impl ModuleProvider {
                 Ok(Response::Labels(answer))
             }
             "dependencies" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 let (path, node) = self.resolve(&slot.module, call)?;
                 // As in `dependents`: the entry node must be named by the scope.
                 if let Some(scope) = &call.path_scope {
@@ -703,7 +712,7 @@ impl ModuleProvider {
                 Ok(Response::Labels(answer))
             }
             "content_hash" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 // A hash names the whole module: under a scope it would answer a
                 // question about data the capability was never granted, and it
                 // is an equality oracle for the parts outside the scope.
@@ -784,7 +793,7 @@ impl ModuleProvider {
                 ))
             }
             "stats" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 let module = &slot.module;
                 let mut map = BTreeMap::new();
                 // A size is an oracle over the secret cone: a redacting caller
@@ -797,7 +806,11 @@ impl ModuleProvider {
                     map.insert("edges".to_string(), Value::Int(module.edges().len() as i64));
                 }
                 // `security.md` promises a redacting capability learns that a
-                // cone is tainted, never how many secrets it holds.
+                // cone is tainted, never how many secrets `stats` holds. The
+                // redacted projections (`evaluate`, `subgraph`) still preserve
+                // structure, so they reveal the count and positions of secret
+                // nodes; the security spec states that trade-off explicitly
+                // (round 36, L-5).
                 if !call.redact {
                     let live = module
                         .nodes()
@@ -825,7 +838,7 @@ impl ModuleProvider {
                 Ok(Response::Value(Value::Map(map)))
             }
             "annotations" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 let module = &slot.module;
                 // The taint walk is only needed when the capability redacts.
                 let tainted_ids = if call.redact {
@@ -873,7 +886,7 @@ impl ModuleProvider {
                 Ok(Response::Value(Value::List(out)))
             }
             "provenance" => {
-                check_node_budget(&slot.module, call)?;
+                check_node_budget(slot, call)?;
                 // A raw content address over the secret heap is an offline
                 // oracle, so a secret-bearing module hides it from every
                 // capability, exactly like `content_hash` (round 13, H2).
@@ -975,26 +988,34 @@ impl Provider for ModuleProvider {
 /// These methods do no evaluator work, so nothing else bounds them: without
 /// this check a `why` on a large installed module burns unbounded CPU for one
 /// charged call.
-fn check_node_budget(module: &InfinityModule, call: &Call) -> Result<()> {
-    if module.node_count() as u64 > call.budget.max_nodes {
-        return Err(Error::BudgetExceeded("nodes"));
-    }
-    // Annotations are extra records, each carrying text the metadata walks and
-    // the scope closure scan; they are charged against the same node ceiling
-    // so a module with one per node cannot make one charged call quadratic
-    // (round 23, #5). The kind is `nodes` for both counts: a distinct label
-    // would let a redacting or scoped caller binary-search a size `stats`
+fn check_node_budget(slot: &ModuleSlot, call: &Call) -> Result<()> {
+    // The weight is computed once, at install and after each patch: a node
+    // ceiling bounds nodes, not references, and a two-node module whose root is
+    // a table with a million fields passed a `max_nodes = 4` check and spent
+    // 261 ms under a 5 ms grant (round 36, M-1). Counting it here would do the
+    // work the ceiling exists to refuse. Annotations and bindings are part of
+    // the same weight: each is a record the metadata walks scan (round 23, #5;
+    // round 35, L-3). The dimension is `nodes` for all of them: a distinct
+    // label would let a redacting or scoped caller binary-search a size `stats`
     // deliberately hides (round 24, F6).
-    if module.annotations().len() as u64 > call.budget.max_nodes {
-        return Err(Error::BudgetExceeded("nodes"));
-    }
-    // A binding is not a node, but every label and metadata pass walks the
-    // table: 200 000 names on a two-node module bought a ~500 ms call under a
-    // five-millisecond grant (round 35, L-3).
-    if module.bindings().len() as u64 > call.budget.max_nodes {
+    if slot.walk_weight > call.budget.max_nodes {
         return Err(Error::BudgetExceeded("nodes"));
     }
     Ok(())
+}
+
+/// The work a metadata walk may do on `module`: its nodes, the references past
+/// one per node, its annotations and its bindings.
+fn walk_weight(module: &InfinityModule) -> u64 {
+    let nodes = module.node_count() as u64;
+    let mut references = 0u64;
+    for node in module.nodes() {
+        references = references.saturating_add(node.children().len() as u64);
+    }
+    nodes
+        .saturating_add(references.saturating_sub(nodes))
+        .saturating_add(module.annotations().len() as u64)
+        .saturating_add(module.bindings().len() as u64)
 }
 
 /// Refuse a metadata query that has run past the capability's wall ceiling.
@@ -1581,11 +1602,19 @@ fn scoped_labels(
     call: &Call,
 ) -> Result<Vec<String>> {
     let ids: Vec<NodeId> = ids.into_iter().collect();
+    // Nothing to name: an empty answer must not walk the module (round 36,
+    // L-2).
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
     // A pathless node has no name a caller could use: under a scope the label
     // would name a node the scope never granted, and under a redacting
     // capability it names an arena position of a module the caller cannot read
     // (round 9, #6). Round 4 fixed only the scoped half.
     if scope.is_none() && !redact {
+        // The unfiltered path builds the whole path map too; keep it under the
+        // ceiling like the filtered one (round 36, L-2).
+        check_wall_budget(started, call)?;
         return Ok(labels_for(module, ids));
     }
     let paths = active_infinity::interop::value_paths(module);
@@ -2098,7 +2127,11 @@ fn literal_node(value: &Value) -> Option<Inode> {
         Value::Int(number) => Some(Inode::Int(*number)),
         Value::Float(number) => Some(Inode::Float(*number)),
         Value::Text(text) => Some(Inode::Str(text.clone())),
-        Value::Path(path) => Some(Inode::Str(path.clone())),
+        // `patch` skips a `Value::Path` replacement (the first path names the
+        // target), so a path never becomes text: a future refactor that removed
+        // that filter should decide the behaviour here explicitly
+        // (round 36, L-4).
+        Value::Path(_) => None,
         // Composite values need a full node tree; `patch` accepts literals and
         // callers that need structure send a module instead.
         Value::List(_) | Value::Map(_) | Value::Secret | Value::Module(_) => None,

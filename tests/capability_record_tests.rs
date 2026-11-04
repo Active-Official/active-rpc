@@ -471,3 +471,36 @@ fn dropping_a_restored_capability_is_not_an_orphan() {
         "a spent record is not a restorable orphan"
     );
 }
+
+/// A tombstoned record can never be restored, so its object pin must be
+/// released by the revocation: otherwise the provider never reclaims the
+/// module and one module per record is retained (round 36, L-3).
+#[test]
+fn a_revoked_exported_record_releases_its_object() {
+    use active_infinity::{InfinityModule, Inode};
+    use active_rpc::domain::ModuleProvider;
+
+    let mut module = InfinityModule::new();
+    let root = module.push(Inode::Str("app".to_string()));
+    module.set_root(Some(root));
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x71; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x94; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.persistence = CapPersistence::Durable;
+    let owner = admitted(b"durable-owner");
+    let cap = agent
+        .mint_bound(&owner, id, object, attrs)
+        .expect("durable cap");
+    let _record = agent.export_capability(&cap).expect("export");
+    agent.revoke(&cap).expect("revoke");
+    drop(cap);
+    let drops = agent.take_drops(id);
+    assert!(
+        !drops.is_empty(),
+        "the revoked record kept its object pinned"
+    );
+}

@@ -5856,6 +5856,26 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         };
         if let Some(record_id) = record_id {
             kernel.revoked_records.insert(record_id);
+            // A tombstoned record can never be restored, so its object pin can
+            // never be released by a restore: release it here and let the
+            // provider reclaim the object once no live capability names it
+            // (round 36, L-3).
+            if let Some(record) = kernel.caps.get(&id) {
+                let key = (record.provider, record.object);
+                let release = match kernel.record_pins.get_mut(&key) {
+                    Some(count) => {
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    }
+                    None => false,
+                };
+                if release {
+                    kernel.record_pins.remove(&key);
+                    if !kernel.object_records.contains_key(&key) {
+                        kernel.queue_provider_drop(key.0, key.1, id);
+                    }
+                }
+            }
         }
         // A second revoke of the same capability is authority-correct but is
         // not a second revocation: counting it let a retry loop over-report the

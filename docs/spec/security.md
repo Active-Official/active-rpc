@@ -211,3 +211,11 @@ aspirational without a date.
 | Durable capabilities | `CapPersistence::Durable` is opt-in; `CapabilityRecord` + `restore_capability` re-mint with the original deadline and bind to an admitted peer | `tests/persistence_tests.rs`, `tests/capability_record_tests.rs`, ADR-0010 | enforced |
 | Topic filters | `CapAttrs::topics` restricts `publish`; attenuation only narrows | `tests/topic_tests.rs` | enforced |
 | No oracle | Secrets never compare, never render, never enter a receipt; capability ids are correlated for telemetry | `tests/invariant_gate.rs`, H2.43, `tests/observability_tests.rs` | enforced |
+
+- **A redacted projection preserves structure.** `stats` hides node, edge and
+  secret counts from a redacting caller, but `evaluate` and `subgraph` return the
+  redacted module itself, so the number and position of secret *nodes* is
+  visible there (`Value::Secret` values and `***SECRET***` text). The material
+  and the count of distinct secret literals stay hidden: the install-time
+  redactor replaces every occurrence. A capability that must not learn even the
+  shape keeps to `stats` and `why` (round 36, L-5).

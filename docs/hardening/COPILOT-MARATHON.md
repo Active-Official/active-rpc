@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-35: round 35 found 2 mediums and 3 lows, all fixed or documented; rounds 36-37 must be clean | 209 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-36: round 36 found 1 medium and 4 lows, all fixed or documented; rounds 37-38 must be clean | 214 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-29: round 29 found 1 medium and 5 lows, all fixed; rounds 30-31 must be clean | 224 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,22 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 36)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `d776717`.
+Round-35 fixes verified. One medium, four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the node ceiling counted nodes, annotations and bindings but not child references, so a two-node module with 1 000 000 fields passed `max_nodes = 4` and spent 261 ms under a 5 ms grant | **fixed**: `walk_weight` (nodes + references past one per node + annotations + bindings) is computed at install and after a patch and stored on the slot, so the check is O(1); `a_wide_table_is_refused_against_the_node_ceiling_before_the_walk` pins the sub-100 ms refusal |
+| 2 | low | the unfiltered label path had no interim wall check and an empty answer still built the whole path map | **fixed**: an empty id set returns at once and the plain branch checks the wall before `labels_for` |
+| 3 | low | a revoked durable record kept its object pin forever, so the provider never reclaimed the module | **fixed**: `revoke_subtree` releases the pin and queues the drop when no live capability names the object; the test fails pre-fix |
+| 4 | low | `literal_node`'s `Value::Path` arm was unreachable | **fixed**: the arm returns `None` and documents the `patch` filter |
+| 5 | low | a redacting `evaluate`/`subgraph` returns the number and position of secret nodes although `stats` hides the size | **documented**: `security.md` states that a redacted projection preserves structure; the material and the number of distinct literals stay hidden |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-04 (round 35)
 

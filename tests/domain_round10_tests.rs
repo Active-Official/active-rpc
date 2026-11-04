@@ -1575,3 +1575,48 @@ fn a_binding_heavy_module_is_refused_against_the_node_ceiling() {
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
     assert!(format!("{error}").contains("nodes"), "{error}");
 }
+
+/// The node ceiling bounds the references a metadata walk traverses, not only
+/// the node count: a two-node module with 200 000 fields used to pass
+/// `max_nodes = 4` and spend hundreds of milliseconds under a 5 ms grant
+/// (round 36, M-1).
+#[test]
+fn a_wide_table_is_refused_against_the_node_ceiling_before_the_walk() {
+    let mut module = InfinityModule::new();
+    let leaf = module.push(Inode::Int(1));
+    let fields: Vec<(String, active_infinity::NodeId)> = (0..200_000)
+        .map(|index| (format!("f{index:06}"), leaf))
+        .collect();
+    let root = module.push(Inode::Table { fields });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x78; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["stats", "why"]);
+    attrs.budget.max_nodes = 4;
+    attrs.budget.max_wall_ms = 5;
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("r10-wide", Budget::default())
+        .expect("lane");
+
+    for (method, args) in [("stats", Vec::new()), ("why", vec![path("f000000")])] {
+        let started = std::time::Instant::now();
+        let promise = agent.call(lane, &cap, method, args).expect("queued");
+        agent.run();
+        let error = promise
+            .value()
+            .expect_err("the walk weight is over the ceiling");
+        assert_eq!(error.code(), "rpc/budget-exceeded", "{method}: {error}");
+        assert!(format!("{error}").contains("nodes"), "{method}: {error}");
+        // The refusal is decided from the precomputed weight, so it precedes
+        // the walk.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "{method} took {:?}",
+            started.elapsed()
+        );
+    }
+}
