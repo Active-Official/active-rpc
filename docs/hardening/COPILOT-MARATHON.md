@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-27: 27 found 1 critical + 1 high + 2 mediums, fixed; rounds 28-29 must be clean | 163 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-20: ... + 10 findings; round 21 is the confirmation | 169 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-28: 28 found 1 critical + 1 medium, fixed; rounds 29-30 must be clean | 172 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-21: ... + 10 findings; round 22 is the confirmation | 179 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,26 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 28)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `4180196`.
+Round-27 fixes verified except two gaps; one **critical**, one medium, six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | critical | `content_hash` still derived the "redacted" image from the stored bytes, so after a declassifying patch the redacted hash equalled the raw one | **fixed**: redact a clone of the module with the install-time `Redactor`, then encode and hash; the declassify test now reconstructs the stored image *including the provenance a patch records* and asserts the served hash differs — it fails against the pre-fix library (verified by stashing `domain.rs`) |
+| 2 | medium | `evaluate` derived redaction placeholders by indexing the cone with the module's node ids, turning a secret field into data and a public one into `Secret` once a subtree was renumbered | **fixed**: placeholders come from a redacted clone of the source arena again; `a_scoped_evaluate_keeps_secret_and_public_fields_apart` |
+| 3 | low | HTTP/2 accepted a duplicate or signed/zero-padded `content-length` | **fixed**: one value, ASCII digits, at most 20 |
+| 4 | low | the HTTP/2 405 carried no `Allow` | **fixed**: `allow: POST` |
+| 5 | low | an idle accept deadline stopped polling a connection with live streams, so a long handler could never flush | **fixed**: an idle timeout with live streams continues; completed tasks are reaped before the emptiness check (the first version looped forever — caught by `http2_round2_tests`) |
+| 6 | low | `nodes_within_scope` scanned ids before any wall check | **fixed**: the grant is checked every 64 ids |
+| 7 | low | `is_invisible_or_reordering` missed U+180B–U+180D | **fixed**: the range is U+180B..=U+180E |
+| 8 | low | `ConnectClient::call` accepted any envelope as the answer | **fixed**: only a response or error for the same request id; `an_answer_for_another_request_is_refused` |
+| 9 | low | HTTP/2 responses had no connection-wide in-flight budget | **fixed**: a response holds a `Reservation` for its encoded length (the request reservation is released first, or one stream charged the connection twice) |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 27)
 
@@ -230,6 +250,28 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 21)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `5a68d09`. All ten round-20
+fixes present; one medium (the process ceiling shared the verdict, not the
+buffer) and nine lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | both process readers buffered a full ceiling each, so transient memory reached twice the grant | **fixed**: the readers draw from one atomic budget; a compare-exchange loop rather than `fetch_update`, which is deprecated on newer toolchains and whose replacement is past the MSRV |
+| 2 | low | per-line HTTP caps ignored the grant | **fixed**: `min(static, header_cap)` for the status and header lines |
+| 3 | low | the outgoing MCP static-ceiling arm was dead code (the grant check subsumed it) | **fixed**: the static ceiling is checked first, as on the receive path |
+| 4 | low | one `as usize` budget cast remained | **fixed**: `usize::try_from` |
+| 5 | low | a nested secret argument was `rpc/invalid-argument` in the wasm adapter | **fixed**: the shared `args_contain_secret` check reports `rpc/tool-policy` |
+| 6 | low | the wasm adapter ignored the byte grant for its output | **fixed**: an output past the grant is `rpc/budget-exceeded` |
+| 7 | low | a zero-byte grant let a process or HTTP call do its work before the kernel refused the answer | **fixed**: both adapters refuse before spawning or connecting |
+| 8 | low | a direct `timeout_ms = 0` assignment spawned and then timed out | **fixed**: clamped at use |
+| 9 | low | `initialize` errors dropped the server code | **fixed**: `mcp/initialize:<code>` (spec row and test updated) |
+| 10 | low | `max_request` had no static backstop | **fixed**: `MAX_REQUEST_BYTES` (64 MiB) at use |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 20)
 

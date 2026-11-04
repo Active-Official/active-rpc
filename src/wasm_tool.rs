@@ -570,6 +570,12 @@ impl Provider for WasmTool {
                 "this adapter cannot enforce a path scope",
             ));
         }
+        if crate::tool::args_contain_secret(&call.args) {
+            // A secret anywhere in the argument is authority this adapter was
+            // not granted; the text adapters report it the same way
+            // (round 21, F5).
+            return Err(Error::ToolPolicy("a secret is not a wasm argument"));
+        }
         let mut input = None;
         for arg in &call.args {
             let bytes = match arg {
@@ -614,12 +620,18 @@ impl Provider for WasmTool {
             log: Vec::new(),
             now_ms: call.now_ms,
         };
+        let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
         let result = tool.call(&input);
         // Keep the guest's log even when the call was refused: a trap is exactly
         // when its diagnostics matter, and `call` cleared the buffer first so it
         // can only hold this call's bytes.
         self.log = std::mem::take(&mut tool.log);
         let output = result?;
+        if output.len() > grant {
+            // The guest ran for an answer the grant cannot carry; every other
+            // adapter pre-caps by the grant (round 21, F6).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         // Guest output is bytes: a lossy UTF-8 conversion would hand the caller
         // text the guest never produced. Binary results travel as a module value.
         if std::str::from_utf8(&output).is_ok() {

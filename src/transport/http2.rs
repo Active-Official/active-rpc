@@ -291,10 +291,21 @@ where
         // nothing is dropped, while an active connection lives as long as both
         // sides keep talking. Wrapping the whole connection instead cut every
         // long-lived agent off mid-session.
+        // Reap before deciding whether any stream is live: a JoinSet holds a
+        // completed task until it is joined, so `is_empty` was false forever
+        // and an idle connection looped (round 28, low).
+        while let Some(done) = streams.try_join_next() {
+            let _ = done;
+        }
         let accepted = match tokio::time::timeout(connection_deadline, connection.accept()).await {
             Ok(Some(request)) => request,
-            // The peer closed, or the connection went idle past the deadline.
-            Ok(None) | Err(_) => break,
+            // The peer closed.
+            Ok(None) => break,
+            // An idle timeout with live streams must keep polling the
+            // connection: a handler that outlives the deadline could otherwise
+            // never flush its response (round 28, low).
+            Err(_) if !streams.is_empty() => continue,
+            Err(_) => break,
         };
         let (request, respond) = match accepted {
             Ok(parts) => parts,
@@ -381,15 +392,30 @@ where
         // (round 27, low).
         return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
     }
-    let declared_length = match request.headers().get(http::header::CONTENT_LENGTH) {
-        Some(value) => match value
-            .to_str()
-            .ok()
-            .and_then(|text| text.parse::<usize>().ok())
-        {
-            Some(length) => Some(length),
-            None => return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire"),
-        },
+    let mut lengths = request
+        .headers()
+        .get_all(http::header::CONTENT_LENGTH)
+        .iter();
+    let declared_length = match lengths.next() {
+        Some(value) => {
+            let text = value.to_str().unwrap_or_default();
+            // The HTTP/1.1 bridge refuses a duplicate, a sign and leading
+            // zeros; a lenient parse lets an intermediary disagree about the
+            // message (round 28, low).
+            if lengths.next().is_some()
+                || text.is_empty()
+                || text.len() > 20
+                || !text.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
+            }
+            match text.parse::<usize>() {
+                Ok(length) => Some(length),
+                Err(_) => {
+                    return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire")
+                }
+            }
+        }
         None => None,
     };
     if media_type != CONTENT_TYPE {
@@ -401,7 +427,7 @@ where
     }
     let mut body = request.into_body();
     let mut bytes = Vec::new();
-    let mut reservation = Reservation::new(inflight);
+    let mut reservation = Reservation::new(Arc::clone(&inflight));
     // The caller's wire ceiling bounds the body; `MAX_BODY` is the hard cap.
     let ceiling = limits.max_bytes.min(MAX_BODY);
     // Two bounds. Per-chunk inactivity catches a stall; the total catches a drip
@@ -456,6 +482,10 @@ where
             None => break,
         }
     }
+    // The body is in memory; releasing its reservation before the response
+    // reserves keeps one stream from charging the connection twice
+    // (round 28, low).
+    drop(reservation);
     if declared_length.is_some_and(|length| length != bytes.len()) {
         // The stream is the body; a `content-length` that disagrees is a
         // framing ambiguity (round 27, low).
@@ -507,6 +537,17 @@ where
             );
         }
     };
+    // The request side reserves its body against the connection budget; a
+    // response parked until flow control grants capacity is the same kind of
+    // hold, so it is charged the same way (round 28, low).
+    let mut response_reservation = Reservation::new(Arc::clone(&inflight));
+    if !response_reservation.reserve(encoded.len(), inflight_budget) {
+        return respond_status(
+            &mut respond,
+            StatusCode::TOO_MANY_REQUESTS,
+            b"rpc/backpressure",
+        );
+    }
     if encoded.len() > MAX_BODY {
         // The bridge answers 413 past `MAX_BODY`; the HTTP/2 server streamed
         // whatever the kernel produced (round 26, #5).
@@ -563,10 +604,16 @@ fn respond_status(
     status: StatusCode,
     body: &[u8],
 ) -> Result<bool> {
-    let head = Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(http::header::CONTENT_LENGTH, body.len())
+        .header(http::header::CONTENT_LENGTH, body.len());
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        // RFC 9110 requires Allow on a 405, and the HTTP/1.1 bridge sends it
+        // (round 28, low).
+        builder = builder.header(http::header::ALLOW, "POST");
+    }
+    let head = builder
         .body(())
         .map_err(|error| Error::Transport(format!("response head: {error}")))?;
     let mut send = respond

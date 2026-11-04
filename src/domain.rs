@@ -372,7 +372,7 @@ impl ModuleProvider {
                     // about who can see the value).
                     let mut affected = dependents.clone();
                     affected.insert(node);
-                    if !nodes_within_scope(&slot.module, &affected, scope) {
+                    if !nodes_within_scope(&slot.module, &affected, scope, started, call)? {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
@@ -614,7 +614,7 @@ impl ModuleProvider {
                     .into_iter()
                     .collect();
                 if let Some(scope) = &call.path_scope {
-                    if !nodes_within_scope(&slot.module, &ids, scope) {
+                    if !nodes_within_scope(&slot.module, &ids, scope, started, call)? {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
@@ -645,7 +645,7 @@ impl ModuleProvider {
                     .into_iter()
                     .collect();
                 if let Some(scope) = &call.path_scope {
-                    if !nodes_within_scope(&slot.module, &ids, scope) {
+                    if !nodes_within_scope(&slot.module, &ids, scope, started, call)? {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
@@ -700,10 +700,15 @@ impl ModuleProvider {
                     // secret, even for a caller that cannot read the bytes. The
                     // redacted hash still proves structural identity
                     // (round 12, F4).
-                    let bytes = encode(&slot.module)
+                    // Redact in memory with the install-time handle: deriving
+                    // the literal set from the stored image made the "redacted"
+                    // hash equal the raw one once a patch removed the last
+                    // secret node (round 28, critical).
+                    let mut redacted = slot.module.clone();
+                    crate::security::redact_derived(&mut redacted, &slot.redactor)?;
+                    let redacted_bytes = encode(&redacted)
                         .map_err(|error| Error::Payload(error.code().to_string()))?;
-                    let redacted = crate::security::redact_module(&bytes)?;
-                    let redacted_hash = active_infinity::content_hash(&redacted)
+                    let redacted_hash = active_infinity::content_hash(&redacted_bytes)
                         .map_err(|error| Error::Payload(error.code().to_string()))?;
                     check_wall_budget(started, call)?;
                     return Ok(Response::Value(Value::Text(format!(
@@ -1257,20 +1262,40 @@ fn keep_scoped_bindings(module: &mut InfinityModule, scope: &str) {
 }
 
 /// True when every node in `ids` is named by a path inside `scope`.
-fn nodes_within_scope(module: &InfinityModule, ids: &BTreeSet<NodeId>, scope: &str) -> bool {
+fn nodes_within_scope(
+    module: &InfinityModule,
+    ids: &BTreeSet<NodeId>,
+    scope: &str,
+    started: std::time::Instant,
+    call: &Call,
+) -> Result<bool> {
     if ids.is_empty() {
-        return true;
+        return Ok(true);
     }
     let paths = active_infinity::interop::value_paths(module);
     let root = module.root();
-    ids.iter().all(|id| match named_path(&paths, *id) {
-        Some(path) => in_scope_path(module, *id, path, scope),
-        // The module root is pathless by construction; a pathless node inside
-        // the scope's subtree is part of it; any other is a floating value or an
-        // expression, and a scoped answer that dropped it presented itself as
-        // complete (round 8, #6).
-        None => Some(*id) == root || in_scope_node(module, *id, scope),
-    })
+    let mut inside = true;
+    for (index, id) in ids.iter().enumerate() {
+        // A pathless id costs a subtree walk; a hostile module makes that
+        // quadratic, so the grant is checked inside the scan
+        // (round 28, low).
+        if index % 64 == 63 {
+            check_wall_budget(started, call)?;
+        }
+        let within = match named_path(&paths, *id) {
+            Some(path) => in_scope_path(module, *id, path, scope),
+            // The module root is pathless by construction; a pathless node
+            // inside the scope's subtree is part of it; any other is a floating
+            // value or an expression, and a scoped answer that dropped it
+            // presented itself as complete (round 8, #6).
+            None => Some(*id) == root || in_scope_node(module, *id, scope),
+        };
+        if !within {
+            inside = false;
+            break;
+        }
+    }
+    Ok(inside)
 }
 
 /// True when `path` is inside `scope` *and* still resolves to `id`.
@@ -1662,7 +1687,9 @@ fn evaluate_for_caller(
     // held both (round 12, F2).
     // A restricted cone no longer holds the secret node, so the placeholders are
     // read from a redacted copy of the source (round 15, #6).
-    let redacted_source = redacted.clone();
+    let mut redacted_source = source.clone();
+    security::redact_derived(&mut redacted_source, redactor)
+        .map_err(|error| active_infinity::Error::Encode(error.code()))?;
     let placeholders: BTreeSet<String> = (0..source.node_count())
         .map(|index| NodeId(index as u32))
         .filter(|id| source.get(*id).is_some_and(|node| node.is_secret()))

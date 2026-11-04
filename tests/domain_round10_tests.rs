@@ -234,10 +234,22 @@ fn a_patch_cannot_declassify_an_install_time_secret() {
     }
 
     // The raw content address of the declassified image must not be served.
+    // The image is reconstructed exactly: the write, plus the provenance a
+    // patch records (no parent and no hash entries, because the slot held a
+    // secret). A hand arena without that provenance would differ from the
+    // served hash for the wrong reason (round 28, critical).
     let mut patched = module;
     let node = active_infinity::interop::resolve_path(&patched, "app.s")
         .expect("the secret node resolves");
     *patched.node_mut(node).expect("node") = Inode::Int(0);
+    patched.set_provenance(Some(active_infinity::Provenance {
+        producer: Some("active-rpc/patch".to_string()),
+        timestamp_ms: 0,
+        model: None,
+        tool: Some("patch".to_string()),
+        parent: None,
+        entries: Vec::new(),
+    }));
     let raw = active_infinity::encode(&patched).expect("encode");
     let raw_text = format!(
         "blake3:{}",
@@ -252,6 +264,59 @@ fn a_patch_cannot_declassify_an_install_time_secret() {
         other => panic!("unexpected {other:?}"),
     };
     assert_ne!(served, raw_text, "the raw hash of the declassified image");
+}
+
+/// A scoped evaluation maps placeholders by the cone's ids, not the module's:
+/// the two arenas diverge once a subtree is renumbered, and indexing the cone
+/// with module ids turned a secret field into data and a public one into
+/// `Secret` (round 28, medium).
+#[test]
+fn a_scoped_evaluate_keeps_secret_and_public_fields_apart() {
+    const SECRET: &str = "round28-placeholder-7c";
+
+    let mut module = InfinityModule::new();
+    let _padding = module.push(Inode::Int(0));
+    let a = module.push(Inode::Str(SECRET.into()));
+    let b = module.push(Inode::Secret(SECRET.into()));
+    let c = module.push(Inode::Str(SECRET.into()));
+    let d = module.push(Inode::Str("public-d".into()));
+    let e = module.push(Inode::Str("public-e".into()));
+    let app = module.push(Inode::Table {
+        fields: vec![
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("c".to_string(), c),
+            ("d".to_string(), d),
+            ("e".to_string(), e),
+        ],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+
+    let (agent, cap, lane) = install(module, &["evaluate"], None, true);
+    let promise = agent
+        .call(lane, &cap, "evaluate", vec![path("app")])
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("evaluate");
+    let Value::Map(fields) = value else {
+        panic!("a table: {value:?}");
+    };
+    for name in ["a", "b", "c"] {
+        assert!(
+            matches!(fields.get(name), Some(Value::Secret)),
+            "{name} = {:?}",
+            fields.get(name)
+        );
+    }
+    for (name, text) in [("d", "public-d"), ("e", "public-e")] {
+        match fields.get(name) {
+            Some(Value::Text(value)) => assert_eq!(value, text, "{name}"),
+            other => panic!("{name} = {other:?}"),
+        }
+    }
 }
 
 /// A constraint whose expression is its own subject used to re-enqueue forever:

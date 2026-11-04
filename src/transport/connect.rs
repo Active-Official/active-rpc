@@ -428,7 +428,13 @@ impl BridgeServer {
             // 64 MiB and sends ten bytes costs 64 KiB, not 64 MiB. A body that
             // ran out of time is a timeout instead, the same discrimination
             // the head path makes (round 24, F4).
-            if std::time::Instant::now() >= deadline {
+            // A socket timeout can fire a few milliseconds before the
+            // deadline it was armed from; treat that band as a timeout so a
+            // loaded host does not report a drip as a framing fault.
+            let now = std::time::Instant::now();
+            if now >= deadline
+                || deadline.saturating_duration_since(now) < std::time::Duration::from_millis(10)
+            {
                 let _ = write_http_response(&mut stream, 408, b"rpc/transport", deadline);
             } else {
                 let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
@@ -780,7 +786,17 @@ impl ConnectClient {
         if !rest.is_empty() {
             return Err(Error::Wire("trailing bytes in bridge response"));
         }
-        Envelope::decode_with(message, self.limits)
+        let answer = Envelope::decode_with(message, self.limits)?;
+        // A bridge that mixes responses, replays one or echoes a request must
+        // not have it accepted as this call's answer (round 28, low).
+        if !matches!(
+            answer.kind,
+            crate::wire::Kind::Response | crate::wire::Kind::Error
+        ) || answer.request_id != envelope.request_id
+        {
+            return Err(Error::Wire("the bridge answered a different request"));
+        }
+        Ok(answer)
     }
 
     /// Send a raw body (used to prove malformed frames are rejected).

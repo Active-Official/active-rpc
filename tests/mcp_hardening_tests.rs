@@ -94,7 +94,7 @@ fn an_error_on_initialize_is_refused() {
     let session = McpSession::handshake(Scripted::new(&[
         r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}"#,
     ]));
-    assert_eq!(code(session), "mcp/initialize");
+    assert_eq!(code(session), "mcp/initialize:-32601");
 }
 
 #[test]

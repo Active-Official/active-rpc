@@ -333,7 +333,7 @@ pub fn is_invisible_or_reordering(character: char) -> bool {
             // Invisible operators, the Mongolian vowel separator, and variation
             // selectors, which change rendering without adding width.
             | '\u{2061}'..='\u{2064}'
-            | '\u{180E}'
+            | '\u{180B}'..='\u{180E}'
             | '\u{FE00}'..='\u{FE0F}'
             // Deprecated format characters and the interlinear annotation set.
             | '\u{206A}'..='\u{206F}'

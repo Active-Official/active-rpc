@@ -375,6 +375,12 @@ const MAX_JSON_NODES: usize = 1 << 20;
 /// Largest child output this adapter will buffer.
 const MAX_OUTPUT_BYTES: usize = 16 << 20;
 
+/// Largest HTTP request body a caller may configure.
+///
+/// The field is public; a static ceiling at use keeps a misconfiguration from
+/// turning a grant into an unbounded write (round 21, F10).
+pub const MAX_REQUEST_BYTES: usize = 64 << 20;
+
 /// Largest HTTP response body this adapter will buffer.
 ///
 /// A public `max_body` past this is clamped: the peer names the length, and an
@@ -1075,10 +1081,15 @@ impl<T: McpTransport> McpSession<T> {
             deadline,
             MAX_MCP_LINE_BYTES,
         )?;
-        if initialize.get("error").is_some() {
-            return Err(Error::Provider {
-                code: "mcp/initialize".to_string(),
-            });
+        if let Some(error) = initialize.get("error") {
+            // Keep the server's numeric code, as `tools/list` does: a retry or
+            // alert rule can tell a refused method from a server fault
+            // (round 21, F9).
+            let code = match error.get("code").and_then(Json::as_i64) {
+                Some(code) => format!("mcp/initialize:{code}"),
+                None => "mcp/initialize".to_string(),
+            };
+            return Err(Error::Provider { code });
         }
         let list = session.request_within("tools/list", json!({}), deadline, MAX_MCP_LINE_BYTES)?;
         if let Some(error) = list.get("error") {
@@ -1189,17 +1200,19 @@ impl<T: McpTransport> McpSession<T> {
             "params": params,
         });
         let line = payload.to_string();
-        if line.len() > max_line {
-            // JSON escaping can grow the arguments several times over; the
-            // grant bounds the frame this call writes (round 20, L4).
-            return Err(Error::BudgetExceeded("byte"));
-        }
         if line.len() > MAX_MCP_LINE_BYTES {
             // The peer refuses a line of this size; refuse it here instead of
             // sending a frame that can only be a desync.
             return Err(Error::InvalidArgument(
                 "the MCP request exceeds the line ceiling",
             ));
+        }
+        if line.len() > max_line {
+            // JSON escaping can grow the arguments several times over; the
+            // grant bounds the frame this call writes (round 20, L4). A grant
+            // cannot make an over-1-MiB line legal, so the static ceiling is
+            // checked first (round 21, F3).
+            return Err(Error::BudgetExceeded("byte"));
         }
         // A ceiling already spent means nothing has been written: the session
         // stays usable, and the caller may retry (round 5, #5).
@@ -1614,7 +1627,7 @@ impl HttpTool {
         // Every line is read under a cap, and the block has its own budget: a
         // hostile endpoint that streams headers would otherwise grow a `String`
         // until the allocator aborts the process (outside `catch_unwind`).
-        let mut status_line = reader.line(MAX_HTTP_STATUS_LINE)?;
+        let mut status_line = reader.line(MAX_HTTP_STATUS_LINE.min(header_cap).max(1))?;
         let status: u16 = status_line
             .split_whitespace()
             .nth(1)
@@ -1654,7 +1667,7 @@ impl HttpTool {
         let mut header_bytes = 0usize;
         let mut fields = 0usize;
         loop {
-            let line = reader.line(MAX_HTTP_HEADER_LINE)?;
+            let line = reader.line(MAX_HTTP_HEADER_LINE.min(header_cap).max(1))?;
             if line == "\r\n" || line == "\n" {
                 break;
             }
@@ -1774,6 +1787,11 @@ impl Provider for HttpTool {
             // A zero grant is a refusal, not a one-millisecond grant: the
             // adapters used `.max(1)` and did the work anyway (round 4, #5).
             return Err(Error::BudgetExceeded("wall"));
+        }
+        if call.budget.max_bytes == 0 {
+            // A zero-byte grant cannot carry an answer; do not open a socket
+            // (round 21, F7).
+            return Err(Error::BudgetExceeded("byte"));
         }
         if !call.payload.is_empty() {
             // This adapter sends the body it builds from the arguments; an
@@ -1942,7 +1960,10 @@ impl Provider for HttpTool {
                 }
                 None => Vec::new(),
             };
-            if body.len() > self.max_request.min(call.budget.max_bytes as usize) {
+            let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+            // A public field can be set past any sane ceiling; the static cap
+            // bounds it regardless of the grant (round 21, F10).
+            if body.len() > self.max_request.min(MAX_REQUEST_BYTES).min(grant) {
                 return Err(Error::ToolPolicy("request too large"));
             }
             Some(body)
@@ -2058,7 +2079,7 @@ pub(crate) fn is_http_token(byte: u8) -> bool {
 }
 
 /// Whether any argument carries a secret marker.
-fn args_contain_secret(args: &[Arg]) -> bool {
+pub(crate) fn args_contain_secret(args: &[Arg]) -> bool {
     args.iter().any(|arg| match arg {
         Arg::Value(value) => value.is_tainted(),
         Arg::Promise(_) | Arg::Cap(_) => false,
@@ -2396,7 +2417,11 @@ impl Provider for LocalProcess {
         // buffer a megabyte (round 19, M2).
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
         let max_output = self.max_output.min(MAX_OUTPUT_BYTES).min(grant);
-        let ceiling = (max_output as u64).saturating_add(1);
+        // One budget for both pipes: each reader used to take a full ceiling,
+        // so transient buffering reached twice the grant (round 21, F1).
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            max_output.saturating_add(1),
+        ));
         // `(stream, bytes)`: 1 is stdout and 2 is stderr. Two threads sharing
         // one channel report in completion order, and a child that writes both
         // pipes quickly would otherwise have its streams swapped.
@@ -2407,15 +2432,62 @@ impl Provider for LocalProcess {
             |sender: std::sync::mpsc::Sender<(u8, Vec<u8>)>,
              tag: u8,
              mut stream: Option<Box<dyn std::io::Read + Send>>| {
-                if let Some(stream) = stream.take() {
+                if let Some(mut stream) = stream.take() {
+                    let shared = std::sync::Arc::clone(&shared);
                     // `thread::spawn` panics on failure; a named builder
                     // reports it, and the child is killed rather than leaked
                     // (round 10, F-4).
                     let spawned = std::thread::Builder::new()
                         .name("active-rpc-process-reader".to_string())
                         .spawn(move || {
+                            use std::io::Read;
                             let mut buffer = Vec::new();
-                            let _ = stream.take(ceiling).read_to_end(&mut buffer);
+                            let mut chunk = [0u8; 8 * 1024];
+                            loop {
+                                match stream.read(&mut chunk) {
+                                    Ok(0) => break,
+                                    Ok(read) => {
+                                        // A plain compare-exchange loop: the
+                                        // `fetch_update` API is deprecated on
+                                        // newer toolchains and `try_update` is
+                                        // past this crate's MSRV.
+                                        let before = loop {
+                                            let left =
+                                                shared.load(std::sync::atomic::Ordering::SeqCst);
+                                            if left == 0 {
+                                                break 0;
+                                            }
+                                            match shared.compare_exchange(
+                                                left,
+                                                left.saturating_sub(read),
+                                                std::sync::atomic::Ordering::SeqCst,
+                                                std::sync::atomic::Ordering::SeqCst,
+                                            ) {
+                                                Ok(_) => break left,
+                                                Err(actual) => {
+                                                    if actual == left {
+                                                        break left;
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        if before == 0 {
+                                            break;
+                                        }
+                                        let take = read.min(before);
+                                        buffer.extend_from_slice(&chunk[..take]);
+                                        if take < read {
+                                            break;
+                                        }
+                                    }
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::Interrupted =>
+                                    {
+                                        continue
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
                             let _ = sender.send((tag, buffer));
                         });
                     match spawned {
@@ -2452,7 +2524,10 @@ impl Provider for LocalProcess {
 
         // The capability's wall budget can be tighter than the adapter default;
         // the effective ceiling is the smaller of the two.
-        let ceiling_ms = self.timeout_ms.min(call.budget.max_wall_ms);
+        let ceiling_ms = self
+            .timeout_ms
+            .clamp(1, 300_000)
+            .min(call.budget.max_wall_ms.max(1));
         let deadline = std::time::Instant::now()
             .checked_add(std::time::Duration::from_millis(ceiling_ms))
             .unwrap_or_else(std::time::Instant::now);

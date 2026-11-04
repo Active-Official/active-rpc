@@ -613,6 +613,43 @@ fn a_malformed_response_head_line_is_a_wire_fault() {
     server.join().expect("server");
 }
 
+/// An answer for another request is not this call's result
+/// (round 28, low).
+#[test]
+fn an_answer_for_another_request_is_refused() {
+    use active_rpc::transport::connect::{grpc_frame, CONNECT_TYPE};
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let body = grpc_frame(
+        &Envelope::response(99, Value::Null)
+            .encode()
+            .expect("encode"),
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut scratch = [0u8; 4096];
+        let _ = stream.read(&mut scratch);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {CONNECT_TYPE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).expect("head");
+        stream.write_all(&body).expect("body");
+        // Close gracefully: a reset can discard the response on Windows.
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut sink = [0u8; 64];
+        let _ = stream.read(&mut sink);
+    });
+    let mut client = ConnectClient::connect(&address).expect("connect");
+    let error = client
+        .call(&request(1, "echo", Vec::new()))
+        .expect_err("a mismatched answer");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+    server.join().expect("server");
+}
+
 /// A truncated body is one bad connection: the bridge answers 400 and keeps
 /// accepting. Before this, the read error aborted `serve`, so one hostile
 /// connection could refuse service to every later caller.
