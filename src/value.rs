@@ -446,7 +446,11 @@ impl Arg {
 }
 
 /// A request as a provider sees it.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is written by hand: the payload is opaque bytes and a derived
+/// formatter would dump them into every provider log line (F-02). Formatting
+/// shows sizes, flags and a bounded method label.
+#[derive(Clone, PartialEq)]
 pub struct Call {
     /// Method name.
     pub method: String,
@@ -476,6 +480,34 @@ pub struct Call {
     /// default virtual mode and real when the kernel was switched to the wall
     /// clock.
     pub now_ms: u64,
+}
+
+impl std::fmt::Debug for Call {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut method = String::new();
+        for (index, character) in self.method.chars().enumerate() {
+            if index == 64 {
+                method.push('…');
+                break;
+            }
+            method.push(character);
+        }
+        write!(
+            formatter,
+            "Call {{ method: {:?}, args: {}, path_scope: {:?}, redact: {}, read_only: {}, \
+             tool_allows_process: {}, payload: {} bytes, now_ms: {} }}",
+            method,
+            self.args.len(),
+            self.path_scope
+                .as_deref()
+                .map(|scope| scope.chars().take(64).collect::<String>()),
+            self.redact,
+            self.read_only,
+            self.tool_allows_process,
+            self.payload.len(),
+            self.now_ms,
+        )
+    }
 }
 
 impl Call {

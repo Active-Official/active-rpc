@@ -293,7 +293,12 @@ pub fn cap_table_hash(caps: &[CapDescriptor]) -> Result<[u8; 32]> {
 }
 
 /// One Active RPC envelope.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is written by hand: the payload is opaque bytes (an in-process
+/// provider may hand back a large blob) and a derived formatter would dump it
+/// into every log line. Formatting shows sizes and a bounded method label
+/// (F-02).
+#[derive(Clone, PartialEq)]
 pub struct Envelope {
     /// Envelope kind.
     pub kind: Kind,
@@ -313,6 +318,41 @@ pub struct Envelope {
     pub read_only: bool,
     /// Optional capability-table delta relative to a negotiated base.
     pub cap_delta: Option<CapTableDelta>,
+}
+
+impl std::fmt::Debug for Envelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Envelope {{ kind: {:?}, request_id: {}, method: {:?}, args: {}, payload: {} bytes, \
+             caps: {}, redact: {}, read_only: {}, cap_delta: {} }}",
+            self.kind,
+            self.request_id,
+            debug_label(&self.method),
+            self.args.len(),
+            self.payload.len(),
+            self.caps.len(),
+            self.redact,
+            self.read_only,
+            self.cap_delta.is_some(),
+        )
+    }
+}
+
+/// A bounded, escaped label for a debug line.
+///
+/// A hand-built envelope may carry a method far past the wire ceiling; a log
+/// line must stay a log line (F-02).
+fn debug_label(text: &str) -> String {
+    let mut label = String::new();
+    for (index, character) in text.chars().enumerate() {
+        if index == 64 {
+            label.push('…');
+            break;
+        }
+        label.push(character);
+    }
+    label
 }
 
 /// Envelope size and count ceilings for untrusted input.
@@ -486,12 +526,21 @@ impl Envelope {
         self
     }
 
-    /// Serialize.
+    /// Serialize under the default profile.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.encode_with_limits(WireLimits::default())
+    }
+
+    /// Serialize under a caller's profile.
+    ///
+    /// A peer that decodes with `WireLimits::strict()` should encode with the
+    /// same limits, so a frame is refused by the sender rather than by the
+    /// receiver (F-09). `encode()` stays the default-profile form.
+    pub fn encode_with_limits(&self, limits: WireLimits) -> Result<Vec<u8>> {
         // Encoding is documented as the inverse of decoding: a frame this
         // crate would refuse must be refused locally, not by the peer
         // (round 39, L-7).
-        self.check_limits(&WireLimits::default())?;
+        self.check_limits(&limits)?;
         let mut out = Vec::with_capacity(32 + self.payload.len());
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
@@ -536,7 +585,7 @@ impl Envelope {
                 write_cap(&mut out, cap)?;
             }
         }
-        if out.len() > WireLimits::default().max_bytes {
+        if out.len() > limits.max_bytes {
             return Err(Error::Wire("envelope exceeds the size ceiling"));
         }
         Ok(out)

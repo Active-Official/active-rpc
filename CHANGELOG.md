@@ -10,6 +10,23 @@ key, `ReceiptLog::snapshot`/`repair_tail`, `Snapshot`, `derive_receipt_key`,
 Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
 (replay) and R-13 (receipts) audit rounds.
 
+### DeepSeek fix pack (2026-11-04)
+
+- **Egress secret walks are iterative.** `redact_value`,
+  `assert_no_secret_material` and `assert_no_structural_secrets` walked a
+  provider-built value recursively; a value deeper than the stack aborted the
+  process after the provider returned. They use an explicit stack now, so the
+  containment walk cannot be the thing that overflows (F-04).
+- **Formatting an envelope or a call does not print its payload.** Both types
+  have a hand-written `Debug` (kind, ids, bounded method label, sizes, flags);
+  a derived formatter dumped up to 64 MiB of provider bytes into a log line
+  (F-02/F-03).
+- **`Envelope::encode_with_limits`.** A peer that decodes under
+  `WireLimits::strict()` can encode under the same profile instead of producing
+  a frame only its sender accepts; `encode()` keeps the default profile (F-09).
+- **SECURITY.md lists the shipped minor**, and a doc-gate test fails when the
+  policy table does not name the version in `Cargo.toml` (F-44).
+
 ### Receipts
 
 - **The log is `ARRL` v2.** The header carries the sequence it starts at and

@@ -225,3 +225,32 @@ fn status_publishes_residual_risks_and_the_sign_off_block() {
         assert!(status.contains(phrase), "STATUS must contain {phrase}");
     }
 }
+
+/// The security policy lists the minor this crate ships.
+///
+/// A shipped version outside the supported table tells a reporter the release is
+/// out of scope while it is the one in production (F-44).
+#[test]
+fn the_security_policy_lists_the_shipped_minor() {
+    let cargo = fs::read_to_string(repo_path("Cargo.toml")).expect("Cargo.toml");
+    let version = cargo
+        .lines()
+        .find_map(|line| line.strip_prefix("version = "))
+        .expect("a package version");
+    let version = version.trim().trim_matches('"');
+    let mut parts = version.split('.');
+    let minor = format!(
+        "{}.{}.x",
+        parts.next().expect("major"),
+        parts.next().expect("minor")
+    );
+    let policy = fs::read_to_string(repo_path("SECURITY.md")).expect("SECURITY.md");
+    assert!(
+        policy.contains(&minor),
+        "SECURITY.md must list {minor} (the shipped minor)"
+    );
+    assert!(
+        policy.contains("| yes") || policy.contains("| yes (current)"),
+        "SECURITY.md must say which version is supported"
+    );
+}

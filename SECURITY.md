@@ -4,7 +4,8 @@
 
 | Version | Security fixes |
 |---|---|
-| 2.2.x | yes |
+| 2.3.x | yes (current) |
+| 2.2.x | until 2.3.0 + 12 months |
 | 2.1.x | until 2.2.0 + 12 months |
 | 1.0.x | no (superseded) |
 

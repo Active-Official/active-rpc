@@ -9,7 +9,7 @@
 //!    secret-cone labels; a non-redacting one still never sees values.
 //! 3. **Diagnostics are value-free.** Provider errors carry stable codes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -111,44 +111,83 @@ pub fn redact_cone_labels(labels: Vec<String>, tainted: &BTreeSet<String>) -> Ve
 /// tainted (used when a capability is redacting but a provider already built
 /// labels).
 pub fn redact_value(value: Value) -> Value {
-    match value {
-        Value::Secret => Value::Secret,
-        Value::List(items) => Value::List(items.into_iter().map(redact_value).collect()),
-        // A key is text too: a provider that puts a secret copy or the marker
-        // in a `Value::Map` key would otherwise pass through untouched. The
-        // whole map collapses to the marker, because renaming a key could
-        // collide with another entry.
-        Value::Map(entries) if entries.keys().any(|key| key.contains(SECRET_MARKER)) => {
-            Value::Secret
-        }
-        Value::Map(entries) => Value::Map(
-            entries
-                .into_iter()
-                .map(|(key, value)| (key, redact_value(value)))
-                .collect(),
-        ),
-        // A text that *is* the marker (or that embeds it) stays text: the marker
-        // is content-free, and a provider that already redacted its answer
-        // returns it as a label. Collapsing it here turned `["***SECRET***"]`
-        // into `[Secret]` and made redaction destroy its own output. Secret
-        // *bytes* in plain text are the provider's fault and are what the
-        // codec's fragment checks refuse on encode.
-        Value::Text(_) => value,
-        // A module is the only variant that carries arbitrary bytes, so it is
-        // the only one that can smuggle a secret node. Rewriting beats passing
-        // it through: a redacting caller must not receive the original bytes.
-        // A module is either an Infinity image or opaque bytes a provider
-        // produced (a WASM tool's binary output). Only an image has secret
-        // structure; refusing an opaque blob here turned every binary tool
-        // result into a marker.
-        Value::Module(bytes) => match redact_module(&bytes) {
-            Ok(redacted) => Value::Module(redacted),
-            Err(_) if !is_infinity_image(&bytes) => Value::Module(bytes),
-            // An image that cannot be redacted is not safe to hand back.
-            Err(_) => Value::Secret,
-        },
-        other => other,
+    // An explicit stack, like `Value::shape`: a provider-built value can be
+    // deeper than the Rust stack, and the walk that exists to contain a hostile
+    // provider must not be the thing that aborts the process (F-04).
+    enum Task {
+        Visit(Value),
+        AssembleList(usize),
+        AssembleMap(Vec<String>, usize),
     }
+    let mut tasks = vec![Task::Visit(value)];
+    let mut done: Vec<Value> = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Visit(value) => match value {
+                Value::Secret => done.push(Value::Secret),
+                Value::List(items) => {
+                    let count = items.len();
+                    tasks.push(Task::AssembleList(count));
+                    // Children are visited in order: push them reversed so the
+                    // first one is on top of the stack.
+                    for item in items.into_iter().rev() {
+                        tasks.push(Task::Visit(item));
+                    }
+                }
+                // A key is text too: a provider that puts a secret copy or the
+                // marker in a `Value::Map` key would otherwise pass through
+                // untouched. The whole map collapses to the marker, because
+                // renaming a key could collide with another entry.
+                Value::Map(entries) => {
+                    if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
+                        done.push(Value::Secret);
+                        continue;
+                    }
+                    let count = entries.len();
+                    let keys: Vec<String> = entries.keys().cloned().collect();
+                    tasks.push(Task::AssembleMap(keys, count));
+                    for value in entries.into_values().rev() {
+                        tasks.push(Task::Visit(value));
+                    }
+                }
+                // A text that *is* the marker (or that embeds it) stays text:
+                // the marker is content-free, and a provider that already
+                // redacted its answer returns it as a label. Collapsing it here
+                // turned `["***SECRET***"]` into `[Secret]` and made redaction
+                // destroy its own output. Secret *bytes* in plain text are the
+                // provider's fault and are what the codec's fragment checks
+                // refuse on encode.
+                Value::Text(text) => done.push(Value::Text(text)),
+                // A module is the only variant that carries arbitrary bytes, so
+                // it is the only one that can smuggle a secret node. Rewriting
+                // beats passing it through: a redacting caller must not receive
+                // the original bytes. A module is either an Infinity image or
+                // opaque bytes a provider produced (a WASM tool's binary
+                // output). Only an image has secret structure; refusing an
+                // opaque blob here turned every binary tool result into a
+                // marker.
+                Value::Module(bytes) => done.push(match redact_module(&bytes) {
+                    Ok(redacted) => Value::Module(redacted),
+                    Err(_) if !is_infinity_image(&bytes) => Value::Module(bytes),
+                    // An image that cannot be redacted is not safe to hand back.
+                    Err(_) => Value::Secret,
+                }),
+                other => done.push(other),
+            },
+            Task::AssembleList(count) => {
+                let start = done.len().saturating_sub(count);
+                let items = done.split_off(start);
+                done.push(Value::List(items));
+            }
+            Task::AssembleMap(keys, count) => {
+                let start = done.len().saturating_sub(count);
+                let values = done.split_off(start);
+                let entries: BTreeMap<String, Value> = keys.into_iter().zip(values).collect();
+                done.push(Value::Map(entries));
+            }
+        }
+    }
+    done.pop().unwrap_or(Value::Null)
 }
 
 /// Rewrite every secret node of an Active Infinity module to the marker.
@@ -231,72 +270,84 @@ pub fn check_module_payload(bytes: &[u8]) -> Result<()> {
 /// secret nodes is the original bytes and must not cross. The distinction is why
 /// this is not [`assert_no_secret_material`], which refuses the marker too.
 pub fn assert_no_structural_secrets(value: &Value) -> Result<()> {
-    match value {
-        Value::Secret => Ok(()),
-        Value::List(items) => items.iter().try_for_each(assert_no_structural_secrets),
-        // A key is text the peer reads: `redact_value` collapses a map whose
-        // key carries the marker, so the door out must inspect keys too
-        // (round 22, #5).
-        Value::Map(entries) => {
-            if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
-                return Err(Error::Provider {
-                    code: "provider/secret-material".to_string(),
-                });
+    // An explicit stack: a provider-built value can be deeper than the Rust
+    // stack, and this walk runs after the provider returns (F-04).
+    let mut stack: Vec<&Value> = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Secret => {}
+            Value::List(items) => stack.extend(items.iter()),
+            // A key is text the peer reads: `redact_value` collapses a map whose
+            // key carries the marker, so the door out must inspect keys too
+            // (round 22, #5).
+            Value::Map(entries) => {
+                if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
+                    return Err(Error::Provider {
+                        code: "provider/secret-material".to_string(),
+                    });
+                }
+                stack.extend(entries.values());
             }
-            entries.values().try_for_each(assert_no_structural_secrets)
-        }
-        Value::Module(bytes) => {
-            if module_has_secret(bytes)? {
-                return Err(Error::Provider {
-                    code: "provider/secret-material".to_string(),
-                });
+            Value::Module(bytes) => {
+                if module_has_secret(bytes)? {
+                    return Err(Error::Provider {
+                        code: "provider/secret-material".to_string(),
+                    });
+                }
             }
-            Ok(())
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Text(_)
+            | Value::Path(_) => {}
         }
-        Value::Null
-        | Value::Bool(_)
-        | Value::Int(_)
-        | Value::Float(_)
-        | Value::Text(_)
-        | Value::Path(_) => Ok(()),
     }
+    Ok(())
 }
 
 /// Ensure a response carries no secret material.
 pub fn assert_no_secret_material(value: &Value) -> Result<()> {
-    match value {
-        Value::Secret => Err(Error::Provider {
-            code: "provider/secret-material".to_string(),
-        }),
-        Value::List(items) => items.iter().try_for_each(assert_no_secret_material),
-        Value::Map(entries) => {
-            if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
+    // An explicit stack, like its sibling: the check runs on values a provider
+    // built, so its own depth must not be the process's depth limit (F-04).
+    let mut stack: Vec<&Value> = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Secret => {
                 return Err(Error::Provider {
                     code: "provider/secret-material".to_string(),
-                });
+                })
             }
-            entries.values().try_for_each(assert_no_secret_material)
-        }
-        // A module is bytes: it is the one variant that can carry a secret
-        // without the value model noticing, so it is decoded and inspected.
-        Value::Module(bytes) => {
-            if module_has_secret(bytes)? {
-                return Err(Error::Provider {
-                    code: "provider/secret-material".to_string(),
-                });
+            Value::List(items) => stack.extend(items.iter()),
+            Value::Map(entries) => {
+                if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
+                    return Err(Error::Provider {
+                        code: "provider/secret-material".to_string(),
+                    });
+                }
+                stack.extend(entries.values());
             }
-            Ok(())
+            // A module is bytes: it is the one variant that can carry a secret
+            // without the value model noticing, so it is decoded and inspected.
+            Value::Module(bytes) => {
+                if module_has_secret(bytes)? {
+                    return Err(Error::Provider {
+                        code: "provider/secret-material".to_string(),
+                    });
+                }
+            }
+            // Every other variant is a scalar or a label with no room for
+            // secret bytes, and a new variant has to be considered here rather
+            // than inheriting this arm silently.
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Text(_)
+            | Value::Path(_) => {}
         }
-        // Every other variant is a scalar or a label with no room for secret
-        // bytes, and a new variant has to be considered here rather than
-        // inheriting this arm silently.
-        Value::Null
-        | Value::Bool(_)
-        | Value::Int(_)
-        | Value::Float(_)
-        | Value::Text(_)
-        | Value::Path(_) => Ok(()),
     }
+    Ok(())
 }
 
 /// Characters that reorder rendered text or render as nothing.
