@@ -4102,7 +4102,6 @@ impl Agent {
         Some(kernel.events.iter().skip(skip).cloned().collect())
     }
 
-    /// Point-in-time counters. Contains no capability ids or payloads.
     /// Bytes this capability's own meter has left.
     ///
     /// The meter's ceiling, not an ancestor's: a caller that needs the
@@ -4122,7 +4121,7 @@ impl Agent {
             .unwrap_or(record.attrs.budget.max_bytes))
     }
 
-    /// Counters and gauges for this kernel.
+    /// Point-in-time counters. Contains no capability ids or payloads.
     pub fn metrics(&self) -> Metrics {
         let kernel = self.cell.borrow();
         let mut metrics = kernel.metrics;
@@ -4729,7 +4728,12 @@ impl Agent {
                 Some(error) => Some(error),
                 None => self.charge_dispatch_delta(&job, extra).err(),
             };
-            // Phase 2: run provider code with no borrow held.
+            // Phase 2: run provider code with no borrow held. Whether the
+            // method mutates decides how a post-provider refusal is reported:
+            // a provider that ran may already have changed its state
+            // (round 31, F1).
+            let mutating = guard.provider_mut().mutating(&job.call.method);
+            let mut provider_succeeded = false;
             let outcome = match failure {
                 Some(error) => Err(error),
                 None => {
@@ -4749,6 +4753,7 @@ impl Agent {
                         guard.provider_mut().invoke(object, &call)
                     })) {
                         Ok(Ok(response)) => {
+                            provider_succeeded = true;
                             let value = response.into_value();
                             // Settlement hashes and walks the value; an
                             // unbounded one would abort the process where no
@@ -4845,14 +4850,38 @@ impl Agent {
                 Err(error) => Err(error),
             };
 
+            // A mutating provider that ran already applied its effect. A
+            // post-provider budget or lane refusal is then a withheld reply,
+            // not a call that did not happen: a retryable budget class would
+            // invite a second, non-idempotent write, and a `Refused` receipt
+            // would deny an effect that landed (round 31, F1).
+            let mut effect_withheld = false;
+            let outcome = match outcome {
+                Err(Error::BudgetExceeded(_)) | Err(Error::UnknownLane(_))
+                    if provider_succeeded && mutating =>
+                {
+                    effect_withheld = true;
+                    Err(Error::Provider {
+                        code: "provider/reply-withheld".to_string(),
+                    })
+                }
+                other => other,
+            };
+
             // The decision is final here: dispatch's re-checks, provider code
             // and the egress policy (redaction, shape ceilings, the byte charge)
             // have all run. Seal exactly one receipt with the outcome the caller
             // will see: a refusal after that point (an egress budget, a module
             // carrying secret material) used to be sealed as `Admitted`, so the
-            // audit artifact disagreed with the metric and the caller.
+            // audit artifact disagreed with the metric and the caller. When the
+            // provider ran and only the reply was withheld, the effect stands
+            // and the receipt records the admission.
             if !resolved_out_of_band {
-                self.record_receipt(&job, outcome.as_ref().err());
+                if effect_withheld {
+                    self.record_receipt(&job, None);
+                } else {
+                    self.record_receipt(&job, outcome.as_ref().err());
+                }
             }
 
             // Phase 3: settle under a write borrow.
@@ -5550,6 +5579,8 @@ fn budget_dimension(error: &Error) -> &'static str {
             "records" => "records",
             "tombstones" => "tombstones",
             "nodes" => "nodes",
+            "keys" => "keys",
+            "value" => "value",
             "wall" => "wall",
             "depth" => "depth",
             "array_len" => "array_len",

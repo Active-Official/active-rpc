@@ -196,6 +196,20 @@ a message.
 | `rpc/pipelined-cycle` | pipelined calls form a dependency cycle |
 | `rpc/invalid-argument` | a caller-supplied argument is out of range |
 
+### Kernel and domain provider codes
+
+A provider failure is `rpc/provider` with an inner code in the provider's own
+namespace. The kernel itself reports two:
+
+| Code | Condition |
+|------|-----------|
+| `provider/reply-withheld` | a mutating provider ran and applied its effect, but the reply could not be delivered (a post-provider budget or lane refusal); the effect stands and the receipt records the admission, so this is not a retryable budget class |
+| `provider/secret-material` | a provider reply would have carried structural secret material and the redaction policy refused it |
+
+The domain provider reports `rpc/domain` with the Active class where the
+evaluator failed, and `rpc/budget-exceeded` with the dimension it measured
+(`nodes`, `keys`, `value`, `depth`, `wall`, `array_len`).
+
 ### MCP adapter codes
 
 An `McpSession` reports adapter failures as `rpc/provider` with one of these

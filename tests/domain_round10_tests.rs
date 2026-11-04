@@ -1189,10 +1189,12 @@ fn a_redacting_stats_answer_hides_the_size() {
     assert!(!fields.contains_key("secrets"), "{fields:?}");
 }
 
-/// A patch that orphans a secret leaves a module that no longer holds one
-/// (round 21, #3).
+/// A patch that orphans a secret leaves a canonical image, and the module
+/// stays secret-bearing because the install-time redactor still holds the
+/// literal (round 21, #3; round 31, F5 restored the assertions this test lost
+/// in round 27).
 #[test]
-fn a_patch_that_orphans_a_secret_canonicalizes() {
+fn a_patch_that_orphans_a_secret_stays_secret_bearing() {
     let mut module = InfinityModule::new();
     let secret = module.push(Inode::Secret(CANARY.into()));
     let subtree = module.push(Inode::Table {
@@ -1205,7 +1207,7 @@ fn a_patch_that_orphans_a_secret_canonicalizes() {
 
     let (agent, cap, lane) = install(
         module,
-        &["patch", "provenance", "content_hash"],
+        &["patch", "provenance", "content_hash", "stats"],
         None,
         false,
     );
@@ -1215,8 +1217,21 @@ fn a_patch_that_orphans_a_secret_canonicalizes() {
     agent.run();
     promise.value().expect("patch");
 
-    // The stored module is canonical: the orphaned secret is gone, so the raw
-    // hash is served again and the provenance is visible.
+    // Stats still reports one secret: the redactor remembers the literal, so
+    // the module is treated as secret-bearing for every other method too.
+    let promise = agent.call(lane, &cap, "stats", Vec::new()).expect("queued");
+    agent.run();
+    let stats = promise.value().expect("stats");
+    let Value::Map(stats) = stats else {
+        panic!("stats is a map: {stats:?}");
+    };
+    assert_eq!(stats.get("secrets"), Some(&Value::Int(1)), "{stats:?}");
+    assert!(
+        !stats.contains_key("has_provenance"),
+        "stats no longer answers a signal the provenance method owns: {stats:?}"
+    );
+
+    // The hash is still served, in the redacted form.
     let promise = agent
         .call(lane, &cap, "content_hash", Vec::new())
         .expect("queued");
@@ -1226,6 +1241,18 @@ fn a_patch_that_orphans_a_secret_canonicalizes() {
         panic!("a hash: {hash:?}");
     };
     assert!(hash.starts_with("blake3:"), "{hash}");
+
+    // Provenance stays visible but never names the canonical image's hash,
+    // which would let a caller recompute what was redacted.
+    let promise = agent
+        .call(lane, &cap, "provenance", Vec::new())
+        .expect("queued");
+    agent.run();
+    let provenance = promise.value().expect("provenance");
+    assert!(
+        !format!("{provenance:?}").contains("blake3:"),
+        "provenance still names a canonical hash: {provenance:?}"
+    );
 }
 
 /// A scoped evaluate gives one answer whether the name is missing or confined
@@ -1264,4 +1291,65 @@ fn a_scoped_evaluate_hides_whether_a_name_exists() {
     };
     assert_eq!(missing.code(), outside.code(), "{missing} vs {outside}");
     assert_eq!(missing.code(), "rpc/path-not-granted", "{missing}");
+}
+
+/// A mutating provider that ran before the byte charge is not reported as a
+/// retryable budget refusal, and its receipt records the admission: the write
+/// stands even though the reply was withheld (round 31, F1).
+#[test]
+fn a_mutating_patch_refused_on_egress_reports_the_write() {
+    use active_rpc::receipts::Decision;
+
+    let mut module = InfinityModule::new();
+    let blob = module.push(Inode::Str("x".repeat(64 * 1024)));
+    let app = module.push(Inode::Table {
+        fields: vec![("data".to_string(), blob)],
+    });
+    // The large sibling keeps the returned image past the grant even after the
+    // patched cone shrinks.
+    let big = module.push(Inode::Str("y".repeat(64 * 1024)));
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app), ("big".to_string(), big)],
+    });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x72; 32]);
+    agent.enable_receipts(true);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["patch", "content_hash"]);
+    // Enough for the arguments and a hash reply, not enough for the patch
+    // reply that carries the new cone.
+    attrs.budget.max_bytes = 256;
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("r10-egress", Budget::default())
+        .expect("lane");
+
+    let before = call(&agent, &cap, lane, "content_hash", Vec::new());
+    let promise = agent
+        .call(lane, &cap, "patch", vec![path("app"), Arg::text("public")])
+        .expect("queued");
+    agent.run();
+    let error = promise
+        .value()
+        .expect_err("the reply does not fit the grant");
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
+
+    let receipts = agent.receipts();
+    assert_eq!(receipts.len(), 2, "one receipt per job");
+    match &receipts[1].decision {
+        Decision::Admitted => {}
+        other => panic!("the write was receipted as {other:?}"),
+    }
+
+    // The write landed: the module's content hash moved.
+    let after = call(&agent, &cap, lane, "content_hash", Vec::new());
+    assert_ne!(before, after, "the patch did not change the module");
 }

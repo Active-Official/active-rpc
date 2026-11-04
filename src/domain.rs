@@ -299,20 +299,19 @@ impl ModuleProvider {
                         // Keep the caller's branch: the provider's own gates use
                         // `nodes`, `depth` and `wall`, and an evaluator ceiling
                         // names the same conditions (round 17, F4).
-                        let kind = if kind.starts_with("node") {
+                        let kind = if kind.contains("node") {
                             "nodes"
-                        } else if kind.starts_with("depth") {
-                            "depth"
-                        } else if kind.starts_with("wall") {
-                            "wall"
-                        } else if kind.starts_with("array") {
-                            "array_len"
-                        } else if kind.starts_with("key") {
-                            "keys"
                         } else if kind.contains("depth") {
                             "depth"
-                        } else if kind.contains("node") {
-                            "nodes"
+                        } else if kind.contains("wall") {
+                            "wall"
+                        } else if kind.contains("array") {
+                            "array_len"
+                        } else if kind.contains("key") {
+                            // `annotation key bytes` is a key ceiling even
+                            // though the word does not start the label
+                            // (round 31, F3).
+                            "keys"
                         } else {
                             // The provider's own vocabulary is closed; an
                             // unknown dimension is the value budget.
@@ -763,15 +762,11 @@ impl ModuleProvider {
                     };
                     map.insert("secrets".to_string(), Value::Int(reported));
                 }
-                // Provenance describes the whole module; whether it exists at
-                // all is a size signal a redacting caller must not read
-                // (round 27, low).
-                if !call.redact {
-                    map.insert(
-                        "has_provenance".to_string(),
-                        Value::Bool(module.provenance().is_some()),
-                    );
-                }
+                // Whether provenance exists is a size signal a redacting caller
+                // must not read, and `provenance` already answers the question
+                // for a caller that holds that grant (round 27, low; round 31,
+                // F2 removed the field that leaked the same bit through
+                // `stats`).
                 check_wall_budget(started, call)?;
                 Ok(Response::Value(Value::Map(map)))
             }

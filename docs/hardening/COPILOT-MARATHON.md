@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-29: 29 found 1 high, fixed; rounds 30-31 must be clean | 177 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-31: round 31 found 1 medium and 4 lows, all fixed; round 32 must be clean | 182 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-24: round 24 found 3 mediums and 7 lows, all fixed or triaged; rounds 25-26 must be clean | 196 fixed / 1 rejected / 0 open (2 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,22 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 31)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `1f3896a`.
+All nine round-30 fixes verified. No critical or high; one medium, four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a mutating provider ran, applied its effect, and then a post-provider egress budget refusal was reported as `rpc/budget-exceeded` with a `Refused` receipt: the audit artifact denied a write that landed, and the class invited a non-idempotent retry | **fixed**: dispatch asks the provider whether the method mutates before invoking it; a post-provider `BudgetExceeded`/`UnknownLane` on a mutating method becomes `rpc/provider` with inner code `provider/reply-withheld`, and the receipt records the admission. `a_mutating_patch_refused_on_egress_reports_the_write` fails on the pre-fix kernel (budget code, refused receipt) and asserts the content hash moved |
+| 2 | low | `stats.has_provenance` answered the same bit as `provenance`, so the round-27 removal was void | **fixed**: the field is gone; the provenance method owns the question; the strengthened F5 test asserts it is absent |
+| 3 | low | the domain's `keys`/`value` budget dimensions reached telemetry as `other`, and `annotation key bytes` was read as `value` | **fixed**: both arms added to `budget_dimension`, `annotation key bytes`/`annotation key depth` map by substring, and `observability.md` lists the names; `a_provider_budget_dimension_reaches_the_tape` pins both |
+| 4 | low | the round-30 doc fix left the "Point-in-time counters" summary on `remaining_bytes` | **fixed**: the summary is back on `metrics`, and `remaining_bytes` has its own |
+| 5 | low | `a_patch_that_orphans_a_secret_canonicalizes` lost its assertions in round 27 and proved nothing | **fixed and renamed** `a_patch_that_orphans_a_secret_stays_secret_bearing`: stats reports one secret, the hash is redacted, provenance names no `blake3:` field |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 30)
 

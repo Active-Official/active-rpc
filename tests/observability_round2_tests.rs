@@ -272,3 +272,50 @@ fn two_long_method_names_with_a_shared_prefix_stay_distinct() {
         );
     }
 }
+
+/// A provider-authored budget dimension is not flattened to `other` on the
+/// tape: the evaluator's own `keys` and `value` ceilings reach the event
+/// (round 31, F3).
+#[test]
+fn a_provider_budget_dimension_reaches_the_tape() {
+    struct Dimension(&'static str);
+
+    impl Provider for Dimension {
+        fn name(&self) -> &'static str {
+            "dimension"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["ping".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Err(active_rpc::Error::BudgetExceeded(self.0))
+        }
+    }
+
+    for dimension in ["keys", "value"] {
+        let agent = Agent::with_secret([0x5d; 32]);
+        let provider = agent.register(Box::new(Dimension(dimension)));
+        let cap = agent
+            .mint(provider, 0, CapAttrs::new(&["ping"]))
+            .expect("mint");
+        let lane = agent.create_lane("dim", Budget::default()).expect("lane");
+        let error = agent
+            .call(lane, &cap, "ping", Vec::new())
+            .expect("queued")
+            .value()
+            .expect_err("the provider refuses");
+        assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+        let dimensions: Vec<String> = agent
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                Event::BudgetExhausted { dimension, .. } => Some(dimension.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dimensions, vec![dimension.to_string()], "{dimensions:?}");
+    }
+}
