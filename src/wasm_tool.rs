@@ -580,6 +580,19 @@ impl Provider for WasmTool {
             // (round 21, F5).
             return Err(Error::ToolPolicy("a secret is not a wasm argument"));
         }
+        // Budget refusals come before any argument rule, as in the other
+        // adapters: a zero wall or byte grant does no work, and a malformed
+        // argument must not mask it (round 26, #5).
+        let granted = call.budget.max_wall_ms.saturating_mul(FUEL_PER_MS);
+        let fuel = self.limits.fuel.min(granted);
+        if fuel == 0 {
+            return Err(Error::BudgetExceeded("wall"));
+        }
+        if call.budget.max_bytes == 0 {
+            // An empty answer still costs a run; a zero-byte grant does no
+            // work (round 22, F-B).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         // Borrow the argument first: the byte grant bounds the input, and the
         // copy must happen only after every check (round 24, #5).
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
@@ -618,19 +631,8 @@ impl Provider for WasmTool {
             ));
         };
 
-        // The call's wall budget bounds the guest: fuel is a proxy for CPU time,
-        // and a capability that granted 100 ms must not buy minutes of
-        // interpretation because the tool's default fuel is generous.
-        let granted = call.budget.max_wall_ms.saturating_mul(FUEL_PER_MS);
-        let fuel = self.limits.fuel.min(granted);
-        if fuel == 0 {
-            return Err(Error::BudgetExceeded("wall"));
-        }
-        if call.budget.max_bytes == 0 {
-            // An empty answer still costs a run; a zero-byte grant does no
-            // work (round 22, F-B).
-            return Err(Error::BudgetExceeded("byte"));
-        }
+        // The call's wall budget already bounds the guest: fuel was derived
+        // above, before the argument rules (round 26, #5).
         let input = input.to_vec();
         let mut limits = self.limits;
         limits.fuel = fuel;

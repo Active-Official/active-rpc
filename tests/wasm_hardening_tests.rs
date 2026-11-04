@@ -7,7 +7,7 @@
 
 use active_rpc::budget::Budget;
 use active_rpc::cap::CapAttrs;
-use active_rpc::value::{Arg, Value};
+use active_rpc::value::{Arg, Call, Value};
 use active_rpc::wasm_tool::{
     WasmHostPolicy, WasmLimits, WasmTool, FUEL_PER_MS, MAX_TABLE_ELEMENTS,
 };
@@ -431,4 +431,20 @@ fn a_text_module_is_refused_by_default() {
     };
     WasmTool::from_bytes_with_policy(CONSTANT.as_bytes(), WasmLimits::default(), policy)
         .expect("an explicit opt-in accepts text");
+}
+
+/// A zero wall budget is refused before the argument rules, as in the other
+/// adapters: a malformed argument must not mask the budget (round 26, #5).
+#[test]
+fn a_zero_wall_grant_precedes_the_argument_rules() {
+    let mut tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
+    let mut call = Call::new("run", vec![Arg::value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    call.budget = Budget {
+        max_wall_ms: 0,
+        ..Budget::default()
+    };
+    let error =
+        active_rpc::kernel::Provider::invoke(&mut tool, 0, &call).expect_err("a zero wall grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }

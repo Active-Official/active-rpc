@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-32: round 32 found 1 high, 4 mediums and 5 lows, all fixed; rounds 33-34 must be clean | 192 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-25: round 25 found 1 high, 4 mediums and 2 lows, all fixed; rounds 26-27 must be clean | 203 fixed / 1 rejected / 0 open (2 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-26: round 26 found 3 mediums and 3 lows, all fixed or recorded; rounds 27-28 must be clean | 208 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -348,6 +348,23 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 26)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `6710c50`. All seven round-25
+fixes verified. Three mediums, three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `HttpTool` never refused a `path_scope`, and the kernel compares dotted paths, so a URL scope looked like confinement while only the allow-list confined the call | **fixed**: the adapter refuses a scope like the other three; `a_scoped_http_capability_is_refused` |
+| 2 | medium | the HTTP request head was never charged against the byte grant, and `base` is public and unbounded | **fixed**: the head is built before the connection and its excess over a 256-byte framing allowance, plus the request body, is charged; `an_http_request_head_past_the_grant_is_a_budget_refusal` |
+| 3 | medium | a shell `program` with a `*` rule is a command-line grant: a metacharacter-free payload with a space still runs an arbitrary simple command | **recorded as residual 13**: refusing every shell + prefix combination would break the operator pattern and the shipped tests; `wire.md`/`security.md` state that prefix rules are unconfined and the metacharacter check is defense in depth |
+| 4 | low | the MCP outgoing request checked the static 1 MiB ceiling before the grant, masking a budget refusal | **fixed**: the grant is checked first; `an_mcp_request_past_the_grant_and_the_line_ceiling_is_a_budget_refusal` |
+| 5 | low | the wasm host checked its wall/byte grants after the argument-shape loop | **fixed**: both precede the loop; `a_zero_wall_grant_precedes_the_argument_rules` |
+| 6 | low | a declared `content-length` past the 64 MiB ceiling reported a provider code even when the grant was the tighter bound | **fixed**: the branch routes through `capped()`; `a_declared_length_past_the_grant_is_a_budget_refusal` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 25)
 

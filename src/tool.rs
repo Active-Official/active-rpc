@@ -1208,19 +1208,18 @@ impl<T: McpTransport> McpSession<T> {
             "params": params,
         });
         let line = payload.to_string();
+        if line.len() > max_line {
+            // The grant comes first: a request past both ceilings is a budget
+            // exhaustion, and reporting the static ceiling masked it
+            // (round 26, #4).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         if line.len() > MAX_MCP_LINE_BYTES {
             // The peer refuses a line of this size; refuse it here instead of
             // sending a frame that can only be a desync.
             return Err(Error::InvalidArgument(
                 "the MCP request exceeds the line ceiling",
             ));
-        }
-        if line.len() > max_line {
-            // JSON escaping can grow the arguments several times over; the
-            // grant bounds the frame this call writes (round 20, L4). A grant
-            // cannot make an over-1-MiB line legal, so the static ceiling is
-            // checked first (round 21, F3).
-            return Err(Error::BudgetExceeded("byte"));
         }
         // A ceiling already spent means nothing has been written: the session
         // stays usable, and the caller may retry (round 5, #5).
@@ -1564,6 +1563,10 @@ impl HttpTool {
         }
     }
 
+    // One exchange needs the method, the path, the body, the wall ceiling and
+    // three byte limits; grouping the limits would add an allocation-free struct
+    // for a private helper.
+    #[allow(clippy::too_many_arguments)]
     fn perform(
         &self,
         method: &str,
@@ -1571,6 +1574,7 @@ impl HttpTool {
         body: Option<&[u8]>,
         ceiling_ms: u64,
         max_body: usize,
+        grant: usize,
         grant_bound: bool,
     ) -> Result<(u16, Vec<u8>)> {
         // A cap-derived refusal is a budget exhaustion when the capability's
@@ -1589,6 +1593,31 @@ impl HttpTool {
             .base
             .strip_prefix("http://")
             .ok_or(Error::ToolPolicy("only http:// endpoints are supported"))?;
+        // The request head is part of what the capability pays for: an
+        // unbounded `base` or an allowlisted long path could otherwise write
+        // megabytes before any response check (round 26, #2). A GET carries no
+        // `content-length` and no body (the request ends at the empty line).
+        let head = {
+            let mut head =
+                format!("{method} {path} HTTP/1.1\r\nhost: {base}\r\nconnection: close\r\n");
+            if let Some(body) = body {
+                head.push_str(&format!("content-length: {}\r\n", body.len()));
+            }
+            head.push_str("\r\n");
+            head
+        };
+        // Most of the head is fixed adapter framing (method, version, host
+        // header), so a small allowance is free; what exceeds it is data the
+        // capability pays for. A megabyte of `base` or an allowlisted long path
+        // must not be written under a tiny grant (round 26, #2).
+        const HEAD_ALLOWANCE: usize = 256;
+        let charged = head
+            .len()
+            .saturating_sub(HEAD_ALLOWANCE)
+            .saturating_add(body.map_or(0, <[u8]>::len));
+        if charged > grant {
+            return Err(Error::BudgetExceeded("byte"));
+        }
         // A grant too small to hold the head cannot pay for the answer; the
         // static ceiling was its only bound (round 20, M3).
         if max_body < MIN_HTTP_ANSWER_BYTES {
@@ -1659,20 +1688,6 @@ impl HttpTool {
         // per (ceiling - epsilon) makes every write return `Ok(1)`, so the phase
         // would cost body_len * interval; the deadline is re-armed and re-checked
         // per chunk instead (round 8, F3).
-        let head = {
-            // A method defined without content sends no `content-length` and no
-            // body. A GET that carries one makes simple servers and
-            // intermediaries reset the connection instead of answering: the
-            // request is already complete at the empty line, so the extra bytes
-            // are unread data.
-            let mut head =
-                format!("{method} {path} HTTP/1.1\r\nhost: {base}\r\nconnection: close\r\n");
-            if let Some(body) = body {
-                head.push_str(&format!("content-length: {}\r\n", body.len()));
-            }
-            head.push_str("\r\n");
-            head
-        };
         write_within(&mut stream, head.as_bytes(), deadline)?;
         if let Some(body) = body {
             write_within(&mut stream, body, deadline)?;
@@ -1826,9 +1841,7 @@ impl HttpTool {
                 // sane ceiling would turn it into an allocation abort
                 // (round 11, #14).
                 if length > MAX_RESPONSE_BYTES {
-                    return Err(Error::Provider {
-                        code: "http/body-too-large".to_string(),
-                    });
+                    return Err(capped("http/body-too-large"));
                 }
                 if length > body_cap {
                     // The same code as the read-to-end arm: a peer must not
@@ -1897,6 +1910,15 @@ impl Provider for HttpTool {
             // (round 3, #7).
             return Err(Error::ToolPolicy(
                 "a secret argument cannot be sent to an external peer",
+            ));
+        }
+        if call.path_scope.is_some() {
+            // The kernel's scope check compares dotted paths, which means
+            // nothing for a `/`-separated URL path: a scoped HTTP capability
+            // would look confined while only the allow-list confined it
+            // (round 26, #1). The other adapters refuse the same way.
+            return Err(Error::ToolPolicy(
+                "this adapter cannot enforce a path scope",
             ));
         }
         let takes_method_text = call.method == "request";
@@ -2079,6 +2101,7 @@ impl Provider for HttpTool {
             body.as_deref(),
             call.budget.max_wall_ms,
             cap,
+            grant,
             grant < self.max_body.min(MAX_RESPONSE_BYTES),
         )?;
         if !(200..300).contains(&status) {

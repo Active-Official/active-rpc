@@ -215,7 +215,8 @@ evaluator failed, and `rpc/budget-exceeded` with the dimension it measured
 
 An `McpSession` reports adapter failures as `rpc/provider` with one of these
 inner codes. Every one is a fail-closed refusal; none is retryable without a new
-session:
+session. The capability's byte grant is checked before the static 1 MiB line
+ceiling, so a request past both is a budget refusal.
 
 | Code | Condition |
 |------|-----------|
@@ -292,7 +293,12 @@ peer’s. A server that drips a byte per timeout period cannot stretch the
 ceiling. A HEAD,
 204 or 304 reply is read as bodyless whatever its headers say. A path is
 refused if it contains a byte outside `0x21..=0x7e`, because it is
-interpolated into the request line. A leading UTF-8 byte-order mark on an
+interpolated into the request line. A capability with a path scope is refused
+(`rpc/tool-policy`): the kernel compares dotted paths, which cannot confine a
+URL path, so the scope would look like confinement while only the allow-list
+confined the call. The request head is charged against the byte grant beyond a
+256-byte framing allowance, so a megabyte of `base` or an allowlisted long path
+cannot be written under a tiny grant. A leading UTF-8 byte-order mark on an
 answer is ignored before the JSON gates and the decode.
 
 ### Process adapter codes (`LocalProcess`)

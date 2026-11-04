@@ -2202,3 +2202,71 @@ fn the_head_and_body_share_the_grant_exactly() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 26
+// ---------------------------------------------------------------------------
+
+/// The HTTP adapter refuses a path scope: the kernel compares dotted paths,
+/// which cannot confine a URL path, so a scoped capability would look confined
+/// while only the allow-list confined it (round 26, #1).
+#[test]
+fn a_scoped_http_capability_is_refused() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/safe")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/safe"))]);
+    call.tool_allows_process = true;
+    call.path_scope = Some("safe".to_string());
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a scope cannot be enforced");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// The request head is charged before the connection: an allowlisted long path
+/// or an operator `base` must not write past a tiny grant (round 26, #2).
+#[test]
+fn an_http_request_head_past_the_grant_is_a_budget_refusal() {
+    let long_path = format!("/{}", "a".repeat(512));
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", &long_path)]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path(&long_path))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 64;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the head is past the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A request past both ceilings reports the budget: the static line ceiling
+/// used to mask it (round 26, #4).
+#[test]
+fn an_mcp_request_past_the_grant_and_the_line_ceiling_is_a_budget_refusal() {
+    let mut session = echo_session();
+    let big = "x".repeat(1 << 20);
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Text(big))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 8;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the request is refused");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A huge declared `content-length` under a tiny grant is a budget refusal
+/// (round 26, #6).
+#[test]
+fn a_declared_length_past_the_grant_is_a_budget_refusal() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    fixed_response(
+        listener,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 104857600\r\nconnection: close\r\n\r\n".to_vec(),
+    );
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/huge")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/huge"))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 256;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the body is past the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}

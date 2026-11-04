@@ -96,4 +96,11 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
     inside the host process. A peer has no path to them, so this is an operator
     footgun rather than an escalation; moving them behind setters is a breaking
     change scheduled with the next minor release.
+13. **A shell as the process `program` with a `*` rule is a command-line
+    grant.** `LocalProcess` refuses shell syntax in a prefix-matched argument,
+    but a metacharacter-free payload with a space still runs an arbitrary simple
+    command (`sh -c curl …`), which is what a prefix grant on a shell means.
+    Operators must not configure `sh`/`cmd` with prefix rules; `wire.md` and
+    `security.md` say prefix rules are unconfined, and the metacharacter refusal
+    is defense in depth only.
 
