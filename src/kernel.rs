@@ -491,7 +491,7 @@ pub struct Kernel {
     /// object let an unrelated restore (or revoke) drop another record's pin
     /// (round 32, #3; round 38, F1-F3). Kept apart from `object_records`,
     /// which mirrors the live capability registry exactly.
-    record_pins: BTreeMap<[u8; 32], (ProviderId, u64)>,
+    record_pins: BTreeMap<[u8; 32], (ProviderId, u64, CapId)>,
     /// Reference operations that arrived while the kernel was borrowed.
     ///
     /// Shared with the handle control, which cannot borrow the kernel from a
@@ -1225,7 +1225,9 @@ impl Agent {
                 .map_err(|_| Error::persistence("the grant is already committed"))?;
         }
         kernel.consumed_records.insert(record.record_id);
-        kernel.record_pins.insert(record.record_id, pinned);
+        kernel
+            .record_pins
+            .insert(record.record_id, (pinned.0, pinned.1, cap.id()));
         kernel.push_event(Event::CapExported(cap.id()));
         Ok(record)
     }
@@ -1907,9 +1909,18 @@ impl Agent {
         if newly {
             // A tombstoned record can never be restored, and the documented
             // orphan workflow drops the handle before the tombstone, so no live
-            // capability may be left to revoke: release the pin here
+            // capability may be left to revoke: release the pin here and, when
+            // nothing else names the object, let the provider reclaim it
             // (round 38, F3).
-            kernel.record_pins.remove(&record_id);
+            if let Some((provider, object, cap)) = kernel.record_pins.remove(&record_id) {
+                let still_pinned = kernel
+                    .record_pins
+                    .values()
+                    .any(|(other, target, _)| *other == provider && *target == object);
+                if !still_pinned && !kernel.object_records.contains_key(&(provider, object)) {
+                    kernel.queue_provider_drop(provider, object, cap);
+                }
+            }
         }
         let live: Vec<CapId> = kernel
             .caps
@@ -5188,10 +5199,9 @@ impl Kernel {
             // used to fire for every capability, so a provider that freed the
             // object when its first capability was dropped would free it while
             // a sibling could still call it.
-            let pinned = kernel
-                .record_pins
-                .values()
-                .any(|(provider, object)| *provider == record.provider && *object == record.object);
+            let pinned = kernel.record_pins.values().any(|(provider, object, _)| {
+                *provider == record.provider && *object == record.object
+            });
             if !kernel
                 .object_records
                 .contains_key(&(record.provider, record.object))

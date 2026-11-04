@@ -504,3 +504,71 @@ fn a_revoked_exported_record_releases_its_object() {
         "the revoked record kept its object pinned"
     );
 }
+
+/// Tombstoning an exported record after its handle was dropped still releases
+/// the export pin: the provider must reclaim the module (round 38, F3).
+#[test]
+fn a_tombstone_after_the_handle_is_dropped_releases_the_pin() {
+    use active_infinity::{InfinityModule, Inode};
+    use active_rpc::domain::ModuleProvider;
+
+    let mut module = InfinityModule::new();
+    let root = module.push(Inode::Str("app".to_string()));
+    module.set_root(Some(root));
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x71; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x96; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.persistence = CapPersistence::Durable;
+    let owner = admitted(b"durable-owner");
+    let cap = agent
+        .mint_bound(&owner, id, object, attrs)
+        .expect("durable cap");
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+    let _ = agent.take_drops(id);
+    agent.tombstone_record(record.record_id).expect("tombstone");
+    // The tombstone queues the provider drop; a run delivers it.
+    agent.run();
+    let drops = agent.take_drops(id);
+    assert!(
+        !drops.is_empty(),
+        "a tombstoned record kept its object pinned"
+    );
+}
+
+/// An export refuses a record id a replayed kill list already holds, before it
+/// reserves anything (round 38, F2).
+#[test]
+fn an_export_refuses_a_tombstoned_record_id() {
+    let (agent, provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    agent.revoke(&cap).expect("revoke");
+    drop(cap);
+    agent.tombstone_record(record.record_id).expect("tombstone");
+
+    // A second kernel with the same secret re-issues serial 0, so its first
+    // durable capability carries the tombstoned record id.
+    let second = Agent::with_secret([0x71; 32]);
+    second.set_durable_capabilities(true);
+    second.set_record_seal_key([0x91; 32]);
+    // A restart replays its kill list, so the tombstone is local knowledge.
+    second
+        .tombstone_record(record.record_id)
+        .expect("replay the tombstone");
+    let provider = second.register(Box::new(Echo));
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let owner = admitted(b"durable-owner");
+    let cap = second
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect("durable cap");
+    let error = second
+        .export_capability(&cap)
+        .expect_err("the id is tombstoned");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+    let _ = provider;
+}
