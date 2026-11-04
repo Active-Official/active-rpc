@@ -544,7 +544,7 @@ fn a_tombstone_after_the_handle_is_dropped_releases_the_pin() {
 /// reserves anything (round 38, F2).
 #[test]
 fn an_export_refuses_a_tombstoned_record_id() {
-    let (agent, provider, cap) = durable_agent();
+    let (agent, _provider, cap) = durable_agent();
     let record = agent.export_capability(&cap).expect("export");
     agent.revoke(&cap).expect("revoke");
     drop(cap);
