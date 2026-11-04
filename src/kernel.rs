@@ -3723,11 +3723,15 @@ impl Agent {
                 let reusable = kernel
                     .promises
                     .get(&id)
-                    .map(|record| {
-                        matches!(
-                            record.state,
-                            PromiseState::Pending | PromiseState::Resolved(_)
-                        )
+                    .map(|record| match &record.state {
+                        PromiseState::Pending | PromiseState::Resolved(_) => true,
+                        // A withheld reply means the write landed, so replaying
+                        // the key returns the same outcome instead of running
+                        // the mutating provider a second time (round 33, F2).
+                        PromiseState::Rejected(error) => {
+                            error.provider_code() == Some("provider/reply-withheld")
+                        }
+                        _ => false,
                     })
                     .unwrap_or(false);
                 if reusable {
@@ -5160,10 +5164,14 @@ impl Kernel {
             };
             kernel.meters.remove(&id);
             kernel.push_event(Event::CapDropped(id));
-            if kernel.consumed_records.contains(&record.record_id) {
+            if kernel.consumed_records.contains(&record.record_id)
+                && !kernel.restored_records.contains(&record.record_id)
+            {
                 // Exported and now unreferenced: the record is still
                 // restorable, which an operator must be able to see
-                // (audit AR-03).
+                // (audit AR-03). A restored capability carries the same record
+                // id, but its record is spent, so dropping it is not an
+                // orphan (round 33, F4).
                 kernel.push_event(Event::CapRecordOrphaned(id));
             }
             // `on_drop` means "the last capability that referenced this object

@@ -199,7 +199,7 @@ a message.
 ### Kernel and domain provider codes
 
 A provider failure is `rpc/provider` with an inner code in the provider's own
-namespace. The kernel itself reports two:
+namespace. The kernel itself reports three:
 
 | Code | Condition |
 |------|-----------|

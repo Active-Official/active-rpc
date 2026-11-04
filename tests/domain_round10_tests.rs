@@ -703,7 +703,12 @@ fn a_patch_removing_the_last_secret_serves_no_parent() {
 
     let (agent, cap, lane) = install(module, &["patch", "provenance", "subgraph"], None, false);
     let promise = agent
-        .call(lane, &cap, "patch", vec![path("s"), Arg::text("public")])
+        .call(
+            lane,
+            &cap,
+            "patch",
+            vec![path("s"), Arg::Value(Value::Int(1))],
+        )
         .expect("queued");
     agent.run();
     let cone = promise.value().expect("patch");
@@ -823,7 +828,12 @@ fn a_patch_removing_the_last_secret_drops_hash_entries() {
 
     let (agent, cap, lane) = install(module, &["patch", "provenance"], None, false);
     let promise = agent
-        .call(lane, &cap, "patch", vec![path("s"), Arg::text("public")])
+        .call(
+            lane,
+            &cap,
+            "patch",
+            vec![path("s"), Arg::Value(Value::Int(1))],
+        )
         .expect("queued");
     agent.run();
     promise.value().expect("patch");
@@ -1212,7 +1222,12 @@ fn a_patch_that_orphans_a_secret_stays_secret_bearing() {
         false,
     );
     let promise = agent
-        .call(lane, &cap, "patch", vec![path("app"), Arg::text("public")])
+        .call(
+            lane,
+            &cap,
+            "patch",
+            vec![path("app"), Arg::Value(Value::Int(1))],
+        )
         .expect("queued");
     agent.run();
     promise.value().expect("patch");
@@ -1356,49 +1371,52 @@ fn a_mutating_patch_refused_on_egress_reports_the_write() {
 
 /// A text replacement on a secret-bearing module is refused uniformly: the
 /// reply is the caller's own literal through the install-time redactor, so a
-/// candidate that contains the secret would echo the placeholder and one that
-/// does not would echo the text (round 32, #1).
+/// candidate that contains the secret would echo the marker and one that does
+/// not would echo the text. The `redact` flag does not narrow it: the cone is
+/// redacted for every capability (round 32, #1; round 33, F1).
 #[test]
 fn a_patch_reply_does_not_reveal_the_installed_secret() {
-    let mut module = InfinityModule::new();
-    let secret = module.push(Inode::Secret(CANARY.into()));
-    let app = module.push(Inode::Table {
-        fields: vec![("c".to_string(), secret)],
-    });
-    let root = module.push(Inode::Table {
-        fields: vec![("app".to_string(), app)],
-    });
-    module.set_root(Some(root));
+    for redact in [true, false] {
+        let mut module = InfinityModule::new();
+        let secret = module.push(Inode::Secret(CANARY.into()));
+        let app = module.push(Inode::Table {
+            fields: vec![("c".to_string(), secret)],
+        });
+        let root = module.push(Inode::Table {
+            fields: vec![("app".to_string(), app)],
+        });
+        module.set_root(Some(root));
 
-    let mut provider = ModuleProvider::new();
-    let object = provider.install(module).expect("install");
-    let agent = Agent::with_secret([0x74; 32]);
-    let id = agent.register(Box::new(provider));
-    let mut attrs = CapAttrs::new(&["patch"]);
-    attrs.redact = true;
-    let cap = agent.mint(id, object, attrs).expect("cap");
-    let lane = agent
-        .create_lane("r10-oracle", Budget::default())
-        .expect("lane");
+        let mut provider = ModuleProvider::new();
+        let object = provider.install(module).expect("install");
+        let agent = Agent::with_secret([0x74; 32]);
+        let id = agent.register(Box::new(provider));
+        let mut attrs = CapAttrs::new(&["patch"]);
+        attrs.redact = redact;
+        let cap = agent.mint(id, object, attrs).expect("cap");
+        let lane = agent
+            .create_lane("r10-oracle", Budget::default())
+            .expect("lane");
 
-    for candidate in [CANARY, "not-the-secret"] {
-        let promise = agent
-            .call(
-                lane,
-                &cap,
-                "patch",
-                vec![path("app.c"), Arg::text(candidate)],
-            )
-            .expect("queued");
-        agent.run();
-        let error = promise
-            .value()
-            .expect_err("a text replacement on a secret-bearing module is refused");
-        assert_eq!(
-            error.code(),
-            "rpc/invalid-argument",
-            "{candidate:?}: {error}"
-        );
+        for candidate in [CANARY, "not-the-secret"] {
+            let promise = agent
+                .call(
+                    lane,
+                    &cap,
+                    "patch",
+                    vec![path("app.c"), Arg::text(candidate)],
+                )
+                .expect("queued");
+            agent.run();
+            let error = promise
+                .value()
+                .expect_err("a text replacement on a secret-bearing module is refused");
+            assert_eq!(
+                error.code(),
+                "rpc/invalid-argument",
+                "redact={redact} {candidate:?}: {error}"
+            );
+        }
     }
 }
 
@@ -1455,4 +1473,72 @@ fn a_mutating_reply_with_a_structural_secret_is_a_withheld_reply() {
         Decision::Admitted => {}
         other => panic!("the write was receipted as {other:?}"),
     }
+}
+
+/// A withheld reply is not forgotten by the idempotency cache: replaying the
+/// key returns the same outcome instead of running the mutating provider again
+/// (round 33, F2).
+#[test]
+fn a_withheld_reply_is_not_re_executed_by_its_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct SecretWriter {
+        image: Vec<u8>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl active_rpc::kernel::Provider for SecretWriter {
+        fn name(&self) -> &'static str {
+            "secret-writer"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["write".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            true
+        }
+        fn invoke(
+            &mut self,
+            _object: u64,
+            _call: &Call,
+        ) -> active_rpc::Result<active_rpc::value::Response> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(active_rpc::value::Response::Module(self.image.clone()))
+        }
+    }
+
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    module.set_root(Some(secret));
+    let image = active_infinity::encode(&module).expect("encode");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::with_secret([0x76; 32]);
+    let id = agent.register(Box::new(SecretWriter {
+        image,
+        calls: Arc::clone(&calls),
+    }));
+    let cap = agent.mint(id, 0, CapAttrs::new(&["write"])).expect("cap");
+    let lane = agent
+        .create_lane("r10-withheld-key", Budget::default())
+        .expect("lane");
+
+    let mut outcomes = Vec::new();
+    for _ in 0..2 {
+        let promise = agent
+            .call_idempotent(lane, &cap, "write", Vec::new(), "key-1")
+            .expect("queued");
+        agent.run();
+        let error = promise.value().expect_err("the reply is withheld");
+        outcomes.push(error.provider_code().map(str::to_string));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the provider ran once");
+    assert_eq!(
+        outcomes,
+        vec![
+            Some("provider/reply-withheld".to_string()),
+            Some("provider/reply-withheld".to_string())
+        ]
+    );
 }

@@ -335,7 +335,13 @@ impl Envelope {
         Self {
             kind: Kind::Error,
             request_id,
-            method: error.code().to_string(),
+            // The inner provider code is the bit a peer needs: `rpc/provider`
+            // alone cannot say whether a mutating call landed, and a caller
+            // that retries a withheld reply writes twice (round 33, F3).
+            method: error
+                .provider_code()
+                .unwrap_or_else(|| error.code())
+                .to_string(),
             args: Vec::new(),
             payload: Vec::new(),
             caps: Vec::new(),

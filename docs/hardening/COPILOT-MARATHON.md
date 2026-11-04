@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-32: round 32 found 1 high, 4 mediums and 5 lows, all fixed; rounds 33-34 must be clean | 192 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-33: round 33 found 1 high, 2 mediums and 4 lows, all fixed; rounds 34-35 must be clean | 199 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-26: round 26 found 3 mediums and 3 lows, all fixed or recorded; rounds 27-28 must be clean | 208 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,24 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 33)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `a6814e4`.
+Round-32 fixes verified (two gaps). One **high**, two mediums, four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the patch oracle was still open for a non-redacting capability: the cone is redacted for every capability, so `redact=false` did not narrow the echo | **fixed**: the refusal is unconditional for text on a secret-bearing module; non-text literals declassify. The round-21 tests now patch with an `Int`, and `a_patch_reply_does_not_reveal_the_installed_secret` loops over both `redact` values |
+| 2 | medium | the idempotency cache forgot a withheld reply, so replaying the key ran the mutating provider again | **fixed**: a rejected promise whose provider code is `provider/reply-withheld` is reusable; `a_withheld_reply_is_not_re_executed_by_its_key` fails pre-fix (two invocations) |
+| 3 | medium | `Envelope::error` dropped the provider inner code, so a peer could not tell a withheld write from a refusal | **fixed**: the envelope carries `provider_code()` when present; `an_error_envelope_carries_the_provider_inner_code` |
+| 4 | low | `cap.record-orphaned` fired for a restored capability whose record is spent | **fixed**: the event requires the record not to be in `restored_records`; `dropping_a_restored_capability_is_not_an_orphan` |
+| 5 | low | three `redact_derived` sites still surfaced a provider-side redaction fault as `rpc/payload` | **fixed**: one `redaction_fault` helper maps them to `provider/redaction` |
+| 6 | low | a stray doc block described `restrict` above `evaluate_for_caller` | **fixed** |
+| 7 | low | `wire.md` counted two kernel provider codes after a third was added | **fixed**: it says three |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-04 (round 32)
 

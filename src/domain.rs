@@ -413,7 +413,7 @@ impl ModuleProvider {
                 // secret node with the marker leaves nothing to taint, and the
                 // metadata filter below needs the original cone.
                 let tainted = call.redact.then(|| tainted_nodes(&sub));
-                security::redact_derived(&mut sub, &slot.redactor)?;
+                security::redact_derived(&mut sub, &slot.redactor).map_err(redaction_fault)?;
                 // A secret-bearing module carries a raw content address in its
                 // provenance; that is an offline oracle, so the cone drops it
                 // for every capability (round 13, H2).
@@ -499,23 +499,19 @@ impl ModuleProvider {
                             _ => None,
                         })
                         .ok_or(Error::InvalidArgument("patch needs a literal value"))?;
-                    if call.redact
-                        && !slot.redactor.is_empty()
-                        && matches!(replacement, Inode::Str(_))
-                    {
-                        // The reply carries the caller's own replacement
-                        // redacted through the install-time secret set: a
-                        // candidate containing the secret comes back as the
-                        // placeholder and one that does not comes back
-                        // verbatim, so the reply is an equality oracle over
-                        // secrets (round 32, #1). A redacting writer is the
-                        // caller that must not learn the secret, so its text
-                        // replacements are refused uniformly; non-text
-                        // literals cannot carry the secret, and a
-                        // non-redacting capability is already authorized to
-                        // the secret-bearing image.
+                    if !slot.redactor.is_empty() && matches!(replacement, Inode::Str(_)) {
+                        // The reply is the caller's own literal through the
+                        // install-time redactor, and that redaction is
+                        // unconditional: a candidate containing the secret
+                        // comes back as the marker and one that does not comes
+                        // back verbatim, for every capability (round 32, #1;
+                        // round 33, F1 showed the `redact` flag does not
+                        // narrow it). Refuse every text replacement on a
+                        // secret-bearing module; a non-text literal cannot
+                        // carry the secret, so declassification uses one of
+                        // those.
                         return Err(Error::InvalidArgument(
-                            "a redacting capability cannot write text into a secret-bearing module",
+                            "a text replacement is refused on a secret-bearing module",
                         ));
                     }
                     let mut patched = module.clone();
@@ -562,7 +558,7 @@ impl ModuleProvider {
                     // As in `subgraph`: the reply is a projection, and a copy of
                     // a secret literal in the cone is still the secret.
                     let tainted = call.redact.then(|| tainted_nodes(&cone));
-                    security::redact_derived(&mut cone, &slot.redactor)?;
+                    security::redact_derived(&mut cone, &slot.redactor).map_err(redaction_fault)?;
                     // The provenance names the pre-patch image, so the
                     // pre-patch secret set decides too (round 14, H1).
                     let holds_secret = !slot.redactor.is_empty()
@@ -729,7 +725,8 @@ impl ModuleProvider {
                         Some(hash) => hash,
                         None => {
                             let mut redacted = slot.module.clone();
-                            crate::security::redact_derived(&mut redacted, &slot.redactor)?;
+                            crate::security::redact_derived(&mut redacted, &slot.redactor)
+                                .map_err(redaction_fault)?;
                             let redacted_bytes = encode(&redacted)
                                 .map_err(|error| Error::Payload(error.code().to_string()))?;
                             let hash = active_infinity::content_hash(&redacted_bytes)
@@ -1592,6 +1589,21 @@ fn tainted_labels(module: &InfinityModule) -> BTreeSet<String> {
 /// so a module returned by `subgraph` or `patch` is a redacted projection: the
 /// structure survives, the material does not. A caller that needs the raw module
 /// moves it through a transport payload, not through a capability result.
+/// A provider-side redaction fault, not a fault in the caller's payload.
+///
+/// Redacting a stored module can make two field names collide after the
+/// replacement, which the encoder refuses. The stored module came from this
+/// provider, so blaming the caller's payload with `rpc/payload` misreports it
+/// (round 33, F5).
+fn redaction_fault(error: Error) -> Error {
+    match error {
+        Error::Payload(_) => Error::Provider {
+            code: "provider/redaction".to_string(),
+        },
+        other => other,
+    }
+}
+
 fn redacted_module_bytes(module: &InfinityModule) -> Result<Vec<u8>> {
     // One implementation, shared with the security helpers: a second copy of
     // the redactor would drift, and the one that drifted would be the leak.
@@ -1683,10 +1695,6 @@ fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
         .collect()
 }
 
-/// Extract the subgraph rooted at `node` as a standalone module.
-///
-/// The cone is closed under dependencies by construction, so every child
-/// reference stays inside the new arena.
 /// Evaluate a module for a caller, redacting first when the capability asks.
 ///
 /// The engine has no notion of a secret literal: a plain `Str` that copies one

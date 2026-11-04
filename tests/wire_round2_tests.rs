@@ -223,3 +223,24 @@ fn map_keys_charge_the_decode_arena() {
     // The same frame decodes when the ceiling covers keys and values.
     Envelope::decode_with(&bytes, WireLimits::default()).expect("keys and values fit");
 }
+
+/// A provider failure keeps its inner code on the wire: `rpc/provider` alone
+/// cannot tell a peer whether a mutating call landed (round 33, F3).
+#[test]
+fn an_error_envelope_carries_the_provider_inner_code() {
+    let envelope = Envelope::error(
+        3,
+        &active_rpc::Error::Provider {
+            code: "provider/reply-withheld".to_string(),
+        },
+    );
+    let bytes = envelope.encode().expect("encode");
+    let decoded = Envelope::decode(&bytes).expect("decode");
+    assert_eq!(decoded.method, "provider/reply-withheld");
+
+    // A kernel-authored refusal keeps its own code.
+    let envelope = Envelope::error(4, &active_rpc::Error::ReadOnly);
+    let bytes = envelope.encode().expect("encode");
+    let decoded = Envelope::decode(&bytes).expect("decode");
+    assert_eq!(decoded.method, "rpc/read-only");
+}

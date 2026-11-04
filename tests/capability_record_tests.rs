@@ -439,3 +439,35 @@ fn an_exported_record_keeps_its_object_alive() {
     let value = promise.value().expect("the restored capability works");
     assert!(matches!(value, Value::Map(_)), "{value:?}");
 }
+
+/// A restored capability carries the same record id, but its record is spent:
+/// dropping it must not report a restorable orphan (round 33, F4).
+#[test]
+fn dropping_a_restored_capability_is_not_an_orphan() {
+    use active_rpc::kernel::Event;
+
+    let (agent, provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+    let _ = agent.take_drops(provider);
+    let orphans = |agent: &Agent| {
+        agent
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::CapRecordOrphaned(_)))
+            .count()
+    };
+    assert_eq!(orphans(&agent), 1, "the export orphan is reported");
+
+    let restored = match agent.restore_capability(&record, &admitted(b"durable-owner")) {
+        Ok(cap) => cap,
+        Err(error) => panic!("restore: {error}"),
+    };
+    drop(restored);
+    let _ = agent.take_drops(provider);
+    assert_eq!(
+        orphans(&agent),
+        1,
+        "a spent record is not a restorable orphan"
+    );
+}
