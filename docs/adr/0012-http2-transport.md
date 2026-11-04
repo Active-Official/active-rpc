@@ -92,7 +92,7 @@ places.
 | `MAX_FRAME` | 16 KiB | `SETTINGS_MAX_FRAME_SIZE` on both sides |
 | `MAX_CONCURRENT_STREAMS` | 128 | `SETTINGS_MAX_CONCURRENT_STREAMS` |
 | `MAX_STREAM_WINDOW` / `MAX_CONNECTION_WINDOW` | 256 KiB / 2 MiB | `SETTINGS_INITIAL_WINDOW_SIZE` and the connection window |
-| `MAX_INFLIGHT_BODY` | 128 MiB per connection | per-stream `Reservation` guard; over budget is `429` before buffering |
+| `MAX_INFLIGHT_BODY` | 128 MiB across every connection of one `serve` call | per-stream `Reservation` guard; a request over budget is `429` before buffering, and an executed call's over-budget response is a non-retryable `500` |
 
 Why each one exists:
 

@@ -62,8 +62,10 @@ must trust with `--cert`.
 ## Examples
 
 ```bash
-# Start a peer and capture its address and capability
-active-rpc-cli peer --limit 4 > peer.txt
+# Start a peer and capture its address and capability.
+# `--emit-cap-hex` prints the capability in the transferable hex form; `peer.txt`
+# is bearer authority, so keep it private (mode 600) and delete it when done.
+active-rpc-cli peer --limit 4 --emit-cap-hex > peer.txt
 ADDR=$(awk -F= '/^addr=/{print $2}' peer.txt)
 CAP=$(awk -F= '/^cap=/{print $2}' peer.txt)
 

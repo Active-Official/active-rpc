@@ -109,7 +109,7 @@ WasmTool::from_bytes_with_policy(bytes, limits, policy)
 
 | Import | Signature | Grant | Bound |
 |---|---|---|---|
-| `env.clock_ms` | `() -> i64` | `clock` | wall-clock milliseconds since the Unix epoch |
+| `env.clock_ms` | `() -> i64` | `clock` | the kernel's `Call::now_ms` (virtual by default; wall-clock only when the agent enables that mode) |
 | `env.random` | `(ptr u32, len u32) -> i32` | `random` | at most 64 KiB per call, OS CSPRNG; bounds-checked against guest memory |
 | `env.log` | `(ptr u32, len u32) -> i32` | `log` | at most `max_log_bytes` (policy ceiling 64 KiB) per call, captured by the host |
 
@@ -129,8 +129,10 @@ Rules:
 
 Limits of the profile:
 
-- `clock_ms` is wall-clock, so a recorded session that calls a guest using it is
-  not byte-deterministic. Replay packages record the demo provider, not WASM
-  guests; keeping a guest deterministic requires it to take the time as input.
+- `clock_ms` reports the kernel/embedder clock, so a guest under the default
+  virtual clock is deterministic. A deployment that enables wall-clock mode makes
+  the guest time-dependent; a recorded session then needs the guest to take the
+  time as input, because replay packages record the demo provider, not WASM
+  guests.
 - There is no filesystem or network import. Adding one requires a new policy
   field, a capability-scoped path or address allow-list, and its own ADR.

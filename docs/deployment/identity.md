@@ -63,7 +63,7 @@ let identity = ServerIdentity {
 };
 let bind: SocketAddr = "0.0.0.0:7443".parse()?;
 let server = QuicServer::start_with_identity(
-    1_000_000,                                  // connection budget
+    1_000_000,                                  // max calls before shutdown (0 = unlimited)
     handler,                                    // FnMut(Envelope, Option<PeerIdentity>) -> Envelope
     bind,
     identity,
