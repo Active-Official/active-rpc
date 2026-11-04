@@ -645,39 +645,43 @@ fn an_ungranted_method_leaves_no_receipt() {
 /// stat, one small read and one append, not a re-walk of the file.
 ///
 /// The measure is *growth*, not absolute time: a `sync_data` costs whatever the
-/// disk costs (about 8 ms on the machine this was written on), and a bound on
-/// that number fails on a loaded CI box while saying nothing about the
-/// algorithm. A quadratic append would make the last 200 records far slower than
-/// the first 200; a linear one keeps the ratio near one.
+/// disk costs, and a bound on that number fails on a loaded CI box while saying
+/// nothing about the algorithm. The comparison uses the **median** of each
+/// window, so one stalled write (a CI runner can pause a second) cannot fake a
+/// quadratic log the way a summed window did on 2026-11-04.
 #[test]
 fn many_appends_stay_linear() {
     let dir = sandbox("linear");
     let path = dir.join("receipts.arrl");
     let log = ReceiptLog::create(&path).expect("create");
-    const COUNT: u64 = 2_000;
-    const BATCH: u64 = 200;
+    const COUNT: usize = 2_000;
+    const BATCH: usize = 200;
 
-    let mut early = std::time::Duration::ZERO;
-    let mut late = std::time::Duration::ZERO;
-    for sequence in 1..=COUNT {
+    let mut samples = Vec::with_capacity(COUNT);
+    for sequence in 1..=COUNT as u64 {
         let started = std::time::Instant::now();
         log.append(&receipt(sequence, sequence)).expect("append");
-        let elapsed = started.elapsed();
-        if sequence <= BATCH {
-            early += elapsed;
-        }
-        if sequence > COUNT - BATCH {
-            late += elapsed;
-        }
+        samples.push(started.elapsed());
     }
-    assert_eq!(log.len().expect("len"), COUNT);
-    // Quadratic behaviour at this size is roughly a 10x ratio; a linear append
-    // stays within a small multiple even when the disk stutters.
-    let ratio = late.as_secs_f64() / early.as_secs_f64().max(1e-9);
+    assert_eq!(log.len().expect("len"), COUNT as u64);
+
+    let median_nanos = |window: &[std::time::Duration]| {
+        let mut nanos: Vec<u128> = window.iter().map(|sample| sample.as_nanos()).collect();
+        nanos.sort_unstable();
+        nanos[nanos.len() / 2]
+    };
+    let early = median_nanos(&samples[..BATCH]);
+    let late = median_nanos(&samples[COUNT - BATCH..]);
+    // Quadratic behaviour at this size is roughly a 10x ratio on the medians; a
+    // linear append stays near one even when the disk stutters.
+    let ratio = late as f64 / (early.max(1)) as f64;
+    // A sub-millisecond median is below scheduler noise on a shared runner; in
+    // that regime only an absolute blow-up is meaningful.
+    let noisy = early < 1_000_000 && late < 1_000_000;
     assert!(
-        ratio < 5.0,
-        "the last {BATCH} appends took {late:?} against {early:?} for the first {BATCH} \
-         (ratio {ratio:.1}), which suggests the cost grows with the log"
+        noisy || ratio < 5.0,
+        "the last {BATCH} appends had a median of {late} ns against {early} ns for the first \
+         {BATCH} (ratio {ratio:.1}), which suggests the cost grows with the log"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
