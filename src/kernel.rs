@@ -437,6 +437,10 @@ struct Job {
 
 /// The deterministic kernel: providers, capabilities, budgets and promises.
 ///
+/// One export pin: the object it keeps alive, the capability that exported it
+/// and that capability's binding.
+type RecordPin = (ProviderId, u64, CapId, Option<[u8; 32]>);
+
 /// It performs no I/O of its own; transports hand it envelopes and take the
 /// results back. Holding the kernel is the only way to reach a provider.
 pub struct Kernel {
@@ -491,7 +495,12 @@ pub struct Kernel {
     /// object let an unrelated restore (or revoke) drop another record's pin
     /// (round 32, #3; round 38, F1-F3). Kept apart from `object_records`,
     /// which mirrors the live capability registry exactly.
-    record_pins: BTreeMap<[u8; 32], (ProviderId, u64, CapId)>,
+    ///
+    /// The pin also carries the exporting capability's binding: the handle may
+    /// be dropped before a rotation, and a record that names a retired peer is
+    /// authority the rotation must withdraw even when no capability record can
+    /// be matched to it (round 40, R-07-2).
+    record_pins: BTreeMap<[u8; 32], RecordPin>,
     /// How many pins name each object: `drop_record` must not scan the map on
     /// the unbudgeted drop path (round 39, L-3).
     pin_counts: BTreeMap<(ProviderId, u64), usize>,
@@ -1229,9 +1238,10 @@ impl Agent {
                 .map_err(|_| Error::persistence("the grant is already committed"))?;
         }
         kernel.consumed_records.insert(record.record_id);
-        kernel
-            .record_pins
-            .insert(record.record_id, (pinned.0, pinned.1, cap.id()));
+        kernel.record_pins.insert(
+            record.record_id,
+            (pinned.0, pinned.1, cap.id(), record.bound_to),
+        );
         *kernel.pin_counts.entry(pinned).or_insert(0) += 1;
         kernel.push_event(Event::CapExported(cap.id()));
         Ok(record)
@@ -1330,6 +1340,12 @@ impl Agent {
             }
             if kernel.restored_records.len() >= kernel.record_id_ceiling {
                 return Err(Error::BudgetExceeded("records"));
+            }
+            // A restore is a durable mint, so it obeys the same tombstone
+            // budget: without this a restore/revoke cycle grew the set past
+            // what a mint could ever create (round 40, residual R-3).
+            if durable_ceiling_reached(&kernel) {
+                return Err(Error::BudgetExceeded("tombstones"));
             }
         }
         let provider = {
@@ -1746,22 +1762,29 @@ impl Agent {
                 }
             }
         }
-        for id in std::iter::once(cap.id()).chain(subtree) {
-            if let Some(child) = kernel.caps.get_mut(&id) {
-                if child.attrs.bound_to == Some(from_fingerprint) {
-                    child.attrs.bound_to = Some(to_fingerprint);
-                }
-            }
-        }
         // A credential exported for the old peer is authority the rotation
         // exists to remove: tombstone every exported, unrestored record in the
-        // subtree (round 39, M-2). The kill set is bounded, and a full set
-        // fails the rotation closed.
-        let mut records: Vec<[u8; 32]> = std::iter::once(cap.id())
-            .chain(descendants_of(&kernel.children, cap.id()))
-            .filter_map(|id| kernel.caps.get(&id).map(|record| record.record_id))
+        // subtree (round 39, M-2). An export pinned before its handle was
+        // dropped has no capability record to match, so the pin's own binding
+        // is the second selector (round 40, R-07-2). Both the set and its
+        // ceiling are settled before anything is mutated: a rotation that
+        // reports a refusal must leave the subtree bound to the old peer
+        // (round 40, R-07-1).
+        let in_subtree: Vec<CapId> = std::iter::once(cap.id()).chain(subtree).collect();
+        let mut records: Vec<[u8; 32]> = in_subtree
+            .iter()
+            .filter_map(|id| kernel.caps.get(id).map(|record| record.record_id))
             .filter(|record_id| kernel.record_pins.contains_key(record_id))
             .collect();
+        if from_fingerprint != to_fingerprint {
+            records.extend(kernel.record_pins.iter().filter_map(
+                |(record_id, (_provider, _object, _cap, binding))| {
+                    (*binding == Some(from_fingerprint)
+                        && !kernel.revoked_records.contains(record_id))
+                    .then_some(*record_id)
+                },
+            ));
+        }
         records.sort_unstable();
         records.dedup();
         let fresh = records
@@ -1770,6 +1793,13 @@ impl Agent {
             .count();
         if kernel.revoked_records.len().saturating_add(fresh) > MAX_TOMBSTONES {
             return Err(Error::BudgetExceeded("tombstones"));
+        }
+        for id in &in_subtree {
+            if let Some(child) = kernel.caps.get_mut(id) {
+                if child.attrs.bound_to == Some(from_fingerprint) {
+                    child.attrs.bound_to = Some(to_fingerprint);
+                }
+            }
         }
         for record_id in records {
             mark_tombstoned(&mut kernel, record_id);
@@ -5684,12 +5714,17 @@ fn pad128(id: CapId) -> [u8; 16] {
 }
 
 /// True when the durable grant budget is used up: every tombstone plus every
-/// live durable capability would exceed the set the kernel can tombstone.
+/// durable capability that is still live would exceed the set the kernel can
+/// tombstone.
+///
+/// A revoked capability is excluded: its tombstone already exists, so it can
+/// never add a second one. Counting it made a mint/revoke cycle grow the sum by
+/// two per pair and let the set pass its ceiling (round 40, residual R-3).
 fn durable_ceiling_reached(kernel: &Kernel) -> bool {
     let live = kernel
         .caps
         .values()
-        .filter(|record| record.attrs.persistence == CapPersistence::Durable)
+        .filter(|record| record.attrs.persistence == CapPersistence::Durable && !record.revoked)
         .count();
     kernel.revoked_records.len().saturating_add(live) >= MAX_TOMBSTONES
 }
@@ -5923,7 +5958,7 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
 /// A restore calls this because the restored capability now holds the object; a
 /// tombstone because the record can never be restored (round 38, F3).
 fn release_pin(kernel: &mut Kernel, record_id: [u8; 32]) {
-    let Some((provider, object, cap)) = kernel.record_pins.remove(&record_id) else {
+    let Some((provider, object, cap, _binding)) = kernel.record_pins.remove(&record_id) else {
         return;
     };
     let key = (provider, object);

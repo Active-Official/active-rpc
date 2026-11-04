@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-39: round 39 found 2 mediums and 7 lows, all fixed; rounds 40-41 must be clean | 236 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-40: round 40 found 1 high, 1 medium and 3 lows, all fixed plus 3 residuals; rounds 41-42 must be clean | 243 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-33: round 33 found 3 highs and 4 mediums, all fixed; rounds 34-35 must be clean | 246 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -474,6 +474,32 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-07 domain operations - 2026-11-04 (round 40)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
+`9a37413` plus the working tree. All nine round-39 claims verified (two partial,
+each becoming a finding). One **high**, one medium, three lows, and three
+residuals closed while fixing.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `reintroduce_to` rewrote the subtree binding before the tombstone-ceiling check, so a refused rotation was already applied and the retry failed `rpc/identity` | **fixed**: the record set and its ceiling are settled before any mutation; `a_refused_rotation_leaves_the_binding_alone` |
+| 2 | medium | rotation missed an exported record whose exporting handle was dropped (the documented orphan workflow), so the retired peer could still restore it | **fixed**: the pin carries the export-time binding and the rotation tombstones every pinned record naming the retired peer; `a_rotation_tombstones_the_record_of_a_dropped_exporter` |
+| 3 | low | the encoder never walked argument values, so it emitted a frame its own decoder refuses (cumulative value count, one container's width) | **fixed**: `check_value_limits` in `check_limits`; `an_over_wide_value_is_refused_by_encode`, `a_value_at_the_width_ceiling_round_trips` |
+| 4 | low | mint granted method names up to 1024 bytes while the wire default was 256, so a blessed capability was unusable over every transport | **fixed**: one number — the default wire ceiling is 1024, `strict()` stays 64, documented in `docs/spec/wire.md` §4; `a_granted_method_name_fits_the_wire` |
+| 5 | low | the round-39 evaluator/redaction error split had no test, so the classes could drift silently | **fixed**: `evaluator_fault` is one function with unit tests, and `redaction_fault` is asserted; `tests/` build 4 domain unit tests |
+
+Closed from the residual list in the same round:
+
+| Residual | Disposition |
+|----------|-------------|
+| R-1: no two-pin test | `two_records_on_one_object_hold_two_pins` |
+| R-3: the tombstone ceiling was not an invariant | `durable_ceiling_reached` counts only unrevoked durable capabilities, and a restore obeys the same budget, so mint/restore plus revoke cannot grow the set past `MAX_TOMBSTONES`; `a_restore_is_refused_when_the_tombstone_budget_is_spent` |
+| R-6: the encoder refused a duplicate across table and delta while the decoder accepted it | the decoder now refuses it too; `a_delta_addition_repeating_a_base_id_is_refused_by_decode` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Six of the new behavioural tests fail against the pre-fix tree.
 
 ### R-08 tools and MCP - 2026-11-04 (round 33)
 

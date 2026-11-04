@@ -29,6 +29,45 @@ use crate::error::{Error, Result};
 use crate::promise::PromiseId;
 use crate::value::{Arg, Value};
 
+/// Refuse a value whose node count or width the decoder would refuse.
+///
+/// `write_value_at` bounds depth only; the decoder also decrements a cumulative
+/// `max_values` per value (and per map key) and refuses a container past
+/// `max_array_len`. Without this walk the encoder emitted frames its own reader
+/// rejected, after the call had been charged (round 40, R-07-3).
+fn check_value_limits(value: &Value, limits: &WireLimits) -> Result<()> {
+    let widest = u64::from(limits.max_array_len);
+    let mut remaining = u64::from(limits.max_values);
+    let mut stack: Vec<&Value> = vec![value];
+    while let Some(value) = stack.pop() {
+        remaining = remaining
+            .checked_sub(1)
+            .ok_or(Error::Wire("value count exceeds the ceiling"))?;
+        match value {
+            Value::List(items) => {
+                if items.len() as u64 > widest {
+                    return Err(Error::Wire("list is wider than the ceiling"));
+                }
+                stack.extend(items.iter());
+            }
+            Value::Map(entries) => {
+                if entries.len() as u64 > widest {
+                    return Err(Error::Wire("map is wider than the ceiling"));
+                }
+                for item in entries.values() {
+                    // A key is a value on the wire; the reader charges it.
+                    remaining = remaining
+                        .checked_sub(1)
+                        .ok_or(Error::Wire("value count exceeds the ceiling"))?;
+                    stack.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Envelope magic.
 pub const MAGIC: [u8; 4] = *b"ARP1";
 /// Envelope version.
@@ -271,7 +310,11 @@ impl Default for WireLimits {
         Self {
             max_bytes: 64 << 20,
             max_args: 1 << 12,
-            max_method: 256,
+            // The same bound the kernel mints against
+            // (`kernel::MAX_GRANTED_METHOD_BYTES`) and the receipts accept:
+            // three numbers disagreed, so a capability could be granted a name
+            // no transport in this crate could encode (round 40, R-07-4).
+            max_method: 1_024,
             max_payload: 32 << 20,
             max_caps: 1 << 8,
             max_methods: 64,
@@ -469,6 +512,11 @@ impl Envelope {
         if self.args.len() > limits.max_args as usize {
             return Err(Error::Wire("argument count exceeds the ceiling"));
         }
+        for arg in &self.args {
+            if let Arg::Value(value) = arg {
+                check_value_limits(value, limits)?;
+            }
+        }
         if self.payload.len() > limits.max_payload as usize {
             // A ceiling is `rpc/wire`, like every other limit: `rpc/payload`
             // means "this is not an image", which would send a caller to fix a
@@ -622,6 +670,15 @@ impl Envelope {
             let mut added = Vec::with_capacity(added_count as usize);
             for _ in 0..added_count {
                 added.push(read_cap(bytes, &mut cursor, &limits)?);
+            }
+            for descriptor in &added {
+                // A delta addition that repeats an id the table already names
+                // (or another addition) makes the table order-dependent. The
+                // writer refuses that union, so the reader must too
+                // (round 40, residual R-6).
+                if !seen.insert(descriptor.id.0) {
+                    return Err(Error::CapabilityTable("duplicate capability id"));
+                }
             }
             Some(CapTableDelta {
                 base,

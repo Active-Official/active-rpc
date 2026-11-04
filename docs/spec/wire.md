@@ -151,10 +151,22 @@ with the lane's budget before dispatch.
 
 ## 4. Envelope limits
 
-`WireLimits` bounds total bytes, arguments, method length, payload, descriptors
-and methods per descriptor. Defaults accept real modules (64 MiB envelopes) and
-`WireLimits::strict()` is the profile for adversarial surfaces. Exceeding a limit
-is `rpc/wire` (or `rpc/capability-table` for the table).
+`WireLimits` bounds total bytes, arguments, method length, payload, descriptors,
+methods per descriptor, the cumulative value count and the width of one value.
+Defaults accept real modules (64 MiB envelopes) and `WireLimits::strict()` is the
+profile for adversarial surfaces. Exceeding a limit is `rpc/wire` (or
+`rpc/capability-table` for the table).
+
+The default method ceiling is 1024 bytes, the same number
+`kernel::MAX_GRANTED_METHOD_BYTES` and `receipts::MAX_METHOD_BYTES` use: a name a
+capability may grant is a name every transport in this crate can encode.
+`strict()` tightens it to 64 for adversarial surfaces.
+
+`Envelope::encode` validates against the same limits the decoder applies —
+including the value count, the width of one list or map, a zero capability id, a
+descriptor that grants no method, a disabled budget ceiling and a duplicate id
+across the table and its delta — so an encoder cannot emit a frame this crate's
+own reader refuses.
 
 ---
 

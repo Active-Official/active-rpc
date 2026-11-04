@@ -19,18 +19,22 @@ fn envelope_with(value: Value) -> Vec<u8> {
 
 #[test]
 fn a_wide_list_is_refused_by_the_decode_arena_ceiling() {
-    // A frame is bounded by bytes, but a byte can be a whole value: 200 000
-    // nulls fit in 200 KB and decode to 200 000 `Value`s. The decode limits
-    // bound the arena, not the frame.
-    let wide = Value::list((0..1_100_000).map(|_| Value::Null));
+    // A frame is bounded by bytes, but a byte can be a whole value: 80 000
+    // nulls fit in 80 KB and decode to 80 000 `Value`s. The decode limits
+    // bound the arena, not the frame. The writer now refuses a frame past the
+    // default arena ceiling, so this exercises a frame the default profile
+    // accepts and a strict one does not (round 40, R-07-3).
+    let wide = Value::list(vec![
+        Value::list((0..40_000).map(|_| Value::Null)),
+        Value::list((0..40_000).map(|_| Value::Null)),
+    ]);
     let bytes = envelope_with(wide);
 
     let strict = WireLimits::strict();
     let error = Envelope::decode_with(&bytes, strict).expect_err("too many values");
     assert_eq!(error.code(), "rpc/wire", "{}", error.code());
 
-    let error = Envelope::decode(&bytes).expect_err("the default arena ceiling binds");
-    assert_eq!(error.code(), "rpc/wire", "{}", error.code());
+    Envelope::decode(&bytes).expect("the default arena ceiling holds");
 
     // A list wider than `max_array_len` is refused even when the cumulative
     // count would fit.

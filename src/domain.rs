@@ -293,63 +293,7 @@ impl ModuleProvider {
                     // than cloning the whole arena.
                     None => evaluate_for_caller(&slot.module, &slot.module, budget, &slot.redactor),
                 }
-                .map_err(|error| match &error {
-                    active_infinity::Error::Evaluation(code) if code.starts_with("active/X00") => {
-                        // The engine reports its ceilings as evaluation codes
-                        // (X001 nodes .. X006 value size); a caller branches on
-                        // them and must not be told this is a domain fault
-                        // (round 19, #1).
-                        let kind = if code.contains("node") {
-                            "nodes"
-                        } else if code.contains("wall") {
-                            "wall"
-                        } else if code.contains("depth") {
-                            "depth"
-                        } else if code.contains("array") {
-                            "array_len"
-                        } else if code.contains("keys") {
-                            "keys"
-                        } else {
-                            "value"
-                        };
-                        Error::BudgetExceeded(kind)
-                    }
-                    active_infinity::Error::Evaluation(code) => Error::Domain(code),
-                    // A resource ceiling the evaluator hit is this provider's
-                    // budget refusal, not a payload fault: a caller branches on
-                    // the two differently (round 16, #1).
-                    active_infinity::Error::Limit { kind, .. } => {
-                        // Keep the caller's branch: the provider's own gates use
-                        // `nodes`, `depth` and `wall`, and an evaluator ceiling
-                        // names the same conditions (round 17, F4).
-                        let kind = if kind.contains("node") {
-                            "nodes"
-                        } else if kind.contains("depth") {
-                            "depth"
-                        } else if kind.contains("wall") {
-                            "wall"
-                        } else if kind.contains("array") {
-                            "array_len"
-                        } else if kind.contains("key") {
-                            // `annotation key bytes` is a key ceiling even
-                            // though the word does not start the label
-                            // (round 31, F3).
-                            "keys"
-                        } else {
-                            // The provider's own vocabulary is closed; an
-                            // unknown dimension is the value budget.
-                            "value"
-                        };
-                        Error::BudgetExceeded(kind)
-                    }
-                    // The evaluator's own encode failure is a bridge fault (a
-                    // schema type the Active core cannot represent, secret
-                    // material it refuses), not a redaction collision; the
-                    // redaction sites above raise `provider/redaction`
-                    // themselves (round 39, L-2).
-                    active_infinity::Error::Encode(_) => Error::Domain("active/encode"),
-                    other => Error::Payload(other.code().to_string()),
-                })?;
+                .map_err(|error| evaluator_fault(&error))?;
                 // The conversion recurses; a result deeper than the wire can
                 // carry can never be returned, so it is refused before the walk
                 // (round 7, #4).
@@ -1845,6 +1789,68 @@ fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
         .collect()
 }
 
+/// Map an evaluator fault to the code a caller branches on.
+///
+/// Kept as one function so the classes cannot drift: a resource ceiling is this
+/// provider's budget refusal, an evaluator encode failure is the Active bridge,
+/// and anything else is a payload fault (round 39, L-2; round 40, R-07-5).
+fn evaluator_fault(error: &active_infinity::Error) -> Error {
+    match error {
+        active_infinity::Error::Evaluation(code) if code.starts_with("active/X00") => {
+            // The engine reports its ceilings as evaluation codes (X001 nodes
+            // .. X006 value size); a caller branches on them and must not be
+            // told this is a domain fault (round 19, #1).
+            let kind = if code.contains("node") {
+                "nodes"
+            } else if code.contains("wall") {
+                "wall"
+            } else if code.contains("depth") {
+                "depth"
+            } else if code.contains("array") {
+                "array_len"
+            } else if code.contains("keys") {
+                "keys"
+            } else {
+                "value"
+            };
+            Error::BudgetExceeded(kind)
+        }
+        active_infinity::Error::Evaluation(code) => Error::Domain(code),
+        // A resource ceiling the evaluator hit is this provider's budget
+        // refusal, not a payload fault: a caller branches on the two
+        // differently (round 16, #1).
+        active_infinity::Error::Limit { kind, .. } => {
+            // Keep the caller's branch: the provider's own gates use `nodes`,
+            // `depth` and `wall`, and an evaluator ceiling names the same
+            // conditions (round 17, F4).
+            let kind = if kind.contains("node") {
+                "nodes"
+            } else if kind.contains("depth") {
+                "depth"
+            } else if kind.contains("wall") {
+                "wall"
+            } else if kind.contains("array") {
+                "array_len"
+            } else if kind.contains("key") {
+                // `annotation key bytes` is a key ceiling even though the word
+                // does not start the label (round 31, F3).
+                "keys"
+            } else {
+                // The provider's own vocabulary is closed; an unknown dimension
+                // is the value budget.
+                "value"
+            };
+            Error::BudgetExceeded(kind)
+        }
+        // The evaluator's own encode failure is a bridge fault (a schema type
+        // the Active core cannot represent, secret material it refuses), not a
+        // redaction collision; the redaction sites raise `provider/redaction`
+        // themselves (round 39, L-2).
+        active_infinity::Error::Encode(_) => Error::Domain("active/encode"),
+        other => Error::Payload(other.code().to_string()),
+    }
+}
+
 /// Evaluate a module for a caller, redacting first when the capability asks.
 ///
 /// The engine has no notion of a secret literal: a plain `Str` that copies one
@@ -2214,4 +2220,60 @@ pub fn cone_ids(module: &InfinityModule, path: &str) -> Result<Vec<NodeId>> {
     let node = active_infinity::interop::resolve_path(module, path)
         .ok_or(Error::InvalidArgument("path does not resolve"))?;
     Ok(subgraph(module, &[node]))
+}
+
+#[cfg(test)]
+mod evaluator_fault_tests {
+    use super::{evaluator_fault, redaction_fault};
+    use crate::error::Error;
+
+    #[test]
+    fn the_evaluator_ceiling_classes_keep_their_caller_branch() {
+        let nodes = evaluator_fault(&active_infinity::Error::Evaluation("active/X001 nodes"));
+        assert_eq!(nodes.code(), "rpc/budget-exceeded");
+        assert!(nodes.to_string().contains("nodes"), "{nodes}");
+
+        let array = evaluator_fault(&active_infinity::Error::Evaluation(
+            "active/X004 array length",
+        ));
+        assert!(array.to_string().contains("array_len"), "{array}");
+
+        let keys = evaluator_fault(&active_infinity::Error::Limit {
+            kind: "annotation key bytes",
+            limit: 1,
+        });
+        assert!(keys.to_string().contains("keys"), "{keys}");
+
+        let unknown = evaluator_fault(&active_infinity::Error::Limit {
+            kind: "unheard-of",
+            limit: 1,
+        });
+        assert!(unknown.to_string().contains("value"), "{unknown}");
+    }
+
+    #[test]
+    fn an_evaluator_encode_failure_is_a_domain_fault() {
+        // The round-39 split: a bridge encode failure is this provider's
+        // domain, not a redaction collision (round 40, R-07-5).
+        let error = evaluator_fault(&active_infinity::Error::Encode("duplicate key"));
+        assert_eq!(error.code(), "rpc/domain", "{error}");
+        assert!(error.to_string().contains("active/encode"), "{error}");
+    }
+
+    #[test]
+    fn an_evaluator_diagnostic_and_a_framing_fault_stay_distinct() {
+        let diagnostic = evaluator_fault(&active_infinity::Error::Evaluation("active/T001"));
+        assert_eq!(diagnostic.code(), "rpc/domain", "{diagnostic}");
+        let framing = evaluator_fault(&active_infinity::Error::Magic);
+        assert_eq!(framing.code(), "rpc/payload", "{framing}");
+    }
+
+    #[test]
+    fn a_redaction_collision_is_the_providers_fault() {
+        let error = redaction_fault(Error::Payload("two fields collide".to_string()));
+        assert_eq!(error.code(), "rpc/provider", "{error}");
+        assert!(error.to_string().contains("provider/redaction"), "{error}");
+        let other = redaction_fault(Error::BudgetExceeded("byte"));
+        assert_eq!(other.code(), "rpc/budget-exceeded");
+    }
 }

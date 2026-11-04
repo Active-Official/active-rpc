@@ -618,3 +618,138 @@ fn a_record_with_a_deadline_but_no_lease_is_refused_by_the_parser() {
     let error = CapabilityRecord::from_json(&text).expect_err("no lease");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 40
+// ---------------------------------------------------------------------------
+
+/// Spend every tombstone slot the kernel has, so the next one is refused.
+fn fill_tombstones(agent: &Agent) {
+    for index in 0..active_rpc::kernel::MAX_TOMBSTONES {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        id[31] = 0xA5;
+        agent
+            .tombstone_record(id)
+            .expect("a tombstone with room remains");
+    }
+    assert_eq!(
+        agent.record_tombstone_count(),
+        active_rpc::kernel::MAX_TOMBSTONES
+    );
+}
+
+/// A rotation that cannot record its tombstones must not be half applied: the
+/// subtree stays bound to the peer it was bound to (round 40, R-07-1).
+#[test]
+fn a_refused_rotation_leaves_the_binding_alone() {
+    let (agent, _provider, ancestor) = durable_agent();
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let child = agent.attenuate(&ancestor, attrs).expect("attenuate");
+    let _record = agent.export_capability(&child).expect("export");
+
+    fill_tombstones(&agent);
+    let old = peer(b"durable-owner");
+    let new = admitted(b"rotated-owner");
+    let error = agent
+        .reintroduce_to(&ancestor, &old, &new)
+        .expect_err("no tombstone budget is left");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+
+    // Either fully rotated or fully untouched: a refusal must report the truth.
+    assert_eq!(
+        agent.cap_attrs(&ancestor).expect("attrs").bound_to,
+        Some(old.fingerprint())
+    );
+    assert_eq!(
+        agent.cap_attrs(&child).expect("attrs").bound_to,
+        Some(old.fingerprint())
+    );
+    // And the retry reports the same state rather than "already rotated".
+    let _ = agent.reintroduce_to(&ancestor, &old, &new);
+    assert_eq!(
+        agent.cap_attrs(&ancestor).expect("attrs").bound_to,
+        Some(old.fingerprint())
+    );
+}
+
+/// A rotation withdraws the record of a peer even when the exporting handle is
+/// gone: the documented orphan workflow leaves no capability record to match
+/// (round 40, R-07-2).
+#[test]
+fn a_rotation_tombstones_the_record_of_a_dropped_exporter() {
+    let (agent, _provider, ancestor) = durable_agent();
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let child = agent.attenuate(&ancestor, attrs).expect("attenuate");
+    let record = agent.export_capability(&child).expect("export");
+    drop(child);
+    agent.run();
+
+    let old = peer(b"durable-owner");
+    let new = admitted(b"rotated-owner");
+    agent
+        .reintroduce_to(&ancestor, &old, &new)
+        .expect("rotate the binding");
+    let error = agent
+        .restore_capability(&record, &admitted(b"durable-owner"))
+        .expect_err("the retired peer's record is tombstoned");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+/// A restore is a durable mint, so it obeys the tombstone budget the mint
+/// obeys; without that the set grew past its ceiling (round 40, residual R-3).
+#[test]
+fn a_restore_is_refused_when_the_tombstone_budget_is_spent() {
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+    agent.run();
+    fill_tombstones(&agent);
+    let error = agent
+        .restore_capability(&record, &admitted(b"durable-owner"))
+        .expect_err("no tombstone budget is left");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert_eq!(
+        agent.record_tombstone_count(),
+        active_rpc::kernel::MAX_TOMBSTONES,
+        "a refused restore adds no tombstone"
+    );
+}
+
+/// Two records can name one provider object; restoring one must not drop the
+/// object the other still pins (round 40, residual R-1).
+#[test]
+fn two_records_on_one_object_hold_two_pins() {
+    let (agent, provider, first) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let second = agent
+        .mint_bound(&owner, provider, 0, agent.cap_attrs(&first).expect("attrs"))
+        .expect("a second durable cap on the same object");
+    let first_record = agent.export_capability(&first).expect("export");
+    let second_record = agent.export_capability(&second).expect("export");
+    drop(first);
+    drop(second);
+    assert!(
+        agent.take_drops(provider).is_empty(),
+        "both records still pin the object"
+    );
+
+    let restored = agent
+        .restore_capability(&first_record, &owner)
+        .expect("restore the first");
+    assert!(
+        agent.take_drops(provider).is_empty(),
+        "the second record still pins the object"
+    );
+    drop(restored);
+    assert!(
+        agent.take_drops(provider).is_empty(),
+        "the second record still pins the object after the restored handle drops"
+    );
+
+    let _restored = agent
+        .restore_capability(&second_record, &owner)
+        .expect("restore the second");
+}
