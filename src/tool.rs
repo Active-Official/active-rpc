@@ -207,20 +207,20 @@ fn is_number_token(text: &str) -> bool {
     if bytes[index] == b'-' {
         index += 1;
     }
-    let mut digits = 0usize;
+    let int_start = index;
     while index < bytes.len() && bytes[index].is_ascii_digit() {
-        digits += 1;
         index += 1;
+    }
+    // JSON requires at least one integer digit: `-.5` is not a number
+    // (round 32, #4).
+    if index == int_start {
+        return false;
     }
     if index < bytes.len() && bytes[index] == b'.' {
         index += 1;
         while index < bytes.len() && bytes[index].is_ascii_digit() {
-            digits += 1;
             index += 1;
         }
-    }
-    if digits == 0 {
-        return false;
     }
     if index < bytes.len() && (bytes[index] == b'e' || bytes[index] == b'E') {
         index += 1;
@@ -1056,10 +1056,13 @@ impl McpTransport for StdioTransport {
     }
 
     fn recv_line_within(&mut self, deadline: Option<std::time::Instant>) -> Result<String> {
-        let Some(deadline) = deadline else {
-            return self.lines.recv().map_err(|_| Error::Provider {
-                code: "mcp/eof".to_string(),
-            })?;
+        // A direct caller with no deadline still gets a bounded wait: an
+        // unbounded `recv` held the dispatch thread for as long as the server
+        // stayed silent (round 32, #2).
+        let Some(deadline) = deadline
+            .or_else(|| std::time::Instant::now().checked_add(std::time::Duration::from_secs(5)))
+        else {
+            return Err(Error::Timeout);
         };
         let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
             return Err(Error::Timeout);
@@ -1312,20 +1315,22 @@ impl<T: McpTransport> McpSession<T> {
                     return Err(error);
                 }
             };
+            if line.len() > MAX_MCP_LINE_BYTES {
+                // A line past the static ceiling is illegal whatever the grant:
+                // the peer wrote it, so the session is desynced and poisoned
+                // (round 32, #3). A line that is only past the grant stays a
+                // non-poisoning budget refusal below.
+                self.poisoned = true;
+                return Err(Error::Provider {
+                    code: "mcp/line-too-long".to_string(),
+                });
+            }
             if max_line < MAX_MCP_LINE_BYTES && line.len() > max_line {
                 // The capability's byte grant bounds what this call may buffer,
                 // not only what it may return (round 19, M2). The line was
                 // consumed, so the session stays in step, and a grant refusal
                 // does not poison it (round 28, #2).
                 return Err(Error::BudgetExceeded("byte"));
-            }
-            if line.len() > MAX_MCP_LINE_BYTES {
-                // Past the static ceiling: the peer wrote a line no budget can
-                // legalise, so the session is desynced.
-                self.poisoned = true;
-                return Err(Error::Provider {
-                    code: "mcp/line-too-long".to_string(),
-                });
             }
             let response: Json = match serde_json::from_str(&line) {
                 // A number the decoder rounded or an overflowing float is not
@@ -2628,6 +2633,20 @@ impl Provider for LocalProcess {
             return Err(Error::ToolPolicy(
                 "this adapter cannot enforce a path scope",
             ));
+        }
+        // The grant bounds the argument line too: a direct caller could pass a
+        // 10 MiB argv under a one-byte grant because only the output was
+        // counted (round 32, #1). The kernel charges the same bytes at
+        // dispatch; this is the adapter's own gate.
+        let mut arg_bytes = 0u64;
+        for arg in &call.args {
+            let Some(next) = arg_bytes.checked_add(Arg::wire_size(arg)) else {
+                return Err(Error::BudgetExceeded("byte"));
+            };
+            arg_bytes = next;
+        }
+        if arg_bytes > call.budget.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
         }
         let mut args = Vec::new();
         for arg in &call.args {

@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-38: round 38 found 2 mediums and 6 lows, all fixed; rounds 39-40 must be clean | 227 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-31: round 31 found 8 lows, all fixed or shown not to hold; rounds 32-33 must be clean | 235 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-32: round 32 found 1 high, 2 mediums and 1 low, all fixed; rounds 33-34 must be clean | 239 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -453,6 +453,22 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 32)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `fe885eb`. Round-31 fixes
+verified except one doc sentence. One **high**, two mediums, one low.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `LocalProcess` never charged the argument line against the grant, so a direct caller could pass a 10 MiB argv under a one-byte grant | **fixed**: the adapter sums `Arg::wire_size` and refuses `rpc/budget-exceeded` before the child starts; `a_process_argument_line_is_bounded_by_the_grant` |
+| 2 | medium | `StdioTransport::recv_line_within(None)` blocked with no ceiling | **fixed**: 5 s, with `mcp/eof` for a dead writer |
+| 3 | medium | a 2 MiB line under a small grant was a non-poisoning budget refusal, so a hostile peer kept the session | **fixed**: a line past the static ceiling poisons whatever the grant; only a line between the grant and the static ceiling stays a budget refusal; `a_line_past_the_static_ceiling_poisons_even_under_a_small_grant` |
+| 4 | low | `is_number_token("-.5")` was true, so an invalid number was reported as `bad-number` | **fixed**: JSON requires an integer digit |
+| 5 | doc | the process paragraph still owned an HTTP sentence | **fixed** |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 31)
 

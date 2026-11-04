@@ -605,10 +605,13 @@ fn both_process_streams_share_the_byte_grant() {
     let argv = [
         "-NoProfile",
         "-Command",
-        "Write-Output 'aaaaaaaa'; [Console]::Error.WriteLine('bbbbbbbb')",
+        "for /L %i in (1,1,64) do @echo a; for /L %j in (1,1,64) do @echo b 1>&2",
     ];
     #[cfg(not(windows))]
-    let argv = ["-c", "echo aaaaaaaa; echo bbbbbbbb 1>&2"];
+    let argv = [
+        "-c",
+        "i=0; while [ $i -lt 64 ]; do echo a; echo b 1>&2; i=$((i+1)); done",
+    ];
     #[cfg(windows)]
     let mut env = std::collections::BTreeMap::new();
     #[cfg(windows)]
@@ -625,11 +628,13 @@ fn both_process_streams_share_the_byte_grant() {
         argv.iter().map(|argument| Arg::text(*argument)).collect(),
     );
     call.tool_allows_process = true;
-    call.budget.max_bytes = 8;
+    // The argument line fits (about 60 bytes); the two streams together
+    // (about 260) do not.
+    call.budget.max_bytes = 80;
     let error = tool
         .invoke(0, &call)
         .expect_err("both streams over the grant");
-    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
 
 /// The response head is bounded by the byte grant too (round 20, M3).
@@ -2489,4 +2494,82 @@ fn a_refused_call_does_not_increment_the_served_counter() {
     let error = tool.invoke(0, &call).expect_err("a zero grant");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
     assert_eq!(tool.calls, 0, "a refusal is not a served call");
+}
+
+/// The argument line is charged against the grant before the child starts: a
+/// direct caller cannot pass a large argv under a one-byte grant (round 32,
+/// #1).
+#[test]
+fn a_process_argument_line_is_bounded_by_the_grant() {
+    let mut tool = LocalProcess::new(absolute_shell(), &["*"]).expect("an absolute program");
+    let big = "x".repeat(64 * 1024);
+    let mut call = Call::new("run", vec![Arg::text(big)]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 1;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the argv is past the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A line past the static MCP ceiling poisons the session even when a small
+/// grant is also exceeded: the peer wrote an illegal line, and the grant must
+/// not make a hostile frame look like a budget inconvenience (round 32, #3).
+#[test]
+fn a_line_past_the_static_ceiling_poisons_even_under_a_small_grant() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+
+    struct Huge {
+        inner: MemoryTransport,
+        replies: usize,
+    }
+    impl McpTransport for Huge {
+        fn send_line(&mut self, line: &str) -> active_rpc::error::Result<()> {
+            self.inner.send_line(line)
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.inner.recv_line()
+        }
+        fn recv_line_within(
+            &mut self,
+            deadline: Option<std::time::Instant>,
+        ) -> active_rpc::error::Result<String> {
+            self.replies += 1;
+            if self.replies <= 2 {
+                // The handshake's initialize and tools/list answers.
+                return self.inner.recv_line_within(deadline);
+            }
+            Ok(format!(
+                r#"{{"jsonrpc":"2.0","id":3,"result":"{}"}}"#,
+                "x".repeat(2 << 20)
+            ))
+        }
+    }
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(Huge {
+        inner: MemoryTransport::new(responses),
+        replies: 0,
+    })
+    .expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    // Enough for the request line, far less than the 2 MiB answer.
+    call.budget.max_bytes = 4096;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the line is illegal");
+    assert_eq!(error.provider_code(), Some("mcp/line-too-long"), "{error}");
+    let again = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the session is poisoned");
+    assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
 }

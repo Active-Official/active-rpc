@@ -331,9 +331,9 @@ answer is ignored before the JSON gates and the decode.
 
 The effective output ceiling is the smaller of `max_output`, 16 MiB and the
 capability byte grant, for both streams together. A grant-derived ceiling
-reports `rpc/budget-exceeded`; an adapter setting reports the policy code. A
-request body is capped by the adapter's own `max_request`, and a grant past it
-is `rpc/budget-exceeded` before the child starts.
+reports `rpc/budget-exceeded`; an adapter setting reports the policy code. The
+argument line is charged against the same grant, so a direct caller cannot pass
+a megabyte of argv under a one-byte grant.
 
 `LocalProcess::new` requires an absolute program path. A bare name would be
 resolved from the parent's `PATH`, which is ambient authority: anything that can
