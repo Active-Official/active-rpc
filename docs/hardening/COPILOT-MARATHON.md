@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-36: round 36 found 1 medium and 4 lows, all fixed or documented; rounds 37-38 must be clean | 214 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-29: round 29 found 1 medium and 5 lows, all fixed; rounds 30-31 must be clean | 224 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-30: round 30 found 1 medium and 5 lows, all fixed, rejected with evidence, or recorded; rounds 31-32 must be clean | 228 fixed / 2 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -418,6 +418,23 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 30)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `aeba3f2`. All six round-29
+dispositions verified. One medium, five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | output, the guest log and the entropy draw each had their own `share` cap, so one grant could buffer and generate up to three times its bytes | **fixed**: the three are summed against the share after the call; `the_wasm_reply_and_log_share_one_grant` fails against the pre-fix sum (the first attempt exposed that `tool.log` had already been moved, so the check reads `self.log`) |
+| 2 | low | `json_to_value`/`value_to_json` recurse; inbound depth relies on `serde_json`'s limit | **recorded**: STATUS 16 (serde's ~128 plus the kernel's 64 gate) |
+| 3 | low | a tiny adapter `max_body` with a large grant reported a budget refusal | **fixed**: the refusal tokenizes `grant_bound`; `a_configured_tiny_body_ceiling_is_a_provider_refusal` |
+| 4 | low | `send_line_within(None)` waited 30 s with no capability ceiling | **fixed**: 5 s |
+| 5 | low | `SHELL_METACHARACTERS` omits `\` | **rejected with evidence**: the same rejection as round 24, #2; a backslash is a path separator in `cmd` and escapes one character in POSIX, so it cannot chain without a separator already refused, and adding it broke two shipped process tests whose arguments carry Windows paths |
+| 6 | low | `pub program` was dead beside the pinned `resolved` | **fixed**: the field is private and `LocalProcess::program()` reports it |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 29)
 

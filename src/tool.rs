@@ -982,7 +982,10 @@ impl McpTransport for StdioTransport {
         }
         match deadline {
             None => outcome
-                .recv_timeout(std::time::Duration::from_secs(30))
+                // A direct caller with no deadline still gets a bounded wait:
+                // 30 s held the dispatch thread with no capability ceiling
+                // (round 30, #4).
+                .recv_timeout(std::time::Duration::from_secs(5))
                 .map_err(|_| Error::Timeout)?,
             Some(deadline) => {
                 let left = deadline
@@ -1671,10 +1674,17 @@ impl HttpTool {
         // A grant too small to hold the head cannot pay for the answer; the
         // static ceiling was its only bound (round 20, M3).
         if max_body < MIN_HTTP_ANSWER_BYTES {
-            // No answer of any shape fits: the capability cannot carry a
-            // response, which is a budget refusal, not a malformed peer
-            // (round 24, #4).
-            return Err(Error::BudgetExceeded("byte"));
+            // No answer of any shape fits. When the capability's grant set the
+            // cap it is a budget refusal; when the adapter's own `max_body` did,
+            // the refusal is a provider/configuration one (round 24, #4;
+            // round 30, #3).
+            return Err(if grant_bound {
+                Error::BudgetExceeded("byte")
+            } else {
+                Error::Provider {
+                    code: "http/body-too-large".to_string(),
+                }
+            });
         }
         let header_cap = MAX_HTTP_HEADER_BYTES.min(max_body.max(1));
         // Resolution is not peer-controlled: the base URL is the operator's
@@ -2360,7 +2370,11 @@ fn has_nul(path: &std::path::Path) -> bool {
 #[derive(Debug)]
 pub struct LocalProcess {
     /// Absolute program path as given to [`LocalProcess::new`].
-    pub program: String,
+    ///
+    /// Private: `invoke` runs the canonical path pinned at construction, so a
+    /// later assignment would silently keep running the old binary
+    /// (round 30, #6). The advertised form is [`LocalProcess::program`].
+    program: String,
     /// Arguments the caller may pass (each must be an exact match or a prefix
     /// when it ends with `*`).
     pub allow_args: Vec<String>,
@@ -2445,6 +2459,15 @@ impl LocalProcess {
     /// The working directory this tool pins.
     pub fn working_directory(&self) -> &Path {
         &self.workdir
+    }
+
+    /// The absolute program path this tool was built with.
+    ///
+    /// `invoke` runs the canonical path pinned at construction, which may differ
+    /// from this string (a symlink, a different spelling); this accessor reports
+    /// what the operator configured.
+    pub fn program(&self) -> &str {
+        &self.program
     }
 
     /// Set the per-invocation wall-clock ceiling.

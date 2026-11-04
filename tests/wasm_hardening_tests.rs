@@ -465,3 +465,37 @@ fn a_zero_wall_grant_precedes_the_wasm_policy_checks() {
         active_rpc::kernel::Provider::invoke(&mut tool, 0, &call).expect_err("a zero wall grant");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
+
+/// Output, the guest log and the entropy draw share one grant: three
+/// independent caps let a 64 KiB grant buffer and generate ~192 KiB in one
+/// call (round 30, #1).
+#[test]
+fn the_wasm_reply_and_log_share_one_grant() {
+    const BOTH: &str = r#"
+      (module
+      (import "env" "log" (func $log (param i32 i32) (result i32)))
+      (memory (export "memory") 2)
+      (data (i32.const 0) "logbytes")
+      (data (i32.const 65536) "outbytes")
+      (func (export "run") (param i32) (result i32)
+        (drop (call $log (i32.const 0) (i32.const 8)))
+        i32.const 8))
+      "#;
+    let policy = WasmHostPolicy {
+        log: true,
+        max_log_bytes: 64,
+        ..WasmHostPolicy::default()
+    };
+    let mut tool = WasmTool::from_bytes_with_policy(&binary(BOTH), WasmLimits::default(), policy)
+        .expect("compile");
+    let mut call = Call::new("run", vec![Arg::text("")]);
+    call.tool_allows_process = true;
+    // Eight bytes of output plus eight of log do not fit a ten-byte grant.
+    call.budget = Budget {
+        max_bytes: 10,
+        ..Budget::default()
+    };
+    let error = active_rpc::kernel::Provider::invoke(&mut tool, 0, &call)
+        .expect_err("output and log share the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}

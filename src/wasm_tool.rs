@@ -175,6 +175,8 @@ pub struct WasmTool {
     /// capability's byte share so a tiny grant cannot buy 64 KiB of CSPRNG
     /// (round 29, F6).
     random_cap: usize,
+    /// Entropy the last call drew, for the grant accounting in `invoke`.
+    last_random_used: usize,
     /// Time the guest sees when the clock import is granted.
     ///
     /// Seeded by the embedder: the kernel passes `Call::now_ms`, so the guest
@@ -265,6 +267,7 @@ impl WasmTool {
             limits,
             host,
             log: Vec::new(),
+            last_random_used: 0,
             random_cap: MAX_RANDOM_PER_CALL,
             now_ms: 0,
         })
@@ -509,6 +512,7 @@ impl WasmTool {
                 // Keep whatever the guest logged before it trapped: the log is
                 // diagnostic evidence, not a success signal.
                 self.log = std::mem::take(&mut store.data_mut().log);
+                self.last_random_used = store.data().random_used;
                 // wasmi reports an exhausted budget as an out-of-fuel trap.
                 let out_of_fuel = error.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel)
                     || matches!(error.kind(), wasmi::errors::ErrorKind::Fuel(_));
@@ -520,6 +524,7 @@ impl WasmTool {
             }
         };
         self.log = std::mem::take(&mut store.data_mut().log);
+        self.last_random_used = store.data().random_used;
         if returned < 0 {
             return Err(provider("wasm/output"));
         }
@@ -666,6 +671,7 @@ impl Provider for WasmTool {
             limits,
             host,
             log: Vec::new(),
+            last_random_used: 0,
             random_cap: share,
             now_ms: call.now_ms,
         };
@@ -681,9 +687,14 @@ impl Provider for WasmTool {
             }
             Err(error) => return Err(error),
         };
-        // Input and output share the grant, as the process and HTTP adapters
-        // charge one budget (round 23, #3).
-        if output.len() > share {
+        // Input, output, the guest log and the entropy draw share one grant:
+        // three independent `share` caps let a 64 KiB grant buffer and generate
+        // ~192 KiB in one call (round 23, #3; round 30, #1).
+        let spent = output
+            .len()
+            .saturating_add(self.log.len())
+            .saturating_add(tool.last_random_used);
+        if spent > share {
             return Err(Error::BudgetExceeded("byte"));
         }
         // Guest output is bytes: a lossy UTF-8 conversion would hand the caller

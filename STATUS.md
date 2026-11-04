@@ -115,4 +115,10 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
     ordinary label list instead of the marker. No secret material moves; the
     disclosure fails open, so a caller cannot rely on "no marker" meaning "no
     tainted dependency" (round 35, L-5).
+16. **Inbound JSON conversion recurses and relies on `serde_json`'s depth
+    limit.** `json_to_value` walks the decoded tree recursively; a peer answer
+    deeper than ~128 frames is refused by `serde_json` before the conversion,
+    and the kernel refuses a provider reply past `MAX_VALUE_DEPTH` (64) with
+    `rpc/budget-exceeded: depth`. The conversion has no crate-level gate of its
+    own, so a future parser change must add one (round 30, #2).
 

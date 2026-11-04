@@ -2414,3 +2414,27 @@ fn an_ambiguous_allowlist_entry_is_refused_at_construction() {
         assert_eq!(error.code(), "rpc/tool-policy", "{path}: {error}");
     }
 }
+
+/// A tiny adapter `max_body` with a large grant is a configuration refusal,
+/// not a budget one: no budget can enlarge the adapter's own ceiling
+/// (round 30, #3).
+#[test]
+fn a_configured_tiny_body_ceiling_is_a_provider_refusal() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    fixed_response(
+        listener,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec(),
+    );
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/tiny")]);
+    tool.max_body = 8;
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/tiny"))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 4096;
+    let error = tool.invoke(0, &call).expect_err("no answer fits");
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert!(
+        format!("{error}").contains("http/body-too-large"),
+        "{error}"
+    );
+}
