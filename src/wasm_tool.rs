@@ -530,7 +530,10 @@ impl WasmTool {
         }
         let output_len = returned as usize;
         if output_len > self.limits.max_output_bytes {
-            return Err(provider("wasm/output"));
+            // A length past the output ceiling: distinct from the guest's own
+            // `-1`, so a grant-bound refusal can be tokenized as a budget one
+            // without relabelling a guest fault (round 31, F4).
+            return Err(provider("wasm/output-limit"));
         }
         let data = memory.data(&store);
         if data.len() < OUTPUT_OFFSET + output_len {
@@ -682,7 +685,9 @@ impl Provider for WasmTool {
         self.log = std::mem::take(&mut tool.log);
         let output = match result {
             Ok(output) => output,
-            Err(error) if output_grant_bound && error.provider_code() == Some("wasm/output") => {
+            Err(error)
+                if output_grant_bound && error.provider_code() == Some("wasm/output-limit") =>
+            {
                 return Err(Error::BudgetExceeded("byte"))
             }
             Err(error) => return Err(error),

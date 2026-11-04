@@ -2438,3 +2438,55 @@ fn a_configured_tiny_body_ceiling_is_a_provider_refusal() {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 31
+// ---------------------------------------------------------------------------
+
+/// A bare date or score is plain text, not a number with no `Value` form: the
+/// repair heuristic used to rewrite it to `0` and answer `http/bad-number`
+/// (round 31, F3).
+#[test]
+fn a_bare_date_answer_is_text_not_a_bad_number() {
+    let body = "2024-01-01";
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    fixed_response(
+        listener,
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    );
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/date")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/date"))]);
+    call.tool_allows_process = true;
+    let response = tool.invoke(0, &call).expect("a date is text");
+    assert_eq!(response, Response::Value(Value::text(body)));
+}
+
+/// A request target must be an absolute path: a relative or single-slash form
+/// could reach the wire as an absolute-form target (round 31, F8).
+#[test]
+fn a_request_target_without_a_leading_slash_is_refused() {
+    for path in ["noslash", "http:/evil", "http://evil/x"] {
+        let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", path)]);
+        let mut call = Call::new("get", vec![Arg::Value(Value::path(path))]);
+        call.tool_allows_process = true;
+        let error = tool.invoke(0, &call).expect_err("not an absolute path");
+        assert_eq!(error.code(), "rpc/tool-policy", "{path}: {error}");
+    }
+}
+
+/// A refused call is not a served call (round 31, F7).
+#[test]
+fn a_refused_call_does_not_increment_the_served_counter() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/x"))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 0;
+    let error = tool.invoke(0, &call).expect_err("a zero grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert_eq!(tool.calls, 0, "a refusal is not a served call");
+}

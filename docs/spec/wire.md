@@ -330,11 +330,10 @@ answer is ignored before the JSON gates and the decode.
 | `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, a secret argument was passed, the output exceeded the effective ceiling, or process execution was not granted |
 
 The effective output ceiling is the smaller of `max_output`, 16 MiB and the
-capability byte grant, for both streams together. A request body is capped by
-`min(max_request, 64 MiB, the grant)`; a response head is capped by
-`min(64 KiB, the grant)`, and the head and the body share that grant. A grant
-below the shortest possible answer (16 bytes: a status line plus the empty
-end-of-head line) is `rpc/budget-exceeded` before the request is sent.
+capability byte grant, for both streams together. A grant-derived ceiling
+reports `rpc/budget-exceeded`; an adapter setting reports the policy code. A
+request body is capped by the adapter's own `max_request`, and a grant past it
+is `rpc/budget-exceeded` before the child starts.
 
 `LocalProcess::new` requires an absolute program path. A bare name would be
 resolved from the parent's `PATH`, which is ambient authority: anything that can
@@ -350,11 +349,19 @@ shell as the program the rest of the line would be code.
 A `wasm_tool::WasmTool` provider reports failures as `rpc/provider` with one of
 these inner codes (ADR-0019): `wasm/module`, `wasm/limits`, `wasm/import`,
 `wasm/instantiate`, `wasm/memory`, `wasm/entry`, `wasm/fuel`, `wasm/trap`,
-`wasm/input`, `wasm/output`. The guest ABI is `memory` plus
+`wasm/input`, `wasm/output`, `wasm/output-limit`. The guest ABI is `memory` plus
 `run(len: i32) -> i32` with input at offset 0 and output at offset 65536. ABI v1
 allows no imports; ABI v2 lets the embedder grant `env.clock_ms`,
 `env.random(ptr, len)` and `env.log(ptr, len)` per tool instance, and refuses
 any other import with `wasm/import`.
+
+The capability's byte grant is one budget for the whole call: the input copy,
+the returned output, the guest log the host buffers and the entropy drawn by
+`env.random` are summed against it, and a refusal is `rpc/budget-exceeded` with
+dimension `byte`. The static `max_output_bytes` and `max_log_bytes` still apply;
+the tighter ceiling decides the code, so `wasm/output-limit` maps to
+`rpc/budget-exceeded` only when the grant share is the tighter bound, and a
+guest's own `-1` stays `wasm/output`.
 
 ---
 

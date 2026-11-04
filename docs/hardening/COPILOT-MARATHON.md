@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-37: round 37 found 1 high, 1 medium and 3 lows, all fixed; rounds 38-39 must be clean | 219 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-30: round 30 found 1 medium and 5 lows, all fixed, rejected with evidence, or recorded; rounds 31-32 must be clean | 228 fixed / 2 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-31: round 31 found 8 lows, all fixed or shown not to hold; rounds 32-33 must be clean | 235 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -434,6 +434,25 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 31)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `3bde2f3`. No critical, high
+or medium findings; eight lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the "ack unbounded" comment was stale and a writer death was reported as `Timeout` | **fixed**: the comment states 5 s + 5 s and a dead writer is `mcp/write:closed` |
+| 2 | low | the reviewer read `STATUS.md` as unnumbered with residues 9/13/16 missing | **does not hold**: the file has a numbered list and items 9, 13 and 16 (JSON recursion) are present; checked at the audited commit |
+| 3 | low | a bare date or score body was repaired to `0` and reported `http/bad-number` | **fixed**: a bare body is re-examined only when it is exactly a JSON number token; `a_bare_date_answer_is_text_not_a_bad_number` |
+| 4 | low | a guest's own `-1` was relabelled a budget refusal under a grant-bound share | **fixed**: the ceiling refusal is `wasm/output-limit` and only that maps to `rpc/budget-exceeded`; `a_guest_negative_return_is_not_a_budget_refusal` |
+| 5 | low | the process paragraph owned two HTTP sentences | **fixed** |
+| 6 | low | `wire.md` did not describe the wasm unified share | **fixed**: the wasm section states the one-budget rule and the code mapping |
+| 7 | low | the served-call counter incremented before refusals | **fixed**: all three adapters count admitted calls only; `a_refused_call_does_not_increment_the_served_counter` |
+| 8 | low | a request target need not start with `/` | **fixed**: `ambiguous_path` refuses it before the allowlist; `a_request_target_without_a_leading_slash_is_refused` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 30)
 

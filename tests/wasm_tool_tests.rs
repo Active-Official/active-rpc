@@ -150,7 +150,10 @@ fn output_beyond_the_ceiling_is_refused() {
         ..WasmLimits::default()
     };
     let mut tool = WasmTool::from_bytes(&binary(BIG_OUTPUT), limits).expect("compile");
-    assert_eq!(error_code(tool.call(b"")), "wasm/output");
+    // A length past the output ceiling has its own code: the guest's own `-1`
+    // stays `wasm/output`, and only the ceiling maps to a budget refusal when
+    // the grant is the tighter bound (round 31, F4).
+    assert_eq!(error_code(tool.call(b"")), "wasm/output-limit");
 }
 
 #[test]

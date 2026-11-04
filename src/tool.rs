@@ -168,16 +168,15 @@ pub fn json_text_bad_number(text: &str) -> bool {
 /// object, an array or a number is re-examined, so a plain-text body is never
 /// accused of carrying a bad number (round 15, F-1; round 16, F-1).
 fn text_fails_only_on_a_number(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    // A document that opens as an object, an array or a number is a JSON
-    // candidate; a bare `1e400` is one, so it reports `bad-number` instead of
-    // being downgraded to text (round 16, F-1; round 29, F5 fixed the stale
-    // comment).
-    let json_start = trimmed.starts_with('{')
-        || trimmed.starts_with('[')
-        || trimmed.starts_with(|c: char| c == '-' || c.is_ascii_digit());
+    let trimmed = text.trim();
+    let json_start = trimmed.starts_with('{') || trimmed.starts_with('[');
     if !json_start {
-        return false;
+        // A bare body is re-examined only when it is a number token: a date, a
+        // version or a score opens with a digit too, and the repair heuristic
+        // would turn it into `0` and report a provider fault for benign text
+        // (round 31, F3). A bare `1e400` is a number token, so it still
+        // reports `bad-number` (round 16, F-1).
+        return is_number_token(trimmed);
     }
     let spans = bad_number_spans(text);
     if spans.is_empty() {
@@ -192,6 +191,51 @@ fn text_fails_only_on_a_number(text: &str) -> bool {
     }
     repaired.push_str(&text[cursor..]);
     serde_json::from_str::<Json>(&repaired).is_ok()
+}
+
+/// Whether `text` is exactly one JSON number token.
+///
+/// `-?digits[.digits][e[+-]digits]`; anything else (a date, a version, a
+/// word) is text. Used to tell an out-of-range number from a benign body that
+/// happens to open with a digit (round 31, F3).
+fn is_number_token(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut index = 0usize;
+    if bytes[index] == b'-' {
+        index += 1;
+    }
+    let mut digits = 0usize;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        digits += 1;
+        index += 1;
+    }
+    if index < bytes.len() && bytes[index] == b'.' {
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            digits += 1;
+            index += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if index < bytes.len() && (bytes[index] == b'e' || bytes[index] == b'E') {
+        index += 1;
+        if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == start {
+            return false;
+        }
+    }
+    index == bytes.len()
 }
 
 /// Whether a decoded tree holds more nodes than the adapter accepts.
@@ -949,10 +993,10 @@ impl McpTransport for StdioTransport {
         // forever (round 11, #1). `try_send` under the deadline keeps the
         // promise the trait makes.
         let mut command = (line.to_string(), reply);
-        // A caller with no deadline still gets a bounded queue wait: the writer
-        // blocks while the child does not read, and an unbounded loop parked
-        // the dispatch thread forever (round 18, L-7). The ack below is still
-        // unbounded, because a large line may legitimately take long to write.
+        // A caller with no deadline still gets bounded waits: the writer blocks
+        // while the child does not read, so the enqueue waits 5 s and the ack
+        // 5 s (round 18, L-7; round 30, #4). The two are separate because a
+        // large line may legitimately take the writer a while.
         let enqueue_deadline = deadline.unwrap_or_else(|| {
             std::time::Instant::now()
                 .checked_add(std::time::Duration::from_secs(5))
@@ -984,9 +1028,15 @@ impl McpTransport for StdioTransport {
             None => outcome
                 // A direct caller with no deadline still gets a bounded wait:
                 // 30 s held the dispatch thread with no capability ceiling
-                // (round 30, #4).
+                // (round 30, #4). A dead writer is reported as such, not as a
+                // timeout (round 31, F1).
                 .recv_timeout(std::time::Duration::from_secs(5))
-                .map_err(|_| Error::Timeout)?,
+                .map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => Error::Provider {
+                        code: "mcp/write:closed".to_string(),
+                    },
+                })?,
             Some(deadline) => {
                 let left = deadline
                     .checked_duration_since(std::time::Instant::now())
@@ -1411,7 +1461,6 @@ impl<T: McpTransport> Provider for McpSession<T> {
     }
 
     fn invoke(&mut self, object: u64, call: &Call) -> Result<Response> {
-        self.calls += 1;
         if call.budget.max_wall_ms == 0 {
             return Err(Error::BudgetExceeded("wall"));
         }
@@ -1502,6 +1551,9 @@ impl<T: McpTransport> Provider for McpSession<T> {
         // refusal and a line past only the static ceiling is a bad argument
         // (round 27, #1).
         let max_line = grant;
+        // Count admitted calls only: a zero-grant or policy refusal is not a
+        // served call (round 31, F7).
+        self.calls += 1;
         let response = self.request_within(
             "tools/call",
             json!({ "name": tool.name, "arguments": Json::Object(arguments) }),
@@ -1558,7 +1610,8 @@ impl HttpTool {
     /// backslash, double slash or non-printable byte can name a different
     /// resource than the allowlisted string (round 27, #4; round 29, F4).
     fn ambiguous_path(path: &str) -> bool {
-        path.contains('%')
+        !path.starts_with('/')
+            || path.contains('%')
             || path.contains('?')
             || path.contains('#')
             || path.contains('\\')
@@ -1953,7 +2006,6 @@ impl Provider for HttpTool {
     }
 
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
-        self.calls += 1;
         if call.budget.max_wall_ms == 0 {
             // A zero grant is a refusal, not a one-millisecond grant: the
             // adapters used `.max(1)` and did the work anyway (round 4, #5).
@@ -2170,6 +2222,8 @@ impl Provider for HttpTool {
         };
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
         let cap = self.max_body.min(MAX_RESPONSE_BYTES).min(grant);
+        // Count admitted calls only (round 31, F7).
+        self.calls += 1;
         let (status, response) = self.perform(
             &method,
             &path,
@@ -2531,7 +2585,6 @@ impl Provider for LocalProcess {
     }
 
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
-        self.calls += 1;
         if call.budget.max_wall_ms == 0 {
             // Before the spawn: a zero grant must not start a child and kill it
             // (round 4, #5).
@@ -2649,6 +2702,8 @@ impl Provider for LocalProcess {
             }
             command.env(key, value);
         }
+        // Count admitted calls only (round 31, F7).
+        self.calls += 1;
         let mut child = command.spawn().map_err(|error| Error::Provider {
             code: format!("process/spawn:{error}"),
         })?;

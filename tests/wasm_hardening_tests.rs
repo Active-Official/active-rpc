@@ -499,3 +499,26 @@ fn the_wasm_reply_and_log_share_one_grant() {
         .expect_err("output and log share the grant");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
+
+/// A guest's own `-1` return is a guest fault, not grant exhaustion: only a
+/// length past the ceiling is `wasm/output-limit`, and only that maps to a
+/// budget refusal (round 31, F4).
+#[test]
+fn a_guest_negative_return_is_not_a_budget_refusal() {
+    const REFUSE: &str = r#"
+      (module
+      (memory (export "memory") 2)
+      (func (export "run") (param i32) (result i32) i32.const -1))
+      "#;
+    let mut tool = WasmTool::from_bytes(&binary(REFUSE), WasmLimits::default()).expect("compile");
+    let mut call = Call::new("run", vec![Arg::text("")]);
+    call.tool_allows_process = true;
+    call.budget = Budget {
+        max_bytes: 8,
+        ..Budget::default()
+    };
+    let error =
+        active_rpc::kernel::Provider::invoke(&mut tool, 0, &call).expect_err("the guest refused");
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(error.provider_code(), Some("wasm/output"), "{error}");
+}
