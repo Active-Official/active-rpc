@@ -224,7 +224,9 @@ session:
 | `mcp/<code>` | the server returned a JSON-RPC error; `<code>` is its numeric code |
 
 A line past the capability's byte grant is `rpc/budget-exceeded` with dimension
-`byte`; the 1 MiB line ceiling still bounds the read.
+`byte`; the 1 MiB line ceiling still bounds the read. An outgoing request over
+1 MiB is `rpc/invalid-argument`, and one past the grant is
+`rpc/budget-exceeded`.
 
 A tool name is validated because it becomes an allow-list entry and a method
 name. Control characters, bidi overrides and duplicates are refused at
@@ -284,14 +286,15 @@ answer is ignored before the JSON gates and the decode.
 | `process/wait:<err>` | waiting for the child failed |
 | `process/cwd` | the working directory could not be pinned at construction |
 | `process/thread:<err>` | a pipe reader thread could not start; the child is killed |
-| `rpc/budget-exceeded` | the wall grant is zero |
+| `rpc/budget-exceeded` | the wall or byte grant is zero, or the input is past the byte grant |
 | `rpc/timeout` | the call exceeded the effective wall ceiling; the whole process group was killed |
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
-| `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, the output exceeded the effective ceiling, or process execution was not granted |
+| `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, a secret argument was passed, the output exceeded the effective ceiling, or process execution was not granted |
 
 The effective output ceiling is the smaller of `max_output`, 16 MiB and the
-capability byte grant, for both streams together; a response head is capped by
-`min(64 KiB, the grant)`.
+capability byte grant, for both streams together. A request body is capped by
+`min(max_request, 64 MiB, the grant)`; a response head is capped by
+`min(64 KiB, the grant)`, and the head and the body share that grant.
 
 `LocalProcess::new` requires an absolute program path. A bare name would be
 resolved from the parent's `PATH`, which is ambient authority: anything that can

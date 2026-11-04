@@ -340,7 +340,7 @@ impl WasmTool {
             // read real time breaks replay determinism and gets a covert channel
             // the kernel claims not to have. The embedder seeds it
             // (`set_time_ms`, or `Call::now_ms` through the kernel).
-            let now = self.now_ms as i64;
+            let now = i64::try_from(self.now_ms).unwrap_or(i64::MAX);
             linker
                 .func_wrap("env", "clock_ms", move || -> i64 { now })
                 .map_err(|_| provider("wasm/import"))?;
@@ -610,6 +610,11 @@ impl Provider for WasmTool {
         if fuel == 0 {
             return Err(Error::BudgetExceeded("wall"));
         }
+        if call.budget.max_bytes == 0 {
+            // An empty answer still costs a run; a zero-byte grant does no
+            // work (round 22, F-B).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         let mut limits = self.limits;
         limits.fuel = fuel;
         let mut tool = WasmTool {
@@ -621,6 +626,12 @@ impl Provider for WasmTool {
             now_ms: call.now_ms,
         };
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+        let input_grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+        if input.len() > input_grant {
+            // The guest must not run on data the grant cannot carry
+            // (round 22, F-G).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         let result = tool.call(&input);
         // Keep the guest's log even when the call was refused: a trap is exactly
         // when its diagnostics matter, and `call` cleared the buffer first so it
@@ -634,12 +645,9 @@ impl Provider for WasmTool {
         }
         // Guest output is bytes: a lossy UTF-8 conversion would hand the caller
         // text the guest never produced. Binary results travel as a module value.
-        if std::str::from_utf8(&output).is_ok() {
-            Ok(Response::Value(Value::Text(
-                String::from_utf8(output).expect("checked above"),
-            )))
-        } else {
-            Ok(Response::Module(output))
+        match String::from_utf8(output) {
+            Ok(text) => Ok(Response::Value(Value::Text(text))),
+            Err(error) => Ok(Response::Module(error.into_bytes())),
         }
     }
 }

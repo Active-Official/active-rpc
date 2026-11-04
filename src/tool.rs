@@ -1443,7 +1443,9 @@ impl<T: McpTransport> Provider for McpSession<T> {
         }
         // The capability's wall ceiling bounds the wait, not only the total: a
         // silent server must not hold the kernel for its own timeout.
-        let ceiling = std::time::Duration::from_millis(call.budget.max_wall_ms.max(1));
+        // A `u64::MAX` grant overflowed `checked_add` and became an instant
+        // timeout; clamp the same way `LocalProcess` does (round 22, F-E).
+        let ceiling = std::time::Duration::from_millis(call.budget.max_wall_ms.clamp(1, 300_000));
         let deadline = std::time::Instant::now()
             .checked_add(ceiling)
             .unwrap_or_else(std::time::Instant::now);
@@ -1523,7 +1525,8 @@ impl HttpTool {
                 .map(|method| method.to_string())
                 .collect(),
             // The serialised body adds keys, quotes and up to six-fold escaping.
-            max_arg_bytes: (self.max_request as u64 / 6).saturating_sub(256),
+            max_arg_bytes: ((self.max_request.min(MAX_REQUEST_BYTES) as u64) / 6)
+                .saturating_sub(256),
             allow_process: false,
         }
     }
@@ -1741,12 +1744,20 @@ impl HttpTool {
         if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
             return Ok((status, Vec::new()));
         }
+        // The head already spent part of the grant; the body may use the rest
+        // (round 22, F-F).
+        let body_cap = max_body.saturating_sub(header_bytes);
+        if body_cap == 0 {
+            return Err(Error::Provider {
+                code: "http/body-too-large".to_string(),
+            });
+        }
         let body = match content_length {
             Some(length) => {
                 // The peer names this length; a caller-set `max_body` past a
                 // sane ceiling would turn it into an allocation abort
                 // (round 11, #14).
-                if length > MAX_RESPONSE_BYTES || length > max_body {
+                if length > MAX_RESPONSE_BYTES || length > body_cap {
                     // The same code as the read-to-end arm: a peer must not
                     // choose the code by choosing a framing (round 12, F-5).
                     return Err(Error::Provider {
@@ -1758,7 +1769,7 @@ impl HttpTool {
             None => {
                 // `body_rest` already enforces `min(max_body, MAX_RESPONSE_BYTES)`
                 // and answers `http/body-too-large` (round 13, F-4).
-                reader.body_rest(max_body.min(MAX_RESPONSE_BYTES))?
+                reader.body_rest(body_cap.min(MAX_RESPONSE_BYTES))?
             }
         };
         Ok((status, body))
@@ -2349,6 +2360,18 @@ impl Provider for LocalProcess {
             }
             args.push(text.clone());
         }
+        if call.budget.max_bytes == 0 {
+            // A zero-byte grant cannot carry an answer; the child is never
+            // started (round 22, F-A).
+            return Err(Error::BudgetExceeded("byte"));
+        }
+        if args_contain_secret(&call.args) {
+            // Authority this adapter was not granted; the other text adapters
+            // report it the same way (round 22, F-H).
+            return Err(Error::ToolPolicy(
+                "a secret argument cannot be passed to a process",
+            ));
+        }
         // The policy in the capability must have granted process execution.
         if !call.tool_allows_process {
             return Err(Error::ToolPolicy("process execution not granted"));
@@ -2464,11 +2487,12 @@ impl Provider for LocalProcess {
                                                 std::sync::atomic::Ordering::SeqCst,
                                             ) {
                                                 Ok(_) => break left,
-                                                Err(actual) => {
-                                                    if actual == left {
-                                                        break left;
-                                                    }
-                                                }
+                                                // A failed exchange means
+                                                // another reader moved the
+                                                // counter; retry rather than
+                                                // buffering the bytes free
+                                                // (round 22, F-C).
+                                                Err(_) => continue,
                                             }
                                         };
                                         if before == 0 {

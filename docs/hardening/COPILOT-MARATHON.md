@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-28: 28 found 1 critical + 1 medium, fixed; rounds 29-30 must be clean | 172 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-21: ... + 10 findings; round 22 is the confirmation | 179 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-29: 29 found 1 high, fixed; rounds 30-31 must be clean | 177 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-22: ... + 9 findings; round 23 is the confirmation | 188 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,22 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 29)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `bbd53c1`.
+All round-28 fixes verified except two gaps; one **high**, four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the HTTP/2 in-flight body reservation was dropped *before* the handler ran, so 128 streams could park 128 bodies plus their decoded copies outside the documented memory bound | **fixed**: the request guard lives until the response is written; the response charges only the excess over what the guard already holds. `a_parked_handler_keeps_its_body_charged` fails pre-fix (the second call is served and the first times out) and gets `rpc/backpressure` after |
+| 2 | low | the HTTP/2 client accepted any envelope as the answer | **fixed**: kind and request id checked in `call` and `call_many` |
+| 3 | low | the gRPC 5-byte prefix was left out of both size ceilings, so the largest legal envelope could not cross | **fixed**: both directions allow the prefix on top of the envelope ceiling |
+| 4 | low | U+034F, U+17B4–U+17B5 and U+180F still passed the invisible-character filter | **fixed** |
+| 5 | low | `rpc/secret-material` claimed the closed `rpc/` namespace without being registered | **fixed**: `provider/secret-material`, a provider-namespace code like `wasm/*` |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 28)
 
@@ -250,6 +266,27 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 22)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `bbd53c1`. Round-21 fixes
+verified; round 21's zero-grant fix was partial. One medium, eight lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `LocalProcess` (and the wasm adapter) still did the work under a zero-byte grant | **fixed**: both refuse before spawning or running; `rpc/budget-exceeded` |
+| 2 | low | a failed compare-exchange in the shared output budget buffered the bytes free | **fixed**: retry the exchange |
+| 3 | low | `HttpTool::policy` advertised `max_request / 6` with no static ceiling | **fixed**: `max_request.min(MAX_REQUEST_BYTES)` |
+| 4 | low | a `u64::MAX` MCP wall grant overflowed into an instant timeout | **fixed**: clamped to 300 s at use |
+| 5 | low | the HTTP head and body each got the full grant, so their sum could exceed it | **fixed**: the body cap is the grant minus the head bytes |
+| 6 | low | the wasm input was not bounded by the grant | **fixed**: `rpc/budget-exceeded` before the guest runs |
+| 7 | low | a secret process argument was `rpc/invalid-argument` | **fixed**: `rpc/tool-policy`, as in the other adapters |
+| 8 | low | the spec rows missed the request ceiling, the byte-grant refusals and the outgoing MCP codes, and the process section owned an HTTP sentence | **fixed**: `wire.md` updated |
+| 9 | low | the wasm embedder clock wrapped negative past `i64::MAX` | **fixed**: saturated |
+| 10 | low | an `expect` sat inside the adapter boundary | **fixed**: `match String::from_utf8` |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 21)
 

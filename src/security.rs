@@ -240,7 +240,7 @@ pub fn assert_no_structural_secrets(value: &Value) -> Result<()> {
         Value::Map(entries) => {
             if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
                 return Err(Error::Provider {
-                    code: "rpc/secret-material".to_string(),
+                    code: "provider/secret-material".to_string(),
                 });
             }
             entries.values().try_for_each(assert_no_structural_secrets)
@@ -248,7 +248,7 @@ pub fn assert_no_structural_secrets(value: &Value) -> Result<()> {
         Value::Module(bytes) => {
             if module_has_secret(bytes)? {
                 return Err(Error::Provider {
-                    code: "rpc/secret-material".to_string(),
+                    code: "provider/secret-material".to_string(),
                 });
             }
             Ok(())
@@ -266,13 +266,13 @@ pub fn assert_no_structural_secrets(value: &Value) -> Result<()> {
 pub fn assert_no_secret_material(value: &Value) -> Result<()> {
     match value {
         Value::Secret => Err(Error::Provider {
-            code: "rpc/secret-material".to_string(),
+            code: "provider/secret-material".to_string(),
         }),
         Value::List(items) => items.iter().try_for_each(assert_no_secret_material),
         Value::Map(entries) => {
             if entries.keys().any(|key| key.contains(SECRET_MARKER)) {
                 return Err(Error::Provider {
-                    code: "rpc/secret-material".to_string(),
+                    code: "provider/secret-material".to_string(),
                 });
             }
             entries.values().try_for_each(assert_no_secret_material)
@@ -282,7 +282,7 @@ pub fn assert_no_secret_material(value: &Value) -> Result<()> {
         Value::Module(bytes) => {
             if module_has_secret(bytes)? {
                 return Err(Error::Provider {
-                    code: "rpc/secret-material".to_string(),
+                    code: "provider/secret-material".to_string(),
                 });
             }
             Ok(())
@@ -333,7 +333,9 @@ pub fn is_invisible_or_reordering(character: char) -> bool {
             // Invisible operators, the Mongolian vowel separator, and variation
             // selectors, which change rendering without adding width.
             | '\u{2061}'..='\u{2064}'
-            | '\u{180B}'..='\u{180E}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{034F}'
+            | '\u{17B4}'..='\u{17B5}'
             | '\u{FE00}'..='\u{FE0F}'
             // Deprecated format characters and the interlinear annotation set.
             | '\u{206A}'..='\u{206F}'

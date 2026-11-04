@@ -399,9 +399,9 @@ where
     let declared_length = match lengths.next() {
         Some(value) => {
             let text = value.to_str().unwrap_or_default();
-            // The HTTP/1.1 bridge refuses a duplicate, a sign and leading
-            // zeros; a lenient parse lets an intermediary disagree about the
-            // message (round 28, low).
+            // The HTTP/1.1 bridge refuses a duplicate and a sign (leading
+            // zeros are legal and accepted by both); a lenient parse lets an
+            // intermediary disagree about the message (round 28, low).
             if lengths.next().is_some()
                 || text.is_empty()
                 || text.len() > 20
@@ -482,17 +482,20 @@ where
             None => break,
         }
     }
-    // The body is in memory; releasing its reservation before the response
-    // reserves keeps one stream from charging the connection twice
-    // (round 28, low).
-    drop(reservation);
     if declared_length.is_some_and(|length| length != bytes.len()) {
         // The stream is the body; a `content-length` that disagrees is a
         // framing ambiguity (round 27, low).
         return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
     }
     let envelope = match Envelope::decode_with(&bytes, limits) {
-        Ok(envelope) => envelope,
+        Ok(envelope) => {
+            // The envelope owns its payload; the framed buffer is dead weight
+            // from here. The reservation stays held through the handler, so a
+            // parked call is still charged for the memory it pins
+            // (round 29, high).
+            drop(bytes);
+            envelope
+        }
         Err(error) => {
             return respond_status(
                 &mut respond,
@@ -537,11 +540,12 @@ where
             );
         }
     };
-    // The request side reserves its body against the connection budget; a
-    // response parked until flow control grants capacity is the same kind of
-    // hold, so it is charged the same way (round 28, low).
-    let mut response_reservation = Reservation::new(Arc::clone(&inflight));
-    if !response_reservation.reserve(encoded.len(), inflight_budget) {
+    // The request guard still holds this stream's bytes (the parked handler is
+    // charged for them); charge only the response's excess over that, so one
+    // stream cannot charge the connection twice and a stream that is waiting
+    // keeps its body charged (round 29, high).
+    let held = reservation.held();
+    if !reservation.reserve(encoded.len().saturating_sub(held), inflight_budget) {
         return respond_status(
             &mut respond,
             StatusCode::TOO_MANY_REQUESTS,
@@ -568,6 +572,11 @@ struct Reservation {
 impl Reservation {
     fn new(budget: Arc<AtomicUsize>) -> Self {
         Self { budget, held: 0 }
+    }
+
+    /// Bytes this guard holds.
+    fn held(&self) -> usize {
+        self.held
     }
 
     /// Reserve `bytes` if the connection stays under `limit`.
@@ -787,7 +796,17 @@ impl Http2Client {
         if status != StatusCode::OK {
             return Err(refusal(&response));
         }
-        Envelope::decode_with(&response, self.limits)
+        let answer = Envelope::decode_with(&response, self.limits)?;
+        // Mirror the Connect client: a peer must not hand us another request's
+        // answer or a call envelope (round 29, low).
+        if !matches!(
+            answer.kind,
+            crate::wire::Kind::Response | crate::wire::Kind::Error
+        ) || answer.request_id != envelope.request_id
+        {
+            return Err(Error::Wire("the peer answered a different request"));
+        }
+        Ok(answer)
     }
 
     /// Send several calls concurrently over the one connection.
@@ -801,6 +820,10 @@ impl Http2Client {
             self.check_body(&payload)?;
             payloads.push(payload);
         }
+        let expected: Vec<u64> = envelopes
+            .iter()
+            .map(|envelope| envelope.request_id)
+            .collect();
         let sender = self.sender.clone();
         let limits = self.limits;
         let deadline = self.deadline;
@@ -813,6 +836,7 @@ impl Http2Client {
                 let mut tasks = tokio::task::JoinSet::new();
                 for (index, body) in payloads.into_iter().enumerate() {
                     let mut sender = sender.clone();
+                    let expected_id = expected.get(index).copied().unwrap_or(0);
                     tasks.spawn(async move {
                         let decoded = async {
                             let request = Request::builder()
@@ -836,7 +860,20 @@ impl Http2Client {
                             if status != StatusCode::OK {
                                 Err(refusal(&body))
                             } else {
-                                Envelope::decode_with(&body, limits)
+                                let answer = Envelope::decode_with(&body, limits)?;
+                                // As in `call`: a stream's answer must belong
+                                // to the request that opened it
+                                // (round 29, low).
+                                if !matches!(
+                                    answer.kind,
+                                    crate::wire::Kind::Response | crate::wire::Kind::Error
+                                ) || answer.request_id != expected_id
+                                {
+                                    return Err(Error::Wire(
+                                        "the peer answered a different request",
+                                    ));
+                                }
+                                Ok(answer)
                             }
                         };
                         (index, decoded.await)
@@ -972,6 +1009,11 @@ async fn read_response(
             .saturating_mul(8)
             .min(std::time::Duration::from_secs(30));
     let status = response.status();
+    let declared: Option<usize> = response
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse().ok());
     let mut body = response.into_body();
     let mut bytes = Vec::new();
     loop {
@@ -998,6 +1040,13 @@ async fn read_response(
             }
             None => break,
         }
+    }
+    if declared.is_some_and(|length| length != bytes.len()) {
+        // RFC 9113 requires the DATA total to match a declared content-length;
+        // a mismatch is a framing ambiguity (round 29, low).
+        return Err(Error::Wire(
+            "HTTP/2 response length disagrees with its data",
+        ));
     }
     Ok((status, bytes))
 }

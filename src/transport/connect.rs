@@ -389,7 +389,8 @@ impl BridgeServer {
         // The body ceiling is the wire limit, not only the protocol maximum: a
         // strict server must not read 64 MiB to discover it refuses the frame.
         let body_ceiling = MAX_BODY.min(self.limits.max_bytes);
-        if content_length > body_ceiling {
+        // `content-length` counts the framed message, prefix included.
+        if content_length > body_ceiling.saturating_add(5) {
             let _ = write_http_response(&mut stream, 413, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
@@ -819,7 +820,9 @@ impl ConnectClient {
             // a header (round 27, low).
             return Err(Error::Wire("invalid content type"));
         }
-        if body.len() > MAX_BODY.min(self.limits.max_bytes) {
+        // `body` is the framed message; the ceiling names the envelope, so
+        // the 5-byte prefix is allowed on top (round 29, low).
+        if body.len() > MAX_BODY.min(self.limits.max_bytes).saturating_add(5) {
             // Framing a body the bridge can only refuse wastes the write and
             // could wrap the 32-bit frame length (round 25, #5).
             return Err(Error::Wire("request exceeds the ceiling"));
@@ -919,7 +922,7 @@ impl ConnectClient {
             [] => return Err(Error::Wire("missing response length")),
             _ => return Err(Error::Wire("repeated response length")),
         };
-        if length > MAX_BODY.min(self.limits.max_bytes) {
+        if length > MAX_BODY.min(self.limits.max_bytes).saturating_add(5) {
             return Err(Error::Wire("response exceeds the ceiling"));
         }
         // Grow with the bytes that actually arrive: a hostile server that

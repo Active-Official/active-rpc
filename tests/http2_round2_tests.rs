@@ -199,3 +199,69 @@ fn a_dripping_body_cannot_hold_the_http2_budget_forever() {
     );
     assert!(calls.load(Ordering::SeqCst) >= 1);
 }
+
+/// A stream whose handler is parked keeps its body charged: the reservation is
+/// released only when the stream ends, so a second stream cannot pin another
+/// body under the same budget (round 29, high).
+#[test]
+fn a_parked_handler_keeps_its_body_charged() {
+    let (started, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let server = Http2Server::bind_loopback()
+        .expect("bind")
+        .with_inflight_budget(4096)
+        .with_connection_deadline(Duration::from_millis(500));
+    let address = server.address().to_string();
+    let handle = std::thread::spawn(move || {
+        let mut started = Some(started);
+        let mut release = Some(release_rx);
+        server
+            .serve(2, move |envelope| {
+                if let Some(sender) = started.take() {
+                    let _ = sender.send(());
+                    if let Some(receiver) = release.take() {
+                        let _ = receiver.recv();
+                    }
+                }
+                echo(envelope)
+            })
+            .expect("serve")
+    });
+
+    let large = Envelope::request(2, "ping", Vec::new())
+        .with_payload(vec![b'a'; 3_000])
+        .encode()
+        .expect("encode")
+        .len();
+    assert!(large < 4096, "the first body fits the budget: {large}");
+
+    let mut first = Http2Client::connect(&address)
+        .expect("connect")
+        .with_deadline(Duration::from_secs(10));
+    let first_request = Envelope::request(2, "ping", Vec::new()).with_payload(vec![b'a'; 3_000]);
+    let first_client = std::thread::spawn(move || {
+        let answer = first.call(&first_request);
+        (first, answer)
+    });
+    // Wait until the parked handler holds the reservation.
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the handler runs");
+
+    let mut second = Http2Client::connect(&address)
+        .expect("connect")
+        .with_deadline(Duration::from_secs(10));
+    let second_request = Envelope::request(3, "ping", Vec::new()).with_payload(vec![b'b'; 2_000]);
+    let error = second
+        .call(&second_request)
+        .expect_err("the budget is still held by the parked stream");
+    assert_eq!(error.provider_code(), Some("rpc/backpressure"), "{error}");
+
+    let _ = release.send(());
+    let (first, answer) = first_client.join().expect("first client");
+    let answer = answer.expect("the first call still completes");
+    assert_eq!(answer.first_value(), Some(&Value::text("pong")));
+    drop(first);
+    drop(second);
+    let _ = handle.join().expect("serve returns");
+}
