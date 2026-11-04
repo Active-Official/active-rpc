@@ -1115,11 +1115,13 @@ impl Agent {
         if record.revoked {
             return Err(Error::Revoked(cap_token(cap.id())));
         }
-        if let Some(expires_at) = record.expires_at {
-            if kernel.now_ms >= expires_at {
-                kernel.push_event(Event::CapExpired(cap.id()));
-                return Err(Error::Revoked(cap_token(cap.id())));
-            }
+        // Export obeys the same expiry rule as dispatch: a deadline minted in
+        // the other clock domain cannot be read here, and ADR-0015's amendment
+        // asks the operator to re-export from the target domain
+        // (round 43, F5).
+        if is_expired(&kernel, &record) {
+            kernel.push_event(Event::CapExpired(cap.id()));
+            return Err(Error::Revoked(cap_token(cap.id())));
         }
         let provider_name = kernel
             .providers
@@ -1859,12 +1861,16 @@ impl Agent {
             .get(&cap.id())
             .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
         let descriptor = crate::wire::CapDescriptor::from_attrs(record.id, &record.attrs);
-        let rebound = record.id;
-        kernel.push_event(Event::CapRebound {
-            cap: rebound,
-            from: from_fingerprint,
-            to: to_fingerprint,
-        });
+        // A no-op rotation is not a rebind: the tape must not report an
+        // authority move that did not happen (round 43, F4).
+        if from_fingerprint != to_fingerprint {
+            let rebound = record.id;
+            kernel.push_event(Event::CapRebound {
+                cap: rebound,
+                from: from_fingerprint,
+                to: to_fingerprint,
+            });
+        }
         Ok(descriptor)
     }
 
@@ -5968,6 +5974,25 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         if record_ids.contains(&record.record_id) {
             doomed.insert(*id);
         }
+    }
+    // An exported record whose exporting capability was dropped before this
+    // revocation has no live record to match, so the subtree walk cannot see
+    // it. The pin carries its exporter and lineage, exactly as the rotation
+    // selector uses them (round 40, R-07-2), and a dropped durable cap already
+    // left the `live` term of `durable_ceiling_reached`, so this adds no
+    // ceiling pressure (round 43, F1).
+    let orphans: Vec<[u8; 32]> = kernel
+        .record_pins
+        .iter()
+        .filter(|(record_id, pin)| {
+            !kernel.revoked_records.contains(*record_id)
+                && (doomed.contains(&pin.cap)
+                    || pin.lineage.iter().any(|ancestor| doomed.contains(ancestor)))
+        })
+        .map(|(record_id, _)| *record_id)
+        .collect();
+    for record_id in orphans {
+        mark_tombstoned(kernel, record_id);
     }
     for id in doomed {
         let mut was_revoked = false;

@@ -223,6 +223,15 @@ impl CapTableDelta {
         if base.len() < self.removed.len() {
             return Err(Error::CapabilityTable("delta removes more than the base"));
         }
+        let limits = WireLimits::default();
+        // One delta is bounded like one envelope: a programmatic delta with 300
+        // additions applied locally but could never be encoded or decoded
+        // (round 36, #2).
+        if self.added.len() > limits.max_caps as usize
+            || self.removed.len() > limits.max_caps as usize
+        {
+            return Err(Error::CapabilityTable("delta exceeds the ceiling"));
+        }
         let resulting = base.len() - self.removed.len() + self.added.len();
         if resulting > MAX_CAP_TABLE {
             return Err(Error::CapabilityTable(
@@ -233,7 +242,6 @@ impl CapTableDelta {
             // The programmatic path must not admit something the wire path would
             // refuse: the same descriptor rule, ceilings included, applies
             // whichever way a descriptor arrived (round 35, N2).
-            let limits = WireLimits::default();
             for cap in &self.added {
                 check_descriptor(cap, &limits)?;
             }
@@ -1175,24 +1183,33 @@ fn read_cap_inner(bytes: &[u8], cursor: &mut usize, limits: &WireLimits) -> Resu
 }
 
 /// Decode a capability table on its own (side-channel use).
+///
+/// A table is bounded by [`MAX_CAP_TABLE`], not by one envelope's descriptor
+/// ceiling: it is the negotiated object `apply_to` grows.
 pub fn decode_capability_table(bytes: &[u8]) -> Result<Vec<CapDescriptor>> {
-    decode_capability_table_with(bytes, &WireLimits::default())
+    let limits = WireLimits {
+        max_caps: MAX_CAP_TABLE as u32,
+        ..WireLimits::default()
+    };
+    decode_capability_table_with(bytes, &limits)
 }
 
 /// Decode a capability table under caller-supplied limits.
 ///
 /// A strict peer can tighten `max_caps` and `max_methods` for a context that
-/// accepts only a few, narrowly-scoped capabilities.
+/// accepts only a few, narrowly-scoped capabilities. `max_caps` is honoured
+/// here, and `MAX_CAP_TABLE` is the absolute ceiling whatever the caller asks
+/// for (round 43, F3).
 pub fn decode_capability_table_with(
     bytes: &[u8],
     limits: &WireLimits,
 ) -> Result<Vec<CapDescriptor>> {
     let mut cursor = 0usize;
     let count = read_u32(bytes, &mut cursor)?;
-    // A negotiated table is bounded by its own ceiling, not by the per-envelope
-    // descriptor ceiling: `MAX_CAP_TABLE` is what `apply_to` grows to, and the
-    // reader must accept a table the writer can produce (round 42, F2).
     if count as usize > MAX_CAP_TABLE {
+        return Err(Error::CapabilityTable("too many descriptors"));
+    }
+    if count > limits.max_caps {
         return Err(Error::CapabilityTable("too many descriptors"));
     }
     let mut caps = Vec::with_capacity((count as usize).min(64));

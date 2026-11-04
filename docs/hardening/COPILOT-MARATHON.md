@@ -20,9 +20,9 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-42: round 42 found 4 mediums, 2 lows and a doc fix, all fixed; rounds 43-44 must be clean | 257 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-35: round 35 found 2 mediums and 1 low, all fixed; rounds 36-37 must be clean | 256 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-8: round 8 found 1 medium and 4 lows, all fixed; round 9 must be clean | 78 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-43: round 43 found 1 high, 2 mediums and 3 lows, all fixed; rounds 44-45 must be clean | 263 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-36: round 36 found 2 lows, all fixed; rounds 37-38 must be clean | 258 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-9: round 9 found 2 highs, 2 mediums and 2 lows, all fixed; rounds 10-11 must be clean | 84 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -475,6 +475,24 @@ are closed.
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
 
+### R-07 domain operations - 2026-11-04 (round 43)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
+`6e29de7`. Round-42 claims: four HOLD, two PARTIAL. One **high**, two mediums,
+three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a revocation never tombstoned a record exported from a descendant whose handle was dropped, so the documented orphan workflow restored live authority after the parent was revoked | **fixed**: `revoke_subtree` sweeps the pins whose exporter or lineage is doomed, using the same selector rotation uses; `a_revocation_tombstones_an_orphaned_descendant_record` |
+| 2 | medium | the canonical-text rule re-rendered the parsed map, and `serde_json` carries `preserve_order`, so a reordered record parsed and kept a valid seal | **fixed**: `from_json` compares the input with `Self::to_json()`; `a_record_with_a_reordered_key_is_refused` |
+| 3 | medium | `decode_capability_table_with` ignored `limits.max_caps`, so a strict caller's ceiling was unenforced and the round-42 over-count test tripped the zero-id rule instead | **fixed**: `_with` honours `max_caps` under the absolute `MAX_CAP_TABLE`, the wrapper passes the table profile, and the test uses 300 non-zero ids plus a `max_caps: 16` case |
+| 4 | low | a rotation to the same peer still emitted `cap.rebound` with identical fingerprints | **fixed**: the event is unconditional only for a real change; `a_rotation_to_the_same_peer_is_not_on_the_tape` |
+| 5 | low | export was the only expiry predicate outside `is_expired`, so a wall-clock record could leave a virtual-clock kernel | **fixed**: export refuses the cross-domain deadline; `an_export_after_a_clock_switch_is_refused` |
+| 6 | low | the new `annotation escaped the cone` branch has no test and a mode switch reads as lease expiry on the tape | **documented**: the branch is unreachable for a well-formed arena (`edges()` carries the constraint edge); the telemetry wording is noted in `STATUS.md` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Five new tests fail against the pre-fix tree.
+
 ### R-07 domain operations - 2026-11-04 (round 42)
 
 Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
@@ -494,6 +512,27 @@ mediums, two lows and one documentation fix.
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
 
+### R-09 transports - 2026-11-04 (round 9)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `f89c454`. All five round-8
+fixes HOLD. Two **highs**, two mediums, two lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a TCP frame past the ceiling left its body unread and the transport kept the connection, so the next read parsed attacker bytes as a header (smuggling) | **fixed**: `TcpTransport::recv` poisons on a framing `rpc/wire`; `an_oversize_frame_poisons_the_connection` |
+| 2 | high | `refusal()` accepted any `ERROR_CODES` token in the peer's body, so a bridge could make the client report `rpc/revoked` or `rpc/identity` as if the kernel decided it | **fixed**: an explicit allowlist (`rpc/transport`, `rpc/backpressure`, `rpc/provider`); `a_peer_cannot_choose_an_authority_refusal_class` and the hardening test updated |
+| 3 | medium | a stalled QUIC frame prefix was reported as `rpc/wire` (fatal) instead of a retryable transport fault | **fixed**: `Ok(Err(_))` is a framing fault, a timeout is `rpc/transport` |
+| 4 | medium | a QUIC client with no deadline could be parked forever by a peer that accepts and then goes silent | **fixed**: `DEFAULT_QUIC_WAIT` (30 s) bounds every exchange; `with_deadline` still tightens it |
+| 5 | low | `resolve_within` used increment-then-rollback, so transient churn at the resolver cap refused a caller that fit | **fixed**: compare-exchange loop |
+| 6 | low | TCP and QUIC sends ignored the transport's own `limits.max_bytes` while the other transports refused locally | **fixed**: both refuse `rpc/wire`; `a_strict_transport_refuses_to_send_an_oversized_frame` |
+
+Verification gaps recorded in `STATUS.md` residual 17: the QUIC stall and the
+30-second default need a fault peer or an injectable stream wait, and the
+resolver CAS needs concurrent churn at the cap.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Three new tests fail against the pre-fix tree.
+
 ### R-09 transports - 2026-11-04 (round 8)
 
 Reviewer: Muse through the Copilot CLI, `xhigh`, at `ff1d455`. Not clean: one
@@ -510,6 +549,19 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 36)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `f89c454`. All three round-35
+claims HOLD. No critical, high or medium; two lows, both fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the wasm adapter checked the method and the payload before the zero wall/byte grant, so a spent capability answered "method not granted" (an oracle) instead of a budget refusal | **fixed**: the budget checks come first, as in every other adapter; `a_zero_grant_precedes_the_method_and_payload_rules` |
+| 2 | low | `CapTableDelta::apply_to` enforced only the final table size, not the per-delta descriptor ceiling that the wire path enforces | **fixed**: a delta with more additions or removals than `max_caps` is refused; `a_programmatic_delta_past_the_per_delta_ceiling_is_refused` |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

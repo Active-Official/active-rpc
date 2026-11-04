@@ -452,6 +452,12 @@ pub const HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(1
 /// connection's traffic forever.
 pub const STREAM_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Default wall ceiling for one client exchange when the caller sets none.
+///
+/// Three times `STREAM_WAIT`: a handshake, a write and a read each have their
+/// own bound, and the whole exchange needs one (round 9, R-09 #9).
+pub const DEFAULT_QUIC_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long to wait for a FIN after the frame, to notice trailing bytes.
 ///
 /// A client that sends one frame closes the stream at once, so this is short. A
@@ -584,8 +590,16 @@ async fn serve_stream<H>(
     // unverified bytes beyond that decision.
     let mut header = [0u8; 4];
     let read = tokio::time::timeout(STREAM_WAIT, recv.read_exact(&mut header)).await;
-    if !matches!(read, Ok(Ok(()))) {
-        let error = Error::Wire("stream did not deliver a frame prefix");
+    let prefix_fault = match read {
+        Ok(Ok(())) => None,
+        // A reset or a short read is a framing fault; a stall is a transport
+        // condition the caller may retry (round 9, R-09 #8).
+        Ok(Err(_)) => Some(Error::Wire("stream did not deliver a frame prefix")),
+        Err(_) => Some(Error::Transport(
+            "stream stalled before the frame prefix".to_string(),
+        )),
+    };
+    if let Some(error) = prefix_fault {
         let response = Envelope::error(0, &error);
         reply(&mut send, &response).await;
         return;
@@ -937,6 +951,11 @@ impl QuicClient {
     /// Send one call and read the response.
     pub fn call(&self, envelope: &Envelope) -> Result<Envelope> {
         let bytes = envelope.encode()?;
+        // The client's own limits bound what it sends, as they bound what it
+        // reads (round 9, R-09 #11).
+        if bytes.len() > self.limits.max_bytes.min(MAX_FRAME_BYTES) {
+            return Err(Error::Wire("frame exceeds the size ceiling"));
+        }
         let mut payload = Vec::with_capacity(bytes.len() + 4);
         payload.extend_from_slice(&frame(bytes.len())?);
         payload.extend_from_slice(&bytes);
@@ -956,7 +975,8 @@ impl QuicClient {
     ///
     /// Without it a peer that completes the handshake and then stalls parks the
     /// caller forever; the CLI hides that with a helper thread, a library
-    /// consumer has nothing.
+    /// consumer has nothing. The default is [`DEFAULT_QUIC_WAIT`], the same
+    /// shape the HTTP/2 client uses (round 9, R-09 #9).
     pub fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.deadline = Some(deadline);
         self
@@ -970,7 +990,10 @@ impl QuicClient {
             self.server_name.clone(),
         );
         let request = payload.to_vec();
-        let deadline = self.deadline;
+        // A client that sets no deadline still gets one: a peer that completes
+        // the handshake and then stalls must not park the caller forever
+        // (round 9, R-09 #9).
+        let deadline = Some(self.deadline.unwrap_or(DEFAULT_QUIC_WAIT));
         // The stream carries a four-byte length and then the body; bound the
         // read by the caller's own limits, so a strict client does not buffer
         // the server's full 64 MiB before `read_frame` refuses it

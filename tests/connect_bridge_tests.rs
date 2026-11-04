@@ -439,6 +439,13 @@ fn a_non_three_digit_status_is_a_wire_fault() {
         stream
             .write_all(b"HTTP/1.1 +200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
             .expect("write");
+        let _ = stream.flush();
+        // Half-close and wait for the client: a plain drop with queued data can
+        // reset the connection on Windows and discard the response, which made
+        // this test fail under load (flake seen in the full suite).
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut sink = [0u8; 1024];
+        let _ = stream.read(&mut sink);
     });
     let mut client = ConnectClient::connect(&address).expect("connect");
     let error = client

@@ -121,4 +121,14 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
     and the kernel refuses a provider reply past `MAX_VALUE_DEPTH` (64) with
     `rpc/budget-exceeded: depth`. The conversion has no crate-level gate of its
     own, so a future parser change must add one (round 30, #2).
+17. **Three R-09 round-9 behaviours are verified by inspection, not by a
+    test.** (a) A QUIC stream that accepts and then never sends a frame prefix
+    is refused as `rpc/transport` after `STREAM_WAIT`; a test needs a raw quinn
+    peer or an injectable stream wait, and the constant is fixed. (b) The
+    client's default 30-second exchange deadline (`DEFAULT_QUIC_WAIT`) is only
+    reached by a blackhole peer; `with_deadline` covers the mechanism with a
+    short bound. (c) The resolver-thread reservation is a compare-exchange loop
+    now, and observing a spurious refusal needs concurrent churn at the cap.
+    Each is a documented gap rather than untested behaviour being claimed as
+    tested (round 9, R-09 #8-#10).
 

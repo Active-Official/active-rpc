@@ -40,6 +40,12 @@ pub const MAX_FRAME_BYTES: usize = 64 << 20;
 /// error must not carry a megabyte of the peer's prose.
 pub const MAX_ERROR_BODY: usize = 64;
 
+/// Refusal classes a peer is allowed to choose.
+///
+/// Every other `rpc/…` token in the body becomes `rpc/provider`: a transport
+/// may report a transport condition, not an authority decision.
+const PEER_REFUSAL_CLASSES: &[&str] = &["rpc/transport", "rpc/backpressure", "rpc/provider"];
+
 /// Map a peer's refusal body to the matching error.
 ///
 /// A frame rejection is a wire fault; every other refusal keeps its class in
@@ -52,10 +58,10 @@ pub(crate) fn refusal(body: &[u8]) -> Error {
     if text == "rpc/wire" {
         return Error::Wire("the peer rejected the frame");
     }
-    // Only the documented classes. A peer that labels its own refusal
-    // `rpc/revoked` (or `rpc/` alone) must not make an operator branch on a
-    // class the kernel never decided.
-    let code = if crate::error::ERROR_CODES.contains(&text) {
+    // Only the classes a transport itself can decide. A peer that labels its
+    // own refusal `rpc/revoked` or `rpc/identity` turned its HTTP body into a
+    // kernel decision the kernel never made (round 9, R-09 #7).
+    let code = if PEER_REFUSAL_CLASSES.contains(&text) {
         text.to_string()
     } else {
         "rpc/provider".to_string()
@@ -273,6 +279,12 @@ impl Transport for TcpTransport {
             ));
         }
         let bytes = envelope.encode()?;
+        // The transport's own limits bound what it sends, as they bound what it
+        // reads: a strict peer must refuse locally instead of writing a frame
+        // it would itself reject (round 9, R-09 #11).
+        if bytes.len() > self.limits.max_bytes.min(MAX_FRAME_BYTES) {
+            return Err(Error::Wire("frame exceeds the size ceiling"));
+        }
         // A reader that stops must not hold a serial server for the whole
         // message: each frame gets a fresh write budget.
         if let Some(wait) = self.frame_deadline {
@@ -309,8 +321,20 @@ impl Transport for TcpTransport {
                 .max(std::time::Duration::from_millis(1));
             let _ = self.stream.get_ref().set_read_timeout(Some(remaining));
         }
-        let Some(body) = read_frame_before(&mut self.stream, &self.limits, deadline)? else {
-            return Ok(None);
+        let body = match read_frame_before(&mut self.stream, &self.limits, deadline) {
+            Ok(Some(body)) => body,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                // A frame past the ceiling leaves its body unread, so the
+                // stream now holds body bytes where the next header belongs.
+                // A transport that kept reading would parse attacker data as a
+                // frame prefix (smuggling); the connection is poisoned instead
+                // (round 9, R-09 #6).
+                if matches!(error, Error::Wire(_)) {
+                    self.poisoned = true;
+                }
+                return Err(error);
+            }
         };
         Ok(Some(Envelope::decode_with(&body, self.limits)?))
     }

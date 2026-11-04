@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use active_rpc::cap::CapId;
-use active_rpc::wire::{CapDescriptor, CapTableDelta};
+use active_rpc::wire::{CapDescriptor, CapTableDelta, WireLimits};
 use active_rpc::Budget;
 
 fn descriptor(id: u8, methods: BTreeSet<String>) -> CapDescriptor {
@@ -57,11 +57,13 @@ fn a_table_encoder_refuses_duplicate_ids_and_an_over_count() {
         encode_capability_table(&[one.clone(), one]).expect_err("the same id twice is not a table");
     assert_eq!(error.code(), "rpc/capability-table", "{error}");
 
-    let limits = WireLimits::default();
-    let mut many = Vec::with_capacity(limits.max_caps as usize + 1);
-    for index in 0..=limits.max_caps {
+    // `MAX_CAP_TABLE + 1` non-zero ids: the count is what the writer must
+    // refuse, not the zero-id rule (round 43, F3).
+    use active_rpc::wire::MAX_CAP_TABLE;
+    let mut many = Vec::with_capacity(MAX_CAP_TABLE + 1);
+    for index in 1..=(MAX_CAP_TABLE + 1) {
         let mut id = [0u8; 16];
-        id[..4].copy_from_slice(&index.to_le_bytes());
+        id[..8].copy_from_slice(&(index as u64).to_le_bytes());
         many.push(CapDescriptor {
             id: CapId(id),
             methods: BTreeSet::from(["echo".to_string()]),
@@ -71,6 +73,63 @@ fn a_table_encoder_refuses_duplicate_ids_and_an_over_count() {
             path_scope: None,
         });
     }
-    let error = encode_capability_table(&many).expect_err("past the descriptor ceiling");
+    let error = encode_capability_table(&many).expect_err("past the table ceiling");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+
+    // The reader honours `max_caps` when the caller supplies it, and the
+    // convenience wrapper accepts what the writer produces.
+    let mut table = Vec::new();
+    for index in 1..=300u64 {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&index.to_le_bytes());
+        table.push(CapDescriptor {
+            id: CapId(id),
+            methods: BTreeSet::from(["echo".to_string()]),
+            budget: Budget::default(),
+            read_only: false,
+            redact: false,
+            path_scope: None,
+        });
+    }
+    let bytes = encode_capability_table(&table).expect("300 descriptors fit the table");
+    assert_eq!(
+        active_rpc::wire::decode_capability_table(&bytes)
+            .expect("the table profile accepts it")
+            .len(),
+        300
+    );
+    let error = active_rpc::wire::decode_capability_table_with(
+        &bytes,
+        &WireLimits {
+            max_caps: 16,
+            ..WireLimits::default()
+        },
+    )
+    .expect_err("a strict caller's ceiling is honoured");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+}
+
+/// A programmatic delta is bounded like an envelope delta: 300 additions applied
+/// locally would never encode (round 36, #2).
+#[test]
+fn a_programmatic_delta_past_the_per_delta_ceiling_is_refused() {
+    let base = vec![descriptor(1, BTreeSet::from(["echo".to_string()]))];
+    let mut added = Vec::new();
+    for index in 0u32..=WireLimits::default().max_caps {
+        let mut id = [0u8; 16];
+        id[..4].copy_from_slice(&(index + 2).to_le_bytes());
+        added.push(CapDescriptor {
+            id: CapId(id),
+            methods: BTreeSet::from(["echo".to_string()]),
+            budget: Budget::default(),
+            read_only: false,
+            redact: false,
+            path_scope: None,
+        });
+    }
+    let delta = CapTableDelta::new(&base, Vec::new(), added).expect("delta");
+    let error = delta
+        .apply_to(&base)
+        .expect_err("past the per-delta ceiling");
     assert_eq!(error.code(), "rpc/capability-table", "{error}");
 }

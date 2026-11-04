@@ -7,6 +7,7 @@
 
 use active_rpc::budget::Budget;
 use active_rpc::cap::CapAttrs;
+use active_rpc::kernel::Provider;
 use active_rpc::value::{Arg, Call, Value};
 use active_rpc::wasm_tool::{
     WasmHostPolicy, WasmLimits, WasmTool, FUEL_PER_MS, MAX_TABLE_ELEMENTS,
@@ -521,4 +522,25 @@ fn a_guest_negative_return_is_not_a_budget_refusal() {
         active_rpc::kernel::Provider::invoke(&mut tool, 0, &call).expect_err("the guest refused");
     assert_eq!(error.code(), "rpc/provider", "{error}");
     assert_eq!(error.provider_code(), Some("wasm/output"), "{error}");
+}
+
+/// A zero grant is refused before the method and the payload are inspected:
+/// a spent capability must not answer either question (round 36, #1).
+#[test]
+fn a_zero_grant_precedes_the_method_and_payload_rules() {
+    let tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
+    let mut tool = tool;
+    let mut call = Call::new("not-run", vec![Arg::Value(Value::Int(1))]);
+    call.payload = vec![1, 2, 3];
+    call.budget.max_wall_ms = 0;
+    assert_eq!(
+        error_code(Provider::invoke(&mut tool, 0, &call)),
+        "rpc/budget-exceeded"
+    );
+    call.budget.max_wall_ms = 1_000;
+    call.budget.max_bytes = 0;
+    assert_eq!(
+        error_code(Provider::invoke(&mut tool, 0, &call)),
+        "rpc/budget-exceeded"
+    );
 }

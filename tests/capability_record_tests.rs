@@ -1009,3 +1009,106 @@ fn a_wall_clock_deadline_does_not_survive_a_switch_to_virtual() {
     };
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 43
+// ---------------------------------------------------------------------------
+
+/// A revocation reaches a record exported from a descendant whose handle was
+/// dropped: the orphan workflow must not defeat the kill switch
+/// (round 43, F1).
+#[test]
+fn a_revocation_tombstones_an_orphaned_descendant_record() {
+    use active_rpc::kernel::Event;
+
+    let (agent, _provider, parent) = durable_agent();
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let child = agent.attenuate(&parent, attrs.clone()).expect("attenuate");
+    let grandchild = agent.attenuate(&child, attrs).expect("attenuate");
+    // One export: an export reserves the grant on the whole chain, so a second
+    // record from the same chain has nothing left to carry.
+    let record = agent
+        .export_capability(&grandchild)
+        .expect("export grandchild");
+    drop(child);
+    drop(grandchild);
+    agent.run();
+
+    agent.revoke(&parent).expect("revoke the subtree");
+
+    assert!(
+        agent.record_is_tombstoned(&record.record_id),
+        "the dropped exporter's record is retired with the subtree"
+    );
+    let error = agent
+        .restore_capability(&record, &admitted(b"durable-owner"))
+        .expect_err("the record is tombstoned");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+    assert!(
+        agent
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::CapRevoked(id) if *id == parent.id())),
+        "the revocation is on the tape"
+    );
+}
+
+/// A reordered record text is not the text this crate writes, so it is
+/// refused even though the parsed value is the same (round 43, F2).
+#[test]
+fn a_record_with_a_reordered_key_is_refused() {
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    let mut value: serde_json::Value = serde_json::from_str(&record.to_json()).expect("json");
+    // Reverse the top-level key order deterministically.
+    let object = value.as_object().expect("object");
+    let mut reversed = serde_json::Map::new();
+    for (key, item) in object.iter().rev() {
+        reversed.insert(key.clone(), item.clone());
+    }
+    value = serde_json::Value::Object(reversed);
+    let text = serde_json::to_string(&value).expect("serialize");
+    let error = CapabilityRecord::from_json(&text).expect_err("reordered keys");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+}
+
+/// A no-op rotation is not reported as a rebind (round 43, F4).
+#[test]
+fn a_rotation_to_the_same_peer_is_not_on_the_tape() {
+    use active_rpc::kernel::Event;
+
+    let (agent, _provider, cap) = durable_agent();
+    agent
+        .reintroduce_to(&cap, &peer(b"durable-owner"), &admitted(b"durable-owner"))
+        .expect("a no-op rotation");
+    assert!(
+        !agent
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::CapRebound { .. })),
+        "no authority moved, so the tape says nothing moved"
+    );
+}
+
+/// Export obeys the clock-domain rule: a deadline minted in the wall clock
+/// cannot leave from a virtual-clock kernel (round 43, F5).
+#[test]
+fn an_export_after_a_clock_switch_is_refused() {
+    let agent = Agent::with_secret([0x71; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x91; 32]);
+    agent.use_wall_clock(true);
+    let provider = agent.register(Box::new(Echo));
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    attrs.ttl_ms = Some(60_000);
+    let cap = agent
+        .mint_bound(&admitted(b"durable-owner"), provider, 0, attrs)
+        .expect("durable cap");
+    agent.use_wall_clock(false);
+    let error = agent
+        .export_capability(&cap)
+        .expect_err("the deadline belongs to the other clock domain");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}

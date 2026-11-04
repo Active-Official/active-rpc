@@ -586,7 +586,7 @@ impl CapabilityRecord {
             Some(Json::String(text)) if text.len() == 64 && text.is_ascii() => Some(text.clone()),
             Some(_) => return Err(Error::persistence("the seal is malformed")),
         };
-        Ok(Self {
+        let record = Self {
             provider: provider.to_string(),
             object,
             methods,
@@ -603,7 +603,17 @@ impl CapabilityRecord {
             lease_ms,
             record_id,
             seal,
-        })
+        };
+        // The text must be the one this crate writes, key order included.
+        // `refuse_non_canonical` re-renders the *parsed* map, and `serde_json`
+        // carries `preserve_order` here, so it echoed the input order: a
+        // reordered text parsed and kept a valid seal (round 43, F2).
+        if record.to_json() != text {
+            return Err(Error::persistence(
+                "record text is not the canonical rendering of its value",
+            ));
+        }
+        Ok(record)
     }
 
     /// The attributes a *restore* mints with.

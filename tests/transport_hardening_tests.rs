@@ -225,17 +225,18 @@ fn refusal_stub(status: u16, body: Vec<u8>) -> (String, std::thread::JoinHandle<
     (address, handle)
 }
 
-/// The peer's refusal class survives the round trip, and an oversized body is
-/// not copied into the error.
+/// A peer cannot choose an authority class: `rpc/identity` in the body is a
+/// provider refusal, and an oversized body is not copied into the error
+/// (round 9, R-09 #7).
 #[test]
-fn the_client_preserves_a_peer_refusal_code() {
+fn the_client_does_not_take_an_authority_class_from_the_peer() {
     let (address, stub) = refusal_stub(400, b"rpc/identity".to_vec());
     let mut client = ConnectClient::connect(&address).expect("client");
     let error = client
         .call(&Envelope::request(1, "ping", vec![]))
         .expect_err("a refusal");
     assert_eq!(error.code(), "rpc/provider");
-    assert_eq!(error.provider_code(), Some("rpc/identity"));
+    assert_eq!(error.provider_code(), Some("rpc/provider"));
     stub.join().expect("stub");
 
     let (address, stub) = refusal_stub(400, vec![b'x'; 1 << 20]);

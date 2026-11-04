@@ -724,10 +724,18 @@ fn resolve_within(
     static LIVE_RESOLVERS: AtomicUsize = AtomicUsize::new(0);
     // An already-spent budget must not spawn anything.
     let left = remaining(deadline)?;
-    let live = LIVE_RESOLVERS.fetch_add(1, Ordering::SeqCst);
-    if live >= MAX_LIVE_RESOLVERS {
-        LIVE_RESOLVERS.fetch_sub(1, Ordering::SeqCst);
-        return Err(Error::Transport("resolver busy".to_string()));
+    // A compare-exchange loop, like the body budgets: increment-then-rollback
+    // refused a caller while two others were merely arriving and leaving
+    // (round 9, R-09 #10).
+    let mut live = LIVE_RESOLVERS.load(Ordering::SeqCst);
+    loop {
+        if live >= MAX_LIVE_RESOLVERS {
+            return Err(Error::Transport("resolver busy".to_string()));
+        }
+        match LIVE_RESOLVERS.compare_exchange(live, live + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(actual) => live = actual,
+        }
     }
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let target = address.to_string();

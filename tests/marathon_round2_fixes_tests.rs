@@ -217,12 +217,20 @@ fn a_record_keeps_the_clock_mode_its_deadline_was_taken_in() {
     let cap = source
         .mint_bound(&owner, provider, 0, attrs)
         .expect("wall-clock cap");
-    source.use_wall_clock(false);
     let record = source.export_capability(&cap).expect("export");
     assert!(
         record.wall_clock,
-        "the export stamped the current mode instead of the deadline's"
+        "the record carries the mode the deadline was taken in"
     );
+
+    // A switch between the mint and the export is refused: the deadline lives
+    // in the other domain and the operator re-exports from the target one
+    // (round 43, F5).
+    source.use_wall_clock(false);
+    let error = source
+        .export_capability(&cap)
+        .expect_err("the deadline belongs to the wall clock");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
 
     let virtual_kernel = Agent::with_secret([0x43; 32]);
     virtual_kernel.set_durable_capabilities(true);

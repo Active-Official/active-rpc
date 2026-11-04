@@ -572,6 +572,20 @@ impl Provider for WasmTool {
         // log) exists, so the previous call's bytes would be attributed to this
         // one. The kernel-facing path is the one an operator reads.
         self.log.clear();
+        // Budget refusals come before any policy or argument rule, as in the
+        // other adapters: a zero wall or byte grant does no work, and a method
+        // or a payload must not be an oracle past an exhausted grant
+        // (round 26, #5; round 28, #4; round 36, #1).
+        let granted = call.budget.max_wall_ms.saturating_mul(FUEL_PER_MS);
+        let fuel = self.limits.fuel.min(granted);
+        if fuel == 0 {
+            return Err(Error::BudgetExceeded("wall"));
+        }
+        if call.budget.max_bytes == 0 {
+            // An empty answer still costs a run; a zero-byte grant does no
+            // work (round 22, F-B).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         if call.method != "run" {
             return Err(Error::MethodNotGranted {
                 method: call.method.clone(),
@@ -584,20 +598,6 @@ impl Provider for WasmTool {
             return Err(Error::InvalidArgument(
                 "the wasm adapter reads its input from a single argument, not a payload",
             ));
-        }
-        // Budget refusals come before any policy or argument rule, as in the
-        // other adapters: a zero wall or byte grant does no work, and a scope
-        // or a malformed argument must not mask it (round 26, #5; round 28,
-        // #4 put this above the policy checks).
-        let granted = call.budget.max_wall_ms.saturating_mul(FUEL_PER_MS);
-        let fuel = self.limits.fuel.min(granted);
-        if fuel == 0 {
-            return Err(Error::BudgetExceeded("wall"));
-        }
-        if call.budget.max_bytes == 0 {
-            // An empty answer still costs a run; a zero-byte grant does no
-            // work (round 22, F-B).
-            return Err(Error::BudgetExceeded("byte"));
         }
         if call.path_scope.is_some() {
             // The input is bytes and the kernel inspects only `Value::Path`: a
