@@ -482,6 +482,12 @@ pub struct Kernel {
     /// every capability to answer that was quadratic: dropping 20k capabilities
     /// took 1.33 s in a release build.
     object_records: BTreeMap<(ProviderId, u64), usize>,
+    /// Objects held alive by an exported, not-yet-restored durable record.
+    ///
+    /// A record names its object, so the provider must not reclaim it while the
+    /// record is restorable. Kept apart from `object_records`, which mirrors the
+    /// live capability registry exactly (round 32, #3).
+    record_pins: BTreeMap<(ProviderId, u64), usize>,
     /// Reference operations that arrived while the kernel was borrowed.
     ///
     /// Shared with the handle control, which cannot borrow the kernel from a
@@ -848,6 +854,7 @@ impl Agent {
             record_id_ceiling: MAX_RECORD_IDS,
             children: BTreeMap::new(),
             object_records: BTreeMap::new(),
+            record_pins: BTreeMap::new(),
             deferred_refops: Rc::clone(&deferred_refops),
         };
         let cell: KernelCell = Rc::new(RefCell::new(kernel));
@@ -1163,6 +1170,11 @@ impl Agent {
                 .check_reserve(remaining_calls, remaining_bytes)
                 .map_err(|_| Error::persistence("the grant is already committed"))?;
         }
+        // A restorable record pins its object: dropping the last handle before
+        // the restore must not let the provider reclaim state the record names,
+        // or the restore would mint authority over a dead object (round 32,
+        // #3). The pin is released when the record is restored.
+        let pinned = (record.provider, record.object);
         let mut record = crate::persistence::CapabilityRecord {
             provider: provider_name,
             object: record.object,
@@ -1202,6 +1214,7 @@ impl Agent {
                 .map_err(|_| Error::persistence("the grant is already committed"))?;
         }
         kernel.consumed_records.insert(record.record_id);
+        *kernel.record_pins.entry(pinned).or_insert(0) += 1;
         kernel.push_event(Event::CapExported(cap.id()));
         Ok(record)
     }
@@ -1371,6 +1384,19 @@ impl Agent {
             .borrow_mut()
             .restored_records
             .insert(record.record_id);
+        // The record is spent and the restored capability now holds the object:
+        // release the pin export took (round 32, #3). A failed mint above left
+        // the pin in place, which is the fail-closed side.
+        {
+            let mut kernel = self.cell.borrow_mut();
+            let key = (provider, record.object);
+            if let Some(count) = kernel.record_pins.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    kernel.record_pins.remove(&key);
+                }
+            }
+        }
         // Keep the record identity: a revocation that reaches this capability
         // must tombstone the same record id the credential carries.
         if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {
@@ -4240,7 +4266,6 @@ impl Agent {
         depths
     }
 
-    /// Channel statistics.
     /// Statistics for one channel, with no queue and no messages.
     ///
     /// This used to return a clone of the channel, which owns its queue and can
@@ -4850,22 +4875,26 @@ impl Agent {
                 Err(error) => Err(error),
             };
 
-            // A mutating provider that ran already applied its effect. A
-            // post-provider budget or lane refusal is then a withheld reply,
-            // not a call that did not happen: a retryable budget class would
+            // A mutating provider that ran already applied its effect. Any
+            // refusal the kernel decides after a successful `invoke` (a shape
+            // ceiling, the redaction policy, the egress charge) is a withheld
+            // reply, not a call that did not happen: a retryable class would
             // invite a second, non-idempotent write, and a `Refused` receipt
-            // would deny an effect that landed (round 31, F1).
+            // would deny an effect that landed (round 31, F1; round 32, #2
+            // decides it by provenance rather than by error class).
             let mut effect_withheld = false;
-            let outcome = match outcome {
-                Err(Error::BudgetExceeded(_)) | Err(Error::UnknownLane(_))
-                    if provider_succeeded && mutating =>
-                {
-                    effect_withheld = true;
-                    Err(Error::Provider {
-                        code: "provider/reply-withheld".to_string(),
-                    })
+            let outcome = if provider_succeeded && mutating {
+                match outcome {
+                    Err(_) => {
+                        effect_withheld = true;
+                        Err(Error::Provider {
+                            code: "provider/reply-withheld".to_string(),
+                        })
+                    }
+                    Ok(value) => Ok(value),
                 }
-                other => other,
+            } else {
+                outcome
             };
 
             // The decision is final here: dispatch's re-checks, provider code
@@ -4922,7 +4951,15 @@ impl Agent {
                     if settled_now {
                         kernel.push_event(Event::PromiseRejected {
                             promise: job.promise,
-                            code: error.code().to_string(),
+                            // A withheld reply is kernel-authored, so its code
+                            // is the tape's own: otherwise a landed write is
+                            // visible only as a generic provider failure
+                            // (round 32, #5).
+                            code: if effect_withheld {
+                                "provider/reply-withheld".to_string()
+                            } else {
+                                error.code().to_string()
+                            },
                         });
                         kernel.metrics.promises_rejected =
                             kernel.metrics.promises_rejected.saturating_add(1);
@@ -5137,6 +5174,9 @@ impl Kernel {
             if !kernel
                 .object_records
                 .contains_key(&(record.provider, record.object))
+                && !kernel
+                    .record_pins
+                    .contains_key(&(record.provider, record.object))
             {
                 kernel.queue_provider_drop(record.provider, record.object, id);
             }

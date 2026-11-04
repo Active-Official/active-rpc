@@ -60,6 +60,13 @@ pub const METHODS: &[&str] = &[
 struct ModuleSlot {
     module: InfinityModule,
     hash: Option<[u8; 32]>,
+    /// Cached hash of the redacted projection.
+    ///
+    /// A secret-bearing module is hashed in redacted form on every
+    /// `content_hash` call; the projection clones, re-encodes and re-hashes the
+    /// whole arena, so the answer is cached and invalidated by a patch
+    /// (round 32, #8).
+    redacted_hash: Option<[u8; 32]>,
     /// The secret literals the module held when it was installed.
     ///
     /// A patch can remove the last secret node, and the redactor rebuilt from
@@ -125,6 +132,7 @@ impl ModuleProvider {
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
+            redacted_hash: None,
             redactor,
         }))
     }
@@ -146,6 +154,7 @@ impl ModuleProvider {
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
+            redacted_hash: None,
             redactor,
         }))
     }
@@ -353,13 +362,11 @@ impl ModuleProvider {
                     call.path_scope.as_deref(),
                     call.redact,
                 );
+                let answer = redact_answer(&slot.module, node, labels, call.redact);
+                // The redaction walk is the caller's work too: the ceiling is
+                // checked after the answer is built (round 32, #7).
                 check_wall_budget(started, call)?;
-                Ok(Response::Labels(redact_answer(
-                    &slot.module,
-                    node,
-                    labels,
-                    call.redact,
-                )))
+                Ok(Response::Labels(answer))
             }
             "impact" => {
                 check_node_budget(&slot.module, call)?;
@@ -381,13 +388,11 @@ impl ModuleProvider {
                     call.path_scope.as_deref(),
                     call.redact,
                 );
+                let answer = redact_answer(&slot.module, node, labels, call.redact);
+                // As in `dependencies`: after the redaction walk
+                // (round 32, #7).
                 check_wall_budget(started, call)?;
-                Ok(Response::Labels(redact_answer(
-                    &slot.module,
-                    node,
-                    labels,
-                    call.redact,
-                )))
+                Ok(Response::Labels(answer))
             }
             "subgraph" => {
                 check_node_budget(&slot.module, call)?;
@@ -494,6 +499,25 @@ impl ModuleProvider {
                             _ => None,
                         })
                         .ok_or(Error::InvalidArgument("patch needs a literal value"))?;
+                    if call.redact
+                        && !slot.redactor.is_empty()
+                        && matches!(replacement, Inode::Str(_))
+                    {
+                        // The reply carries the caller's own replacement
+                        // redacted through the install-time secret set: a
+                        // candidate containing the secret comes back as the
+                        // placeholder and one that does not comes back
+                        // verbatim, so the reply is an equality oracle over
+                        // secrets (round 32, #1). A redacting writer is the
+                        // caller that must not learn the secret, so its text
+                        // replacements are refused uniformly; non-text
+                        // literals cannot carry the secret, and a
+                        // non-redacting capability is already authorized to
+                        // the secret-bearing image.
+                        return Err(Error::InvalidArgument(
+                            "a redacting capability cannot write text into a secret-bearing module",
+                        ));
+                    }
                     let mut patched = module.clone();
                     *patched
                         .node_mut(node)
@@ -592,6 +616,9 @@ impl ModuleProvider {
                     .map_err(|error| Error::Payload(error.code().to_string()))?;
                 slot.module = decoded;
                 slot.hash = Some(hash);
+                // The reply changed, and the redacted projection is derived
+                // from it (round 32, #8).
+                slot.redacted_hash = None;
                 Ok(Response::Module(bytes))
             }
             "dependents" => {
@@ -619,13 +646,10 @@ impl ModuleProvider {
                 }
                 let labels =
                     scoped_labels(&slot.module, ids, call.path_scope.as_deref(), call.redact);
+                let answer = redact_answer(&slot.module, node, labels, call.redact);
+                // After the redaction walk (round 32, #7).
                 check_wall_budget(started, call)?;
-                Ok(Response::Labels(redact_answer(
-                    &slot.module,
-                    node,
-                    labels,
-                    call.redact,
-                )))
+                Ok(Response::Labels(answer))
             }
             "dependencies" => {
                 check_node_budget(&slot.module, call)?;
@@ -650,13 +674,10 @@ impl ModuleProvider {
                 }
                 let labels =
                     scoped_labels(&slot.module, ids, call.path_scope.as_deref(), call.redact);
+                let answer = redact_answer(&slot.module, node, labels, call.redact);
+                // After the redaction walk (round 32, #7).
                 check_wall_budget(started, call)?;
-                Ok(Response::Labels(redact_answer(
-                    &slot.module,
-                    node,
-                    labels,
-                    call.redact,
-                )))
+                Ok(Response::Labels(answer))
             }
             "content_hash" => {
                 check_node_budget(&slot.module, call)?;
@@ -702,13 +723,21 @@ impl ModuleProvider {
                     // Redact in memory with the install-time handle: deriving
                     // the literal set from the stored image made the "redacted"
                     // hash equal the raw one once a patch removed the last
-                    // secret node (round 28, critical).
-                    let mut redacted = slot.module.clone();
-                    crate::security::redact_derived(&mut redacted, &slot.redactor)?;
-                    let redacted_bytes = encode(&redacted)
-                        .map_err(|error| Error::Payload(error.code().to_string()))?;
-                    let redacted_hash = active_infinity::content_hash(&redacted_bytes)
-                        .map_err(|error| Error::Payload(error.code().to_string()))?;
+                    // secret node (round 28, critical). The result is cached: a
+                    // patch invalidates it (round 32, #8).
+                    let redacted_hash = match slot.redacted_hash {
+                        Some(hash) => hash,
+                        None => {
+                            let mut redacted = slot.module.clone();
+                            crate::security::redact_derived(&mut redacted, &slot.redactor)?;
+                            let redacted_bytes = encode(&redacted)
+                                .map_err(|error| Error::Payload(error.code().to_string()))?;
+                            let hash = active_infinity::content_hash(&redacted_bytes)
+                                .map_err(|error| Error::Payload(error.code().to_string()))?;
+                            slot.redacted_hash = Some(hash);
+                            hash
+                        }
+                    };
                     check_wall_budget(started, call)?;
                     return Ok(Response::Value(Value::Text(format!(
                         "blake3:{}",
@@ -1566,7 +1595,12 @@ fn tainted_labels(module: &InfinityModule) -> BTreeSet<String> {
 fn redacted_module_bytes(module: &InfinityModule) -> Result<Vec<u8>> {
     // One implementation, shared with the security helpers: a second copy of
     // the redactor would drift, and the one that drifted would be the leak.
-    let bytes = encode(module).map_err(|error| Error::Payload(error.code().to_string()))?;
+    // An encode fault here is the provider's own reply, not the caller's
+    // payload: blaming `rpc/payload` misreported a redaction collision as bad
+    // input (round 32, #9).
+    let bytes = encode(module).map_err(|_| Error::Provider {
+        code: "provider/redaction".to_string(),
+    })?;
     security::redact_module(&bytes)
 }
 

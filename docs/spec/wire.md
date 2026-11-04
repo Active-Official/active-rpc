@@ -205,6 +205,7 @@ namespace. The kernel itself reports two:
 |------|-----------|
 | `provider/reply-withheld` | a mutating provider ran and applied its effect, but the reply could not be delivered (a post-provider budget or lane refusal); the effect stands and the receipt records the admission, so this is not a retryable budget class |
 | `provider/secret-material` | a provider reply would have carried structural secret material and the redaction policy refused it |
+| `provider/redaction` | the provider could not build its redacted projection (an encode fault in its own reply) |
 
 The domain provider reports `rpc/domain` with the Active class where the
 evaluator failed, and `rpc/budget-exceeded` with the dimension it measured

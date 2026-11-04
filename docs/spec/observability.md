@@ -58,6 +58,8 @@ authority.
 | `cap.expired` | `cap` | a capability's TTL elapsed and it was refused like a revocation |
 | `cap.exported` | `cap` | a durable capability was exported as a sealed record |
 | `cap.restored` | `cap` | a sealed durable record was restored as a live capability (paired with `cap.minted`) |
+| `cap.record-orphaned` | `cap` | the last handle of an exported durable capability was dropped: the record is still restorable, and its object stays pinned until the record is restored |
+| `cap.rebound` | `cap`, `identity` | a capability was rebound from one authenticated peer to another (`from->to` fingerprints) |
 | `cap.introduced` | `cap`, `identity` | a capability was bound to an authenticated peer |
 | `cap.transferred` | `cap`, `channel` | a capability travelled on a channel |
 | `lane.created` | `lane` | a lane was created |

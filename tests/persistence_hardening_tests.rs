@@ -19,7 +19,15 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     let agent = Agent::with_secret([0x61; 32]);
     agent.set_record_seal_key([0x62; 32]);
     agent.set_durable_capabilities(true);
-    let provider = agent.register(Box::new(active_rpc::domain::ModuleProvider::new()));
+    // A record names a real object: restore refuses one whose object the
+    // provider no longer holds (round 32, #3). The module is installed first,
+    // so it takes object id 0.
+    let mut provider = active_rpc::domain::ModuleProvider::new();
+    let mut module = active_infinity::InfinityModule::new();
+    let root = module.push(active_infinity::Inode::Str("app".to_string()));
+    module.set_root(Some(root));
+    provider.install(module).expect("install");
+    let provider = agent.register(Box::new(provider));
     (agent, provider)
 }
 

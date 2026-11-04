@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-31: round 31 found 1 medium and 4 lows, all fixed; round 32 must be clean | 182 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-32: round 32 found 1 high, 4 mediums and 5 lows, all fixed; rounds 33-34 must be clean | 192 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-25: round 25 found 1 high, 4 mediums and 2 lows, all fixed; rounds 26-27 must be clean | 203 fixed / 1 rejected / 0 open (2 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,30 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 32)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `8d6f25f`.
+All five round-31 fixes verified. One **high**, four mediums, five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `patch` echoed the caller's own text through the install-time redactor, so a redacting writer could probe `patch` with a candidate and read from the reply whether it contains the secret | **fixed**: a redacting capability's text replacement on a secret-bearing module is refused uniformly (`rpc/invalid-argument`), so both candidates answer the same; non-text literals stay allowed, and a non-redacting capability (which is authorized to the secret-bearing image and is how a secret is declassified) is unaffected. `a_patch_reply_does_not_reveal_the_installed_secret` |
+| 2 | medium | the withheld-reply class was keyed on the error class, so a post-provider `provider/secret-material` or a contained redaction panic still sealed `Refused` after a write landed | **fixed**: any kernel refusal after a successful `invoke` of a mutating method is `provider/reply-withheld` with an `Admitted` receipt; `a_mutating_reply_with_a_structural_secret_is_a_withheld_reply` |
+| 3 | medium | an exported record did not pin its object: dropping the last handle reclaimed the module, and a restore minted a grant over a dead object | **fixed**: a `record_pins` count keeps the object alive while the record is restorable (kept apart from the registry index), the pin is released on restore, and `Provider::on_drop` does not fire while it is held; `an_exported_record_keeps_its_object_alive` |
+| 4 | medium | `cap.rebound` and `cap.record-orphaned` were emitted but absent from `EVENT_NAMES`, the spec and the fixture, so the closed-schema gate passed by omitting them | **fixed**: both names are in the schema, the doc table and `every_event` |
+| 5 | low | a withheld write showed only as a generic `rpc/provider` on the tape | **fixed**: `promise.rejected` carries `provider/reply-withheld`, which is kernel-authored |
+| 6 | low | `call.queued` carries `method`/`args_bytes` that the projection drops | **recorded**: the fields stay for in-process consumers; the schema has no slot for them |
+| 7 | low | `check_wall_budget` ran before `redact_answer`, so the last taint/label pass was unpaid | **fixed**: the ceiling is checked after the answer is built in the four label arms |
+| 8 | low | `content_hash` cloned, re-encoded and re-hashed a secret-bearing module on every call | **fixed**: the redacted hash is cached on the slot and invalidated by a patch |
+| 9 | low | a provider-side encode fault in a redacted reply surfaced as `rpc/payload`, blaming the caller | **fixed**: `provider/redaction`, documented in `wire.md` |
+| 10 | low | an orphaned `/// Channel statistics.` line sat above `Agent::channel` | **fixed** |
+
+Also corrected in this round: the `security.md` row still said `taskkill /T`
+ends the Windows tree, which ARPC-004 replaced.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-04 (round 31)
 

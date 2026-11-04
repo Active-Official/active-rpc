@@ -1353,3 +1353,106 @@ fn a_mutating_patch_refused_on_egress_reports_the_write() {
     let after = call(&agent, &cap, lane, "content_hash", Vec::new());
     assert_ne!(before, after, "the patch did not change the module");
 }
+
+/// A text replacement on a secret-bearing module is refused uniformly: the
+/// reply is the caller's own literal through the install-time redactor, so a
+/// candidate that contains the secret would echo the placeholder and one that
+/// does not would echo the text (round 32, #1).
+#[test]
+fn a_patch_reply_does_not_reveal_the_installed_secret() {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    let app = module.push(Inode::Table {
+        fields: vec![("c".to_string(), secret)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x74; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["patch"]);
+    attrs.redact = true;
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("r10-oracle", Budget::default())
+        .expect("lane");
+
+    for candidate in [CANARY, "not-the-secret"] {
+        let promise = agent
+            .call(
+                lane,
+                &cap,
+                "patch",
+                vec![path("app.c"), Arg::text(candidate)],
+            )
+            .expect("queued");
+        agent.run();
+        let error = promise
+            .value()
+            .expect_err("a text replacement on a secret-bearing module is refused");
+        assert_eq!(
+            error.code(),
+            "rpc/invalid-argument",
+            "{candidate:?}: {error}"
+        );
+    }
+}
+
+/// Any kernel refusal after a mutating provider succeeded is a withheld reply,
+/// whatever its class: the effect landed and the receipt records it
+/// (round 32, #2).
+#[test]
+fn a_mutating_reply_with_a_structural_secret_is_a_withheld_reply() {
+    use active_rpc::receipts::Decision;
+    use active_rpc::value::Response;
+
+    struct SecretWriter {
+        image: Vec<u8>,
+    }
+
+    impl active_rpc::kernel::Provider for SecretWriter {
+        fn name(&self) -> &'static str {
+            "secret-writer"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["write".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            true
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Ok(Response::Module(self.image.clone()))
+        }
+    }
+
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(CANARY.into()));
+    module.set_root(Some(secret));
+    let image = active_infinity::encode(&module).expect("encode");
+
+    let agent = Agent::with_secret([0x75; 32]);
+    agent.enable_receipts(true);
+    let id = agent.register(Box::new(SecretWriter { image }));
+    let cap = agent.mint(id, 0, CapAttrs::new(&["write"])).expect("cap");
+    let lane = agent
+        .create_lane("r10-withheld", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "write", Vec::new()).expect("queued");
+    agent.run();
+    let error = promise.value().expect_err("the reply carries a secret");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
+    let receipts = agent.receipts();
+    assert_eq!(receipts.len(), 1, "one receipt per job");
+    match &receipts[0].decision {
+        Decision::Admitted => {}
+        other => panic!("the write was receipted as {other:?}"),
+    }
+}

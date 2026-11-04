@@ -34,6 +34,8 @@ pub const EVENT_NAMES: &[&str] = &[
     "cap.expired",
     "cap.exported",
     "cap.restored",
+    "cap.record-orphaned",
+    "cap.rebound",
     "cap.introduced",
     "cap.transferred",
     "lane.created",

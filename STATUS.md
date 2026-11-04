@@ -81,8 +81,10 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
    still kills the whole process group.
 10. **Dropping the last handle of an exported durable capability does not
     tombstone its record.** The sealed record stays restorable by design (an
-    operator may export for later restore); `Event::CapRecordOrphaned` reports
-    the window, and a deployment that treats drop as revocation must tombstone.
+    operator may export for later restore) and the record now pins its object,
+    so the provider keeps the module until the record is restored;
+    `Event::CapRecordOrphaned` reports the window, and a deployment that treats
+    drop as revocation must tombstone.
 11. **A durable record names a provider-local object id.** Restoring after a
     provider rebuild can bind the record to a different logical object. The fix
     needs a record-format version plus a provider epoch/stable-key callback

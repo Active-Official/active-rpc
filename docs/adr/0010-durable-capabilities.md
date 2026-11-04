@@ -84,6 +84,13 @@ resurrection:
   deployment-wide, so a second kernel (or a restart) would otherwise restore the
   same record again and mint a fresh grant for the full recorded budget.
 
+  An exported record **pins its object**: the provider does not see `on_drop`
+  while the record is restorable, so dropping the last handle does not reclaim
+  the state the record names (round 32, #3). Restoring releases the pin, and
+  the restored capability then holds the object in the usual way; a record that
+  is never restored keeps the object alive for the kernel's lifetime, which is
+  bounded by `MAX_RECORD_IDS`.
+
   `Agent::restore_capability_with(record, peer, Some(&mut store))` takes a
   [`crate::persistence::RecordStore`]: the deployment keeps the restored ids next
   to its kill list, and a record is single-use across processes. The store is

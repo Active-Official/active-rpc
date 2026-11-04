@@ -394,3 +394,48 @@ fn an_expired_export_is_an_expiry_event() {
         "the export refusal is not an expiry event: {json}"
     );
 }
+
+/// An exported record pins its object: dropping the last handle must not let
+/// the provider reclaim the module the record names, or a later restore would
+/// mint authority over a dead object (round 32, #3).
+#[test]
+fn an_exported_record_keeps_its_object_alive() {
+    use active_infinity::{InfinityModule, Inode};
+    use active_rpc::domain::ModuleProvider;
+
+    let mut module = InfinityModule::new();
+    let root = module.push(Inode::Str("app".to_string()));
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module).expect("install");
+    let agent = Agent::with_secret([0x71; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x93; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["stats"]);
+    attrs.persistence = CapPersistence::Durable;
+    let owner = admitted(b"durable-owner");
+    let cap = agent
+        .mint_bound(&owner, id, object, attrs)
+        .expect("durable cap");
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+    // The provider would remove the module here without the record's pin.
+    let drops = agent.take_drops(id);
+    assert!(
+        drops.is_empty(),
+        "the pinned object was reclaimed: {drops:?}"
+    );
+
+    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let lane = agent
+        .create_lane("restored", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(Some(owner.identity()), lane, &restored, "stats", Vec::new())
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("the restored capability works");
+    assert!(matches!(value, Value::Map(_)), "{value:?}");
+}
