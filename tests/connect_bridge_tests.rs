@@ -551,6 +551,64 @@ fn an_ambiguous_head_is_refused() {
     }
 }
 
+/// The two bridges agree on the status for a wrong method: 405
+/// (round 26, #8).
+#[test]
+fn a_get_is_405_on_the_bridge() {
+    use std::io::{Read, Write};
+
+    let server = BridgeServer::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+        stream
+            .write_all(
+                b"GET /active.rpc.v1.Agent/Call HTTP/1.1\r\nhost: active-rpc\r\ncontent-length: 0\r\n\r\n",
+            )
+            .expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    });
+    let mut served = 0;
+    server
+        .serve(1, |envelope| {
+            served += 1;
+            Envelope::error(envelope.request_id, &Error::Transport("x".to_string()))
+        })
+        .expect("serve");
+    let response = client.join().expect("client");
+    assert!(
+        response.starts_with("HTTP/1.1 405 Method Not Allowed"),
+        "{response:?}"
+    );
+    assert_eq!(served, 0);
+}
+
+/// A response field the server would refuse is refused by the client too
+/// (round 26, #3).
+#[test]
+fn a_malformed_response_head_line_is_a_wire_fault() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut scratch = [0u8; 4096];
+        let _ = stream.read(&mut scratch);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nbogus line without a colon\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .expect("write");
+    });
+    let mut client = ConnectClient::connect(&address).expect("connect");
+    let error = client
+        .call(&request(30, "echo", Vec::new()))
+        .expect_err("a malformed field");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+    server.join().expect("server");
+}
+
 /// A truncated body is one bad connection: the bridge answers 400 and keeps
 /// accepting. Before this, the read error aborted `serve`, so one hostile
 /// connection could refuse service to every later caller.

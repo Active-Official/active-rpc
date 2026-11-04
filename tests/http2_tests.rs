@@ -153,6 +153,46 @@ fn a_silent_h2_server_fails_the_call_within_the_deadline() {
     hold.join().ok();
 }
 
+/// A query string names a different target than the service path, as the
+/// HTTP/1.1 bridge already treats it (round 26, #2).
+#[test]
+fn http2_rejects_a_query_string_on_the_service_path() {
+    let server = Http2Server::bind_loopback().expect("bind");
+    let address = server.address().to_string();
+    let serve = std::thread::spawn(move || server.serve(1, handler));
+    let mut client = Http2Client::connect(&address).expect("connect");
+    let body = sample_envelope(6).encode().expect("encode");
+    let (status, body) = client
+        .request_raw(&format!("{PATH}?x=1"), CONTENT_TYPE, &body)
+        .expect("query");
+    assert_eq!(status.as_u16(), 404);
+    assert_eq!(body, b"rpc/wire");
+    drop(client);
+    serve.join().expect("join").expect("serve");
+}
+
+/// A request body past the ceiling is refused before it is written
+/// (round 26, #4).
+#[test]
+fn http2_refuses_an_oversized_request_before_sending() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let hold = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        drop(stream);
+    });
+    let mut client = Http2Client::connect(&address)
+        .expect("connect")
+        .with_limits(WireLimits::strict());
+    let body = vec![0u8; 2 << 20];
+    let error = client
+        .request_raw(PATH, CONTENT_TYPE, &body)
+        .expect_err("over the ceiling");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+    hold.join().ok();
+}
+
 #[test]
 fn http2_enforces_wire_limits_from_the_server_side() {
     let server = Http2Server::bind_loopback()

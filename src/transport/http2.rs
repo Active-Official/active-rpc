@@ -359,7 +359,9 @@ where
     if request.method() != Method::POST {
         return respond_status(&mut respond, StatusCode::METHOD_NOT_ALLOWED, b"rpc/wire");
     }
-    if request.uri().path() != PATH {
+    if request.uri().path() != PATH || request.uri().query().is_some() {
+        // The HTTP/1.1 bridge compares the full target, so `PATH?x` is a 404
+        // there; name the same resource on both (round 26, #2).
         return respond_status(&mut respond, StatusCode::NOT_FOUND, b"rpc/wire");
     }
     let media_type = request
@@ -477,6 +479,11 @@ where
             );
         }
     };
+    if encoded.len() > MAX_BODY {
+        // The bridge answers 413 past `MAX_BODY`; the HTTP/2 server streamed
+        // whatever the kernel produced (round 26, #5).
+        return respond_status(&mut respond, StatusCode::PAYLOAD_TOO_LARGE, b"rpc/wire");
+    }
     respond_body(respond, encoded, connection_deadline).await
 }
 
@@ -715,7 +722,9 @@ impl Http2Client {
     pub fn call_many(&mut self, envelopes: &[Envelope]) -> Result<Vec<Envelope>> {
         let mut payloads = Vec::with_capacity(envelopes.len());
         for envelope in envelopes {
-            payloads.push(envelope.encode()?);
+            let payload = envelope.encode()?;
+            self.check_body(&payload)?;
+            payloads.push(payload);
         }
         let sender = self.sender.clone();
         let limits = self.limits;
@@ -795,6 +804,14 @@ impl Http2Client {
         self.request(path, content_type, &[], body)
     }
 
+    /// Refuse a body the server can only answer with 413.
+    fn check_body(&self, body: &[u8]) -> Result<()> {
+        if body.len() > MAX_BODY.min(self.limits.max_bytes) {
+            return Err(Error::Wire("request exceeds the ceiling"));
+        }
+        Ok(())
+    }
+
     /// Send a request with extra header fields (for header-budget tests).
     ///
     /// A refusal from the server's header budget arrives either as a `431`
@@ -817,6 +834,7 @@ impl Http2Client {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<(StatusCode, Vec<u8>)> {
+        self.check_body(body)?;
         let mut sender = self.sender.clone();
         let mut builder = Request::builder()
             .method(Method::POST)

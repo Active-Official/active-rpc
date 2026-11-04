@@ -365,7 +365,11 @@ pub trait McpTransport {
     }
 }
 
-/// Largest JSON tree either adapter will decode from one answer.
+/// Largest JSON tree the HTTP adapter will decode from one answer.
+///
+/// An MCP answer is bounded by [`MAX_MCP_LINE_BYTES`] instead (a 1 MiB line
+/// holds far fewer nodes), so this ceiling is not applied there
+/// (round 19, L5).
 const MAX_JSON_NODES: usize = 1 << 20;
 
 /// Largest child output this adapter will buffer.
@@ -917,6 +921,13 @@ impl McpTransport for StdioTransport {
         // The session checks the ceiling before calling in; repeating it here
         // made a spent deadline look like a frame that may have left, which
         // poisons a session that was never touched (round 13, F-5).
+        // A frame handed over after the deadline is written anyway, which is
+        // the desync the round-5 fix existed to prevent (round 19, L1).
+        if let Some(deadline) = deadline {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
+        }
         let (reply, outcome) = std::sync::mpsc::channel();
         // A blocking `send` on the capacity-1 queue has no ceiling: a writer
         // stuck in `write_all` leaves the queue full and the next send waits
@@ -1062,17 +1073,19 @@ impl<T: McpTransport> McpSession<T> {
                 "clientInfo": { "name": "active-rpc", "version": env!("CARGO_PKG_VERSION") }
             }),
             deadline,
+            MAX_MCP_LINE_BYTES,
         )?;
         if initialize.get("error").is_some() {
             return Err(Error::Provider {
                 code: "mcp/initialize".to_string(),
             });
         }
-        let list = session.request_within("tools/list", json!({}), deadline)?;
+        let list = session.request_within("tools/list", json!({}), deadline, MAX_MCP_LINE_BYTES)?;
         if let Some(error) = list.get("error") {
-            // `initialize` already keeps the server's code; a failed list was
-            // reported as a missing array and the code was lost
-            // (round 18, L-4).
+            // A failed list was reported as a missing array and the server's
+            // code was lost. `initialize` keeps its own class
+            // (`mcp/initialize`), so this is the one handshake step that
+            // carries the numeric code (round 18, L-4).
             let Some(code) = error.get("code").and_then(Json::as_i64) else {
                 return Err(Error::Provider {
                     code: "mcp/bad-response".to_string(),
@@ -1148,6 +1161,7 @@ impl<T: McpTransport> McpSession<T> {
         method: &str,
         params: Json,
         deadline: Option<std::time::Instant>,
+        max_line: usize,
     ) -> Result<Json> {
         if self.poisoned {
             return Err(Error::Provider {
@@ -1216,6 +1230,12 @@ impl<T: McpTransport> McpSession<T> {
                 return Err(Error::Provider {
                     code: "mcp/line-too-long".to_string(),
                 });
+            }
+            if line.len() > max_line {
+                // The capability's byte grant bounds what this call may buffer,
+                // not only what it may return (round 19, M2). The line was
+                // consumed, so the session stays in step.
+                return Err(Error::BudgetExceeded("byte"));
             }
             let response: Json = match serde_json::from_str(&line) {
                 // A number the decoder rounded or an overflowing float is not
@@ -1364,9 +1384,11 @@ impl<T: McpTransport> Provider for McpSession<T> {
                 "this adapter cannot enforce a path scope",
             ));
         }
+        let index =
+            usize::try_from(object).map_err(|_| Error::InvalidArgument("unknown MCP tool"))?;
         let tool = self
             .tools
-            .get(object as usize)
+            .get(index)
             .ok_or(Error::InvalidArgument("unknown MCP tool"))?;
         if tool.name != call.method {
             return Err(Error::MethodNotGranted {
@@ -1407,10 +1429,12 @@ impl<T: McpTransport> Provider for McpSession<T> {
         let deadline = std::time::Instant::now()
             .checked_add(ceiling)
             .unwrap_or_else(std::time::Instant::now);
+        let max_line = (call.budget.max_bytes as usize).min(MAX_MCP_LINE_BYTES);
         let response = self.request_within(
             "tools/call",
             json!({ "name": tool.name, "arguments": Json::Object(arguments) }),
             Some(deadline),
+            max_line,
         )?;
         if let Some(error) = response.get("error") {
             let Some(code) = error.get("code").and_then(Json::as_i64) else {
@@ -1491,6 +1515,7 @@ impl HttpTool {
         path: &str,
         body: Option<&[u8]>,
         ceiling_ms: u64,
+        max_body: usize,
     ) -> Result<(u16, Vec<u8>)> {
         let base = self
             .base
@@ -1699,7 +1724,7 @@ impl HttpTool {
                 // The peer names this length; a caller-set `max_body` past a
                 // sane ceiling would turn it into an allocation abort
                 // (round 11, #14).
-                if length > MAX_RESPONSE_BYTES || length > self.max_body {
+                if length > MAX_RESPONSE_BYTES || length > max_body {
                     // The same code as the read-to-end arm: a peer must not
                     // choose the code by choosing a framing (round 12, F-5).
                     return Err(Error::Provider {
@@ -1711,7 +1736,7 @@ impl HttpTool {
             None => {
                 // `body_rest` already enforces `min(max_body, MAX_RESPONSE_BYTES)`
                 // and answers `http/body-too-large` (round 13, F-4).
-                reader.body_rest(self.max_body.min(MAX_RESPONSE_BYTES))?
+                reader.body_rest(max_body.min(MAX_RESPONSE_BYTES))?
             }
         };
         Ok((status, body))
@@ -1915,8 +1940,17 @@ impl Provider for HttpTool {
         } else {
             None
         };
-        let (status, response) =
-            self.perform(&method, &path, body.as_deref(), call.budget.max_wall_ms)?;
+        let cap = self
+            .max_body
+            .min(MAX_RESPONSE_BYTES)
+            .min(call.budget.max_bytes as usize);
+        let (status, response) = self.perform(
+            &method,
+            &path,
+            body.as_deref(),
+            call.budget.max_wall_ms,
+            cap,
+        )?;
         if !(200..300).contains(&status) {
             // A 3xx is not a completed call: the adapter does not follow
             // redirects, so a caller that saw `Ok` would believe a mutating
@@ -1927,8 +1961,10 @@ impl Provider for HttpTool {
         }
         // A binary answer is not text: transcoding it inserts replacement
         // characters the peer never wrote (round 12, F-6).
-        let Ok(text) = String::from_utf8(response.clone()) else {
-            return Ok(Response::Value(Value::Module(response)));
+        // `from_utf8` returns the bytes on failure, so no clone is needed.
+        let text = match String::from_utf8(response) {
+            Ok(text) => text,
+            Err(error) => return Ok(Response::Value(Value::Module(error.into_bytes()))),
         };
         // RFC 8259 lets a parser ignore a leading byte-order mark; serde_json
         // does not, and an unstripped one would hide a huge array from the size
@@ -2348,7 +2384,13 @@ impl Provider for LocalProcess {
         // exceed the wall ceiling without any way to interrupt it.
         // A caller-set ceiling feeds the reader's allocation, so it is clamped
         // at use (round 12, F-2).
-        let max_output = self.max_output.min(MAX_OUTPUT_BYTES);
+        // The adapter's ceiling and the capability's byte grant both bound
+        // what is read: a call with an 8-byte grant must not make the host
+        // buffer a megabyte (round 19, M2).
+        let max_output = self
+            .max_output
+            .min(MAX_OUTPUT_BYTES)
+            .min(call.budget.max_bytes as usize);
         let ceiling = (max_output as u64).saturating_add(1);
         // `(stream, bytes)`: 1 is stdout and 2 is stderr. Two threads sharing
         // one channel report in completion order, and a child that writes both
@@ -2488,9 +2530,10 @@ impl Provider for LocalProcess {
         // A binary stream is not text: transcoding it inserts replacement
         // characters, so two different byte strings would compare equal
         // (round 13, F-6).
-        let stream = |bytes: Vec<u8>| match String::from_utf8(bytes.clone()) {
+        // `from_utf8` hands the bytes back on failure: no clone per stream.
+        let stream = |bytes: Vec<u8>| match String::from_utf8(bytes) {
             Ok(text) => Value::Text(text),
-            Err(_) => Value::Module(bytes),
+            Err(error) => Value::Module(error.into_bytes()),
         };
         map.insert("stdout".to_string(), stream(stdout));
         map.insert("stderr".to_string(), stream(stderr));

@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-25: 25 found 1 high + 3 mediums, fixed; round 26 is the confirmation | 145 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-18: ... + 7 findings; round 19 is the confirmation | 149 fixed / 0 rejected / 0 open | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-26; round 26 found no critical/high/medium (eight lows fixed); round 27 is the second clean | 153 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-19: ... + 10 findings; round 20 is the confirmation | 159 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -67,6 +67,25 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 26)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `2615c75`. All six round-25
+fixes verified; **no critical, high or medium finding**. Eight lows, all fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | `grpc_frame` still wrapped a length past 4 GiB for a direct caller | **fixed**: a release-checked invariant (`assert!`) with the rationale; both shipped callers bound first |
+| 2 | low | the HTTP/2 server ignored the query string, which the HTTP/1.1 bridge 404s | **fixed**: `PATH?x` is a 404 on both; `http2_rejects_a_query_string_on_the_service_path` |
+| 3 | low | the Connect client skipped response head lines the server would refuse | **fixed**: an unparsable or untokenized field is `rpc/wire`; `a_malformed_response_head_line_is_a_wire_fault` |
+| 4 | low | `Http2Client` sent an oversized body the server could only 413 | **fixed**: `check_body` before framing; `http2_refuses_an_oversized_request_before_sending` |
+| 5 | low | the HTTP/2 server streamed a response past `MAX_BODY` | **fixed**: 413 before writing |
+| 6 | low | `scoped_labels` built `value_paths` and `labels_for` rebuilt it | **fixed**: `labels_from` takes the map |
+| 7 | low | a transient accept failure consumed one of `serve`'s connections | **fixed**: the loop counts accepted connections, with the failure budget unchanged |
+| 8 | low | a wrong method was 404 on the bridge and 405 on HTTP/2 | **fixed**: 405 on both; `a_get_is_405_on_the_bridge` |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 25)
 
@@ -189,6 +208,31 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 19)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `2d5fd8f`.
+All seven round-18 fixes present; two mediums (one a contract regression the
+round-18 test had masked) and seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the wasm reservation charged the *configured* ceiling, so a two-page module under a small grant was refused, and memory growth was never charged | **fixed**: the module's declared initial memory (`exports()` -> `MemoryType::minimum`) is reserved; a shortfall is `wasm/fuel`; the two-page case is now asserted to run; `a_memory_reservation_is_charged_before_instantiation` |
+| 2 | medium | response/output buffering was bounded only by the adapter's static cap, never by `call.budget.max_bytes` | **fixed**: the HTTP body cap, the process output cap and an MCP answer line are each `min(static, grant)`; `a_response_past_the_byte_grant_is_refused`, `an_answer_past_the_byte_grant_is_refused` |
+| 3 | low | `send_line_within` enqueued before checking the deadline, so a spent grant still wrote the frame | **fixed**: the check is first; `a_spent_deadline_does_not_enqueue_the_frame` (an echo child must receive nothing) |
+| 4 | low | the budget shortfall was `wasm/limits` although the spec defines that as a resource over a ceiling | **fixed** with #1: `wasm/fuel` |
+| 5 | low | adapter bodies were cloned before the UTF-8 decision | **fixed**: `FromUtf8Error::into_bytes` on both paths |
+| 6 | low | the `mcp/<code>` comment claimed `initialize` behaves the same; it reports `mcp/initialize` | **fixed**: the comment states the difference |
+| 7 | low | `MAX_JSON_NODES` said "either adapter" while only HTTP applies it | **fixed**: the doc names the HTTP adapter and records the MCP bound (1 MiB line) |
+| 8 | low | `object as usize` truncated a `u64` on a 32-bit target | **fixed**: `usize::try_from` |
+
+Residuals recorded: the MCP reader queue is 64 x (1 MiB + 2); a parent-directory
+swap between `canonicalize` and spawn still redirects the pinned path; the HTTP
+adapter's resolver has no ceiling of its own; the more obscure documented codes
+still lack a direct test (tracked in the log).
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 18)
 

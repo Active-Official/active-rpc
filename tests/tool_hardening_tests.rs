@@ -565,6 +565,29 @@ fn a_truncated_head_or_body_has_its_own_code() {
     );
 }
 
+/// The capability's byte grant bounds the response the adapter buffers, not
+/// only what the kernel charges on egress (round 19, M2).
+#[test]
+fn a_response_past_the_byte_grant_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let body = "x".repeat(64);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    fixed_response(listener, response.into_bytes());
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/big")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/big"))]);
+    call.budget.max_bytes = 8;
+    let error = tool.invoke(0, &call).expect_err("past the grant");
+    assert_eq!(
+        error.provider_code(),
+        Some("http/body-too-large"),
+        "{error}"
+    );
+}
+
 /// A repeated `content-length` is a framing ambiguity; the adapter refuses the
 /// message instead of picking one.
 #[test]
@@ -1272,6 +1295,45 @@ fn a_nul_working_directory_is_refused() {
     call.tool_allows_process = true;
     let error = tool.invoke(0, &call).expect_err("a NUL directory");
     assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// A frame handed over after the deadline is not queued at all, so the echo
+/// child never sees it (round 19, L1).
+#[test]
+fn a_spent_deadline_does_not_enqueue_the_frame() {
+    use active_rpc::tool::{McpTransport, StdioTransport};
+
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    #[cfg(windows)]
+    let mut env = std::collections::BTreeMap::new();
+    #[cfg(windows)]
+    env.insert(
+        "SystemRoot".to_string(),
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+    );
+    #[cfg(not(windows))]
+    let env = std::collections::BTreeMap::new();
+    #[cfg(windows)]
+    let args = vec![
+        "-NoProfile",
+        "-Command",
+        "$line=[Console]::In.ReadLine(); [Console]::Out.WriteLine($line)",
+    ];
+    #[cfg(not(windows))]
+    let args = vec!["-c", "read line; echo \"$line\""];
+    let mut transport = StdioTransport::spawn(program, &args, &env).expect("spawn");
+    let error = transport
+        .send_line_within("{\"jsonrpc\":\"2.0\"}", Some(std::time::Instant::now()))
+        .expect_err("a spent deadline");
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    let error = transport
+        .recv_line_within(Some(deadline))
+        .expect_err("the frame must not have been written");
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
 }
 
 /// `Command` panics on an interior NUL. A caller-supplied argument and a

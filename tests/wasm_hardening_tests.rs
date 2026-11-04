@@ -62,6 +62,13 @@ const START_LOOP: &str = r#"
   (func (export "run") (param i32) (result i32) i32.const 0))
 "#;
 
+/// A module that declares a quarter-gigabyte of initial memory.
+const BIG_MEMORY: &str = r#"
+(module
+  (memory (export "memory") 4096)
+  (func (export "run") (param i32) (result i32) i32.const 0))
+"#;
+
 const BIG_TABLE: &str = r#"
 (module
   (memory (export "memory") 2)
@@ -138,13 +145,28 @@ fn a_memory_reservation_is_charged_before_instantiation() {
         max_memory_bytes: 256 << 20,
         ..WasmLimits::default()
     };
-    let mut tool = WasmTool::from_bytes(&binary(CONSTANT), limits).expect("compile");
-    assert_eq!(error_code(tool.call(b"")), "wasm/limits");
+    let mut tool = WasmTool::from_bytes(&binary(BIG_MEMORY), limits).expect("compile");
+    // The declared 256 MiB needs 524 288 fuel; the grant pays 10 000. A grant
+    // too small for the guest's own memory is a fuel shortfall (round 19, L2).
+    assert_eq!(error_code(tool.call(b"")), "wasm/fuel");
     assert!(
         started.elapsed() < std::time::Duration::from_millis(500),
         "the memory was materialised before the refusal: {:?}",
         started.elapsed()
     );
+
+    // A small module is not charged for the configured ceiling: two pages under
+    // a small grant still run (round 19, M1).
+    let mut small = WasmTool::from_bytes(
+        &binary(CONSTANT),
+        WasmLimits {
+            fuel: 10_000,
+            max_memory_bytes: 256 << 20,
+            ..WasmLimits::default()
+        },
+    )
+    .expect("compile");
+    assert!(small.call(b"").is_ok(), "a two-page module must run");
 }
 
 // ---------------------------------------------------------------------------

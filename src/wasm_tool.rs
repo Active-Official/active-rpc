@@ -413,15 +413,29 @@ impl WasmTool {
         }
         // A start function that traps keeps its log: the log is diagnostic
         // evidence (ADR-0019), not a success signal.
-        // Reserve the declared memory ceiling before the instance exists: a
-        // module that asks for 256 MiB must not spend the allocation (and its
-        // wall time) before the refusal (round 18, #1). The difference between
-        // the reservation and the materialised size is refunded below.
-        let reserved_kib = (self.limits.max_memory_bytes as u64).div_ceil(1024);
-        let reserved_fuel = reserved_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
+        // Reserve the module's declared initial memory before the instance
+        // exists: a module that asks for 256 MiB must not spend the allocation
+        // (and its wall time) before the refusal (round 18, #1). The module's
+        // own declaration, not the configured ceiling, is what instantiation
+        // allocates; charging the ceiling refused a two-page module under a
+        // small grant (round 19, M1). A module with no exported memory falls
+        // back to the ceiling, because its size is not knowable here.
+        let declared_kib = self
+            .module
+            .exports()
+            .find(|export| export.name() == "memory")
+            .and_then(|export| match export.ty() {
+                wasmi::ExternType::Memory(memory) => Some(memory.minimum()),
+                _ => None,
+            })
+            .map(|pages| pages.saturating_mul(64))
+            .unwrap_or((self.limits.max_memory_bytes as u64).div_ceil(1024));
+        let reserved_fuel = declared_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
         let granted = store.get_fuel().unwrap_or(0);
         if reserved_fuel > granted {
-            return Err(provider("wasm/limits"));
+            // A grant too small to pay for the guest's own memory is a fuel
+            // shortfall, not a resource over a ceiling (round 19, L2).
+            return Err(provider("wasm/fuel"));
         }
         store
             .set_fuel(granted - reserved_fuel)

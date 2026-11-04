@@ -999,9 +999,21 @@ fn named_path(paths: &std::collections::HashMap<NodeId, String>, id: NodeId) -> 
 /// queries quadratic; one map turns the whole answer into a lookup.
 fn labels_for(module: &InfinityModule, ids: impl IntoIterator<Item = NodeId>) -> Vec<String> {
     let paths = active_infinity::interop::value_paths(module);
+    labels_from(module, &paths, ids)
+}
+
+/// Labels from a path map the caller already built.
+///
+/// The scoped path needs the map for its own resolution check, so rebuilding it
+/// here walked the module twice per charged query (round 26, #6).
+fn labels_from(
+    module: &InfinityModule,
+    paths: &std::collections::HashMap<NodeId, String>,
+    ids: impl IntoIterator<Item = NodeId>,
+) -> Vec<String> {
     let mut labels: Vec<String> = ids
         .into_iter()
-        .map(|id| match named_path(&paths, id) {
+        .map(|id| match named_path(paths, id) {
             Some(path) => path.to_string(),
             None => match module.get(id) {
                 Some(node) => format!("{}[{}]", node.kind().name(), id.0),
@@ -1449,8 +1461,9 @@ fn scoped_labels(
     // Only a label that resolves back to the node is a name the caller may
     // receive: `@node[7]`, `@annotation[0]` and a stale dotted binding label
     // are arena positions (round 10, #4).
-    labels_for(
+    labels_from(
         module,
+        &paths,
         ids.into_iter().filter(|id| match named_path(&paths, *id) {
             Some(path) => structural_resolve(module, path)
                 .is_some_and(|resolved| same_place(module, resolved, *id)),

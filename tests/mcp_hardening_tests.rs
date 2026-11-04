@@ -557,3 +557,22 @@ fn a_tools_list_error_keeps_the_server_code() {
     let session = McpSession::handshake(Scripted::new(&[initialize.as_str(), list]));
     assert_eq!(code(session), "mcp/-32000");
 }
+
+/// The byte grant bounds the MCP line the adapter buffers for a call
+/// (round 19, M2).
+#[test]
+fn an_answer_past_the_byte_grant_is_refused() {
+    let (initialize, list) = handshake_responses();
+    let response = r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
+    let mut session = McpSession::handshake(Scripted::new(&[
+        initialize.as_str(),
+        list.as_str(),
+        response,
+    ]))
+    .expect("handshake");
+    let mut call = Call::new("read", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 8;
+    let error = Provider::invoke(&mut session, 0, &call).expect_err("past the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}

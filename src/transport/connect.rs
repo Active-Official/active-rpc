@@ -48,9 +48,15 @@ pub const CONNECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Frame one message with the gRPC 5-byte prefix.
 pub fn grpc_frame(payload: &[u8]) -> Vec<u8> {
-    // Both callers bound the payload to `MAX_BODY` first, so the length fits
-    // `u32`; an unbounded caller used to wrap it and the peer read the tail as
-    // a second message (round 25, #5).
+    // Both shipped callers bound the payload to `MAX_BODY` first, so the
+    // length fits `u32`; a direct caller that does not would wrap it and the
+    // peer would read the tail as a second message (round 25, #5; round 26,
+    // #1). The invariant is checked in release too, because a wrapped frame
+    // is a wire fault, not a slow path.
+    assert!(
+        payload.len() <= MAX_BODY,
+        "grpc_frame payload exceeds MAX_BODY"
+    );
     let mut out = Vec::with_capacity(5 + payload.len());
     out.push(0);
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -209,10 +215,16 @@ impl BridgeServer {
     {
         let mut served = 0u64;
         let mut failures = 0u32;
-        for _ in 0..requests {
+        // Count accepted connections, not loop iterations: a transient accept
+        // failure used to consume one of the caller's `requests`, so a peer
+        // that reset its connections could starve the ones that would work
+        // (round 26, #7).
+        let mut accepted_count = 0usize;
+        while accepted_count < requests {
             let (stream, _) = match self.listener.accept() {
                 Ok(accepted) => {
                     failures = 0;
+                    accepted_count += 1;
                     accepted
                 }
                 // A transient accept failure (EINTR, ECONNABORTED) belongs to the
@@ -296,7 +308,14 @@ impl BridgeServer {
             drain_before_close(&mut stream);
             return 0;
         }
-        if method != "POST" || target != PATH {
+        if method != "POST" {
+            // The HTTP/2 bridge answers 405 for this mistake; one status per
+            // property across both bridges (round 26, #8).
+            let _ = write_http_response(&mut stream, 405, b"rpc/wire", deadline);
+            drain_before_close(&mut stream);
+            return 0;
+        }
+        if target != PATH {
             let _ = write_http_response(&mut stream, 404, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
@@ -618,6 +637,7 @@ fn write_http_response(
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         408 => "Request Timeout",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
@@ -822,10 +842,18 @@ impl ConnectClient {
         // `transfer-encoding`; the client applies the same rules so an
         // intermediary cannot desync the two (round 22, #4).
         let mut lengths: Vec<usize> = Vec::new();
-        for line in &head {
-            let Some((name, value)) = line.split_once(':') else {
+        for (index, line) in head.iter().enumerate() {
+            if index == 0 {
                 continue;
+            }
+            // The server refuses an unparsable or untokenized field; a client
+            // that skipped it saw a different message (round 26, #3).
+            let Some((name, value)) = line.split_once(':') else {
+                return Err(Error::Wire("malformed response head line"));
             };
+            if name.is_empty() || !name.bytes().all(crate::tool::is_http_token) {
+                return Err(Error::Wire("malformed response field name"));
+            }
             if name.eq_ignore_ascii_case("transfer-encoding") {
                 return Err(Error::Wire("transfer-encoding is not accepted"));
             }
