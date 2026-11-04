@@ -203,8 +203,7 @@ fn a_timeout_kills_the_descendant_tree() {
     std::thread::sleep(Duration::from_millis(2_500));
     assert!(
         !marker.exists(),
-        "a descendant survived the timeout and wrote {:?}",
-        marker
+        "a descendant survived the timeout and wrote {marker:?}"
     );
     let _ = std::fs::remove_dir_all(&directory);
 }

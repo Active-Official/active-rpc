@@ -107,7 +107,7 @@ fn an_empty_certificate_is_not_a_bindable_identity() {
     assert_eq!(empty.kind(), IdentityKind::Anonymous);
     assert!(empty.is_anonymous());
     assert!(!active_rpc::identity::bindable(empty.fingerprint()));
-    assert!(!active_rpc::identity::presented_fingerprint(Some(&empty)).is_some());
+    assert!(active_rpc::identity::presented_fingerprint(Some(&empty)).is_none());
 
     let agent = Agent::with_secret([0x73; 32]);
     let provider = agent.register(Box::new(Echo));

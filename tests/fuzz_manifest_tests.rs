@@ -48,14 +48,13 @@ fn every_target_has_a_source_file_and_a_committed_corpus_directory() {
     );
     for target in &targets {
         let source = fuzz_targets().join(format!("{target}.rs"));
-        assert!(source.is_file(), "{} is declared but has no source", target);
+        assert!(source.is_file(), "{target} is declared but has no source");
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fuzz/corpus")
             .join(target);
         assert!(
             corpus.is_dir(),
-            "{} has no corpus directory (an empty one is fine)",
-            target
+            "{target} has no corpus directory (an empty one is fine)"
         );
     }
 }

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use active_rpc::cap::{CapAttrs, CapPersistence};
 use active_rpc::kernel::Provider;
 use active_rpc::persistence::MemoryRecordStore;
-use active_rpc::value::{Arg, Call, Response, Value};
+#[cfg(windows)]
+use active_rpc::value::Arg;
+use active_rpc::value::{Call, Response, Value};
 use active_rpc::{
     AdmittedIdentity, Agent, Budget, CapHandle, Error, IdentityPolicy, LaneId, PeerIdentity,
 };
