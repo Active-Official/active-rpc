@@ -1210,13 +1210,12 @@ impl<T: McpTransport> McpSession<T> {
         let line = payload.to_string();
         if line.len() > max_line {
             // The grant comes first: a request past both ceilings is a budget
-            // exhaustion, and reporting the static ceiling masked it
-            // (round 26, #4).
+            // exhaustion (round 26, #4).
             return Err(Error::BudgetExceeded("byte"));
         }
         if line.len() > MAX_MCP_LINE_BYTES {
-            // The peer refuses a line of this size; refuse it here instead of
-            // sending a frame that can only be a desync.
+            // Past the static ceiling but inside the grant: no budget can make
+            // this line legal, so it is a bad argument (round 27, #1).
             return Err(Error::InvalidArgument(
                 "the MCP request exceeds the line ceiling",
             ));
@@ -1482,7 +1481,11 @@ impl<T: McpTransport> Provider for McpSession<T> {
             .checked_add(ceiling)
             .unwrap_or_else(std::time::Instant::now);
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
-        let max_line = grant.min(MAX_MCP_LINE_BYTES);
+        // The raw grant, not the smaller of the two: `request_within` reports
+        // the static ceiling separately so a line past both is a budget
+        // refusal and a line past only the static ceiling is a bad argument
+        // (round 27, #1).
+        let max_line = grant;
         let response = self.request_within(
             "tools/call",
             json!({ "name": tool.name, "arguments": Json::Object(arguments) }),
@@ -2017,6 +2020,20 @@ impl Provider for HttpTool {
                 "a path argument must be printable ASCII without spaces",
             ));
         }
+        // The allow-list is an exact string match while the peer normalizes:
+        // `..`, `%2f`, `//`, `?` and `#` can name a different resource than the
+        // allowlisted string does, so an ambiguous path is refused before the
+        // allowlist is consulted (round 27, #4).
+        let ambiguous = path.contains('%')
+            || path.contains('?')
+            || path.contains('#')
+            || path.contains("//")
+            || path.split('/').any(|segment| segment == "..");
+        if ambiguous {
+            return Err(Error::ToolPolicy(
+                "a path with a dot segment, escape, query or fragment is refused",
+            ));
+        }
         // The base is the operator's endpoint, but a control character in it is a
         // request split waiting for a configuration mistake (round 3, #8).
         if self.base.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
@@ -2474,6 +2491,20 @@ impl Provider for LocalProcess {
                 "a secret argument cannot be passed to a process",
             ));
         }
+        // The authority checks come before the argument allowlist: a direct
+        // caller without the process grant must not learn allowlist membership
+        // from which refusal it receives (round 27, #3).
+        if !call.tool_allows_process {
+            return Err(Error::ToolPolicy("process execution not granted"));
+        }
+        if call.path_scope.is_some() {
+            // Every process argument is text and the kernel only inspects
+            // `Value::Path`: a scope attached here would read as confinement
+            // while enforcing nothing (round 9, F-1). Fail closed.
+            return Err(Error::ToolPolicy(
+                "this adapter cannot enforce a path scope",
+            ));
+        }
         let mut args = Vec::new();
         for arg in &call.args {
             // A process argument is text. Anything else would be executed as
@@ -2507,18 +2538,6 @@ impl Provider for LocalProcess {
                 ));
             }
             args.push(text.clone());
-        }
-        // The policy in the capability must have granted process execution.
-        if !call.tool_allows_process {
-            return Err(Error::ToolPolicy("process execution not granted"));
-        }
-        if call.path_scope.is_some() {
-            // Every process argument is text and the kernel only inspects
-            // `Value::Path`: a scope attached here would read as confinement
-            // while enforcing nothing (round 9, F-1). Fail closed.
-            return Err(Error::ToolPolicy(
-                "this adapter cannot enforce a path scope",
-            ));
         }
         // The fields are public, so the pinning is checked again here: a caller
         // that assigned a relative directory would have it resolved against the

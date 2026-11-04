@@ -368,18 +368,22 @@ impl WasmTool {
                         else {
                             return -1;
                         };
+                        // The pointer is checked before the allocation and the
+                        // CSPRNG call: a guest that loops `random(OOB, 64 KiB)`
+                        // otherwise makes the host allocate and fill 64 KiB per
+                        // fuel while charging nothing (round 27, #2).
+                        let start = ptr as usize;
+                        let Some(end) = start.checked_add(len as usize) else {
+                            return -1;
+                        };
+                        if end > memory.data(&caller).len() {
+                            return -1;
+                        }
                         let mut buffer = vec![0u8; len as usize];
                         if getrandom::fill(&mut buffer).is_err() {
                             return -1;
                         }
                         let data = memory.data_mut(&mut caller);
-                        let start = ptr as usize;
-                        let Some(end) = start.checked_add(buffer.len()) else {
-                            return -1;
-                        };
-                        if end > data.len() {
-                            return -1;
-                        }
                         data[start..end].copy_from_slice(&buffer);
                         // Charged only after the copy: a refused pointer must
                         // not burn the call's entropy budget
@@ -636,6 +640,13 @@ impl Provider for WasmTool {
         let input = input.to_vec();
         let mut limits = self.limits;
         limits.fuel = fuel;
+        // The static output ceiling and the grant share are one ceiling, and
+        // the tighter one tokenizes the refusal: a guest whose output passes
+        // the static cap but not the share is a budget exhaustion
+        // (round 27, #6).
+        let share = grant.saturating_sub(input.len());
+        let output_grant_bound = limits.max_output_bytes > share;
+        limits.max_output_bytes = limits.max_output_bytes.min(share);
         let mut tool = WasmTool {
             engine: self.engine.clone(),
             module: self.module.clone(),
@@ -649,10 +660,16 @@ impl Provider for WasmTool {
         // when its diagnostics matter, and `call` cleared the buffer first so it
         // can only hold this call's bytes.
         self.log = std::mem::take(&mut tool.log);
-        let output = result?;
+        let output = match result {
+            Ok(output) => output,
+            Err(error) if output_grant_bound && error.provider_code() == Some("wasm/output") => {
+                return Err(Error::BudgetExceeded("byte"))
+            }
+            Err(error) => return Err(error),
+        };
         // Input and output share the grant, as the process and HTTP adapters
         // charge one budget (round 23, #3).
-        if output.len() > grant.saturating_sub(input.len()) {
+        if output.len() > share {
             return Err(Error::BudgetExceeded("byte"));
         }
         // Guest output is bytes: a lossy UTF-8 conversion would hand the caller

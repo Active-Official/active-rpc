@@ -2270,3 +2270,56 @@ fn a_declared_length_past_the_grant_is_a_budget_refusal() {
         .expect_err("the body is past the grant");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 27
+// ---------------------------------------------------------------------------
+
+/// A request inside the grant but past the static line ceiling is a bad
+/// argument, not a budget: no budget can make the line legal (round 27, #1).
+#[test]
+fn an_mcp_request_past_only_the_line_ceiling_is_an_argument_refusal() {
+    let mut session = echo_session();
+    let big = "x".repeat(1 << 20);
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Text(big))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 64 << 20;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the line is past the static ceiling");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// The process grant and the scope are checked before the argument allowlist,
+/// so a direct caller without the grant cannot read allowlist membership from
+/// the refusal reason (round 27, #3).
+#[test]
+fn a_missing_process_grant_precedes_the_argument_allowlist() {
+    let mut tool = LocalProcess::new(absolute_shell(), &["allowed"]).expect("an absolute program");
+    let call = Call::new("run", vec![Arg::text("not-allowed")]);
+    let error = tool.invoke(0, &call).expect_err("no process grant");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+    assert!(
+        format!("{error}").contains("process execution not granted"),
+        "{error}"
+    );
+}
+
+/// A path with a dot segment, escape, query or fragment is refused before the
+/// allowlist: the peer normalizes, so an allowlisted string can name a
+/// different resource (round 27, #4).
+#[test]
+fn an_ambiguous_http_path_is_refused() {
+    for path in [
+        "/safe/../secret",
+        "/a%2fb",
+        "/a//b",
+        "/safe?x=1",
+        "/safe#frag",
+    ] {
+        let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", path)]);
+        let mut call = Call::new("get", vec![Arg::Value(Value::path(path))]);
+        call.tool_allows_process = true;
+        let error = tool.invoke(0, &call).expect_err("an ambiguous path");
+        assert_eq!(error.code(), "rpc/tool-policy", "{path}: {error}");
+    }
+}

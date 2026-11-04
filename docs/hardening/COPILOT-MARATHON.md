@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-33: round 33 found 1 high, 2 mediums and 4 lows, all fixed; rounds 34-35 must be clean | 199 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-26: round 26 found 3 mediums and 3 lows, all fixed or recorded; rounds 27-28 must be clean | 208 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-27: round 27 found 2 mediums and 4 lows, all fixed; rounds 28-29 must be clean | 214 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -366,6 +366,23 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 27)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `85c4d80`. All six round-26
+dispositions verified. Two mediums, four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the MCP request path compared the line against `min(grant, 1 MiB)`, so a line past the static ceiling inside a large grant was reported as a budget refusal | **fixed**: `request_within` receives the raw grant, checks it first, and reports the static ceiling as `rpc/invalid-argument`; `an_mcp_request_past_only_the_line_ceiling_is_an_argument_refusal` |
+| 2 | medium | the wasm `random` host function allocated and filled up to 64 KiB before checking the guest pointer, so a looping guest burned host work for free | **fixed**: the bounds check precedes the allocation and the CSPRNG call |
+| 3 | low | the process grant and the path scope were checked after the argument allowlist, so a direct caller could read allowlist membership from the refusal reason | **fixed**: both precede the loop; `a_missing_process_grant_precedes_the_argument_allowlist` |
+| 4 | low | the HTTP allowlist is an exact string while the peer normalizes, so `..`, `%2f`, `//`, `?` or `#` could name a different resource | **fixed**: an ambiguous path is refused before the allowlist; `an_ambiguous_http_path_is_refused` |
+| 5 | low | list and map lengths were cast to `u32` without a check | **fixed**: `u32::try_from` refuses |
+| 6 | low | the wasm static output ceiling fired before the grant share, reporting `wasm/output` for a budget exhaustion | **fixed**: the share caps the limit passed to the guest and a grant-bound `wasm/output` becomes `rpc/budget-exceeded` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 26)
 

@@ -621,14 +621,18 @@ fn write_value_at(out: &mut Vec<u8>, value: &Value, depth: usize) -> Result<()> 
         }
         Value::List(items) => {
             out.push(5);
-            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            // A length past `u32` cannot be carried by the wire; refuse it
+            // rather than write a truncated count (round 27, #5).
+            let count = u32::try_from(items.len()).map_err(|_| Error::Wire("list too long"))?;
+            out.extend_from_slice(&count.to_le_bytes());
             for item in items {
                 write_value_at(out, item, depth + 1)?;
             }
         }
         Value::Map(entries) => {
             out.push(6);
-            out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            let count = u32::try_from(entries.len()).map_err(|_| Error::Wire("map too large"))?;
+            out.extend_from_slice(&count.to_le_bytes());
             for (key, value) in entries {
                 write_str(out, key)?;
                 write_value_at(out, value, depth + 1)?;
