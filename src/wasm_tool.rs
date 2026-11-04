@@ -169,6 +169,12 @@ pub struct WasmTool {
     host: WasmHostPolicy,
     /// Host log captured from the most recent call.
     log: Vec<u8>,
+    /// Cumulative entropy this tool's next call may draw, in bytes.
+    ///
+    /// [`MAX_RANDOM_PER_CALL`] by default; `invoke` lowers it to the
+    /// capability's byte share so a tiny grant cannot buy 64 KiB of CSPRNG
+    /// (round 29, F6).
+    random_cap: usize,
     /// Time the guest sees when the clock import is granted.
     ///
     /// Seeded by the embedder: the kernel passes `Call::now_ms`, so the guest
@@ -259,6 +265,7 @@ impl WasmTool {
             limits,
             host,
             log: Vec::new(),
+            random_cap: MAX_RANDOM_PER_CALL,
             now_ms: 0,
         })
     }
@@ -327,7 +334,7 @@ impl WasmTool {
             log: Vec::new(),
             max_log: self.host.max_log_bytes,
             random_used: 0,
-            max_random: MAX_RANDOM_PER_CALL,
+            max_random: self.random_cap.min(MAX_RANDOM_PER_CALL),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
@@ -659,6 +666,7 @@ impl Provider for WasmTool {
             limits,
             host,
             log: Vec::new(),
+            random_cap: share,
             now_ms: call.now_ms,
         };
         let result = tool.call(&input);

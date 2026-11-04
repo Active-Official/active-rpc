@@ -231,6 +231,7 @@ past only the static 1 MiB ceiling is `rpc/invalid-argument` (a request) or
 | `mcp/bad-json` | the request line could not be serialised (client bug) |
 | `mcp/no-response` | the transport returned nothing for a request |
 | `mcp/eof` | the server closed its stdout |
+| `mcp/queue` | the writer queue stayed full until the ceiling; the frame never reached the writer, so the session stays usable |
 | `mcp/line-too-long` | a line exceeded 1 MiB before parsing |
 | `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer |
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |
@@ -300,13 +301,18 @@ system resolver’s own timeout, because the endpoint is the operator’s, not t
 peer’s. A server that drips a byte per timeout period cannot stretch the
 ceiling. A HEAD,
 204 or 304 reply is read as bodyless whatever its headers say. A path is
-refused if it contains a byte outside `0x21..=0x7e`, because it is
-interpolated into the request line. A capability with a path scope is refused
+refused if it contains a byte outside `0x21..=0x7e`, a dot segment, a percent
+escape, a backslash, a double slash, a query or a fragment: the allow-list is an
+exact string and the peer normalizes, so an ambiguous entry could name a
+different resource. `HttpTool::try_new` refuses such an entry at construction and
+`HttpTool::new` drops it. A capability with a path scope is refused
 (`rpc/tool-policy`): the kernel compares dotted paths, which cannot confine a
 URL path, so the scope would look like confinement while only the allow-list
 confined the call. The request head is charged against the byte grant beyond a
 256-byte framing allowance, so a megabyte of `base` or an allowlisted long path
-cannot be written under a tiny grant. A leading UTF-8 byte-order mark on an
+cannot be written under a tiny grant. A non-2xx answer is returned as
+`http/<status>` without reading its body, so a hostile endpoint cannot force up
+to the grant of buffering per refusal. A leading UTF-8 byte-order mark on an
 answer is ignored before the JSON gates and the decode.
 
 ### Process adapter codes (`LocalProcess`)

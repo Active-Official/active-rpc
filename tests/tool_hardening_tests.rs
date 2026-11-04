@@ -2324,3 +2324,93 @@ fn an_ambiguous_http_path_is_refused() {
         assert_eq!(error.code(), "rpc/tool-policy", "{path}: {error}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 29
+// ---------------------------------------------------------------------------
+
+/// A queue-full refusal happens before the writer takes the frame, so the
+/// session must survive it; poisoning made transient backpressure kill the
+/// session until a re-handshake (round 29, F1).
+#[test]
+fn a_queue_full_mcp_send_does_not_poison_the_session() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+
+    struct QueueOnce {
+        inner: MemoryTransport,
+        sends: usize,
+        fail_at: usize,
+    }
+
+    impl McpTransport for QueueOnce {
+        fn send_line(&mut self, line: &str) -> active_rpc::error::Result<()> {
+            self.inner.send_line(line)
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.inner.recv_line()
+        }
+        fn send_line_within(
+            &mut self,
+            line: &str,
+            deadline: Option<std::time::Instant>,
+        ) -> active_rpc::error::Result<()> {
+            self.sends += 1;
+            if self.sends == self.fail_at {
+                return Err(active_rpc::error::Error::Provider {
+                    code: "mcp/queue".to_string(),
+                });
+            }
+            self.inner.send_line_within(line, deadline)
+        }
+    }
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/call".to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#
+            .to_string(),
+    );
+    // The third send is the first `tools/call`; the fourth is the retry.
+    let transport = QueueOnce {
+        inner: MemoryTransport::new(responses),
+        sends: 0,
+        fail_at: 3,
+    };
+    let mut session = McpSession::handshake(transport).expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the queue was full");
+    assert_eq!(error.provider_code(), Some("mcp/queue"), "{error}");
+    active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect("the session survived the queue refusal");
+}
+
+/// The HTTP constructor refuses an ambiguous allowlist entry through
+/// `try_new`, and `new` drops one rather than keeping a widening alive
+/// (round 29, F4).
+#[test]
+fn an_ambiguous_allowlist_entry_is_refused_at_construction() {
+    for path in ["/a/../b", "/a\\b", "/a?q", "/a%2f"] {
+        let error = HttpTool::try_new("http://127.0.0.1:9", &[("GET", path)])
+            .expect_err("an ambiguous entry");
+        assert_eq!(error.code(), "rpc/tool-policy", "{path}: {error}");
+        // `new` keeps only the unambiguous entries: the dropped one is refused
+        // at the allowlist check.
+        let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", path)]);
+        let mut call = Call::new("get", vec![Arg::Value(Value::path(path))]);
+        call.tool_allows_process = true;
+        let error = tool.invoke(0, &call).expect_err("not allowlisted");
+        assert_eq!(error.code(), "rpc/tool-policy", "{path}: {error}");
+    }
+}

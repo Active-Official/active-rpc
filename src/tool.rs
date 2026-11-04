@@ -169,9 +169,10 @@ pub fn json_text_bad_number(text: &str) -> bool {
 /// accused of carrying a bad number (round 15, F-1; round 16, F-1).
 fn text_fails_only_on_a_number(text: &str) -> bool {
     let trimmed = text.trim_start();
-    // A document that opens as an object, an array or a number is JSON; plain
-    // text that happens to hold a stray minus or digits is not re-examined
-    // (round 16, F-1: a bare `1e400` answer was downgraded to text).
+    // A document that opens as an object, an array or a number is a JSON
+    // candidate; a bare `1e400` is one, so it reports `bad-number` instead of
+    // being downgraded to text (round 16, F-1; round 29, F5 fixed the stale
+    // comment).
     let json_start = trimmed.starts_with('{')
         || trimmed.starts_with('[')
         || trimmed.starts_with(|c: char| c == '-' || c.is_ascii_digit());
@@ -968,7 +969,12 @@ impl McpTransport for StdioTransport {
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
                     command = returned;
                     if std::time::Instant::now() >= enqueue_deadline {
-                        return Err(Error::Timeout);
+                        // The frame never reached the writer, so the session is
+                        // not desynced: a distinct code lets the caller keep it
+                        // (round 29, F1).
+                        return Err(Error::Provider {
+                            code: "mcp/queue".to_string(),
+                        });
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -1231,8 +1237,12 @@ impl<T: McpTransport> McpSession<T> {
             // A partial write desynchronises the stream: the next read could
             // answer this request with the previous call's remainder
             // (round 3, #3). A timeout takes the same path, because a frame the
-            // writer thread already took may have reached the wire.
-            self.poisoned = true;
+            // writer thread already took may have reached the wire. `mcp/queue`
+            // is the exception: the writer never took the frame, so the session
+            // stays usable (round 29, F1).
+            if !matches!(&error, Error::Provider { code } if code == "mcp/queue") {
+                self.poisoned = true;
+            }
             return Err(error);
         }
         let mut skipped = 0usize;
@@ -1538,7 +1548,30 @@ pub struct HttpTool {
 }
 
 impl HttpTool {
+    /// Whether an exact-match allow-list entry is ambiguous for a peer.
+    ///
+    /// The adapter sends the path verbatim and compares it as a string while a
+    /// server normalizes: a dot segment, percent escape, query, fragment,
+    /// backslash, double slash or non-printable byte can name a different
+    /// resource than the allowlisted string (round 27, #4; round 29, F4).
+    fn ambiguous_path(path: &str) -> bool {
+        path.contains('%')
+            || path.contains('?')
+            || path.contains('#')
+            || path.contains('\\')
+            || path.contains("//")
+            || path
+                .split('/')
+                .any(|segment| segment == ".." || segment == ".")
+            || path.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+    }
+
     /// Build a tool for `base` with an allowlist.
+    ///
+    /// An ambiguous entry is dropped: the peer normalizes, so such an entry
+    /// could name a different resource, and a dead entry is safer than a
+    /// silently widened one. [`HttpTool::try_new`] refuses at construction
+    /// instead.
     pub fn new(base: impl Into<String>, allow: &[(&str, &str)]) -> Self {
         Self {
             base: base.into(),
@@ -1547,12 +1580,23 @@ impl HttpTool {
                 // `invoke` uppercases the requested method, so a lowercase
                 // allowlist entry used to match nothing and the capability was
                 // permanently dead (round 16, F-8).
+                .filter(|(_, path)| !Self::ambiguous_path(path))
                 .map(|(method, path)| (method.to_ascii_uppercase(), path.to_string()))
                 .collect(),
             max_body: 1 << 20,
             max_request: 1 << 20,
             calls: 0,
         }
+    }
+
+    /// [`HttpTool::new`] that refuses an ambiguous allowlist entry.
+    pub fn try_new(base: impl Into<String>, allow: &[(&str, &str)]) -> Result<Self> {
+        if allow.iter().any(|(_, path)| Self::ambiguous_path(path)) {
+            return Err(Error::ToolPolicy(
+                "an allowlist entry has an ambiguous path",
+            ));
+        }
+        Ok(Self::new(base, allow))
     }
 
     /// Build a tool policy for a capability.
@@ -1835,6 +1879,13 @@ impl HttpTool {
         if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
             return Ok((status, Vec::new()));
         }
+        // A non-2xx answer is a refusal: the adapter returns `http/<status>`
+        // and never hands the body to the caller, so a hostile endpoint cannot
+        // force up to the grant of buffering per 404 (round 29, F3). The
+        // connection is `close`, so abandoning the body is safe.
+        if !(200..300).contains(&status) {
+            return Ok((status, Vec::new()));
+        }
         // The head already spent part of the grant; the body may use the rest
         // (round 22, F-F).
         let body_cap = max_body.saturating_sub(header_bytes);
@@ -2024,17 +2075,9 @@ impl Provider for HttpTool {
             ));
         }
         // The allow-list is an exact string match while the peer normalizes:
-        // `..`, `%2f`, `//`, `?` and `#` can name a different resource than the
-        // allowlisted string does, so an ambiguous path is refused before the
-        // allowlist is consulted (round 27, #4).
-        let ambiguous = path.contains('%')
-            || path.contains('?')
-            || path.contains('#')
-            || path.contains("//")
-            || path
-                .split('/')
-                .any(|segment| segment == ".." || segment == ".");
-        if ambiguous {
+        // an ambiguous path is refused before the allowlist is consulted, and
+        // `new` drops such an entry (round 27, #4; round 29, F4).
+        if Self::ambiguous_path(&path) {
             return Err(Error::ToolPolicy(
                 "a path with a dot segment, escape, query or fragment is refused",
             ));
@@ -2471,6 +2514,13 @@ impl Provider for LocalProcess {
             // (round 4, #5).
             return Err(Error::BudgetExceeded("wall"));
         }
+        if call.budget.max_bytes == 0 {
+            // The grant is checked before the method, the payload and every
+            // argument rule: a zero-byte capability does no work, and the
+            // refusal class must not depend on the other inputs
+            // (round 25, #4; round 29, F2).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         if !call.payload.is_empty() {
             return Err(Error::InvalidArgument(
                 "the process adapter does not accept an envelope payload",
@@ -2480,13 +2530,6 @@ impl Provider for LocalProcess {
             return Err(Error::MethodNotGranted {
                 method: call.method.clone(),
             });
-        }
-        if call.budget.max_bytes == 0 {
-            // The grant is checked before any argument rule: otherwise a
-            // disallowed argument answered `rpc/tool-policy` and an allowed one
-            // `rpc/budget-exceeded`, which is an allowlist oracle for a direct
-            // caller (round 25, #4). The child is never started.
-            return Err(Error::BudgetExceeded("byte"));
         }
         if args_contain_secret(&call.args) {
             // Before the shape loop: `Value::Secret` used to be reported as a

@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-35: round 35 found 2 mediums and 3 lows, all fixed or documented; rounds 36-37 must be clean | 209 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-28: round 28 found 2 highs, 2 mediums and 1 low, all fixed; rounds 29-30 must be clean | 218 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-29: round 29 found 1 medium and 5 lows, all fixed; rounds 30-31 must be clean | 224 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -402,6 +402,23 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 29)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `987ccb7`. All five round-28
+dispositions verified. One medium, five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a queue-full `Timeout` from the MCP writer poisoned the session although the frame never reached the writer | **fixed**: the enqueue-full refusal is `mcp/queue`, and the session keeps it; `a_queue_full_mcp_send_does_not_poison_the_session` |
+| 2 | low | `LocalProcess` checked the method and payload before the byte grant | **fixed**: the grant comes first |
+| 3 | low | a non-2xx HTTP body was fully buffered before the status refusal, so a hostile endpoint forced up to the grant per 404 | **fixed**: a non-2xx answer returns without reading the body (`connection: close`) |
+| 4 | low | `HttpTool::new` kept ambiguous allowlist entries | **fixed**: `try_new` refuses them and `new` drops them (fail closed); `an_ambiguous_allowlist_entry_is_refused_at_construction` |
+| 5 | low | the `1e400` comment described an older downgrade | **fixed** |
+| 6 | low | the wasm cumulative entropy budget ignored the grant | **fixed**: `random_cap` is the grant share |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 28)
 
