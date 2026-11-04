@@ -75,7 +75,7 @@ fuzz_target!(|data: &[u8]| {
 
     // 3. gRPC framing.
     if let Ok((message, rest)) = grpc_unframe(data) {
-        let framed = grpc_frame(message);
+        let Ok(framed) = grpc_frame(message) else { return };
         assert!(rest.len() < data.len());
         let (again, tail) = grpc_unframe(&framed).expect("framed message parses");
         assert_eq!(again, message);

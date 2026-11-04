@@ -95,7 +95,7 @@ fuzz_target!(|data: &[u8]| {
 
     // 4. gRPC framing round-trips and refuses an over-declared length.
     if let Ok((message, rest)) = grpc_unframe(data) {
-        let framed = grpc_frame(message);
+        let Ok(framed) = grpc_frame(message) else { return };
         let (again, tail) = grpc_unframe(&framed).expect("framed message parses");
         assert_eq!(again, message);
         assert!(tail.is_empty());
