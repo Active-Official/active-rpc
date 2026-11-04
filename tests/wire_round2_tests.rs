@@ -201,3 +201,25 @@ fn a_non_canonical_method_order_is_refused() {
         .expect_err("descending method order is refused");
     assert_eq!(error.code(), "rpc/capability-table", "{error}");
 }
+
+/// A map key is a value for the decode arena. Keys were read with `read_str`
+/// and never charged, so a frame of many keys bought one `BTreeMap` insert
+/// each without touching `max_values` (round 24, #7).
+#[test]
+fn map_keys_charge_the_decode_arena() {
+    let map = Value::Map(
+        (0..8u32)
+            .map(|index| (format!("k{index:02}"), Value::Null))
+            .collect(),
+    );
+    let bytes = envelope_with(map);
+    // One arg value, the map node, eight keys and eight null values.
+    let limits = WireLimits {
+        max_values: 12,
+        ..WireLimits::default()
+    };
+    let error = Envelope::decode_with(&bytes, limits).expect_err("keys count as values");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+    // The same frame decodes when the ceiling covers keys and values.
+    Envelope::decode_with(&bytes, WireLimits::default()).expect("keys and values fit");
+}

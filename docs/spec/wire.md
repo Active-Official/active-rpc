@@ -286,6 +286,7 @@ answer is ignored before the JSON gates and the decode.
 | `process/wait:<err>` | waiting for the child failed |
 | `process/cwd` | the working directory could not be pinned at construction |
 | `process/thread:<err>` | a pipe reader thread could not start; the child is killed |
+| `process/signalled` | the child died from a signal, so it has no exit status to report |
 | `rpc/budget-exceeded` | the wall or byte grant is zero, or the input is past the byte grant |
 | `rpc/timeout` | the call exceeded the effective wall ceiling; the whole process group was killed |
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
@@ -294,7 +295,9 @@ answer is ignored before the JSON gates and the decode.
 The effective output ceiling is the smaller of `max_output`, 16 MiB and the
 capability byte grant, for both streams together. A request body is capped by
 `min(max_request, 64 MiB, the grant)`; a response head is capped by
-`min(64 KiB, the grant)`, and the head and the body share that grant.
+`min(64 KiB, the grant)`, and the head and the body share that grant. A grant
+below the shortest possible answer (16 bytes: a status line plus the empty
+end-of-head line) is `rpc/budget-exceeded` before the request is sent.
 
 `LocalProcess::new` requires an absolute program path. A bare name would be
 resolved from the parent's `PATH`, which is ambient authority: anything that can

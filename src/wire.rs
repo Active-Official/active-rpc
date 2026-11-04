@@ -834,6 +834,11 @@ fn read_value_at(
             }
             let mut entries = std::collections::BTreeMap::new();
             for _ in 0..count {
+                // A key is a value: a 1 MiB map of keys cost one insert each
+                // without ever charging `max_values` (round 24, #7).
+                *remaining_values = remaining_values
+                    .checked_sub(1)
+                    .ok_or(Error::Wire("value count exceeds the ceiling"))?;
                 let key = read_str(bytes, cursor, budget as u32)?;
                 let value = read_value_at(
                     bytes,

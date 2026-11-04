@@ -580,25 +580,37 @@ impl Provider for WasmTool {
             // (round 21, F5).
             return Err(Error::ToolPolicy("a secret is not a wasm argument"));
         }
-        let mut input = None;
+        // Borrow the argument first: the byte grant bounds the input, and the
+        // copy must happen only after every check (round 24, #5).
+        let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+        let mut input: Option<&[u8]> = None;
         for arg in &call.args {
-            let bytes = match arg {
-                Arg::Value(Value::Text(text)) => Some(text.as_bytes().to_vec()),
-                Arg::Value(Value::Module(bytes)) => Some(bytes.clone()),
+            let bytes: &[u8] = match arg {
+                Arg::Value(Value::Text(text)) => text.as_bytes(),
+                Arg::Value(Value::Module(bytes)) => bytes,
                 // A secret is authority the capability did not grant to this
                 // adapter, a policy refusal rather than a malformed argument
                 // (round 20, L8).
                 Arg::Value(Value::Secret) => {
                     return Err(Error::ToolPolicy("a secret is not a wasm argument"))
                 }
-                _ => None,
+                _ => {
+                    return Err(Error::InvalidArgument(
+                        "the wasm adapter takes exactly one text or module argument",
+                    ))
+                }
             };
-            if input.is_some() || bytes.is_none() {
+            if input.is_some() {
                 return Err(Error::InvalidArgument(
                     "the wasm adapter takes exactly one text or module argument",
                 ));
             }
-            input = bytes;
+            if bytes.len() > grant {
+                // Before the copy: the grant bounds the input too
+                // (round 23, #3).
+                return Err(Error::BudgetExceeded("byte"));
+            }
+            input = Some(bytes);
         }
         let Some(input) = input else {
             return Err(Error::InvalidArgument(
@@ -619,14 +631,7 @@ impl Provider for WasmTool {
             // work (round 22, F-B).
             return Err(Error::BudgetExceeded("byte"));
         }
-        let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
-        if let Some(Arg::Value(Value::Text(text))) = call.args.first() {
-            if text.len() > grant {
-                // Before the copy: the grant bounds the input too
-                // (round 23, #3).
-                return Err(Error::BudgetExceeded("byte"));
-            }
-        }
+        let input = input.to_vec();
         let mut limits = self.limits;
         limits.fuel = fuel;
         let mut tool = WasmTool {
@@ -637,11 +642,6 @@ impl Provider for WasmTool {
             log: Vec::new(),
             now_ms: call.now_ms,
         };
-        if input.len() > grant {
-            // The guest must not run on data the grant cannot carry
-            // (round 22, F-G).
-            return Err(Error::BudgetExceeded("byte"));
-        }
         let result = tool.call(&input);
         // Keep the guest's log even when the call was refused: a trap is exactly
         // when its diagnostics matter, and `call` cleared the buffer first so it

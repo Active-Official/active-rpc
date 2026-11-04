@@ -644,19 +644,14 @@ fn a_response_head_past_the_byte_grant_is_refused() {
     fixed_response(listener, response.as_bytes().to_vec());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/small")]);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/small"))]);
-    call.budget.max_bytes = 8;
+    // Enough for the status line, not for the whole head (round 24, #4 makes a
+    // grant below the shortest answer a budget refusal, which the next test
+    // covers).
+    call.budget.max_bytes = 40;
     let error = tool
         .invoke(0, &call)
         .expect_err("the head is past the grant");
-    // The status line itself is longer than the grant, so the per-line cap
-    // answers first; the block cap has the same effect on a longer grant.
-    assert!(
-        matches!(
-            error.provider_code(),
-            Some("http/line-too-long") | Some("http/headers")
-        ),
-        "{error}"
-    );
+    assert_eq!(error.provider_code(), Some("http/headers"), "{error}");
 }
 
 /// A repeated `content-length` is a framing ambiguity; the adapter refuses the
@@ -1995,4 +1990,109 @@ fn a_scoped_wasm_call_is_refused() {
     let error = active_rpc::kernel::Provider::invoke(&mut tool, 0, &call)
         .expect_err("a wasm adapter cannot enforce a scope");
     assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Round 24
+// ---------------------------------------------------------------------------
+
+/// A secret argument reaches the process policy. The shape loop refuses every
+/// non-text argument, so checking the secret after it reported the secret as a
+/// malformed argument and the policy branch never ran (round 24, #1).
+#[test]
+fn a_secret_process_argument_is_a_policy_refusal() {
+    let mut tool = LocalProcess::new(absolute_shell(), &["*"]).expect("an absolute program");
+    let mut call = Call::new("run", vec![Arg::Value(Value::Text("x".to_string()))]);
+    call.args.push(Arg::Value(Value::Secret));
+    call.tool_allows_process = true;
+    let error = tool.invoke(0, &call).expect_err("a secret is refused");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// A child killed by a signal has no exit status. Reporting `-1` as the status
+/// made an externally killed mutating tool read as a success (round 24, #3).
+#[cfg(unix)]
+#[test]
+fn a_signalled_child_is_a_provider_fault() {
+    let mut tool = LocalProcess::new("/bin/sh", &["*"]).expect("an absolute program");
+    tool.timeout_ms = 5_000;
+    let mut call = Call::new(
+        "run",
+        vec![
+            Arg::Value(Value::Text("-c".to_string())),
+            Arg::Value(Value::Text("kill -TERM $$".to_string())),
+        ],
+    );
+    call.tool_allows_process = true;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a signalled child is not a success");
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(error.provider_code(), Some("process/signalled"), "{error}");
+}
+
+/// A byte grant below the shortest possible answer can never carry one, so the
+/// refusal names the budget instead of a provider framing fault (round 24, #4).
+#[test]
+fn a_grant_below_the_smallest_answer_is_a_budget_refusal() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/x"))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 8;
+    let error = tool.invoke(0, &call).expect_err("no answer fits the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A JSON-RPC frame carrying both `result` and `error` is malformed. Preferring
+/// `error` let the peer choose which outcome the caller saw (round 24, #6).
+#[test]
+fn an_mcp_frame_with_both_result_and_error_is_refused() {
+    use active_rpc::tool::{McpSession, McpTransport};
+
+    struct RawLines(std::collections::VecDeque<String>);
+
+    impl McpTransport for RawLines {
+        fn send_line(&mut self, _line: &str) -> active_rpc::error::Result<()> {
+            Ok(())
+        }
+
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.0.pop_front().ok_or(active_rpc::error::Error::Timeout)
+        }
+    }
+
+    let mut lines = std::collections::VecDeque::new();
+    lines.push_back(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    lines.push_back(
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    lines.push_back(
+        r#"{"jsonrpc":"2.0","id":3,"result":{"ok":true},"error":{"code":-32000,"message":"no"}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(RawLines(lines)).expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("both members are refused");
+    assert_eq!(error.provider_code(), Some("mcp/bad-response"), "{error}");
+}
+
+/// A zero-byte grant is a budget refusal for every argument size; a large
+/// request used to be reported as a line-ceiling violation first
+/// (round 24, #9).
+#[test]
+fn a_zero_grant_mcp_call_is_a_budget_refusal_at_any_size() {
+    let mut session = echo_session();
+    let big = "x".repeat(1 << 20);
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Text(big))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 0;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("a zero-byte grant does no work");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }

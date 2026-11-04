@@ -542,6 +542,12 @@ impl McpTransport for MemoryTransport {
 /// Longest HTTP status line accepted, in bytes.
 pub const MAX_HTTP_STATUS_LINE: usize = 1024;
 
+/// Smallest answer a byte grant must carry: the shortest status line
+/// (`HTTP/1.0 200\r\n`, 14 bytes) and the empty end-of-head line (2 bytes).
+/// A smaller grant can never receive an answer, so the refusal is a budget
+/// fault rather than a provider fault (round 24, #4).
+pub const MIN_HTTP_ANSWER_BYTES: usize = 16;
+
 /// Longest single HTTP header line accepted, in bytes.
 pub const MAX_HTTP_HEADER_LINE: usize = 8 * 1024;
 
@@ -780,9 +786,11 @@ impl StdioTransport {
             ));
         }
         let program = pin_program(program, "an MCP server")?;
-        let workdir = std::env::current_dir().map_err(|_| Error::Provider {
-            code: "mcp/cwd".to_string(),
-        })?;
+        let workdir = std::env::current_dir()
+            .and_then(std::fs::canonicalize)
+            .map_err(|_| Error::Provider {
+                code: "mcp/cwd".to_string(),
+            })?;
         let mut command = Command::new(&program);
         command
             .args(args)
@@ -1295,7 +1303,18 @@ impl<T: McpTransport> McpSession<T> {
                 // whatever id it reuses: answering it as our result lets a
                 // peer choose the shape of our answer (round 18, L-3).
                 Some(value) if value.as_u64() == Some(id) && !object.contains_key("method") => {
-                    if object.get("result").is_none() && object.get("error").is_none() {
+                    let has_result = object.get("result").is_some();
+                    let has_error = object.get("error").is_some();
+                    if !has_result && !has_error {
+                        self.poisoned = true;
+                        return Err(Error::Provider {
+                            code: "mcp/bad-response".to_string(),
+                        });
+                    }
+                    if has_result && has_error {
+                        // JSON-RPC forbids both members; preferring `error`
+                        // let a peer choose which outcome the caller sees
+                        // (round 24, #6).
                         self.poisoned = true;
                         return Err(Error::Provider {
                             code: "mcp/bad-response".to_string(),
@@ -1381,6 +1400,12 @@ impl<T: McpTransport> Provider for McpSession<T> {
         self.calls += 1;
         if call.budget.max_wall_ms == 0 {
             return Err(Error::BudgetExceeded("wall"));
+        }
+        if call.budget.max_bytes == 0 {
+            // A zero-byte grant cannot carry the answer. Checking it first
+            // reports the budget for every argument size; the static line
+            // ceiling used to mask it on a large request (round 24, #9).
+            return Err(Error::BudgetExceeded("byte"));
         }
         if !call.payload.is_empty() {
             // The adapter builds `arguments` from the arguments; an envelope
@@ -1545,6 +1570,12 @@ impl HttpTool {
             .ok_or(Error::ToolPolicy("only http:// endpoints are supported"))?;
         // A grant too small to hold the head cannot pay for the answer; the
         // static ceiling was its only bound (round 20, M3).
+        if max_body < MIN_HTTP_ANSWER_BYTES {
+            // No answer of any shape fits: the capability cannot carry a
+            // response, which is a budget refusal, not a malformed peer
+            // (round 24, #4).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         let header_cap = MAX_HTTP_HEADER_BYTES.min(max_body.max(1));
         // Resolution is not peer-controlled: the base URL is the operator's
         // endpoint, so the system resolver's own timeout applies here and its
@@ -2344,6 +2375,14 @@ impl Provider for LocalProcess {
                 method: call.method.clone(),
             });
         }
+        if args_contain_secret(&call.args) {
+            // Before the shape loop: `Value::Secret` used to be reported as a
+            // malformed argument there, so this policy branch never ran
+            // (round 23, #1; round 24, #1 was the same gap still live here).
+            return Err(Error::ToolPolicy(
+                "a secret argument cannot be passed to a process",
+            ));
+        }
         let mut args = Vec::new();
         for arg in &call.args {
             // A process argument is text. Anything else would be executed as
@@ -2382,14 +2421,6 @@ impl Provider for LocalProcess {
             // A zero-byte grant cannot carry an answer; the child is never
             // started (round 22, F-A).
             return Err(Error::BudgetExceeded("byte"));
-        }
-        if args_contain_secret(&call.args) {
-            // Before the shape loop: `Value::Secret` used to be reported as a
-            // malformed argument there, so the policy branch below never ran
-            // (round 23, #1).
-            return Err(Error::ToolPolicy(
-                "a secret argument cannot be passed to a process",
-            ));
         }
         // The policy in the capability must have granted process execution.
         if !call.tool_allows_process {
@@ -2648,10 +2679,13 @@ impl Provider for LocalProcess {
             return Err(Error::ToolPolicy("output too large"));
         }
         let mut map = BTreeMap::new();
-        map.insert(
-            "status".to_string(),
-            Value::Int(status.code().unwrap_or(-1) as i64),
-        );
+        // A child killed by a signal has no exit code. Reporting `-1` as a
+        // status made an externally killed mutating tool look successful in
+        // the receipt (round 24, #3).
+        let status_code = status.code().ok_or(Error::Provider {
+            code: "process/signalled".to_string(),
+        })?;
+        map.insert("status".to_string(), Value::Int(i64::from(status_code)));
         // A binary stream is not text: transcoding it inserts replacement
         // characters, so two different byte strings would compare equal
         // (round 13, F-6).

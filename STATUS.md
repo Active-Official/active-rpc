@@ -88,7 +88,10 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
     needs a record-format version plus a provider epoch/stable-key callback
     (audit ARPC-009); the seal and peer binding are enforced, semantic object
     identity is not.
-12. **The wasm clock ADR is being aligned with the code** (`env.clock_ms` is the
-    kernel/embedder `now_ms`). Recorded until the ADR-0019 edit lands with the
-    documentation batch.
+12. **HTTP and process adapter limits are public and mutable after
+    construction.** `HttpTool::{max_body,max_request}` and
+    `LocalProcess::{allow_args,env,max_output,timeout}` can be widened by code
+    inside the host process. A peer has no path to them, so this is an operator
+    footgun rather than an escalation; moving them behind setters is a breaking
+    change scheduled with the next minor release.
 

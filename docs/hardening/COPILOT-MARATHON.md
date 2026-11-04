@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-29: 29 found 1 high, fixed; rounds 30-31 must be clean | 177 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-22: ... + 9 findings; round 23 is the confirmation | 188 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-24: round 24 found 3 mediums and 7 lows, all fixed or triaged; rounds 25-26 must be clean | 196 fixed / 1 rejected / 0 open (2 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -308,6 +308,28 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 24)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `a845fe0`. Round-23 fixes
+verified except one (the process secret branch was still dead) and one partial.
+Four mediums reported, three confirmed; seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the process secret branch really was dead: the shape loop refuses a non-text argument before `args_contain_secret`, so `Value::Secret` was `rpc/invalid-argument` and the promised `rpc/tool-policy` never fired | **fixed**: the secret check runs before the loop; `a_secret_process_argument_is_a_policy_refusal` |
+| 2 | medium | `SHELL_METACHARACTERS` omitted TAB, `,` and `\`, which the reviewer read as command separators | **rejected with evidence**: `cmd /C echo one,two` prints `one,two` and a tab prints literally, so neither splits a command; in POSIX `sh` a backslash quotes the next character and cannot chain without one of the separators already refused; `2` also broke the two shipped process tests whose arguments carry Windows paths (`local_process_timeout_kills_a_hung_child`, `capability_wall_budget_caps_a_slow_tool`) |
+| 3 | medium | a signal death was reported as `status: -1` and `Ok`, so an externally killed mutating tool sealed an `Admitted` receipt that read as a success | **fixed**: no exit code is `provider(process/signalled)` and documented in `wire.md`; Unix test `a_signalled_child_is_a_provider_fault` |
+| 4 | medium | a byte grant below the shortest possible answer surfaced as `http/line-too-long` or `http/body-too-large`, which reads as a provider fault | **fixed**: `min(max_body, ...) < MIN_HTTP_ANSWER_BYTES` (16) is `rpc/budget-exceeded` before the request is sent; `a_grant_below_the_smallest_answer_is_a_budget_refusal`; the older head-cap test now uses a 40-byte grant |
+| 5 | low | the wasm input was copied (`to_vec`/`clone`) before any byte-grant check | **fixed**: the argument is borrowed and length-checked against the grant, and the copy happens after every check |
+| 6 | low | an MCP frame carrying both `result` and `error` was accepted, and `error` won, so the peer chose the caller-visible outcome | **fixed**: both members is `mcp/bad-response` and poisons the session; `an_mcp_frame_with_both_result_and_error_is_refused` |
+| 7 | low | map keys did not charge `remaining_values`, so a key-heavy envelope bought one `BTreeMap` insert per key for free | **fixed**: each key charges the arena; `map_keys_charge_the_decode_arena` fails against the pre-fix decode |
+| 8 | low | `StdioTransport::spawn` pinned the raw `current_dir` without canonicalising, unlike `LocalProcess` | **fixed**: the directory is canonicalised before it is pinned |
+| 9 | low | a zero-byte MCP grant with a request past the static 1 MiB line ceiling reported `rpc/invalid-argument` | **fixed**: the zero grant is `rpc/budget-exceeded` before anything else |
+| 10 | low | `HttpTool::{max_body,max_request}` and `LocalProcess::{allow_args,env,max_output,timeout}` stay public and mutable after construction | **recorded residual**: mutation needs code inside the host process, and a peer has no path to it; `STATUS.md` row 13 |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc;
+negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 23)
 
