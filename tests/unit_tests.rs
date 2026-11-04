@@ -584,10 +584,19 @@ fn wire_rejects_malformed_envelopes() {
         path_scope: None,
     };
     cap.budget.max_calls = 0;
-    let envelope = Envelope::request(1, "stats", vec![]).with_caps(vec![cap]);
-    let bytes = envelope.encode().unwrap();
+    let envelope = Envelope::request(1, "stats", vec![]).with_caps(vec![cap.clone()]);
+    // The writer refuses to produce an envelope it would itself refuse, and the
+    // low-level table encoder (which carries no policy) still round-trips into a
+    // decoder refusal: both sides apply the same rule (round 33, M4).
     assert_eq!(
-        Envelope::decode(&bytes).unwrap_err().code(),
+        envelope.encode().unwrap_err().code(),
+        "rpc/capability-table"
+    );
+    let table = active_rpc::wire::encode_capability_table(&[cap]).unwrap();
+    assert_eq!(
+        active_rpc::wire::decode_capability_table(&table)
+            .unwrap_err()
+            .code(),
         "rpc/capability-table"
     );
 

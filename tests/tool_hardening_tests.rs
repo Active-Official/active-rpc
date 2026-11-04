@@ -2570,3 +2570,242 @@ fn a_line_past_the_static_ceiling_poisons_even_under_a_small_grant() {
         .expect_err("the session is poisoned");
     assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 33
+// ---------------------------------------------------------------------------
+
+/// A number with a leading zero is not a JSON number token, so a body like
+/// `00` is text rather than a provider fault (round 33, M1).
+#[test]
+fn a_zero_padded_number_is_text_not_a_bad_number() {
+    for body in ["00", "01", "-00"] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        fixed_response(
+            listener,
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        );
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/p")]);
+        let mut call = Call::new("get", vec![Arg::Value(Value::path("/p"))]);
+        call.tool_allows_process = true;
+        let response = tool.invoke(0, &call).expect("a padded number is text");
+        assert_eq!(response, Response::Value(Value::text(body)), "{body}");
+    }
+}
+
+/// The repair heuristic replaces a span only when the span is one number
+/// token: `1-2` and `1e` are framing faults in the answer, not out-of-range
+/// numbers (round 33, M2).
+#[test]
+fn a_malformed_number_group_is_text_not_a_bad_number() {
+    for body in ["[1-2]", "[1e]", "{\"n\":1-2}"] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        fixed_response(
+            listener,
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        );
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/p")]);
+        let mut call = Call::new("get", vec![Arg::Value(Value::path("/p"))]);
+        call.tool_allows_process = true;
+        let response = tool.invoke(0, &call).expect("not a number");
+        assert_eq!(response, Response::Value(Value::text(body)), "{body}");
+    }
+}
+
+/// The argument line spends part of the capability's grant: what it costs is
+/// not available to the child's output (round 33, H1).
+#[test]
+fn an_argument_line_spends_part_of_the_process_grant() {
+    #[cfg(windows)]
+    let argv: Vec<&str> = vec![
+        "/C",
+        "echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ];
+    #[cfg(not(windows))]
+    let argv: Vec<&str> = vec!["-c", "printf '%060d' 0"];
+    let arguments: Vec<Arg> = argv.iter().map(|argument| Arg::text(*argument)).collect();
+    let argv_bytes: u64 = arguments.iter().map(Arg::wire_size).sum();
+
+    let mut tool = LocalProcess::new(absolute_shell(), &argv).expect("an absolute program");
+    #[cfg(windows)]
+    tool.env.insert(
+        "SystemRoot".to_string(),
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+    );
+    let mut call = Call::new("run", arguments);
+    call.tool_allows_process = true;
+    // The line fits with about 20 bytes to spare; the child prints 60.
+    call.budget.max_bytes = argv_bytes + 20;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the output is past what the line left");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// The response head spends part of the capability's grant: a body that fits
+/// the grant but not what the head left is refused (round 33, H1).
+#[test]
+fn a_response_body_is_bounded_by_what_the_head_left() {
+    let path = format!("/{}", "p".repeat(300));
+    let body = "y".repeat(120);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    fixed_response(
+        listener,
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    );
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", &path)]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path(&path))]);
+    call.tool_allows_process = true;
+    // The long allowlisted path puts about 60 bytes of the head past the free
+    // allowance; 200 covers the head but not the head and the body together.
+    call.budget.max_bytes = 200;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the body is past the head");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// The MCP request line spends part of the capability's grant: an answer that
+/// fits the grant but not what the request left is refused (round 33, H1).
+#[test]
+fn an_mcp_answer_is_bounded_by_what_the_request_left() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+    use std::sync::{Arc, Mutex};
+
+    struct Recorder {
+        inner: MemoryTransport,
+        lengths: Arc<Mutex<Vec<usize>>>,
+    }
+    impl McpTransport for Recorder {
+        fn send_line(&mut self, line: &str) -> active_rpc::error::Result<()> {
+            self.lengths.lock().expect("lock").push(line.len());
+            self.inner.send_line(line)
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.inner.recv_line()
+        }
+    }
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/call".to_string(),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"result":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            "z".repeat(40)
+        ),
+    );
+    let lengths = Arc::new(Mutex::new(Vec::new()));
+    let mut session = McpSession::handshake(Recorder {
+        inner: MemoryTransport::new(responses),
+        lengths: Arc::clone(&lengths),
+    })
+    .expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    // A generous grant measures the request line on the shipped path.
+    call.budget.max_bytes = 1 << 20;
+    active_rpc::kernel::Provider::invoke(&mut session, 0, &call).expect("the first call");
+    let request = *lengths
+        .lock()
+        .expect("lock")
+        .last()
+        .expect("a request line");
+    // The answer line fits the grant as a whole, so only the request's share
+    // makes the difference: room for the request and 30 bytes more, while the
+    // answer line is longer than 30.
+    let answer = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"result":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+        "z".repeat(40)
+    )
+    .len();
+    assert!(
+        answer > 30 && answer <= request + 30,
+        "the fixture must fit the grant and not what the request leaves: \
+         request {request}, answer {answer}"
+    );
+    call.budget.max_bytes = (request + 30) as u64;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the answer is past what the request left");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A far deadline does not buy a longer enqueue wait: a full queue is
+/// backpressure, so the cap refuses inside five seconds (round 33, M3).
+#[test]
+fn a_far_deadline_does_not_extend_the_enqueue_wait() {
+    use active_rpc::tool::{McpTransport, StdioTransport};
+    use std::time::{Duration, Instant};
+
+    #[cfg(windows)]
+    let (program, args): (&str, Vec<&str>) = (
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 20"],
+    );
+    #[cfg(unix)]
+    let (program, args): (&str, Vec<&str>) = ("/bin/sh", vec!["-c", "sleep 20"]);
+    #[cfg(windows)]
+    let env: std::collections::BTreeMap<String, String> =
+        [("SystemRoot".to_string(), "C:\\Windows".to_string())]
+            .into_iter()
+            .collect();
+    #[cfg(unix)]
+    let env: std::collections::BTreeMap<String, String> =
+        [("PATH".to_string(), "/usr/bin:/bin".to_string())]
+            .into_iter()
+            .collect();
+    let mut transport = StdioTransport::spawn(program, &args, &env).expect("spawn a silent server");
+    // The child never reads: a line larger than the pipe buffer holds the
+    // writer thread, and the next line fills the capacity-one queue.
+    let filler = "x".repeat(512 * 1024);
+    let short = Instant::now() + Duration::from_millis(50);
+    let _ = transport.send_line_within(&filler, Some(short));
+    std::thread::sleep(Duration::from_millis(200));
+    let mut queued = false;
+    for _ in 0..3 {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        match transport.send_line_within(&filler, Some(deadline)) {
+            Err(active_rpc::Error::Timeout) => {
+                queued = true;
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    assert!(queued, "the queue never filled");
+    let far = Instant::now() + Duration::from_secs(20);
+    let started = Instant::now();
+    let error = transport
+        .send_line_within("x", Some(far))
+        .expect_err("the queue is full");
+    let elapsed = started.elapsed();
+    assert_eq!(error.provider_code(), Some("mcp/queue"), "{error}");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "the enqueue waited {elapsed:?} instead of the five-second cap"
+    );
+}

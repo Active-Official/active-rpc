@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-39: round 39 found 2 mediums and 7 lows, all fixed; rounds 40-41 must be clean | 236 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-32: round 32 found 1 high, 2 mediums and 1 low, all fixed; rounds 33-34 must be clean | 239 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-33: round 33 found 3 highs and 4 mediums, all fixed; rounds 34-35 must be clean | 246 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -474,6 +474,24 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 33)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `a42978a`. Round-32 fixes
+all verified HOLD. Three **highs**, four mediums.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the byte grant was spent twice: `Process` charged the argv and then read `grant` again as its output cap, `Http` charged the head and then read the body up to `grant`, and `McpSession` bounded the request and the answer each by `grant` | **fixed**: one share per call. The process caps the read at `grant - arg_bytes`, HTTP at `grant - charged`, and MCP at `max_line - sent_bytes` (the static ceiling still binds when the grant is at or above it); `an_argument_line_spends_part_of_the_process_grant`, `a_response_body_is_bounded_by_what_the_head_left`, `an_mcp_answer_is_bounded_by_what_the_request_left` |
+| 2 | high | `check_limits` reported an oversized payload as `rpc/payload` while the decoder reports `rpc/wire`, so a caller that branches on the class fixes an image instead of shrinking a frame | **fixed**: `Error::Wire("payload exceeds the ceiling")`; `an_oversized_payload_is_a_wire_fault_at_the_writer` |
+| 3 | high | on Windows the kill ends the leader only, so a descendant that holds the pipe keeps each reader thread blocked in `read`; a timeout loop leaked two threads per call | **fixed**: `LIVE_READERS` with `MAX_LIVE_READERS` (256) and a `ReaderSlot` guard, so a spawn failure or a finished reader releases its place and a call past the cap is refused `process/thread:…`; `the_reader_cap_refuses_beyond_its_ceiling_and_releases_on_drop` (the descendant kill stays the documented ARPC-004 residual) |
+| 4 | medium | `is_number_token("00")` was true, so a bare zero-padded body was reported `bad-number` instead of text | **fixed**: a leading zero is refused unless the integer part is one digit; `a_zero_padded_number_is_text_not_a_bad_number` |
+| 5 | medium | the repair scan groups `1-2` and `1e` into one literal, so a framing fault was reported `bad-number` | **fixed**: a span is repaired only when it is one number token; `a_malformed_number_group_is_text_not_a_bad_number` |
+| 6 | medium | the MCP enqueue wait took the caller's deadline uncapped, so a full queue with a 300 s wall ceiling held the dispatch thread that long | **fixed**: `min(deadline, now + 5 s)` for the enqueue only (the ack keeps its own bound); `a_far_deadline_does_not_extend_the_enqueue_wait` |
+| 7 | medium | `check_limits` omitted the zero id, the empty method set, `budget.check()` and the duplicate id, so the encoder emitted frames the decoder refuses | **fixed**: all four are refused locally; `tests/wire_round33_tests.rs` (five tests, all failing against the pre-fix tree) |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 32)
 

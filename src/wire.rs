@@ -470,7 +470,10 @@ impl Envelope {
             return Err(Error::Wire("argument count exceeds the ceiling"));
         }
         if self.payload.len() > limits.max_payload as usize {
-            return Err(Error::Payload("payload exceeds the ceiling".to_string()));
+            // A ceiling is `rpc/wire`, like every other limit: `rpc/payload`
+            // means "this is not an image", which would send a caller to fix a
+            // payload that is merely too large (round 33, H2).
+            return Err(Error::Wire("payload exceeds the ceiling"));
         }
         if self.caps.len() > limits.max_caps as usize {
             return Err(Error::CapabilityTable("too many descriptors"));
@@ -480,6 +483,15 @@ impl Envelope {
             .iter()
             .chain(self.cap_delta.iter().flat_map(|delta| delta.added.iter()))
         {
+            if cap.id.0 == [0u8; 16] {
+                return Err(Error::CapabilityTable("zero capability id"));
+            }
+            if cap.methods.is_empty() {
+                return Err(Error::CapabilityTable("capability grants no methods"));
+            }
+            cap.budget
+                .check()
+                .map_err(|_| Error::CapabilityTable("budget disables a ceiling"))?;
             if cap.methods.len() > limits.max_methods as usize {
                 return Err(Error::CapabilityTable("too many methods"));
             }
@@ -489,6 +501,18 @@ impl Envelope {
                 .is_some_and(|path| path.len() > limits.max_path as usize)
             {
                 return Err(Error::CapabilityTable("path scope exceeds the ceiling"));
+            }
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for cap in self
+            .caps
+            .iter()
+            .chain(self.cap_delta.iter().flat_map(|delta| delta.added.iter()))
+        {
+            if !ids.insert(cap.id) {
+                // The decoder refuses a repeated id: a table order would decide
+                // which descriptor wins (round 33, M4).
+                return Err(Error::CapabilityTable("duplicate capability id"));
             }
         }
         if let Some(delta) = &self.cap_delta {

@@ -185,6 +185,12 @@ fn text_fails_only_on_a_number(text: &str) -> bool {
     let mut repaired = String::with_capacity(text.len().saturating_sub(spans.len()));
     let mut cursor = 0usize;
     for (start, end) in spans {
+        // A span is replaced only when it really is one number token: the scan
+        // groups `1-2` or `1e` into a single span, and repairing those would
+        // report a framing fault as a bad number (round 33, M2).
+        if !is_number_token(&text[start..end]) {
+            return false;
+        }
         repaired.push_str(&text[cursor..start]);
         repaired.push('0');
         cursor = end;
@@ -211,9 +217,12 @@ fn is_number_token(text: &str) -> bool {
     while index < bytes.len() && bytes[index].is_ascii_digit() {
         index += 1;
     }
-    // JSON requires at least one integer digit: `-.5` is not a number
-    // (round 32, #4).
+    // JSON requires at least one integer digit and forbids a leading zero:
+    // `-.5` and `00` are not numbers (round 32, #4; round 33, M1).
     if index == int_start {
+        return false;
+    }
+    if index - int_start > 1 && bytes[int_start] == b'0' {
         return false;
     }
     if index < bytes.len() && bytes[index] == b'.' {
@@ -419,6 +428,40 @@ const MAX_JSON_NODES: usize = 1 << 20;
 
 /// Largest child output this adapter will buffer.
 const MAX_OUTPUT_BYTES: usize = 16 << 20;
+
+/// Process reader threads that may still be draining an earlier child.
+///
+/// On Windows the cleanup kills the leader only (ARPC-004), so a descendant
+/// that holds the pipe keeps its reader blocked in `read` until it exits. The
+/// count is capped so a timeout loop cannot exhaust the process
+/// (round 33, H3).
+static LIVE_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Cap for [`LIVE_READERS`]; well above any legitimate concurrency.
+const MAX_LIVE_READERS: usize = 256;
+
+/// One reserved place in [`LIVE_READERS`], released when the reader ends.
+///
+/// A guard rather than paired calls: a thread that fails to spawn drops the
+/// closure, so a failed spawn cannot leak a place and eventually refuse every
+/// process call (round 33, H3).
+struct ReaderSlot;
+
+impl ReaderSlot {
+    fn acquire() -> Option<Self> {
+        if LIVE_READERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_LIVE_READERS {
+            LIVE_READERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return None;
+        }
+        Some(Self)
+    }
+}
+
+impl Drop for ReaderSlot {
+    fn drop(&mut self) {
+        let _ = LIVE_READERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Largest HTTP request body a caller may configure.
 ///
@@ -995,13 +1038,14 @@ impl McpTransport for StdioTransport {
         let mut command = (line.to_string(), reply);
         // A caller with no deadline still gets bounded waits: the writer blocks
         // while the child does not read, so the enqueue waits 5 s and the ack
-        // 5 s (round 18, L-7; round 30, #4). The two are separate because a
-        // large line may legitimately take the writer a while.
-        let enqueue_deadline = deadline.unwrap_or_else(|| {
-            std::time::Instant::now()
-                .checked_add(std::time::Duration::from_secs(5))
-                .unwrap_or_else(std::time::Instant::now)
-        });
+        // 5 s (round 18, L-7; round 30, #4). A far deadline does not buy a
+        // longer enqueue wait: a full queue is backpressure, not work
+        // (round 33, M3).
+        let enqueue_now = std::time::Instant::now();
+        let enqueue_cap = enqueue_now
+            .checked_add(std::time::Duration::from_secs(5))
+            .unwrap_or(enqueue_now);
+        let enqueue_deadline = deadline.map_or(enqueue_cap, |value| value.min(enqueue_cap));
         loop {
             match self.writer.try_send(command) {
                 Ok(()) => break,
@@ -1282,6 +1326,9 @@ impl<T: McpTransport> McpSession<T> {
                 "the MCP request exceeds the line ceiling",
             ));
         }
+        // The request spent part of the grant; only the remainder is available
+        // to the answer (round 33, H1).
+        let sent_bytes = line.len();
         // A ceiling already spent means nothing has been written: the session
         // stays usable, and the caller may retry (round 5, #5).
         if let Some(deadline) = deadline {
@@ -1325,9 +1372,19 @@ impl<T: McpTransport> McpSession<T> {
                     code: "mcp/line-too-long".to_string(),
                 });
             }
-            if max_line < MAX_MCP_LINE_BYTES && line.len() > max_line {
+            // The request spent part of the grant; only the remainder is
+            // available to the answer when the grant is the binding ceiling
+            // (round 33, H1). At or above the static ceiling the grant is not
+            // what bounds the answer, so the full line stays legal.
+            let response_cap = if max_line >= MAX_MCP_LINE_BYTES {
+                MAX_MCP_LINE_BYTES
+            } else {
+                max_line.saturating_sub(sent_bytes)
+            };
+            if response_cap < MAX_MCP_LINE_BYTES && line.len() > response_cap {
                 // The capability's byte grant bounds what this call may buffer,
-                // not only what it may return (round 19, M2). The line was
+                // not only what it may return (round 19, M2); the request line
+                // already spent its part (round 33, H1). The line was
                 // consumed, so the session stays in step, and a grant refusal
                 // does not poison it (round 28, #2).
                 return Err(Error::BudgetExceeded("byte"));
@@ -1729,6 +1786,9 @@ impl HttpTool {
         if charged > grant {
             return Err(Error::BudgetExceeded("byte"));
         }
+        // The request spent part of the grant; only the remainder is available
+        // to the answer (round 33, H1).
+        let max_body = max_body.min(grant.saturating_sub(charged));
         // A grant too small to hold the head cannot pay for the answer; the
         // static ceiling was its only bound (round 20, M3).
         if max_body < MIN_HTTP_ANSWER_BYTES {
@@ -2739,7 +2799,10 @@ impl Provider for LocalProcess {
         // what is read: a call with an 8-byte grant must not make the host
         // buffer a megabyte (round 19, M2).
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
-        let max_output = self.max_output.min(MAX_OUTPUT_BYTES).min(grant);
+        // One grant for the call: what the argument line spends is not
+        // available to the output (round 33, H1).
+        let share = grant.saturating_sub(arg_bytes as usize);
+        let max_output = self.max_output.min(MAX_OUTPUT_BYTES).min(share);
         // Which ceiling bound the read: token the refusal accordingly so a
         // caller can tell a capability budget from an adapter setting
         // (round 25, #3).
@@ -2767,6 +2830,15 @@ impl Provider for LocalProcess {
              mut stream: Option<Box<dyn std::io::Read + Send>>| {
                 if let Some(mut stream) = stream.take() {
                     let shared = std::sync::Arc::clone(&shared);
+                    // Every reader of a descendant-held pipe outlives its call
+                    // on Windows; a timeout loop must not be able to exhaust
+                    // the process (round 33, H3).
+                    let Some(slot) = ReaderSlot::acquire() else {
+                        spawn_error = Some(std::io::Error::other(
+                            "too many process readers are still draining an earlier child",
+                        ));
+                        return;
+                    };
                     // `thread::spawn` panics on failure; a named builder
                     // reports it, and the child is killed rather than leaked
                     // (round 10, F-4).
@@ -2774,6 +2846,7 @@ impl Provider for LocalProcess {
                         .name("active-rpc-process-reader".to_string())
                         .spawn(move || {
                             use std::io::Read;
+                            let _slot = slot;
                             let mut buffer = Vec::new();
                             let mut chunk = [0u8; 8 * 1024];
                             loop {
@@ -2957,5 +3030,42 @@ impl Provider for LocalProcess {
         map.insert("stdout".to_string(), stream(stdout));
         map.insert("stderr".to_string(), stream(stderr));
         Ok(Response::Value(Value::Map(map)))
+    }
+}
+
+#[cfg(test)]
+mod reader_slot_tests {
+    use super::{ReaderSlot, MAX_LIVE_READERS};
+
+    /// The reservation is a hard cap and a drop always gives the place back,
+    /// including when the thread that took it never started
+    /// (round 33, H3).
+    #[test]
+    fn the_reader_cap_refuses_beyond_its_ceiling_and_releases_on_drop() {
+        let mut held = Vec::new();
+        while let Some(slot) = ReaderSlot::acquire() {
+            held.push(slot);
+            assert!(
+                held.len() <= MAX_LIVE_READERS,
+                "the cap admitted {} reservations",
+                held.len()
+            );
+        }
+        assert_eq!(held.len(), MAX_LIVE_READERS);
+        assert!(ReaderSlot::acquire().is_none(), "the cap is full");
+
+        // A dropped reservation is reusable: a reader that ends (or a spawn
+        // that fails) must not consume a place for the life of the process.
+        held.pop();
+        let again = ReaderSlot::acquire().expect("a released place is reusable");
+        drop(again);
+        drop(held);
+
+        // And every place is back.
+        let mut recovered = Vec::new();
+        while let Some(slot) = ReaderSlot::acquire() {
+            recovered.push(slot);
+        }
+        assert_eq!(recovered.len(), MAX_LIVE_READERS);
     }
 }
