@@ -1456,6 +1456,14 @@ impl<T: McpTransport> Provider for McpSession<T> {
                             "an MCP argument cannot carry a non-finite number",
                         ));
                     }
+                    if crate::kernel::value_too_deep(value, crate::wire::MAX_VALUE_DEPTH) {
+                        // `value_to_json` recurses; a caller-built value past
+                        // the wire depth would abort the stack where no
+                        // `catch_unwind` can help (round 25, #1).
+                        return Err(Error::InvalidArgument(
+                            "an MCP argument is nested too deeply",
+                        ));
+                    }
                     arguments.insert(format!("arg{index}"), value_to_json(value));
                 }
                 // A capability or a promise is authority, not JSON text: the
@@ -1563,7 +1571,20 @@ impl HttpTool {
         body: Option<&[u8]>,
         ceiling_ms: u64,
         max_body: usize,
+        grant_bound: bool,
     ) -> Result<(u16, Vec<u8>)> {
+        // A cap-derived refusal is a budget exhaustion when the capability's
+        // grant set the cap, and a provider framing fault otherwise
+        // (round 25, #7).
+        let capped = |code: &'static str| {
+            if grant_bound {
+                Error::BudgetExceeded("byte")
+            } else {
+                Error::Provider {
+                    code: code.to_string(),
+                }
+            }
+        };
         let base = self
             .base
             .strip_prefix("http://")
@@ -1661,7 +1682,14 @@ impl HttpTool {
         // Every line is read under a cap, and the block has its own budget: a
         // hostile endpoint that streams headers would otherwise grow a `String`
         // until the allocator aborts the process (outside `catch_unwind`).
-        let mut status_line = reader.line(MAX_HTTP_STATUS_LINE.min(header_cap).max(1))?;
+        let mut status_line = reader
+            .line(MAX_HTTP_STATUS_LINE.min(header_cap).max(1))
+            .map_err(|error| match &error {
+                Error::Provider { code } if grant_bound && code == "http/line-too-long" => {
+                    Error::BudgetExceeded("byte")
+                }
+                _ => error,
+            })?;
         let status: u16 = status_line
             .split_whitespace()
             .nth(1)
@@ -1703,8 +1731,19 @@ impl HttpTool {
         let mut content_length: Option<usize> = None;
         let mut fields = 0usize;
         loop {
-            let line = reader.line(MAX_HTTP_HEADER_LINE.min(header_cap).max(1))?;
+            let line = reader
+                .line(MAX_HTTP_HEADER_LINE.min(header_cap).max(1))
+                .map_err(|error| match &error {
+                    Error::Provider { code } if grant_bound && code == "http/line-too-long" => {
+                        Error::BudgetExceeded("byte")
+                    }
+                    _ => error,
+                })?;
             if line == "\r\n" || line == "\n" {
+                // The empty line is part of the head the grant pays for. Not
+                // counting it left the body cap two bytes too generous
+                // (round 25, #5).
+                header_bytes = header_bytes.saturating_add(line.len());
                 break;
             }
             if line.trim().is_empty() {
@@ -1718,9 +1757,7 @@ impl HttpTool {
             header_bytes = header_bytes.saturating_add(line.len());
             fields += 1;
             if header_bytes > header_cap || fields > MAX_HTTP_HEADER_FIELDS {
-                return Err(Error::Provider {
-                    code: "http/headers".to_string(),
-                });
+                return Err(capped("http/headers"));
             }
             let Some((name, value)) = line.split_once(':') else {
                 // A header line without a colon is a framing fault: ignoring it
@@ -1781,28 +1818,38 @@ impl HttpTool {
         // (round 22, F-F).
         let body_cap = max_body.saturating_sub(header_bytes);
         if body_cap == 0 {
-            return Err(Error::Provider {
-                code: "http/body-too-large".to_string(),
-            });
+            return Err(capped("http/body-too-large"));
         }
         let body = match content_length {
             Some(length) => {
                 // The peer names this length; a caller-set `max_body` past a
                 // sane ceiling would turn it into an allocation abort
                 // (round 11, #14).
-                if length > MAX_RESPONSE_BYTES || length > body_cap {
-                    // The same code as the read-to-end arm: a peer must not
-                    // choose the code by choosing a framing (round 12, F-5).
+                if length > MAX_RESPONSE_BYTES {
                     return Err(Error::Provider {
                         code: "http/body-too-large".to_string(),
                     });
+                }
+                if length > body_cap {
+                    // The same code as the read-to-end arm: a peer must not
+                    // choose the code by choosing a framing (round 12, F-5).
+                    return Err(capped("http/body-too-large"));
                 }
                 reader.body_exact(length)?
             }
             None => {
                 // `body_rest` already enforces `min(max_body, MAX_RESPONSE_BYTES)`
                 // and answers `http/body-too-large` (round 13, F-4).
-                reader.body_rest(body_cap.min(MAX_RESPONSE_BYTES))?
+                reader.body_rest(body_cap.min(MAX_RESPONSE_BYTES)).map_err(
+                    |error| match &error {
+                        Error::Provider { code }
+                            if grant_bound && code == "http/body-too-large" =>
+                        {
+                            Error::BudgetExceeded("byte")
+                        }
+                        _ => error,
+                    },
+                )?
             }
         };
         Ok((status, body))
@@ -1999,6 +2046,10 @@ impl Provider for HttpTool {
                             "an HTTP body cannot carry a non-finite number",
                         ));
                     }
+                    if crate::kernel::value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
+                        // `value_to_json` recurses (round 25, #1).
+                        return Err(Error::InvalidArgument("an HTTP body is nested too deeply"));
+                    }
                     serde_json::to_vec(&value_to_json(&value))
                         .map_err(|_| Error::InvalidArgument("the HTTP body cannot be serialised"))?
                 }
@@ -2007,7 +2058,13 @@ impl Provider for HttpTool {
             let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
             // A public field can be set past any sane ceiling; the static cap
             // bounds it regardless of the grant (round 21, F10).
-            if body.len() > self.max_request.min(MAX_REQUEST_BYTES).min(grant) {
+            if body.len() > grant {
+                // The capability's grant is the tighter authority, so the
+                // refusal names the budget rather than a tool policy
+                // (round 25, #2).
+                return Err(Error::BudgetExceeded("byte"));
+            }
+            if body.len() > self.max_request.min(MAX_REQUEST_BYTES) {
                 return Err(Error::ToolPolicy("request too large"));
             }
             Some(body)
@@ -2022,6 +2079,7 @@ impl Provider for HttpTool {
             body.as_deref(),
             call.budget.max_wall_ms,
             cap,
+            grant < self.max_body.min(MAX_RESPONSE_BYTES),
         )?;
         if !(200..300).contains(&status) {
             // A 3xx is not a completed call: the adapter does not follow
@@ -2253,8 +2311,11 @@ impl LocalProcess {
         })?;
         // Canonical now, so a symlink swapped in later does not change what the
         // stored path names (audit ARPC-005). A directory that cannot be
-        // canonicalised keeps its absolute form; `invoke` re-checks it.
-        let workdir = std::fs::canonicalize(&workdir).unwrap_or(workdir);
+        // canonicalised is refused: falling back to the raw path let a later
+        // link swap redirect the child (round 25, #6).
+        let workdir = std::fs::canonicalize(&workdir).map_err(|_| Error::Provider {
+            code: "process/cwd".to_string(),
+        })?;
         Ok(Self {
             program,
             allow_args: allow_args.iter().map(|arg| arg.to_string()).collect(),
@@ -2375,6 +2436,13 @@ impl Provider for LocalProcess {
                 method: call.method.clone(),
             });
         }
+        if call.budget.max_bytes == 0 {
+            // The grant is checked before any argument rule: otherwise a
+            // disallowed argument answered `rpc/tool-policy` and an allowed one
+            // `rpc/budget-exceeded`, which is an allowlist oracle for a direct
+            // caller (round 25, #4). The child is never started.
+            return Err(Error::BudgetExceeded("byte"));
+        }
         if args_contain_secret(&call.args) {
             // Before the shape loop: `Value::Secret` used to be reported as a
             // malformed argument there, so this policy branch never ran
@@ -2416,11 +2484,6 @@ impl Provider for LocalProcess {
                 ));
             }
             args.push(text.clone());
-        }
-        if call.budget.max_bytes == 0 {
-            // A zero-byte grant cannot carry an answer; the child is never
-            // started (round 22, F-A).
-            return Err(Error::BudgetExceeded("byte"));
         }
         // The policy in the capability must have granted process execution.
         if !call.tool_allows_process {
@@ -2490,6 +2553,16 @@ impl Provider for LocalProcess {
         // buffer a megabyte (round 19, M2).
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
         let max_output = self.max_output.min(MAX_OUTPUT_BYTES).min(grant);
+        // Which ceiling bound the read: token the refusal accordingly so a
+        // caller can tell a capability budget from an adapter setting
+        // (round 25, #3).
+        let output_refusal = || {
+            if grant < self.max_output.min(MAX_OUTPUT_BYTES) {
+                Error::BudgetExceeded("byte")
+            } else {
+                Error::ToolPolicy("output too large")
+            }
+        };
         // One budget for both pipes: each reader used to take a full ceiling,
         // so transient buffering reached twice the grant (round 21, F1).
         let shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -2624,7 +2697,7 @@ impl Provider for LocalProcess {
                         // grant pay for twice the bytes (round 20, M2).
                         if stdout.len().saturating_add(stderr.len()) > max_output {
                             kill_process_tree(&mut child);
-                            return Err(Error::ToolPolicy("output too large"));
+                            return Err(output_refusal());
                         }
                     }
                     if std::time::Instant::now() >= deadline {
@@ -2666,7 +2739,7 @@ impl Provider for LocalProcess {
                     // the grant (round 11, #2).
                     if stdout.len().saturating_add(stderr.len()) > max_output {
                         kill_process_tree(&mut child);
-                        return Err(Error::ToolPolicy("output too large"));
+                        return Err(output_refusal());
                     }
                 }
                 Err(_) => {
@@ -2676,7 +2749,7 @@ impl Provider for LocalProcess {
             }
         }
         if stdout.len().saturating_add(stderr.len()) > max_output {
-            return Err(Error::ToolPolicy("output too large"));
+            return Err(output_refusal());
         }
         let mut map = BTreeMap::new();
         // A child killed by a signal has no exit code. Reporting `-1` as a

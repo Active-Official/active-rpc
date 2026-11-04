@@ -270,8 +270,8 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
 | `http/bad-number` | a JSON number has no `Value` form: an integer outside `i64`, or a float that is not finite (a literal with a fraction or an exponent that overflows `f64`) |
 | `http/too-complex` | an object or array body has more than 2^20 structural tokens before parsing, or the decoded tree has more than 2^20 nodes |
-| `http/body-too-large` | the response body exceeded `min(max_body, 64 MiB, the capability byte grant)`, by its declared length or by its stream |
-| `http/line-too-long` | a status or header line exceeded its own cap |
+| `http/body-too-large` | the response body exceeded `min(max_body, 64 MiB)`, by its declared length or by its stream; when the capability's byte grant is the tighter ceiling the refusal is `rpc/budget-exceeded` instead |
+| `http/line-too-long` | a status or header line exceeded its own cap; a grant-capped line is `rpc/budget-exceeded` |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
 | `http/read:truncated`, `http/read:truncated-body` | the peer closed before a full line or body arrived |
@@ -279,7 +279,9 @@ Reported as `rpc/provider` with one of these inner codes:
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `content-length` only for a method defined to carry content (`POST`, `PUT`,
-`PATCH`). A GET sends no body: the request is complete at the empty line, and
+`PATCH`). The request body shares the capability's byte grant: a body past the
+grant is `rpc/budget-exceeded` before the connection, and one past the adapter's
+`max_request` is `rpc/tool-policy`. A GET sends no body: the request is complete at the empty line, and
 extra bytes make simple servers and intermediaries reset the connection instead
 of answering. The `max_wall_ms` grant (clamped to 10 s) is **one deadline** for
 the exchange from connect onward: connect, write, every header line and the body.
@@ -301,7 +303,7 @@ answer is ignored before the JSON gates and the decode.
 | `process/cwd` | the working directory could not be pinned at construction |
 | `process/thread:<err>` | a pipe reader thread could not start; the child is killed |
 | `process/signalled` | the child died from a signal, so it has no exit status to report |
-| `rpc/budget-exceeded` | the wall or byte grant is zero, or the input is past the byte grant |
+| `rpc/budget-exceeded` | the wall or byte grant is zero, the input is past the byte grant, or the output reached the grant-derived ceiling |
 | `rpc/timeout` | the call exceeded the effective wall ceiling; the whole process group was killed |
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
 | `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, a secret argument was passed, the output exceeded the effective ceiling, or process execution was not granted |

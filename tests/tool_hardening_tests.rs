@@ -582,14 +582,11 @@ fn a_response_past_the_byte_grant_is_refused() {
     fixed_response(listener, response.into_bytes());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/big")]);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/big"))]);
-    // The head (~56 bytes) fits; the 128-byte body does not.
+    // The head fits; the 128-byte body does not. The grant is the binding
+    // ceiling, so the refusal names the budget (round 25, #3).
     call.budget.max_bytes = 64;
     let error = tool.invoke(0, &call).expect_err("past the grant");
-    assert_eq!(
-        error.provider_code(),
-        Some("http/body-too-large"),
-        "{error}"
-    );
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
 
 /// The two process streams share the capability's byte grant
@@ -643,14 +640,15 @@ fn a_response_head_past_the_byte_grant_is_refused() {
     let response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
     fixed_response(listener, response.as_bytes().to_vec());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/small")]);
+    // The adapter's own ceiling binds here, so the refusal is a provider
+    // framing fault; a grant-bound cap answers `rpc/budget-exceeded` instead
+    // (round 25, #7).
+    tool.max_body = 40;
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/small"))]);
-    // Enough for the status line, not for the whole head (round 24, #4 makes a
-    // grant below the shortest answer a budget refusal, which the next test
-    // covers).
-    call.budget.max_bytes = 40;
+    call.budget.max_bytes = 4096;
     let error = tool
         .invoke(0, &call)
-        .expect_err("the head is past the grant");
+        .expect_err("the head is past the adapter ceiling");
     assert_eq!(error.provider_code(), Some("http/headers"), "{error}");
 }
 
@@ -2096,4 +2094,111 @@ fn a_zero_grant_mcp_call_is_a_budget_refusal_at_any_size() {
     let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
         .expect_err("a zero-byte grant does no work");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Round 25
+// ---------------------------------------------------------------------------
+
+/// `value_to_json` recurses, so an adapter that accepts a caller-built value
+/// has to gate its depth: a 100k-deep list aborted the stack outside any
+/// `catch_unwind` (round 25, #1).
+#[test]
+fn a_deep_mcp_argument_is_refused_not_aborted() {
+    let mut session = echo_session();
+    let mut value = Value::Null;
+    for _ in 0..200 {
+        value = Value::list([value]);
+    }
+    let mut call = Call::new("echo", vec![Arg::Value(value)]);
+    call.tool_allows_process = true;
+    let error = Provider::invoke(&mut session, 0, &call).expect_err("too deep");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// A request body past the capability grant is a budget refusal, not a tool
+/// policy: the grant is the tighter authority (round 25, #2).
+#[test]
+fn an_http_request_past_the_grant_is_a_budget_refusal() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("POST", "/submit")]);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("k".to_string(), Value::text("v".repeat(64)));
+    let mut call = Call::new(
+        "post",
+        vec![
+            Arg::Value(Value::path("/submit")),
+            Arg::Value(Value::Map(entries)),
+        ],
+    );
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 8;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the body is past the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// Output past the capability grant is a budget refusal; only an adapter
+/// setting that binds reports the tool policy (round 25, #3).
+#[test]
+fn process_output_past_the_grant_is_a_budget_refusal() {
+    #[cfg(windows)]
+    let (program, flag, script) = ("C:\\Windows\\System32\\cmd.exe", "/C", "echo hello");
+    #[cfg(not(windows))]
+    let (program, flag, script) = ("/bin/sh", "-c", "echo hello");
+
+    let mut tool = LocalProcess::new(program, &[flag, script])
+        .expect("an absolute program")
+        .with_timeout(5_000);
+    let mut call = Call::new("run", vec![Arg::text(flag), Arg::text(script)]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 2;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the output is past the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A zero-byte grant is checked before the argument allowlist, so a direct
+/// caller cannot use the refusal class as an allowlist oracle (round 25, #4).
+#[test]
+fn a_zero_grant_does_not_reveal_the_allowlist() {
+    let mut tool = LocalProcess::new(absolute_shell(), &["ok"]).expect("an absolute program");
+    let mut call = Call::new("run", vec![Arg::text("not-allowed")]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 0;
+    let error = tool.invoke(0, &call).expect_err("a zero grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// The status line, every header line and the empty line all count against the
+/// grant, so a body that fits exactly succeeds and one byte less is refused
+/// (round 25, #5).
+#[test]
+fn the_head_and_body_share_the_grant_exactly() {
+    let response = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+    let head = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("head end")
+        + 4;
+    let total = response.len();
+    assert_eq!(total - head, 2, "the fixture body is two bytes");
+
+    for (grant, should_fit) in [(total, true), (total - 1, false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        fixed_response(listener, response.to_vec());
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/exact")]);
+        let mut call = Call::new("get", vec![Arg::Value(Value::path("/exact"))]);
+        call.tool_allows_process = true;
+        call.budget.max_bytes = grant as u64;
+        match tool.invoke(0, &call) {
+            Ok(_) => assert!(should_fit, "grant {grant} should not fit (head {head})"),
+            Err(error) => {
+                assert!(!should_fit, "grant {grant} should fit: {error}");
+                assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+            }
+        }
+    }
 }

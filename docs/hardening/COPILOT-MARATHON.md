@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-31: round 31 found 1 medium and 4 lows, all fixed; round 32 must be clean | 182 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-24: round 24 found 3 mediums and 7 lows, all fixed or triaged; rounds 25-26 must be clean | 196 fixed / 1 rejected / 0 open (2 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-25: round 25 found 1 high, 4 mediums and 2 lows, all fixed; rounds 26-27 must be clean | 203 fixed / 1 rejected / 0 open (2 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -324,6 +324,25 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 25)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `8d6f25f`. All eight round-24
+dispositions verified (and the metacharacter rejection upheld). One **high**,
+four mediums, two lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `value_to_json` recurses, so a direct `Provider::invoke` with a caller-built value past the wire depth aborted the stack outside `catch_unwind` | **fixed**: the MCP and HTTP body paths gate with the kernel depth probe (now `pub(crate)`) before converting; `a_deep_mcp_argument_is_refused_not_aborted` |
+| 2 | medium | an HTTP request body past the capability grant was `rpc/tool-policy`, which hides a budget exhaustion | **fixed**: the grant is checked first and answers `rpc/budget-exceeded`, the adapter ceiling keeps the policy code; `an_http_request_past_the_grant_is_a_budget_refusal` |
+| 3 | medium | process output and the HTTP body cap reported provider codes even when the grant set the cap | **fixed**: `LocalProcess` tokens its output refusal by which ceiling bound it, and the HTTP head/body/line refusals do the same through `perform`'s `grant_bound`; two tests |
+| 4 | medium | a zero-byte grant was checked after the process allowlist, so `run(disallowed)` answered policy and `run(allowed)` budget: an allowlist oracle for a direct caller | **fixed**: the grant is refused before any argument rule; `a_zero_grant_does_not_reveal_the_allowlist` |
+| 5 | medium | the empty line that ends the head was not charged against the grant, so the body cap was two bytes too generous | **fixed**: the terminator is counted; `the_head_and_body_share_the_grant_exactly` pins the exact boundary |
+| 6 | low | `LocalProcess::new` fell back to the raw directory when canonicalisation failed, while `StdioTransport` failed closed | **fixed**: `process/cwd` is returned instead |
+| 7 | low | grant-derived line caps reported `http/line-too-long`, and `read_str` truncated a budget above `u32::MAX` | **fixed**: the line/header/body caps token the grant, and the value budget saturates at `u32::MAX` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-04 (round 24)
 

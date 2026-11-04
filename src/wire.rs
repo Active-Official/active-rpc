@@ -799,7 +799,11 @@ fn read_value_at(
         },
         2 => Value::Int(read_u64(bytes, cursor)? as i64),
         3 => Value::Float(f64::from_bits(read_u64(bytes, cursor)?)),
-        4 => Value::Text(read_str(bytes, cursor, budget as u32)?),
+        4 => Value::Text(read_str(
+            bytes,
+            cursor,
+            budget.min(u32::MAX as usize) as u32,
+        )?),
         5 => {
             let count = read_u32(bytes, cursor)?;
             // A list cannot hold more elements than there are bytes left.
@@ -839,7 +843,7 @@ fn read_value_at(
                 *remaining_values = remaining_values
                     .checked_sub(1)
                     .ok_or(Error::Wire("value count exceeds the ceiling"))?;
-                let key = read_str(bytes, cursor, budget as u32)?;
+                let key = read_str(bytes, cursor, budget.min(u32::MAX as usize) as u32)?;
                 let value = read_value_at(
                     bytes,
                     cursor,
@@ -880,7 +884,11 @@ fn read_value_at(
             *cursor = end;
             Value::Module(module)
         }
-        9 => Value::Path(read_str(bytes, cursor, budget as u32)?),
+        9 => Value::Path(read_str(
+            bytes,
+            cursor,
+            budget.min(u32::MAX as usize) as u32,
+        )?),
         _ => return Err(Error::Wire("unknown value tag")),
     };
     Ok(value)

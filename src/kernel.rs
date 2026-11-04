@@ -5987,7 +5987,7 @@ fn shape_refusal(value: &Value, budget: &Budget) -> Option<Error> {
     None
 }
 
-fn value_too_deep(value: &Value, limit: usize) -> bool {
+pub(crate) fn value_too_deep(value: &Value, limit: usize) -> bool {
     // A bounded depth probe: `shape_exceeded` stops at the first violation
     // instead of pushing every child of a wide value first (round 8, #3). The
     // other ceilings are disabled by construction: this asks about depth alone.
