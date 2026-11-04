@@ -166,6 +166,94 @@ fn a_constraint_chain_is_inside_one_cone() {
     }
 }
 
+/// A patch that removes the last secret node must not declassify the literals
+/// the module held at install: the redactor is the install-time set, so a
+/// redacting capability still sees the marker and a redacted hash, never a
+/// plaintext copy or the raw content address (round 27, critical).
+#[test]
+fn a_patch_cannot_declassify_an_install_time_secret() {
+    const SECRET: &str = "round27-canary-4d1a";
+
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(SECRET.into()));
+    let copy = module.push(Inode::Str(SECRET.into()));
+    let app = module.push(Inode::Table {
+        fields: vec![("s".to_string(), secret), ("c".to_string(), copy)],
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("app".to_string(), app)],
+    });
+    module.set_root(Some(root));
+
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(module.clone()).expect("install");
+    let agent = Agent::with_secret([0x74; 32]);
+    let id = agent.register(Box::new(provider));
+    let mut attrs = CapAttrs::new(&["patch", "subgraph", "evaluate", "content_hash"]);
+    attrs.redact = true;
+    let cap = agent.mint(id, object, attrs).expect("cap");
+    let lane = agent
+        .create_lane("r27-declassify", Budget::default())
+        .expect("lane");
+
+    // Remove the only secret node through a supported write.
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "patch",
+            vec![path("app.s"), Arg::Value(Value::Int(0))],
+        )
+        .expect("queued");
+    agent.run();
+    promise.value().expect("patch");
+
+    // A plaintext copy in the module must still read as hidden.
+    let promise = agent
+        .call(lane, &cap, "subgraph", vec![path("app.c")])
+        .expect("queued");
+    agent.run();
+    match promise.value().expect("subgraph") {
+        Value::Module(bytes) => assert!(
+            !bytes
+                .windows(SECRET.len())
+                .any(|window| window == SECRET.as_bytes()),
+            "a cone carried the install-time secret"
+        ),
+        other => panic!("a module: {other:?}"),
+    }
+
+    let promise = agent
+        .call(lane, &cap, "evaluate", vec![path("app.c")])
+        .expect("queued");
+    agent.run();
+    match promise.value().expect("evaluate") {
+        Value::Text(text) => assert!(!text.contains(SECRET), "evaluate returned {text:?}"),
+        Value::Secret => {}
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // The raw content address of the declassified image must not be served.
+    let mut patched = module;
+    let node = active_infinity::interop::resolve_path(&patched, "app.s")
+        .expect("the secret node resolves");
+    *patched.node_mut(node).expect("node") = Inode::Int(0);
+    let raw = active_infinity::encode(&patched).expect("encode");
+    let raw_text = format!(
+        "blake3:{}",
+        active_infinity::content_hash_hex(&raw).expect("hash")
+    );
+    let promise = agent
+        .call(lane, &cap, "content_hash", Vec::new())
+        .expect("queued");
+    agent.run();
+    let served = match promise.value().expect("content_hash") {
+        Value::Text(text) => text,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_ne!(served, raw_text, "the raw hash of the declassified image");
+}
+
 /// A constraint whose expression is its own subject used to re-enqueue forever:
 /// the walk must terminate.
 #[test]

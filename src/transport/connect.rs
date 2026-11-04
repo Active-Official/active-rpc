@@ -297,7 +297,18 @@ impl BridgeServer {
             }
         };
         let request_line = head.first().cloned().unwrap_or_default();
-        let mut parts = request_line.split_whitespace();
+        if !request_line
+            .bytes()
+            .all(|byte| byte == 0x20 || (0x21..=0x7e).contains(&byte))
+        {
+            // Unicode whitespace (a TAB, an NBSP) is not a separator in HTTP:
+            // `split_whitespace` accepted what a proxy would not
+            // (round 27, low).
+            let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
+            drain_before_close(&mut stream);
+            return 0;
+        }
+        let mut parts = request_line.split(' ');
         let method = parts.next().unwrap_or_default();
         let target = parts.next().unwrap_or_default();
         let version = parts.next().unwrap_or_default();
@@ -643,8 +654,9 @@ fn write_http_response(
         415 => "Unsupported Media Type",
         _ => "Internal Server Error",
     };
+    let allow = if status == 405 { "allow: POST\r\n" } else { "" };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: {CONNECT_TYPE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {CONNECT_TYPE}\r\n{allow}content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     write_all_before(stream, head.as_bytes(), deadline)
@@ -752,6 +764,11 @@ impl ConnectClient {
     /// Call the bridge with one envelope.
     pub fn call(&mut self, envelope: &Envelope) -> Result<Envelope> {
         let body = envelope.encode()?;
+        if body.len() > MAX_BODY.min(self.limits.max_bytes) {
+            // The frame boundary refuses this body; framing it first would hit
+            // the release invariant as a panic (round 27, medium).
+            return Err(Error::Wire("request exceeds the ceiling"));
+        }
         let framed = grpc_frame(&body);
         let (status, response) = self.post(&framed, CONNECT_TYPE)?;
         if status != 200 {
@@ -777,6 +794,15 @@ impl ConnectClient {
     }
 
     fn post(&mut self, body: &[u8], content_type: &str) -> Result<(u16, Vec<u8>)> {
+        if content_type.is_empty()
+            || !content_type
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            // The value is interpolated into the head: a CR or LF would inject
+            // a header (round 27, low).
+            return Err(Error::Wire("invalid content type"));
+        }
         if body.len() > MAX_BODY.min(self.limits.max_bytes) {
             // Framing a body the bridge can only refuse wastes the write and
             // could wrap the 32-bit frame length (round 25, #5).

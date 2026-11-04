@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-26; round 26 found no critical/high/medium (eight lows fixed); round 27 is the second clean | 153 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-27: 27 found 1 critical + 1 high + 2 mediums, fixed; rounds 28-29 must be clean | 163 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-20: ... + 10 findings; round 21 is the confirmation | 169 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -67,6 +67,28 @@ the codec is fine, the **oracle** was not.
   from it.
 - No wire change: a NaN argument was already round-tripping to the same bytes;
   the wire format permits the bit pattern and the decoder is total over it.
+
+### R-07 domain operations - 2026-11-03 (round 27)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `6e9487f`.
+All eight round-26 lows verified. One **critical**, one high, two mediums, six
+lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | critical | a patch that removes the last secret node declassified the module: the redactor was rebuilt from the post-write module, so a later `subgraph`/`evaluate` served the plaintext copy and `content_hash` served the raw hash | **fixed**: `ModuleSlot` keeps the install-time `Redactor`; every redaction and every "holds a secret" decision uses it (a patch can only remove secrets, so it is an upper bound); `a_patch_cannot_declassify_an_install_time_secret` (patch the secret away, then assert no cone byte, no evaluated value and no raw hash) |
+| 2 | high | the HTTP/2 `JoinSet` retained every completed stream task per connection (~2.2 KB/request, measured), so one long-lived connection grew memory without bound | **fixed**: `try_join_next` reaps inside the accept loop |
+| 3 | medium | the patch provenance filter rescanned all nodes per entry, after the last wall check | **fixed**: one `held_secret` per patch |
+| 4 | medium | `ConnectClient::call` framed before the size check, so an oversized envelope hit the release invariant as a panic | **fixed**: the bound runs before `grpc_frame` |
+| 5 | low | HTTP/2 accepted a duplicate `content-type` and ignored `content-length` | **fixed**: a duplicate is 400; a `content-length` that disagrees with the stream is 400 |
+| 6 | low | the request line accepted Unicode whitespace and the header values used Unicode `trim` | **fixed**: the request line must be visible ASCII plus spaces |
+| 7 | low | `post_typed` interpolated an unvalidated content type (CRLF injection) | **fixed**: visible ASCII only |
+| 8 | low | the spec said 404 for a wrong method and a 405 carried no `Allow` | **fixed**: interop.md says 405, and the refusal carries `allow: POST` |
+| 9 | low | `scoped_labels` takes a scope it never enforces | **documented**: callers pre-check; the doc says so |
+| 10 | low | `stats` returned `has_provenance` to a redacting caller | **fixed**: withheld when `call.redact` |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-07 domain operations - 2026-11-03 (round 26)
 

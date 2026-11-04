@@ -582,6 +582,10 @@ fn a_get_is_405_on_the_bridge() {
         response.starts_with("HTTP/1.1 405 Method Not Allowed"),
         "{response:?}"
     );
+    assert!(
+        response.to_ascii_lowercase().contains("allow: post"),
+        "{response:?}"
+    );
     assert_eq!(served, 0);
 }
 

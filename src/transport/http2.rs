@@ -305,6 +305,12 @@ where
         let handler = Arc::clone(&handler);
         let served = Arc::clone(&served);
         let inflight = Arc::clone(&inflight);
+        // A JoinSet retains a completed task until it is joined; without this
+        // reap, one long-lived connection kept every finished stream's memory
+        // (~2.2 KB per request, measured) until it closed (round 27, high).
+        while let Some(done) = streams.try_join_next() {
+            let _ = done;
+        }
         streams.spawn(async move {
             let handled = handle_stream(
                 request,
@@ -364,11 +370,28 @@ where
         // there; name the same resource on both (round 26, #2).
         return respond_status(&mut respond, StatusCode::NOT_FOUND, b"rpc/wire");
     }
-    let media_type = request
-        .headers()
-        .get(http::header::CONTENT_TYPE)
+    let mut media_types = request.headers().get_all(http::header::CONTENT_TYPE).iter();
+    let media_type = media_types
+        .next()
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
+    if media_types.next().is_some() {
+        // The HTTP/1.1 bridge refuses a repeated content-type; a proxy that
+        // joins or takes the last value would disagree with this server
+        // (round 27, low).
+        return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
+    }
+    let declared_length = match request.headers().get(http::header::CONTENT_LENGTH) {
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|text| text.parse::<usize>().ok())
+        {
+            Some(length) => Some(length),
+            None => return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire"),
+        },
+        None => None,
+    };
     if media_type != CONTENT_TYPE {
         return respond_status(
             &mut respond,
@@ -432,6 +455,11 @@ where
             }
             None => break,
         }
+    }
+    if declared_length.is_some_and(|length| length != bytes.len()) {
+        // The stream is the body; a `content-length` that disagrees is a
+        // framing ambiguity (round 27, low).
+        return respond_status(&mut respond, StatusCode::BAD_REQUEST, b"rpc/wire");
     }
     let envelope = match Envelope::decode_with(&bytes, limits) {
         Ok(envelope) => envelope,
