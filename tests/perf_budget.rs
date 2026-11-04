@@ -210,16 +210,19 @@ fn lane_and_channel_churn_does_not_leak_descriptors_or_threads() {
             .expect("channel");
         agent.destroy_channel(channel).expect("destroy channel");
     }
+    // Read once: the harness's own threads open descriptors concurrently, so
+    // two reads around one assertion already disagreed on a loaded runner.
+    // The slack absorbs that churn; a per-lane leak is 2 000 descriptors.
+    let fds_after = descriptors();
     assert!(
-        descriptors() <= fds_before,
-        "descriptor table grew from {fds_before} to {}",
-        descriptors()
+        fds_after <= fds_before + 16,
+        "descriptor table grew from {fds_before} to {fds_after}"
     );
     // The test harness and the OS may add a thread for unrelated reasons; the
     // property under test is that lane/channel churn adds no per-lane thread.
+    let threads_after = threads();
     assert!(
-        threads() <= threads_before + 2,
-        "thread count grew from {threads_before} to {}",
-        threads()
+        threads_after <= threads_before + 2,
+        "thread count grew from {threads_before} to {threads_after}"
     );
 }
