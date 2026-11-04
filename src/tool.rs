@@ -961,9 +961,9 @@ impl McpTransport for StdioTransport {
             }
         }
         match deadline {
-            None => outcome.recv().map_err(|_| Error::Provider {
-                code: "mcp/write:closed".to_string(),
-            })?,
+            None => outcome
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| Error::Timeout)?,
             Some(deadline) => {
                 let left = deadline
                     .checked_duration_since(std::time::Instant::now())
@@ -1189,6 +1189,11 @@ impl<T: McpTransport> McpSession<T> {
             "params": params,
         });
         let line = payload.to_string();
+        if line.len() > max_line {
+            // JSON escaping can grow the arguments several times over; the
+            // grant bounds the frame this call writes (round 20, L4).
+            return Err(Error::BudgetExceeded("byte"));
+        }
         if line.len() > MAX_MCP_LINE_BYTES {
             // The peer refuses a line of this size; refuse it here instead of
             // sending a frame that can only be a desync.
@@ -1429,7 +1434,8 @@ impl<T: McpTransport> Provider for McpSession<T> {
         let deadline = std::time::Instant::now()
             .checked_add(ceiling)
             .unwrap_or_else(std::time::Instant::now);
-        let max_line = (call.budget.max_bytes as usize).min(MAX_MCP_LINE_BYTES);
+        let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+        let max_line = grant.min(MAX_MCP_LINE_BYTES);
         let response = self.request_within(
             "tools/call",
             json!({ "name": tool.name, "arguments": Json::Object(arguments) }),
@@ -1521,6 +1527,9 @@ impl HttpTool {
             .base
             .strip_prefix("http://")
             .ok_or(Error::ToolPolicy("only http:// endpoints are supported"))?;
+        // A grant too small to hold the head cannot pay for the answer; the
+        // static ceiling was its only bound (round 20, M3).
+        let header_cap = MAX_HTTP_HEADER_BYTES.min(max_body.max(1));
         // Resolution is not peer-controlled: the base URL is the operator's
         // endpoint, so the system resolver's own timeout applies here and its
         // time is not charged against the grant (round 16, F-3).
@@ -1659,7 +1668,7 @@ impl HttpTool {
             }
             header_bytes = header_bytes.saturating_add(line.len());
             fields += 1;
-            if header_bytes > MAX_HTTP_HEADER_BYTES || fields > MAX_HTTP_HEADER_FIELDS {
+            if header_bytes > header_cap || fields > MAX_HTTP_HEADER_FIELDS {
                 return Err(Error::Provider {
                     code: "http/headers".to_string(),
                 });
@@ -1933,17 +1942,15 @@ impl Provider for HttpTool {
                 }
                 None => Vec::new(),
             };
-            if body.len() > self.max_request {
+            if body.len() > self.max_request.min(call.budget.max_bytes as usize) {
                 return Err(Error::ToolPolicy("request too large"));
             }
             Some(body)
         } else {
             None
         };
-        let cap = self
-            .max_body
-            .min(MAX_RESPONSE_BYTES)
-            .min(call.budget.max_bytes as usize);
+        let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+        let cap = self.max_body.min(MAX_RESPONSE_BYTES).min(grant);
         let (status, response) = self.perform(
             &method,
             &path,
@@ -2387,10 +2394,8 @@ impl Provider for LocalProcess {
         // The adapter's ceiling and the capability's byte grant both bound
         // what is read: a call with an 8-byte grant must not make the host
         // buffer a megabyte (round 19, M2).
-        let max_output = self
-            .max_output
-            .min(MAX_OUTPUT_BYTES)
-            .min(call.budget.max_bytes as usize);
+        let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+        let max_output = self.max_output.min(MAX_OUTPUT_BYTES).min(grant);
         let ceiling = (max_output as u64).saturating_add(1);
         // `(stream, bytes)`: 1 is stdout and 2 is stderr. Two threads sharing
         // one channel report in completion order, and a child that writes both
@@ -2466,7 +2471,9 @@ impl Provider for LocalProcess {
                         } else {
                             stderr = buffer;
                         }
-                        if stdout.len() > max_output || stderr.len() > max_output {
+                        // Both pipes together: checking each separately let a
+                        // grant pay for twice the bytes (round 20, M2).
+                        if stdout.len().saturating_add(stderr.len()) > max_output {
                             kill_process_tree(&mut child);
                             return Err(Error::ToolPolicy("output too large"));
                         }
@@ -2508,7 +2515,7 @@ impl Provider for LocalProcess {
                     // A descendant that outlives the leader can flood after it
                     // exits; refuse at the same ceiling instead of waiting out
                     // the grant (round 11, #2).
-                    if stdout.len() > max_output || stderr.len() > max_output {
+                    if stdout.len().saturating_add(stderr.len()) > max_output {
                         kill_process_tree(&mut child);
                         return Err(Error::ToolPolicy("output too large"));
                     }
@@ -2519,7 +2526,7 @@ impl Provider for LocalProcess {
                 }
             }
         }
-        if stdout.len() > max_output || stderr.len() > max_output {
+        if stdout.len().saturating_add(stderr.len()) > max_output {
             return Err(Error::ToolPolicy("output too large"));
         }
         let mut map = BTreeMap::new();

@@ -579,13 +579,73 @@ fn a_response_past_the_byte_grant_is_refused() {
     fixed_response(listener, response.into_bytes());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/big")]);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/big"))]);
-    call.budget.max_bytes = 8;
+    // The head (~39 bytes) fits; the 64-byte body does not.
+    call.budget.max_bytes = 48;
     let error = tool.invoke(0, &call).expect_err("past the grant");
     assert_eq!(
         error.provider_code(),
         Some("http/body-too-large"),
         "{error}"
     );
+}
+
+/// The two process streams share the capability's byte grant
+/// (round 20, M2).
+#[test]
+fn both_process_streams_share_the_byte_grant() {
+    #[cfg(windows)]
+    let program = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    #[cfg(not(windows))]
+    let program = "/bin/sh";
+    #[cfg(windows)]
+    let allowed = ["-NoProfile", "-Command", "*"];
+    #[cfg(not(windows))]
+    let allowed = ["-c", "*"];
+    #[cfg(windows)]
+    let argv = [
+        "-NoProfile",
+        "-Command",
+        "Write-Output 'aaaaaaaa'; [Console]::Error.WriteLine('bbbbbbbb')",
+    ];
+    #[cfg(not(windows))]
+    let argv = ["-c", "echo aaaaaaaa; echo bbbbbbbb 1>&2"];
+    #[cfg(windows)]
+    let mut env = std::collections::BTreeMap::new();
+    #[cfg(windows)]
+    env.insert(
+        "SystemRoot".to_string(),
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+    );
+    #[cfg(not(windows))]
+    let env = std::collections::BTreeMap::new();
+    let mut tool = LocalProcess::new(program, &allowed).expect("an absolute program");
+    tool.env.extend(env);
+    let mut call = Call::new(
+        "run",
+        argv.iter().map(|argument| Arg::text(*argument)).collect(),
+    );
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 8;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("both streams over the grant");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// The response head is bounded by the byte grant too (round 20, M3).
+#[test]
+fn a_response_head_past_the_byte_grant_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+    fixed_response(listener, response.as_bytes().to_vec());
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/small")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::path("/small"))]);
+    call.budget.max_bytes = 8;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the head is past the grant");
+    assert_eq!(error.provider_code(), Some("http/headers"), "{error}");
 }
 
 /// A repeated `content-length` is a framing ambiguity; the adapter refuses the

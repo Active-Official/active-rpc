@@ -62,6 +62,17 @@ const START_LOOP: &str = r#"
   (func (export "run") (param i32) (result i32) i32.const 0))
 "#;
 
+/// A module whose guest tries to grow its memory far past what the grant paid
+/// for.
+const GROW: &str = r#"
+(module
+  (memory (export "memory") 2 4096)
+  (func (export "run") (param i32) (result i32)
+    (if (result i32) (i32.eq (memory.grow (i32.const 4000)) (i32.const -1))
+      (then (i32.const -1))
+      (else (i32.const 0)))))
+"#;
+
 /// A module that declares a quarter-gigabyte of initial memory.
 const BIG_MEMORY: &str = r#"
 (module
@@ -167,6 +178,31 @@ fn a_memory_reservation_is_charged_before_instantiation() {
     )
     .expect("compile");
     assert!(small.call(b"").is_ok(), "a two-page module must run");
+}
+
+/// `memory.grow` is not charged by wasmi, so the store limiter must stop at
+/// what the grant could pay for; a 256 MiB grow under a 10 000 fuel grant is
+/// refused without allocating it (round 20, HIGH #1).
+#[test]
+fn a_memory_grow_is_capped_by_the_fuel_grant() {
+    let started = std::time::Instant::now();
+    let mut tool = WasmTool::from_bytes(
+        &binary(GROW),
+        WasmLimits {
+            fuel: 10_000,
+            max_memory_bytes: 256 << 20,
+            ..WasmLimits::default()
+        },
+    )
+    .expect("compile");
+    // The guest returns -1 when the grow is refused, which the host reports as
+    // a bad output length.
+    assert_eq!(error_code(tool.call(b"")), "wasm/output");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "the grow was materialised: {:?}",
+        started.elapsed()
+    );
 }
 
 // ---------------------------------------------------------------------------

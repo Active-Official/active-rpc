@@ -306,8 +306,17 @@ impl WasmTool {
         if input.len() > OUTPUT_OFFSET {
             return Err(provider("wasm/input"));
         }
+        // wasmi does not charge fuel for `memory.grow`, so the store limiter is
+        // what keeps a guest from allocating memory the grant never paid for.
+        // `invoke` has already capped `limits.fuel` to the call's grant, so the
+        // ceiling is what that fuel could buy at `FUEL_PER_MEMORY_KIB`
+        // (round 20, HIGH #1).
+        let affordable = (self.limits.fuel / FUEL_PER_MEMORY_KIB)
+            .saturating_mul(1024)
+            .min(u64::try_from(self.limits.max_memory_bytes).unwrap_or(u64::MAX))
+            .max(MIN_MEMORY_BYTES as u64) as usize;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(self.limits.max_memory_bytes)
+            .memory_size(affordable)
             .table_elements(self.limits.max_table_elements)
             .instances(1)
             .memories(1)
@@ -460,10 +469,11 @@ impl WasmTool {
         let memory_fuel = memory_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
         let remaining = store.get_fuel().unwrap_or(0);
         if memory_fuel > reserved_fuel {
-            // The store limiter caps the materialised size at the reservation,
-            // so this is a defensive refusal, not a reachable one.
+            // A start function that grew the memory spent fuel the reservation
+            // did not cover: a shortfall, not a resource over a ceiling
+            // (round 20, L9).
             self.log = std::mem::take(&mut store.data_mut().log);
-            return Err(provider("wasm/limits"));
+            return Err(provider("wasm/fuel"));
         }
         store
             .set_fuel(remaining + (reserved_fuel - memory_fuel))
@@ -565,6 +575,12 @@ impl Provider for WasmTool {
             let bytes = match arg {
                 Arg::Value(Value::Text(text)) => Some(text.as_bytes().to_vec()),
                 Arg::Value(Value::Module(bytes)) => Some(bytes.clone()),
+                // A secret is authority the capability did not grant to this
+                // adapter, a policy refusal rather than a malformed argument
+                // (round 20, L8).
+                Arg::Value(Value::Secret) => {
+                    return Err(Error::ToolPolicy("a secret is not a wasm argument"))
+                }
                 _ => None,
             };
             if input.is_some() || bytes.is_none() {

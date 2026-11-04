@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-26; round 26 found no critical/high/medium (eight lows fixed); round 27 is the second clean | 153 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-19: ... + 10 findings; round 20 is the confirmation | 159 fixed / 0 rejected / 0 open | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-20: ... + 10 findings; round 21 is the confirmation | 169 fixed / 0 rejected / 0 open | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -208,6 +208,27 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-03 (round 20)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `6e9487f`. Round-19 fixes
+verified; one high, two mediums, seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | wasmi does not charge fuel for `memory.grow`, so a guest could grow to the configured 256 MiB ceiling under a 10 000 fuel grant | **fixed**: the store limiter ceiling is `min(configured, fuel / FUEL_PER_MEMORY_KIB * 1024)`; `a_memory_grow_is_capped_by_the_fuel_grant` (256 MiB grow under 10k fuel refused without allocating) |
+| 2 | medium | each process stream was capped separately, so both together buffered twice the grant | **fixed**: one ceiling for the sum; `both_process_streams_share_the_byte_grant` |
+| 3 | medium | the response header block was not capped by the grant | **fixed**: `min(64 KiB, grant)`; `a_response_head_past_the_byte_grant_is_refused` |
+| 4 | low | the outgoing MCP line was capped at 1 MiB, not by the grant (JSON escaping can multiply the arguments) | **fixed**: a line past the grant is `rpc/budget-exceeded` |
+| 5 | low | the request body was capped by `max_request` only | **fixed**: `min(max_request, grant)` |
+| 6 | low | `budget.max_bytes as usize` truncated on a 32-bit target | **fixed**: `usize::try_from(..).unwrap_or(usize::MAX)` in all three adapters |
+| 7 | low | the spec rows still named the static ceilings | **fixed**: `wire.md` names the grant in each |
+| 8 | low | a secret argument was `rpc/invalid-argument` | **fixed**: `rpc/tool-policy` |
+| 9 | low | memory grown by the start function was `wasm/limits` | **fixed**: `wasm/fuel` |
+| 10 | low | a send with no deadline waited forever for the writer's ack | **fixed**: 30 s bound on the ack |
+
+Gate: 86 suites, all green on both feature sets; clippy/fmt/fuzz clean;
+negative controls 9/9.
 
 ### R-08 tools and MCP - 2026-11-03 (round 19)
 

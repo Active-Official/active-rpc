@@ -223,6 +223,9 @@ session:
 | `mcp/thread:<err>` | a reader or writer thread could not start |
 | `mcp/<code>` | the server returned a JSON-RPC error; `<code>` is its numeric code |
 
+A line past the capability's byte grant is `rpc/budget-exceeded` with dimension
+`byte`; the 1 MiB line ceiling still bounds the read.
+
 A tool name is validated because it becomes an allow-list entry and a method
 name. Control characters, bidi overrides and duplicates are refused at
 handshake rather than filtered silently, so an operator never sees one name and
@@ -251,7 +254,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
 | `http/bad-number` | a JSON number has no `Value` form: an integer outside `i64`, or a float that is not finite (a literal with a fraction or an exponent that overflows `f64`) |
 | `http/too-complex` | an object or array body has more than 2^20 structural tokens before parsing, or the decoded tree has more than 2^20 nodes |
-| `http/body-too-large` | the response body exceeded `max_body`, by its declared length or by its stream |
+| `http/body-too-large` | the response body exceeded `min(max_body, 64 MiB, the capability byte grant)`, by its declared length or by its stream |
 | `http/line-too-long` | a status or header line exceeded its own cap |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
@@ -286,8 +289,9 @@ answer is ignored before the JSON gates and the decode.
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
 | `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, the output exceeded the effective ceiling, or process execution was not granted |
 
-The effective output ceiling is the smaller of `max_output` and 16 MiB per
-stream.
+The effective output ceiling is the smaller of `max_output`, 16 MiB and the
+capability byte grant, for both streams together; a response head is capped by
+`min(64 KiB, the grant)`.
 
 `LocalProcess::new` requires an absolute program path. A bare name would be
 resolved from the parent's `PATH`, which is ambient authority: anything that can
