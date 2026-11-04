@@ -244,6 +244,7 @@ past only the static 1 MiB ceiling is `rpc/invalid-argument` (a request) or
 | `mcp/no-response` | the transport returned nothing for a request |
 | `mcp/eof` | the server closed its stdout |
 | `mcp/queue` | the writer queue stayed full until the ceiling; the frame never reached the writer, so the session stays usable |
+| `mcp/not-sent` | the deadline had passed before anything was written; the frame never reached the wire, so the session stays usable |
 | `mcp/line-too-long` | a line exceeded 1 MiB before parsing |
 | `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer |
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |

@@ -1323,7 +1323,9 @@ fn a_spent_deadline_does_not_write_a_line() {
     let error = transport
         .send_line_within("{\"jsonrpc\":\"2.0\"}", Some(std::time::Instant::now()))
         .expect_err("a spent deadline");
-    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    // Nothing was written, and the session can tell that from an ack timeout
+    // (round 34, #7).
+    assert_eq!(error.provider_code(), Some("mcp/not-sent"), "{error}");
     transport
         .send_line_within("{\"jsonrpc\":\"2.0\"}", None)
         .expect("the transport still writes");
@@ -1398,7 +1400,7 @@ fn a_spent_deadline_does_not_enqueue_the_frame() {
     let error = transport
         .send_line_within("{\"jsonrpc\":\"2.0\"}", Some(std::time::Instant::now()))
         .expect_err("a spent deadline");
-    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    assert_eq!(error.provider_code(), Some("mcp/not-sent"), "{error}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
     let error = transport
         .recv_line_within(Some(deadline))
@@ -2808,4 +2810,203 @@ fn a_far_deadline_does_not_extend_the_enqueue_wait() {
         elapsed < Duration::from_secs(8),
         "the enqueue waited {elapsed:?} instead of the five-second cap"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 34
+// ---------------------------------------------------------------------------
+
+/// A grant at or above the static line ceiling still bounds the whole exchange:
+/// request plus answer must fit it (round 34, #1).
+#[test]
+fn an_mcp_grant_above_the_line_ceiling_still_bounds_the_sum() {
+    use active_rpc::tool::{McpSession, MemoryTransport, MAX_MCP_LINE_BYTES};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/call".to_string(),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"result":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            // Just under the static ceiling: legal on its own, over the
+            // remainder the request left.
+            "z".repeat(MAX_MCP_LINE_BYTES - 200)
+        ),
+    );
+    let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::text("x".repeat(800 * 1024))]);
+    call.tool_allows_process = true;
+    // The request is under the static ceiling; together with the 1 MiB answer
+    // it is over the grant.
+    call.budget.max_bytes = (MAX_MCP_LINE_BYTES as u64 * 3) / 2;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("request plus answer exceeds the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    // The answer was consumed, so the session is still in step: a small
+    // request leaves room for the same answer.
+    let mut small = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    small.tool_allows_process = true;
+    small.budget.max_bytes = (MAX_MCP_LINE_BYTES as u64 * 3) / 2;
+    active_rpc::kernel::Provider::invoke(&mut session, 0, &small)
+        .expect("a budget refusal does not poison the session");
+}
+
+/// A process refusal is a budget one when the share left by the argument line
+/// is what bounds the read, and a policy one when the adapter's ceiling does
+/// (round 34, #2).
+#[test]
+fn a_process_share_under_the_static_ceiling_is_a_budget_refusal() {
+    #[cfg(windows)]
+    let argv: Vec<&str> = vec!["/C", "for /L %i in (1,1,200) do @echo aaaa"];
+    #[cfg(not(windows))]
+    let argv: Vec<&str> = vec![
+        "-c",
+        "i=0; while [ $i -lt 200 ]; do echo aaaa; i=$((i+1)); done",
+    ];
+    let arguments: Vec<Arg> = argv.iter().map(|argument| Arg::text(*argument)).collect();
+    let argv_bytes: u64 = arguments.iter().map(Arg::wire_size).sum();
+
+    let mut tool = LocalProcess::new(absolute_shell(), &argv).expect("an absolute program");
+    #[cfg(windows)]
+    tool.env.insert(
+        "SystemRoot".to_string(),
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+    );
+    tool.max_output = 1_000;
+    let mut call = Call::new("run", arguments);
+    call.tool_allows_process = true;
+    // A grant exactly at the adapter's ceiling leaves a share under it once the
+    // argument line is charged; the child prints about 1 200 bytes, more than
+    // the share. Pre-fix the token compared the raw grant and reported a policy
+    // refusal.
+    call.budget.max_bytes = 1_000;
+    assert!(argv_bytes < 200, "the fixture argv is small: {argv_bytes}");
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the output is past the share");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// The HTTP refusal follows the same rule: the share, not the raw grant,
+/// decides whether the budget or the adapter's ceiling refused
+/// (round 34, #3).
+#[test]
+fn an_http_share_under_the_static_ceiling_is_a_budget_refusal() {
+    let path = format!("/{}", "p".repeat(600));
+    let body = "y".repeat(950);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    fixed_response(
+        listener,
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    );
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", &path)]);
+    tool.max_body = 1_000;
+    let mut call = Call::new("get", vec![Arg::Value(Value::path(&path))]);
+    call.tool_allows_process = true;
+    // The long path charges more than 200 bytes of the head, so the share is
+    // under the 1 000-byte adapter ceiling while the grant is over it.
+    call.budget.max_bytes = 1_200;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the body is past the share");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// A number with no fraction digit is not a JSON number: `1.` is text
+/// (round 34, #5).
+#[test]
+fn a_dangling_fraction_point_is_text_not_a_bad_number() {
+    for body in ["1.", "0.e1"] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        fixed_response(
+            listener,
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        );
+        let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/n")]);
+        let mut call = Call::new("get", vec![Arg::Value(Value::path("/n"))]);
+        call.tool_allows_process = true;
+        let response = tool.invoke(0, &call).expect("not a number");
+        assert_eq!(response, Response::Value(Value::text(body)), "{body}");
+    }
+}
+
+/// A frame that was never sent does not poison the session: the transport says
+/// so with its own code rather than a bare timeout (round 34, #7).
+#[test]
+fn a_frame_that_was_never_sent_leaves_the_session_usable() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+
+    struct NotSentOnce {
+        inner: MemoryTransport,
+        sends: usize,
+    }
+    impl McpTransport for NotSentOnce {
+        fn send_line(&mut self, line: &str) -> active_rpc::error::Result<()> {
+            self.inner.send_line(line)
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.inner.recv_line()
+        }
+        fn send_line_within(
+            &mut self,
+            line: &str,
+            deadline: Option<std::time::Instant>,
+        ) -> active_rpc::error::Result<()> {
+            self.sends += 1;
+            if self.sends == 3 {
+                return Err(active_rpc::error::Error::Provider {
+                    code: "mcp/not-sent".to_string(),
+                });
+            }
+            self.inner.send_line_within(line, deadline)
+        }
+    }
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/call".to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(NotSentOnce {
+        inner: MemoryTransport::new(responses),
+        sends: 0,
+    })
+    .expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the frame was not sent");
+    assert_eq!(error.provider_code(), Some("mcp/not-sent"), "{error}");
+    active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect("the session survived a frame that never left");
 }

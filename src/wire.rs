@@ -35,12 +35,11 @@ use crate::value::{Arg, Value};
 /// `max_values` per value (and per map key) and refuses a container past
 /// `max_array_len`. Without this walk the encoder emitted frames its own reader
 /// rejected, after the call had been charged (round 40, R-07-3).
-fn check_value_limits(value: &Value, limits: &WireLimits) -> Result<()> {
+fn check_value_limits(value: &Value, limits: &WireLimits, remaining: &mut u64) -> Result<()> {
     let widest = u64::from(limits.max_array_len);
-    let mut remaining = u64::from(limits.max_values);
     let mut stack: Vec<&Value> = vec![value];
     while let Some(value) = stack.pop() {
-        remaining = remaining
+        *remaining = remaining
             .checked_sub(1)
             .ok_or(Error::Wire("value count exceeds the ceiling"))?;
         match value {
@@ -56,7 +55,7 @@ fn check_value_limits(value: &Value, limits: &WireLimits) -> Result<()> {
                 }
                 for item in entries.values() {
                     // A key is a value on the wire; the reader charges it.
-                    remaining = remaining
+                    *remaining = remaining
                         .checked_sub(1)
                         .ok_or(Error::Wire("value count exceeds the ceiling"))?;
                     stack.push(item);
@@ -512,9 +511,13 @@ impl Envelope {
         if self.args.len() > limits.max_args as usize {
             return Err(Error::Wire("argument count exceeds the ceiling"));
         }
+        // One counter for the whole frame: the decoder's ceiling is cumulative,
+        // so two arguments that each fit are still over it together
+        // (round 34, #4).
+        let mut remaining_values = u64::from(limits.max_values);
         for arg in &self.args {
             if let Arg::Value(value) = arg {
-                check_value_limits(value, limits)?;
+                check_value_limits(value, limits, &mut remaining_values)?;
             }
         }
         if self.payload.len() > limits.max_payload as usize {

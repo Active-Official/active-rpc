@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-40: round 40 found 1 high, 1 medium and 3 lows, all fixed plus 3 residuals; rounds 41-42 must be clean | 243 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-33: round 33 found 3 highs and 4 mediums, all fixed; rounds 34-35 must be clean | 246 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-34: round 34 found 1 high, 3 mediums and 3 lows, all fixed; round 35 must be clean | 253 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -474,6 +474,25 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 34)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `995ccc1`. Round-33 fixes:
+seven HOLD, three PARTIAL on the refusal token only. One **high**, three
+mediums, three lows — all fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the MCP exception for a grant at or above the static ceiling skipped the budget entirely, so a 1.5 MiB grant carried a 1.8 MiB exchange | **fixed**: the charge is now `grant - sent` capped at the static ceiling, and a handshake (`None`) is the only unbounded case; `an_mcp_grant_above_the_line_ceiling_still_bounds_the_sum` |
+| 2 | medium | the process refusal token compared the raw grant with the static ceiling, so a grant just past it with a charged argv was reported as a policy refusal | **fixed**: the comparison uses the share; `a_process_share_under_the_static_ceiling_is_a_budget_refusal` |
+| 3 | medium | the HTTP refusal token had the same shape (`grant_bound` ignored the head charge) | **fixed**: `perform` takes the static ceiling and derives `grant_bound` after the charge; `an_http_share_under_the_static_ceiling_is_a_budget_refusal` |
+| 4 | medium | the encoder's value budget restarted per argument while the decoder's is cumulative | **fixed**: one counter across the frame; `the_value_ceiling_is_cumulative_across_arguments` |
+| 5 | low | `is_number_token` accepted `1.` and `0.e1` (no fraction digit) | **fixed**: a fraction needs at least one digit; `a_dangling_fraction_point_is_text_not_a_bad_number` |
+| 6 | low | the reader-cap refusal carried a 75-byte provider code, past the 64-byte envelope ceiling, so a peer saw a generic `rpc/provider` | **fixed**: "too many process readers" (39 bytes) |
+| 7 | low | a deadline that passed before the frame was written returned `rpc/timeout`, which poisoned a session that was never touched | **fixed**: the transport reports `mcp/not-sent` (nothing written) and the session stays usable; `a_frame_that_was_never_sent_leaves_the_session_usable`; `docs/spec/wire.md` lists the code |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Six new behavioural tests fail against the pre-fix tree.
 
 ### R-07 domain operations - 2026-11-04 (round 40)
 

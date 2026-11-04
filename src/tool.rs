@@ -227,8 +227,15 @@ fn is_number_token(text: &str) -> bool {
     }
     if index < bytes.len() && bytes[index] == b'.' {
         index += 1;
+        // JSON requires at least one fraction digit: `1.` and `0.e1` are not
+        // numbers, and reporting them as a bad number blamed the wrong party
+        // (round 34, #5).
+        let fraction = index;
         while index < bytes.len() && bytes[index].is_ascii_digit() {
             index += 1;
+        }
+        if index == fraction {
+            return false;
         }
     }
     if index < bytes.len() && (bytes[index] == b'e' || bytes[index] == b'E') {
@@ -1027,7 +1034,13 @@ impl McpTransport for StdioTransport {
         // the desync the round-5 fix existed to prevent (round 19, L1).
         if let Some(deadline) = deadline {
             if std::time::Instant::now() >= deadline {
-                return Err(Error::Timeout);
+                // Nothing was written, and a distinct code says so: an
+                // `rpc/timeout` here is indistinguishable from an ack timeout,
+                // where the frame may be in flight and the session is
+                // desynchronised (round 34, #7).
+                return Err(Error::Provider {
+                    code: "mcp/not-sent".to_string(),
+                });
             }
         }
         let (reply, outcome) = std::sync::mpsc::channel();
@@ -1193,7 +1206,7 @@ impl<T: McpTransport> McpSession<T> {
                 "clientInfo": { "name": "active-rpc", "version": env!("CARGO_PKG_VERSION") }
             }),
             deadline,
-            MAX_MCP_LINE_BYTES,
+            None,
         )?;
         if let Some(error) = initialize.get("error") {
             // Keep the server's numeric code, as `tools/list` does: a retry or
@@ -1205,7 +1218,7 @@ impl<T: McpTransport> McpSession<T> {
             };
             return Err(Error::Provider { code });
         }
-        let list = session.request_within("tools/list", json!({}), deadline, MAX_MCP_LINE_BYTES)?;
+        let list = session.request_within("tools/list", json!({}), deadline, None)?;
         if let Some(error) = list.get("error") {
             // A failed list was reported as a missing array and the server's
             // code was lost. `initialize` keeps its own class
@@ -1286,7 +1299,7 @@ impl<T: McpTransport> McpSession<T> {
         method: &str,
         params: Json,
         deadline: Option<std::time::Instant>,
-        max_line: usize,
+        grant: Option<usize>,
     ) -> Result<Json> {
         if self.poisoned {
             return Err(Error::Provider {
@@ -1314,10 +1327,12 @@ impl<T: McpTransport> McpSession<T> {
             "params": params,
         });
         let line = payload.to_string();
-        if max_line < MAX_MCP_LINE_BYTES && line.len() > max_line {
-            // The grant is the tighter bound: a request past it is a budget
-            // exhaustion (round 26, #4).
-            return Err(Error::BudgetExceeded("byte"));
+        if let Some(grant) = grant {
+            if grant < MAX_MCP_LINE_BYTES && line.len() > grant {
+                // The grant is the tighter bound: a request past it is a budget
+                // exhaustion (round 26, #4).
+                return Err(Error::BudgetExceeded("byte"));
+            }
         }
         if line.len() > MAX_MCP_LINE_BYTES {
             // Past the static ceiling: no budget can make this line legal, so
@@ -1340,10 +1355,13 @@ impl<T: McpTransport> McpSession<T> {
             // A partial write desynchronises the stream: the next read could
             // answer this request with the previous call's remainder
             // (round 3, #3). A timeout takes the same path, because a frame the
-            // writer thread already took may have reached the wire. `mcp/queue`
-            // is the exception: the writer never took the frame, so the session
-            // stays usable (round 29, F1).
-            if !matches!(&error, Error::Provider { code } if code == "mcp/queue") {
+            // writer thread already took may have reached the wire.
+            // `mcp/queue` and `mcp/not-sent` are the exceptions: the writer
+            // never took the frame, so the session stays usable
+            // (round 29, F1; round 34, #7).
+            if !matches!(&error, Error::Provider { code }
+                if code == "mcp/queue" || code == "mcp/not-sent")
+            {
                 self.poisoned = true;
             }
             return Err(error);
@@ -1373,15 +1391,14 @@ impl<T: McpTransport> McpSession<T> {
                 });
             }
             // The request spent part of the grant; only the remainder is
-            // available to the answer when the grant is the binding ceiling
-            // (round 33, H1). At or above the static ceiling the grant is not
-            // what bounds the answer, so the full line stays legal.
-            let response_cap = if max_line >= MAX_MCP_LINE_BYTES {
-                MAX_MCP_LINE_BYTES
-            } else {
-                max_line.saturating_sub(sent_bytes)
-            };
-            if response_cap < MAX_MCP_LINE_BYTES && line.len() > response_cap {
+            // available to the answer (round 33, H1). The static ceiling always
+            // caps one line, and a handshake with no grant (`None`) has no sum
+            // bound at all: treating a grant at or above the ceiling as if it
+            // did let a 1.5 MiB grant carry 1.8 MiB (round 34, #1).
+            let response_cap = grant.map_or(MAX_MCP_LINE_BYTES, |grant| {
+                grant.saturating_sub(sent_bytes).min(MAX_MCP_LINE_BYTES)
+            });
+            if line.len() > response_cap {
                 // The capability's byte grant bounds what this call may buffer,
                 // not only what it may return (round 19, M2); the request line
                 // already spent its part (round 33, H1). The line was
@@ -1620,7 +1637,7 @@ impl<T: McpTransport> Provider for McpSession<T> {
             "tools/call",
             json!({ "name": tool.name, "arguments": Json::Object(arguments) }),
             Some(deadline),
-            max_line,
+            Some(max_line),
         )?;
         if let Some(error) = response.get("error") {
             let Some(code) = error.get("code").and_then(Json::as_i64) else {
@@ -1741,14 +1758,13 @@ impl HttpTool {
         path: &str,
         body: Option<&[u8]>,
         ceiling_ms: u64,
-        max_body: usize,
+        static_ceiling: usize,
         grant: usize,
-        grant_bound: bool,
     ) -> Result<(u16, Vec<u8>)> {
         // A cap-derived refusal is a budget exhaustion when the capability's
         // grant set the cap, and a provider framing fault otherwise
         // (round 25, #7).
-        let capped = |code: &'static str| {
+        let capped = |code: &'static str, grant_bound: bool| {
             if grant_bound {
                 Error::BudgetExceeded("byte")
             } else {
@@ -1787,8 +1803,10 @@ impl HttpTool {
             return Err(Error::BudgetExceeded("byte"));
         }
         // The request spent part of the grant; only the remainder is available
-        // to the answer (round 33, H1).
-        let max_body = max_body.min(grant.saturating_sub(charged));
+        // to the answer (round 33, H1). Whether the grant left less than the
+        // static ceiling is decided here, after the charge (round 34, #3).
+        let max_body = static_ceiling.min(grant.saturating_sub(charged));
+        let grant_bound = max_body < static_ceiling;
         // A grant too small to hold the head cannot pay for the answer; the
         // static ceiling was its only bound (round 20, M3).
         if max_body < MIN_HTTP_ANSWER_BYTES {
@@ -1950,7 +1968,7 @@ impl HttpTool {
             header_bytes = header_bytes.saturating_add(line.len());
             fields += 1;
             if header_bytes > header_cap || fields > MAX_HTTP_HEADER_FIELDS {
-                return Err(capped("http/headers"));
+                return Err(capped("http/headers", grant_bound));
             }
             let Some((name, value)) = line.split_once(':') else {
                 // A header line without a colon is a framing fault: ignoring it
@@ -2018,7 +2036,7 @@ impl HttpTool {
         // (round 22, F-F).
         let body_cap = max_body.saturating_sub(header_bytes);
         if body_cap == 0 {
-            return Err(capped("http/body-too-large"));
+            return Err(capped("http/body-too-large", grant_bound));
         }
         let body = match content_length {
             Some(length) => {
@@ -2026,12 +2044,12 @@ impl HttpTool {
                 // sane ceiling would turn it into an allocation abort
                 // (round 11, #14).
                 if length > MAX_RESPONSE_BYTES {
-                    return Err(capped("http/body-too-large"));
+                    return Err(capped("http/body-too-large", grant_bound));
                 }
                 if length > body_cap {
                     // The same code as the read-to-end arm: a peer must not
                     // choose the code by choosing a framing (round 12, F-5).
-                    return Err(capped("http/body-too-large"));
+                    return Err(capped("http/body-too-large", grant_bound));
                 }
                 reader.body_exact(length)?
             }
@@ -2286,7 +2304,7 @@ impl Provider for HttpTool {
             None
         };
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
-        let cap = self.max_body.min(MAX_RESPONSE_BYTES).min(grant);
+        let static_ceiling = self.max_body.min(MAX_RESPONSE_BYTES);
         // Count admitted calls only (round 31, F7).
         self.calls += 1;
         let (status, response) = self.perform(
@@ -2294,9 +2312,8 @@ impl Provider for HttpTool {
             &path,
             body.as_deref(),
             call.budget.max_wall_ms,
-            cap,
+            static_ceiling,
             grant,
-            grant < self.max_body.min(MAX_RESPONSE_BYTES),
         )?;
         if !(200..300).contains(&status) {
             // A 3xx is not a completed call: the adapter does not follow
@@ -2806,8 +2823,12 @@ impl Provider for LocalProcess {
         // Which ceiling bound the read: token the refusal accordingly so a
         // caller can tell a capability budget from an adapter setting
         // (round 25, #3).
+        let static_ceiling = self.max_output.min(MAX_OUTPUT_BYTES);
         let output_refusal = || {
-            if grant < self.max_output.min(MAX_OUTPUT_BYTES) {
+            // The share, not the grant, is what bounds the read now: a grant
+            // just past the static ceiling with a large argv leaves a share
+            // under it, and that refusal is a budget one (round 34, #2).
+            if share < static_ceiling {
                 Error::BudgetExceeded("byte")
             } else {
                 Error::ToolPolicy("output too large")
@@ -2834,9 +2855,11 @@ impl Provider for LocalProcess {
                     // on Windows; a timeout loop must not be able to exhaust
                     // the process (round 33, H3).
                     let Some(slot) = ReaderSlot::acquire() else {
-                        spawn_error = Some(std::io::Error::other(
-                            "too many process readers are still draining an earlier child",
-                        ));
+                        // Short enough that the provider code survives the
+                        // receipt's 64-byte ceiling: a longer reason turned
+                        // `process/thread:…` into a generic `rpc/provider`
+                        // (round 34, #6).
+                        spawn_error = Some(std::io::Error::other("too many process readers"));
                         return;
                     };
                     // `thread::spawn` panics on failure; a named builder
