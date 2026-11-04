@@ -790,9 +790,10 @@ impl PlaneCore {
             .mint(
                 http_provider,
                 0,
-                CapAttrs::new(&["get"])
-                    .with_path("/health")
-                    .with_tool_policy(http_policy),
+                // The allow-list is what confines an HTTP path; the adapter
+                // refuses a path scope because the kernel compares dotted
+                // paths, which cannot confine a URL path.
+                CapAttrs::new(&["get"]).with_tool_policy(http_policy),
             )
             .expect("http cap");
 
@@ -2333,17 +2334,21 @@ impl PlaneCore {
         self.counters.tool_calls += 1;
         self.stage("GET /health", brief(&value), call_us, true);
         let start = Instant::now();
-        let error = self
-            .agent
-            .call(
-                self.lane,
-                &cap,
-                "get",
-                vec![Arg::Value(Value::path("/../etc/passwd"))],
-            )
-            .expect_err("path escape must be refused");
+        // The allow-list is what confines an HTTP path now (the adapter refuses
+        // a path scope), and it refuses at dispatch, so the rejection is read
+        // from the promise rather than from the queue call.
+        let escape = match self.agent.call(
+            self.lane,
+            &cap,
+            "get",
+            vec![Arg::Value(Value::path("/../etc/passwd"))],
+        ) {
+            Ok(promise) => self.await_value(&promise).map(|_| ()),
+            Err(error) => Err(error),
+        };
+        let error = escape.expect_err("path escape must be refused");
         let refusal_us = start.elapsed().as_secs_f64() * 1e6;
-        let escape_ok = error.code() == "rpc/path-not-granted";
+        let escape_ok = matches!(error.code(), "rpc/path-not-granted" | "rpc/tool-policy");
         self.stage("escape", error.code(), refusal_us, escape_ok);
         let ok = escape_ok && format!("{value:?}").contains("true");
         (
