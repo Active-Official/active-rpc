@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-33: round 33 found 1 high, 2 mediums and 4 lows, all fixed; rounds 34-35 must be clean | 199 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-34: round 34 found 3 mediums and 5 lows, all fixed or documented; rounds 35-36 must be clean | 205 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-27: round 27 found 2 mediums and 4 lows, all fixed; rounds 28-29 must be clean | 214 fixed / 1 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -89,6 +89,25 @@ was real here; each is fixed with a regression.
 | ARPC-009 | P2 | a durable object id is provider-local | **deferred**: needs a record format version and a provider epoch callback; recorded in STATUS |
 | ARPC-011 | P2 | the wasm clock ADR disagreed with the code | **deferred to the doc batch**: ADR-0019 edit queued with the P3 docs |
 | Polyglot P3 | P3 | Fortran/C/Swift/C# endian and Dart EOF | **deferred**: recorded in STATUS with the exact client files |
+
+### R-07 domain operations - 2026-11-04 (round 34)
+
+Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `ac0cf78`.
+Round-33 fixes verified (three partial). Three mediums, five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `scoped_labels` re-resolved every id against the arena with no interim wall check: a wide alias table made one charged call O(ids x nodes) on the dispatch thread | **fixed**: the loop checks the wall every 64 kept ids, like `nodes_within_scope` |
+| 2 | medium | three provider-side redaction/encode faults still answered `rpc/payload`: the redacted content hash, the library redactor inside `redacted_module_bytes`, and the evaluator's `Encode` arm | **fixed**: all three map to `provider/redaction` |
+| 3 | medium | `Envelope::error` wrote the provider code into the 256-byte (64 strict) `method` field, so an OS-bearing code made the refusal undecodable and looked hostile | **fixed**: ASCII codes of at most 64 bytes travel; longer ones fall back to `rpc/provider`. `an_overlong_provider_code_falls_back_to_the_class` |
+| 4 | low | the round-33 doc fix spliced `redacted_module_bytes`' doc onto `redaction_fault` | **fixed**: each function has its own block |
+| 5 | low | `wire.md` said the kernel reports three provider codes and listed the wrong set | **fixed**: it names `rpc/provider`, `wasm/trap`, `provider/reply-withheld`, and the domain's `provider/redaction`/`provider/object` |
+| 6 | low | an idempotency key does not cover a cancelled in-flight call or an evicted key | **recorded**: STATUS 14; a cancelled promise is deliberately retryable |
+| 7 | low | a vanished provider object answered `rpc/invalid-argument`, telling the peer its argument was bad | **fixed**: `provider/object`; two tests updated |
+| 8 | low | the domain wall ceiling is a post-hoc label that reads a host `Instant`, so a replayed call can flip | **documented**: ADR-0022 note; the loops that can run long now check every 64 steps |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-07 domain operations - 2026-11-04 (round 33)
 

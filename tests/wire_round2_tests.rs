@@ -244,3 +244,26 @@ fn an_error_envelope_carries_the_provider_inner_code() {
     let decoded = Envelope::decode(&bytes).expect("decode");
     assert_eq!(decoded.method, "rpc/read-only");
 }
+
+/// An error envelope carries the provider inner code only when it fits the
+/// bounded destination field; an over-long OS-bearing code falls back to the
+/// class so the refusal stays decodable under the strict profile
+/// (round 34, M-3).
+#[test]
+fn an_overlong_provider_code_falls_back_to_the_class() {
+    let long = format!("process/spawn:{}", "x".repeat(300));
+    let envelope = Envelope::error(5, &active_rpc::Error::Provider { code: long.clone() });
+    assert_eq!(envelope.method, "rpc/provider");
+    let bytes = envelope.encode().expect("encode");
+    let strict = WireLimits::strict();
+    Envelope::decode_with(&bytes, strict).expect("the refusal stays decodable");
+
+    // A code that fits keeps its detail.
+    let short = Envelope::error(
+        6,
+        &active_rpc::Error::Provider {
+            code: "provider/object".to_string(),
+        },
+    );
+    assert_eq!(short.method, "provider/object");
+}

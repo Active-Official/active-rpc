@@ -60,6 +60,12 @@ agent only when it wants simulated time.
   coexist).
 - `latency_ms` still drives promise batching in wall mode; it just no longer
   drives the clock.
+- A domain provider's `max_wall_ms` check reads the host's `Instant`, so a call
+  that reaches the ceiling answers `rpc/budget-exceeded: wall` on one host and
+  may answer `Ok` on a faster one. A replay package that recorded such a call
+  is not byte-reproducible at that boundary; the loops that can run long check
+  the ceiling every 64 steps, so the refusal is prompt, and the trace records
+  the decision that was taken (round 34, L-8).
 
 ## Evidence
 

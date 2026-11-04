@@ -199,13 +199,19 @@ a message.
 ### Kernel and domain provider codes
 
 A provider failure is `rpc/provider` with an inner code in the provider's own
-namespace. The kernel itself reports three:
+namespace. The kernel itself reports `rpc/provider` (a provider panicked or
+vanished), `wasm/trap` (a panic inside the kernel's own egress policy) and
+`provider/reply-withheld`; the domain provider reports `provider/redaction`
+and `provider/object`. An error envelope carries the inner code when it is
+ASCII and at most 64 bytes (`Envelope::error`), and falls back to `rpc/provider`
+otherwise, so the destination field stays decodable under the strict profile.
 
 | Code | Condition |
 |------|-----------|
 | `provider/reply-withheld` | a mutating provider ran and applied its effect, but the reply could not be delivered (a post-provider budget or lane refusal); the effect stands and the receipt records the admission, so this is not a retryable budget class |
 | `provider/secret-material` | a provider reply would have carried structural secret material and the redaction policy refused it |
 | `provider/redaction` | the provider could not build its redacted projection (an encode fault in its own reply) |
+| `provider/object` | the capability names an object the provider no longer holds |
 
 The domain provider reports `rpc/domain` with the Active class where the
 evaluator failed, and `rpc/budget-exceeded` with the dimension it measured

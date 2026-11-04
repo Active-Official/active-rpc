@@ -103,4 +103,10 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
     Operators must not configure `sh`/`cmd` with prefix rules; `wire.md` and
     `security.md` say prefix rules are unconfined, and the metacharacter refusal
     is defense in depth only.
+14. **An idempotency key does not cover a cancelled in-flight call or an evicted
+    key.** A settled `provider/reply-withheld` reply is reused by its key, so a
+    retry does not write twice. Cancelling an in-flight mutating call leaves a
+    cancelled promise, which is deliberately retryable, and eviction at
+    `MAX_IDEMPOTENCY` starts a fresh call: at-most-once holds for a settled
+    withheld reply, not across a cancel or an eviction (round 34, L-6).
 

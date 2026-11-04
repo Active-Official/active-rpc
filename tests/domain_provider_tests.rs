@@ -282,7 +282,10 @@ fn an_unknown_object_is_refused_without_touching_the_map() {
     let error = provider
         .invoke(object + 100, &Call::new("stats", vec![]))
         .expect_err("unknown object");
-    assert_eq!(error.code(), "rpc/invalid-argument");
+    // The object is provider state, not a caller argument: a vanished object
+    // is a provider fault, not the peer's bad input (round 34, L-7).
+    assert_eq!(error.code(), "rpc/provider");
+    assert_eq!(error.provider_code(), Some("provider/object"));
     assert!(provider.module(object).is_some());
 }
 

@@ -190,9 +190,13 @@ impl ModuleProvider {
     /// method (`stats`, `why`, `subgraph`, …). The module is re-inserted on
     /// every path, including errors, so a failed call never drops the object.
     fn take(&mut self, object: u64) -> Result<ModuleSlot> {
-        self.modules
-            .remove(&object)
-            .ok_or(Error::InvalidArgument("unknown module"))
+        self.modules.remove(&object).ok_or(Error::Provider {
+            // The object is provider state, not a caller argument: a record
+            // restored onto a rebuilt provider or a hand-minted object number
+            // is a provider-side fault, and `rpc/invalid-argument` told the
+            // peer to fix its own input (round 34, L-7).
+            code: "provider/object".to_string(),
+        })
     }
 
     fn path_arg(call: &Call) -> Option<String> {
@@ -328,6 +332,12 @@ impl ModuleProvider {
                         };
                         Error::BudgetExceeded(kind)
                     }
+                    // The evaluator encodes the redacted copy itself; a failure
+                    // there is the provider's, not the caller's payload
+                    // (round 34, M-2).
+                    active_infinity::Error::Encode(_) => Error::Provider {
+                        code: "provider/redaction".to_string(),
+                    },
                     other => Error::Payload(other.code().to_string()),
                 })?;
                 // The conversion recurses; a result deeper than the wire can
@@ -361,7 +371,9 @@ impl ModuleProvider {
                     dependencies,
                     call.path_scope.as_deref(),
                     call.redact,
-                );
+                    started,
+                    call,
+                )?;
                 let answer = redact_answer(&slot.module, node, labels, call.redact);
                 // The redaction walk is the caller's work too: the ceiling is
                 // checked after the answer is built (round 32, #7).
@@ -387,7 +399,9 @@ impl ModuleProvider {
                     dependents,
                     call.path_scope.as_deref(),
                     call.redact,
-                );
+                    started,
+                    call,
+                )?;
                 let answer = redact_answer(&slot.module, node, labels, call.redact);
                 // As in `dependencies`: after the redaction walk
                 // (round 32, #7).
@@ -640,8 +654,14 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels =
-                    scoped_labels(&slot.module, ids, call.path_scope.as_deref(), call.redact);
+                let labels = scoped_labels(
+                    &slot.module,
+                    ids,
+                    call.path_scope.as_deref(),
+                    call.redact,
+                    started,
+                    call,
+                )?;
                 let answer = redact_answer(&slot.module, node, labels, call.redact);
                 // After the redaction walk (round 32, #7).
                 check_wall_budget(started, call)?;
@@ -668,8 +688,14 @@ impl ModuleProvider {
                         return Err(Error::PathNotGranted(path));
                     }
                 }
-                let labels =
-                    scoped_labels(&slot.module, ids, call.path_scope.as_deref(), call.redact);
+                let labels = scoped_labels(
+                    &slot.module,
+                    ids,
+                    call.path_scope.as_deref(),
+                    call.redact,
+                    started,
+                    call,
+                )?;
                 let answer = redact_answer(&slot.module, node, labels, call.redact);
                 // After the redaction walk (round 32, #7).
                 check_wall_budget(started, call)?;
@@ -727,8 +753,9 @@ impl ModuleProvider {
                             let mut redacted = slot.module.clone();
                             crate::security::redact_derived(&mut redacted, &slot.redactor)
                                 .map_err(redaction_fault)?;
-                            let redacted_bytes = encode(&redacted)
-                                .map_err(|error| Error::Payload(error.code().to_string()))?;
+                            let redacted_bytes = encode(&redacted).map_err(|error| {
+                                redaction_fault(Error::Payload(error.code().to_string()))
+                            })?;
                             let hash = active_infinity::content_hash(&redacted_bytes)
                                 .map_err(|error| Error::Payload(error.code().to_string()))?;
                             slot.redacted_hash = Some(hash);
@@ -1522,28 +1549,39 @@ fn scoped_labels(
     ids: impl IntoIterator<Item = NodeId>,
     scope: Option<&str>,
     redact: bool,
-) -> Vec<String> {
+    started: std::time::Instant,
+    call: &Call,
+) -> Result<Vec<String>> {
     let ids: Vec<NodeId> = ids.into_iter().collect();
     // A pathless node has no name a caller could use: under a scope the label
     // would name a node the scope never granted, and under a redacting
     // capability it names an arena position of a module the caller cannot read
     // (round 9, #6). Round 4 fixed only the scoped half.
     if scope.is_none() && !redact {
-        return labels_for(module, ids);
+        return Ok(labels_for(module, ids));
     }
     let paths = active_infinity::interop::value_paths(module);
     // Only a label that resolves back to the node is a name the caller may
     // receive: `@node[7]`, `@annotation[0]` and a stale dotted binding label
     // are arena positions (round 10, #4).
-    labels_from(
-        module,
-        &paths,
-        ids.into_iter().filter(|id| match named_path(&paths, *id) {
+    let mut kept = Vec::new();
+    for id in ids {
+        let named = match named_path(&paths, id) {
             Some(path) => structural_resolve(module, path)
-                .is_some_and(|resolved| same_place(module, resolved, *id)),
+                .is_some_and(|resolved| same_place(module, resolved, id)),
             None => false,
-        }),
-    )
+        };
+        if named {
+            kept.push(id);
+        }
+        // Resolving one label walks the arena: a wide table of aliases made
+        // this O(ids x nodes) with no interim ceiling, on the dispatch thread
+        // (round 34, M-1). Mirror `nodes_within_scope`.
+        if kept.len() % 64 == 63 {
+            check_wall_budget(started, call)?;
+        }
+    }
+    Ok(labels_from(module, &paths, kept))
 }
 
 /// Answer a metadata query under a redacting capability.
@@ -1583,12 +1621,6 @@ fn tainted_labels(module: &InfinityModule) -> BTreeSet<String> {
         .collect()
 }
 
-/// Encode a module for an RPC payload with every secret replaced by the marker.
-///
-/// The RPC wire has no tag that carries secret bytes (`docs/spec/wire.md` §2.2),
-/// so a module returned by `subgraph` or `patch` is a redacted projection: the
-/// structure survives, the material does not. A caller that needs the raw module
-/// moves it through a transport payload, not through a capability result.
 /// A provider-side redaction fault, not a fault in the caller's payload.
 ///
 /// Redacting a stored module can make two field names collide after the
@@ -1604,16 +1636,21 @@ fn redaction_fault(error: Error) -> Error {
     }
 }
 
+/// Encode a module for an RPC payload with every secret replaced by the marker.
+///
+/// The RPC wire has no tag that carries secret bytes (`docs/spec/wire.md` §2.2),
+/// so a module returned by `subgraph` or `patch` is a redacted projection: the
+/// structure survives, the material does not. A caller that needs the raw module
+/// moves it through a transport payload, not through a capability result.
 fn redacted_module_bytes(module: &InfinityModule) -> Result<Vec<u8>> {
     // One implementation, shared with the security helpers: a second copy of
     // the redactor would drift, and the one that drifted would be the leak.
     // An encode fault here is the provider's own reply, not the caller's
     // payload: blaming `rpc/payload` misreported a redaction collision as bad
-    // input (round 32, #9).
-    let bytes = encode(module).map_err(|_| Error::Provider {
-        code: "provider/redaction".to_string(),
-    })?;
-    security::redact_module(&bytes)
+    // input (round 32, #9; round 34, M-2 also maps the library redactor).
+    let bytes = encode(module)
+        .map_err(|error| redaction_fault(Error::Payload(error.code().to_string())))?;
+    security::redact_module(&bytes).map_err(redaction_fault)
 }
 
 /// Strip the metadata a redacting cone must not carry.

@@ -558,7 +558,9 @@ fn the_last_drop_reclaims_the_module() {
         .expect("queued");
     agent.run();
     let error = promise.value().expect_err("the module is gone");
-    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+    // A vanished provider object is provider state (round 34, L-7).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(error.provider_code(), Some("provider/object"), "{error}");
 }
 
 /// The entry node of a dependency query is part of the answer: an alias that

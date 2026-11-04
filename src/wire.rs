@@ -330,6 +330,22 @@ impl Envelope {
         }
     }
 
+    /// Longest provider code an error envelope carries, in bytes.
+    ///
+    /// The destination field is bounded on decode (`WireLimits::max_method`: 256 by
+    /// default, 64 in the strict profile), and a provider code may embed OS text, so
+    /// a longer code falls back to `rpc/provider`. The trace keeps the full code
+    /// (round 34, M-3).
+    pub const MAX_ENVELOPE_PROVIDER_CODE: usize = 64;
+
+    fn bounded_provider_code(code: &str) -> &str {
+        if code.len() <= Self::MAX_ENVELOPE_PROVIDER_CODE && code.is_ascii() {
+            code
+        } else {
+            "rpc/provider"
+        }
+    }
+
     /// An error envelope.
     pub fn error(request_id: u64, error: &Error) -> Self {
         Self {
@@ -337,9 +353,13 @@ impl Envelope {
             request_id,
             // The inner provider code is the bit a peer needs: `rpc/provider`
             // alone cannot say whether a mutating call landed, and a caller
-            // that retries a withheld reply writes twice (round 33, F3).
+            // that retries a withheld reply writes twice (round 33, F3). The
+            // field is bounded on decode, so an over-long code (a provider
+            // code may embed OS text) falls back to the class instead of
+            // making the refusal undecodable (round 34, M-3).
             method: error
                 .provider_code()
+                .map(Self::bounded_provider_code)
                 .unwrap_or_else(|| error.code())
                 .to_string(),
             args: Vec::new(),
