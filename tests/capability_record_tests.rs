@@ -696,6 +696,12 @@ fn a_rotation_tombstones_the_record_of_a_dropped_exporter() {
         .restore_capability(&record, &admitted(b"durable-owner"))
         .expect_err("the retired peer's record is tombstoned");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
+    // A deployment can find the kill through its own API and append it to its
+    // persistent kill list (round 41, F6).
+    assert!(
+        agent.record_is_tombstoned(&record.record_id),
+        "the rotation's kill is visible to the deployment"
+    );
 }
 
 /// A restore is a durable mint, so it obeys the tombstone budget the mint
@@ -752,4 +758,122 @@ fn two_records_on_one_object_hold_two_pins() {
     let _restored = agent
         .restore_capability(&second_record, &owner)
         .expect("restore the second");
+}
+
+// ---------------------------------------------------------------------------
+// Round 41
+// ---------------------------------------------------------------------------
+
+/// A rotation retires the records of the rotated subtree, not every record the
+/// retired peer holds: a sibling capability stays usable (round 41, F2).
+#[test]
+fn a_rotation_leaves_a_siblings_record_restorable() {
+    let (agent, provider, first) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let second = agent
+        .mint_bound(&owner, provider, 0, agent.cap_attrs(&first).expect("attrs"))
+        .expect("a second durable cap bound to the same peer");
+    let first_record = agent.export_capability(&first).expect("export first");
+    let second_record = agent.export_capability(&second).expect("export second");
+
+    let old = peer(b"durable-owner");
+    let new = admitted(b"rotated-owner");
+    agent
+        .reintroduce_to(&first, &old, &new)
+        .expect("rotate the binding");
+    // A record is restorable once its exporting handle is gone.
+    drop(first);
+    drop(second);
+    agent.run();
+
+    assert!(
+        agent.record_is_tombstoned(&first_record.record_id),
+        "the rotated capability's record is retired"
+    );
+    assert!(
+        !agent.record_is_tombstoned(&second_record.record_id),
+        "the sibling's record is not this rotation's authority"
+    );
+    let restored = agent
+        .restore_capability(&second_record, &owner)
+        .expect("the sibling record is still restorable");
+    let error = agent
+        .restore_capability(&first_record, &owner)
+        .expect_err("the rotated capability's record is tombstoned");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+    drop(restored);
+}
+
+/// A registry at its ceiling refuses a restore *before* the claim, so the
+/// record stays usable once capacity frees (round 41, F7).
+#[test]
+fn a_restore_refused_by_a_full_registry_does_not_spend_the_record() {
+    use active_rpc::kernel::MAX_CAPS;
+    use active_rpc::persistence::MemoryRecordStore;
+
+    let (agent, provider, cap) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+    agent.run();
+
+    // Fill the capability registry and keep every handle alive: dropping one
+    // would remove its record from the registry.
+    let mut held = Vec::with_capacity(MAX_CAPS);
+    loop {
+        match agent.mint(provider, 0, CapAttrs::new(&["echo"])) {
+            Ok(cap) => held.push(cap),
+            Err(error) => {
+                assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+                break;
+            }
+        }
+    }
+    assert_eq!(held.len(), MAX_CAPS, "the registry is full");
+    let mut store = MemoryRecordStore::new();
+    let error = agent
+        .restore_capability_with(&record, &owner, Some(&mut store))
+        .expect_err("the registry is full");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert!(
+        store.is_empty(),
+        "a deterministic refusal must not spend the claim"
+    );
+
+    held.pop();
+    agent
+        .restore_capability_with(&record, &owner, Some(&mut store))
+        .expect("the record is still usable once capacity frees");
+}
+
+/// A record's present fields must have the type the format defines, and its
+/// arrays must be canonical: two texts with one meaning shared one seal
+/// (round 41, F4).
+#[test]
+fn a_record_with_a_coerced_field_or_an_unsorted_list_is_refused() {
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    let base: serde_json::Value = serde_json::from_str(&record.to_json()).expect("json");
+
+    let mutated = |key: &str, value: serde_json::Value| {
+        let mut object = base.clone();
+        object[key] = value;
+        serde_json::to_string(&object).expect("serialize")
+    };
+    for (key, value) in [
+        ("wall_clock", serde_json::Value::String("true".into())),
+        ("publish", serde_json::Value::String("false".into())),
+    ] {
+        let error = CapabilityRecord::from_json(&mutated(key, value)).expect_err(key);
+        assert_eq!(error.code(), "rpc/persistence", "{key}: {error}");
+    }
+
+    for methods in [
+        serde_json::json!(["stats", "echo"]),
+        serde_json::json!(["echo", "echo"]),
+    ] {
+        let error = CapabilityRecord::from_json(&mutated("methods", methods))
+            .expect_err("a non-canonical list");
+        assert_eq!(error.code(), "rpc/persistence", "{error}");
+    }
 }

@@ -382,7 +382,9 @@ fn evaluator_ceilings_never_exceed_the_grant() {
 fn a_delta_cannot_grow_the_table_past_its_ceiling() {
     use active_rpc::wire::{CapTableDelta, MAX_CAP_TABLE};
     let mut base = Vec::new();
-    for index in 0..MAX_CAP_TABLE {
+    // Start at 1: a zero id is not a capability, and the delta validates its
+    // descriptors (round 33, M4).
+    for index in 1..=MAX_CAP_TABLE {
         let mut id = [0u8; 16];
         id[0] = (index & 0xff) as u8;
         id[1] = (index >> 8) as u8;

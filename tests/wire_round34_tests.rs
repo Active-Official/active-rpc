@@ -24,3 +24,33 @@ fn the_value_ceiling_is_cumulative_across_arguments() {
         .expect("one argument fits");
     Envelope::decode(&bytes).expect("the decoder agrees");
 }
+
+/// A descriptor's method is bounded by the same `max_method` the envelope uses:
+/// the writer refused the frame but the table encoder used to emit it, so a
+/// peer was left to refuse it (round 41, F3).
+#[test]
+fn a_descriptor_method_past_the_ceiling_is_refused_by_the_writer() {
+    use std::collections::BTreeSet;
+
+    use active_rpc::cap::CapId;
+    use active_rpc::wire::{encode_capability_table, CapDescriptor};
+    use active_rpc::Budget;
+
+    let long = "m".repeat(WireLimits::default().max_method as usize + 1);
+    let descriptor = CapDescriptor {
+        id: CapId([0x5A; 16]),
+        methods: BTreeSet::from([long]),
+        budget: Budget::default(),
+        read_only: false,
+        redact: false,
+        path_scope: None,
+    };
+    let error = encode_capability_table(std::slice::from_ref(&descriptor))
+        .expect_err("a descriptor method past the ceiling");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+    let error = Envelope::request(1, "p", Vec::new())
+        .with_caps(vec![descriptor])
+        .encode()
+        .expect_err("the envelope applies the same rule");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+}

@@ -156,6 +156,14 @@ is fail-open. A record whose deadline
 has passed is refused, and so is one whose clock mode differs from the restoring
 kernel's (ADR-0015).
 
+A rotation (`reintroduce_to`) retires the records exported from the rotated
+subtree by tombstoning their ids in memory; the ids are discoverable with
+`record_is_tombstoned`. Because an `Event` cannot carry a record id, a
+deployment that keeps a persistent kill list must re-check its stored records
+against `record_is_tombstoned` after a successful rotation (or replay the
+rotation's ids from its own copy) before it restores anything: otherwise a
+restart forgets a kill that the rotation only recorded in memory.
+
 ### Why this is safe
 
 A record alone is not authority: using it requires a deployment that opted into

@@ -437,9 +437,19 @@ struct Job {
 
 /// The deterministic kernel: providers, capabilities, budgets and promises.
 ///
-/// One export pin: the object it keeps alive, the capability that exported it
-/// and that capability's binding.
-type RecordPin = (ProviderId, u64, CapId, Option<[u8; 32]>);
+/// One export pin: the object it keeps alive, the capability that exported it,
+/// that capability's binding and its lineage.
+///
+/// The lineage is what lets a rotation select the record of an exporting
+/// capability whose handle is already gone without retiring every record the
+/// same peer holds (round 41, F2).
+struct RecordPin {
+    provider: ProviderId,
+    object: u64,
+    cap: CapId,
+    binding: Option<[u8; 32]>,
+    lineage: Vec<CapId>,
+}
 
 /// It performs no I/O of its own; transports hand it envelopes and take the
 /// results back. Holding the kernel is the only way to reach a provider.
@@ -1185,7 +1195,8 @@ impl Agent {
         if remaining_calls == 0 || remaining_bytes == 0 {
             return Err(Error::persistence("the capability's grant is spent"));
         }
-        let mut chain: Vec<CapId> = record.lineage.clone();
+        let lineage = record.lineage.clone();
+        let mut chain: Vec<CapId> = lineage.clone();
         chain.push(record.id);
         for id in &chain {
             let meter = meter_for(&kernel, *id)?
@@ -1240,7 +1251,13 @@ impl Agent {
         kernel.consumed_records.insert(record.record_id);
         kernel.record_pins.insert(
             record.record_id,
-            (pinned.0, pinned.1, cap.id(), record.bound_to),
+            RecordPin {
+                provider: pinned.0,
+                object: pinned.1,
+                cap: cap.id(),
+                binding: record.bound_to,
+                lineage,
+            },
         );
         *kernel.pin_counts.entry(pinned).or_insert(0) += 1;
         kernel.push_event(Event::CapExported(cap.id()));
@@ -1405,6 +1422,29 @@ impl Agent {
             .budget
             .check()
             .map_err(|_| Error::persistence("the record's budget disables a ceiling"))?;
+        let attrs = record.attrs(ttl_ms);
+        // Every deterministic refusal the mint would apply is settled before the
+        // claim: a registry at its ceiling or a malformed method name used to
+        // burn the record's single-use claim for a transient refusal, so the
+        // credential could never be restored even after capacity freed
+        // (round 41, F7).
+        if !peer.can_bind() {
+            return Err(Error::Identity("the peer cannot be bound"));
+        }
+        check_binding(&attrs)?;
+        if attrs.methods.is_empty() {
+            return Err(Error::InvalidArgument("capability grants no methods"));
+        }
+        check_method_names(&attrs)?;
+        {
+            let kernel = self.cell.borrow();
+            if !kernel.providers.contains_key(&provider) {
+                return Err(Error::InvalidArgument("unknown provider"));
+            }
+            if kernel.caps.len() >= MAX_CAPS {
+                return Err(Error::BudgetExceeded("caps"));
+            }
+        }
         // Claim the record *before* minting. `claim` is atomic where the store
         // can make it so: a check-then-mark pair let two processes restore one
         // record into two grants, and the second grant's budget was a second
@@ -1413,7 +1453,6 @@ impl Agent {
         if let Some(store) = store {
             store.claim(&record.record_id)?;
         }
-        let attrs = record.attrs(ttl_ms);
         let restored = self.mint_restored(peer, provider, record.object, attrs)?;
         self.cell
             .borrow_mut()
@@ -1777,13 +1816,23 @@ impl Agent {
             .filter(|record_id| kernel.record_pins.contains_key(record_id))
             .collect();
         if from_fingerprint != to_fingerprint {
-            records.extend(kernel.record_pins.iter().filter_map(
-                |(record_id, (_provider, _object, _cap, binding))| {
-                    (*binding == Some(from_fingerprint)
-                        && !kernel.revoked_records.contains(record_id))
-                    .then_some(*record_id)
-                },
-            ));
+            // Only records whose exporting capability, or one of its
+            // ancestors, is in the rotated subtree: a sibling capability bound
+            // to the same peer is not this rotation's authority, and retiring
+            // its record stranded a capability the new peer could not use
+            // either (round 41, F2).
+            let rotated: std::collections::BTreeSet<CapId> = in_subtree.iter().copied().collect();
+            records.extend(kernel.record_pins.iter().filter_map(|(record_id, pin)| {
+                let inside = rotated.contains(&pin.cap)
+                    || pin
+                        .lineage
+                        .iter()
+                        .any(|ancestor| rotated.contains(ancestor));
+                (inside
+                    && pin.binding == Some(from_fingerprint)
+                    && !kernel.revoked_records.contains(record_id))
+                .then_some(*record_id)
+            }));
         }
         records.sort_unstable();
         records.dedup();
@@ -5958,9 +6007,10 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
 /// A restore calls this because the restored capability now holds the object; a
 /// tombstone because the record can never be restored (round 38, F3).
 fn release_pin(kernel: &mut Kernel, record_id: [u8; 32]) {
-    let Some((provider, object, cap, _binding)) = kernel.record_pins.remove(&record_id) else {
+    let Some(pin) = kernel.record_pins.remove(&record_id) else {
         return;
     };
+    let (provider, object, cap) = (pin.provider, pin.object, pin.cap);
     let key = (provider, object);
     if let Some(count) = kernel.pin_counts.get_mut(&key) {
         *count = count.saturating_sub(1);

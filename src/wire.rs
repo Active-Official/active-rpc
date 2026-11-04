@@ -67,6 +67,41 @@ fn check_value_limits(value: &Value, limits: &WireLimits, remaining: &mut u64) -
     Ok(())
 }
 
+/// Refuse a descriptor the decoder would refuse.
+///
+/// Shared by the envelope writer and the standalone table encoder so the two
+/// cannot drift: a descriptor method longer than the table's ceiling used to
+/// encode here and be refused by every reader (round 41, F3).
+fn check_descriptor(cap: &CapDescriptor, limits: &WireLimits) -> Result<()> {
+    if cap.id.0 == [0u8; 16] {
+        return Err(Error::CapabilityTable("zero capability id"));
+    }
+    if cap.methods.is_empty() {
+        return Err(Error::CapabilityTable("capability grants no methods"));
+    }
+    cap.budget
+        .check()
+        .map_err(|_| Error::CapabilityTable("budget disables a ceiling"))?;
+    if cap.methods.len() > limits.max_methods as usize {
+        return Err(Error::CapabilityTable("too many methods"));
+    }
+    if cap
+        .methods
+        .iter()
+        .any(|method| method.len() > limits.max_method as usize)
+    {
+        return Err(Error::CapabilityTable("method name exceeds the ceiling"));
+    }
+    if cap
+        .path_scope
+        .as_deref()
+        .is_some_and(|path| path.len() > limits.max_path as usize)
+    {
+        return Err(Error::CapabilityTable("path scope exceeds the ceiling"));
+    }
+    Ok(())
+}
+
 /// Envelope magic.
 pub const MAGIC: [u8; 4] = *b"ARP1";
 /// Envelope version.
@@ -384,8 +419,9 @@ impl Envelope {
 
     /// Longest provider code an error envelope carries, in bytes.
     ///
-    /// The destination field is bounded on decode (`WireLimits::max_method`: 256 by
-    /// default, 64 in the strict profile), and a provider code may embed OS text, so
+    /// The destination field is bounded on decode (`WireLimits::max_method`: 1024
+    /// by default, 64 in the strict profile), and a provider code may embed OS
+    /// text, so
     /// a longer code falls back to `rpc/provider`. The trace keeps the full code
     /// (round 34, M-3).
     pub const MAX_ENVELOPE_PROVIDER_CODE: usize = 64;
@@ -534,25 +570,7 @@ impl Envelope {
             .iter()
             .chain(self.cap_delta.iter().flat_map(|delta| delta.added.iter()))
         {
-            if cap.id.0 == [0u8; 16] {
-                return Err(Error::CapabilityTable("zero capability id"));
-            }
-            if cap.methods.is_empty() {
-                return Err(Error::CapabilityTable("capability grants no methods"));
-            }
-            cap.budget
-                .check()
-                .map_err(|_| Error::CapabilityTable("budget disables a ceiling"))?;
-            if cap.methods.len() > limits.max_methods as usize {
-                return Err(Error::CapabilityTable("too many methods"));
-            }
-            if cap
-                .path_scope
-                .as_deref()
-                .is_some_and(|path| path.len() > limits.max_path as usize)
-            {
-                return Err(Error::CapabilityTable("path scope exceeds the ceiling"));
-            }
+            check_descriptor(cap, limits)?;
         }
         let mut ids = std::collections::BTreeSet::new();
         for cap in self
@@ -1196,9 +1214,11 @@ pub fn decode_capability_table_with(
 
 /// Encode a capability table on its own.
 pub fn encode_capability_table(caps: &[CapDescriptor]) -> Result<Vec<u8>> {
+    let limits = WireLimits::default();
     let mut out = Vec::new();
     put_len(&mut out, caps.len())?;
     for cap in caps {
+        check_descriptor(cap, &limits)?;
         write_cap(&mut out, cap)?;
     }
     Ok(out)

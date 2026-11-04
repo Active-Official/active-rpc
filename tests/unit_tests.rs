@@ -585,14 +585,32 @@ fn wire_rejects_malformed_envelopes() {
     };
     cap.budget.max_calls = 0;
     let envelope = Envelope::request(1, "stats", vec![]).with_caps(vec![cap.clone()]);
-    // The writer refuses to produce an envelope it would itself refuse, and the
-    // low-level table encoder (which carries no policy) still round-trips into a
-    // decoder refusal: both sides apply the same rule (round 33, M4).
+    // The writer refuses to produce an envelope it would itself refuse: both the
+    // envelope and the standalone table encoder apply the same rule
+    // (round 33, M4).
     assert_eq!(
         envelope.encode().unwrap_err().code(),
         "rpc/capability-table"
     );
-    let table = active_rpc::wire::encode_capability_table(&[cap]).unwrap();
+    assert_eq!(
+        active_rpc::wire::encode_capability_table(&[cap])
+            .unwrap_err()
+            .code(),
+        "rpc/capability-table"
+    );
+    // And the reader refuses the same class: a table whose descriptor grants no
+    // method is a capability-table fault, whatever the writer did.
+    let mut table = active_rpc::wire::encode_capability_table(&[CapDescriptor {
+        id: CapId([0x21; 16]),
+        methods: ["stats".to_string()].into_iter().collect(),
+        budget: Budget::calls(1),
+        read_only: false,
+        redact: false,
+        path_scope: None,
+    }])
+    .expect("a legal table");
+    // count (4) + id (16) is the method count.
+    table[20..24].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(
         active_rpc::wire::decode_capability_table(&table)
             .unwrap_err()

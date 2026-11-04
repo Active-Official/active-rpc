@@ -441,10 +441,15 @@ impl CapabilityRecord {
         // A record written before the grant existed carries no field. The
         // default narrows authority (no publishing) rather than widening it, and
         // a record that names topics implies the grant.
-        let publish = value
-            .get("publish")
-            .and_then(Json::as_bool)
-            .unwrap_or_else(|| topics.is_some());
+        // A present field must have the type the record defines: `"publish":
+        // "false"` used to parse as `true` (a non-empty string is not a bool, so
+        // the default "topics imply publishing" applied), and a JSON-reading
+        // policy tool disagreed with the kernel about the grant (round 41, F4).
+        let publish = match value.get("publish") {
+            None | Some(Json::Null) => topics.is_some(),
+            Some(Json::Bool(flag)) => *flag,
+            Some(_) => return Err(Error::persistence("publish is not a boolean")),
+        };
         let tool_policy = match value.get("tool_policy") {
             None | Some(Json::Null) => None,
             Some(Json::Object(policy)) => {
@@ -502,10 +507,14 @@ impl CapabilityRecord {
                     .ok_or_else(|| Error::persistence("deadline is malformed"))?,
             ),
         };
-        let wall_clock = value
-            .get("wall_clock")
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
+        // Same rule as `publish`: the clock mode decides how an absolute
+        // deadline is read, so a text that is not a boolean must not silently
+        // default it (round 41, F4).
+        let wall_clock = match value.get("wall_clock") {
+            None | Some(Json::Null) => false,
+            Some(Json::Bool(flag)) => *flag,
+            Some(_) => return Err(Error::persistence("wall_clock is not a boolean")),
+        };
         let lease_ms = match value.get("lease_ms") {
             None | Some(Json::Null) => None,
             Some(number) => Some(
@@ -593,10 +602,23 @@ fn string_set(value: &Json, key: &str) -> Result<Option<BTreeSet<String>>> {
         None | Some(Json::Null) => Ok(None),
         Some(Json::Array(items)) => {
             let mut set = BTreeSet::new();
+            let mut previous: Option<&str> = None;
             for item in items {
                 let text = item
                     .as_str()
                     .ok_or_else(|| Error::persistence("a record list holds a non-string"))?;
+                // The writer renders a sorted set, and the canonicality check
+                // compares the parsed value with the text: an unsorted or
+                // duplicated array parsed to the same set and passed, so two
+                // texts shared one record and one seal (round 41, F4).
+                if let Some(previous) = previous {
+                    if text <= previous {
+                        return Err(Error::persistence(
+                            "a record list is not in canonical order",
+                        ));
+                    }
+                }
+                previous = Some(text);
                 set.insert(text.to_string());
             }
             Ok(Some(set))

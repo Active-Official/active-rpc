@@ -20,7 +20,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-40: round 40 found 1 high, 1 medium and 3 lows, all fixed plus 3 residuals; rounds 41-42 must be clean | 243 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-41: round 41 found 2 mediums and 5 lows, all fixed; round 42 must be clean | 250 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-34: round 34 found 1 high, 3 mediums and 3 lows, all fixed; round 35 must be clean | 253 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
@@ -474,6 +474,30 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-07 domain operations - 2026-11-04 (round 41)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
+`12afc99`. Round-40 claims: five HOLD, one PARTIAL (the value count was
+per-argument, already fixed by round 34), one HOLD over-broad. Two mediums and
+five lows — all fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the encoder's value budget restarted per argument while the decoder's is per envelope | **fixed in round 34** (R-08 landed the cumulative counter); `the_value_ceiling_is_cumulative_across_arguments` |
+| 2 | medium | the rotation's pin selector was global by binding, so rotating one capability retired every durable record the peer held, including siblings outside the subtree | **fixed**: the pin carries the exporting capability's lineage and only records of the rotated subtree are retired; `a_rotation_leaves_a_siblings_record_restorable` |
+| 3 | low | `check_limits` never bounded a descriptor's method bytes, so the writer emitted a table every reader refused | **fixed**: `check_descriptor` is shared by the envelope and `encode_capability_table`; `a_descriptor_method_past_the_ceiling_is_refused_by_the_writer` |
+| 4 | low | `from_json` coerced `"wall_clock":"true"` and `"publish":"false"`, and accepted unsorted or duplicated arrays, so two texts shared one record and one seal | **fixed**: a present field must have its declared type and a list must be strictly ascending; `a_record_with_a_coerced_field_or_an_unsorted_list_is_refused` |
+| 5 | low | the provider-code doc still said `max_method: 256` | **fixed** (1024, strict 64) |
+| 6 | low | a rotation's kills are in memory and no event can carry a record id, so a restart forgets them | **documented** in ADR-0010 (re-check `record_is_tombstoned` after a rotation); the orphan test asserts the kill is visible through that API |
+| 7 | low | `store.claim` ran before the mint's capacity checks, so a full registry burned the record's single-use claim | **fixed**: every deterministic refusal is settled before the claim; `a_restore_refused_by_a_full_registry_does_not_spend_the_record` |
+
+Also repaired while fixing: `a_delta_cannot_grow_the_table_past_its_ceiling`
+built its first descriptor with a zero id, which the round-33 writer rule now
+refuses; the fixture starts at 1.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Four of the new behavioural tests fail against the pre-fix tree.
 
 ### R-08 tools and MCP - 2026-11-04 (round 34)
 
