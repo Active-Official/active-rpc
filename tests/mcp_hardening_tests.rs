@@ -488,7 +488,8 @@ fn an_expired_deadline_sends_no_frame() {
     let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let transport = Spy { sent: sent.clone() };
     let result = McpSession::handshake_within(transport, Some(std::time::Instant::now()));
-    assert_eq!(code(result), "rpc/timeout");
+    // Nothing was written, and the code says so (round 35, N3).
+    assert_eq!(code(result), "mcp/not-sent");
     assert!(
         sent.borrow().is_empty(),
         "a frame was sent: {:?}",

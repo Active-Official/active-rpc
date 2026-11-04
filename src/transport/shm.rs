@@ -122,6 +122,12 @@ impl SharedSegment {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let used = state.head.saturating_sub(state.tail) as usize;
+        // The length prefix is four bytes: a payload past `u32::MAX` would wrap
+        // and the reader would take the tail as a second frame. The segment
+        // ceiling makes this unreachable in practice, and the conversion keeps
+        // the invariant independent of it (round 35, R-09 #3).
+        let length =
+            u32::try_from(payload.len()).map_err(|_| Error::Wire("frame length overflow"))?;
         let needed = payload.len() + 4;
         if needed > state.capacity {
             return Err(Error::Transport(
@@ -163,7 +169,7 @@ impl SharedSegment {
             state.tail = 0;
         }
         let start = state.head as usize % state.capacity;
-        state.data[start..start + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        state.data[start..start + 4].copy_from_slice(&length.to_le_bytes());
         state.data[start + 4..start + 4 + payload.len()].copy_from_slice(payload);
         state.head += needed as u64;
         state.produced_total = state.produced_total.saturating_add(needed as u64);

@@ -723,9 +723,23 @@ impl<'a> BodyBudget<'a> {
     }
 
     fn reserve(&mut self, want: usize) -> Result<()> {
-        if self.counter.fetch_add(want, Ordering::SeqCst) + want > MAX_INFLIGHT_BODY {
-            self.counter.fetch_sub(want, Ordering::SeqCst);
-            return Err(Error::Backpressure("the server's QUIC body budget"));
+        // A compare-exchange loop, like the HTTP/2 `Reservation`: the earlier
+        // increment-then-rollback let a transient overshoot refuse a caller that
+        // would have fit (round 35, R-09 #4).
+        let mut current = self.counter.load(Ordering::SeqCst);
+        loop {
+            if current.saturating_add(want) > MAX_INFLIGHT_BODY {
+                return Err(Error::Backpressure("the server's QUIC body budget"));
+            }
+            match self.counter.compare_exchange(
+                current,
+                current + want,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
         self.held += want;
         Ok(())
@@ -957,6 +971,11 @@ impl QuicClient {
         );
         let request = payload.to_vec();
         let deadline = self.deadline;
+        // The stream carries a four-byte length and then the body; bound the
+        // read by the caller's own limits, so a strict client does not buffer
+        // the server's full 64 MiB before `read_frame` refuses it
+        // (round 35, R-09 #1).
+        let read_ceiling = self.limits.max_bytes.min(MAX_FRAME_BYTES).saturating_add(4);
         self.runtime.block_on(async move {
             let exchange = async move {
                 let connection = endpoint
@@ -973,10 +992,18 @@ impl QuicClient {
                     .map_err(|error| Error::Transport(format!("write: {error}")))?;
                 send.finish()
                     .map_err(|error| Error::Transport(format!("finish: {error}")))?;
-                let response = recv
-                    .read_to_end(MAX_FRAME_BYTES)
-                    .await
-                    .map_err(|error| Error::Transport(format!("read: {error}")))?;
+                let response = match recv.read_to_end(read_ceiling).await {
+                    Ok(response) => response,
+                    // A stream past the caller's ceiling is a wire fault: the
+                    // peer framed a message this client will never accept
+                    // (round 35, R-09 #1).
+                    Err(quinn::ReadToEndError::TooLong) => {
+                        return Err(Error::Wire("response exceeds the size ceiling"))
+                    }
+                    Err(error) => {
+                        return Err(Error::Transport(format!("read: {error}")));
+                    }
+                };
                 connection.close(0u32.into(), b"done");
                 Ok(response)
             };

@@ -1550,7 +1550,8 @@ fn a_spent_handshake_deadline_sends_nothing() {
         Ok(_) => panic!("a spent handshake must not succeed"),
         Err(error) => error,
     };
-    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    // Nothing was written, so the refusal says so (round 35, N3).
+    assert_eq!(error.provider_code(), Some("mcp/not-sent"), "{error}");
 }
 
 // ---------------------------------------------------------------------------
@@ -3009,4 +3010,145 @@ fn a_frame_that_was_never_sent_leaves_the_session_usable() {
     assert_eq!(error.provider_code(), Some("mcp/not-sent"), "{error}");
     active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
         .expect("the session survived a frame that never left");
+}
+
+// ---------------------------------------------------------------------------
+// Round 35
+// ---------------------------------------------------------------------------
+
+/// A skipped MCP notification is bytes the call buffered, so it spends the
+/// grant; sixteen of them under a small grant used to fit freely
+/// (round 35, N1).
+#[test]
+fn an_mcp_notification_spends_the_grant() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+
+    struct Chatty {
+        inner: MemoryTransport,
+        answers: usize,
+    }
+    impl McpTransport for Chatty {
+        fn send_line(&mut self, line: &str) -> active_rpc::error::Result<()> {
+            self.inner.send_line(line)
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.inner.recv_line()
+        }
+        fn recv_line_within(
+            &mut self,
+            deadline: Option<std::time::Instant>,
+        ) -> active_rpc::error::Result<String> {
+            self.answers += 1;
+            if self.answers <= 2 {
+                // The handshake's initialize and tools/list answers.
+                return self.inner.recv_line_within(deadline);
+            }
+            // Progress notifications are legal before the answer.
+            if self.answers <= 6 {
+                return Ok(format!(
+                    r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"note":"{}"}}}}"#,
+                    "p".repeat(1_000)
+                ));
+            }
+            Ok(
+                r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#
+                    .to_string(),
+            )
+        }
+    }
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(Chatty {
+        inner: MemoryTransport::new(responses),
+        answers: 0,
+    })
+    .expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    // Four 1 KiB notifications do not fit the grant, so the first frames past
+    // it are refused.
+    call.budget.max_bytes = 2_048;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the notifications are over the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    // The answer is still behind frames the call could not account for, so the
+    // session is desynchronised.
+    let again = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the session is poisoned");
+    assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
+}
+
+/// A notification past the grant fails the same way the answer does, and the
+/// session is refused afterwards rather than reading a stale frame as its
+/// answer (round 35, N1).
+#[test]
+fn an_mcp_answer_beyond_the_notifications_is_a_budget_refusal() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+
+    struct OneNotification {
+        inner: MemoryTransport,
+        answers: usize,
+    }
+    impl McpTransport for OneNotification {
+        fn send_line(&mut self, line: &str) -> active_rpc::error::Result<()> {
+            self.inner.send_line(line)
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.inner.recv_line()
+        }
+        fn recv_line_within(
+            &mut self,
+            deadline: Option<std::time::Instant>,
+        ) -> active_rpc::error::Result<String> {
+            self.answers += 1;
+            if self.answers <= 2 {
+                return self.inner.recv_line_within(deadline);
+            }
+            if self.answers == 3 {
+                return Ok(format!(
+                    r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"note":"{}"}}}}"#,
+                    "q".repeat(200)
+                ));
+            }
+            Ok(format!(
+                r#"{{"jsonrpc":"2.0","id":3,"result":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+                "r".repeat(900)
+            ))
+        }
+    }
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(OneNotification {
+        inner: MemoryTransport::new(responses),
+        answers: 0,
+    })
+    .expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    // The request and the 200-byte notification fit; the 900-byte answer does
+    // not fit what they left.
+    call.budget.max_bytes = 1_100;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the answer is past the remainder");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }

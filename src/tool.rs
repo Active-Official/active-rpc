@@ -1310,7 +1310,11 @@ impl<T: McpTransport> McpSession<T> {
         // can no longer be refused without the server having acted on it.
         if let Some(deadline) = deadline {
             if std::time::Instant::now() >= deadline {
-                return Err(Error::Timeout);
+                // Nothing has been written: the caller may keep the session
+                // (round 35, N3).
+                return Err(Error::Provider {
+                    code: "mcp/not-sent".to_string(),
+                });
             }
         }
         // JSON-RPC ids wrap rather than panic in a long-lived session; id 0 is
@@ -1345,10 +1349,14 @@ impl<T: McpTransport> McpSession<T> {
         // to the answer (round 33, H1).
         let sent_bytes = line.len();
         // A ceiling already spent means nothing has been written: the session
-        // stays usable, and the caller may retry (round 5, #5).
+        // stays usable, and the caller may retry (round 5, #5). The code says
+        // so, so a caller does not treat it as an in-flight timeout
+        // (round 35, N3).
         if let Some(deadline) = deadline {
             if std::time::Instant::now() >= deadline {
-                return Err(Error::Timeout);
+                return Err(Error::Provider {
+                    code: "mcp/not-sent".to_string(),
+                });
             }
         }
         if let Err(error) = self.transport.send_line_within(&line, deadline) {
@@ -1367,6 +1375,11 @@ impl<T: McpTransport> McpSession<T> {
             return Err(error);
         }
         let mut skipped = 0usize;
+        // What the call has buffered so far: the request line plus every
+        // notification frame read before the answer. A skipped frame is bytes
+        // this call pays for, and sixteen of them under a small grant held
+        // 16 MiB (round 35, N1).
+        let mut spent = sent_bytes;
         loop {
             let line = match self.transport.recv_line_within(deadline) {
                 Ok(line) => line,
@@ -1389,22 +1402,6 @@ impl<T: McpTransport> McpSession<T> {
                 return Err(Error::Provider {
                     code: "mcp/line-too-long".to_string(),
                 });
-            }
-            // The request spent part of the grant; only the remainder is
-            // available to the answer (round 33, H1). The static ceiling always
-            // caps one line, and a handshake with no grant (`None`) has no sum
-            // bound at all: treating a grant at or above the ceiling as if it
-            // did let a 1.5 MiB grant carry 1.8 MiB (round 34, #1).
-            let response_cap = grant.map_or(MAX_MCP_LINE_BYTES, |grant| {
-                grant.saturating_sub(sent_bytes).min(MAX_MCP_LINE_BYTES)
-            });
-            if line.len() > response_cap {
-                // The capability's byte grant bounds what this call may buffer,
-                // not only what it may return (round 19, M2); the request line
-                // already spent its part (round 33, H1). The line was
-                // consumed, so the session stays in step, and a grant refusal
-                // does not poison it (round 28, #2).
-                return Err(Error::BudgetExceeded("byte"));
             }
             let response: Json = match serde_json::from_str(&line) {
                 // A number the decoder rounded or an overflowing float is not
@@ -1446,6 +1443,21 @@ impl<T: McpTransport> McpSession<T> {
                 // whatever id it reuses: answering it as our result lets a
                 // peer choose the shape of our answer (round 18, L-3).
                 Some(value) if value.as_u64() == Some(id) && !object.contains_key("method") => {
+                    // The request and every skipped frame spent part of the
+                    // grant; only the remainder is available to the answer
+                    // (round 33, H1; round 35, N1). The static ceiling always
+                    // caps one line, and a handshake with no grant (`None`) has
+                    // no sum bound at all: treating a grant at or above the
+                    // ceiling as if it did let a 1.5 MiB grant carry 1.8 MiB
+                    // (round 34, #1). The line was consumed and it is the
+                    // answer, so a grant refusal does not poison the session
+                    // (round 28, #2).
+                    let response_cap = grant.map_or(MAX_MCP_LINE_BYTES, |grant| {
+                        grant.saturating_sub(spent).min(MAX_MCP_LINE_BYTES)
+                    });
+                    if line.len() > response_cap {
+                        return Err(Error::BudgetExceeded("byte"));
+                    }
                     let has_result = object.get("result").is_some();
                     let has_error = object.get("error").is_some();
                     if !has_result && !has_error {
@@ -1469,6 +1481,15 @@ impl<T: McpTransport> McpSession<T> {
                 // request. Skip a bounded number so progress and log
                 // notifications do not break a spec-compliant server.
                 None if object.contains_key("method") => {
+                    // The frame is buffered like any other, so it spends the
+                    // grant. Past it the stream is desynchronised: the answer
+                    // this call wants is still behind frames it could not
+                    // account for, so the session is poisoned.
+                    spent = spent.saturating_add(line.len());
+                    if grant.is_some_and(|grant| spent > grant) {
+                        self.poisoned = true;
+                        return Err(Error::BudgetExceeded("byte"));
+                    }
                     skipped += 1;
                     if skipped > MAX_MCP_NOTIFICATIONS {
                         self.poisoned = true;

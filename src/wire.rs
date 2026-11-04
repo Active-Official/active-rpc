@@ -229,18 +229,13 @@ impl CapTableDelta {
                 "cap-table delta exceeds the table ceiling",
             ));
         }
-        for cap in &self.added {
+        {
             // The programmatic path must not admit something the wire path would
-            // refuse: a descriptor whose budget disables a ceiling is invalid
-            // whichever way it arrived.
-            cap.budget
-                .check()
-                .map_err(|_| Error::CapabilityTable("budget disables a ceiling"))?;
-            if cap.id.0 == [0u8; 16] {
-                return Err(Error::CapabilityTable("zero capability id"));
-            }
-            if cap.methods.is_empty() {
-                return Err(Error::CapabilityTable("capability grants no methods"));
+            // refuse: the same descriptor rule, ceilings included, applies
+            // whichever way a descriptor arrived (round 35, N2).
+            let limits = WireLimits::default();
+            for cap in &self.added {
+                check_descriptor(cap, &limits)?;
             }
         }
         // An added id that already exists in the *base* table is a replacement.

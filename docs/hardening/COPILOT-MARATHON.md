@@ -21,8 +21,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | rounds 1-41: round 41 found 2 mediums and 5 lows, all fixed; round 42 must be clean | 250 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-34: round 34 found 1 high, 3 mediums and 3 lows, all fixed; round 35 must be clean | 253 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-7: 22 + 16 + 13 + 6 + 6 + 6 + 4 findings | 73 fixed / 0 rejected / 0 open (QUIC and TCP audited CLEAN) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-35: round 35 found 2 mediums and 1 low, all fixed; rounds 36-37 must be clean | 256 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-8: round 8 found 1 medium and 4 lows, all fixed; round 9 must be clean | 78 fixed / 0 rejected / 0 open | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -474,6 +474,40 @@ are closed.
 
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
+
+### R-09 transports - 2026-11-04 (round 8)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `ff1d455`. Not clean: one
+medium and four lows, all fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `QuicClient::exchange` read the stream to `MAX_FRAME_BYTES` whatever the caller's limits, so a strict client buffered 64 MiB before the decoder refused the frame | **fixed**: the read is capped at `limits.max_bytes.min(MAX_FRAME_BYTES) + 4` and `ReadToEndError::TooLong` is `rpc/wire`; `a_strict_client_does_not_buffer_a_frame_past_its_limits` (guards the class and the read) |
+| 2 | low | `grpc_frame` asserted on an oversized payload, so a direct caller with untrusted bytes could panic the process | **fixed**: it returns `Result` and refuses `rpc/wire`; all callers updated; `grpc_frame_refuses_a_message_past_its_ceiling` |
+| 3 | low | the shared-memory writer cast `payload.len()` to `u32`, which wraps past 4 GiB | **fixed**: `u32::try_from` refuses with `rpc/wire` (the segment ceiling makes it unreachable; the cast is gone) |
+| 4 | low | `BodyBudget::reserve` used increment-then-rollback, so a transient overshoot refused a caller that would have fit | **fixed**: a compare-exchange loop, like the HTTP/2 `Reservation` |
+| 5 | low | the bridge's ten-millisecond grace mapped a truncated body (EOF) to 408 as well as a real stall | **fixed**: `read_body_by_deadline` returns `Truncated` or `TimedOut`, and only the second is 408; `a_truncated_body_gets_a_400_and_the_bridge_keeps_serving` still holds |
+
+Two conversions are defensive and have no behavioural test: the shared-memory
+`u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
+concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 35)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `eb9d789`. All seven
+round-34 claims HOLD. Two mediums and one low, all fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | skipped MCP notification frames were read but never charged, so sixteen 1 MiB notifications fit under a 1 KiB grant | **fixed**: the answer's cap is `grant - (request + notifications)` and a notification past the grant poisons the session; `an_mcp_notification_spends_the_grant`, `an_mcp_answer_beyond_the_notifications_is_a_budget_refusal` |
+| 2 | medium | `CapTableDelta::apply_to` checked the budget, id and method count but not the method-length or path ceilings the wire path applies | **fixed**: it calls `check_descriptor` with the default limits; `a_delta_addition_obeys_the_descriptor_ceilings` |
+| 3 | low | the session's own spent-deadline pre-checks still returned `rpc/timeout`, which reads as an in-flight timeout while nothing was written | **fixed**: `mcp/not-sent` on both, matching the transport; `an_expired_deadline_sends_no_frame` updated |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Three new behavioural tests fail against the pre-fix tree.
 
 ### R-07 domain operations - 2026-11-04 (round 41)
 

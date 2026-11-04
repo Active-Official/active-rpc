@@ -352,3 +352,30 @@ mod quic {
         assert_eq!(response.method, "rpc/wire");
     }
 }
+
+#[cfg(feature = "quic")]
+mod quic_round35 {
+    use super::*;
+    use active_rpc::transport::quic::{QuicClient, QuicServer};
+    use active_rpc::wire::WireLimits;
+
+    /// A client's own limits also bound what it *reads*: a strict client used to
+    /// buffer the server's full 64 MiB frame before the decoder refused it
+    /// (round 35, R-09 #1).
+    #[test]
+    fn a_strict_client_does_not_buffer_a_frame_past_its_limits() {
+        let server = QuicServer::start(1, |envelope| {
+            // Two MiB: legal for the default server profile, past a strict
+            // client's one-MiB ceiling.
+            Envelope::response(envelope.request_id, Value::text("x".repeat(2 << 20)))
+        })
+        .expect("server");
+        let client = QuicClient::connect(server.address(), server.certificate())
+            .expect("client")
+            .with_limits(WireLimits::strict());
+        let error = client
+            .call(&Envelope::request(1, "ping", vec![]))
+            .expect_err("the answer is past the strict ceiling");
+        assert_eq!(error.code(), "rpc/wire", "{error}");
+    }
+}

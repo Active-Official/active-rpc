@@ -47,21 +47,20 @@ pub const MAX_HEAD: usize = 16 << 10;
 pub const CONNECTION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Frame one message with the gRPC 5-byte prefix.
-pub fn grpc_frame(payload: &[u8]) -> Vec<u8> {
-    // Both shipped callers bound the payload to `MAX_BODY` first, so the
-    // length fits `u32`; a direct caller that does not would wrap it and the
-    // peer would read the tail as a second message (round 25, #5; round 26,
-    // #1). The invariant is checked in release too, because a wrapped frame
-    // is a wire fault, not a slow path.
-    assert!(
-        payload.len() <= MAX_BODY,
-        "grpc_frame payload exceeds MAX_BODY"
-    );
+pub fn grpc_frame(payload: &[u8]) -> Result<Vec<u8>> {
+    // A payload past the ceiling is a wire fault, not a slow path: wrapping the
+    // length would make the peer read the tail as a second message
+    // (round 25, #5; round 26, #1). A direct caller may hold untrusted bytes,
+    // so this is a refusal and never an assertion (round 35, #2).
+    if payload.len() > MAX_BODY {
+        return Err(Error::Wire("bridge message exceeds the ceiling"));
+    }
+    let length = u32::try_from(payload.len()).map_err(|_| Error::Wire("bridge length overflow"))?;
     let mut out = Vec::with_capacity(5 + payload.len());
     out.push(0);
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&length.to_be_bytes());
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 /// Split one gRPC-framed message off `body`, returning it and the rest.
@@ -158,27 +157,48 @@ fn read_line_before(
 /// A drip that stays inside a per-read timeout is still bounded by the
 /// connection deadline; the timeout is recomputed from the remaining time before
 /// every read.
+enum BodyFault {
+    /// The peer closed or errored before the announced length arrived.
+    Truncated,
+    /// The deadline passed while the body was still arriving.
+    TimedOut,
+}
+
 fn read_body_by_deadline(
     reader: &mut BufReader<TcpStream>,
     length: usize,
     deadline: std::time::Instant,
     body: &mut Vec<u8>,
-) -> bool {
+) -> std::result::Result<(), BodyFault> {
     use std::io::Read;
     let mut chunk = [0u8; 16 * 1024];
     while body.len() < length {
         if !arm_deadline(reader.get_ref(), deadline) {
-            return false;
+            return Err(BodyFault::TimedOut);
         }
         let want = (length - body.len()).min(chunk.len());
         match reader.read(&mut chunk[..want]) {
-            Ok(0) => return false,
+            Ok(0) => return Err(BodyFault::Truncated),
             Ok(read) => body.extend_from_slice(&chunk[..read]),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return false,
+            // A socket timeout is a slow peer; anything else is a broken one.
+            // Reporting a truncated body as a timeout made a framing fault
+            // retryable and put an EOF and a stall in one class
+            // (round 35, R-09 #5).
+            Err(error)
+                if error.kind() == std::io::ErrorKind::TimedOut
+                    || error.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                return Err(BodyFault::TimedOut)
+            }
+            Err(_) => return Err(BodyFault::Truncated),
         }
     }
-    body.len() == length
+    if body.len() == length {
+        Ok(())
+    } else {
+        Err(BodyFault::Truncated)
+    }
 }
 
 impl BridgeServer {
@@ -421,25 +441,21 @@ impl BridgeServer {
             return 0;
         }
         let mut body = Vec::with_capacity(content_length.min(64 * 1024));
-        let complete = read_body_by_deadline(&mut reader, content_length, deadline, &mut body);
-        if !complete {
+        if let Err(fault) = read_body_by_deadline(&mut reader, content_length, deadline, &mut body)
+        {
             // A truncated body is one bad connection, not a server failure:
             // answer 400 for it and keep accepting the next one. Growing the
             // buffer with the bytes that arrive means a header that announces
             // 64 MiB and sends ten bytes costs 64 KiB, not 64 MiB. A body that
             // ran out of time is a timeout instead, the same discrimination
-            // the head path makes (round 24, F4).
-            // A socket timeout can fire a few milliseconds before the
-            // deadline it was armed from; treat that band as a timeout so a
-            // loaded host does not report a drip as a framing fault.
-            let now = std::time::Instant::now();
-            if now >= deadline
-                || deadline.saturating_duration_since(now) < std::time::Duration::from_millis(10)
-            {
-                let _ = write_http_response(&mut stream, 408, b"rpc/transport", deadline);
-            } else {
-                let _ = write_http_response(&mut stream, 400, b"rpc/wire", deadline);
-            }
+            // the head path makes (round 24, F4). The fault carries its own
+            // reason, so an EOF inside the grace band is not called a timeout
+            // (round 35, R-09 #5).
+            let (status, code) = match fault {
+                BodyFault::TimedOut => (408, &b"rpc/transport"[..]),
+                BodyFault::Truncated => (400, &b"rpc/wire"[..]),
+            };
+            let _ = write_http_response(&mut stream, status, code, deadline);
             drain_before_close(&mut stream);
             return 0;
         }
@@ -498,7 +514,13 @@ impl BridgeServer {
             drain_before_close(&mut stream);
             return 0;
         }
-        let framed = grpc_frame(&bytes);
+        let Ok(framed) = grpc_frame(&bytes) else {
+            // The body was checked against `MAX_BODY` above, so this is the
+            // length conversion failing on a 32-bit target.
+            let _ = write_http_response(&mut stream, 413, b"rpc/wire", deadline);
+            drain_before_close(&mut stream);
+            return 0;
+        };
         // The read deadline's remainder may be milliseconds after a body that
         // landed just in time; give the response its own budget.
         let _ = stream.set_write_timeout(Some(CONNECTION_WAIT));
@@ -776,7 +798,7 @@ impl ConnectClient {
             // the release invariant as a panic (round 27, medium).
             return Err(Error::Wire("request exceeds the ceiling"));
         }
-        let framed = grpc_frame(&body);
+        let framed = grpc_frame(&body)?;
         let (status, response) = self.post(&framed, CONNECT_TYPE)?;
         if status != 200 {
             // The body is peer text; `refusal` keeps a short stable token and

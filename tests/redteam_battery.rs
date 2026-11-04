@@ -783,8 +783,9 @@ fn h2_34_corpus() -> std::result::Result<(), String> {
         let _ = Envelope::decode_with(&bytes, WireLimits::strict());
         let _ = decode_capability_table(&bytes);
         if let Ok((message, _)) = grpc_unframe(&bytes) {
-            let framed = grpc_frame(message);
-            let _ = grpc_unframe(&framed);
+            if let Ok(framed) = grpc_frame(message) {
+                let _ = grpc_unframe(&framed);
+            }
         }
     }
     Ok(())

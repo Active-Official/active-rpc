@@ -455,28 +455,45 @@ fn a_non_three_digit_status_is_a_wire_fault() {
 fn a_dripping_reader_cannot_hold_the_bridge_response() {
     use active_rpc::transport::connect::{grpc_frame, CONNECT_TYPE, PATH};
     use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     let server = BridgeServer::bind_loopback().expect("bind");
     let address = server.address().to_string();
-    let body = grpc_frame(&request(29, "echo", Vec::new()).encode().expect("encode"));
+    let body =
+        grpc_frame(&request(29, "echo", Vec::new()).encode().expect("encode")).expect("frame");
+    // The drip stops when the serve returns, so the test pays for the bridge's
+    // bound and not for a fixed sleep; the flag and the read timeout keep the
+    // join prompt even when the server closed the socket mid-drip.
+    let finished = Arc::new(AtomicBool::new(false));
+    let client_finished = Arc::clone(&finished);
     let client = thread::spawn(move || {
         let mut stream = std::net::TcpStream::connect(&address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
         let head = format!(
             "POST {PATH} HTTP/1.1\r\nhost: active-rpc\r\ncontent-type: {CONNECT_TYPE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(head.as_bytes()).expect("head");
         stream.write_all(&body).expect("body");
-        // One byte per 1.5 s: each read resets the socket timeout the client
-        // does not have, and each write is a little progress.
+        // One byte per 300 ms: each read resets the socket timeout the client
+        // does not have, and each write is a little progress. The drip keeps
+        // going while the serve is running, so a regression to an unbounded
+        // write shows up as a serve that never returns rather than a margin a
+        // loaded machine can eat.
         let mut one = [0u8; 1];
-        let until = Instant::now() + Duration::from_secs(6);
-        while Instant::now() < until {
-            if stream.read(&mut one).unwrap_or(0) == 0 {
-                break;
+        // A hard stop turns a regression into a failed assertion rather than a
+        // suite that never finishes.
+        let until = Instant::now() + Duration::from_secs(12);
+        while !client_finished.load(Ordering::SeqCst) && Instant::now() < until {
+            match stream.read(&mut one) {
+                Ok(0) => break,
+                Ok(_) => std::thread::sleep(Duration::from_millis(300)),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
             }
-            std::thread::sleep(Duration::from_millis(300));
         }
     });
 
@@ -489,6 +506,7 @@ fn a_dripping_reader_cannot_hold_the_bridge_response() {
         })
         .expect("serve");
     let elapsed = started.elapsed();
+    finished.store(true, Ordering::SeqCst);
     assert_eq!(served, 1, "the call reached the handler");
     assert!(
         elapsed < Duration::from_secs(5),
@@ -626,7 +644,8 @@ fn an_answer_for_another_request_is_refused() {
         &Envelope::response(99, Value::Null)
             .encode()
             .expect("encode"),
-    );
+    )
+    .expect("frame");
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut scratch = [0u8; 4096];
@@ -768,4 +787,18 @@ fn a_short_response_body_is_a_transport_error() {
         "{error}"
     );
     serving.join().expect("server");
+}
+
+/// A framed message past the bridge's body ceiling is refused, not asserted:
+/// a direct caller may hold bytes the shipped paths never bound
+/// (round 35, R-09 #2).
+#[test]
+fn grpc_frame_refuses_a_message_past_its_ceiling() {
+    use active_rpc::transport::connect::grpc_frame;
+
+    let small = grpc_frame(b"hello").expect("a small message frames");
+    assert_eq!(small.len(), 5 + 5);
+    let huge = vec![0u8; active_rpc::transport::connect::MAX_BODY + 1];
+    let error = grpc_frame(&huge).expect_err("past the ceiling");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
 }
