@@ -235,7 +235,6 @@ fn a_refusal_survives_a_body_that_was_never_sent() {
     let mut client = std::net::TcpStream::connect(address).expect("connect");
     // Announce a frame past the strict ceiling and send its body: the server
     // refuses on the prefix alone, leaving the body unread.
-    // refuses on the prefix alone, with the announced body still unread.
     let announced = (2 << 20) as u32;
     client.write_all(&announced.to_le_bytes()).expect("prefix");
     // Send the announced body too: it then sits unread in the server's
@@ -255,5 +254,6 @@ fn a_refusal_survives_a_body_that_was_never_sent() {
     reader.read_exact(&mut body).expect("the error body");
     let answer = Envelope::decode_with(&body, WireLimits::default()).expect("an envelope");
     assert_eq!(answer.kind, active_rpc::wire::Kind::Error);
+    assert_eq!(answer.method, "rpc/wire", "{answer:?}");
     let _ = server.join();
 }

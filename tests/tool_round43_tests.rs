@@ -227,3 +227,22 @@ fn a_request_call_with_a_get_method_is_withheld() {
     );
     drop(server);
 }
+
+/// An exact allowlist entry is the natural home of a fixed credential: the
+/// handle's `Debug` names the method and the entry's length, never the path
+/// (round 48, F-1).
+#[test]
+fn an_http_debug_does_not_print_an_allowlisted_path() {
+    let canary = "/hooks/6f1c2b9a-secret-token";
+    let tool = HttpTool::new("http://127.0.0.1:9", &[("GET", canary)]);
+    let rendered = format!("{tool:?}");
+    assert!(rendered.contains("HttpTool"), "{rendered}");
+    assert!(
+        !rendered.contains("secret-token"),
+        "the allowlisted path leaked: {rendered}"
+    );
+    assert!(
+        !rendered.contains(canary),
+        "the allowlisted path leaked: {rendered}"
+    );
+}

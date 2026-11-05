@@ -432,9 +432,9 @@ transport must preserve when it forwards one:
 | Transport | Framing | Notes |
 |-----------|---------|-------|
 | in-process | none | envelopes move by value; `bytes_written() == 0` |
-| TCP | `u32` length + envelope | cross-process, `MAX_FRAME_BYTES` = 64 MiB |
+| TCP | `u32` length + envelope | cross-process, `MAX_FRAME_BYTES` = 64 MiB; a post-handler refusal is `provider/reply-withheld` |
 | shared memory | `u32` length + envelope in a ring | borrowed frame reads via `with_frame` (the decoded envelope owns its payload) |
-| QUIC | `u32` length + envelope on one bi-directional stream, one stream per call | TLS with a self-signed certificate on loopback; `start_mutual_tls` verifies a client certificate and exposes the authenticated peer identity |
+| QUIC | `u32` length + envelope on one bi-directional stream, one stream per call | TLS with a self-signed certificate on loopback; `start_mutual_tls` verifies a client certificate and exposes the authenticated peer identity; a post-handler refusal, including one past the reply budget, is `provider/reply-withheld` |
 | HTTP/2 | `POST /active.rpc.v1.Agent/Call`, body is the bare envelope, content type `application/arp1` | feature `http2`; one connection, concurrent streams; a non-200 answer carries an `rpc/...` body, or `provider/reply-withheld` once the handler has run |
 | Connect/gRPC | HTTP/1.1 `POST /active.rpc.v1.Agent/Call`, body framed as `[0][len u32 BE][envelope]`, content type `application/connect+active-infinity` or `application/grpc+active-infinity` | a malformed frame is a `400` with an `rpc/...` body and a post-handler refusal carries `provider/reply-withheld`; HTTP/1.1, one request per connection |
 
@@ -486,13 +486,13 @@ answer is still queued) from the answer itself.
 Two deliberate asymmetries. A JSON-RPC `error` object from an MCP server keeps
 its `mcp/<code>` on a writable call: MCP has its own tool-level outcome
 (`result.isError`), which the adapter passes through as content rather than
-reinterpreting, so an `error` object is read as the tool declining. A caller
-that treats an `error` object as meaning nothing happened should consult
-`result.isError` on the successful path; the class is documented, not
-enforced by the adapter. And the kernel's mutating axis for the HTTP adapter is
-the capability's method: `get` keeps its own code, `post` and `request` withhold, which is
-over-conservative for a `request`-with-`GET` and never a claim that a read
-had an effect.
+reinterpreting, so an `error` object is read as the tool declining. The class
+is documented, not enforced by the adapter; a retry after such an `error`
+re-executes a mutating tool, an accepted residual because the peer chooses a
+non-committal class. And the kernel's mutating axis for the HTTP adapter is
+the capability's method: `get` keeps its own code, `post` and `request` withhold
+whatever method text they carry, which is over-conservative for a
+`request`-with-`GET` and never a claim that a read had an effect.
 
 One stream carries one frame. On QUIC the reader takes the announced length and
 then probes for trailing bytes with a `250 ms` window (`STREAM_TAIL_WAIT`): a

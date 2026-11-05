@@ -21,8 +21,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-47: round 47 found no critical/high/medium; 7 lows fixed) | 318 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-19: round 19 found 2 mediums and 8 lows; 5 fixed, 3 noted; rounds 20-21 must be clean | 144 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-48: round 47 was clean; round 48 found 1 medium and 8 lows, all fixed or noted; round 49 must be clean | 326 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-20: round 20 found 1 medium and 6 lows, all fixed; round 21 must be clean | 151 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -586,6 +586,32 @@ mediums, two lows and one documentation fix.
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
 
+### R-09 transports - 2026-11-04 (round 20)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `02f6ec7`, with
+out-of-tree probes. Round-19 claims: two HOLD, one HOLD (wording overstated), one
+BROKEN, one PARTIAL. Verdict **NOT CLEAN**: one medium and six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| A | medium | the reply-budget refusal kept the encoded reply alive across its own `reply(...).await`, so the one reply that was refused was the one held longest, outside every budget | **fixed**: `drop(bytes)` before the await in both refusal arms |
+| B | low | the kind refusal ("a server only serves requests") was the one path not drained, so a pipelined frame could reset the reply away | **fixed**: it drains |
+| C | low | the `DRAIN_GRACE_MS` doc line was spliced into the refusal-class block | **fixed**: the const sits after the classes with its own doc |
+| D | low | the round-19 insert left two half-sentences around the new reservation | **fixed** |
+| E | low | the drain test repeated a stale comment and asserted only the envelope kind | **fixed**: the duplicate is gone and the code is asserted (`rpc/wire`) |
+| F | low | `ReplyBudget` had no test | **fixed**: `the_reply_budget_admits_releases_and_refuses` |
+| G | low | the round-19 record claimed the shared-memory size refusal was `rpc/wire` while the code still returned `rpc/transport` (my earlier edit had not applied) | **fixed**: `rpc/wire`; the record is corrected here |
+
+Accepted residuals: the fixed 150 ms drain cannot consume a body larger than the
+link carries in that window (a byte-bounded drain of the announced length is the
+next step); a transient reply-budget exhaustion is reported as non-retryable
+(same precedent as HTTP/2); `reply_encoded` peaks at twice the charged reply;
+early refusal replies are outside every budget; a handler panic stays
+`rpc/provider` for a call that may have landed.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-09 transports - 2026-11-04 (round 19)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `7a184b1`. Round-18
@@ -841,6 +867,26 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 48)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `02f6ec7`. Round-47
+claims: three HOLD, one PARTIAL, one BROKEN. Verdict **PARTIAL**: one medium and
+eight lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `HttpTool` still derived `Debug`, printing the base and every allowlisted path, the class round 47 had just redacted on `LocalProcess` | **fixed**: a hand-written `Debug` prints the method and each entry's length; `an_http_debug_does_not_print_an_allowlisted_path` |
+| 2 | low | `write_within` returned the byte count only on success, so a partial head still left `after_send` false and the round-47 guard was vacuous | **fixed**: it returns `(usize, Result<()>)`; any written byte sets `after_send` before the error propagates |
+| 3 | low | the HTTP body cloned the caller's map (recursive `Clone`) before the depth gate | **fixed**: borrowed values are walked first |
+| 4 | low | the MCP stdio reader takes no `ReaderSlot`, so a pipe-holding descendant leaks a blocked thread per session on Windows | **noted** with ARPC-004: the same leader-only kill; a slot there would refuse a legitimate second session rather than bound the leak |
+| 5 | low | two `arg_bytes` sums used `Iterator::sum()`, which panics on overflow in a debug build | **fixed**: both fold with `checked_add` |
+| 6 | low | `from_bytes` promised WAT support while the default policy refuses non-magic bytes | **fixed**: the doc says the policy decides |
+| 7 | low | a peer's JSON-RPC `error` keeps a non-committal class on a writable call, so a retry re-executes | **documented** in `wire.md` as an accepted residual (the peer chooses the class) |
+| 8 | low | `calls` counted a poisoned-session refusal | **fixed**: the counter moves after the poison check |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

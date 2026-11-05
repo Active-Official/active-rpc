@@ -783,21 +783,24 @@ async fn serve_stream<H>(
         }
     };
     // A peer controls its own receive window: a response larger than the credit
-    // it grants parks `write_all` forever without this deadline. Reset the
-    // stream instead of holding the task.
-    // Send the bytes that were encoded under this server's profile: encoding
-    // Charge the encoded reply against one shared ceiling before it is held
-    // for a peer that may grant no flow-control credit; a reply that does not
-    // fit is withheld rather than parked (round 19, R-9#2).
+    // it grants parks `write_all` forever without this deadline.
+    // Charge the encoded reply against one shared ceiling before it is held for
+    // a peer that may grant no flow-control credit; a reply that does not fit is
+    // withheld rather than parked (round 19, R-9#2).
     let Some(_reply_budget) = ReplyBudget::try_reserve(&inflight_out, bytes.len()) else {
         let error = Error::Provider {
             code: "provider/reply-withheld".to_string(),
         };
+        // Release the encoded reply before the await: otherwise the one reply
+        // that was refused is the one held longest, outside every budget
+        // (round 20, A).
+        drop(bytes);
         reply(&mut send, &Envelope::error(request_id, &error)).await;
         finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
         return;
     };
-    // again inside `reply` used the default profile (round 18, R16-6).
+    // Send the bytes encoded under this server's profile: encoding again inside
+    // `reply` used the default profile (round 18, R16-6).
     reply_encoded(&mut send, &bytes).await;
     finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
 }
@@ -1321,4 +1324,30 @@ fn transport_config() -> quinn::TransportConfig {
     config.stream_receive_window(STREAM_RECEIVE_WINDOW.into());
     config.receive_window(CONNECTION_RECEIVE_WINDOW.into());
     config
+}
+#[cfg(test)]
+mod budget_tests {
+    use super::{ReplyBudget, MAX_INFLIGHT_BODY};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    /// The shared reply ceiling: a reservation that would pass it is refused,
+    /// the guard releases on drop, and a nested reservation sees the first.
+    #[test]
+    fn the_reply_budget_admits_releases_and_refuses() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = ReplyBudget::try_reserve(&counter, MAX_INFLIGHT_BODY)
+            .expect("the whole ceiling fits once");
+        assert!(
+            ReplyBudget::try_reserve(&counter, 1).is_none(),
+            "a second byte is past the ceiling"
+        );
+        drop(first);
+        let again = ReplyBudget::try_reserve(&counter, 1).expect("released");
+        drop(again);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // A zero-length reservation is always admitted and harmless.
+        let empty = ReplyBudget::try_reserve(&counter, 0).expect("zero bytes");
+        drop(empty);
+    }
 }

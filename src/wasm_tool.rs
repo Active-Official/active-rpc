@@ -187,10 +187,11 @@ pub struct WasmTool {
 }
 
 impl WasmTool {
-    /// Compile a guest from WASM bytes (or WAT text, which wasmi accepts).
+    /// Compile a guest from WASM bytes.
     ///
-    /// This is the ABI v1 entry point: the host policy is deny-by-default, so
-    /// any import is refused.
+    /// WAT text is accepted only by a policy that opts in (WasmHostPolicy::accept_wat);
+    /// this entry point uses the deny-by-default policy, which refuses anything
+    /// that does not start with the wasm magic.
     pub fn from_bytes(bytes: &[u8], limits: WasmLimits) -> Result<WasmTool> {
         Self::from_bytes_with_policy(bytes, limits, WasmHostPolicy::default())
     }

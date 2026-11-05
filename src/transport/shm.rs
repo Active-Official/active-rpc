@@ -130,9 +130,10 @@ impl SharedSegment {
             u32::try_from(payload.len()).map_err(|_| Error::Wire("frame length overflow"))?;
         let needed = payload.len() + 4;
         if needed > state.capacity {
-            return Err(Error::Transport(
-                "frame does not fit the segment".to_string(),
-            ));
+            // A frame that can never fit is a size fault, not a transport
+            // condition: retrying does not help and TCP/QUIC refuse the same
+            // way (round 19, R-9#4; round 20, G).
+            return Err(Error::Wire("frame does not fit the segment"));
         }
         // A desynchronised consumer can advance past the frame boundary and
         // leave `tail` mid-frame. Check this before the capacity decision so the

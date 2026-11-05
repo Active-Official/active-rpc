@@ -47,15 +47,15 @@ pub const MAX_ERROR_BODY: usize = 64;
 /// `provider/reply-withheld` is here because a server decides it after its own
 /// handler ran: it is a provider class, not an authority decision, and a client
 /// that dropped it could never observe the contract (round 17, R16-4).
-/// How long a closing transport drains the peer before the socket drops.
-const DRAIN_GRACE_MS: u64 = 150;
-
 const PEER_REFUSAL_CLASSES: &[&str] = &[
     "rpc/transport",
     "rpc/backpressure",
     "rpc/provider",
     "provider/reply-withheld",
 ];
+
+/// How long a closing transport drains the peer before the socket drops.
+const DRAIN_GRACE_MS: u64 = 150;
 
 /// Map a peer's refusal body to the matching error.
 ///
@@ -573,6 +573,9 @@ where
                         &Error::Wire("a server only serves requests"),
                     );
                     let _ = transport.send(&reply);
+                    // A pipelined second frame is still unread: drain so the
+                    // refusal is not lost to a reset (round 20, B).
+                    transport.drain_before_close();
                     return Ok(served);
                 }
                 // A provider panic is hostile-input reachable. On this

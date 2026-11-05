@@ -838,31 +838,40 @@ fn write_within(
     stream: &mut std::net::TcpStream,
     bytes: &[u8],
     deadline: std::time::Instant,
-) -> Result<usize> {
+) -> (usize, Result<()>) {
     const CHUNK: usize = 4 << 10;
     let mut sent = 0usize;
     while sent < bytes.len() {
-        stream
-            .set_write_timeout(Some(remaining_until(deadline)?))
-            .map_err(|_| Error::Timeout)?;
+        let left = match remaining_until(deadline) {
+            Ok(left) => left,
+            Err(error) => return (sent, Err(error)),
+        };
+        if stream.set_write_timeout(Some(left)).is_err() {
+            return (sent, Err(Error::Timeout));
+        }
         let end = (sent + CHUNK).min(bytes.len());
         match std::io::Write::write(stream, &bytes[sent..end]) {
             Ok(0) => {
-                return Err(Error::Provider {
-                    code: "http/write:short write".to_string(),
-                })
+                return (
+                    sent,
+                    Err(Error::Provider {
+                        code: "http/write:short write".to_string(),
+                    }),
+                )
             }
             Ok(written) => sent += written,
-            Err(error) => return Err(map_http_write(error)),
+            Err(error) => return (sent, Err(map_http_write(error))),
         }
         if sent < bytes.len() {
             // Only between chunks: a head that is fully on the wire, terminator
             // included, must not be reported as a pre-send timeout (round 44,
             // L-6). The next phase arms its own deadline.
-            remaining_until(deadline)?;
+            if let Err(error) = remaining_until(deadline) {
+                return (sent, Err(error));
+            }
         }
     }
-    Ok(sent)
+    (sent, Ok(()))
 }
 
 /// A socket read that hit its timeout is the call's ceiling, not an I/O fault.
@@ -1716,7 +1725,16 @@ impl<T: McpTransport> Provider for McpSession<T> {
         // the budget refused only afterwards (round 39, F2). The uniform
         // prefix is budget, payload, secret, scope, argument bytes, method
         // (round 40, F2).
-        let arg_bytes: u64 = call.args.iter().map(Arg::wire_size).sum();
+        // checked_add, as the process and wasm adapters use: a debug build
+        // must refuse an impossible sum rather than panic inside the adapter
+        // (round 48, F-5).
+        let mut arg_bytes = 0u64;
+        for arg in &call.args {
+            let Some(next) = arg_bytes.checked_add(Arg::wire_size(arg)) else {
+                return Err(Error::BudgetExceeded("byte"));
+            };
+            arg_bytes = next;
+        }
         if arg_bytes > call.budget.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
@@ -1789,17 +1807,17 @@ impl<T: McpTransport> Provider for McpSession<T> {
         // refusal and a line past only the static ceiling is a bad argument
         // (round 27, #1).
         let max_line = grant;
-        // Count admitted calls only: a zero-grant or policy refusal is not a
-        // served call (round 31, F7).
-        self.calls += 1;
         if self.poisoned {
             // Nothing leaves a poisoned session, so this refusal is not a
             // withheld reply (the post-send mapping below assumes the request
-            // left).
+            // left), and it is not a served call either (round 48, F-8).
             return Err(Error::Provider {
                 code: "mcp/desync".to_string(),
             });
         }
+        // Count admitted calls only: a zero-grant or policy refusal is not a
+        // served call (round 31, F7).
+        self.calls += 1;
         let response = match self.request_within(
             "tools/call",
             json!({ "name": tool.name, "arguments": Json::Object(arguments) }),
@@ -1853,7 +1871,6 @@ impl<T: McpTransport> Provider for McpSession<T> {
 /// The allowlist is `(METHOD, path)` pairs. There is no redirect following, no
 /// chunked encoding, and the body is bounded by `max_body`. A URL outside the
 /// allowlist is `rpc/tool-policy`.
-#[derive(Debug)]
 pub struct HttpTool {
     /// Base URL, e.g. `http://127.0.0.1:8080`.
     pub base: String,
@@ -1869,6 +1886,27 @@ pub struct HttpTool {
     /// point may have applied its effect, so it is reported as a withheld
     /// reply for a mutating method (round 43, F-2).
     after_send: bool,
+}
+
+impl std::fmt::Debug for HttpTool {
+    /// Names and shapes, never an allowlisted path: an exact entry is the
+    /// natural home of a fixed credential (a signed URL, a hook token), the
+    /// same rule `LocalProcess` follows (round 48, F-1).
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let allow: Vec<String> = self
+            .allow
+            .iter()
+            .map(|(method, path)| format!("{method} <{} bytes>", path.len()))
+            .collect();
+        formatter
+            .debug_struct("HttpTool")
+            .field("base", &self.base)
+            .field("allow", &allow)
+            .field("max_body", &self.max_body)
+            .field("max_request", &self.max_request)
+            .field("calls", &self.calls)
+            .finish()
+    }
 }
 
 impl HttpTool {
@@ -2081,12 +2119,14 @@ impl HttpTool {
         // A head written in chunks can fail after its first chunk: any byte on
         // the wire means the peer may act, even though the line is incomplete
         // (round 47, L-4).
-        let head_written = write_within(&mut stream, head.as_bytes(), deadline)?;
+        let (head_written, head_result) = write_within(&mut stream, head.as_bytes(), deadline);
         if head_written > 0 {
             self.after_send = true;
         }
+        head_result?;
         if let Some(body) = body {
-            let _ = write_within(&mut stream, body, deadline)?;
+            let (_, body_result) = write_within(&mut stream, body, deadline);
+            body_result?;
         }
         stream.flush().map_err(map_http_write)?;
         let mut reader = DeadlineReader::new(stream, deadline);
@@ -2330,7 +2370,16 @@ impl Provider for HttpTool {
         // The grant bounds the argument bytes before the adapter serializes
         // them: a one-byte grant with a ten-megabyte map built the JSON first
         // and only then refused (round 39, F2).
-        let arg_bytes: u64 = call.args.iter().map(Arg::wire_size).sum();
+        // checked_add, as the process and wasm adapters use: a debug build
+        // must refuse an impossible sum rather than panic inside the adapter
+        // (round 48, F-5).
+        let mut arg_bytes = 0u64;
+        for arg in &call.args {
+            let Some(next) = arg_bytes.checked_add(Arg::wire_size(arg)) else {
+                return Err(Error::BudgetExceeded("byte"));
+            };
+            arg_bytes = next;
+        }
         if arg_bytes > call.budget.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
@@ -2483,6 +2532,15 @@ impl Provider for HttpTool {
             // wrote (round 5, #4). No body object means an empty body.
             let body = match bodies.first() {
                 Some(entries) => {
+                    // The clone below is recursive: a caller-built map past the
+                    // wire depth would abort the stack before the gate on the value
+                    // ran. The walk is over borrowed values, so it costs no copy
+                    // (round 48, F-3).
+                    if entries.values().any(|value| {
+                        crate::kernel::value_too_deep(value, crate::wire::MAX_VALUE_DEPTH - 1)
+                    }) {
+                        return Err(Error::InvalidArgument("an HTTP body is nested too deeply"));
+                    }
                     let value = Value::Map((*entries).clone());
                     if contains_module(&value) {
                         // The JSON form of a module is its length: the peer
