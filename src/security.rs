@@ -242,8 +242,9 @@ fn module_has_secret(bytes: &[u8]) -> Result<bool> {
     Ok((0..module.node_count()).any(|index| {
         module
             .get(active_infinity::NodeId(index as u32))
-            .map(|node| node.is_secret())
-            .unwrap_or(false)
+            // A node the decoder counts but cannot materialise cannot be
+            // proven secret-free, so it fails closed (round 3, F-1).
+            .is_none_or(|node| node.is_secret())
     }))
 }
 
@@ -334,6 +335,14 @@ pub fn assert_no_secret_material(value: &Value) -> Result<()> {
                     return Err(Error::Provider {
                         code: "provider/secret-material".to_string(),
                     });
+                }
+                // A decodable image must also pass the codec's `validate`: a
+                // decoder that tolerates a trailing byte would otherwise emit
+                // an image a peer's install gate refuses, so two byte strings
+                // would name one module for a peer that hashes the payload
+                // (round 3, F-2). Opaque non-image bytes stay untouched.
+                if is_infinity_image(bytes) {
+                    check_module_payload(bytes)?;
                 }
             }
             // Every other variant is a scalar or a label with no room for

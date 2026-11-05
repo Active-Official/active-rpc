@@ -39,7 +39,10 @@ pub trait RecordStore {
     /// this for its own checks (and must answer `true` on a read error: it
     /// would otherwise treat a restored record as fresh).
     fn is_restored(&self, _record_id: &[u8; 32]) -> bool {
-        false
+        // Fail closed: a store that cannot answer treats every record as
+        // restored, so a forgotten implementation cannot mint a second grant
+        // from one credential (round 3, F-3).
+        true
     }
 
     /// Remember a restore, or refuse when the store cannot.
@@ -49,7 +52,10 @@ pub trait RecordStore {
     /// return an error there: two restores of one record are two copies of its
     /// budget, and a revocation reaches only the one it knows.
     fn mark_restored(&mut self, _record_id: &[u8; 32]) -> Result<()> {
-        Ok(())
+        // Fail closed: the default must not be a silent no-op. A store whose
+        // `claim` delegates here (the `MemoryRecordStore` shape) would
+        // otherwise accept every record twice (round 3, F-3).
+        Err(Error::Persistence("this store cannot remember restores"))
     }
 
     /// Atomically take ownership of a record id.
@@ -592,7 +598,19 @@ impl CapabilityRecord {
         }
         let seal = match value.get("seal") {
             None | Some(Json::Null) => None,
-            Some(Json::String(text)) if text.len() == 64 && text.is_ascii() => Some(text.clone()),
+            // Lowercase hex only: `to_json` writes the seal in that form, and a
+            // parser that accepted `ZZZZ…` or uppercase hex would hand back a
+            // record `seal_is_valid` can never accept, so an operator's "it
+            // parses" check would promise a restore that always fails
+            // (round 3, F-4).
+            Some(Json::String(text))
+                if text.len() == 64
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+            {
+                Some(text.clone())
+            }
             Some(_) => return Err(Error::persistence("the seal is malformed")),
         };
         let record = Self {

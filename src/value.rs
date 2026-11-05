@@ -20,7 +20,7 @@ use crate::cap::CapId;
 use crate::promise::PromiseId;
 
 /// A value crossing the RPC boundary.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Value {
     /// Absent value.
     Null,
@@ -42,6 +42,27 @@ pub enum Value {
     Module(Vec<u8>),
     /// A dotted path inside a module.
     Path(String),
+}
+
+impl std::fmt::Debug for Value {
+    /// Marks only, never content: a `Module` is the one variant that carries
+    /// arbitrary bytes (a wasm guest's output, a provider's blob), and a
+    /// derived formatter printed every byte into a log line or a panic message.
+    /// `Secret` was already a marker and stays one (round 3, F-5).
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Null => formatter.write_str("Null"),
+            Value::Bool(value) => formatter.debug_tuple("Bool").field(value).finish(),
+            Value::Int(value) => formatter.debug_tuple("Int").field(value).finish(),
+            Value::Float(value) => formatter.debug_tuple("Float").field(value).finish(),
+            Value::Text(text) => formatter.debug_tuple("Text").field(text).finish(),
+            Value::Path(path) => formatter.debug_tuple("Path").field(path).finish(),
+            Value::Secret => formatter.write_str("Secret"),
+            Value::Module(bytes) => write!(formatter, "Module(<{} bytes>)", bytes.len()),
+            Value::List(items) => formatter.debug_list().entries(items).finish(),
+            Value::Map(entries) => formatter.debug_map().entries(entries).finish(),
+        }
+    }
 }
 
 impl Value {

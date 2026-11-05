@@ -29,7 +29,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-2: 4 + 11 findings (1 noted) | 14 fixed / 0 rejected / 1 noted (no store wired by default; virtual-epoch deadline) | `cb44d07` |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-3: round 3 found 3 mediums and 4 lows; all fixed except the opaque-module residual, accepted in `SECURITY.md` | 21 fixed / 0 rejected / 2 noted (no store wired by default; virtual-epoch deadline; opaque module bytes) | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | rounds 1-2: 11 + 14 findings fixed (2 design-level documented) | 25 fixed / 0 rejected / 0 open (2 recorded: publisher identity, host authority) | `190e9c9` |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
@@ -2278,6 +2278,25 @@ equality oracle over a secret the module was meant to hide
 Gate: full `gate-rpc.sh` green — all-features and no-default suites, clippy on
 both sets, fmt, doc, the fuzz and control-plane and CLI manifests, and
 `python scripts/negative_controls.py --check` 9/9.
+
+### R-16 security helpers - 2026-11-04 (round 3)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `6fb5ca4`. Verdict
+**NOT CLEAN**: three mediums and four lows; the reusable redaction and parser
+properties re-verified clean.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `module_has_secret` returned `false` when `module.get(id)` was `None`, so a node the decoder counts but cannot materialise counted as secret-free | **fixed**: that case fails closed (`map_or(true, …)`). The larger half — opaque non-image bytes are not inspected — is **accepted** and now stated in `SECURITY.md`: a provider that puts its own secret bytes in opaque output is a provider compromise the value model cannot see, exactly as with `Value::Text`; a wire tag separating a blob from an image is the structural fix, recorded for the next format revision |
+| 2 | medium | the non-redacting egress decoded a module but never validated it, so a decodable-but-invalid image crossed while the domain provider's own install gate refuses it | **fixed**: a decodable image must pass `check_module_payload` (the codec's `validate`) at both gates; a non-image stays opaque (finding 1) |
+| 3 | medium | `RecordStore`'s defaults were fail-open: `mark_restored` answered `Ok(())` and `is_restored` `false`, so a store whose `claim` delegates to the default (the `MemoryRecordStore` shape) silently accepted every record twice | **fixed**: the defaults now refuse (`mark_restored` → `Err`, `is_restored` → `true`); `a_store_that_forgets_mark_restored_fails_closed` (fails pre-fix) |
+| 4 | low | the record parser accepted any 64-byte ASCII seal, including uppercase or non-hex, that `seal_is_valid` can never accept | **fixed**: lowercase hex only; `a_record_with_a_seal_the_verifier_can_never_accept_is_refused` |
+| 5 | low | `Value`, `Arg` and `Response` derived `Debug`, so `{:?}` printed a module's bytes | **fixed**: a hand-written `Value` `Debug` prints `Module(<n> bytes)` and keeps `Secret` a marker; `a_value_debug_does_not_print_module_bytes` |
+| 6 | low | nothing pinned the seal's *material*: a nested key reorder would invalidate every record at rest with a green suite | **fixed**: `the_seal_material_is_pinned_to_a_golden_vector` pins the whole seal of a fixed fixture |
+| 7 | low | the trait doc said the "minted grant" is revoked when the store fails | **fixed**: the restore is refused before the mint |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-16 security helpers and persistence - 2026-11-02 (round 2, confirmation)
 

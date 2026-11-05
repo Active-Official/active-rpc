@@ -75,7 +75,18 @@ capability id at rest (it is a bearer token).
 - Channel capacity (per channel and in aggregate) is checked before a send or a
   publish is charged, so a refused message spends nothing; a full channel is
   `rpc/backpressure`, not a budget fault.
-- Secret material is represented by `Value::Secret`, never by bytes.
+- Secret material is represented by `Value::Secret`, never by bytes. The egress
+  gates (`assert_no_secret_material`, `assert_no_structural_secrets`) inspect a
+  `Value::Module` when it decodes as an Active Infinity image: a secret node is
+  refused, and a decodable image must also pass the codec's `validate`. Bytes
+  that are not an image are opaque by declaration (a WASM guest's binary output,
+  a provider's blob): the value model cannot tell them from arbitrary data, so a
+  provider that puts *its own* secret bytes in opaque output is a provider
+  compromise the gates cannot detect, exactly as it could put them in
+  `Value::Text`. Capabilities over such a provider must be minted only to peers
+  trusted with its output. A wire tag that separates a blob from an image is the
+  structural fix; it is an additive wire change recorded for the next format
+  revision.
 - Every frame is bounded and rejected at the boundary; the capability registry,
   the attenuation chain depth and a negotiated capability table have ceilings.
 - `#![forbid(unsafe_code)]`.
