@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-51: round 51 found 1 medium and 5 lows, all fixed; round 52 must be clean | 340 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-52: round 52 found 1 medium and 5 lows, all fixed or closed by design; round 53 must be clean | 345 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -897,6 +897,22 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 52)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `c99f518`. Round-51
+claims: four HOLD, one PARTIAL. Verdict **PARTIAL**: one medium and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the round-51 base cut silently retargeted a base with a path or query (`http://h/api` became `http://h`), where the same configuration used to fail closed at resolution | **fixed**: `HttpTool` records an invalid base, `try_new` refuses it, and `invoke` refuses every call with `rpc/tool-policy`; the authority stays visible in `Debug` and no tail is ever sent; `a_base_with_a_path_is_refused` |
+| 2 | low | the poisoning list still omitted `mcp/read:<err>` and a receive deadline, and labelled `mcp/bad-json` answer-side | **fixed** |
+| 3 | low | the two `too-complex` rows did not mention the text-depth refusal | **fixed** |
+| 4 | low | entropy drawn by a guest start function is not counted when instantiation fails | **closed by design**: the host function enforces the cumulative cap against the same counter and the cap is the grant share, so no draw can exceed the grant even when the post-run check is skipped; only the post-run accounting is lost, and the call's grant was charged at dispatch |
+| 5 | low | `Debug` printed a control character from the base | **fixed**: a control character in the base drops it entirely; `a_base_with_a_control_character_is_refused` |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

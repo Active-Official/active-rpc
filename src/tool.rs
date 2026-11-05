@@ -2012,6 +2012,11 @@ pub struct HttpTool {
     /// point may have applied its effect, so it is reported as a withheld
     /// reply for a mutating method (round 43, F-2).
     after_send: bool,
+    /// Set when the configured base is not a plain scheme and authority (it had
+    /// a path, query or fragment, or a control character). The tool refuses
+    /// every call rather than silently retargeting a request at another
+    /// resource on the same authority (round 52, F-1/F-5).
+    base_invalid: bool,
 }
 
 /// A base URL with any userinfo and path replaced by a length.
@@ -2083,17 +2088,32 @@ impl HttpTool {
     pub fn new(base: impl Into<String>, allow: &[(&str, &str)]) -> Self {
         // The base is a scheme and an authority: a path, query or fragment
         // would be concatenated with every request path and reach the resolver
-        // (`http/resolve`) or the `host:` field (round 51, finding 5). It is cut
-        // here, once, so both uses see the same string.
-        let base = match base.into().split_once("://") {
+        // (`http/resolve`) or the `host:` field (round 51, finding 5). A tail is
+        // not silently dropped — that would retarget the request at another
+        // resource on the same authority — so the tool refuses every call and
+        // `try_new` refuses at construction (round 52, F-1). A control
+        // character would inject a line into the request head and into `Debug`
+        // (round 52, F-5).
+        let base = base.into();
+        let (authority, base_invalid) = match base.split_once("://") {
             Some((scheme, rest)) => {
                 let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-                format!("{scheme}://{}", &rest[..end])
+                let has_tail = end != rest.len();
+                let control = rest.bytes().any(|byte| byte.is_ascii_control());
+                // A control character is never kept: it would reach Debug and a
+                // log line (round 52, F-5). A path or query tail leaves the
+                // authority nameable while the tool refuses (round 52, F-1).
+                let authority = if control {
+                    String::new()
+                } else {
+                    format!("{scheme}://{}", &rest[..end])
+                };
+                (authority, has_tail || control)
             }
-            None => String::new(),
+            None => (String::new(), true),
         };
         Self {
-            base,
+            base: authority,
             allow: allow
                 .iter()
                 // `invoke` uppercases the requested method, so a lowercase
@@ -2106,17 +2126,25 @@ impl HttpTool {
             max_request: 1 << 20,
             calls: 0,
             after_send: false,
+            base_invalid,
         }
     }
 
-    /// [`HttpTool::new`] that refuses an ambiguous allowlist entry.
+    /// [`HttpTool::new`] that refuses an ambiguous allowlist entry or a base
+    /// that is not a plain scheme and authority.
     pub fn try_new(base: impl Into<String>, allow: &[(&str, &str)]) -> Result<Self> {
         if allow.iter().any(|(_, path)| Self::ambiguous_path(path)) {
             return Err(Error::ToolPolicy(
                 "an allowlist entry has an ambiguous path",
             ));
         }
-        Ok(Self::new(base, allow))
+        let tool = Self::new(base, allow);
+        if tool.base_invalid {
+            return Err(Error::ToolPolicy(
+                "an HTTP base URL must be a scheme and an authority",
+            ));
+        }
+        Ok(tool)
     }
 
     /// Build a tool policy for a capability.
@@ -2771,6 +2799,14 @@ impl Provider for HttpTool {
         // and `request` withhold whatever method text they carry - the same
         // axis the kernel's `Provider::mutating` sees (round 43, F-1;
         // round 45, finding 1; round 47, L-2).
+        if self.base_invalid {
+            // A base with a path or a control character is a configuration
+            // fault, not a request the adapter may reinterpret (round 52,
+            // F-1/F-5).
+            return Err(Error::ToolPolicy(
+                "an HTTP base URL must be a scheme and an authority",
+            ));
+        }
         let mutating = self.mutating(&call.method);
         // Count admitted calls only (round 31, F7).
         self.calls += 1;

@@ -205,3 +205,48 @@ fn a_query_only_base_is_redacted() {
     // address rather than `host?query` (round 51, finding 5).
     assert!(rendered.contains("http://127.0.0.1:9\""), "{rendered}");
 }
+
+/// A base with a path is a configuration fault: `try_new` refuses it and `new`
+/// refuses every call, rather than silently retargeting the request at another
+/// resource on the same authority (round 52, F-1).
+#[test]
+fn a_base_with_a_path_is_refused() {
+    let error =
+        active_rpc::tool::HttpTool::try_new("http://127.0.0.1:9/admin-api", &[("POST", "/users")])
+            .expect_err("a path in the base is refused at construction");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+
+    let mut tool =
+        active_rpc::tool::HttpTool::new("http://127.0.0.1:9/admin-api", &[("POST", "/users")]);
+    let mut call = Call::new(
+        "post",
+        vec![
+            Arg::Value(Value::Path("/users".to_string())),
+            Arg::Value(Value::Map(
+                [("n".to_string(), Value::Int(1))].into_iter().collect(),
+            )),
+        ],
+    );
+    call.budget = Budget {
+        max_bytes: 1 << 20,
+        ..Budget::default()
+    };
+    let error = tool.invoke(0, &call).expect_err("the base is a fault");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// A control character in the authority would inject a line into the request
+/// head and into the handle's `Debug` (round 52, F-5).
+#[test]
+fn a_base_with_a_control_character_is_refused() {
+    let mut tool =
+        active_rpc::tool::HttpTool::new("http://127.0.0.1:9\r\nX-Injected: 1", &[("GET", "/x")]);
+    let rendered = format!("{tool:?}");
+    assert!(
+        !rendered.contains("Injected"),
+        "the head leaked: {rendered}"
+    );
+    let call = Call::new("get", vec![Arg::Value(Value::Path("/x".to_string()))]);
+    let error = tool.invoke(0, &call).expect_err("the base is a fault");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
