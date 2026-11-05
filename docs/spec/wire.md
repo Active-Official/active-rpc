@@ -232,8 +232,12 @@ class stays local) and `rpc/budget-exceeded` with the dimension it measured
 ### MCP adapter codes
 
 An `McpSession` reports adapter failures as `rpc/provider` with one of these
-inner codes. Every one is a fail-closed refusal; none is retryable without a new
-session. The byte grant is checked first when it is the tighter bound: a line
+inner codes. Every one is a fail-closed refusal. None needs a new session except
+the ones that poison it (`mcp/line-too-long`, `mcp/too-complex`, `mcp/desync`,
+`mcp/id-mismatch`, `mcp/bad-response`, `mcp/write:closed`, `mcp/write:lost`); a
+JSON-RPC `error` from the server leaves the session usable, which is the
+asymmetry recorded below. The byte grant is checked first when it is the tighter
+bound: a line
 past the grant is `rpc/budget-exceeded` (or a withheld reply on a writable call).
 A line past only the static 1 MiB ceiling is `rpc/invalid-argument` (a request) or
 `mcp/line-too-long` (an answer). Every answer-side refusal poisons the
@@ -299,7 +303,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/connect` | no address accepted the connection inside the ceiling |
 | `http/status` | the status line is not `HTTP/1.<digit>` with exactly three ASCII digits in `200..=599` |
 | `http/interim` | a 1xx interim response arrived; the adapter does not follow it |
-| `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared |
+| `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared; a header flood past the capability's byte grant is `rpc/budget-exceeded` instead |
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
 | `http/bad-number` | a JSON number has no `Value` form: an integer outside `i64`, or a float that is not finite (a literal with a fraction or an exponent that overflows `f64`) |
 | `http/too-complex` | an object or array body has more than 2^20 structural tokens before parsing, or the decoded tree has more than 2^20 nodes |
@@ -459,7 +463,10 @@ request/response pairing, so it offers `send`/`recv` only.
 
 A served TCP connection has a total lifetime (`DEFAULT_CONNECTION_LIFETIME`, ten
 minutes) as well as a per-frame deadline: a peer that sends a valid frame just
-inside every per-frame deadline must not hold a serial server forever.
+inside every per-frame deadline must not hold a serial server forever. A refusal
+that ends a connection drains for up to 150 ms before the socket closes (so a
+reset cannot discard the error envelope); a serial server therefore spends at
+most that long on a refused peer.
 `serve_connection_within` takes an explicit deadline. The frame deadline
 (`with_timeout`, default 30 s) bounds the whole **write** of one frame as well as
 one read, re-armed before each call: a maximum-size frame therefore needs the

@@ -18,7 +18,7 @@
 //! The implementation uses a mutex around the indices and bytes rather than
 //! atomics plus raw pointers, so the crate keeps `#![forbid(unsafe_code)]` and
 //! the ring is safe under concurrent producers and consumers. A frame that does
-//! not fit is refused (`rpc/transport`) instead of overwriting unread data.
+//! not fit is refused (`rpc/wire` for a frame that can never fit; a merely full segment stays `rpc/transport`) instead of overwriting unread data.
 
 use std::sync::{Arc, Mutex};
 

@@ -234,9 +234,18 @@ fn a_request_call_with_a_get_method_is_withheld() {
 #[test]
 fn an_http_debug_does_not_print_an_allowlisted_path() {
     let canary = "/hooks/6f1c2b9a-secret-token";
-    let tool = HttpTool::new("http://127.0.0.1:9", &[("GET", canary)]);
+    // The base can carry a token in its path too (round 49, L-1).
+    let tool = HttpTool::new("http://127.0.0.1:9/hooks/base-canary", &[("GET", canary)]);
     let rendered = format!("{tool:?}");
     assert!(rendered.contains("HttpTool"), "{rendered}");
+    assert!(
+        !rendered.contains("base-canary"),
+        "the base leaked: {rendered}"
+    );
+    assert!(
+        rendered.contains("127.0.0.1:9"),
+        "the authority stays visible: {rendered}"
+    );
     assert!(
         !rendered.contains("secret-token"),
         "the allowlisted path leaked: {rendered}"

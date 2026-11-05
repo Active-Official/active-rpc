@@ -99,6 +99,13 @@ pub fn json_has_unrepresentable_number(value: &Json) -> bool {
 /// [`json_has_unrepresentable_number`] on the decoded tree). Scanning the text
 /// is what sees a literal the decoder would round, turn into an infinity, or
 /// refuse before any tree exists (round 15, F-1).
+/// Largest number of unrepresentable literals this scan collects.
+///
+/// A document with more is either text or a refusal; collecting one 16-byte
+/// span per two-byte literal let a peer answer allocate eight times its size
+/// outside the grant (round 49, L-3).
+const MAX_NUMBER_SPANS: usize = 8;
+
 fn bad_number_spans(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
@@ -138,6 +145,9 @@ fn bad_number_spans(text: &str) -> Vec<(usize, usize)> {
                     && literal_has_no_value_form(literal)
                 {
                     spans.push((start, index));
+                    if spans.len() >= MAX_NUMBER_SPANS {
+                        return spans;
+                    }
                 }
             }
             _ => index += 1,
@@ -990,6 +1000,16 @@ impl StdioTransport {
         std::thread::Builder::new()
             .name("active-rpc-mcp-stdio".to_string())
             .spawn(move || {
+                // One bounded slot, as the process adapter takes: on Windows a
+                // descendant that inherits the pipe keeps this thread blocked
+                // for the life of the process, so abandoned sessions must not
+                // leak threads without bound (round 49, L-5).
+                let Some(_slot) = ReaderSlot::acquire() else {
+                    let _ = sender.send(Err(Error::Provider {
+                        code: "mcp/thread:too many readers".to_string(),
+                    }));
+                    return;
+                };
                 let mut reader = BufReader::new(stdout);
                 loop {
                     let mut line = String::new();
@@ -1858,7 +1878,17 @@ impl<T: McpTransport> Provider for McpSession<T> {
         // `request_within` already refused a response whose tree or text holds
         // a number with no `Value` form, so the result is representable here.
         let result = response.get("result").cloned().unwrap_or(Json::Null);
-        Ok(Response::Value(json_to_value(&result)))
+        let value = json_to_value(&result);
+        if crate::kernel::value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
+            // A tree past the wire shape is an illegal answer, not a caller
+            // budget: the session is poisoned like any other malformed frame
+            // (round 49, L-4).
+            self.poisoned = true;
+            return Err(Error::Provider {
+                code: "mcp/too-complex".to_string(),
+            });
+        }
+        Ok(Response::Value(value))
     }
 }
 
@@ -1888,6 +1918,23 @@ pub struct HttpTool {
     after_send: bool,
 }
 
+/// A base URL with any userinfo and path replaced by a length.
+///
+/// An exact allowlist entry is a credential home, and so is a base such as
+/// `http://host/hooks/<token>`: `Debug` names the scheme and authority only
+/// (round 49, L-1).
+fn redacted_base(base: &str) -> String {
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return format!("<{} bytes>", base.len());
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    match rest.len().checked_sub(authority.len()) {
+        Some(tail) if tail > 0 => format!("{scheme}://{authority}/<{tail} bytes>"),
+        _ => format!("{scheme}://{authority}"),
+    }
+}
+
 impl std::fmt::Debug for HttpTool {
     /// Names and shapes, never an allowlisted path: an exact entry is the
     /// natural home of a fixed credential (a signed URL, a hook token), the
@@ -1900,7 +1947,7 @@ impl std::fmt::Debug for HttpTool {
             .collect();
         formatter
             .debug_struct("HttpTool")
-            .field("base", &self.base)
+            .field("base", &redacted_base(&self.base))
             .field("allow", &allow)
             .field("max_body", &self.max_body)
             .field("max_request", &self.max_request)
@@ -2701,7 +2748,20 @@ impl Provider for HttpTool {
                     mutating,
                 ));
             }
-            Ok(json) => json_to_value(&json),
+            Ok(json) => {
+                let value = json_to_value(&json);
+                if crate::kernel::value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
+                    // The answer's shape is the peer's fault, not the caller's
+                    // budget (round 49, L-4).
+                    return Err(withhold_after_send(
+                        Error::Provider {
+                            code: "http/too-complex".to_string(),
+                        },
+                        mutating,
+                    ));
+                }
+                value
+            }
             Err(_) if text_fails_only_on_a_number(json_text) => {
                 return Err(withhold_after_send(
                     Error::Provider {
@@ -3509,5 +3569,34 @@ mod reader_slot_tests {
             recovered.push(slot);
         }
         assert_eq!(recovered.len(), MAX_LIVE_READERS);
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::write_within;
+
+    /// The byte count survives a failure: a head written in chunks can fail
+    /// after the first one, and the caller needs that count to mark the call as
+    /// possibly applied (round 47, L-4; round 49, L-2).
+    #[test]
+    fn a_partial_write_reports_what_it_sent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = vec![0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buffer);
+            // Close with the rest unread: the next chunk fails.
+            drop(stream);
+        });
+        let mut client = std::net::TcpStream::connect(address).expect("connect");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let payload = vec![b'x'; 3 << 20];
+        let (sent, result) = write_within(&mut client, &payload, deadline);
+        assert!(result.is_err(), "a closed peer fails a later chunk");
+        assert!(sent > 0, "the bytes already written are reported");
+        assert!(sent < payload.len(), "the write did not complete");
+        let _ = server.join();
     }
 }

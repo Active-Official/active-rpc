@@ -702,6 +702,12 @@ async fn respond_body(
         + deadline
             .saturating_mul(8)
             .min(std::time::Duration::from_secs(30));
+    if encoded.is_empty() {
+        // A zero-length body still has to end the stream, or the client waits
+        // for its inactivity timeout (round 21, finding 5).
+        let _ = send.send_data(bytes::Bytes::new(), true);
+        return Ok(true);
+    }
     while offset < encoded.len() {
         let want = (encoded.len() - offset).min(PIECE);
         send.reserve_capacity(want);

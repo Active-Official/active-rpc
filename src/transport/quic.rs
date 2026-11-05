@@ -768,6 +768,10 @@ async fn serve_stream<H>(
             let error = Error::Provider {
                 code: "provider/reply-withheld".to_string(),
             };
+            // Release the encoded reply before the awaits, as the budget arm
+            // does: it is not charged and must not be held for STREAM_WAIT
+            // (round 21, finding 1).
+            drop(bytes);
             reply(&mut send, &Envelope::error(request_id, &error)).await;
             finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
             return;
@@ -783,7 +787,7 @@ async fn serve_stream<H>(
         }
     };
     // A peer controls its own receive window: a response larger than the credit
-    // it grants parks `write_all` forever without this deadline.
+    // it grants parks `write_all` forever, so every write is bounded below.
     // Charge the encoded reply against one shared ceiling before it is held for
     // a peer that may grant no flow-control credit; a reply that does not fit is
     // withheld rather than parked (round 19, R-9#2).
@@ -962,6 +966,30 @@ impl Drop for CallGuard {
 /// Every reply path uses this: a peer that advertises a one-byte receive window
 /// and never reads parks `write_all` after the first byte, so an unbounded early
 /// error reply held the task (and its connection permit) forever.
+/// Write one response and finish the stream, bounded.
+///
+/// Every reply path uses this: a peer that advertises a one-byte receive window
+/// and never reads parks `write_all` after the first byte, so an unbounded early
+/// error reply held the task (and its connection permit) forever.
+async fn reply(send: &mut quinn::SendStream, response: &Envelope) {
+    let written = tokio::time::timeout(STREAM_WAIT, async {
+        if send_envelope(send, response).await.is_err() {
+            return;
+        }
+        let _ = send.finish();
+    })
+    .await;
+    if written.is_err() {
+        let _ = send.reset(0u32.into());
+    }
+}
+
+/// Largest aggregate value of encoded replies one server holds at once.
+///
+/// A second budget beside `MAX_INFLIGHT_BODY` (requests): the documented
+/// per-server bound is the sum of the two (round 21, finding 3).
+pub const MAX_INFLIGHT_REPLY: usize = 256 << 20;
+
 /// Reply bytes held while a peer's flow-control credit is exhausted.
 ///
 /// The guard releases its share when the reply task ends, and the shared
@@ -976,7 +1004,7 @@ impl ReplyBudget {
     fn try_reserve(counter: &Arc<AtomicUsize>, amount: usize) -> Option<Self> {
         let mut current = counter.load(Ordering::SeqCst);
         loop {
-            if current.saturating_add(amount) > MAX_INFLIGHT_BODY {
+            if current.saturating_add(amount) > MAX_INFLIGHT_REPLY {
                 return None;
             }
             match counter.compare_exchange(
@@ -1011,25 +1039,17 @@ impl Drop for ReplyBudget {
 async fn reply_encoded(send: &mut quinn::SendStream, bytes: &[u8]) {
     let written = tokio::time::timeout(STREAM_WAIT, async {
         let Ok(prefix) = frame(bytes.len()) else {
+            // A length the framing cannot express is a refusal, not an empty
+            // answer (round 21, finding 9).
+            let error = Error::Wire("response exceeds the size ceiling");
+            let _ = send_envelope(send, &Envelope::error(0, &error)).await;
+            let _ = send.finish();
             return;
         };
         let mut payload = Vec::with_capacity(bytes.len() + 4);
         payload.extend_from_slice(&prefix);
         payload.extend_from_slice(bytes);
         if send.write_all(&payload).await.is_err() {
-            return;
-        }
-        let _ = send.finish();
-    })
-    .await;
-    if written.is_err() {
-        let _ = send.reset(0u32.into());
-    }
-}
-
-async fn reply(send: &mut quinn::SendStream, response: &Envelope) {
-    let written = tokio::time::timeout(STREAM_WAIT, async {
-        if send_envelope(send, response).await.is_err() {
             return;
         }
         let _ = send.finish();
