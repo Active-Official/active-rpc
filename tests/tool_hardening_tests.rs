@@ -1822,7 +1822,11 @@ fn an_output_flood_is_refused_not_waited_out() {
         "/bin/sh",
         vec!["-c", "yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"],
     );
-    let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    // Exact allowlist entries, not a prefix: a prefix-matched argument that
+    // carries a shell metacharacter is refused before the spawn, which on
+    // Windows would hide the flood this test is about.
+    let allowlist: Vec<&str> = args.clone();
+    let mut tool = LocalProcess::new(program, &allowlist).expect("an absolute program");
     let mut call = Call::new("run", args.iter().map(|arg| Arg::text(*arg)).collect());
     call.tool_allows_process = true;
     call.budget.max_wall_ms = 5_000;
