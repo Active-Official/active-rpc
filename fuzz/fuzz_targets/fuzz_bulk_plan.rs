@@ -51,7 +51,9 @@ fuzz_target!(|data: &[u8]| {
             // sender's own frames in order only proves the happy path, so the
             // order is derived from the input and a frame is substituted.
             if let Ok(sender) = BulkSender::new(data.to_vec(), plan.chunk_size()) {
-                let frames = sender.frames();
+                // `frames` reports a frame it cannot build instead of dropping
+                // it; a plan that decodes must build every frame.
+                let frames = sender.frames().expect("a decoded plan builds its frames");
                 let mut receiver = BulkReceiver::new(decoded.clone()).expect("admitted plan");
                 let mut order: Vec<usize> = (0..frames.len()).collect();
                 // A deterministic permutation from the first byte: no RNG, so a
