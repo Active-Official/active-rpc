@@ -298,6 +298,15 @@ impl WasmTool {
     }
 
     /// The log the guest produced during the most recent call.
+    /// Bytes of entropy the last call drew from the host.
+    ///
+    /// The cumulative per-call cap is the structural guard; the number is
+    /// exposed so a test can assert it without a wall-clock race.
+    pub fn entropy_used(&self) -> usize {
+        self.last_random_used
+    }
+
+    /// Bytes the guest wrote to its log during the last call.
     pub fn log(&self) -> &[u8] {
         &self.log
     }
@@ -706,6 +715,10 @@ impl Provider for WasmTool {
         // when its diagnostics matter, and `call` cleared the buffer first so it
         // can only hold this call's bytes.
         self.log = std::mem::take(&mut tool.log);
+        // Keep the entropy draw as an observable metric: the structural bound is
+        // the per-call cap, and a wall-clock assertion on a loaded runner is not
+        // a test of it (round 43, CI flake in wasm_round2_tests).
+        self.last_random_used = tool.last_random_used;
         let output = match result {
             Ok(output) => output,
             Err(error)

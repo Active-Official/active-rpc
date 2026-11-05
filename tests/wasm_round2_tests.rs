@@ -77,11 +77,18 @@ fn a_random_loop_cannot_outlive_its_wall_budget() {
         error.to_string().contains("wasm/"),
         "unexpected refusal: {error}"
     );
-    // Before the cumulative budget existed this burned ~26 ms of host work per
-    // "1 ms" grant (37 MiB of entropy). Generous bound: the host must not spend
-    // an order of magnitude more than the grant.
+    // The structural bound is the cumulative entropy cap: one call cannot draw
+    // more than that, whatever the wall grant (before it existed, a "1 ms"
+    // grant burned 37 MiB of CSPRNG). Asserting a 15 ms wall clock here measured
+    // the runner's load, not the code (CI flake on the ratio runner).
     assert!(
-        elapsed < std::time::Duration::from_millis(15),
+        tool.entropy_used() <= MAX_RANDOM_PER_CALL,
+        "the guest drew {} bytes of entropy",
+        tool.entropy_used()
+    );
+    // A hang guard, not a performance budget.
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
         "a 1 ms grant took {elapsed:?}"
     );
     const _: () = assert!(

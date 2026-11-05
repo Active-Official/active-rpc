@@ -629,6 +629,11 @@ fn a_malformed_response_head_line_is_a_wire_fault() {
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nbogus line without a colon\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
             .expect("write");
+        // Half-close and wait for the client: a plain drop with queued data can
+        // reset the connection on Windows and discard the response.
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.read(&mut scratch);
     });
     let mut client = ConnectClient::connect(&address).expect("connect");
     let error = client
