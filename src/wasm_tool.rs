@@ -170,11 +170,11 @@ pub struct WasmTool {
     host: WasmHostPolicy,
     /// Host log captured from the most recent call.
     log: Vec<u8>,
-    /// Cumulative entropy this tool's next call may draw, in bytes.
+    /// Cumulative entropy a *child* call inherits, in bytes.
     ///
-    /// [`MAX_RANDOM_PER_CALL`] by default; `invoke` lowers it to the
-    /// capability's byte share so a tiny grant cannot buy 64 KiB of CSPRNG
-    /// (round 29, F6).
+    /// [`MAX_RANDOM_PER_CALL`] by default; `invoke` builds the child with the
+    /// capability's byte share instead, so a tiny grant cannot buy 64 KiB of
+    /// CSPRNG (round 29, F6). A direct [`WasmTool::call`] keeps this ceiling.
     random_cap: usize,
     /// Entropy the last call drew, for the grant accounting in `invoke`.
     last_random_used: usize,

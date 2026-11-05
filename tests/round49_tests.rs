@@ -279,6 +279,12 @@ fn try_new_refuses_a_base_it_could_not_render_safely() {
         "http://host:extra:80",
         "http://[::1:8080",
         "http://ho%73t:80",
+        "http://999.999.999.999:80",
+        "http://192.168.1:80",
+        "http://1.2.3.4.5:80",
+        "http://a..b:80",
+        "http://-:80",
+        "http://host:+80",
         "http://:80",
         "https://host:443",
         "ftp://host:21",
@@ -310,6 +316,8 @@ fn an_unusable_base_is_a_policy_fault_and_never_a_resolve_fault() {
         "http://example.com",
         "http://user:pw@host:80",
         "https://host:443",
+        "http://host:extra:80",
+        "http://[::1:8080",
     ] {
         let mut tool = active_rpc::tool::HttpTool::new(base, &[("GET", "/x")]);
         let call = Call::new("get", vec![Arg::Value(Value::Path("/x".to_string()))]);

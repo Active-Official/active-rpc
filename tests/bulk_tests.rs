@@ -40,7 +40,7 @@ fn chunks_reassemble_into_the_original_body() {
     let sender = BulkSender::new(bytes.clone(), 128 * 1024).expect("sender");
     let mut receiver = BulkReceiver::new(sender.plan().clone()).expect("receiver");
     assert_eq!(receiver.missing().len(), 8);
-    for frame in sender.frames() {
+    for frame in sender.frames().expect("frames") {
         receiver.accept(&frame).expect("accept");
     }
     assert!(receiver.is_complete());
@@ -53,7 +53,7 @@ fn chunks_reassemble_into_the_original_body() {
 fn an_empty_body_plans_to_zero_chunks_and_finishes_empty() {
     let sender = BulkSender::new(Vec::new(), 1024).expect("sender");
     assert_eq!(sender.plan().chunk_count(), 0);
-    assert!(sender.frames().is_empty());
+    assert!(sender.frames().expect("frames").is_empty());
     let mut receiver = BulkReceiver::new(sender.plan().clone()).expect("receiver");
     assert!(receiver.is_complete());
     assert_eq!(receiver.finish().expect("finish"), Vec::<u8>::new());
@@ -64,7 +64,7 @@ fn a_corrupted_or_truncated_chunk_is_refused() {
     let bytes = body(200_000);
     let sender = BulkSender::new(bytes, 64 * 1024).expect("sender");
     let mut receiver = BulkReceiver::new(sender.plan().clone()).expect("receiver");
-    let frames = sender.frames();
+    let frames = sender.frames().expect("frames");
     let frame = frames[0].clone();
     let mut corrupted = frame.clone();
     let last = corrupted.len() - 1;
@@ -108,7 +108,7 @@ fn retransmission_is_idempotent_and_conflicts_are_refused() {
     let bytes = body(150_000);
     let sender = BulkSender::new(bytes, 64 * 1024).expect("sender");
     let mut receiver = BulkReceiver::new(sender.plan().clone()).expect("receiver");
-    let frames = sender.frames();
+    let frames = sender.frames().expect("frames");
     receiver.accept(&frames[0]).expect("first");
     receiver.accept(&frames[0]).expect("identical duplicate");
 
@@ -127,7 +127,7 @@ fn resume_sends_only_the_missing_chunks() {
     let bytes = body(500_000);
     let sender = BulkSender::new(bytes.clone(), 64 * 1024).expect("sender");
     let mut receiver = BulkReceiver::new(sender.plan().clone()).expect("receiver");
-    let all = sender.frames();
+    let all = sender.frames().expect("frames");
     for frame in all.iter().take(3) {
         receiver.accept(frame).expect("first three");
     }
@@ -202,7 +202,7 @@ fn a_bulk_transfer_over_tcp_resumes_after_a_dropped_connection() {
     let bytes = body(1_100_000);
     let sender = BulkSender::new(bytes.clone(), 128 * 1024).expect("sender");
     let plan = sender.plan().clone();
-    let all = sender.frames();
+    let all = sender.frames().expect("frames");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("addr");

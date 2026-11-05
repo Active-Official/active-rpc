@@ -2104,6 +2104,11 @@ impl HttpTool {
 
     /// Whether `name` is a host `ToSocketAddrs` can parse: a DNS name, an IPv4
     /// literal, or a bracketed IPv6 literal.
+    ///
+    /// A dotted-numeric name must be a real IPv4 literal: `999.999.999.999`,
+    /// `192.168.1` and `1.2.3.4.5` are typos that fail at resolution, and
+    /// glibc's short forms would dial an address the text does not spell
+    /// (round 56, M-1).
     fn usable_host(name: &str) -> bool {
         if let Some(inner) = name
             .strip_prefix('[')
@@ -2111,10 +2116,24 @@ impl HttpTool {
         {
             return inner.parse::<std::net::Ipv6Addr>().is_ok();
         }
-        !name.is_empty()
+        if !name.is_empty()
             && name
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            return name.parse::<std::net::Ipv4Addr>().is_ok();
+        }
+        // A DNS name: dot-separated labels, none empty, none starting or ending
+        // with a hyphen.
+        !name.is_empty()
+            && name.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
     }
 
     /// Build a tool for `base` with an allowlist.
@@ -2154,7 +2173,11 @@ impl HttpTool {
                 // `http/resolve` class (round 55, M-1).
                 let usable = match host.rsplit_once(':') {
                     Some((name, port)) => {
-                        Self::usable_host(name) && port.parse::<u16>().is_ok_and(|port| port != 0)
+                        // `u16::from_str` accepts a leading `+`, which no
+                        // authority spells (round 56, M-1).
+                        Self::usable_host(name)
+                            && port.bytes().all(|byte| byte.is_ascii_digit())
+                            && port.parse::<u16>().is_ok_and(|port| port != 0)
                     }
                     None => false,
                 };

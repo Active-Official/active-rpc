@@ -192,8 +192,8 @@ a message.
 | `rpc/promise-cancelled` | the promise was cancelled |
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
 | `rpc/backpressure` | the local call queue or channel window is full |
-| `rpc/identity` | the peer's authenticated identity is missing or does not match the capability's binding |
-| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash |
+| `rpc/identity` | the peer's authenticated identity is missing, does not match the capability's binding, or cannot be a binding at all (a zero or loopback digest); also an *in-process* misuse of a borrowed imported handle (it cannot export, introduce, rebind, attenuate or revoke the owner's authority) |
+| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, or a completed body has not been taken. A state refusal is recoverable by planning again (or by the host taking the body); a hash or framing fault is not |
 | `rpc/replay` | a replay package is malformed, tampered with, or disagrees with the decisions it recorded |
 | `rpc/persistence` | a durable capability record is unsealed, already restored, bound to another peer, or names a provider this kernel does not have |
 | `rpc/unresolvable-promise` | the promise can never settle |

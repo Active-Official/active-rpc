@@ -134,6 +134,28 @@ fn declared_memory_is_charged_against_the_grant() {
     ));
 }
 
+/// A start function that logs, and a module with no `run` export: the entry
+/// refusal keeps the start log (round 56, L-3).
+const START_LOG_NO_ENTRY: &str = r#"
+(module
+  (import "env" "log" (func $log (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (data (i32.const 0) "start-log")
+  (func $s (drop (call $log (i32.const 0) (i32.const 9))))
+  (start $s))
+"#;
+
+#[test]
+fn a_missing_entry_keeps_the_start_log() {
+    let mut tool = tool(START_LOG_NO_ENTRY, WasmLimits::default());
+    let mut call = Call::new("run", vec![Arg::text("")]);
+    call.budget = Budget::default();
+    call.now_ms = 1;
+    let error = tool.invoke(0, &call).expect_err("no run export");
+    assert!(error.to_string().contains("wasm/entry"), "{error}");
+    assert_eq!(tool.log(), b"start-log");
+}
+
 /// A guest whose `start` draws entropy and then traps: the draw is still what
 /// the last call spent, so `entropy_used` reports it (round 53, L-4).
 const START_RANDOM_TRAP: &str = r#"

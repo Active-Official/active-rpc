@@ -117,13 +117,24 @@ client that presents none fails it as well.
    certificates and keys from files; the kernel never prints key material, and
    should not be given a path it cannot read.
 3. **Rotate before expiry.** A new leaf has a new fingerprint, so capabilities
-   introduced to the old one must be re-introduced (`introduce_to`). Plan the
-   rotation window.
+   bound to the old one are moved with `reintroduce_to(cap, &old_peer, &new_peer)`
+   (`introduce_to` refuses an already-bound capability). A rotation also
+   tombstones the durable records exported for the old peer, and only the live
+   subtree is rebound: a revoked or expired child keeps the binding it died
+   with. Plan the rotation window.
 4. **Revoke at the CA and at the kernel.** Dropping a certificate stops new
    handshakes; `Agent::revoke` stops existing capabilities immediately.
 5. **Pin the clock mode.** Mint leases after selecting the clock
    (`use_wall_clock(true)` for real time), or a lease minted under the virtual
    clock is already expired.
+6. **The policy is a path, not an attribute.** `IdentityPolicy::admit` returns an
+   `AdmittedIdentity`, and `dispatch_envelope` is what enforces
+   `require_identity`/`trust_loopback`. `call_as` trusts whatever peer handle the
+   embedder passes, so a server that hands a peer straight to `call_as` has
+   applied no policy: admit first, then dispatch. A QUIC handler receives the
+   peer certificate but not the connection, so it must derive the loopback flag
+   from its own connection (`remote_addr().ip().is_loopback()`) before calling
+   `admit`.
 
 ## Evidence
 

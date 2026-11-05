@@ -81,7 +81,7 @@ fn a_receiver_charges_every_chunk_and_stores_nothing_refused() {
         ..Budget::default()
     };
     let mut receiver = BulkReceiver::with_budget(sender.plan().clone(), budget).expect("receiver");
-    let frames = sender.frames();
+    let frames = sender.frames().expect("frames");
 
     let first = receiver.accept(&frames[0]).expect("first chunk");
     assert_eq!(first, 0);
@@ -181,7 +181,7 @@ fn debug_does_not_print_the_body() {
     assert!(!text.contains("bulk-canary"), "{text}");
 
     let mut receiver = BulkReceiver::new(sender.plan().clone()).expect("receiver");
-    for frame in sender.frames() {
+    for frame in sender.frames().expect("frames") {
         receiver.accept(&frame).expect("chunk");
     }
     let text = format!("{receiver:?}");

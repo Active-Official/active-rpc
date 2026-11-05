@@ -21,10 +21,10 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-55: round 55 found 1 medium and 4 lows (one rejected), all fixed; round 56 must be clean | 360 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-56: round 56 found 1 medium and 3 lows, all fixed; round 57 must be clean | 364 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-4: round 4 found 1 high, 4 mediums and 5 lows, all fixed; round 5 must be clean | 34 fixed / 0 rejected / 0 open | this commit |
-| R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-5: round 5 found 4 mediums and 4 lows, all fixed; round 6 must be clean | 42 fixed / 0 rejected / 0 open (4 residuals recorded) | this commit |
+| R-11 | identity | `src/identity.rs` | rounds 1-4: round 4 found 1 medium and 4 lows, all fixed; round 5 must be clean | 27 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
@@ -897,6 +897,22 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-05 (round 56)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `34c636b`. Round-55
+claims: three verified, one verified with a gap. Verdict **PARTIAL**: one medium
+and three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `usable_host` was a charset check, so `999.999.999.999`, `192.168.1`, `1.2.3.4.5`, `a..b`, `-` and `host:+80` were admitted and then failed at dispatch as the retryable `http/resolve` class; glibc's short numeric forms would dial an address the text does not spell | **fixed**: a dotted-numeric host must parse as `Ipv4Addr`, a DNS name needs non-empty labels that do not start or end with `-`, and the port must be ASCII digits; `try_new_refuses_a_base_it_could_not_render_safely` covers every shape |
+| 2 | low | the dispatch half of the round-55 claim had no test | **fixed**: the two malformed hosts are in `an_unusable_base_is_a_policy_fault_and_never_a_resolve_fault` |
+| 3 | low | the `wasm/entry` log arm was untested | **fixed**: `a_missing_entry_keeps_the_start_log` drives a module whose `start` logs and which exports no `run` |
+| 4 | low | the `random_cap` doc claimed `invoke` lowers the field, while it lowers only the child's copy | **fixed**: the field is documented as the ceiling a child inherits |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
@@ -2510,6 +2526,26 @@ Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
 
+### R-10 bulk transfer - 2026-11-05 (round 5)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `34c636b`. Round-4
+items verified; four new mediums in the lifecycle and the grant. Verdict
+**PARTIAL**: four mediums, four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `last_finished` held a whole plan (up to 1 MiB), never expired and survived `on_drop`, so a fresh object per upload leaked for the process lifetime | **fixed**: the record is the O(1) root/total/digests, `BulkFinish::decode_for` validates a marker against them, and `on_drop` removes it; `a_dropped_capability_drops_the_digest_record` |
+| 2 | medium | idle windows were lazy (only the calling object) and peer-refreshable, and a TTL-expired capability never fires `on_drop` | **fixed**: `expire_idle` sweeps every object and `plan` calls it, and `MAX_TRANSFER_LIFETIME_MS` is anchored at the opening call; `a_new_transfer_sweeps_other_objects`, `expire_idle_releases_incomplete_and_finished_state`, `a_refreshed_transfer_still_hits_the_lifetime_bound` |
+| 3 | medium | `required_grant` sizes bytes only; a legal transfer needs `chunks + 2` calls and `Budget::default().max_calls` is 10 000 | **fixed**: `BulkPlan::required_calls`, named in the spec and ADR, with a kernel test where `chunks + 1` refuses and `chunks + 2` completes |
+| 4 | medium | `finish` did three or more body passes, ignored `max_wall_ms` and aborted the process on a failed 1 GiB allocation | **fixed**: `finish_within` takes a deadline (checked before and between chunks), uses `try_reserve_exact` (`rpc/bulk`, not an abort) and feeds the body digest while assembling; `a_finish_without_wall_grant_refuses_and_keeps_the_transfer` |
+| 5 | low | `MAX_CHUNKS` left 52 bytes of headroom, which a descriptor with a path scope or a cap delta overflows | **fixed**: 32 750, and `the_maximal_plan_fits_with_a_descriptor_and_a_delta` encodes the maximal plan with a descriptor and decodes it under strict limits |
+| 6 | low | `BulkChunk::try_new` multiplied the offset unchecked and panicked in debug | **fixed**: `checked_mul`; `a_chunk_offset_that_overflows_is_refused` |
+| 7 | low | `frames()` swallowed a build failure | **fixed**: it returns `Result`; `frames_reports_every_chunk` |
+| 8 | low | `rpc/bulk` covered both corrupt frames and recoverable state refusals | **documented**: the error row names the state refusals and which are recoverable |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-10 bulk transfer - 2026-11-05 (round 4)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `36ad2ba`. Four of
@@ -2566,6 +2602,23 @@ gives the format a consumer.
 | B2 | medium | `finish` took the transfer before validating: a wrong marker or an early `finish` destroyed the received chunks | **fixed**: the marker and completeness are checked against a borrowed transfer, and only a successful finish consumes it; `a_refused_finish_keeps_the_transfer` |
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
+
+### R-11 identity - 2026-11-05 (round 4)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `34c636b`. Rounds
+1-3 hold. Verdict **PARTIAL**: one medium (reproduced by the reviewer) and four
+lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `introduce_to` collected the live ids for its checks but then rebound **every** descendant, including revoked and clock-domain-expired children; a cross-domain child became live again under the new peer, who could then call it | **fixed**: the check loop collects a `live` set and only that set is written, in `introduce_to` and `reintroduce_to`; `an_introduction_does_not_rebind_a_revoked_child`, `a_rotation_leaves_a_revoked_child_bound_to_the_old_peer`, `an_introduction_does_not_revive_a_cross_domain_child_for_the_new_peer` (the reviewer's exploit B: the lease only reads as expired across a clock-mode switch, Bob still calls it, Alice is refused) — all three fail against the pre-fix kernel, verified by stashing `src/kernel.rs`; `a_live_child_is_rebound_with_the_root` holds both ways |
+| 2 | low | `introduce_to`/`reintroduce_to` wrote `bound_to` with only the trust-level guard, not `identity::bindable` | **fixed**: both refuse an unbindable fingerprint |
+| 3 | low | `rpc/identity` also covers in-process misuse of a borrowed imported handle, which the error table did not say | **documented** in `wire.md` |
+| 4 | low | the deployment doc told operators to rotate with `introduce_to`, which refuses an already-bound capability | **fixed**: it names `reintroduce_to`, the tombstones and the live-subtree rule |
+| 5 | low | nothing on the shipped path applies `IdentityPolicy` (the doc's recipe is `call_as`), and a QUIC handler cannot derive the loopback flag | **documented**: the deployment doc now says the policy is a path (`admit`, then `dispatch_envelope`), that `call_as` is policy-free, and that the handler derives loopback from its own connection; passing the flag through the handler is recorded as a follow-up (not an escalation: an mTLS listener cannot yield an anonymous peer) |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-11 identity - 2026-11-02 (round 3, fix verification)
 

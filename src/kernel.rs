@@ -1777,6 +1777,14 @@ impl Agent {
                 "cannot introduce a capability to an unauthenticated peer",
             ));
         }
+        // Trust level and fingerprint shape are different questions: a
+        // zero or loopback digest would be a wildcard binding
+        // (round 4, F2).
+        if !crate::identity::bindable(peer.fingerprint()) {
+            return Err(Error::Identity(
+                "cannot bind a capability to an unbindable fingerprint",
+            ));
+        }
         // Introducing authority requires holding it: an imported handle is a
         // borrowed id, not ownership. A channel message shows ids, so without
         // this a receiver could bind the sender's capability to a peer of its
@@ -1821,6 +1829,7 @@ impl Agent {
         // the introduction would otherwise stay usable by another peer and
         // transferable over a channel while its parent is locked to this one.
         let subtree = descendants_of(&kernel.children, cap.id());
+        let mut live: Vec<CapId> = vec![cap.id()];
         for id in &subtree {
             if let Some(child) = kernel.caps.get(id) {
                 // A revoked or expired record is dead authority: its binding is
@@ -1836,10 +1845,14 @@ impl Agent {
                         ));
                     }
                 }
+                live.push(*id);
             }
         }
-        for id in std::iter::once(cap.id()).chain(subtree) {
-            if let Some(child) = kernel.caps.get_mut(&id) {
+        // Only a live record is rebound. Rewriting a revoked or expired child's
+        // binding moved authority between principals the moment a clock-domain
+        // mismatch made that child readable again (round 4, F1).
+        for id in &live {
+            if let Some(child) = kernel.caps.get_mut(id) {
                 child.attrs.bound_to = Some(fingerprint);
             }
         }
@@ -1889,6 +1902,11 @@ impl Agent {
                 "cannot rebind a capability to an unauthenticated peer",
             ));
         }
+        if !crate::identity::bindable(to.fingerprint()) {
+            return Err(Error::Identity(
+                "cannot bind a capability to an unbindable fingerprint",
+            ));
+        }
         let from_fingerprint = from.fingerprint();
         let to_fingerprint = to.fingerprint();
         let mut kernel = self.cell.borrow_mut();
@@ -1919,6 +1937,7 @@ impl Agent {
             ));
         }
         let subtree = descendants_of(&kernel.children, cap.id());
+        let mut live: Vec<CapId> = vec![cap.id()];
         for id in &subtree {
             if let Some(child) = kernel.caps.get(id) {
                 if child.revoked || is_expired(&kernel, child) {
@@ -1933,6 +1952,7 @@ impl Agent {
                 {
                     return Err(Error::Identity("a descendant is bound to another peer"));
                 }
+                live.push(*id);
             }
         }
         // A credential exported for the old peer is authority the rotation
@@ -1973,7 +1993,10 @@ impl Agent {
         if kernel.revoked_records.len().saturating_add(fresh) > MAX_TOMBSTONES {
             return Err(Error::BudgetExceeded("tombstones"));
         }
-        for id in &in_subtree {
+        // The tombstone set covers the whole subtree (a dead child's export is
+        // still the old peer's authority), but only a live record is rebound
+        // (round 4, F1).
+        for id in &live {
             if let Some(child) = kernel.caps.get_mut(id) {
                 if child.attrs.bound_to == Some(from_fingerprint) {
                     child.attrs.bound_to = Some(to_fingerprint);
