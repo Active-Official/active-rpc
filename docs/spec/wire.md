@@ -260,7 +260,7 @@ over-grant notification (whose answer is still queued) from the answer itself.
 | `mcp/spawn:<err>` | the child process could not be started |
 | `mcp/cwd` | the working directory could not be pinned |
 | `mcp/read:<err>`, `mcp/write:<err>`, `mcp/stdin`, `mcp/stdout` | transport I/O failed |
-| `mcp/write:closed` | the server closed its input while a line was being sent |
+| `mcp/write:closed` | the writer thread never took the frame (its queue was closed): the session is poisoned and the call is not reported as a withheld reply, because nothing left |
 | `mcp/thread:<err>` | a reader or writer thread could not start |
 | `mcp/<code>` | the server returned a JSON-RPC error; `<code>` is its numeric code |
 

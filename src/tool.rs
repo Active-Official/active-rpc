@@ -1420,6 +1420,8 @@ impl<T: McpTransport> McpSession<T> {
             // Past the static ceiling: a bad argument unless the grant is the
             // tighter bound at equality, where no larger grant helps and the
             // budget is the honest class (round 27, #1; round 44, L-10).
+            // Belt and braces: CappedWriter already refused this line during
+            // serialisation, so this arm is not reachable through invoke.
             return Err(if static_bound {
                 Error::InvalidArgument("the MCP request exceeds the line ceiling")
             } else {
@@ -2538,13 +2540,14 @@ impl Provider for HttpTool {
         };
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
         let static_ceiling = self.max_body.min(MAX_RESPONSE_BYTES);
-        // The axis is the method's effect, not the capability flag: a GET or a
-        // HEAD on a writable capability cannot change anything, so a 404 must
-        // keep its status instead of claiming an effect that could stand
-        // (round 43, F-1).
+        // The axis is the capability's method, not the resolution: get and
+        // head cannot change anything, so their 404 keeps its status, while
+        // equest stays conservative and withholds whatever method text it
+        // carried — the same axis the kernel's `Provider::mutating` sees
+        // (round 43, F-1; round 45, finding 1).
         let mutating = !call.read_only
-            && !method.eq_ignore_ascii_case("GET")
-            && !method.eq_ignore_ascii_case("HEAD");
+            && !call.method.eq_ignore_ascii_case("get")
+            && !call.method.eq_ignore_ascii_case("head");
         // Count admitted calls only (round 31, F7).
         self.calls += 1;
         self.after_send = false;
@@ -3161,19 +3164,6 @@ impl Provider for LocalProcess {
         let share = grant.saturating_sub(arg_bytes as usize);
         let max_output = self.max_output.min(MAX_OUTPUT_BYTES).min(share);
         // Which ceiling bound the read: token the refusal accordingly so a
-        // caller can tell a capability budget from an adapter setting
-        // (round 25, #3).
-        let static_ceiling = self.max_output.min(MAX_OUTPUT_BYTES);
-        let output_refusal = || {
-            // The share, not the grant, is what bounds the read now: a grant
-            // just past the static ceiling with a large argv leaves a share
-            // under it, and that refusal is a budget one (round 34, #2).
-            if share < static_ceiling {
-                Error::BudgetExceeded("byte")
-            } else {
-                Error::ToolPolicy("output too large")
-            }
-        };
         // One budget for both pipes: each reader used to take a full ceiling,
         // so transient buffering reached twice the grant (round 21, F1).
         let shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -3324,7 +3314,7 @@ impl Provider for LocalProcess {
                             kill_process_tree(&mut child);
                             // The child ran: the effect may stand, so a retry
                             // must not fork it again (round 43, F-4).
-                            return Err(reply_withheld(output_refusal()));
+                            return Err(reply_withheld(Error::ToolPolicy("output too large")));
                         }
                     }
                     if std::time::Instant::now() >= deadline {
@@ -3366,7 +3356,7 @@ impl Provider for LocalProcess {
                     // the grant (round 11, #2).
                     if stdout.len().saturating_add(stderr.len()) > max_output {
                         kill_process_tree(&mut child);
-                        return Err(reply_withheld(output_refusal()));
+                        return Err(reply_withheld(Error::ToolPolicy("output too large")));
                     }
                 }
                 Err(_) => {
@@ -3380,7 +3370,7 @@ impl Provider for LocalProcess {
         if stdout.len().saturating_add(stderr.len()) > max_output {
             // The child ran to completion; the output still exceeds the share,
             // and the class says the reply was withheld (round 43, F-4).
-            return Err(reply_withheld(output_refusal()));
+            return Err(reply_withheld(Error::ToolPolicy("output too large")));
         }
         let mut map = BTreeMap::new();
         // A child killed by a signal has no exit code. Reporting `-1` as a

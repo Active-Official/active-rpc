@@ -196,3 +196,34 @@ fn a_child_killed_by_a_signal_withholds_the_reply() {
         "{error}"
     );
 }
+
+/// The mutating axis is the capability's method, not the resolution: a
+/// `request` capability stays conservative even when the method text is `GET`,
+/// which is the axis the kernel sees (round 45, finding 1).
+#[test]
+fn a_request_call_with_a_get_method_is_withheld() {
+    let (address, server) = serve_once(
+        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+    );
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/missing")]);
+    let mut call = Call::new(
+        "request",
+        vec![
+            Arg::Value(Value::Text("GET".to_string())),
+            Arg::Value(Value::Path("/missing".to_string())),
+        ],
+    );
+    call.budget = Budget {
+        max_bytes: 1 << 20,
+        ..Budget::default()
+    };
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a 404 is not a completed call");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
+    drop(server);
+}

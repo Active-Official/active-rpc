@@ -2196,25 +2196,37 @@ fn an_http_request_past_the_grant_is_a_budget_refusal() {
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
 
-/// Output past the capability grant is a budget refusal; only an adapter
-/// setting that binds reports the tool policy (round 25, #3).
+/// Output past the capability grant: the child ran, so the class says the reply
+/// was withheld (round 43, F-4). The grant covers the argument line here, so the
+/// refusal comes from the output share, not from argv (round 45, finding 3).
 #[test]
-fn process_output_past_the_grant_is_a_budget_refusal() {
+fn process_output_past_the_grant_withholds_the_reply() {
     #[cfg(windows)]
     let (program, flag, script) = ("C:\\Windows\\System32\\cmd.exe", "/C", "echo hello");
     #[cfg(not(windows))]
     let (program, flag, script) = ("/bin/sh", "-c", "echo hello");
 
+    // The argv line is about 12 bytes; the grant covers it and one byte of
+    // output, and cho hello writes six.
+    let argv_bytes: u64 = [flag, script]
+        .iter()
+        .map(|argument| Arg::wire_size(&Arg::text(*argument)))
+        .sum();
     let mut tool = LocalProcess::new(program, &[flag, script])
         .expect("an absolute program")
         .with_timeout(5_000);
     let mut call = Call::new("run", vec![Arg::text(flag), Arg::text(script)]);
     call.tool_allows_process = true;
-    call.budget.max_bytes = 2;
+    call.budget.max_bytes = argv_bytes + 1;
     let error = tool
         .invoke(0, &call)
         .expect_err("the output is past the grant");
-    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
 }
 
 /// A zero-byte grant is checked before the argument allowlist, so a direct

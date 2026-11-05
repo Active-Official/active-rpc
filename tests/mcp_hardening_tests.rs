@@ -726,3 +726,58 @@ fn a_writable_call_with_a_refused_answer_withholds_the_reply() {
     let again = Provider::invoke(&mut session, 0, &call).expect_err("the session is poisoned");
     assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
 }
+
+/// A closed writer never took the frame: the session is poisoned, but the call
+/// is not reported as a withheld reply, so an idempotency key is not burned for
+/// an effect that cannot exist (round 44, L-7; round 45, finding 6).
+#[test]
+fn a_closed_writer_does_not_claim_the_effect() {
+    use active_rpc::error::Error as RpcError;
+    use active_rpc::tool::{McpSession, McpTransport};
+
+    struct Closed {
+        queue: std::collections::VecDeque<String>,
+        sends: usize,
+    }
+    impl McpTransport for Closed {
+        fn send_line(&mut self, _line: &str) -> active_rpc::error::Result<()> {
+            Ok(())
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.queue.pop_front().ok_or(RpcError::Provider {
+                code: "mcp/no-response".to_string(),
+            })
+        }
+        fn send_line_within(
+            &mut self,
+            _line: &str,
+            _deadline: Option<std::time::Instant>,
+        ) -> active_rpc::error::Result<()> {
+            self.sends += 1;
+            // The two handshake lines go out; the tool call meets a dead writer.
+            if self.sends <= 2 {
+                return Ok(());
+            }
+            Err(RpcError::Provider {
+                code: "mcp/write:closed".to_string(),
+            })
+        }
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#.to_string(),
+    );
+    queue.push_back(
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"x"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(Closed { queue, sends: 0 }).expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.budget.max_bytes = 1 << 20;
+    let error = Provider::invoke(&mut session, 0, &call).expect_err("the writer is closed");
+    assert_eq!(error.provider_code(), Some("mcp/write:closed"), "{error}");
+    // The session is dead; the next call says so rather than claiming an effect.
+    let again = Provider::invoke(&mut session, 0, &call).expect_err("the session is poisoned");
+    assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
+}

@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-44: round 44 found 2 highs, 3 mediums and 5 lows; all fixed or documented; round 45 must be clean | 299 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-45: round 45 found 1 medium and 5 lows, all fixed; round 46 must be clean | 305 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-17: round 17 found 3 mediums and 6 lows; 6 fixed, 3 noted; the withheld class now survives the client's refusal filter | 133 fixed / 0 rejected / 8 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -799,6 +799,29 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 45)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `51ef8cd`. Round-44
+claims: four HOLD, one PARTIAL (a documented asymmetry described behaviour the code
+did not implement). Verdict **PARTIAL**: one medium and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the round-44 note said an HTTP `request` call is withheld even for a `GET` method text, but the code used the *resolved* method, so `request`+`GET` kept its status while the kernel treated the call as mutating | **fixed**: the axis is the capability's method (`get`/`head` are effect-free), so `request` is withheld whatever it resolves to, matching `Provider::mutating`; `a_request_call_with_a_get_method_is_withheld` |
+| 2 | low | `output_refusal` was dead (its result was always discarded) and its comment still promised a budget-vs-policy token | **fixed**: the closure and the orphaned ceiling are gone |
+| 3 | low | `process_output_past_the_grant_is_a_budget_refusal` set an argv-sized grant, so it exercised the argument branch, not the output one | **fixed and renamed**: the grant covers argv and one output byte; `process_output_past_the_grant_withholds_the_reply` fails pre-fix |
+| 4 | low | the spec described `mcp/write:closed` as a write that failed mid-line, while round 44 made it "the writer never took the frame" | **fixed**: the row says so, and the test asserts the class is kept |
+| 5 | low | the round-44 `static_bound` post-check is unreachable through `invoke` (`CappedWriter` refuses first) | **commented** as belt and braces; the equality rule is proven by the writer arm |
+| 6 | low | no test drove the "poison without claiming the effect" path | **fixed**: `a_closed_writer_does_not_claim_the_effect` |
+
+Accepted residuals: the withheld mapping erases the adapter's own class from the
+metrics; Windows kills only the process-tree leader; a provider that declares
+`mutating=false` while acting has its claim rewritten; the wasm adapter has no
+withheld path.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
