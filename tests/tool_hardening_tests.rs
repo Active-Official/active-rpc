@@ -193,7 +193,14 @@ fn a_timeout_kills_the_descendant_tree() {
     let error = tool
         .invoke(0, &call)
         .expect_err("the child outlives the ceiling");
-    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    // The child ran, so the refusal is a withheld reply (round 43, F-4); the
+    // tree-kill assertions below are unchanged.
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "the call returned after {:?}",
@@ -240,7 +247,14 @@ fn a_timeout_after_the_leader_exits_kills_the_tree() {
     let error = tool
         .invoke(0, &call)
         .expect_err("the inherited pipes outlive the ceiling");
-    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    // The child ran, so the refusal is a withheld reply (round 43, F-4); the
+    // tree-kill assertions below are unchanged.
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "the call returned after {:?}",
@@ -1814,7 +1828,13 @@ fn an_output_flood_is_refused_not_waited_out() {
     call.budget.max_wall_ms = 5_000;
     let started = Instant::now();
     let error = tool.invoke(0, &call).expect_err("the flood is refused");
-    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+    // The child ran, so the refusal is a withheld reply (round 43, F-4).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "the refusal waited {:?}",
