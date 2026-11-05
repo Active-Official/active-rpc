@@ -611,13 +611,9 @@ impl Provider for WasmTool {
                 "this adapter cannot enforce a path scope",
             ));
         }
-        if call.method != "run" {
-            return Err(Error::MethodNotGranted {
-                method: call.method.clone(),
-            });
-        }
         // Borrow the argument first: the byte grant bounds the input, and the
-        // copy must happen only after every check (round 24, #5).
+        // copy must happen only after every check (round 24, #5). The method is
+        // checked after it, the uniform prefix's last step (round 40, F2).
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
         let mut input: Option<&[u8]> = None;
         for arg in &call.args {
@@ -653,6 +649,11 @@ impl Provider for WasmTool {
                 "the wasm adapter takes exactly one text or module argument",
             ));
         };
+        if call.method != "run" {
+            return Err(Error::MethodNotGranted {
+                method: call.method.clone(),
+            });
+        }
 
         // The call's wall budget already bounds the guest: fuel was derived
         // above, before the argument rules (round 26, #5).

@@ -490,6 +490,14 @@ pub struct Kernel {
     /// Maintained on attenuation and on drop so revocation walks the subtree
     /// instead of rescanning every capability per doomed id.
     children: BTreeMap<CapId, BTreeSet<CapId>>,
+    /// Reverse index: for each record id, the live capabilities that carry it.
+    ///
+    /// A record id expands a revocation to every capability restored from it,
+    /// and those capabilities' descendants follow through `children`. Building
+    /// this index inside `revoke_subtree` made every revocation O(caps), so N
+    /// sequential leaf revokes were quadratic; it is maintained on insert,
+    /// remove and the restore-time id rewrite instead (round 47, F3).
+    record_index: BTreeMap<[u8; 32], BTreeSet<CapId>>,
     /// Live capability records per `(provider, object)`.
     ///
     /// `on_drop` fires once per object, when its last record goes. Scanning
@@ -879,6 +887,7 @@ impl Agent {
             restored_records: BTreeSet::new(),
             record_id_ceiling: MAX_RECORD_IDS,
             children: BTreeMap::new(),
+            record_index: BTreeMap::new(),
             object_records: BTreeMap::new(),
             record_pins: BTreeMap::new(),
             pin_counts: BTreeMap::new(),
@@ -1236,6 +1245,17 @@ impl Agent {
                 pin_lineage.push(*id);
             }
         }
+        // A pin that reaches the restore ceiling would mint a record this
+        // kernel can never restore: `restore_capability_with` appends the
+        // exported capability to the pin, so a pin of `MAX - 1` already yields
+        // a `MAX`-link restore. Another kernel has no local pin and could still
+        // take the record, but a same-kernel restore is the common case and
+        // exporting would spend the grant with no error at the point the
+        // credential is minted. A deep chain can attenuate to a shallower
+        // ancestor first (round 47, F1-F2).
+        if pin_lineage.len() + 1 >= MAX_LINEAGE_DEPTH {
+            return Err(Error::Escalation("capability chain is too deep"));
+        }
         for id in &chain {
             let meter = meter_for(&kernel, *id)?
                 .ok_or(Error::Persistence("the capability has no meter"))?;
@@ -1525,9 +1545,31 @@ impl Agent {
         // failed mint above left the pin in place, the fail-closed side.
         release_pin(&mut self.cell.borrow_mut(), record.record_id);
         // Keep the record identity: a revocation that reaches this capability
-        // must tombstone the same record id the credential carries.
-        if let Some(live) = self.cell.borrow_mut().caps.get_mut(&restored.id()) {
-            live.record_id = record.record_id;
+        // must tombstone the same record id the credential carries. The
+        // reverse index moves with it (round 47, F3).
+        {
+            let mut kernel = self.cell.borrow_mut();
+            let old = kernel
+                .caps
+                .get(&restored.id())
+                .map(|live| live.record_id)
+                .unwrap_or(record.record_id);
+            if let Some(live) = kernel.caps.get_mut(&restored.id()) {
+                live.record_id = record.record_id;
+            }
+            if old != record.record_id {
+                if let Some(ids) = kernel.record_index.get_mut(&old) {
+                    ids.remove(&restored.id());
+                    if ids.is_empty() {
+                        kernel.record_index.remove(&old);
+                    }
+                }
+                kernel
+                    .record_index
+                    .entry(record.record_id)
+                    .or_default()
+                    .insert(restored.id());
+            }
         }
         Ok(restored)
     }
@@ -5330,12 +5372,22 @@ impl Kernel {
             .object_records
             .entry((record.provider, record.object))
             .or_insert(0) += 1;
+        self.record_index
+            .entry(record.record_id)
+            .or_default()
+            .insert(record.id);
         self.caps.insert(record.id, record);
     }
 
     /// Remove a capability and decrement its object's count.
     fn remove_cap_record(&mut self, id: CapId) -> Option<CapRecord> {
         let record = self.caps.remove(&id)?;
+        if let Some(ids) = self.record_index.get_mut(&record.record_id) {
+            ids.remove(&id);
+            if ids.is_empty() {
+                self.record_index.remove(&record.record_id);
+            }
+        }
         let key = (record.provider, record.object);
         if let Some(count) = self.object_records.get_mut(&key) {
             *count = count.saturating_sub(1);
@@ -5366,14 +5418,18 @@ impl Kernel {
             };
             kernel.meters.remove(&id);
             kernel.push_event(Event::CapDropped(id));
-            if kernel.consumed_records.contains(&record.record_id)
+            if !record.revoked
+                && !kernel.revoked_records.contains(&record.record_id)
+                && kernel.consumed_records.contains(&record.record_id)
                 && !kernel.restored_records.contains(&record.record_id)
             {
                 // Exported and now unreferenced: the record is still
                 // restorable, which an operator must be able to see
                 // (audit AR-03). A restored capability carries the same record
                 // id, but its record is spent, so dropping it is not an
-                // orphan (round 33, F4).
+                // orphan (round 33, F4). A revoked or tombstoned record is
+                // not restorable either, so it is not an orphan (round 47,
+                // F1).
                 kernel.push_event(Event::CapRecordOrphaned(id));
             }
             // `on_drop` means "the last capability that referenced this object
@@ -6049,21 +6105,18 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
     // those capabilities' own descendants come with them: the expansion used to
     // be a single pass after the walk, so a child attenuated from a restored
     // copy survived (round 44, F-2).
-    // One index over the registry, built once: scanning every capability for
-    // every newly reached record id made a revoke quadratic (16 000 caps took
-    // 23 s inside one borrow, round 45, F-1).
-    let mut by_record: BTreeMap<[u8; 32], Vec<CapId>> = BTreeMap::new();
-    for (id, record) in &kernel.caps {
-        by_record.entry(record.record_id).or_default().push(*id);
-    }
+    // The registry keeps record id -> capabilities (`record_index`), so the
+    // walk expands by lookup instead of scanning every capability per reached
+    // record id (round 45, F-1; round 47, F3).
     let mut record_ids: BTreeSet<[u8; 32]> = BTreeSet::new();
     while let Some(id) = stack.pop() {
         if !doomed.insert(id) {
             continue;
         }
-        if let Some(record) = kernel.caps.get(&id) {
-            if record_ids.insert(record.record_id) {
-                if let Some(sharing) = by_record.get(&record.record_id) {
+        let record_id = kernel.caps.get(&id).map(|record| record.record_id);
+        if let Some(record_id) = record_id {
+            if record_ids.insert(record_id) {
+                if let Some(sharing) = kernel.record_index.get(&record_id) {
                     stack.extend(sharing.iter().copied());
                 }
             }

@@ -1334,7 +1334,27 @@ impl<T: McpTransport> McpSession<T> {
             "method": method,
             "params": params,
         });
-        let line = payload.to_string();
+        // Serialize into a capped buffer: a text-heavy argument becomes up to
+        // six bytes per byte on the wire, so summing `Arg::wire_size` first
+        // undercounts the JSON and the artifact was still built before the
+        // ceiling refused it (round 40, F1).
+        let static_bound = grant.is_none_or(|grant| grant >= MAX_MCP_LINE_BYTES);
+        let cap = grant.map_or(MAX_MCP_LINE_BYTES, |grant| grant.min(MAX_MCP_LINE_BYTES));
+        let mut writer = CappedWriter::new(cap);
+        if serde_json::to_writer(&mut writer, &payload).is_err() {
+            return Err(if !writer.exceeded {
+                Error::InvalidArgument("the MCP request cannot be serialised")
+            } else if static_bound {
+                // Past only the static ceiling: no budget makes it legal
+                // (round 27, #1 keeps the same code as the post-check).
+                Error::InvalidArgument("the MCP request exceeds the line ceiling")
+            } else {
+                Error::BudgetExceeded("byte")
+            });
+        }
+        let line = String::from_utf8(writer.out).map_err(|_| {
+            Error::InvalidArgument("the MCP request is not valid UTF-8 after serialising")
+        })?;
         if let Some(grant) = grant {
             if grant < MAX_MCP_LINE_BYTES && line.len() > grant {
                 // The grant is the tighter bound: a request past it is a budget
@@ -1606,19 +1626,21 @@ impl<T: McpTransport> Provider for McpSession<T> {
                 "a secret argument cannot be sent to an external peer",
             ));
         }
-        // The grant bounds the arguments before they are serialized: a JSON
-        // line built from a ten-megabyte map under a one-byte grant was work
-        // the budget refused only afterwards (round 39, F2).
-        let arg_bytes: u64 = call.args.iter().map(Arg::wire_size).sum();
-        if arg_bytes > call.budget.max_bytes {
-            return Err(Error::BudgetExceeded("byte"));
-        }
         if call.path_scope.is_some() {
             // JSON arguments are not `Value::Path`: the kernel cannot check
             // them, so a scope here would be inert (round 9, F-1).
             return Err(Error::ToolPolicy(
                 "this adapter cannot enforce a path scope",
             ));
+        }
+        // The grant bounds the arguments before they are serialized: a JSON
+        // line built from a ten-megabyte map under a one-byte grant was work
+        // the budget refused only afterwards (round 39, F2). The uniform
+        // prefix is budget, payload, secret, scope, argument bytes, method
+        // (round 40, F2).
+        let arg_bytes: u64 = call.args.iter().map(Arg::wire_size).sum();
+        if arg_bytes > call.budget.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
         }
         let index =
             usize::try_from(object).map_err(|_| Error::InvalidArgument("unknown MCP tool"))?;
@@ -2348,8 +2370,20 @@ impl Provider for HttpTool {
                         // `value_to_json` recurses (round 25, #1).
                         return Err(Error::InvalidArgument("an HTTP body is nested too deeply"));
                     }
-                    serde_json::to_vec(&value_to_json(&value))
-                        .map_err(|_| Error::InvalidArgument("the HTTP body cannot be serialised"))?
+                    {
+                        // Same cap as the request line: JSON escaping can
+                        // multiply a text argument (round 40, F1).
+                        let cap = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+                        let mut writer = CappedWriter::new(cap);
+                        if serde_json::to_writer(&mut writer, &value_to_json(&value)).is_err() {
+                            return Err(if writer.exceeded {
+                                Error::BudgetExceeded("byte")
+                            } else {
+                                Error::InvalidArgument("the HTTP body cannot be serialised")
+                            });
+                        }
+                        writer.out
+                    }
                 }
                 None => Vec::new(),
             };
@@ -2455,6 +2489,43 @@ const SHELL_METACHARACTERS: &[char] = &[
     // `echo /*` lists the filesystem through a prefix grant (round 3, #4).
     '*', '?', '[', ']', '{', '}', '~', '#', '!',
 ];
+
+/// A writer that refuses once the artifact would pass a ceiling.
+///
+/// `serde_json` serializes into a `Vec` with no bound, so a text-heavy argument
+/// (one control byte becomes `\u00XX`) could build six times the grant before
+/// the post-check refused it. The cap makes the refusal happen during the
+/// serialization (round 40, F1).
+struct CappedWriter {
+    out: Vec<u8>,
+    cap: usize,
+    exceeded: bool,
+}
+
+impl CappedWriter {
+    fn new(cap: usize) -> Self {
+        Self {
+            out: Vec::new(),
+            cap,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.out.len().saturating_add(buf.len()) > self.cap {
+            self.exceeded = true;
+            return Err(std::io::Error::other("capped"));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// RFC 9110 token characters, the only bytes legal in a request method.
 pub(crate) fn is_http_token(byte: u8) -> bool {
@@ -2769,6 +2840,21 @@ impl Provider for LocalProcess {
                 "this adapter cannot enforce a path scope",
             ));
         }
+        // The grant bounds the argument line too: a direct caller could pass a
+        // 10 MiB argv under a one-byte grant because only the output was
+        // counted (round 32, #1). The kernel charges the same bytes at
+        // dispatch; this is the adapter's own gate. The uniform prefix puts it
+        // before the method (round 40, F2).
+        let mut arg_bytes = 0u64;
+        for arg in &call.args {
+            let Some(next) = arg_bytes.checked_add(Arg::wire_size(arg)) else {
+                return Err(Error::BudgetExceeded("byte"));
+            };
+            arg_bytes = next;
+        }
+        if arg_bytes > call.budget.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
+        }
         if call.method != "run" {
             return Err(Error::MethodNotGranted {
                 method: call.method.clone(),
@@ -2779,20 +2865,6 @@ impl Provider for LocalProcess {
         // from which refusal it receives (round 27, #3).
         if !call.tool_allows_process {
             return Err(Error::ToolPolicy("process execution not granted"));
-        }
-        // The grant bounds the argument line too: a direct caller could pass a
-        // 10 MiB argv under a one-byte grant because only the output was
-        // counted (round 32, #1). The kernel charges the same bytes at
-        // dispatch; this is the adapter's own gate.
-        let mut arg_bytes = 0u64;
-        for arg in &call.args {
-            let Some(next) = arg_bytes.checked_add(Arg::wire_size(arg)) else {
-                return Err(Error::BudgetExceeded("byte"));
-            };
-            arg_bytes = next;
-        }
-        if arg_bytes > call.budget.max_bytes {
-            return Err(Error::BudgetExceeded("byte"));
         }
         let mut args = Vec::new();
         for arg in &call.args {

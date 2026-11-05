@@ -7,7 +7,7 @@
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
-use active_rpc::kernel::Provider;
+use active_rpc::kernel::{Provider, MAX_LINEAGE_DEPTH};
 use active_rpc::value::{Call, Response, Value};
 use active_rpc::{Agent, Budget, CapPersistence, CapabilityRecord, Error};
 
@@ -1365,15 +1365,16 @@ fn a_live_restored_copy_keeps_its_ancestor_alive() {
     drop(restored);
 }
 
-/// The chain-depth refusal is settled before the store claim, so a credential
-/// is not spent by a deterministic refusal (round 45, F-2).
+/// The chain-depth refusal is settled before the store claim, and the export
+/// already refuses to mint a record this kernel could never restore, so a
+/// deterministic refusal never spends the credential (round 45, F-2; round 47,
+/// F1-F2).
 #[test]
-fn a_chain_too_deep_to_restore_does_not_spend_the_record() {
+fn a_chain_too_deep_to_restore_is_refused_at_export() {
     use active_rpc::kernel::MAX_LINEAGE_DEPTH;
     use active_rpc::persistence::MemoryRecordStore;
 
     let (agent, _provider, first) = durable_agent();
-    let owner = admitted(b"durable-owner");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
     let mut deep = first;
@@ -1382,23 +1383,21 @@ fn a_chain_too_deep_to_restore_does_not_spend_the_record() {
             .attenuate(&deep, attrs.clone())
             .expect("one more link");
     }
-    let record = agent
-        .export_capability(&deep)
-        .expect("export the deepest link");
-    drop(deep);
-    agent.run();
-
-    let mut store = MemoryRecordStore::new();
+    let before = agent.consumed_record_count();
     let error = agent
-        .restore_capability_with(&record, &owner, Some(&mut store))
-        .expect_err("the restore chain is one link too deep");
+        .export_capability(&deep)
+        .expect_err("the export cannot produce a restorable record");
     assert_eq!(error.code(), "rpc/attenuation-escalation", "{error}");
-    assert!(
-        store.is_empty(),
+    assert_eq!(
+        agent.consumed_record_count(),
+        before,
         "a deterministic refusal must not spend the credential"
     );
+    // No record is produced, so no store is consulted; a restore of the
+    // (absent) credential cannot spend anything either.
+    let store = MemoryRecordStore::new();
+    assert!(store.is_empty());
 }
-
 /// Revoking a wide tree is linear: the record-id expansion is one registry
 /// index, not a scan per reached capability (round 45, F-1).
 #[test]
@@ -1491,4 +1490,111 @@ fn a_record_exported_through_a_restored_copy_is_revoked_with_the_root() {
         .restore_capability(&second, &owner)
         .expect_err("the record is tombstoned");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+/// The restore lineage is the pin plus the exported capability itself, so a
+/// pin of `MAX - 1` already reaches the ceiling. An export there would mint a
+/// credential this kernel refuses to restore after spending the grant, so it is
+/// refused before the reserve and the record id stays unspent (round 47, F1-F2).
+#[test]
+fn an_export_past_the_restore_ceiling_is_refused_and_spends_nothing() {
+    let (agent, _provider, root) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+
+    // The boundary itself: MAX - 1 links export a record this kernel would
+    // refuse to restore, so the export refuses first.
+    let mut too_deep = agent
+        .attenuate(&root, attrs.clone())
+        .expect("a fresh chain");
+    for _ in 2..MAX_LINEAGE_DEPTH {
+        too_deep = agent.attenuate(&too_deep, attrs.clone()).expect("link");
+    }
+    let before = agent.consumed_record_count();
+    let error = agent
+        .export_capability(&too_deep)
+        .expect_err("a record that cannot be restored is not exported");
+    assert_eq!(error.code(), "rpc/attenuation-escalation", "{error}");
+    assert_eq!(
+        agent.consumed_record_count(),
+        before,
+        "a refused export does not spend the record id"
+    );
+    let lane = agent
+        .create_lane("ceiling", Budget::default())
+        .expect("lane");
+    agent
+        .call_as(
+            Some(&peer(b"durable-owner")),
+            lane,
+            &too_deep,
+            "echo",
+            Vec::new(),
+        )
+        .expect("the refused export leaves the grant intact");
+    drop(too_deep);
+
+    // The boundary from below: MAX - 2 links still export and restore.
+    let mut deepest = root;
+    for _ in 1..MAX_LINEAGE_DEPTH - 1 {
+        deepest = agent.attenuate(&deepest, attrs.clone()).expect("link");
+    }
+    let record = agent
+        .export_capability(&deepest)
+        .expect("the deepest restorable chain exports");
+    drop(deepest);
+    agent.run();
+    agent
+        .restore_capability(&record, &owner)
+        .expect("the deepest restorable chain restores");
+}
+
+/// A revocation tombstones the record, so dropping the handle afterwards is
+/// not an orphan: the event promises a restorable record and an operator tool
+/// keys off it (round 47, F1).
+#[test]
+fn a_revoked_record_is_not_an_orphan_when_the_handle_drops() {
+    use active_rpc::kernel::Event;
+
+    let (agent, provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    agent.revoke(&cap).expect("revoke");
+    drop(cap);
+    let _ = agent.take_drops(provider);
+    assert!(
+        agent.record_is_tombstoned(&record.record_id),
+        "the revocation tombstones the credential"
+    );
+    let orphans = agent
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::CapRecordOrphaned(_)))
+        .count();
+    assert_eq!(orphans, 0, "a tombstoned record is not an orphan");
+}
+
+/// A narrow revoke is not O(registry): the record-id index is maintained, not
+/// rebuilt per call, so N sequential leaf revokes stay linear (round 47, F3).
+#[test]
+fn sequential_narrow_revocations_are_linear() {
+    let (agent, provider, root) = durable_agent();
+    let mut children = Vec::with_capacity(20_000);
+    for _ in 0..20_000 {
+        children.push(
+            agent
+                .attenuate(&root, CapAttrs::new(&["echo"]))
+                .expect("one child"),
+        );
+    }
+    let started = std::time::Instant::now();
+    for child in &children {
+        agent.revoke(child).expect("one narrow revoke");
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "revoking 20 000 leaves one by one took {elapsed:?}"
+    );
+    let _ = agent.take_drops(provider);
 }

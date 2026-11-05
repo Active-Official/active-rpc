@@ -20,8 +20,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-46: round 46 was cut short when the reviewer edited the tree; its finding was adopted with a test and round 46 is re-run read-only | 277 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-39: round 39 found 2 mediums and 2 lows fixed, 1 high rejected with reasoning; rounds 40-41 must be clean | 267 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-40: round 39 found 2 mediums and 2 lows, round 40 fixed its 1 medium and 1 low; round 41 must be clean | 269 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-12: round 12 found 1 high, 1 medium and 1 low, all fixed; rounds 13-14 must be clean | 98 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -475,6 +475,30 @@ are closed.
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
 
+### R-07 domain operations - 2026-11-04 (round 47)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, read-only
+at `ceb09f2`. Re-audit of the six round-45/46 claims: all six **HOLD** (the walk is
+linear, the restore depth check precedes `claim`, `tree_ancestors` is a real tree edge
+with a descendant count and unlink, an export pin carries the restored ancestors,
+ADR-0010 documents the tombstone bound, the `RecordStore` advisory methods have
+defaults). Verdict **CLEAN**; four low findings, all fixed here.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | `drop_record` emitted `CapRecordOrphaned` for a record a revocation had already tombstoned, so the tape promised a restorable credential that was dead | **fixed**: the event needs `!record.revoked` and the record id outside `revoked_records`; `a_revoked_record_is_not_an_orphan_when_the_handle_drops` (orphan count 1 before, 0 after) |
+| 2 | low | the new export guard was off by one: restore appends the exported capability to the pin, so a pin of `MAX - 1` already refuses; the guard refused only at `MAX` | **fixed**: `pin_lineage.len() + 1 >= MAX_LINEAGE_DEPTH`, before any reserve; the boundary test exports and restores a `MAX - 2` chain and asserts a `MAX - 1` chain is refused, spends no record id and still dispatches |
+| 3 | low | `revoke_subtree` rebuilt the record-id index on every call, so N sequential leaf revokes were quadratic | **fixed**: `Kernel::record_index` is maintained by `insert_cap_record`/`remove_cap_record` and moved by the restore-time id rewrite; measured 20 000 sequential leaf revokes: **574.94 s before, 0.69 s after** (same debug build, `sequential_narrow_revocations_are_linear`) |
+| 4 | low | `cap_table_hash` hashed the caller's descriptor order, so one table held in two orders produced two bases and every delta was refused | **fixed**: `encode_capability_table` writes the table sorted by id, which is what ADR-0009 makes the canonical form; `a_reordered_table_has_the_same_identity` (equal hashes; a delta built on one order applies to the other) |
+
+The reviewer's residual list is accepted: object identity is the provider's ordinal;
+cross-kernel revocation depends on the deployment replaying its kill list; set
+ceilings are per process; `durable_ceiling_reached` is O(caps) per durable mint; an
+export is a full transfer.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Every new test fails against the pre-fix tree.
+
 ### R-07 domain operations - 2026-11-04 (round 46, cut short)
 
 The reviewer began editing the tree (it wrote an unrequested fix for a record
@@ -655,6 +679,20 @@ concurrent overshoot to observe.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 40)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
+`ceb09f2` (report: round-39 re-audit, **NOT CLEAN**, one medium and one low; all five
+round-39 claims HOLD). Both findings are fixed here, so rounds 41 must be clean.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the pre-serialize bound summed `Arg::wire_size` while the adapter writes JSON, where one control byte becomes six; a text-heavy argument passed the pre-check and the artifact was still built before the post-check refused it (about 6x allocation per call under a grant the budget never authorised) | **fixed**: `CappedWriter` serializes the MCP request line and the HTTP body against the grant (and `MAX_MCP_LINE_BYTES`), so the refusal happens during serialization and nothing past the ceiling is ever built; a hit on the static line ceiling is `rpc/invalid-argument` and a hit on a tighter grant is `rpc/budget-exceeded`; `a_large_argument_under_a_small_grant_is_refused_before_serializing`, `a_line_past_the_static_ceiling_is_illegal_whatever_the_grant`, `an_mcp_request_past_only_the_line_ceiling_is_an_argument_refusal` |
+| 2 | low | the four adapters ran their refusals in different orders (MCP budget→scope→method, HTTP scope→budget→method, process scope→method→grant→budget, wasm scope→method→argument bytes), so one malformed call reported a different first code per adapter and the difference fingerprinted the adapter and its policy | **fixed**: every adapter now runs budget, payload, secret, scope, argument bytes, method; the process argument-byte gate moved before its method check, the HTTP method check before its shape loop, the wasm method check after its input loop; `tests/refusal_order_tests.rs` drives all four adapters with a secret, a scope, oversized arguments and a bad method and asserts one code per call |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Both tests fail against the pre-fix tree.
 
 ### R-08 tools and MCP - 2026-11-04 (round 39)
 

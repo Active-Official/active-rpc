@@ -1296,7 +1296,14 @@ pub fn encode_capability_table(caps: &[CapDescriptor]) -> Result<Vec<u8>> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     put_len(&mut out, caps.len())?;
-    for cap in caps {
+    // ADR-0009 makes table identity the hash, not the descriptor order, and
+    // `apply_to` returns a table sorted by id. Writing the caller's order made
+    // `cap_table_hash` order-dependent: the same set held in two orders hashed
+    // differently, so a delta base built from one was refused by the other
+    // (round 47, F4).
+    let mut ordered: Vec<&CapDescriptor> = caps.iter().collect();
+    ordered.sort_by_key(|cap| cap.id.0);
+    for cap in ordered {
         if !seen.insert(cap.id.0) {
             return Err(Error::CapabilityTable("duplicate capability id"));
         }

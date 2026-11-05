@@ -85,3 +85,28 @@ fn delta_removals_are_order_independent_but_the_result_is_sorted() {
     assert_eq!(ids, vec![CapId([1u8; 16]), CapId([3u8; 16])]);
     assert!(applied.iter().all(|cap| !cap.methods.is_empty()));
 }
+
+/// Table identity is the set, not the caller's order: the canonical encoding
+/// sorts by id, so the same descriptors held in two orders hash equally and a
+/// delta built against one applies to the other (round 47, F4).
+#[test]
+fn a_reordered_table_has_the_same_identity() {
+    let declared = vec![descriptor(2, "evaluate"), descriptor(1, "echo")];
+    let reordered = vec![descriptor(1, "echo"), descriptor(2, "evaluate")];
+    assert_eq!(
+        cap_table_hash(&declared).expect("hash"),
+        cap_table_hash(&reordered).expect("hash")
+    );
+    let delta = CapTableDelta::new(&declared, vec![], vec![descriptor(3, "stats")])
+        .expect("delta against the declared order");
+    assert_eq!(
+        delta
+            .apply_to(&reordered)
+            .expect("apply to the reordered base"),
+        vec![
+            descriptor(1, "echo"),
+            descriptor(2, "evaluate"),
+            descriptor(3, "stats")
+        ]
+    );
+}
