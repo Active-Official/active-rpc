@@ -2542,7 +2542,7 @@ impl Provider for HttpTool {
         let static_ceiling = self.max_body.min(MAX_RESPONSE_BYTES);
         // The axis is the capability's method, not the resolution: get and
         // head cannot change anything, so their 404 keeps its status, while
-        // equest stays conservative and withholds whatever method text it
+        // `request` stays conservative and withholds whatever method text it
         // carried — the same axis the kernel's `Provider::mutating` sees
         // (round 43, F-1; round 45, finding 1).
         let mutating = !call.read_only
