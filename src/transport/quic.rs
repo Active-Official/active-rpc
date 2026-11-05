@@ -682,8 +682,15 @@ async fn serve_stream<H>(
                 reply(&mut send, &Envelope::error(envelope.request_id, &error)).await;
                 // No close here: an admitted call may still be running, and the
                 // last one to finish closes the endpoint (round 47). This
-                // stream is not admitted, so it leaves the count as it found it.
-                active.fetch_sub(1, Ordering::SeqCst);
+                // stream is not admitted, but it was counted, so its decrement
+                // may be the last one: without the same predicate here the
+                // server stayed open forever after its budget was spent
+                // (round 15, F-1).
+                let running = active.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+                if running == 0 {
+                    let _ = tokio::time::timeout(DRAIN_BEFORE_CLOSE, send.stopped()).await;
+                    endpoint.close(0u32.into(), b"served");
+                }
                 return;
             }
             match served.compare_exchange(

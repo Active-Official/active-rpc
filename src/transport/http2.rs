@@ -807,8 +807,8 @@ impl Http2Client {
     ///
     /// The library has no internal deadline: a peer that accepts the connection
     /// and then stalls (or dribbles a response) would otherwise park the caller
-    /// forever. Nothing is set by default, so existing callers see the old
-    /// behaviour.
+    /// forever. A thirty-second deadline is applied by default (wait_for), and
+    /// this tightens it.
     pub fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.deadline = Some(deadline);
         self
@@ -890,13 +890,10 @@ impl Http2Client {
                             } else {
                                 let answer = Envelope::decode_with(&body, limits)?;
                                 // As in `call`: a stream's answer must belong
-                                // to the request that opened it
-                                // (round 29, low).
-                                if !matches!(
-                                    answer.kind,
-                                    crate::wire::Kind::Response | crate::wire::Kind::Error
-                                ) || answer.request_id != expected_id
-                                {
+                                // to the request that opened it, and one rule
+                                // decides it, id 0 for an error included
+                                // (round 29, low; round 15, F-3).
+                                if !answer.answers(expected_id) {
                                     return Err(Error::Wire(
                                         "the peer answered a different request",
                                     ));

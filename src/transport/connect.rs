@@ -524,12 +524,16 @@ impl BridgeServer {
             drain_before_close(&mut stream);
             return 0;
         };
-        // The read deadline's remainder may be milliseconds after a body that
-        // landed just in time; give the response its own budget.
-        let _ = stream.set_write_timeout(Some(CONNECTION_WAIT));
+        // The response gets its own budget from now, not the request's
+        // remainder: `write_all_before` re-arms from the deadline it is given,
+        // so passing the connection start left an honest slow client a few
+        // hundred milliseconds to take the whole reply (round 15, F-6).
+        let response_deadline = std::time::Instant::now()
+            .checked_add(CONNECTION_WAIT)
+            .unwrap_or_else(std::time::Instant::now);
         // A peer that never read the response was not served; counting it would
         // make --limit and the served metric lie.
-        u64::from(write_http_response(&mut stream, 200, &framed, deadline).is_ok())
+        u64::from(write_http_response(&mut stream, 200, &framed, response_deadline).is_ok())
     }
 }
 

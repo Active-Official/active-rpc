@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-42: round 42 found 1 high, 1 medium and 3 lows, all fixed; round 43 must be clean | 280 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-14: round 14 found 1 high, 3 mediums and 7 lows; 10 fixed, 1 noted (retry classification); round 15 must be clean | 114 fixed / 0 rejected / 1 noted (3 verification gaps in STATUS 17) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-15: round 15 found 2 mediums and 6 lows; 7 fixed, 1 noted; round 16 must be clean | 121 fixed / 0 rejected / 2 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -586,6 +586,26 @@ mediums, two lows and one documentation fix.
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
 
+### R-09 transports - 2026-11-04 (round 15)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash, `xhigh`, read-only at `b419e33`. Round-14
+claims: five HOLD, three PARTIAL. Verdict **PARTIAL / NOT CLEAN**: two mediums and
+six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a refused QUIC stream was counted and decremented on a path with no close predicate, so its decrement could be the last one and the endpoint never closed: `--calls` was ignored and `wait()` hung | **fixed**: the refusal path runs the same predicate after its decrement, as `finish_call` does |
+| 2 | medium | TCP `send` had no frame or connection deadline: each partial write restarted the socket timeout, so a peer taking one byte per period held a serial server | **fixed**: `DeadlineWrite`/`write_frame_before` re-arm the write timeout from the remaining frame time before every write; the blocked case depends on the OS socket buffers (a loopback peer absorbed 60 MiB here), so no portable assertion; the deadline path is exercised by the code and the round-15 note |
+| 3 | low | HTTP/2 `call_many` had its own answer rule and refused a legal `Error(id 0)` that `call` accepted | **fixed**: both use `Envelope::answers` |
+| 4 | low | shared memory still implements the bidirectional `Transport` over a one-way ring (send then recv echoes the caller's own frame) | **noted**: the shape is `wire.md` §6 now says one ring has no pairing; splitting the type into sender/receiver is an API change for the M-7 transport pass |
+| 5 | low | the frame deadline was armed once per frame, so a peer dripping just inside each socket timeout won up to twice the budget | **fixed**: `Counted` re-arms from the time left before every read; `a_dripped_frame_does_not_get_a_second_deadline` |
+| 6 | low | the bridge reply was written under the request's deadline (plus 250 ms), so an honest slow request lost its answer | **fixed**: the response gets its own `CONNECTION_WAIT` budget from now |
+| 7 | low | the shared ring's `head`/`tail` were truncated to `usize` before the modulo, wrong on 32-bit after 4 GiB | **fixed**: the modulo is done in `u64` |
+| 8 | low | stale text from round 14 (test header, bridge comment, an HTTP/2 deadline comment, a marathon row citing a removed test) | **fixed** |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-09 transports - 2026-11-04 (round 14)
 
 Reviewer: CommandCode DeepSeek V4.1 Flash, `xhigh`, read-only at `e2cc8a7`, with
@@ -629,7 +649,7 @@ Every finding was confirmed against the code and fixed here.
 | 0 | — | **found in CI, not by a reviewer**: the ratio runner failed `quic_dispatches_a_bound_capability_only_for_the_bound_peer` with `read: read error: connection lost`. The serve loop closed the endpoint from the first stream that finished once the call budget was spent, aborting a concurrent call's reply on another connection | **fixed**: a `CallGuard` counts admitted calls and only the last one to finish closes, after waiting for its own peer to read the reply; `the_last_admitted_call_closes_the_server_not_the_first_to_finish` fails 3/3 against the pre-fix tree and passes after |
 | 1 | high | a bridge response whose body stops short of its declared `content-length` was `rpc/transport` (retryable), so a caller could retry a mutating call the peer already executed | **fixed**: `rpc/wire`; `a_truncated_bridge_response_is_a_wire_fault` (pre-fix: `rpc/transport`) |
 | 2 | medium | `TcpTransport::recv` decoded a frame body with `?`, so a body that failed to decode left the session usable after its caller ignored the error | **fixed**: a decode fault sets `recv_poisoned`, like a framing fault; `a_frame_that_decodes_badly_poisons_the_session` |
-| 3 | medium | TCP and shared memory had no answer-identity check, so a relay could hand one call another call's answer (QUIC, HTTP/2 and the bridge already checked) | **fixed**: `Envelope::answers` is one rule, used by QUIC and by new `TcpTransport::call` and `SharedMemoryTransport::call`; `a_tcp_call_refuses_an_answer_to_another_request`, `a_shared_memory_call_refuses_an_answer_to_another_request` |
+| 3 | medium | TCP and shared memory had no answer-identity check, so a relay could hand one call another call's answer (QUIC, HTTP/2 and the bridge already checked) | **fixed**: `Envelope::answers` is one rule, used by QUIC and by new `TcpTransport::call`; `a_tcp_call_refuses_an_answer_to_another_request`. Round 14 removed the shared-memory `call`: a one-ring segment has no request/response pairing |
 | 4 | medium | `serve_connection` bounded one frame but not the connection: a peer sending a valid frame just inside every deadline held a serial server forever | **fixed**: `DEFAULT_CONNECTION_LIFETIME` (10 min) and `serve_connection_within(transport, handler, deadline)`; `a_served_connection_stops_at_its_deadline` |
 | 5 | low | `TcpTransport::new` discarded `set_read_timeout`/`set_write_timeout` errors, so a socket that could not carry a timeout was used blocking | **fixed**: both errors are `rpc/transport` |
 | 6 | low | `Error(id 0)` was accepted for any call with no test pinning it, and a client using id 0 collides with it | **covered**: `a_quic_error_id_zero_is_accepted_and_another_id_is_not` pins id 0 for an error, another id for an error, and id 0 for a response as three outcomes |

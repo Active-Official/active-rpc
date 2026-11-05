@@ -80,7 +80,7 @@ impl SharedSegment {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.head.saturating_sub(state.tail) as usize
+        usize::try_from(state.head.saturating_sub(state.tail)).unwrap_or(usize::MAX)
     }
 
     /// Total bytes written into the ring, since the segment was created.
@@ -121,7 +121,7 @@ impl SharedSegment {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let used = state.head.saturating_sub(state.tail) as usize;
+        let used = usize::try_from(state.head.saturating_sub(state.tail)).unwrap_or(usize::MAX);
         // The length prefix is four bytes: a payload past `u32::MAX` would wrap
         // and the reader would take the tail as a second frame. The segment
         // ceiling makes this unreachable in practice, and the conversion keeps
@@ -147,15 +147,15 @@ impl SharedSegment {
         if used + needed > state.capacity {
             return Err(Error::Transport("shared segment is full".to_string()));
         }
-        let start = state.head as usize % state.capacity;
+        let start = (state.head % state.capacity as u64) as usize;
         if start + needed > state.capacity {
             // Compact instead of fragmenting the frame: move the unread bytes
             // from the *tail* to the front. A contiguous unread region moves in
             // place; a wrapped one is copied through a temporary because its two
             // pieces can overlap the destination.
             let unread = used;
-            let tail_start = state.tail as usize % state.capacity;
             let capacity = state.capacity;
+            let tail_start = (state.tail % capacity as u64) as usize;
             if tail_start + unread <= capacity {
                 state.data.copy_within(tail_start..tail_start + unread, 0);
             } else {
@@ -168,7 +168,7 @@ impl SharedSegment {
             state.head = unread as u64;
             state.tail = 0;
         }
-        let start = state.head as usize % state.capacity;
+        let start = (state.head % state.capacity as u64) as usize;
         state.data[start..start + 4].copy_from_slice(&length.to_le_bytes());
         state.data[start + 4..start + 4 + payload.len()].copy_from_slice(payload);
         state.head += needed as u64;
@@ -269,7 +269,7 @@ fn frame_bounds(state: &SegmentState) -> Result<Option<(usize, usize)>> {
     if state.head == state.tail {
         return Ok(None);
     }
-    let start = state.tail as usize % state.capacity;
+    let start = (state.tail % state.capacity as u64) as usize;
     if start + 4 > state.capacity {
         return Err(Error::Wire("frame header straddles the ring end"));
     }

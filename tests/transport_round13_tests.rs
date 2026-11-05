@@ -1,6 +1,6 @@
 //! R-09 round 13: a truncated bridge body is a wire fault, an undecodable
-//! frame poisons the TCP session, the TCP and shared-memory clients check that
-//! an answer belongs to their call, and a served connection has a total bound.
+//! frame poisons the TCP session, the TCP client checks that an answer belongs
+//! to its call, and a served connection has a total bound.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -149,4 +149,40 @@ fn a_slow_handler_does_not_freeze_the_runtime() {
         thread.join().expect("waiter");
     }
     server.shutdown();
+}
+
+/// A peer that drips one byte just inside each socket timeout must not win a
+/// second full deadline: the remaining frame time is re-armed before every read
+/// (round 15, F-5).
+#[test]
+fn a_dripped_frame_does_not_get_a_second_deadline() {
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        // A four-byte length prefix, one byte every 100 ms, then nothing.
+        for _ in 0..4 {
+            if stream.write_all(&[0u8]).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
+    let stream = std::net::TcpStream::connect(address).expect("connect");
+    let mut client = TcpTransport::with_timeout(stream, Duration::from_millis(150))
+        .expect("a deadline-carrying transport");
+    let started = Instant::now();
+    client
+        .recv()
+        .expect_err("the frame deadline bounds the whole frame");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "a 150 ms frame deadline took {elapsed:?} against a dripping peer"
+    );
+    drop(server);
 }

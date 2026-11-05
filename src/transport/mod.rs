@@ -367,11 +367,13 @@ impl Transport for TcpTransport {
             return Err(Error::Wire("frame exceeds the size ceiling"));
         }
         // A reader that stops must not hold a serial server for the whole
-        // message: each frame gets a fresh write budget.
-        if let Some(wait) = self.frame_deadline {
-            let _ = self.stream.get_ref().set_write_timeout(Some(wait));
-        }
-        if let Err(error) = write_frame(self.stream.get_mut(), &bytes) {
+        // message: each frame gets one write budget, re-armed before every
+        // write, so a peer that takes one byte per socket timeout cannot
+        // stretch a frame (round 15, F-2).
+        let deadline = self
+            .frame_deadline
+            .map(|wait| std::time::Instant::now() + wait);
+        if let Err(error) = write_frame_before(self.stream.get_mut(), &bytes, deadline) {
             // The header or the body (or part of either) may be on the wire, so
             // the peer's read position no longer matches a frame boundary.
             self.send_poisoned = true;
@@ -393,19 +395,7 @@ impl Transport for TcpTransport {
         let deadline = self
             .frame_deadline
             .map(|wait| std::time::Instant::now() + wait);
-        if let Some(deadline) = deadline {
-            let remaining = deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .max(std::time::Duration::from_millis(1));
-            // The deadline is `frame_deadline` or the caller's; `remaining` is
-            // recomputed per read. A socket that refuses the value would keep
-            // the constructor's bound, silently weakening the caller's
-            // deadline, so a failed re-arm ends the receive (round 14, F-8).
-            if let Err(error) = self.stream.get_ref().set_read_timeout(Some(remaining)) {
-                self.recv_poisoned = true;
-                return Err(Error::Transport(format!("read deadline: {error}")));
-            }
-        }
+
         // Count what the read consumed: any error after a byte has been taken
         // leaves the inbound stream off a frame boundary, whether it was a
         // ceiling refusal, a timeout mid-header or a stall mid-body. Only a
@@ -414,9 +404,31 @@ impl Transport for TcpTransport {
         struct Counted<'a> {
             inner: &'a mut BufReader<TcpStream>,
             read: usize,
+            deadline: Option<std::time::Instant>,
         }
         impl std::io::Read for Counted<'_> {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                // One deadline for the whole frame, re-armed to the time left
+                // before every read: a peer that sends one byte just before
+                // each socket timeout used to win a second full deadline
+                // (round 15, F-5). A socket that refuses the value keeps the
+                // constructor's bound, silently weakening the caller's
+                // deadline, so that ends the receive (round 14, F-8).
+                if let Some(deadline) = self.deadline {
+                    let now = std::time::Instant::now();
+                    let remaining = deadline
+                        .saturating_duration_since(now)
+                        .max(std::time::Duration::from_millis(1));
+                    if now >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "frame deadline elapsed",
+                        ));
+                    }
+                    if let Err(error) = self.inner.get_ref().set_read_timeout(Some(remaining)) {
+                        return Err(std::io::Error::other(format!("read deadline: {error}")));
+                    }
+                }
                 let read = self.inner.read(buf)?;
                 self.read += read;
                 Ok(read)
@@ -425,6 +437,7 @@ impl Transport for TcpTransport {
         let mut counted = Counted {
             inner: &mut self.stream,
             read: 0,
+            deadline,
         };
         let result = read_frame_before(&mut counted, &self.limits, deadline);
         let consumed = counted.read;
@@ -642,6 +655,66 @@ pub fn read_frame_before<R: Read>(
 /// Header and body travel in one vectored write, so a TCP frame costs one send
 /// syscall. `IoSlice::advance_slices` handles a short write; a zero write is an
 /// error rather than a spin.
+/// A writer whose socket timeout follows one frame deadline.
+///
+/// The default is a no-op, so an in-memory writer needs no deadline support.
+pub trait DeadlineWrite: Write {
+    /// Re-arm the underlying timeout for the time left, or fail once the
+    /// deadline has passed.
+    fn arm_deadline(&mut self, _deadline: Option<std::time::Instant>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl DeadlineWrite for TcpStream {
+    fn arm_deadline(&mut self, deadline: Option<std::time::Instant>) -> std::io::Result<()> {
+        let Some(deadline) = deadline else {
+            return Ok(());
+        };
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "frame deadline elapsed",
+            ));
+        }
+        let left = deadline
+            .saturating_duration_since(now)
+            .max(std::time::Duration::from_millis(1));
+        self.set_write_timeout(Some(left))
+    }
+}
+
+/// Write one frame under a deadline, re-armed before every write.
+///
+/// A peer that accepts one byte per socket timeout used to stretch a frame
+/// indefinitely: each successful partial write restarted the timeout. The dead
+/// line is checked and the timeout recomputed before each write (round 15, F-2).
+pub fn write_frame_before<W: DeadlineWrite + ?Sized>(
+    writer: &mut W,
+    body: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
+    let header = frame(body.len())?;
+    let mut slices: [IoSlice<'_>; 2] = [IoSlice::new(&header), IoSlice::new(body)];
+    let mut bufs: &mut [IoSlice<'_>] = &mut slices;
+    while !bufs.is_empty() {
+        writer
+            .arm_deadline(deadline)
+            .map_err(|error| Error::Transport(format!("write deadline: {error}")))?;
+        match writer.write_vectored(bufs) {
+            Ok(0) => return Err(Error::Transport("write returned zero bytes".to_string())),
+            Ok(written) => IoSlice::advance_slices(&mut bufs, written),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(Error::Transport(error.to_string())),
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| Error::Transport(error.to_string()))
+}
+
+/// Write one frame (header and body) to a writer with no deadline support.
 pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
     let header = frame(body.len())?;
     let mut slices: [IoSlice<'_>; 2] = [IoSlice::new(&header), IoSlice::new(body)];
