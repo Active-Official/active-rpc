@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-41: round 41 found 1 medium and 5 lows, all fixed; round 42 must be clean | 275 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-42: round 42 found 1 high, 1 medium and 3 lows, all fixed; round 43 must be clean | 280 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-14: round 14 found 1 high, 3 mediums and 7 lows; 10 fixed, 1 noted (retry classification); round 15 must be clean | 114 fixed / 0 rejected / 1 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -731,6 +731,30 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 42)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash, `xhigh`, read-only at `6acbd6b`. Round-41
+claims: five HOLD, one PARTIAL. Verdict **NOT CLEAN**: one high, one medium, three
+lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the round-41 pre-parse grant refusal did not poison. For a notification that is not the answer, the answer stays queued; the next call's request reaches the peer and only then reads the stale answer, so one authorised mutating call can execute twice | **fixed**: an over-grant line poisons before the refusal, the same fail-closed side as `mcp/line-too-long`; `a_writable_call_with_a_refused_answer_withholds_the_reply` asserts poison, and the read-only poison tests keep their parse codes |
+| 2 | medium | every refusal decided **after** the request left was reported as a pre-effect class (`rpc/budget-exceeded`, `http/<status>`), so the kernel sealed `Refused` and an idempotency retry re-executed a write that may have landed | **fixed**: adapters map post-send refusals to `provider/reply-withheld` for a writable call (a read-only call keeps its specific code); the kernel now treats that code as an applied effect even when the provider returned `Err`, so the receipt is `Admitted` and the key is reusable; `a_withheld_reply_is_receipted_as_admitted_and_not_replayed` (fails pre-fix) |
+| 3 | low | wasm copied the argument (`input.to_vec()`) before its ABI ceiling, contrary to its own comment | **fixed**: the `wasm/input` check runs before the copy |
+| 4 | low | round 41 fused two doc blocks into the `LocalProcess::program` field and left stray `///` markers | **fixed** |
+| 5 | low | the HTTP static cap treated `max_request == grant` as a tool-policy refusal while the spec puts the grant first | **fixed**: `static_cap < grant_cap`, so equality is a budget refusal |
+
+Accepted residuals: the MCP request line is charged with no envelope allowance;
+`MAX_MCP_QUEUED_LINES × 1 MiB` per session is buffered before any grant check;
+`arg_bytes` uses `u64::sum()` (overflow needs exabyte values); `value_to_json`
+builds the tree before `CappedWriter`; `HttpTool::policy()` confines methods, not
+paths; Windows kills the process-tree leader only; `McpSession::calls` counts a
+not-sent refusal.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

@@ -447,6 +447,17 @@ minutes) as well as a per-frame deadline: a peer that sends a valid frame just
 inside every per-frame deadline must not hold a serial server forever.
 `serve_connection_within` takes an explicit deadline.
 
+A refusal decided after the request reached the peer is a **withheld reply** for
+a writable capability: the tool may have run, so the caller gets
+`provider/reply-withheld` (the receipt records the admission and an idempotent
+retry returns the same outcome instead of executing again). A read-only call has
+no effect that could stand, so it keeps the answer's own code. This applies to
+the MCP answer path (an over-grant line, a malformed or mismatched answer) and to
+the HTTP adapter (a non-2xx status, a body past the grant or the static
+ceiling). The MCP session is poisoned in either case, because before parsing the
+client cannot tell an over-grant notification (whose answer is still queued)
+from the answer itself.
+
 One stream carries one frame. On QUIC the reader takes the announced length and
 then probes for trailing bytes with a `250 ms` window (`STREAM_TAIL_WAIT`): a
 byte sent later than that is silently discarded with the stream, never

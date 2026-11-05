@@ -5131,7 +5131,16 @@ impl Agent {
             // would deny an effect that landed (round 31, F1; round 32, #2
             // decides it by provenance rather than by error class).
             let mut effect_withheld = false;
-            let outcome = if provider_succeeded && mutating {
+            // An adapter that reached the peer and then had to refuse says so
+            // with `provider/reply-withheld`: the tool may have run, so the
+            // receipt must record the admission and an idempotent retry must
+            // reuse the outcome rather than execute a second time (round 42,
+            // M-1).
+            let withheld_by_code = matches!(
+                &outcome,
+                Err(error) if error.provider_code() == Some("provider/reply-withheld")
+            );
+            let outcome = if withheld_by_code || (provider_succeeded && mutating) {
                 match outcome {
                     Err(_) => {
                         effect_withheld = true;

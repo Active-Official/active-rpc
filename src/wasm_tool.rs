@@ -670,6 +670,12 @@ impl Provider for WasmTool {
 
         // The call's wall budget already bounds the guest: fuel was derived
         // above, before the argument rules (round 26, #5).
+        if input.len() > OUTPUT_OFFSET {
+            // The argument is written into the input area, which ends where the
+            // output area begins. The copy must happen after this check, not
+            // before it (round 42, L-1).
+            return Err(provider("wasm/input"));
+        }
         let input = input.to_vec();
         let mut limits = self.limits;
         limits.fuel = fuel;

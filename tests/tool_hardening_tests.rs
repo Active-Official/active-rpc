@@ -306,7 +306,8 @@ fn a_dripping_server_cannot_stretch_the_wall_ceiling() {
     );
 
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/slow")]);
-    let call = http_get("/slow", 150);
+    let mut call = http_get("/slow", 150);
+    call.read_only = true;
     let started = Instant::now();
     let error = tool
         .invoke(0, &call)
@@ -545,9 +546,9 @@ fn a_truncated_head_or_body_has_its_own_code() {
         b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\nconnection: close\r\n\r\nabc".to_vec(),
     );
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/short")]);
-    let error = tool
-        .invoke(0, &http_get("/short", 2_000))
-        .expect_err("a short body is refused");
+    let mut short = http_get("/short", 2_000);
+    short.read_only = true;
+    let error = tool.invoke(0, &short).expect_err("a short body is refused");
     assert_eq!(
         error.provider_code(),
         Some("http/read:truncated-body"),
@@ -558,8 +559,10 @@ fn a_truncated_head_or_body_has_its_own_code() {
     let address = listener.local_addr().expect("address");
     fixed_response(listener, b"HTTP/1.1 200".to_vec());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/head")]);
+    let mut head = http_get("/head", 2_000);
+    head.read_only = true;
     let error = tool
-        .invoke(0, &http_get("/head", 2_000))
+        .invoke(0, &head)
         .expect_err("a truncated head is refused");
     assert_eq!(
         error.provider_code(),
@@ -582,6 +585,7 @@ fn a_response_past_the_byte_grant_is_refused() {
     fixed_response(listener, response.into_bytes());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/big")]);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/big"))]);
+    call.read_only = true;
     // The head fits; the 128-byte body does not. The grant is the binding
     // ceiling, so the refusal names the budget (round 25, #3).
     call.budget.max_bytes = 64;
@@ -647,6 +651,7 @@ fn a_response_head_past_the_byte_grant_is_refused() {
     // (round 25, #7).
     tool.max_body = 40;
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/small"))]);
+    call.read_only = true;
     call.budget.max_bytes = 4096;
     let error = tool
         .invoke(0, &call)
@@ -668,7 +673,8 @@ fn a_repeated_content_length_is_refused() {
     );
 
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/dup")]);
-    let call = http_get("/dup", 1_000);
+    let mut call = http_get("/dup", 1_000);
+    call.read_only = true;
     let error = tool.invoke(0, &call).expect_err("ambiguous framing");
     assert_eq!(error.code(), "rpc/provider");
     assert!(format!("{error}").contains("http/headers"), "{error}");
@@ -797,6 +803,7 @@ fn a_dripping_body_cannot_stretch_the_wall_ceiling() {
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/drip")]);
     let mut call = http_get("/drip", 150);
     call.tool_allows_process = true;
+    call.read_only = true;
     let started = Instant::now();
     let error = tool
         .invoke(0, &call)
@@ -1007,6 +1014,7 @@ fn a_stalled_http_reader_reports_the_ceiling() {
             Arg::Value(Value::Map(entries)),
         ],
     );
+    call.read_only = true;
     call.tool_allows_process = true;
     call.budget.max_wall_ms = 200;
     let started = Instant::now();
@@ -1162,6 +1170,7 @@ fn an_mcp_result_with_an_unrepresentable_number_is_refused() {
         ));
         let mut session = McpSession::handshake(RawLines(lines)).expect("handshake");
         let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+        call.read_only = true;
         call.tool_allows_process = true;
         let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
             .expect_err("a number with no Value form is refused");
@@ -1728,6 +1737,7 @@ fn a_whitespace_only_line_does_not_end_the_headers() {
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/x")]);
     let mut call = http_get("/x", 1_000);
     call.tool_allows_process = true;
+    call.read_only = true;
     let error = tool
         .invoke(0, &call)
         .expect_err("a folded line is a framing fault");
@@ -1882,6 +1892,7 @@ fn a_post_send_timeout_poisons_the_session() {
     })
     .expect("handshake");
     let mut call = Call::new("echo", Vec::new());
+    call.read_only = true;
     call.tool_allows_process = true;
     call.budget.max_wall_ms = 50;
     let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
@@ -2041,6 +2052,7 @@ fn a_signalled_child_is_a_provider_fault() {
 fn a_grant_below_the_smallest_answer_is_a_budget_refusal() {
     let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x")]);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/x"))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     call.budget.max_bytes = 8;
     let error = tool.invoke(0, &call).expect_err("no answer fits the grant");
@@ -2080,6 +2092,7 @@ fn an_mcp_frame_with_both_result_and_error_is_refused() {
     );
     let mut session = McpSession::handshake(RawLines(lines)).expect("handshake");
     let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
         .expect_err("both members are refused");
@@ -2196,6 +2209,7 @@ fn the_head_and_body_share_the_grant_exactly() {
         fixed_response(listener, response.to_vec());
         let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/exact")]);
         let mut call = Call::new("get", vec![Arg::Value(Value::path("/exact"))]);
+        call.read_only = true;
         call.tool_allows_process = true;
         call.budget.max_bytes = grant as u64;
         match tool.invoke(0, &call) {
@@ -2268,6 +2282,7 @@ fn a_declared_length_past_the_grant_is_a_budget_refusal() {
     );
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/huge")]);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/huge"))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     call.budget.max_bytes = 256;
     let error = tool
@@ -2434,6 +2449,7 @@ fn a_configured_tiny_body_ceiling_is_a_provider_refusal() {
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/tiny")]);
     tool.max_body = 8;
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/tiny"))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     call.budget.max_bytes = 4096;
     let error = tool.invoke(0, &call).expect_err("no answer fits");
@@ -2563,6 +2579,7 @@ fn a_line_past_the_static_ceiling_poisons_even_under_a_small_grant() {
     })
     .expect("handshake");
     let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     // Enough for the request line, far less than the 2 MiB answer.
     call.budget.max_bytes = 4096;
@@ -2729,6 +2746,7 @@ fn an_mcp_answer_is_bounded_by_what_the_request_left() {
     })
     .expect("handshake");
     let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     // A generous grant measures the request line on the shipped path.
     call.budget.max_bytes = 1 << 20;
@@ -2845,6 +2863,7 @@ fn an_mcp_grant_above_the_line_ceiling_still_bounds_the_sum() {
     );
     let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
     let mut call = Call::new("echo", vec![Arg::text("x".repeat(800 * 1024))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     // The request is under the static ceiling; together with the 1 MiB answer
     // it is over the grant.
@@ -2852,13 +2871,14 @@ fn an_mcp_grant_above_the_line_ceiling_still_bounds_the_sum() {
     let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
         .expect_err("request plus answer exceeds the grant");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
-    // The answer was consumed, so the session is still in step: a small
-    // request leaves room for the same answer.
+    // The refused frame may have been a notification with the answer still
+    // queued, so the session is poisoned rather than reused (round 42, H-1).
     let mut small = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
     small.tool_allows_process = true;
     small.budget.max_bytes = (MAX_MCP_LINE_BYTES as u64 * 3) / 2;
-    active_rpc::kernel::Provider::invoke(&mut session, 0, &small)
-        .expect("a budget refusal does not poison the session");
+    let poisoned = active_rpc::kernel::Provider::invoke(&mut session, 0, &small)
+        .expect_err("the session is poisoned");
+    assert_eq!(poisoned.provider_code(), Some("mcp/desync"), "{poisoned}");
 }
 
 /// A process refusal is a budget one when the share left by the argument line
@@ -2917,6 +2937,7 @@ fn an_http_share_under_the_static_ceiling_is_a_budget_refusal() {
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", &path)]);
     tool.max_body = 1_000;
     let mut call = Call::new("get", vec![Arg::Value(Value::path(&path))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     // The long path charges more than 200 bytes of the head, so the share is
     // under the 1 000-byte adapter ceiling while the grant is over it.
@@ -3074,6 +3095,7 @@ fn an_mcp_notification_spends_the_grant() {
     })
     .expect("handshake");
     let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     call.budget.max_bytes = 2_048;
     // Four 1 KiB notifications do not fit the grant, so each is refused before
@@ -3083,11 +3105,14 @@ fn an_mcp_notification_spends_the_grant() {
     // Each call's request line leaves room for one 1 KiB notification and not
     // the next, so the two calls drain the four frames and each ends in the
     // budget refusal.
-    for _ in 0..2 {
-        let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
-            .expect_err("the notifications are over the grant");
-        assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
-    }
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the notifications are over the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    // The refused frame may have been a notification, so the session is
+    // poisoned rather than reused (round 42, H-1).
+    let poisoned = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the session is poisoned");
+    assert_eq!(poisoned.provider_code(), Some("mcp/desync"), "{poisoned}");
 }
 
 /// A notification past the grant fails the same way the answer does, and the
@@ -3146,6 +3171,7 @@ fn an_mcp_answer_beyond_the_notifications_is_a_budget_refusal() {
     })
     .expect("handshake");
     let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.read_only = true;
     call.tool_allows_process = true;
     // The request and the 200-byte notification fit; the 900-byte answer does
     // not fit what they left.

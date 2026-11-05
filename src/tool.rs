@@ -674,6 +674,30 @@ fn remaining_until(deadline: std::time::Instant) -> Result<std::time::Duration> 
         .ok_or(Error::Timeout)
 }
 
+/// A refusal decided after the request reached the peer.
+///
+/// The peer may have run the tool, so the class must say the reply was withheld
+/// rather than that nothing happened: the kernel then seals an admitted receipt
+/// and an idempotent retry returns this outcome instead of executing a second
+/// time (round 42, M-1). A read-only call has no effect that could stand, and a
+/// frame that never left keeps its own class.
+fn withhold_after_send(error: Error, read_only: bool) -> Error {
+    if read_only {
+        return error;
+    }
+    if let Error::Provider { code } = &error {
+        if code == "mcp/not-sent" || code == "mcp/queue" {
+            return error;
+        }
+        if code == "provider/reply-withheld" {
+            return error;
+        }
+    }
+    Error::Provider {
+        code: "provider/reply-withheld".to_string(),
+    }
+}
+
 /// A response reader whose every read is bounded by one wall deadline.
 ///
 /// `set_read_timeout` bounds a single `read` syscall, not the call: a server
@@ -1169,6 +1193,10 @@ pub struct McpSession<T: McpTransport> {
     /// Tool invocations issued through this session (the handshake is not
     /// counted).
     pub calls: u64,
+    /// Whether the last refusal happened after the request left: the peer may
+    /// have run the tool, so the caller must see a withheld reply rather than a
+    /// call that did not happen (round 42, M-1).
+    after_send: bool,
 }
 
 impl<T: McpTransport> McpSession<T> {
@@ -1201,6 +1229,7 @@ impl<T: McpTransport> McpSession<T> {
             next_id: 0,
             poisoned: false,
             calls: 0,
+            after_send: false,
         };
         let initialize = session.request_within(
             "initialize",
@@ -1321,6 +1350,9 @@ impl<T: McpTransport> McpSession<T> {
                 });
             }
         }
+        // Nothing has left yet: a refusal until the send succeeds keeps its
+        // own class (round 42, M-1).
+        self.after_send = false;
         // JSON-RPC ids wrap rather than panic in a long-lived session; id 0 is
         // skipped because it is the conventional "no id" notification value.
         self.next_id = self.next_id.wrapping_add(1);
@@ -1398,6 +1430,8 @@ impl<T: McpTransport> McpSession<T> {
             }
             return Err(error);
         }
+        // The frame left: from here a refusal is a withheld reply.
+        self.after_send = true;
         let mut skipped = 0usize;
         // What the call has buffered so far: the request line plus every
         // notification frame read before the answer. A skipped frame is bytes
@@ -1438,6 +1472,15 @@ impl<T: McpTransport> McpSession<T> {
             if let Some(grant) = grant {
                 let cap = grant.saturating_sub(spent).min(MAX_MCP_LINE_BYTES);
                 if line.len() > cap {
+                    // Poison whatever the line is: before the parse the client
+                    // cannot tell an over-budget notification (the answer is
+                    // still queued) from the answer itself, and continuing
+                    // would let the next call's request reach the peer before
+                    // the stale answer is read (round 42, H-1). This is the
+                    // same fail-closed side as `mcp/line-too-long`. The class
+                    // is the budget on a read-only call and a withheld reply on
+                    // a writable one, decided in `invoke` (round 42, M-1).
+                    self.poisoned = true;
                     return Err(Error::BudgetExceeded("byte"));
                 }
             }
@@ -1711,12 +1754,33 @@ impl<T: McpTransport> Provider for McpSession<T> {
         // Count admitted calls only: a zero-grant or policy refusal is not a
         // served call (round 31, F7).
         self.calls += 1;
-        let response = self.request_within(
+        if self.poisoned {
+            // Nothing leaves a poisoned session, so this refusal is not a
+            // withheld reply (the post-send mapping below assumes the request
+            // left).
+            return Err(Error::Provider {
+                code: "mcp/desync".to_string(),
+            });
+        }
+        let response = match self.request_within(
             "tools/call",
             json!({ "name": tool.name, "arguments": Json::Object(arguments) }),
             Some(deadline),
             Some(max_line),
-        )?;
+        ) {
+            Ok(response) => response,
+            // The request left, so the peer may have run the tool: the class
+            // says the reply was withheld; a send failure keeps its own code
+            // (round 42, M-1).
+            Err(error) => {
+                let after_send = self.after_send;
+                return Err(if after_send {
+                    withhold_after_send(error, call.read_only)
+                } else {
+                    error
+                });
+            }
+        };
         if let Some(error) = response.get("error") {
             let Some(code) = error.get("code").and_then(Json::as_i64) else {
                 // A missing or non-integer code is a malformed answer, not
@@ -2389,7 +2453,7 @@ impl Provider for HttpTool {
                         let grant_cap =
                             usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
                         let static_cap = self.max_request.min(MAX_REQUEST_BYTES);
-                        let static_bound = static_cap <= grant_cap;
+                        let static_bound = static_cap < grant_cap;
                         let mut writer = CappedWriter::new(grant_cap.min(static_cap));
                         if serde_json::to_writer(&mut writer, &value_to_json(&value)).is_err() {
                             return Err(if !writer.exceeded {
@@ -2425,21 +2489,30 @@ impl Provider for HttpTool {
         let static_ceiling = self.max_body.min(MAX_RESPONSE_BYTES);
         // Count admitted calls only (round 31, F7).
         self.calls += 1;
-        let (status, response) = self.perform(
+        let (status, response) = match self.perform(
             &method,
             &path,
             body.as_deref(),
             call.budget.max_wall_ms,
             static_ceiling,
             grant,
-        )?;
+        ) {
+            Ok(pair) => pair,
+            // The request left: a body or deadline refusal after that point is
+            // a withheld reply, not a call that did not happen (round 42, M-1).
+            Err(error) => return Err(withhold_after_send(error, call.read_only)),
+        };
         if !(200..300).contains(&status) {
             // A 3xx is not a completed call: the adapter does not follow
             // redirects, so a caller that saw `Ok` would believe a mutating
-            // request ran (round 12, F-7).
-            return Err(Error::Provider {
-                code: format!("http/{status}"),
-            });
+            // request ran (round 12, F-7). A writable call may have run anyway,
+            // so it reports the withheld reply (round 42, M-1).
+            return Err(withhold_after_send(
+                Error::Provider {
+                    code: format!("http/{status}"),
+                },
+                call.read_only,
+            ));
         }
         // A binary answer is not text: transcoding it inserts replacement
         // characters the peer never wrote (round 12, F-6).
@@ -2664,7 +2737,8 @@ fn has_nul(path: &std::path::Path) -> bool {
 /// a derived formatter would print every value into a log line or a panic
 /// message (round 41, F6).
 pub struct LocalProcess {
-    /// Absolute program path as given to [`LocalProcess::new`].    ///
+    /// Absolute program path as given to [`LocalProcess::new`].
+    ///
     /// Private: `invoke` runs the canonical path pinned at construction, so a
     /// later assignment would silently keep running the old binary
     /// (round 30, #6). The advertised form is [`LocalProcess::program`].

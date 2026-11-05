@@ -29,16 +29,21 @@ fn an_mcp_answer_past_the_grant_is_refused_before_the_parse() {
     responses.insert("tools/call".to_string(), "x".repeat(4_096));
     let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
     let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    // A read-only call keeps the budget code; a writable one reports a withheld
+    // reply (round 42, M-1), and the session is poisoned either way (H-1).
+    call.read_only = true;
     call.budget = Budget {
         max_bytes: 2_048,
         ..Budget::default()
     };
-    for _ in 0..2 {
-        let error = session
-            .invoke(0, &call)
-            .expect_err("the answer is past the grant");
-        assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
-    }
+    let error = session
+        .invoke(0, &call)
+        .expect_err("the answer is past the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    let again = session
+        .invoke(0, &call)
+        .expect_err("the refused frame may have been a notification");
+    assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
 }
 
 /// A bad method on an MCP call is reported before the tool index, as it is on

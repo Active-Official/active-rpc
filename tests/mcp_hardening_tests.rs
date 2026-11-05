@@ -185,7 +185,9 @@ fn a_tool_response_without_a_result_is_rejected() {
         r#"{"jsonrpc":"2.0","id":3}"#,
     ]))
     .expect("handshake");
-    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    let mut call = Call::new("read", Vec::new());
+    call.read_only = true;
+    let result = session.invoke(0, &call);
     assert_eq!(code(result), "mcp/bad-response");
 }
 
@@ -317,7 +319,9 @@ fn a_tool_call_response_for_another_request_is_refused() {
     .expect("handshake");
     // The session sends id 3 for the tool call; a server answering 99 is not
     // answering this call.
-    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    let mut call = Call::new("read", Vec::new());
+    call.read_only = true;
+    let result = session.invoke(0, &call);
     assert_eq!(code(result), "mcp/id-mismatch");
 }
 
@@ -406,9 +410,11 @@ fn a_notification_stream_poisons_the_session() {
     let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
     let mut session = McpSession::handshake(Scripted::new(&borrowed)).expect("handshake");
 
-    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    let mut call = Call::new("read", Vec::new());
+    call.read_only = true;
+    let result = session.invoke(0, &call);
     assert_eq!(code(result), "mcp/desync");
-    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    let result = session.invoke(0, &call);
     assert_eq!(code(result), "mcp/desync", "the session must stay poisoned");
 }
 
@@ -442,9 +448,11 @@ fn a_server_request_poisons_the_session() {
     let request = r#"{"jsonrpc":"2.0","id":5,"method":"sampling/createMessage","params":{}}"#;
     let mut session =
         McpSession::handshake(Scripted::new(&[initialize, &list, request])).expect("handshake");
-    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    let mut call = Call::new("read", Vec::new());
+    call.read_only = true;
+    let result = session.invoke(0, &call);
     assert_eq!(code(result), "mcp/id-mismatch");
-    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    let result = session.invoke(0, &call);
     assert_eq!(code(result), "mcp/desync", "the session must stay poisoned");
 }
 
@@ -457,9 +465,13 @@ fn a_framing_fault_poisons_the_session() {
     let garbage = "not a json line";
     let mut session =
         McpSession::handshake(Scripted::new(&[initialize, &list, garbage])).expect("handshake");
-    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    // A read-only call has no effect to withhold, so the answer's own code
+    // survives (a writable one reports provider/reply-withheld).
+    let mut call = Call::new("read", Vec::new());
+    call.read_only = true;
+    let result = session.invoke(0, &call);
     assert_eq!(code(result), "mcp/bad-response");
-    let result = session.invoke(0, &Call::new("read", Vec::new()));
+    let result = session.invoke(0, &call);
     assert_eq!(code(result), "mcp/desync");
 }
 
@@ -545,6 +557,7 @@ fn a_server_request_with_our_id_is_not_an_answer() {
     .expect("handshake");
     let mut call = Call::new("read", vec![Arg::text("x")]);
     call.tool_allows_process = true;
+    call.read_only = true;
     let error = Provider::invoke(&mut session, 0, &call).expect_err("a request is not an answer");
     assert_eq!(error.provider_code(), Some("mcp/id-mismatch"), "{error}");
 }
@@ -670,8 +683,46 @@ fn a_line_past_the_static_ceiling_is_illegal_whatever_the_grant() {
     call.budget.max_bytes = 200;
     let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
         .expect_err("past the static ceiling");
-    assert_eq!(error.provider_code(), Some("mcp/line-too-long"), "{error}");
+    // The request left, so a writable call reports a withheld reply; the
+    // session is poisoned either way (round 42, H-1/M-1).
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
     let again = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
         .expect_err("the session is poisoned");
+    assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
+}
+
+/// A writable MCP call whose answer cannot be accepted reports a withheld reply:
+/// the peer may have run the tool, so the class must not invite a retry, and the
+/// session is dead because the refused frame may have been a notification with
+/// the answer still queued (round 42, H-1 and M-1).
+#[test]
+fn a_writable_call_with_a_refused_answer_withholds_the_reply() {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#.to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"write","description":"x"}]}}"#
+            .to_string(),
+    );
+    responses.insert("tools/call".to_string(), "x".repeat(4_096));
+    let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
+    let mut call = Call::new("write", vec![Arg::Value(Value::Int(1))]);
+    call.budget.max_bytes = 2_048;
+    let error = Provider::invoke(&mut session, 0, &call).expect_err("the answer is past the grant");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
+    let again = Provider::invoke(&mut session, 0, &call).expect_err("the session is poisoned");
     assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
 }
