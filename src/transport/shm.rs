@@ -271,17 +271,17 @@ fn frame_bounds(state: &SegmentState) -> Result<Option<(usize, usize)>> {
     }
     let start = state.tail as usize % state.capacity;
     if start + 4 > state.capacity {
-        return Err(Error::Transport(
-            "frame header straddles the ring end".to_string(),
-        ));
+        return Err(Error::Wire("frame header straddles the ring end"));
     }
     let len =
         u32::from_le_bytes(state.data[start..start + 4].try_into().expect("4 bytes")) as usize;
     if start + 4 + len > state.capacity {
-        return Err(Error::Transport("frame straddles the ring end".to_string()));
+        return Err(Error::Wire("frame straddles the ring end"));
     }
     if state.tail + len as u64 + 4 > state.head {
-        return Err(Error::Transport("truncated frame".to_string()));
+        // A short frame is a framing fault on every transport (round 11,
+        // R-09 #3).
+        return Err(Error::Wire("truncated frame"));
     }
     Ok(Some((start + 4, len)))
 }

@@ -537,6 +537,10 @@ fn valid_tool_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        // A name made only of dots is a path segment (`.` or `..`) wearing a
+        // tool name: a renderer that joins names into a path would step
+        // through it (round 38, #6).
+        && !name.bytes().all(|byte| byte == b'.')
 }
 
 /// The longest tool description a session keeps, in bytes.
@@ -1403,7 +1407,26 @@ impl<T: McpTransport> McpSession<T> {
                     code: "mcp/line-too-long".to_string(),
                 });
             }
+            // The node ceiling is enforced on the text before the tree exists:
+            // a one-megabyte array of zeros decodes to half a million values,
+            // and the HTTP adapter has refused that shape since round 13 while
+            // this one built it (round 38, #4). The line is the peer's, so the
+            // session is poisoned like any other illegal answer.
+            if json_text_too_complex(&line, MAX_JSON_NODES) {
+                self.poisoned = true;
+                return Err(Error::Provider {
+                    code: "mcp/too-complex".to_string(),
+                });
+            }
             let response: Json = match serde_json::from_str(&line) {
+                // A shape whose token count understates its node count (a chain
+                // of single-element arrays) is caught on the tree.
+                Ok(response) if json_too_many_nodes(&response) => {
+                    self.poisoned = true;
+                    return Err(Error::Provider {
+                        code: "mcp/too-complex".to_string(),
+                    });
+                }
                 // A number the decoder rounded or an overflowing float is not
                 // the answer the server wrote (round 15, F-1).
                 Ok(response)
@@ -2705,11 +2728,9 @@ impl Provider for LocalProcess {
                 "the process adapter does not accept an envelope payload",
             ));
         }
-        if call.method != "run" {
-            return Err(Error::MethodNotGranted {
-                method: call.method.clone(),
-            });
-        }
+        // The uniform prefix: budget, payload, secret, scope, method. Every
+        // adapter uses it so the same malformed call reports the same code
+        // whichever handle it reached (round 38, #5).
         if args_contain_secret(&call.args) {
             // Before the shape loop: `Value::Secret` used to be reported as a
             // malformed argument there, so this policy branch never ran
@@ -2718,12 +2739,6 @@ impl Provider for LocalProcess {
                 "a secret argument cannot be passed to a process",
             ));
         }
-        // The authority checks come before the argument allowlist: a direct
-        // caller without the process grant must not learn allowlist membership
-        // from which refusal it receives (round 27, #3).
-        if !call.tool_allows_process {
-            return Err(Error::ToolPolicy("process execution not granted"));
-        }
         if call.path_scope.is_some() {
             // Every process argument is text and the kernel only inspects
             // `Value::Path`: a scope attached here would read as confinement
@@ -2731,6 +2746,17 @@ impl Provider for LocalProcess {
             return Err(Error::ToolPolicy(
                 "this adapter cannot enforce a path scope",
             ));
+        }
+        if call.method != "run" {
+            return Err(Error::MethodNotGranted {
+                method: call.method.clone(),
+            });
+        }
+        // The authority checks come before the argument allowlist: a direct
+        // caller without the process grant must not learn allowlist membership
+        // from which refusal it receives (round 27, #3).
+        if !call.tool_allows_process {
+            return Err(Error::ToolPolicy("process execution not granted"));
         }
         // The grant bounds the argument line too: a direct caller could pass a
         // 10 MiB argv under a one-byte grant because only the output was

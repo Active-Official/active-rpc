@@ -714,7 +714,7 @@ fn remaining(deadline: std::time::Instant) -> Result<std::time::Duration> {
 /// own; a resolver that never answers would hold a `with_deadline` client past
 /// its deadline (round 23, #3). The lookup runs on a detached thread: a hung
 /// resolver leaks that thread, while the call returns its transport refusal.
-fn resolve_within(
+pub(crate) fn resolve_within(
     address: &str,
     deadline: std::time::Instant,
 ) -> Result<Vec<std::net::SocketAddr>> {

@@ -548,6 +548,13 @@ pub struct CapRecord {
     /// call through it: otherwise dropping the parent handle would free the
     /// subtree's budget and every child would spend the grant again.
     pub descendants: u32,
+    /// Ancestors this record was linked under by a restore.
+    ///
+    /// Kept apart from `lineage`: that one is the budget chain, and an export
+    /// already reserved the grant out of every ancestor's meter, so charging
+    /// them again would refuse a call the record is entitled to. This list is
+    /// the tree edge only, and `drop_record` unlinks it (round 45, F-3).
+    pub tree_ancestors: Vec<CapId>,
     /// Stable identity of this capability's durable record.
     ///
     /// Derived from the kernel secret at mint time, so it is unforgeable and
@@ -572,6 +579,7 @@ impl CapRecord {
             expires_at: None,
             wall_clock: false,
             descendants: 0,
+            tree_ancestors: Vec::new(),
             record_id: [0u8; 32],
         }
     }

@@ -1463,14 +1463,6 @@ impl Agent {
                 return Err(Error::BudgetExceeded("caps"));
             }
         }
-        // Claim the record *before* minting. `claim` is atomic where the store
-        // can make it so: a check-then-mark pair let two processes restore one
-        // record into two grants, and the second grant's budget was a second
-        // copy that no revocation reached. A claim left behind by a failed mint
-        // is fail-closed: the record is spent, not duplicated.
-        if let Some(store) = store {
-            store.claim(&record.record_id)?;
-        }
         // The export pin remembers where the credential stood. A record
         // restored on another kernel has no local pin, so its grant starts a
         // new tree there, which is correct: no ancestor of it is live here.
@@ -1488,6 +1480,21 @@ impl Agent {
                 lineage
             })
             .unwrap_or_default();
+        // Every deterministic refusal the mint would apply is settled before
+        // the claim, and the chain depth is one of them: a 64-generation chain
+        // yields a 65-link restore, which the mint refuses after the claim had
+        // already spent the credential (round 45, F-2).
+        if lineage.len() >= MAX_LINEAGE_DEPTH {
+            return Err(Error::Escalation("capability chain is too deep"));
+        }
+        // Claim the record *before* minting. `claim` is atomic where the store
+        // can make it so: a check-then-mark pair let two processes restore one
+        // record into two grants, and the second grant's budget was a second
+        // copy that no revocation reached. A claim left behind by a failed mint
+        // is fail-closed: the record is spent, not duplicated.
+        if let Some(store) = store {
+            store.claim(&record.record_id)?;
+        }
         let restored = self.mint_restored(peer, provider, record.object, attrs, &lineage)?;
         self.cell
             .borrow_mut()
@@ -1661,6 +1668,7 @@ impl Agent {
         if let Some(parent) = lineage.last() {
             record.parent = Some(*parent);
         }
+        record.tree_ancestors = lineage.to_vec();
         // The restored grant stands where the exported capability stood: it is
         // linked under every ancestor still live, so `revoke` and
         // `reintroduce_to`, which walk the child index, reach it (round 44,
@@ -1674,6 +1682,12 @@ impl Agent {
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.insert_cap_record(record);
         for ancestor in lineage {
+            // The same edge `attenuate` builds: the child index entry and the
+            // ancestor's descendant count, which is what keeps the ancestor's
+            // record and meter alive while a descendant can call through it.
+            if let Some(parent_record) = kernel.caps.get_mut(ancestor) {
+                parent_record.descendants = parent_record.descendants.saturating_add(1);
+            }
             if kernel.caps.contains_key(ancestor) {
                 kernel.children.entry(*ancestor).or_default().insert(id);
             }
@@ -5369,7 +5383,11 @@ impl Kernel {
                 kernel.object_records.is_empty(),
                 "the per-object record count disagrees with the registry"
             );
-            for ancestor in &record.lineage {
+            // Both lists are children the record was linked under: the budget
+            // lineage of a minted/attenuated capability, and the restore's
+            // tree edges (which are not budget links). A restored capability
+            // has an empty lineage, so the lists never overlap.
+            for ancestor in record.lineage.iter().chain(record.tree_ancestors.iter()) {
                 if let Some(parent) = kernel.caps.get_mut(ancestor) {
                     parent.descendants = parent.descendants.saturating_sub(1);
                     if parent.refs == 0 && parent.descendants == 0 {
@@ -6011,6 +6029,13 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
     // those capabilities' own descendants come with them: the expansion used to
     // be a single pass after the walk, so a child attenuated from a restored
     // copy survived (round 44, F-2).
+    // One index over the registry, built once: scanning every capability for
+    // every newly reached record id made a revoke quadratic (16 000 caps took
+    // 23 s inside one borrow, round 45, F-1).
+    let mut by_record: BTreeMap<[u8; 32], Vec<CapId>> = BTreeMap::new();
+    for (id, record) in &kernel.caps {
+        by_record.entry(record.record_id).or_default().push(*id);
+    }
     let mut record_ids: BTreeSet<[u8; 32]> = BTreeSet::new();
     while let Some(id) = stack.pop() {
         if !doomed.insert(id) {
@@ -6018,12 +6043,8 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         }
         if let Some(record) = kernel.caps.get(&id) {
             if record_ids.insert(record.record_id) {
-                // One scan per newly reached record id; the set is bounded by
-                // the capabilities that share it.
-                for (other, live) in &kernel.caps {
-                    if live.record_id == record.record_id {
-                        stack.push(*other);
-                    }
+                if let Some(sharing) = by_record.get(&record.record_id) {
+                    stack.extend(sharing.iter().copied());
                 }
             }
         }

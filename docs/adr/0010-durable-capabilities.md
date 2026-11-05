@@ -130,6 +130,13 @@ A tombstone is a kill switch, not only a restore filter: `tombstone_record`
 revokes every live capability carrying that record id (and its subtree), so a
 restore that ran before the kill list was replayed cannot outlive the replay.
 
+A revocation cannot refuse, so it does not consult the tombstone ceiling: it
+adds one tombstone per durable capability it kills. The invariant that keeps the
+set bounded lives on the other side — a durable mint, and a restore (which is a
+mint), is refused when `revoked + live durable` would pass `MAX_TOMBSTONES`, and
+a revoked capability leaves the live term as its tombstone enters the set, so a
+revoke moves one entry from one side to the other.
+
 ### Startup order
 
 The kill list is replayed with `tombstone_record`. A deployment that also

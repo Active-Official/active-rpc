@@ -577,3 +577,38 @@ fn an_answer_past_the_byte_grant_is_refused() {
     let error = Provider::invoke(&mut session, 0, &call).expect_err("past the grant");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
+
+/// A tool name made only of dots is a path segment with a tool name on: the
+/// handshake refuses it (round 38, #6).
+#[test]
+fn a_dot_only_tool_name_is_refused() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+
+    struct Scripted {
+        replies: std::cell::RefCell<Vec<String>>,
+    }
+    impl McpTransport for Scripted {
+        fn send_line(&mut self, _line: &str) -> active_rpc::error::Result<()> {
+            Ok(())
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            let reply = self.replies.borrow_mut().remove(0);
+            Ok(reply)
+        }
+    }
+
+    let session = McpSession::handshake(Scripted {
+        replies: std::cell::RefCell::new(vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"stub"}}}"#
+                .to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"..","description":"x"}]}}"#
+                .to_string(),
+        ]),
+    });
+    let error = match session {
+        Ok(_) => panic!("a dot-only tool name is not a tool"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    let _ = MemoryTransport::new(std::collections::BTreeMap::new());
+}

@@ -34,16 +34,23 @@ use crate::{Error, Result};
 pub trait RecordStore {
     /// True when this record id was restored by any kernel sharing the store.
     ///
-    /// A read error must answer `true`: the caller treats `false` as "not yet
-    /// restored" and would mint a second grant.
-    fn is_restored(&self, record_id: &[u8; 32]) -> bool;
+    /// Advisory: the kernel calls [`RecordStore::claim`] only, and the default
+    /// answers `false`. An embedder that keeps its own durable view implements
+    /// this for its own checks (and must answer `true` on a read error: it
+    /// would otherwise treat a restored record as fresh).
+    fn is_restored(&self, _record_id: &[u8; 32]) -> bool {
+        false
+    }
 
     /// Remember a restore, or refuse when the store cannot.
     ///
-    /// A store whose backend accepts duplicates (an upsert) must detect the
-    /// conflict and return an error: two restores of one record are two copies
-    /// of its budget, and a revocation reaches only the one it knows.
-    fn mark_restored(&mut self, record_id: &[u8; 32]) -> Result<()>;
+    /// Advisory for the same reason. A store whose backend accepts duplicates
+    /// (an upsert) must detect the conflict in [`RecordStore::claim`] and
+    /// return an error there: two restores of one record are two copies of its
+    /// budget, and a revocation reaches only the one it knows.
+    fn mark_restored(&mut self, _record_id: &[u8; 32]) -> Result<()> {
+        Ok(())
+    }
 
     /// Atomically take ownership of a record id.
     ///

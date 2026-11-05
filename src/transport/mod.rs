@@ -265,26 +265,30 @@ impl TcpTransport {
     /// deadline, and a server that serves one connection at a time needs one on
     /// the accepted socket or its `--limit` is unreachable.
     pub fn connect_with_timeout(address: &str, timeout: std::time::Duration) -> Result<Self> {
-        use std::net::ToSocketAddrs;
         let deadline = std::time::Instant::now() + timeout;
-        let addresses: Vec<std::net::SocketAddr> = address
-            .to_socket_addrs()
-            .map_err(|error| Error::Transport(format!("resolve: {error}")))?
-            .collect();
+        // Name resolution is bounded too, by the same helper the bridge uses:
+        // a slow resolver used to park the caller past its own deadline and to
+        // report every failure as "timed out" (round 11, R-09 #4).
+        let addresses = crate::transport::connect::resolve_within(address, deadline)?;
+        let mut last: Option<std::io::Error> = None;
         // `TcpStream::connect` has no bound: a black-holed SYN parked a caller
         // that asked for a deadline forever. Each attempt gets what is left
-        // (round 10, R-09 #1). Resolution itself is the operator's endpoint and
-        // stays outside the bound, as it does for the bridge.
+        // (round 10, R-09 #1), and the armed timeout is that remainder too, so
+        // several addresses cannot spend the budget twice (round 11, R-09 #5).
         for address in addresses {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 break;
             }
-            if let Ok(stream) = TcpStream::connect_timeout(&address, left) {
-                return Self::with_timeout(stream, timeout);
+            match TcpStream::connect_timeout(&address, left) {
+                Ok(stream) => return Self::with_timeout(stream, left.min(timeout)),
+                Err(error) => last = Some(error),
             }
         }
-        Err(Error::Transport("connect timed out".to_string()))
+        Err(Error::Transport(match last {
+            Some(error) => format!("connect: {error}"),
+            None => "connect timed out".to_string(),
+        }))
     }
 
     /// Wrap an accepted or connected stream with a read and write deadline.
@@ -293,11 +297,17 @@ impl TcpTransport {
     /// *frame* by it, because a peer that sends a byte just inside the read
     /// timeout would otherwise keep a frame alive forever.
     pub fn with_timeout(stream: TcpStream, timeout: std::time::Duration) -> Result<Self> {
-        stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|()| stream.set_write_timeout(Some(timeout)))
-            .map_err(|error| Error::Transport(error.to_string()))?;
+        // `new` installs the default bound and swallows the socket call, so the
+        // caller's timeout is applied afterwards and a failure is reported:
+        // setting it first and letting `new` overwrite it made the tight bound
+        // a no-op (round 11, R-09 #2).
         let mut transport = Self::new(stream)?;
+        transport
+            .stream
+            .get_ref()
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| transport.stream.get_ref().set_write_timeout(Some(timeout)))
+            .map_err(|error| Error::Transport(error.to_string()))?;
         transport.frame_deadline = Some(timeout);
         Ok(transport)
     }
@@ -357,16 +367,33 @@ impl Transport for TcpTransport {
                 .max(std::time::Duration::from_millis(1));
             let _ = self.stream.get_ref().set_read_timeout(Some(remaining));
         }
-        let body = match read_frame_before(&mut self.stream, &self.limits, deadline) {
+        // Count what the read consumed: any error after a byte has been taken
+        // leaves the inbound stream off a frame boundary, whether it was a
+        // ceiling refusal, a timeout mid-header or a stall mid-body. Only a
+        // clean end-of-stream before the first byte keeps the session usable
+        // (round 11, R-09 #1).
+        struct Counted<'a> {
+            inner: &'a mut BufReader<TcpStream>,
+            read: usize,
+        }
+        impl std::io::Read for Counted<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.inner.read(buf)?;
+                self.read += read;
+                Ok(read)
+            }
+        }
+        let mut counted = Counted {
+            inner: &mut self.stream,
+            read: 0,
+        };
+        let result = read_frame_before(&mut counted, &self.limits, deadline);
+        let consumed = counted.read;
+        let body = match result {
             Ok(Some(body)) => body,
             Ok(None) => return Ok(None),
             Err(error) => {
-                // A frame past the ceiling leaves its body unread, so the
-                // stream now holds body bytes where the next header belongs.
-                // A transport that kept reading would parse attacker data as a
-                // frame prefix (smuggling); the connection is poisoned instead
-                // (round 9, R-09 #6).
-                if matches!(error, Error::Wire(_)) {
+                if consumed > 0 || matches!(error, Error::Wire(_)) {
                     self.recv_poisoned = true;
                 }
                 return Err(error);

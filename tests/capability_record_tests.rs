@@ -1281,3 +1281,143 @@ fn a_record_text_has_a_fixed_key_order() {
         text
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 45
+// ---------------------------------------------------------------------------
+
+/// The restored copy is a real tree edge: dropping it unlinks from its
+/// ancestors, so a later revoke does not report a capability that is already
+/// gone (round 45, F-3).
+#[test]
+fn dropping_a_restored_copy_does_not_leave_a_stale_child() {
+    use active_rpc::kernel::Event;
+
+    let (agent, _provider, parent) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let child = agent.attenuate(&parent, attrs).expect("attenuate");
+    let record = agent.export_capability(&child).expect("export");
+    drop(child);
+    agent.run();
+    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored_id = restored.id();
+    drop(restored);
+    agent.run();
+    assert!(
+        agent
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::CapDropped(id) if *id == restored_id)),
+        "the copy was dropped"
+    );
+
+    let before = agent
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::CapRevoked(id) if *id == restored_id))
+        .count();
+    agent.revoke(&parent).expect("revoke the tree");
+    let after = agent
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::CapRevoked(id) if *id == restored_id))
+        .count();
+    assert_eq!(before, after, "a dropped capability is not revoked again");
+}
+
+/// A live restored copy keeps its ancestor's record (and meter) alive
+/// (round 45, F-3).
+#[test]
+fn a_live_restored_copy_keeps_its_ancestor_alive() {
+    use active_rpc::kernel::Event;
+
+    let (agent, _provider, parent) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let child = agent.attenuate(&parent, attrs).expect("attenuate");
+    let record = agent.export_capability(&child).expect("export");
+    drop(child);
+    agent.run();
+    let restored = agent.restore_capability(&record, &owner).expect("restore");
+
+    let parent_id = parent.id();
+    drop(parent);
+    agent.run();
+    assert!(
+        !agent
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::CapDropped(id) if *id == parent_id)),
+        "the ancestor stays while its restored copy can call"
+    );
+    // And the copy still works while the ancestor's handle is gone.
+    let lane = agent
+        .create_lane("restored-tree", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(Some(owner.identity()), lane, &restored, "echo", Vec::new())
+        .expect("queued");
+    agent.run();
+    promise.value().expect("the restored copy answers");
+    drop(restored);
+}
+
+/// The chain-depth refusal is settled before the store claim, so a credential
+/// is not spent by a deterministic refusal (round 45, F-2).
+#[test]
+fn a_chain_too_deep_to_restore_does_not_spend_the_record() {
+    use active_rpc::kernel::MAX_LINEAGE_DEPTH;
+    use active_rpc::persistence::MemoryRecordStore;
+
+    let (agent, _provider, first) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let mut deep = first;
+    for _ in 1..MAX_LINEAGE_DEPTH {
+        deep = agent
+            .attenuate(&deep, attrs.clone())
+            .expect("one more link");
+    }
+    let record = agent
+        .export_capability(&deep)
+        .expect("export the deepest link");
+    drop(deep);
+    agent.run();
+
+    let mut store = MemoryRecordStore::new();
+    let error = agent
+        .restore_capability_with(&record, &owner, Some(&mut store))
+        .expect_err("the restore chain is one link too deep");
+    assert_eq!(error.code(), "rpc/attenuation-escalation", "{error}");
+    assert!(
+        store.is_empty(),
+        "a deterministic refusal must not spend the credential"
+    );
+}
+
+/// Revoking a wide tree is linear: the record-id expansion is one registry
+/// index, not a scan per reached capability (round 45, F-1).
+#[test]
+fn a_wide_revocation_is_linear() {
+    let (agent, _provider, root) = durable_agent();
+    let mut children = Vec::with_capacity(16_000);
+    for _ in 0..16_000 {
+        children.push(
+            agent
+                .attenuate(&root, CapAttrs::new(&["echo"]))
+                .expect("one child"),
+        );
+    }
+    let started = std::time::Instant::now();
+    agent.revoke(&root).expect("revoke the tree");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "revoking 16 000 capabilities took {elapsed:?}"
+    );
+    drop(children);
+}

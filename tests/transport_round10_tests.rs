@@ -108,3 +108,55 @@ fn a_raw_quic_exchange_obeys_the_client_ceiling() {
         .expect("a legal call");
     assert_eq!(response.request_id, 1);
 }
+
+/// A peer that sends part of a header and then stalls leaves the stream off a
+/// frame boundary: the next read must not parse its body as a header
+/// (round 11, R-09 #1).
+#[test]
+fn a_partial_header_that_stalls_poisons_the_receive() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let client = std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).expect("connect");
+        stream.write_all(&[1, 2]).expect("two header bytes");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    });
+    let (stream, _) = listener.accept().expect("accept");
+    let mut server = TcpTransport::with_timeout(stream, std::time::Duration::from_millis(150))
+        .expect("transport");
+    let error = server.recv().expect_err("the header never completes");
+    assert_eq!(error.code(), "rpc/transport", "{error}");
+    let error = server
+        .recv()
+        .expect_err("the inbound stream is off a frame boundary");
+    assert!(
+        error.to_string().contains("poisoned"),
+        "the second read must not decode the stall: {error}"
+    );
+    client.join().ok();
+}
+
+/// A timeout set at construction is the bound that applies: `new` used to
+/// overwrite it with the default (round 11, R-09 #2).
+#[test]
+fn a_chosen_timeout_is_not_overwritten_by_the_default() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let client = std::thread::spawn(move || {
+        let stream = TcpStream::connect(address).expect("connect");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        drop(stream);
+    });
+    let (stream, _) = listener.accept().expect("accept");
+    let mut server = TcpTransport::with_timeout(stream, std::time::Duration::from_millis(100))
+        .expect("transport");
+    let started = std::time::Instant::now();
+    let error = server.recv().expect_err("a silent peer");
+    assert_eq!(error.code(), "rpc/transport", "{error}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the chosen bound was ignored: {:?}",
+        started.elapsed()
+    );
+    client.join().ok();
+}

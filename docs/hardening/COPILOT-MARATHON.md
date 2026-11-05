@@ -20,9 +20,9 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-44: round 44 found 1 high, 2 mediums and 4 lows, all fixed; rounds 45-46 must be clean | 270 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-37: round 37 found 3 lows (2 fixed, 1 rejected); rounds 38-39 must be clean | 260 fixed / 4 rejected / 0 open (4 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-10: round 10 found 3 highs, 3 mediums and 1 low, all fixed; rounds 11-12 must be clean | 90 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-45: round 45 found 3 mediums and 3 lows, all handled; round 46 must be clean | 276 fixed / 1 noted / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-38: round 38 found 1 high, 1 medium and 1 low, all fixed; round 39 must be clean | 263 fixed / 4 rejected / 0 open (4 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-11: round 11 found 1 high, 3 mediums and 1 low, all fixed; rounds 12-13 must be clean | 95 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -475,6 +475,24 @@ are closed.
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
 
+### R-07 domain operations - 2026-11-04 (round 45)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
+`b59b223`. Round-44 claims: five HOLD, two PARTIAL. Three mediums and three lows,
+all in the round-44 changes.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the record-id expansion indexed the registry once per reached capability, so a revoke became quadratic (16 000 caps took 23 s inside one borrow) | **fixed**: one `record id -> caps` index is built before the walk; `a_wide_revocation_is_linear` (16 000 caps under 3 s) |
+| 2 | medium | the restore chain-depth refusal ran after `store.claim`, so a deterministic refusal permanently spent the credential | **fixed**: the lineage is computed and the depth checked before the claim; `a_chain_too_deep_to_restore_does_not_spend_the_record` |
+| 3 | medium | the restored copy was inserted into the child index without a descendant count and was never unlinked on drop, so an ancestor could be dropped while a live copy existed and a later revoke reported a capability already gone | **fixed**: `CapRecord::tree_ancestors` (separate from the budget lineage), the count is incremented on link and decremented with the child entry on drop; `a_live_restored_copy_keeps_its_ancestor_alive`, `dropping_a_restored_copy_does_not_leave_a_stale_child` |
+| 4 | low | the kill-list replay is quadratic in entries × caps | **noted**: the replay is a startup path, and a batch API is an additive feature rather than a defect |
+| 5 | low | a revocation cannot refuse, so it does not consult the tombstone ceiling | **documented** in ADR-0010: the bound is on the mint/restore side, and a revoke moves one entry between the two terms |
+| 6 | low | `RecordStore::is_restored`/`mark_restored` are never called by the kernel but were required methods with a security contract in their docs | **fixed**: both have advisory default bodies and the docs say the kernel calls `claim` only |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Three new tests fail against the pre-fix tree.
+
 ### R-07 domain operations - 2026-11-04 (round 44)
 
 Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
@@ -530,6 +548,23 @@ mediums, two lows and one documentation fix.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
+
+### R-09 transports - 2026-11-04 (round 11)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `b59b223`. All seven round-10
+fixes HOLD. One **high**, three mediums and one low.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a timeout or transport error after part of a header or body did not poison the receive: the consumed bytes were discarded and the next read parsed attacker body bytes as a header | **fixed**: a counting reader reports how many bytes were consumed, and any error after a byte poisons `recv` (a clean end before the first byte stays usable); `a_partial_header_that_stalls_poisons_the_receive` |
+| 2 | medium | `with_timeout` armed the socket timeouts and then `new()` overwrote them with the default, swallowing the error | **fixed**: `new` runs first and the caller's timeout is applied afterwards with errors propagated; `a_chosen_timeout_is_not_overwritten_by_the_default` |
+| 3 | medium | a truncated shared-memory frame was `rpc/transport` while TCP and QUIC report `rpc/wire` | **fixed**: the straddle and truncation faults are wire faults |
+| 4 | medium | `connect_with_timeout` used a blocking, unbounded resolver and collapsed every failure into "timed out" | **fixed**: it uses the bridge's bounded `resolve_within` and reports the last connect error |
+| 5 | low | `connect_with_timeout` re-armed the full timeout for the second address, and `connect` had no bound at all | **fixed**: the socket and frame timeout are the remaining budget |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Two new tests fail against the pre-fix tree; the timeout test
+cannot be run against the pre-fix bound (30 s) and is a guard.
 
 ### R-09 transports - 2026-11-04 (round 10)
 
@@ -593,6 +628,20 @@ concurrent overshoot to observe.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 38)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `b59b223`. Round-37 claims
+HOLD (one with a residual). One **high**, one medium, one low.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the MCP answer had no node-count gate while HTTP refuses `http/too-complex`; a one-megabyte array decodes to half a million values | **fixed** (parity + explicit class): the answer text and then the tree are checked, and a refusal is `mcp/too-complex` and poisons the session. The line ceiling (1 MiB) equals the node ceiling, so the reachable bound is the same as HTTP's; the check is defence in depth |
+| 2 | medium | the secret/scope/method order differed between adapters, so the same malformed call reported different codes | **fixed**: the uniform prefix is budget, payload, secret, scope, method, in MCP, HTTP, process and wasm |
+| 3 | low | `valid_tool_name` accepted a name made only of dots (`.` or `..`) | **fixed**: a dot-only name is refused at the handshake; `a_dot_only_tool_name_is_refused` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. The dot-name test fails against the pre-fix tree.
 
 ### R-08 tools and MCP - 2026-11-04 (round 37)
 

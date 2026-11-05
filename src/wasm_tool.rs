@@ -595,10 +595,13 @@ impl Provider for WasmTool {
                 "the wasm adapter reads its input from a single argument, not a payload",
             ));
         }
-        if call.method != "run" {
-            return Err(Error::MethodNotGranted {
-                method: call.method.clone(),
-            });
+        // The same prefix every adapter uses: budget, payload, secret, scope,
+        // method (round 38, #5).
+        if crate::tool::args_contain_secret(&call.args) {
+            // A secret anywhere in the argument is authority this adapter was
+            // not granted; the text adapters report it the same way
+            // (round 21, F5).
+            return Err(Error::ToolPolicy("a secret is not a wasm argument"));
         }
         if call.path_scope.is_some() {
             // The input is bytes and the kernel inspects only `Value::Path`: a
@@ -608,11 +611,10 @@ impl Provider for WasmTool {
                 "this adapter cannot enforce a path scope",
             ));
         }
-        if crate::tool::args_contain_secret(&call.args) {
-            // A secret anywhere in the argument is authority this adapter was
-            // not granted; the text adapters report it the same way
-            // (round 21, F5).
-            return Err(Error::ToolPolicy("a secret is not a wasm argument"));
+        if call.method != "run" {
+            return Err(Error::MethodNotGranted {
+                method: call.method.clone(),
+            });
         }
         // Borrow the argument first: the byte grant bounds the input, and the
         // copy must happen only after every check (round 24, #5).
