@@ -220,7 +220,7 @@ otherwise, so the destination field stays decodable under the strict profile.
 
 | Code | Condition |
 |------|-----------|
-| `provider/reply-withheld` | a mutating provider ran and applied its effect, but the reply could not be delivered (a post-provider budget or lane refusal); the effect stands and the receipt records the admission, so this is not a retryable budget class |
+| `provider/reply-withheld` | a provider may have applied its effect, but the reply could not be delivered or accepted: a post-provider budget or lane refusal, a post-send adapter refusal on a call that could have changed something, or a process child that outlived its ceiling; the effect stands and the receipt records the admission, so this is not a retryable budget class |
 | `provider/secret-material` | a provider reply would have carried structural secret material and the redaction policy refused it |
 | `provider/redaction` | the provider could not build its redacted projection (an encode fault in its own reply) |
 | `provider/object` | the capability names an object the provider no longer holds |
@@ -233,10 +233,12 @@ class stays local) and `rpc/budget-exceeded` with the dimension it measured
 
 An `McpSession` reports adapter failures as `rpc/provider` with one of these
 inner codes. Every one is a fail-closed refusal; none is retryable without a new
-session. The byte grant is checked first when it is the tighter bound, so a line
-past the grant is `rpc/budget-exceeded` and does not poison the session; a line
-past only the static 1 MiB ceiling is `rpc/invalid-argument` (a request) or
-`mcp/line-too-long` (an answer, which poisons the session).
+session. The byte grant is checked first when it is the tighter bound: a line
+past the grant is `rpc/budget-exceeded` (or a withheld reply on a writable call).
+A line past only the static 1 MiB ceiling is `rpc/invalid-argument` (a request) or
+`mcp/line-too-long` (an answer). Every answer-side refusal poisons the
+session, including the grant one: before parsing, the client cannot tell an
+over-grant notification (whose answer is still queued) from the answer itself.
 
 | Code | Condition |
 |------|-----------|
@@ -448,15 +450,21 @@ inside every per-frame deadline must not hold a serial server forever.
 `serve_connection_within` takes an explicit deadline.
 
 A refusal decided after the request reached the peer is a **withheld reply** for
-a writable capability: the tool may have run, so the caller gets
-`provider/reply-withheld` (the receipt records the admission and an idempotent
-retry returns the same outcome instead of executing again). A read-only call has
-no effect that could stand, so it keeps the answer's own code. This applies to
-the MCP answer path (an over-grant line, a malformed or mismatched answer) and to
-the HTTP adapter (a non-2xx status, a body past the grant or the static
-ceiling). The MCP session is poisoned in either case, because before parsing the
-client cannot tell an over-grant notification (whose answer is still queued)
-from the answer itself.
+a call that could have changed something: the tool may have run, so the caller
+gets `provider/reply-withheld` (the receipt records the admission and an
+idempotent retry returns the same outcome instead of executing again). The
+judgement is the method's effect, not only the capability flag: a GET or a
+HEAD over HTTP keeps its own code (a 404 is a status, not a withheld
+write), and a process adapter, whose child always ran, withholds every
+post-spawn refusal. A pre-send failure (a resolve, a connect, a request-line
+budget check) always keeps its class, so a deployment that cannot reach the
+peer never burns an idempotency key. This applies to the MCP answer path (an
+over-grant line, a malformed or mismatched answer), to the HTTP adapter (a
+non-2xx status for a mutating method, an unparseable 2xx answer, a body past
+the grant or the static ceiling) and to the process adapter (a deadline, an
+output overrun, a wait fault). The MCP session is poisoned in either case,
+because before parsing the client cannot tell an over-grant notification (whose
+answer is still queued) from the answer itself.
 
 One stream carries one frame. On QUIC the reader takes the announced length and
 then probes for trailing bytes with a `250 ms` window (`STREAM_TAIL_WAIT`): a

@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-42: round 42 found 1 high, 1 medium and 3 lows, all fixed; round 43 must be clean | 280 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-43: round 43 found 5 highs, 1 medium and 4 lows, all fixed; round 44 must be clean | 290 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-15: round 15 found 2 mediums and 6 lows; 7 fixed, 1 noted; round 16 must be clean | 121 fixed / 0 rejected / 2 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -751,6 +751,28 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 43)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `e8f2414`, with probes
+outside the tree. Round-42 claims: two HOLD, one HOLD-but-over-broad, two PARTIAL.
+Verdict **NOT CLEAN**: five highs, one medium and four lows, all fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | HTTP decided "withheld" from the capability flag, so a GET 404 on a writable capability claimed an effect and lost its status | **fixed**: the axis is the method's effect (`mutating`); `a_get_404_on_a_writable_capability_keeps_its_status` |
+| 2 | high | every `perform` error was withheld-mapped, including resolve/connect/pre-send budget refusals, so a DNS failure was receipted `Admitted` and burned the idempotency key | **fixed**: `HttpTool` tracks whether the head was written and maps only after it; `a_pre_send_http_failure_is_not_a_withheld_reply` |
+| 3 | high | a 2xx answer the adapter could not parse kept a pre-effect class for a mutating method, so a retry repeated the write | **fixed**: the parse refusals (both JSON gates, the MCP malformed `error` object) go through the mapping; `a_mutating_call_with_an_unparseable_answer_withholds_the_reply` |
+| 4 | high | `LocalProcess` never withheld: a child that timed out or overran was receipted `Refused` and forked again on retry | **fixed**: every post-spawn refusal (deadline, output overrun in both loops, wait fault) is a withheld reply; `a_process_that_outlived_its_ceiling_withholds_the_reply` |
+| 5 | high | an MCP send whose ack timed out kept `after_send=false` although the frame may have reached the peer | **fixed**: the non-queue/not-sent branch sets `after_send` |
+| 6 | medium | the kernel's `withheld_by_code` ignored `mutating`, so a read-only call returning the code got an `Admitted` receipt and a spent key | **fixed**: the gate requires `mutating`, and a read-only claim is not trusted (it becomes `rpc/provider`); `a_read_only_call_never_becomes_an_admitted_receipt` (fails pre-fix) |
+| 7 | low | the spec and one comment said an over-grant line does not poison | **fixed**: both say it does |
+| 8 | low | the `provider/reply-withheld` spec row described only a mutating provider | **fixed**: the row covers post-send adapter refusals and process children |
+| 9 | low | the HTTP and MCP adapters disagreed at `grant == static cap` | **fixed**: both treat equality as the budget's case |
+| 10 | low | no test drove the POST/GET/parse/process coverage the fixes added | **fixed**: `tests/tool_round43_tests.rs` (five tests, four fail pre-fix) |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

@@ -93,3 +93,60 @@ fn a_withheld_reply_is_receipted_as_admitted_and_not_replayed() {
         "the idempotent retry re-executed the mutating provider"
     );
 }
+
+/// A read-only provider that returns the withheld code has no effect that could
+/// stand: the kernel must not rewrite it into an `Admitted` receipt or spend the
+/// idempotency key (round 43, F-6).
+#[test]
+fn a_read_only_call_never_becomes_an_admitted_receipt() {
+    struct ReadOnly(Arc<AtomicUsize>);
+
+    impl Provider for ReadOnly {
+        fn name(&self) -> &'static str {
+            "read-only"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["read".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &ProviderCall) -> active_rpc::Result<Response> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Provider {
+                code: "provider/reply-withheld".to_string(),
+            })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::with_secret([0x6e; 32]);
+    agent.enable_receipts(true);
+    let provider = agent.register(Box::new(ReadOnly(Arc::clone(&calls))));
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["read"]).with_budget(Budget::calls(10)),
+        )
+        .expect("cap");
+    let lane = agent
+        .create_lane("read-only", Budget::default())
+        .expect("lane");
+    let key = "one-read";
+    let promise = agent
+        .call_idempotent(lane, &cap, "read", Vec::new(), key)
+        .expect("queued");
+    agent.run();
+    let _ = promise.value().expect_err("the reply was withheld");
+    let receipts = agent.receipts();
+    assert_eq!(receipts.len(), 1, "one decision, one receipt");
+    match &receipts[0].decision {
+        Decision::Refused(_) => {}
+        other => panic!("a read-only refusal was receipted as {other:?}"),
+    }
+    // The key was not spent on an effect that cannot exist: a later attempt runs.
+    let _ = agent.call_idempotent(lane, &cap, "read", Vec::new(), key);
+    agent.run();
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "the read ran again");
+}

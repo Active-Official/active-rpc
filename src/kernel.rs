@@ -5136,10 +5136,11 @@ impl Agent {
             // receipt must record the admission and an idempotent retry must
             // reuse the outcome rather than execute a second time (round 42,
             // M-1).
-            let withheld_by_code = matches!(
-                &outcome,
-                Err(error) if error.provider_code() == Some("provider/reply-withheld")
-            );
+            let withheld_by_code = mutating
+                && matches!(
+                    &outcome,
+                    Err(error) if error.provider_code() == Some("provider/reply-withheld")
+                );
             let outcome = if withheld_by_code || (provider_succeeded && mutating) {
                 match outcome {
                     Err(_) => {
@@ -5150,6 +5151,16 @@ impl Agent {
                     }
                     Ok(value) => Ok(value),
                 }
+            } else if matches!(
+                &outcome,
+                Err(error) if error.provider_code() == Some("provider/reply-withheld")
+            ) {
+                // A read-only method has no effect that could stand, so the
+                // provider's claim is not trusted: it is a provider fault, and it
+                // must not enter the replay class (round 43, F-6).
+                Err(Error::Provider {
+                    code: "rpc/provider".to_string(),
+                })
             } else {
                 outcome
             };

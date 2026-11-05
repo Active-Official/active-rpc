@@ -635,7 +635,14 @@ fn both_process_streams_share_the_byte_grant() {
     let error = tool
         .invoke(0, &call)
         .expect_err("both streams over the grant");
-    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    // The child ran, so the class says the reply was withheld and a retry does
+    // not fork it again (round 43, F-4).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
 }
 
 /// The response head is bounded by the byte grant too (round 20, M3).
@@ -1839,6 +1846,9 @@ fn a_malformed_error_object_is_a_bad_response() {
     let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
     let mut call = Call::new("echo", Vec::new());
     call.tool_allows_process = true;
+    // A read-only call has no effect to withhold, so the answer's own code
+    // survives (round 43, F-3).
+    call.read_only = true;
     let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
         .expect_err("a malformed error object");
     assert_eq!(error.provider_code(), Some("mcp/bad-response"), "{error}");
@@ -2669,7 +2679,14 @@ fn an_argument_line_spends_part_of_the_process_grant() {
     let error = tool
         .invoke(0, &call)
         .expect_err("the output is past what the line left");
-    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    // The child ran, so the class says the reply was withheld and a retry does
+    // not fork it again (round 43, F-4).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
 }
 
 /// The response head spends part of the capability's grant: a body that fits
@@ -2914,7 +2931,14 @@ fn a_process_share_under_the_static_ceiling_is_a_budget_refusal() {
     let error = tool
         .invoke(0, &call)
         .expect_err("the output is past the share");
-    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    // The child ran, so the class says the reply was withheld and a retry does
+    // not fork it again (round 43, F-4).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
 }
 
 /// The HTTP refusal follows the same rule: the share, not the raw grant,

@@ -997,7 +997,13 @@ fn local_process_timeout_kills_a_hung_child() {
     let error = tool
         .invoke(0, &call)
         .expect_err("a hung child must time out");
-    assert_eq!(error.code(), "rpc/timeout");
+    // The child ran, so the refusal is a withheld reply (round 43, F-4).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
     assert!(
         start.elapsed() < std::time::Duration::from_secs(10),
         "timeout took {:?}",
@@ -1019,7 +1025,13 @@ fn local_process_timeout_kills_a_hung_child() {
     let error = tool
         .invoke(0, &call)
         .expect_err("a hung child must time out");
-    assert_eq!(error.code(), "rpc/timeout");
+    // The child ran, so the refusal is a withheld reply (round 43, F-4).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
     assert!(
         start.elapsed() < std::time::Duration::from_secs(10),
         "timeout took {:?}",
@@ -1164,7 +1176,13 @@ fn capability_wall_budget_caps_a_slow_tool() {
     call.budget.max_wall_ms = 120;
     let start = std::time::Instant::now();
     let error = tool.invoke(0, &call).expect_err("wall budget must bind");
-    assert_eq!(error.code(), "rpc/timeout");
+    // The child ran, so the refusal is a withheld reply (round 43, F-4).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
     // The ceiling is 120 ms and the child would run for ~19 s. The margin
     // covers ending the process tree (`taskkill /T`) after the deadline, which
     // can take seconds on a saturated machine.

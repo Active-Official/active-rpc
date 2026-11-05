@@ -674,15 +674,29 @@ fn remaining_until(deadline: std::time::Instant) -> Result<std::time::Duration> 
         .ok_or(Error::Timeout)
 }
 
+/// A post-spawn process refusal.
+///
+/// The child ran, so its effect may stand: the class says the reply was
+/// withheld, which keeps the kernel from sealing `Refused` and from re-forking
+/// the process on an idempotent retry (round 43, F-4). The inner class (a
+/// deadline, an output overrun) is replaced, as the MCP and HTTP mappings
+/// replace theirs.
+fn reply_withheld(_error: Error) -> Error {
+    Error::Provider {
+        code: "provider/reply-withheld".to_string(),
+    }
+}
+
 /// A refusal decided after the request reached the peer.
 ///
 /// The peer may have run the tool, so the class must say the reply was withheld
 /// rather than that nothing happened: the kernel then seals an admitted receipt
 /// and an idempotent retry returns this outcome instead of executing a second
-/// time (round 42, M-1). A read-only call has no effect that could stand, and a
-/// frame that never left keeps its own class.
-fn withhold_after_send(error: Error, read_only: bool) -> Error {
-    if read_only {
+/// time (round 42, M-1). `mutating` is the caller's judgement that the method
+/// could have changed something; when it is false the specific code survives.
+/// A frame that never left always keeps its own class.
+fn withhold_after_send(error: Error, mutating: bool) -> Error {
+    if !mutating {
         return error;
     }
     if let Error::Provider { code } = &error {
@@ -1370,7 +1384,10 @@ impl<T: McpTransport> McpSession<T> {
         // six bytes per byte on the wire, so summing `Arg::wire_size` first
         // undercounts the JSON and the artifact was still built before the
         // ceiling refused it (round 40, F1).
-        let static_bound = grant.is_none_or(|grant| grant >= MAX_MCP_LINE_BYTES);
+        // Equality is the grant's case too: at `grant == MAX` no larger grant can
+        // help, so the budget class is the honest one, as in the HTTP adapter
+        // (round 43, F-9).
+        let static_bound = grant.is_none_or(|grant| grant > MAX_MCP_LINE_BYTES);
         let cap = grant.map_or(MAX_MCP_LINE_BYTES, |grant| grant.min(MAX_MCP_LINE_BYTES));
         let mut writer = CappedWriter::new(cap);
         if serde_json::to_writer(&mut writer, &payload).is_err() {
@@ -1427,6 +1444,10 @@ impl<T: McpTransport> McpSession<T> {
                 if code == "mcp/queue" || code == "mcp/not-sent")
             {
                 self.poisoned = true;
+                // The writer took the frame, so it may have reached the peer:
+                // a writable call reports a withheld reply rather than a call
+                // that did not happen (round 43, F-5).
+                self.after_send = true;
             }
             return Err(error);
         }
@@ -1466,9 +1487,9 @@ impl<T: McpTransport> McpSession<T> {
             // line under a 200-byte grant decoded into a tree of megabytes
             // before the budget refused it (round 41, F1). A line that cannot
             // fit the remainder is refused here, before the text scan and the
-            // parse. The line was consumed, so the stream is still aligned and
-            // the refusal does not poison the session; an unaffordable
-            // notification is the same refusal.
+            // parse. The refusal poisons the session: before the parse the
+            // client cannot tell an over-grant notification (whose answer is
+            // still queued) from the answer itself (round 42, H-1).
             if let Some(grant) = grant {
                 let cap = grant.saturating_sub(spent).min(MAX_MCP_LINE_BYTES);
                 if line.len() > cap {
@@ -1775,7 +1796,9 @@ impl<T: McpTransport> Provider for McpSession<T> {
             Err(error) => {
                 let after_send = self.after_send;
                 return Err(if after_send {
-                    withhold_after_send(error, call.read_only)
+                    // An MCP tool has no read-only declaration of its own; the
+                    // capability's flag is the only signal (round 42, M-1).
+                    withhold_after_send(error, !call.read_only)
                 } else {
                     error
                 });
@@ -1784,10 +1807,14 @@ impl<T: McpTransport> Provider for McpSession<T> {
         if let Some(error) = response.get("error") {
             let Some(code) = error.get("code").and_then(Json::as_i64) else {
                 // A missing or non-integer code is a malformed answer, not
-                // code 0 (round 10, F-7).
-                return Err(Error::Provider {
-                    code: "mcp/bad-response".to_string(),
-                });
+                // code 0 (round 10, F-7). The answer arrived, so a writable
+                // call reports a withheld reply (round 43, F-3).
+                return Err(withhold_after_send(
+                    Error::Provider {
+                        code: "mcp/bad-response".to_string(),
+                    },
+                    !call.read_only,
+                ));
             };
             return Err(Error::Provider {
                 code: format!("mcp/{code}"),
@@ -1821,6 +1848,10 @@ pub struct HttpTool {
     pub max_request: usize,
     /// Calls served.
     pub calls: u64,
+    /// Whether the last exchange put bytes on the wire. A refusal after that
+    /// point may have applied its effect, so it is reported as a withheld
+    /// reply for a mutating method (round 43, F-2).
+    after_send: bool,
 }
 
 impl HttpTool {
@@ -1863,6 +1894,7 @@ impl HttpTool {
             max_body: 1 << 20,
             max_request: 1 << 20,
             calls: 0,
+            after_send: false,
         }
     }
 
@@ -1895,7 +1927,7 @@ impl HttpTool {
     // for a private helper.
     #[allow(clippy::too_many_arguments)]
     fn perform(
-        &self,
+        &mut self,
         method: &str,
         path: &str,
         body: Option<&[u8]>,
@@ -2026,7 +2058,11 @@ impl HttpTool {
         // per (ceiling - epsilon) makes every write return `Ok(1)`, so the phase
         // would cost body_len * interval; the deadline is re-armed and re-checked
         // per chunk instead (round 8, F3).
+        // Nothing has left yet; the head carries the method and the path, so
+        // once it is written the peer may act (round 43, F-2).
+        self.after_send = false;
         write_within(&mut stream, head.as_bytes(), deadline)?;
+        self.after_send = true;
         if let Some(body) = body {
             write_within(&mut stream, body, deadline)?;
         }
@@ -2487,8 +2523,16 @@ impl Provider for HttpTool {
         };
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
         let static_ceiling = self.max_body.min(MAX_RESPONSE_BYTES);
+        // The axis is the method's effect, not the capability flag: a GET or a
+        // HEAD on a writable capability cannot change anything, so a 404 must
+        // keep its status instead of claiming an effect that could stand
+        // (round 43, F-1).
+        let mutating = !call.read_only
+            && !method.eq_ignore_ascii_case("GET")
+            && !method.eq_ignore_ascii_case("HEAD");
         // Count admitted calls only (round 31, F7).
         self.calls += 1;
+        self.after_send = false;
         let (status, response) = match self.perform(
             &method,
             &path,
@@ -2498,9 +2542,18 @@ impl Provider for HttpTool {
             grant,
         ) {
             Ok(pair) => pair,
-            // The request left: a body or deadline refusal after that point is
-            // a withheld reply, not a call that did not happen (round 42, M-1).
-            Err(error) => return Err(withhold_after_send(error, call.read_only)),
+            // Withhold only when the request actually left: a resolve, connect or
+            // pre-send budget refusal must keep its class, or a deployment that
+            // cannot resolve a name records an applied write and burns the key
+            // (round 43, F-2).
+            Err(error) => {
+                let sent = self.after_send;
+                return Err(if sent {
+                    withhold_after_send(error, mutating)
+                } else {
+                    error
+                });
+            }
         };
         if !(200..300).contains(&status) {
             // A 3xx is not a completed call: the adapter does not follow
@@ -2511,7 +2564,7 @@ impl Provider for HttpTool {
                 Error::Provider {
                     code: format!("http/{status}"),
                 },
-                call.read_only,
+                mutating,
             ));
         }
         // A binary answer is not text: transcoding it inserts replacement
@@ -2540,28 +2593,43 @@ impl Provider for HttpTool {
         if (trimmed.starts_with('{') || trimmed.starts_with('['))
             && json_text_too_complex(json_text, MAX_JSON_NODES)
         {
-            return Err(Error::Provider {
-                code: "http/too-complex".to_string(),
-            });
+            // The answer arrived: for a mutating method the effect may stand,
+            // and a pre-effect class would let the caller retry a write
+            // (round 43, F-3).
+            return Err(withhold_after_send(
+                Error::Provider {
+                    code: "http/too-complex".to_string(),
+                },
+                mutating,
+            ));
         }
         let value = match serde_json::from_str::<Json>(json_text) {
             Ok(json) if json_too_many_nodes(&json) => {
-                return Err(Error::Provider {
-                    code: "http/too-complex".to_string(),
-                })
+                return Err(withhold_after_send(
+                    Error::Provider {
+                        code: "http/too-complex".to_string(),
+                    },
+                    mutating,
+                ));
             }
             Ok(json)
                 if json_has_unrepresentable_number(&json) || json_text_bad_number(json_text) =>
             {
-                return Err(Error::Provider {
-                    code: "http/bad-number".to_string(),
-                })
+                return Err(withhold_after_send(
+                    Error::Provider {
+                        code: "http/bad-number".to_string(),
+                    },
+                    mutating,
+                ));
             }
             Ok(json) => json_to_value(&json),
             Err(_) if text_fails_only_on_a_number(json_text) => {
-                return Err(Error::Provider {
-                    code: "http/bad-number".to_string(),
-                })
+                return Err(withhold_after_send(
+                    Error::Provider {
+                        code: "http/bad-number".to_string(),
+                    },
+                    mutating,
+                ));
             }
             Err(_) => Value::Text(text),
         };
@@ -3237,7 +3305,9 @@ impl Provider for LocalProcess {
                         // grant pay for twice the bytes (round 20, M2).
                         if stdout.len().saturating_add(stderr.len()) > max_output {
                             kill_process_tree(&mut child);
-                            return Err(output_refusal());
+                            // The child ran: the effect may stand, so a retry
+                            // must not fork it again (round 43, F-4).
+                            return Err(reply_withheld(output_refusal()));
                         }
                     }
                     if std::time::Instant::now() >= deadline {
@@ -3245,15 +3315,15 @@ impl Provider for LocalProcess {
                         // the leader may have exited already while a descendant
                         // still holds the pipes.
                         kill_process_tree(&mut child);
-                        return Err(Error::Timeout);
+                        return Err(reply_withheld(Error::Timeout));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(error) => {
                     kill_process_tree(&mut child);
-                    return Err(Error::Provider {
+                    return Err(reply_withheld(Error::Provider {
                         code: format!("process/wait:{error}"),
-                    });
+                    }));
                 }
             }
         };
@@ -3264,7 +3334,7 @@ impl Provider for LocalProcess {
         while received < readers {
             let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 kill_process_tree(&mut child);
-                return Err(Error::Timeout);
+                return Err(reply_withheld(Error::Timeout));
             };
             match receiver.recv_timeout(left) {
                 Ok((tag, buffer)) => {
@@ -3279,7 +3349,7 @@ impl Provider for LocalProcess {
                     // the grant (round 11, #2).
                     if stdout.len().saturating_add(stderr.len()) > max_output {
                         kill_process_tree(&mut child);
-                        return Err(output_refusal());
+                        return Err(reply_withheld(output_refusal()));
                     }
                 }
                 Err(_) => {
@@ -3289,7 +3359,9 @@ impl Provider for LocalProcess {
             }
         }
         if stdout.len().saturating_add(stderr.len()) > max_output {
-            return Err(output_refusal());
+            // The child ran to completion; the output still exceeds the share,
+            // and the class says the reply was withheld (round 43, F-4).
+            return Err(reply_withheld(output_refusal()));
         }
         let mut map = BTreeMap::new();
         // A child killed by a signal has no exit code. Reporting `-1` as a
