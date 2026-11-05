@@ -267,6 +267,17 @@ fn try_new_refuses_a_base_it_could_not_render_safely() {
         "://host",
         "ht:tp://host",
         "http://host/",
+        // Shapes `perform` cannot reach: a permanently dead endpoint must not
+        // surface as the retryable `http/resolve` class (round 54, M-1).
+        "http://example.com",
+        "http://host",
+        "http://host:",
+        "http://host:99999",
+        "http://host:0",
+        "http://user:pw@host:80",
+        "http://:80",
+        "https://host:443",
+        "ftp://host:21",
     ] {
         let error = active_rpc::tool::HttpTool::try_new(base, &[("GET", "/x")])
             .err()
@@ -275,6 +286,29 @@ fn try_new_refuses_a_base_it_could_not_render_safely() {
     }
     active_rpc::tool::HttpTool::try_new("http://127.0.0.1:9", &[("GET", "/x")])
         .expect("a plain base is admitted");
+    // The scheme is matched case-insensitively and stored in the form `perform`
+    // strips, so an upper-case operator value is not a dead endpoint.
+    let upper = active_rpc::tool::HttpTool::try_new("HTTP://127.0.0.1:9", &[("GET", "/x")])
+        .expect("an upper-case scheme is normalised");
+    assert_eq!(upper.base(), "http://127.0.0.1:9");
+}
+
+/// A base that is refused at construction must also be refused at dispatch as a
+/// policy fault: reporting `http/resolve` would invite a retry of a permanent
+/// configuration error (round 54, M-1).
+#[test]
+fn an_unusable_base_is_a_policy_fault_and_never_a_resolve_fault() {
+    for base in [
+        "http://example.com",
+        "http://user:pw@host:80",
+        "https://host:443",
+    ] {
+        let mut tool = active_rpc::tool::HttpTool::new(base, &[("GET", "/x")]);
+        let call = Call::new("get", vec![Arg::Value(Value::Path("/x".to_string()))]);
+        let error = tool.invoke(0, &call).expect_err("the base is unusable");
+        assert_eq!(error.code(), "rpc/tool-policy", "{base}: {error}");
+        assert_eq!(tool.base(), "", "{base} kept an authority it cannot use");
+    }
 }
 
 /// A control character before `://` is dropped at construction, so it can never

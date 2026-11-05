@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-53: round 53 found 1 medium and 4 lows, all fixed; round 54 must be clean | 351 fixed / 4 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-54: round 54 found 1 medium and 3 lows, all fixed; round 55 must be clean | 355 fixed / 4 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-3: round 3 found 1 high, 4 mediums and 5 lows, all fixed; round 4 must be clean | 24 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -897,6 +897,22 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-05 (round 54)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `ddd2124`. Round-53
+claims: three verified, one verified with a gap. Verdict **PARTIAL**: one medium
+and three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `try_new` admitted a base this adapter can never reach: `http://example.com` (no port), `http://host:`, a port outside `u16`, userinfo, and a scheme other than `http` all passed construction and then failed at dispatch as the retryable `http/resolve` class | **fixed**: the base must be `http://host:port` with no userinfo and a port in `1..=65535`; the scheme is matched case-insensitively and stored lowercase; `try_new_refuses_a_base_it_could_not_render_safely`, `an_unusable_base_is_a_policy_fault_and_never_a_resolve_fault` |
+| 2 | low | `base` was a public field, so an embedder could put a control character into a `Debug` line | **fixed**: the field is private with a `base()` accessor, and `redacted_base` substitutes `?` for any byte outside `0x21..=0x7e`; the compile-time privacy is the guard, and the sanitizer covers a future accessor |
+| 3 | low | the new `rpc/tool-policy` row claimed a module body returns that code, while the adapter returns `rpc/invalid-argument` | **fixed**: the row names policy refusals only and the section says a module, a non-finite number or an over-deep body is `rpc/invalid-argument` |
+| 4 | low | `last_random_used` was stale on returns before the store exists (input past `OUTPUT_OFFSET`, the linker arms), and the input-copy arm kept a start-function log | **fixed**: `call` zeroes the metric beside `log.clear()`, and the input-copy arm takes the log; `a_refused_call_reports_no_entropy_from_the_previous_call` |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

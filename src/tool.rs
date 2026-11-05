@@ -1999,7 +1999,10 @@ impl<T: McpTransport> Provider for McpSession<T> {
 /// allowlist is `rpc/tool-policy`.
 pub struct HttpTool {
     /// Base URL, e.g. `http://127.0.0.1:8080`.
-    pub base: String,
+    /// The endpoint this tool can reach. Private: a caller that assigned a
+    /// control byte or a path after construction would otherwise desync
+    /// `base_invalid` from the value `perform` and `Debug` use (round 54, L-1).
+    base: String,
     /// Allowed `(method, path)` pairs.
     pub allow: BTreeSet<(String, String)>,
     /// Maximum response bytes.
@@ -2025,6 +2028,13 @@ pub struct HttpTool {
 /// `http://host/hooks/<token>`: `Debug` names the scheme and authority only
 /// (round 49, L-1).
 fn redacted_base(base: &str) -> String {
+    // A printable substitute for anything else: `base` is a public-free field,
+    // but a log line must never carry a control byte even if a future edit
+    // makes it reachable (round 54, L-1).
+    let base: String = base
+        .chars()
+        .map(|ch| if ('!'..='~').contains(&ch) { ch } else { '?' })
+        .collect();
     let Some((scheme, rest)) = base.split_once("://") else {
         return format!("<{} bytes>", base.len());
     };
@@ -2060,6 +2070,12 @@ impl std::fmt::Debug for HttpTool {
 }
 
 impl HttpTool {
+    /// The configured base: `http://host:port`, or empty when the configured
+    /// value was unusable. A path, query or fragment is never part of it.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     /// Whether an exact-match allow-list entry is ambiguous for a peer.
     ///
     /// The adapter sends the path verbatim and compares it as a string while a
@@ -2084,15 +2100,6 @@ impl HttpTool {
             || path.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
     }
 
-    /// RFC 3986 §3.1: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
-    fn valid_scheme(scheme: &str) -> bool {
-        let mut bytes = scheme.bytes();
-        bytes
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic())
-            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-    }
-
     /// Build a tool for `base` with an allowlist.
     ///
     /// An ambiguous entry is dropped: the peer normalizes, so such an entry
@@ -2115,22 +2122,33 @@ impl HttpTool {
         // byte is refused for the same reason it is at dispatch.
         let printable = base.bytes().all(|byte| (0x21..=0x7e).contains(&byte));
         let (authority, base_invalid) = match base.split_once("://").filter(|_| printable) {
-            Some((scheme, rest)) if Self::valid_scheme(scheme) => {
+            // `perform` speaks plain HTTP and resolves the authority with
+            // `ToSocketAddrs`, which needs `host:port`. A scheme it cannot
+            // speak, userinfo, a missing port or a port outside `u16` used to be
+            // admitted here and then surface at dispatch as the retryable
+            // `http/resolve` class (round 54, M-1).
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => {
                 let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
                 let has_tail = end != rest.len();
-                // No authority, or only a port separator: `http://` and
-                // `http://:9` name the default host, which is not a base the
-                // operator wrote (round 53, L-2).
-                let empty_authority = rest.is_empty() || rest.starts_with(':');
+                let host = &rest[..end];
+                let usable = match host.rsplit_once(':') {
+                    Some((name, port)) => {
+                        !name.is_empty()
+                            && !name.contains('@')
+                            && port.parse::<u16>().is_ok_and(|port| port != 0)
+                    }
+                    None => false,
+                };
                 // An unusable base is never kept: a path tail would retarget a
                 // request if the dispatch refusal were ever bypassed, and a
                 // control character would reach `Debug` (round 52, F-1/F-5).
-                let authority = if empty_authority {
-                    String::new()
+                // The scheme is normalised to the form `perform` strips.
+                let authority = if usable {
+                    format!("http://{host}")
                 } else {
-                    format!("{scheme}://{}", &rest[..end])
+                    String::new()
                 };
-                (authority, has_tail || empty_authority)
+                (authority, has_tail || !usable)
             }
             _ => (String::new(), true),
         };

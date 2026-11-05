@@ -159,6 +159,33 @@ fn a_start_function_draw_is_reported_when_it_traps() {
     assert_eq!(tool.entropy_used(), 8, "the start draw was not reported");
 }
 
+/// A guest that draws eight bytes once and returns.
+const RANDOM_ONCE: &str = r#"
+(module
+  (import "env" "random" (func $random (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (func (export "run") (param i32) (result i32)
+    (drop (call $random (i32.const 0) (i32.const 8)))
+    (i32.const 0)))
+"#;
+
+/// A refusal before the guest runs reports no entropy: the metric is this
+/// call's draw, not the previous call's (round 54, L-3).
+#[test]
+fn a_refused_call_reports_no_entropy_from_the_previous_call() {
+    let mut tool = tool(RANDOM_ONCE, WasmLimits::default());
+    assert_eq!(tool.call(b"").expect("the guest runs"), Vec::<u8>::new());
+    assert_eq!(tool.entropy_used(), 8, "the draw was not reported");
+
+    let oversized = vec![0u8; active_rpc::wasm_tool::OUTPUT_OFFSET + 1];
+    let error = tool.call(&oversized).expect_err("the input is refused");
+    assert!(
+        error.to_string().contains("wasm/input"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(tool.entropy_used(), 0, "a stale draw was reported");
+}
+
 /// F3: a trap in `start` is a trap.
 #[test]
 fn a_start_trap_is_wasm_trap() {

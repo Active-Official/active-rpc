@@ -317,7 +317,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
 | `http/read:truncated`, `http/read:truncated-body` | the peer closed before a full line or body arrived |
 | `http/<status>` | the endpoint answered a status outside 2xx (3xx included: the adapter does not follow redirects) |
-| `rpc/tool-policy` | the base is not a printable scheme and authority (a path, query or fragment, a control character, an invalid scheme, or no authority at all); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; or the call carries a secret, a path scope or a module the adapter cannot send |
+| `rpc/tool-policy` | the base is not a printable scheme and authority (a path, query or fragment, a control character, an invalid scheme, or no authority at all); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; or the call carries a secret or a path scope the adapter cannot enforce |
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `content-length` only for a method defined to carry content (`POST`, `PUT`,
@@ -331,12 +331,18 @@ Resolution of the base URL happens before the deadline starts and uses the
 system resolver’s own timeout, because the endpoint is the operator’s, not the
 peer’s. A server that drips a byte per timeout period cannot stretch the
 ceiling. A HEAD,
-204 or 304 reply is read as bodyless whatever its headers say. A base must be a printable scheme and an authority and nothing else: a path,
+204 or 304 reply is read as bodyless whatever its headers say. A base must be `http://host:port` and nothing else: a path,
 query or fragment would either be dropped (retargeting the request at another
-resource on the same authority) or concatenated with every request path, and a
-control character would forge a request head or a log line. An empty authority,
-an invalid scheme, an `http://host/` trailing slash and any byte outside
-`0x21..=0x7e` are refused for the same reason. `HttpTool::try_new` refuses such a
+resource on the same authority) or concatenated with every request path, a
+control character would forge a request head or a log line, and any other shape
+is an endpoint this adapter cannot reach. That includes a scheme other than
+`http` (matched case-insensitively and stored lowercase: the adapter speaks
+plain HTTP, with no TLS), userinfo, a missing port, a port outside `1..=65535`,
+an empty authority, an `http://host/` trailing slash and any byte outside
+`0x21..=0x7e`. The reason is the same in every case: `perform` resolves the
+authority with `ToSocketAddrs`, which needs `host:port`, so a shape it cannot
+use would otherwise arrive as the retryable `http/resolve` class instead of a
+configuration fault. `HttpTool::try_new` refuses such a
 base at construction; `HttpTool::new` keeps no authority from it and refuses
 every call with `rpc/tool-policy`, so the fault is never reported as a
 retryable `http/resolve`. A path is
@@ -345,7 +351,9 @@ parameter (container peers strip `;name=value` before resolving), a percent
 escape, a backslash, a double slash, a query or a fragment: the allow-list is an
 exact string and the peer normalizes, so an ambiguous entry could name a
 different resource. `HttpTool::try_new` refuses such an entry at construction and
-`HttpTool::new` drops it. A capability with a path scope is refused
+`HttpTool::new` drops it. A body that carries a module or a non-finite number,
+or one nested past the wire depth, is `rpc/invalid-argument`: the
+`rpc/tool-policy` row above covers policy refusals only. A capability with a path scope is refused
 (`rpc/tool-policy`): the kernel compares dotted paths, which cannot confine a
 URL path, so the scope would look like confinement while only the allow-list
 confined the call. The request head is charged against the byte grant beyond a

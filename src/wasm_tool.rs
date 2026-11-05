@@ -321,8 +321,11 @@ impl WasmTool {
     pub fn call(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         // Every refusal below must leave no log behind: `log()` is documented as
         // this call's evidence, and a stale buffer would attribute one caller's
-        // bytes to another caller's failed call.
+        // bytes to another caller's failed call. The entropy metric is per call
+        // for the same reason: a refusal before the guest starts must report
+        // zero, not the previous call's draw (round 54, L-3).
         self.log.clear();
+        self.last_random_used = 0;
         if input.len() > OUTPUT_OFFSET {
             return Err(provider("wasm/input"));
         }
@@ -519,6 +522,9 @@ impl WasmTool {
             return Err(provider("wasm/fuel"));
         }
         if memory.data(&store).len() < input.len() {
+            // The start function already ran, so its log is this call's evidence
+            // and its draw is this call's draw.
+            self.log = std::mem::take(&mut store.data_mut().log);
             self.last_random_used = store.data().random_used;
             return Err(provider("wasm/memory"));
         }
