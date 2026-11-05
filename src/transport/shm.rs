@@ -327,10 +327,21 @@ impl SharedMemoryTransport {
     /// is one copy fewer than [`Transport::recv`], not a borrowed envelope. It
     /// costs the segment lock for the duration of one decode.
     pub fn recv_in_segment(&mut self) -> Result<Option<Envelope>> {
+        if self.poisoned {
+            return Err(Error::Transport(
+                "the segment is poisoned by a frame that did not decode".to_string(),
+            ));
+        }
         let limits = self.limits;
-        self.segment
+        let decoded = self
+            .segment
             .pop_frame(|frame| Envelope::decode_with(frame, limits))?
-            .transpose()
+            .transpose();
+        if decoded.is_err() {
+            // The fast path obeys the same rule as `recv` (round 18, R16-4).
+            self.poisoned = true;
+        }
+        decoded
     }
 }
 

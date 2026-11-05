@@ -21,8 +21,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-45: round 45 found 1 medium and 5 lows, all fixed; round 46 must be clean | 305 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-17: round 17 found 3 mediums and 6 lows; 6 fixed, 3 noted; the withheld class now survives the client's refusal filter | 133 fixed / 0 rejected / 8 noted (3 verification gaps in STATUS 17) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-46: round 46 found 1 medium and 6 lows, all fixed or documented; round 47 must be clean | 311 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-18: round 18 found 1 high, 3 mediums and 6 lows; 6 fixed, 4 noted; round 19 must be clean | 139 fixed / 0 rejected / 12 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -586,6 +586,28 @@ mediums, two lows and one documentation fix.
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
 
+### R-09 transports - 2026-11-04 (round 18)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `c65203d`. Round-17
+claims: two HOLD, three PARTIAL. Verdict **NOT CLEAN**: one high, three mediums and
+six lows — including a regression introduced by round 17.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the HTTP/2 encode refusal answered with the encode error's own code (`rpc/wire`), a fatal class for a call whose handler had run: the post-handler withheld branch was never reached | **fixed**: the encode refusal answers `500 provider/reply-withheld` |
+| 2 | medium | the QUIC size and encode refusals were still `rpc/wire` after admission | **fixed**: both answer `provider/reply-withheld` |
+| 3 | medium | the bridge's withheld refusals were written under the request deadline, which a slow handler has already spent, so nothing reached the client | **fixed**: a fresh `refusal_deadline` |
+| 4 | medium | the shared-memory zero-copy path (`recv_in_segment`) bypassed the poison added in round 17 | **fixed**: it honours and sets the flag |
+| 5 | low | a body write that fails because the bridge answered on the head surfaced as a retryable transport class | **fixed**: a post-head body write failure is tolerated and the answer is read |
+| 6 | low | `send_envelope` re-encoded with the default profile, so the bytes on the wire ignored the server's profile | **fixed**: the success path sends the bytes it encoded (`reply_encoded`) |
+| 7 | low | accepting `provider/reply-withheld` from a peer lets a hostile HTTP server claim an effect that never happened | **noted**: the claim is fail-closed (a non-retryable refusal and a burned key, never a duplicate execution); an authenticated-channel marker is the M-7 fix |
+| 8 | low | the withheld envelope was counted even when it failed, and no drain preceded the close | **partly fixed**: it is counted only when it left; the drain is noted (the connection is one-shot) |
+| 9 | low | a provider panic after a possible mutation stays a non-committal `rpc/provider` | **noted**: a panic means the handler did not complete; making it committal would over-claim for every read |
+| 10 | low | the round-17 fixes shipped without tests | **noted**: the strict-profile and poison paths need fault-injection peers; the round-18 fixes are covered where cheap |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-09 transports - 2026-11-04 (round 17)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `f0fe964`. Round-16
@@ -799,6 +821,24 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 46)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `aeab8b4`. Round-45
+claims: one PARTIAL, four HOLD. Verdict **PARTIAL**: one medium and six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the spec said a `HEAD` keeps its status, but after round 45 the axis is the capability's method: a `request`-with-`HEAD` is withheld, and `head` is not a capability method at all | **fixed**: the sentence names the method axis; the dead `head` clause is gone (the axis is `HttpTool::mutating`) |
+| 2 | low | an orphaned, truncated comment promised the budget/policy token round 45 deleted | **fixed** |
+| 3 | low | `mcp/write:closed` was also emitted after the writer took the frame (its ack channel died), where the class must be withheld | **fixed**: the post-enqueue arms report `mcp/write:lost`, which sets `after_send`; the spec has the row |
+| 4 | low | both adapters keyed the axis on the caller's `read_only` while the kernel re-derives it from `Provider::mutating` | **fixed**: the HTTP adapter uses `self.mutating(&call.method)`; the stalled-reader test now expects the withheld class for a POST |
+| 5 | low | `entropy_used`'s doc opened with the `log` summary | **already correct** in this revision |
+| 6 | low | `result.isError` is never inspected, while the spec's justification implied it was | **documented**: the adapter passes the tool-level outcome through as content; the note says the class is documented, not enforced |
+| 7 | low | the process output test's comment stated the wrong byte bound and a typo | **fixed**: the grant is computed and the comment says so |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

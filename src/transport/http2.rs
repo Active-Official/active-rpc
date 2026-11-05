@@ -540,11 +540,13 @@ where
     });
     let encoded = match encoded {
         Ok(encoded) => encoded,
-        Err(error) => {
+        Err(_) => {
+            // The handler ran: a reply that cannot be encoded under this
+            // profile is a withheld reply, not a wire fault (round 18, R16-1).
             return respond_status(
                 &mut respond,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                error.code().as_bytes(),
+                b"provider/reply-withheld",
             );
         }
     };

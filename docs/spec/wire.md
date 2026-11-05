@@ -261,6 +261,7 @@ over-grant notification (whose answer is still queued) from the answer itself.
 | `mcp/cwd` | the working directory could not be pinned |
 | `mcp/read:<err>`, `mcp/write:<err>`, `mcp/stdin`, `mcp/stdout` | transport I/O failed |
 | `mcp/write:closed` | the writer thread never took the frame (its queue was closed): the session is poisoned and the call is not reported as a withheld reply, because nothing left |
+| `mcp/write:lost` | the frame was handed to the writer, which then died before acknowledging it: the session is poisoned and the call is a withheld reply |
 | `mcp/thread:<err>` | a reader or writer thread could not start |
 | `mcp/<code>` | the server returned a JSON-RPC error; `<code>` is its numeric code |
 
@@ -464,10 +465,10 @@ A refusal decided after the request reached the peer is a **withheld reply** for
 a call that could have changed something: the tool may have run, so the caller
 gets `provider/reply-withheld` (the receipt records the admission and an
 idempotent retry returns the same outcome instead of executing again). The
-judgement is the method's effect, not only the capability flag: a GET or a
-HEAD over HTTP keeps its own code (a 404 is a status, not a withheld
-write), and a process adapter, whose child always ran, withholds every
-post-spawn refusal. A pre-send failure (a resolve, a connect, a request-line
+judgement is the capability's method: a get over HTTP keeps its own code (a
+404 is a status, not a withheld write), while `post` and `request` withhold
+whatever method text they carry — the same axis the kernel sees — and a
+process adapter, whose child always ran, withholds every post-spawn refusal. A pre-send failure (a resolve, a connect, a request-line
 budget check) always keeps its class, so a deployment that cannot reach the
 peer never burns an idempotency key. This applies to the MCP answer path (an
 over-grant line, a malformed or mismatched answer), to the HTTP adapter (a
@@ -478,12 +479,15 @@ because before parsing the client cannot tell an over-grant notification (whose
 answer is still queued) from the answer itself.
 
 Two deliberate asymmetries. A JSON-RPC `error` object from an MCP server keeps
-its `mcp/<code>` on a writable call: MCP reserves `result.isError` for a tool
-that ran and failed, so an `error` object is the tool declining, not a reply
-that was lost. And the kernel's mutating axis for the HTTP adapter is the
-capability flag plus the method it dispatched, so an HTTP `request` call is
-withheld even when its method text is `GET`: over-conservative, never a claim
-that a read had an effect.
+its `mcp/<code>` on a writable call: MCP has its own tool-level outcome
+(`result.isError`), which the adapter passes through as content rather than
+reinterpreting, so an `error` object is read as the tool declining. A caller
+that treats an `error` object as meaning nothing happened should consult
+`result.isError` on the successful path; the class is documented, not
+enforced by the adapter. And the kernel's mutating axis for the HTTP adapter is
+the capability's method: `get` keeps its own code, `post` and `request` withhold, which is
+over-conservative for a `request`-with-`GET` and never a claim that a read
+had an effect.
 
 One stream carries one frame. On QUIC the reader takes the announced length and
 then probes for trailing bytes with a `250 ms` window (`STREAM_TAIL_WAIT`): a

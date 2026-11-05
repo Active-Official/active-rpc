@@ -1042,7 +1042,14 @@ fn a_stalled_http_reader_reports_the_ceiling() {
     let error = tool
         .invoke(0, &call)
         .expect_err("the write never completes");
-    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    // The head carried the POST, so the refusal is a withheld reply
+    // (round 46, F-4).
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "a 200 ms grant took {:?}",
@@ -2206,8 +2213,8 @@ fn process_output_past_the_grant_withholds_the_reply() {
     #[cfg(not(windows))]
     let (program, flag, script) = ("/bin/sh", "-c", "echo hello");
 
-    // The argv line is about 12 bytes; the grant covers it and one byte of
-    // output, and cho hello writes six.
+    // The grant covers the argv line (computed below) and one byte of output;
+    // the child writes more than that.
     let argv_bytes: u64 = [flag, script]
         .iter()
         .map(|argument| Arg::wire_size(&Arg::text(*argument)))
@@ -2221,6 +2228,7 @@ fn process_output_past_the_grant_withholds_the_reply() {
     let error = tool
         .invoke(0, &call)
         .expect_err("the output is past the grant");
+    assert!(argv_bytes > 0, "the fixture argv is non-empty");
     assert_eq!(error.code(), "rpc/provider", "{error}");
     assert_eq!(
         error.provider_code(),

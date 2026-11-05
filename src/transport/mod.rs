@@ -578,8 +578,14 @@ where
                                 code: "provider/reply-withheld".to_string(),
                             },
                         );
-                        let _ = transport.send(&withheld);
-                        return Ok(served + 1);
+                        // Count and close only when the envelope left: a
+                        // failed write means the peer is gone, and unread bytes
+                        // in the buffer would turn the close into a reset that
+                        // discards it anyway (round 18, R16-8).
+                        if transport.send(&withheld).is_ok() {
+                            return Ok(served + 1);
+                        }
+                        return Ok(served);
                     }
                     // The peer is gone; the connection is over, the server is
                     // not.

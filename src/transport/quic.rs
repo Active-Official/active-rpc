@@ -734,25 +734,33 @@ async fn serve_stream<H>(
     });
     // The reply obeys the ceiling this server enforces on a request: a strict
     // profile must not emit a frame its own reader refuses (round 12, R-09 #2).
-    let encoded = response.encode_with_limits(wire);
-    match encoded {
+    let bytes = match response.encode_with_limits(wire) {
+        // The handler ran: a reply past this server's own profile, or one that
+        // cannot be encoded under it, is a withheld reply (round 18, R16-2).
         Ok(bytes) if bytes.len() > wire.max_bytes.min(MAX_FRAME_BYTES) => {
-            let error = Error::Wire("response exceeds the size ceiling");
+            let error = Error::Provider {
+                code: "provider/reply-withheld".to_string(),
+            };
             reply(&mut send, &Envelope::error(request_id, &error)).await;
             finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
             return;
         }
-        Ok(_) => {}
-        Err(error) => {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let error = Error::Provider {
+                code: "provider/reply-withheld".to_string(),
+            };
             reply(&mut send, &Envelope::error(request_id, &error)).await;
             finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
             return;
         }
-    }
+    };
     // A peer controls its own receive window: a response larger than the credit
     // it grants parks `write_all` forever without this deadline. Reset the
     // stream instead of holding the task.
-    reply(&mut send, &response).await;
+    // Send the bytes that were encoded under this server's profile: encoding
+    // again inside `reply` used the default profile (round 18, R16-6).
+    reply_encoded(&mut send, &bytes).await;
     finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
 }
 
@@ -913,6 +921,30 @@ impl Drop for CallGuard {
 /// Every reply path uses this: a peer that advertises a one-byte receive window
 /// and never reads parks `write_all` after the first byte, so an unbounded early
 /// error reply held the task (and its connection permit) forever.
+/// Write bytes that were already encoded under this server's profile.
+///
+/// The success path encodes once (so the bytes on the wire obey `wire`) and
+/// sends those bytes: re-encoding inside `reply` used the default profile
+/// (round 18, R16-6).
+async fn reply_encoded(send: &mut quinn::SendStream, bytes: &[u8]) {
+    let written = tokio::time::timeout(STREAM_WAIT, async {
+        let Ok(prefix) = frame(bytes.len()) else {
+            return;
+        };
+        let mut payload = Vec::with_capacity(bytes.len() + 4);
+        payload.extend_from_slice(&prefix);
+        payload.extend_from_slice(bytes);
+        if send.write_all(&payload).await.is_err() {
+            return;
+        }
+        let _ = send.finish();
+    })
+    .await;
+    if written.is_err() {
+        let _ = send.reset(0u32.into());
+    }
+}
+
 async fn reply(send: &mut quinn::SendStream, response: &Envelope) {
     let written = tokio::time::timeout(STREAM_WAIT, async {
         if send_envelope(send, response).await.is_err() {

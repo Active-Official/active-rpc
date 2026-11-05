@@ -1138,7 +1138,7 @@ impl McpTransport for StdioTransport {
                 .map_err(|error| match error {
                     std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
                     std::sync::mpsc::RecvTimeoutError::Disconnected => Error::Provider {
-                        code: "mcp/write:closed".to_string(),
+                        code: "mcp/write:lost".to_string(),
                     },
                 })?,
             Some(deadline) => {
@@ -1148,7 +1148,7 @@ impl McpTransport for StdioTransport {
                 outcome.recv_timeout(left).map_err(|error| match error {
                     std::sync::mpsc::RecvTimeoutError::Timeout => Error::Timeout,
                     std::sync::mpsc::RecvTimeoutError::Disconnected => Error::Provider {
-                        code: "mcp/write:closed".to_string(),
+                        code: "mcp/write:lost".to_string(),
                     },
                 })?
             }
@@ -2545,9 +2545,7 @@ impl Provider for HttpTool {
         // `request` stays conservative and withholds whatever method text it
         // carried — the same axis the kernel's `Provider::mutating` sees
         // (round 43, F-1; round 45, finding 1).
-        let mutating = !call.read_only
-            && !call.method.eq_ignore_ascii_case("get")
-            && !call.method.eq_ignore_ascii_case("head");
+        let mutating = self.mutating(&call.method);
         // Count admitted calls only (round 31, F7).
         self.calls += 1;
         self.after_send = false;
@@ -3163,7 +3161,6 @@ impl Provider for LocalProcess {
         // available to the output (round 33, H1).
         let share = grant.saturating_sub(arg_bytes as usize);
         let max_output = self.max_output.min(MAX_OUTPUT_BYTES).min(share);
-        // Which ceiling bound the read: token the refusal accordingly so a
         // One budget for both pipes: each reader used to take a full ceiling,
         // so transient buffering reached twice the grant (round 21, F1).
         let shared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(

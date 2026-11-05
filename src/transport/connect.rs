@@ -501,12 +501,23 @@ impl BridgeServer {
                     },
                 ),
             };
+        // A refusal needs its own budget: the request phase has already spent
+        // deadline, and write_all_before hard-stops 250 ms past it, so a
+        // slow handler could never deliver the withheld answer (round 18, R16-3).
+        let refusal_deadline = std::time::Instant::now()
+            .checked_add(CONNECTION_WAIT)
+            .unwrap_or_else(std::time::Instant::now);
         // The handler ran: a refusal to build or frame its reply is a withheld
         // reply, the same class HTTP/2 sends (round 17, R16-3).
         let bytes = match response.encode_with_limits(self.limits) {
             Ok(bytes) => bytes,
             Err(_) => {
-                let _ = write_http_response(&mut stream, 500, b"provider/reply-withheld", deadline);
+                let _ = write_http_response(
+                    &mut stream,
+                    500,
+                    b"provider/reply-withheld",
+                    refusal_deadline,
+                );
                 drain_before_close(&mut stream);
                 return 0;
             }
@@ -515,14 +526,24 @@ impl BridgeServer {
         // request: a strict peer must not receive a frame its own reader
         // refuses (round 10, R-09 #5).
         if bytes.len() > MAX_BODY.min(self.limits.max_bytes) {
-            let _ = write_http_response(&mut stream, 413, b"provider/reply-withheld", deadline);
+            let _ = write_http_response(
+                &mut stream,
+                413,
+                b"provider/reply-withheld",
+                refusal_deadline,
+            );
             drain_before_close(&mut stream);
             return 0;
         }
         let Ok(framed) = grpc_frame(&bytes) else {
             // The body was checked against `MAX_BODY` above, so this is the
             // length conversion failing on a 32-bit target; the handler ran.
-            let _ = write_http_response(&mut stream, 413, b"provider/reply-withheld", deadline);
+            let _ = write_http_response(
+                &mut stream,
+                413,
+                b"provider/reply-withheld",
+                refusal_deadline,
+            );
             drain_before_close(&mut stream);
             return 0;
         };
@@ -928,7 +949,10 @@ impl ConnectClient {
             .and_then(|()| stream.set_write_timeout(Some(wait)))
             .map_err(|error| Error::Transport(error.to_string()))?;
         write_all_before(&mut stream, head.as_bytes(), deadline)?;
-        write_all_before(&mut stream, body, deadline)?;
+        // A server that decides on the head (404, 405, 413, 415) answers and
+        // closes, so the body write can fail with EPIPE: that answer is the
+        // result, and a real failure surfaces on the read (round 18, R16-5).
+        let _ = write_all_before(&mut stream, body, deadline);
         stream
             .flush()
             .map_err(|error| Error::Transport(error.to_string()))?;
