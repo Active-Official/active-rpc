@@ -781,3 +781,67 @@ fn a_closed_writer_does_not_claim_the_effect() {
     let again = Provider::invoke(&mut session, 0, &call).expect_err("the session is poisoned");
     assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
 }
+
+/// A frame the writer took and then lost is a withheld reply for a writable
+/// call, while a read-only call keeps the code: the idempotency key is spent
+/// only when an effect could stand (round 47, L-3).
+#[test]
+fn a_lost_write_ack_is_withheld_only_for_a_writable_call() {
+    use active_rpc::error::Error as RpcError;
+    use active_rpc::tool::{McpSession, McpTransport};
+
+    struct Lost {
+        queue: std::collections::VecDeque<String>,
+        sends: usize,
+    }
+    impl McpTransport for Lost {
+        fn send_line(&mut self, _line: &str) -> active_rpc::error::Result<()> {
+            Ok(())
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.queue.pop_front().ok_or(RpcError::Provider {
+                code: "mcp/no-response".to_string(),
+            })
+        }
+        fn send_line_within(
+            &mut self,
+            _line: &str,
+            _deadline: Option<std::time::Instant>,
+        ) -> active_rpc::error::Result<()> {
+            self.sends += 1;
+            if self.sends <= 2 {
+                return Ok(());
+            }
+            Err(RpcError::Provider {
+                code: "mcp/write:lost".to_string(),
+            })
+        }
+    }
+
+    fn session() -> McpSession<Lost> {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#.to_string(),
+        );
+        queue.push_back(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"x"}]}}"#
+                .to_string(),
+        );
+        McpSession::handshake(Lost { queue, sends: 0 }).expect("handshake")
+    }
+
+    let mut writable = session();
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.budget.max_bytes = 1 << 20;
+    let error = Provider::invoke(&mut writable, 0, &call).expect_err("the writer died");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
+
+    let mut read_only = session();
+    call.read_only = true;
+    let error = Provider::invoke(&mut read_only, 0, &call).expect_err("the writer died");
+    assert_eq!(error.provider_code(), Some("mcp/write:lost"), "{error}");
+}

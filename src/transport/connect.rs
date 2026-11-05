@@ -285,7 +285,9 @@ impl BridgeServer {
         // timeout before every read. A per-read timeout let a peer send one byte
         // just inside it forever, holding the (serial) bridge's only accept slot
         // while every later peer waited.
-        let deadline = std::time::Instant::now() + CONNECTION_WAIT;
+        let deadline = std::time::Instant::now()
+            .checked_add(CONNECTION_WAIT)
+            .unwrap_or_else(std::time::Instant::now);
         let Ok(clone) = stream.try_clone() else {
             return 0;
         };

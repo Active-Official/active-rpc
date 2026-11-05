@@ -497,6 +497,11 @@ async fn serve<H>(
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     // Body bytes every live stream holds, across every connection.
     let inflight = Arc::new(AtomicUsize::new(0));
+    // Encoded reply bytes held while a peer's flow-control credit is exhausted:
+    // a stream with no receive window parks its whole reply for STREAM_WAIT,
+    // and without a shared ceiling one peer could park tens of GiB (round 19,
+    // R-9#2).
+    let inflight_out = Arc::new(AtomicUsize::new(0));
     while let Some(incoming) = endpoint.accept().await {
         // Each connection is driven in its own task. `incoming.await` is where
         // an abandoned or refused handshake parks for its timeout; awaiting it
@@ -516,6 +521,7 @@ async fn serve<H>(
         let endpoint = endpoint.clone();
         let limits = Arc::clone(&limits);
         let inflight = Arc::clone(&inflight);
+        let inflight_out = Arc::clone(&inflight_out);
         let active = Arc::clone(&active);
         tokio::spawn(async move {
             let _permit = permit;
@@ -527,7 +533,15 @@ async fn serve<H>(
                 Err(_) => return,
             };
             serve_connection(
-                &endpoint, &handler, &served, &active, max_calls, &limits, &inflight, connection,
+                &endpoint,
+                &handler,
+                &served,
+                &active,
+                max_calls,
+                &limits,
+                &inflight,
+                &inflight_out,
+                connection,
             )
             .await;
         });
@@ -543,6 +557,7 @@ async fn serve_connection<H>(
     max_calls: usize,
     limits: &Arc<std::sync::RwLock<WireLimits>>,
     inflight: &Arc<AtomicUsize>,
+    inflight_out: &Arc<AtomicUsize>,
     connection: quinn::Connection,
 ) where
     H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
@@ -567,11 +582,22 @@ async fn serve_connection<H>(
         let active = Arc::clone(active);
         let limits = Arc::clone(limits);
         let inflight = Arc::clone(inflight);
+        let inflight_out = Arc::clone(inflight_out);
         let peer = peer.clone();
         let endpoint = endpoint.clone();
         streams.spawn(async move {
             serve_stream(
-                &endpoint, handler, served, active, max_calls, limits, inflight, send, recv, peer,
+                &endpoint,
+                handler,
+                served,
+                active,
+                max_calls,
+                limits,
+                inflight,
+                inflight_out,
+                send,
+                recv,
+                peer,
             )
             .await;
         });
@@ -590,6 +616,7 @@ async fn serve_stream<H>(
     max_calls: usize,
     limits: Arc<std::sync::RwLock<WireLimits>>,
     inflight: Arc<AtomicUsize>,
+    inflight_out: Arc<AtomicUsize>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     peer: Option<PeerIdentity>,
@@ -759,6 +786,17 @@ async fn serve_stream<H>(
     // it grants parks `write_all` forever without this deadline. Reset the
     // stream instead of holding the task.
     // Send the bytes that were encoded under this server's profile: encoding
+    // Charge the encoded reply against one shared ceiling before it is held
+    // for a peer that may grant no flow-control credit; a reply that does not
+    // fit is withheld rather than parked (round 19, R-9#2).
+    let Some(_reply_budget) = ReplyBudget::try_reserve(&inflight_out, bytes.len()) else {
+        let error = Error::Provider {
+            code: "provider/reply-withheld".to_string(),
+        };
+        reply(&mut send, &Envelope::error(request_id, &error)).await;
+        finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
+        return;
+    };
     // again inside `reply` used the default profile (round 18, R16-6).
     reply_encoded(&mut send, &bytes).await;
     finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
@@ -921,6 +959,47 @@ impl Drop for CallGuard {
 /// Every reply path uses this: a peer that advertises a one-byte receive window
 /// and never reads parks `write_all` after the first byte, so an unbounded early
 /// error reply held the task (and its connection permit) forever.
+/// Reply bytes held while a peer's flow-control credit is exhausted.
+///
+/// The guard releases its share when the reply task ends, and the shared
+/// counter is the ceiling that keeps one peer from parking tens of GiB of
+/// encoded replies across its streams (round 19, R-9#2).
+struct ReplyBudget {
+    counter: Arc<AtomicUsize>,
+    amount: usize,
+}
+
+impl ReplyBudget {
+    fn try_reserve(counter: &Arc<AtomicUsize>, amount: usize) -> Option<Self> {
+        let mut current = counter.load(Ordering::SeqCst);
+        loop {
+            if current.saturating_add(amount) > MAX_INFLIGHT_BODY {
+                return None;
+            }
+            match counter.compare_exchange(
+                current,
+                current.saturating_add(amount),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        counter: Arc::clone(counter),
+                        amount,
+                    })
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ReplyBudget {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.amount, Ordering::SeqCst);
+    }
+}
+
 /// Write bytes that were already encoded under this server's profile.
 ///
 /// The success path encodes once (so the bytes on the wire obey `wire`) and

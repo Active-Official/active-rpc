@@ -47,6 +47,9 @@ pub const MAX_ERROR_BODY: usize = 64;
 /// `provider/reply-withheld` is here because a server decides it after its own
 /// handler ran: it is a provider class, not an authority decision, and a client
 /// that dropped it could never observe the contract (round 17, R16-4).
+/// How long a closing transport drains the peer before the socket drops.
+const DRAIN_GRACE_MS: u64 = 150;
+
 const PEER_REFUSAL_CLASSES: &[&str] = &[
     "rpc/transport",
     "rpc/backpressure",
@@ -263,6 +266,27 @@ impl TcpTransport {
         self
     }
 
+    /// Half-close and drain before the socket drops.
+    ///
+    /// A frame refused after its header leaves the announced body unread;
+    /// dropping the socket then sends RST, and the peer's stack discards the
+    /// refusal it has not read yet. Shutting the write half and reading until
+    /// the peer closes (bounded) makes the reply deliverable (round 19, R-9#1).
+    pub fn drain_before_close(&mut self) {
+        let _ = self.stream.get_ref().shutdown(std::net::Shutdown::Write);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(DRAIN_GRACE_MS);
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            if self.stream.get_ref().set_read_timeout(Some(left)).is_err() {
+                return;
+            }
+            let mut chunk = [0u8; 4096];
+            match std::io::Read::read(&mut self.stream, &mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    }
+
     /// Send one request and read its answer, which must belong to the call.
     ///
     /// A response echoes the request id and an error echoes it or carries id 0
@@ -298,7 +322,9 @@ impl TcpTransport {
     /// deadline, and a server that serves one connection at a time needs one on
     /// the accepted socket or its `--limit` is unreachable.
     pub fn connect_with_timeout(address: &str, timeout: std::time::Duration) -> Result<Self> {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(std::time::Instant::now);
         // Name resolution is bounded too, by the same helper the bridge uses:
         // a slow resolver used to park the caller past its own deadline and to
         // report every failure as "timed out" (round 11, R-09 #4).
@@ -380,7 +406,7 @@ impl Transport for TcpTransport {
         // stretch a frame (round 15, F-2).
         let deadline = self
             .frame_deadline
-            .map(|wait| std::time::Instant::now() + wait);
+            .and_then(|wait| std::time::Instant::now().checked_add(wait));
         if let Err(error) = write_frame_before(self.stream.get_mut(), &bytes, deadline) {
             // The header or the body (or part of either) may be on the wire, so
             // the peer's read position no longer matches a frame boundary.
@@ -402,7 +428,7 @@ impl Transport for TcpTransport {
         // outlive the deadline by its own timeout.
         let deadline = self
             .frame_deadline
-            .map(|wait| std::time::Instant::now() + wait);
+            .and_then(|wait| std::time::Instant::now().checked_add(wait));
 
         // Count what the read consumed: any error after a byte has been taken
         // leaves the inbound stream off a frame boundary, whether it was a
@@ -583,6 +609,7 @@ where
                         // in the buffer would turn the close into a reset that
                         // discards it anyway (round 18, R16-8).
                         if transport.send(&withheld).is_ok() {
+                            transport.drain_before_close();
                             return Ok(served + 1);
                         }
                         return Ok(served);
@@ -596,6 +623,9 @@ where
             Err(error) => {
                 let reply = Envelope::error(0, &error);
                 let _ = transport.send(&reply);
+                // The refused frame's body may still be unread; drain so the
+                // reply is not discarded by a reset (round 19, R-9#1).
+                transport.drain_before_close();
                 return Ok(served);
             }
         }

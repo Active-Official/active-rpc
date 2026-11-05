@@ -838,7 +838,7 @@ fn write_within(
     stream: &mut std::net::TcpStream,
     bytes: &[u8],
     deadline: std::time::Instant,
-) -> Result<()> {
+) -> Result<usize> {
     const CHUNK: usize = 4 << 10;
     let mut sent = 0usize;
     while sent < bytes.len() {
@@ -862,7 +862,7 @@ fn write_within(
             remaining_until(deadline)?;
         }
     }
-    Ok(())
+    Ok(sent)
 }
 
 /// A socket read that hit its timeout is the call's ceiling, not an I/O fault.
@@ -2078,10 +2078,15 @@ impl HttpTool {
         // Nothing has left yet; the head carries the method and the path, so
         // once it is written the peer may act (round 43, F-2).
         self.after_send = false;
-        write_within(&mut stream, head.as_bytes(), deadline)?;
-        self.after_send = true;
+        // A head written in chunks can fail after its first chunk: any byte on
+        // the wire means the peer may act, even though the line is incomplete
+        // (round 47, L-4).
+        let head_written = write_within(&mut stream, head.as_bytes(), deadline)?;
+        if head_written > 0 {
+            self.after_send = true;
+        }
         if let Some(body) = body {
-            write_within(&mut stream, body, deadline)?;
+            let _ = write_within(&mut stream, body, deadline)?;
         }
         stream.flush().map_err(map_http_write)?;
         let mut reader = DeadlineReader::new(stream, deadline);
@@ -2540,11 +2545,11 @@ impl Provider for HttpTool {
         };
         let grant = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
         let static_ceiling = self.max_body.min(MAX_RESPONSE_BYTES);
-        // The axis is the capability's method, not the resolution: get and
-        // head cannot change anything, so their 404 keeps its status, while
-        // `request` stays conservative and withholds whatever method text it
-        // carried — the same axis the kernel's `Provider::mutating` sees
-        // (round 43, F-1; round 45, finding 1).
+        // The axis is the capability's method, not the resolution: a `get`
+        // cannot change anything, so its 404 keeps its status, while `post`
+        // and `request` withhold whatever method text they carry - the same
+        // axis the kernel's `Provider::mutating` sees (round 43, F-1;
+        // round 45, finding 1; round 47, L-2).
         let mutating = self.mutating(&call.method);
         // Count admitted calls only (round 31, F7).
         self.calls += 1;
@@ -2857,10 +2862,24 @@ impl std::fmt::Debug for LocalProcess {
         for key in self.env.keys() {
             env.insert(key, "<redacted>");
         }
+        // An exact allowlist entry is the natural home of a fixed credential
+        // ("--api-key", "sk-...") while a prefix rule is configuration: only the
+        // rule's shape and an entry's length are printed (round 47, L-5).
+        let allow: Vec<String> = self
+            .allow_args
+            .iter()
+            .map(|rule| {
+                if rule.ends_with('*') {
+                    rule.clone()
+                } else {
+                    format!("<{} bytes>", rule.len())
+                }
+            })
+            .collect();
         formatter
             .debug_struct("LocalProcess")
             .field("program", &self.program)
-            .field("allow_args", &self.allow_args)
+            .field("allow_args", &allow)
             .field("env", &env)
             .field("workdir", &self.workdir)
             .field("max_output", &self.max_output)

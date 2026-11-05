@@ -21,8 +21,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-46: round 46 found 1 medium and 6 lows, all fixed or documented; round 47 must be clean | 311 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-18: round 18 found 1 high, 3 mediums and 6 lows; 6 fixed, 4 noted; round 19 must be clean | 139 fixed / 0 rejected / 12 noted (3 verification gaps in STATUS 17) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-47: round 47 found no critical/high/medium; 7 lows fixed) | 318 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-19: round 19 found 2 mediums and 8 lows; 5 fixed, 3 noted; rounds 20-21 must be clean | 144 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -586,6 +586,26 @@ mediums, two lows and one documentation fix.
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
 
+### R-09 transports - 2026-11-04 (round 19)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `7a184b1`. Round-18
+claims: all six HOLD, confirmed with probes. Verdict **NOT CLEAN**: two mediums and
+eight lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a refused frame whose announced body was still unread was followed by a plain drop, so the peer's stack got RST and discarded the error envelope; the caller saw a retryable transport fault | **fixed**: `TcpTransport::drain_before_close` half-closes and reads for up to 150 ms on the refusal paths; `a_refusal_survives_a_body_that_was_never_sent` fails pre-fix with `ConnectionReset` and passes with it |
+| 2 | medium | QUIC had no aggregate reply budget: a peer granting no flow-control credit could park encoded replies up to 256 streams × 256 connections for `STREAM_WAIT` | **fixed**: `ReplyBudget` charges the encoded reply against a shared `MAX_INFLIGHT_BODY` ceiling and withholds instead of parking |
+| 3 | low | `Instant::now() + wait` panics on an overflowing caller duration in three places | **fixed**: `checked_add` with a now fallback |
+| 4 | low | "frame does not fit the segment" was a retryable `rpc/transport` | **fixed**: `rpc/wire` |
+| 5 | low | the spec said a non-200 answer carries an `rpc/...` body, while a post-handler refusal carries `provider/reply-withheld` | **fixed**: both transport rows say so |
+| 6 | low | none of the round-18 fixes had a regression test | **partly**: the drain has one; a strict-profile server test and a credit-starved QUIC peer need custom peers |
+| 7 | low | the QUIC size branch is unreachable under the default profile | **noted**: it is the guard for a server started with a loosened `max_bytes` |
+| 8 | low | `reply_encoded` copies the encoded reply once more into the framed buffer | **noted**: one allocation per reply, bounded by the reply ceiling |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-09 transports - 2026-11-04 (round 18)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `c65203d`. Round-17
@@ -824,6 +844,30 @@ concurrent overshoot to observe.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 47, first clean pass)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `7a184b1`. Round-46
+claims: four HOLD. Verdict **CLEAN — no critical, high or medium remains**; seven
+lows, all fixed or documented here.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | `entropy_used`'s docblock still opened with `log`'s summary line, and the round-46 entry wrongly recorded it as correct | **fixed**: the line is gone; the record is corrected here |
+| 2 | low | the axis comment still said "get and head" while no `head` capability method exists | **fixed**: the comment names `get`, `post`, `request` |
+| 3 | low | `mcp/write:lost` had no test and the spec stated the withheld class unconditionally | **fixed**: the row says "a writable call"; `a_lost_write_ack_is_withheld_only_for_a_writable_call` |
+| 4 | low | `after_send` was set only after the whole head, so a head written in chunks could fail with bytes on the wire and still be reported pre-send | **fixed**: `write_within` returns the byte count and any written byte sets `after_send` |
+| 5 | low | `Debug for LocalProcess` printed exact allowlist entries, the natural home of a fixed credential | **fixed**: exact entries print their length, prefix rules stay visible |
+| 6 | low | the uniform refusal order lived only in this log | **fixed**: `wire.md` §5 states it |
+| 7 | low | the wasm module doc still described the pre-ABI-v2 import model | **fixed**: deny-by-default with explicit grants |
+
+Accepted residuals: a valid MCP `error` object keeps `mcp/<code>` on a writable
+call (the peer chooses a non-committal class); `request`+`GET` is over-conservative;
+the withheld mapping erases the adapter's class from metrics; Windows kills the
+leader only; `MAX_MCP_QUEUED_LINES` buffers before the grant check.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. R-08 needs one more clean round (48) to close.
 
 ### R-08 tools and MCP - 2026-11-04 (round 46)
 

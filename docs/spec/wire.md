@@ -240,6 +240,11 @@ A line past only the static 1 MiB ceiling is `rpc/invalid-argument` (a request) 
 session, including the grant one: before parsing, the client cannot tell an
 over-grant notification (whose answer is still queued) from the answer itself.
 
+Every adapter applies one refusal order - budget, payload, secret, scope,
+argument bytes, method - so the same malformed call reports the same first
+code whichever adapter it reached; a per-adapter order would fingerprint the
+handle and probe its policy.
+
 | Code | Condition |
 |------|-----------|
 | `mcp/bad-json` | the request line could not be serialised (client bug) |
@@ -261,7 +266,7 @@ over-grant notification (whose answer is still queued) from the answer itself.
 | `mcp/cwd` | the working directory could not be pinned |
 | `mcp/read:<err>`, `mcp/write:<err>`, `mcp/stdin`, `mcp/stdout` | transport I/O failed |
 | `mcp/write:closed` | the writer thread never took the frame (its queue was closed): the session is poisoned and the call is not reported as a withheld reply, because nothing left |
-| `mcp/write:lost` | the frame was handed to the writer, which then died before acknowledging it: the session is poisoned and the call is a withheld reply |
+| `mcp/write:lost` | the frame was handed to the writer, which then died before acknowledging it: the session is poisoned and a writable call is a withheld reply |
 | `mcp/thread:<err>` | a reader or writer thread could not start |
 | `mcp/<code>` | the server returned a JSON-RPC error; `<code>` is its numeric code |
 
@@ -430,8 +435,8 @@ transport must preserve when it forwards one:
 | TCP | `u32` length + envelope | cross-process, `MAX_FRAME_BYTES` = 64 MiB |
 | shared memory | `u32` length + envelope in a ring | borrowed frame reads via `with_frame` (the decoded envelope owns its payload) |
 | QUIC | `u32` length + envelope on one bi-directional stream, one stream per call | TLS with a self-signed certificate on loopback; `start_mutual_tls` verifies a client certificate and exposes the authenticated peer identity |
-| HTTP/2 | `POST /active.rpc.v1.Agent/Call`, body is the bare envelope, content type `application/arp1` | feature `http2`; one connection, concurrent streams; a non-200 answer carries an `rpc/...` body |
-| Connect/gRPC | HTTP/1.1 `POST /active.rpc.v1.Agent/Call`, body framed as `[0][len u32 BE][envelope]`, content type `application/connect+active-infinity` or `application/grpc+active-infinity` | a malformed frame is a `400` with an `rpc/...` body; HTTP/1.1, one request per connection |
+| HTTP/2 | `POST /active.rpc.v1.Agent/Call`, body is the bare envelope, content type `application/arp1` | feature `http2`; one connection, concurrent streams; a non-200 answer carries an `rpc/...` body, or `provider/reply-withheld` once the handler has run |
+| Connect/gRPC | HTTP/1.1 `POST /active.rpc.v1.Agent/Call`, body framed as `[0][len u32 BE][envelope]`, content type `application/connect+active-infinity` or `application/grpc+active-infinity` | a malformed frame is a `400` with an `rpc/...` body and a post-handler refusal carries `provider/reply-withheld`; HTTP/1.1, one request per connection |
 
 A malformed frame is always an error at the frame boundary: no transport retries,
 guesses or forwards a partially decoded envelope. A body that stops short of its

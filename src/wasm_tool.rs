@@ -1,10 +1,11 @@
 //! Fuel-metered WebAssembly guest tools.
 //!
-//! A guest runs in an interpreter with no host imports, a bounded linear
-//! memory and a fuel budget. The kernel still owns authority: the tool is only
-//! reachable through a minted capability, and a guest cannot reach the host at
-//! all in this build — any module that declares an import is refused before it
-//! runs.
+//! A guest runs in an interpreter with a bounded linear memory and a fuel
+//! budget. The kernel still owns authority: the tool is only reachable through
+//! a minted capability. Host imports are deny-by-default: a module that declares
+//! an import the build's WasmHostPolicy does not explicitly grant is refused
+//! before it runs, and a granted one is a single checked host function
+//! (clock, random, log), never a general host ABI.
 //!
 //! # ABI v1
 //!
@@ -14,8 +15,8 @@
 //! - The guest writes its output at offset `65536` and returns the output
 //!   length. A negative length, or one beyond the configured ceiling, is
 //!   refused.
-//! - The guest must not declare imports. Host functions become available only
-//!   through a future capability policy, never by default.
+//! - The guest must not declare an import that WasmHostPolicy does not grant;
+//!   a granted import is one of the checked host functions, never a general ABI.
 
 use crate::error::{Error, Result};
 use crate::kernel::Provider;
@@ -297,7 +298,6 @@ impl WasmTool {
         self.host
     }
 
-    /// The log the guest produced during the most recent call.
     /// Bytes of entropy the last call drew from the host.
     ///
     /// The cumulative per-call cap is the structural guard; the number is

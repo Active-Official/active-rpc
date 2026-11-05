@@ -214,3 +214,46 @@ fn a_strict_transport_refuses_to_send_a_frame_its_reader_rejects() {
     assert_eq!(error.code(), "rpc/wire", "{error}");
     drop(server);
 }
+
+/// A refusal whose frame body is still unread must reach the peer: dropping the
+/// socket would send RST and discard the error envelope (round 19, R-9#1).
+#[test]
+fn a_refusal_survives_a_body_that_was_never_sent() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let transport = TcpTransport::new(stream)
+            .expect("wrap")
+            .with_limits(WireLimits::strict());
+        serve_connection_within(
+            transport,
+            |envelope| Envelope::response(envelope.request_id, active_rpc::Value::Null),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        )
+    });
+    let mut client = std::net::TcpStream::connect(address).expect("connect");
+    // Announce a frame past the strict ceiling and send its body: the server
+    // refuses on the prefix alone, leaving the body unread.
+    // refuses on the prefix alone, with the announced body still unread.
+    let announced = (2 << 20) as u32;
+    client.write_all(&announced.to_le_bytes()).expect("prefix");
+    // Send the announced body too: it then sits unread in the server's
+    // receive buffer, which is what a plain drop turns into a reset.
+    client
+        .write_all(&vec![0u8; announced as usize])
+        .expect("the body queues");
+    let _ = client.flush();
+    let mut reader = std::io::BufReader::new(client);
+    let mut header = [0u8; 4];
+    reader
+        .read_exact(&mut header)
+        .expect("the refusal arrives instead of a reset");
+    let len = u32::from_le_bytes(header) as usize;
+    assert!(len > 0 && len < 4096, "a small error envelope: {len}");
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).expect("the error body");
+    let answer = Envelope::decode_with(&body, WireLimits::default()).expect("an envelope");
+    assert_eq!(answer.kind, active_rpc::wire::Kind::Error);
+    let _ = server.join();
+}
