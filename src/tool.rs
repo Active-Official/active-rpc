@@ -3354,7 +3354,9 @@ impl Provider for LocalProcess {
                 }
                 Err(_) => {
                     kill_process_tree(&mut child);
-                    return Err(Error::Timeout);
+                    // The child ran; the drain deadline is a withheld reply
+                    // (round 43, F-4).
+                    return Err(reply_withheld(Error::Timeout));
                 }
             }
         }
