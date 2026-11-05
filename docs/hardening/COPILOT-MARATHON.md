@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-43: round 43 found 5 highs, 1 medium and 4 lows, all fixed; round 44 must be clean | 290 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-15: round 15 found 2 mediums and 6 lows; 7 fixed, 1 noted; round 16 must be clean | 121 fixed / 0 rejected / 2 noted (3 verification gaps in STATUS 17) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-16: round 16 found 1 high, 2 mediums and 6 lows; 6 fixed, 3 noted; round 17 must be clean | 127 fixed / 0 rejected / 5 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -585,6 +585,33 @@ mediums, two lows and one documentation fix.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
+
+### R-09 transports - 2026-11-04 (round 16)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `92f6221`. Round-15
+claims: four HOLD, two HOLD-but-untested, one PARTIAL (the F-5 test could not fail
+pre-fix). Verdict **PARTIAL**: one high, two mediums, six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | every sender encoded with the default profile and checked only the byte ceiling, so a strict transport emitted a frame its own decoder refuses; the peer's `rpc/wire` is fatal and poisons the link | **fixed**: TCP, shared memory, the bridge, HTTP/2 and the QUIC client encode with their own `WireLimits`; `a_strict_transport_refuses_to_send_a_frame_its_reader_rejects` fails pre-fix; `wire.md` §6 states the rule |
+| 2 | medium | the QUIC client hard-bound `127.0.0.1:0` and required a numeric address, so the documented off-host mutual-TLS deployment could not connect | **fixed**: the target resolves (IPv4 preferred for a dual-stack name) and the endpoint binds the wildcard of its family; `a_quic_client_accepts_a_hostname` |
+| 3 | medium | the round-15 F-5 test asserted a 700 ms bound that the pre-fix code also met, so it proved nothing | **partly**: the test now asserts the error class and a 450 ms bound with a 300 ms deadline and a 250 ms drip; on this host the pre-fix code also met it, so it pins the property rather than proving the fix — stated rather than faked |
+| 4 | low | the round-15 poison on a failed read-deadline re-arm was dropped when the re-arm moved into `Counted` | **fixed**: restored through `Counted::rearm_failed` |
+| 5 | low | the bridge's success path did not drain before close, unlike every refusal path, so Windows could reset the 200 | **fixed**: `drain_before_close` on the success path |
+| 6 | low | HTTP/2's post-handler refusals (connection budget, oversize reply) used `rpc/transport` and `rpc/wire` for a call that had already run | **fixed**: both are `provider/reply-withheld`, the class the caller's kernel treats as an effect that stands |
+| 7 | low | the server reply budget (2.25 s) exceeds the client's whole-request default (2 s) | **noted**: the reply phase is bounded on the client by its own `with_deadline`; a shorter reply than the request's is the client's choice |
+| 8 | low | the write side's frame deadline was undocumented | **fixed**: `wire.md` §6 states that the deadline bounds the whole write and a slow link must raise it |
+| 9 | low | the round-15 QUIC close-on-refusal path has no test of its own | **noted**: the path shares `finish_call` with the tested admitted path, and reproducing the credit-starved peer needs a custom QUIC test peer |
+
+Accepted residuals: a post-delivery failure is still a retryable class where a
+reply was lost after the effect (noted for M-7); the in-flight budgets count
+payload bytes while a `Vec` can transiently double; the shared-memory
+`Transport` self-echo is noted for M-7; `Instant::now() + wait` panics on an
+overflowing caller duration.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9; the full suite also run on Linux in the `rust:1.98` container.
 
 ### R-09 transports - 2026-11-04 (round 15)
 

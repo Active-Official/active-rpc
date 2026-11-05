@@ -6,7 +6,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 
 use active_rpc::transport::{serve_connection_within, TcpTransport, Transport};
-use active_rpc::wire::Envelope;
+use active_rpc::value::{Arg, Value};
+use active_rpc::wire::{Envelope, WireLimits};
 
 fn frame(body: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(body.len() + 4);
@@ -153,7 +154,9 @@ fn a_slow_handler_does_not_freeze_the_runtime() {
 
 /// A peer that drips one byte just inside each socket timeout must not win a
 /// second full deadline: the remaining frame time is re-armed before every read
-/// (round 15, F-5).
+/// (round 15, F-5). Three bytes at 0/100/200 ms then silence: the re-armed read
+/// fails at the 300 ms deadline, while a single arming blocks a further 300 ms
+/// and returns at about 500 ms (round 16, F-3).
 #[test]
 fn a_dripped_frame_does_not_get_a_second_deadline() {
     use std::time::{Duration, Instant};
@@ -162,8 +165,7 @@ fn a_dripped_frame_does_not_get_a_second_deadline() {
     let address = listener.local_addr().expect("address");
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        // A four-byte length prefix, one byte every 100 ms, then nothing.
-        for _ in 0..4 {
+        for _ in 0..2 {
             if stream.write_all(&[0u8]).is_err() {
                 return;
             }
@@ -173,16 +175,42 @@ fn a_dripped_frame_does_not_get_a_second_deadline() {
         std::thread::sleep(Duration::from_secs(2));
     });
     let stream = std::net::TcpStream::connect(address).expect("connect");
-    let mut client = TcpTransport::with_timeout(stream, Duration::from_millis(150))
+    let mut client = TcpTransport::with_timeout(stream, Duration::from_millis(300))
         .expect("a deadline-carrying transport");
     let started = Instant::now();
-    client
+    let error = client
         .recv()
         .expect_err("the frame deadline bounds the whole frame");
     let elapsed = started.elapsed();
+    assert_eq!(error.code(), "rpc/transport", "{error}");
     assert!(
-        elapsed < Duration::from_millis(700),
-        "a 150 ms frame deadline took {elapsed:?} against a dripping peer"
+        elapsed < Duration::from_millis(450),
+        "a 300 ms frame deadline took {elapsed:?} against a dripping peer"
     );
+    drop(server);
+}
+/// A sender enforces the same profile its reader does: a strict transport must
+/// not emit a frame its own decoder refuses, or one honest mismatch poisons the
+/// session (round 16, F-1).
+#[test]
+fn a_strict_transport_refuses_to_send_a_frame_its_reader_rejects() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (_stream, _) = listener.accept().expect("accept");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    });
+    let stream = std::net::TcpStream::connect(address).expect("connect");
+    let mut client = TcpTransport::new(stream)
+        .expect("a transport")
+        .with_limits(WireLimits::strict());
+    let args = (0..100)
+        .map(|index| Arg::Value(Value::Int(index)))
+        .collect();
+    let envelope = Envelope::request(1, "big", args);
+    let error = client
+        .send(&envelope)
+        .expect_err("its own reader refuses this frame");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
     drop(server);
 }

@@ -359,7 +359,7 @@ impl Transport for TcpTransport {
                 "the connection is poisoned by a partial frame".to_string(),
             ));
         }
-        let bytes = envelope.encode()?;
+        let bytes = envelope.encode_with_limits(self.limits)?;
         // The transport's own limits bound what it sends, as they bound what it
         // reads: a strict peer must refuse locally instead of writing a frame
         // it would itself reject (round 9, R-09 #11).
@@ -405,6 +405,7 @@ impl Transport for TcpTransport {
             inner: &'a mut BufReader<TcpStream>,
             read: usize,
             deadline: Option<std::time::Instant>,
+            rearm_failed: bool,
         }
         impl std::io::Read for Counted<'_> {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -426,6 +427,7 @@ impl Transport for TcpTransport {
                         ));
                     }
                     if let Err(error) = self.inner.get_ref().set_read_timeout(Some(remaining)) {
+                        self.rearm_failed = true;
                         return Err(std::io::Error::other(format!("read deadline: {error}")));
                     }
                 }
@@ -438,8 +440,15 @@ impl Transport for TcpTransport {
             inner: &mut self.stream,
             read: 0,
             deadline,
+            rearm_failed: false,
         };
         let result = read_frame_before(&mut counted, &self.limits, deadline);
+        if counted.rearm_failed {
+            // The socket refused the deadline the caller asked for: the frame is
+            // not where the reader thinks it is (round 14, F-8; restored in round
+            // 16, F-5).
+            self.recv_poisoned = true;
+        }
         let consumed = counted.read;
         let body = match result {
             Ok(Some(body)) => body,

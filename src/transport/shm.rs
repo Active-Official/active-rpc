@@ -335,7 +335,7 @@ impl Transport for SharedMemoryTransport {
     }
 
     fn send(&mut self, envelope: &Envelope) -> Result<()> {
-        let bytes = envelope.encode()?;
+        let bytes = envelope.encode_with_limits(self.limits)?;
         // The segment framing carries a 32-bit length and the peer reads at
         // most `MAX_FRAME_BYTES`: a larger `limits` must not emit a frame no
         // reader accepts (round 10, R-09 #7).

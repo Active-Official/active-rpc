@@ -1027,11 +1027,35 @@ impl QuicClient {
             .enable_all()
             .build()
             .map_err(|error| Error::Transport(format!("runtime: {error}")))?;
-        let address: SocketAddr = address
-            .parse()
-            .map_err(|_| Error::Transport("invalid QUIC address".to_string()))?;
+        // A hostname is resolved like the bridge's, and the client endpoint binds
+        // the wildcard of the destination family: a hard 127.0.0.1:0 made the
+        // documented off-host mutual-TLS deployment unreachable (round 16, F-2).
+        let address = match address.parse::<SocketAddr>() {
+            Ok(address) => address,
+            Err(_) => {
+                let deadline = std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(std::time::Instant::now);
+                let resolved = crate::transport::connect::resolve_within(address, deadline)?;
+                // Prefer IPv4 when a name publishes both families: a dual-stack
+                // name resolves to `::1`-style addresses first on some hosts,
+                // and a listener documented as `0.0.0.0:port` would never answer
+                // (round 16, F-2).
+                resolved
+                    .iter()
+                    .find(|address| address.is_ipv4())
+                    .or_else(|| resolved.first())
+                    .copied()
+                    .ok_or_else(|| Error::Transport(format!("no address for {address}")))?
+            }
+        };
+        let bind = if address.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         let mut endpoint = runtime
-            .block_on(async { quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback")) })
+            .block_on(async { quinn::Endpoint::client(bind.parse().expect("a static wildcard")) })
             .map_err(|error| Error::Transport(format!("client endpoint: {error}")))?;
         endpoint.set_default_client_config(client_config);
         Ok(QuicClient {
@@ -1052,7 +1076,10 @@ impl QuicClient {
 
     /// Send one call and read the response.
     pub fn call(&self, envelope: &Envelope) -> Result<Envelope> {
-        let bytes = envelope.encode()?;
+        // Every limit the client's profile enforces, not only the byte ceiling:
+        // a strict client that emitted a frame its own decoder refuses would
+        // poison the session (round 16, F-1).
+        let bytes = envelope.encode_with_limits(self.limits)?;
         // The client's own limits bound what it sends, as they bound what it
         // reads (round 9, R-09 #11).
         if bytes.len() > self.limits.max_bytes.min(MAX_FRAME_BYTES) {

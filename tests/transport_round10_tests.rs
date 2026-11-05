@@ -289,3 +289,31 @@ fn a_quic_error_id_zero_is_accepted_and_another_id_is_not() {
     drop(client);
     zero_response.shutdown();
 }
+
+/// A hostname target resolves and the client endpoint binds the destination's
+/// family, so the documented off-host mutual-TLS deployment is reachable
+/// (round 16, F-2).
+#[cfg(feature = "quic")]
+#[test]
+fn a_quic_client_accepts_a_hostname() {
+    use active_rpc::transport::quic::{QuicClient, QuicServer};
+
+    let server = QuicServer::start(1, |envelope| {
+        Envelope::response(envelope.request_id, active_rpc::Value::Null)
+    })
+    .expect("server");
+    let port = server
+        .address()
+        .rsplit(':')
+        .next()
+        .expect("a port")
+        .to_string();
+    let hostport = format!("localhost:{port}");
+    let client = QuicClient::connect(&hostport, server.certificate()).expect("a hostname resolves");
+    let answer = client
+        .call(&Envelope::request(1, "ping", Vec::new()))
+        .expect("the hostname target answers");
+    assert_eq!(answer.request_id, 1);
+    drop(client);
+    server.shutdown();
+}

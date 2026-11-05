@@ -532,8 +532,12 @@ impl BridgeServer {
             .checked_add(CONNECTION_WAIT)
             .unwrap_or_else(std::time::Instant::now);
         // A peer that never read the response was not served; counting it would
-        // make --limit and the served metric lie.
-        u64::from(write_http_response(&mut stream, 200, &framed, response_deadline).is_ok())
+        // make --limit and the served metric lie. The success path drains like
+        // every refusal path: on Windows a plain drop with queued bytes can
+        // reset the connection and discard the 200 (round 16, F-6).
+        let served = write_http_response(&mut stream, 200, &framed, response_deadline).is_ok();
+        drain_before_close(&mut stream);
+        u64::from(served)
     }
 }
 
@@ -807,7 +811,7 @@ impl ConnectClient {
 
     /// Call the bridge with one envelope.
     pub fn call(&mut self, envelope: &Envelope) -> Result<Envelope> {
-        let body = envelope.encode()?;
+        let body = envelope.encode_with_limits(self.limits)?;
         if body.len() > MAX_BODY.min(self.limits.max_bytes) {
             // The frame boundary refuses this body; framing it first would hit
             // the release invariant as a panic (round 27, medium).

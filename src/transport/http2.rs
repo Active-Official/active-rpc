@@ -554,19 +554,24 @@ where
     // keeps its body charged (round 29, high).
     let held = reservation.held();
     if !reservation.reserve(encoded.len().saturating_sub(held), inflight_budget) {
-        // The handler has run and the kernel charged it; a retryable class
-        // would tell the caller to repeat a call that already took effect
-        // (round 30, M-2). `rpc/transport` is not retried.
+        // The handler has run and the kernel charged it: the reply was
+        // withheld, which is the class the caller's kernel treats as an effect
+        // that stands (round 30, M-2; round 16, F-7).
         return respond_status(
             &mut respond,
             StatusCode::INTERNAL_SERVER_ERROR,
-            b"rpc/transport",
+            b"provider/reply-withheld",
         );
     }
     if encoded.len() > MAX_BODY.min(limits.max_bytes) {
         // The bridge answers 413 past its ceiling; the HTTP/2 server streamed
-        // whatever the kernel produced (round 26, #5).
-        return respond_status(&mut respond, StatusCode::PAYLOAD_TOO_LARGE, b"rpc/wire");
+        // whatever the kernel produced (round 26, #5). The handler ran, so the
+        // class is a withheld reply (round 16, F-7).
+        return respond_status(
+            &mut respond,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            b"provider/reply-withheld",
+        );
     }
     respond_body(respond, encoded, connection_deadline).await
 }
@@ -821,7 +826,7 @@ impl Http2Client {
 
     /// Send one call and decode the response.
     pub fn call(&mut self, envelope: &Envelope) -> Result<Envelope> {
-        let body = envelope.encode()?;
+        let body = envelope.encode_with_limits(self.limits)?;
         let (status, response) = self.request(PATH, CONTENT_TYPE, &[], &body)?;
         if status != StatusCode::OK {
             return Err(refusal(&response));
@@ -844,7 +849,7 @@ impl Http2Client {
     pub fn call_many(&mut self, envelopes: &[Envelope]) -> Result<Vec<Envelope>> {
         let mut payloads = Vec::with_capacity(envelopes.len());
         for envelope in envelopes {
-            let payload = envelope.encode()?;
+            let payload = envelope.encode_with_limits(self.limits)?;
             self.check_body(&payload)?;
             payloads.push(payload);
         }

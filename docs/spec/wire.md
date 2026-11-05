@@ -436,6 +436,10 @@ caller that retried a mutating call would execute it twice. A frame that reaches
 the decoder intact but fails to decode also ends the session on TCP; a caller
 that ignores the error must not read the next frame as if the peer were healthy.
 
+Both ends of a transport enforce the same profile: a sender encodes with its own
+`WireLimits` (`encode_with_limits`), so a strict transport refuses to emit a
+frame its own decoder would reject instead of poisoning the link.
+
 An answer must belong to its call. A response echoes the request id; an error
 echoes it or carries id `0`, which is the id a peer writes when the frame was
 refused before its id could be read. `TcpTransport::call`, `QuicClient::call`,
@@ -447,7 +451,11 @@ request/response pairing, so it offers `send`/`recv` only.
 A served TCP connection has a total lifetime (`DEFAULT_CONNECTION_LIFETIME`, ten
 minutes) as well as a per-frame deadline: a peer that sends a valid frame just
 inside every per-frame deadline must not hold a serial server forever.
-`serve_connection_within` takes an explicit deadline.
+`serve_connection_within` takes an explicit deadline. The frame deadline
+(`with_timeout`, default 30 s) bounds the whole **write** of one frame as well as
+one read, re-armed before each call: a maximum-size frame therefore needs the
+link to carry it inside the deadline, and a slow link must raise it with
+`with_timeout` rather than assume the ceiling alone governs.
 
 A refusal decided after the request reached the peer is a **withheld reply** for
 a call that could have changed something: the tool may have run, so the caller
