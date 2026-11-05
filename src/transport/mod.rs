@@ -231,9 +231,15 @@ impl TcpTransport {
         // A default bound: a blocking `read` or `write_vectored` on a peer that
         // accepted and then went silent parked a serial server forever. The
         // other transports have a bound (bridge 2 s, QUIC 10 s, HTTP/2 60 s);
-        // `with_timeout` still tightens this one (round 10, R-09 #2).
-        let _ = stream.set_read_timeout(Some(DEFAULT_FRAME_WAIT));
-        let _ = stream.set_write_timeout(Some(DEFAULT_FRAME_WAIT));
+        // `with_timeout` still tightens this one (round 10, R-09 #2). A socket
+        // that cannot carry a timeout is refused rather than used blocking
+        // (round 13, R-09 #5).
+        stream
+            .set_read_timeout(Some(DEFAULT_FRAME_WAIT))
+            .map_err(|error| Error::Transport(format!("read timeout: {error}")))?;
+        stream
+            .set_write_timeout(Some(DEFAULT_FRAME_WAIT))
+            .map_err(|error| Error::Transport(format!("write timeout: {error}")))?;
         Ok(Self {
             stream: BufReader::with_capacity(TCP_READ_BUFFER, stream),
             inbox: VecDeque::new(),
@@ -249,6 +255,27 @@ impl TcpTransport {
     pub fn with_limits(mut self, limits: WireLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Send one request and read its answer, which must belong to the call.
+    ///
+    /// A response echoes the request id and an error echoes it or carries id 0
+    /// (the frame was refused before the id could be read). A relay, or an
+    /// attacker on a plaintext connection, that replays another call's answer
+    /// is refused with `rpc/wire` instead of being handed to the caller as this
+    /// call's result (round 13, R-09 #3). `send`/`recv` stay available for
+    /// protocols that do their own matching.
+    pub fn call(&mut self, envelope: &Envelope) -> Result<Envelope> {
+        self.send(envelope)?;
+        let Some(answer) = self.recv()? else {
+            return Err(Error::Transport(
+                "the peer closed before answering".to_string(),
+            ));
+        };
+        if !answer.answers(envelope.request_id) {
+            return Err(Error::Wire("the answer belongs to another request"));
+        }
+        Ok(answer)
     }
 
     /// Connect to a peer.
@@ -405,7 +432,17 @@ impl Transport for TcpTransport {
                 return Err(error);
             }
         };
-        Ok(Some(Envelope::decode_with(&body, self.limits)?))
+        Ok(Some(match Envelope::decode_with(&body, self.limits) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                // A frame whose body decodes badly is a protocol fault like a
+                // malformed frame: the session must not be reused as if the
+                // peer were healthy after its caller ignored the error
+                // (round 13, R-09 #2).
+                self.recv_poisoned = true;
+                return Err(error);
+            }
+        }))
     }
 
     fn bytes_written(&self) -> u64 {
@@ -421,17 +458,49 @@ pub fn frame(len: usize) -> Result<[u8; 4]> {
     Ok((len as u32).to_le_bytes())
 }
 
+/// How long one served connection may live before the loop stops reading.
+///
+/// The per-frame deadline bounds one stalled read; without a total bound a peer
+/// that sends a valid frame just inside every deadline holds a serial server
+/// forever and starves every other peer. Ten minutes leaves a long-lived
+/// session its run and bounds the starvation (round 13, R-09 #4).
+pub const DEFAULT_CONNECTION_LIFETIME: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
 /// Serve one connection: read envelopes and answer each with `handler`.
 ///
 /// A frame error or a broken socket ends *this* connection, not the server: the
 /// reply carries the stable code and the call returns the count served so far.
 /// A caller that is serving many connections keeps accepting.
-pub fn serve_connection<H>(mut transport: TcpTransport, mut handler: H) -> Result<u64>
+pub fn serve_connection<H>(transport: TcpTransport, handler: H) -> Result<u64>
+where
+    H: FnMut(Envelope) -> Envelope,
+{
+    let deadline = std::time::Instant::now()
+        .checked_add(DEFAULT_CONNECTION_LIFETIME)
+        .unwrap_or_else(std::time::Instant::now);
+    serve_connection_within(transport, handler, Some(deadline))
+}
+
+/// [`serve_connection`] with an explicit connection deadline.
+///
+/// `None` removes the total bound; the per-frame deadline still applies.
+pub fn serve_connection_within<H>(
+    mut transport: TcpTransport,
+    mut handler: H,
+    deadline: Option<std::time::Instant>,
+) -> Result<u64>
 where
     H: FnMut(Envelope) -> Envelope,
 {
     let mut served = 0u64;
     loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            // The connection outlived its budget: stop reading. The caller
+            // accepts the next peer instead of serving this one forever
+            // (round 13, R-09 #4).
+            return Ok(served);
+        }
         match transport.recv() {
             Ok(Some(envelope)) => {
                 // A response or error envelope is not a call. Refusing it at the

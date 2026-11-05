@@ -809,3 +809,33 @@ fn grpc_frame_refuses_a_message_past_its_ceiling() {
     let error = grpc_frame(&huge).expect_err("past the ceiling");
     assert_eq!(error.code(), "rpc/wire", "{error}");
 }
+
+/// A body that stops short of its declared length is a framing fault, not a
+/// retryable network condition: retrying a mutating call because the answer was
+/// truncated would execute it twice (round 13, R-09 #1).
+#[test]
+fn a_truncated_bridge_response_is_a_wire_fault() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut sink = [0u8; 4096];
+        let _ = stream.read(&mut sink);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4096\r\nconnection: close\r\n\r\nshort")
+            .expect("write");
+        let _ = stream.flush();
+        // Keep the socket open until the client gave up, so the short body is a
+        // truncation and not an end-of-stream the reader could explain away.
+        let mut tail = [0u8; 1024];
+        let _ = stream.read(&mut tail);
+    });
+    let mut client = ConnectClient::connect(&address).expect("connect");
+    let error = client
+        .call(&request(21, "echo", Vec::new()))
+        .expect_err("the body is shorter than declared");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+    server.join().expect("server");
+}

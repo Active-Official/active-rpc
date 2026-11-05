@@ -1002,9 +1002,11 @@ impl ConnectClient {
             response.extend_from_slice(&chunk[..read]);
         }
         if response.len() != length {
-            return Err(Error::Transport(
-                "response body is shorter than declared".to_string(),
-            ));
+            // A body that stops short of its declared length is a framing
+            // fault, not a retryable network condition: retrying a mutating
+            // call because the answer was truncated would execute it twice
+            // (round 13, R-09 #1).
+            return Err(Error::Wire("response body is shorter than declared"));
         }
         Ok((status, response))
     }

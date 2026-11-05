@@ -191,3 +191,101 @@ fn a_quic_answer_must_belong_to_the_call() {
         .expect_err("a request is not an answer");
     assert_eq!(error.code(), "rpc/wire", "{error}");
 }
+
+/// A server whose budget is spent must not close the endpoint while an admitted
+/// call is still answering: the first stream to finish used to close it and
+/// abort the other connection's reply (round 47; a CI flake in the mutual-TLS
+/// identity test).
+#[cfg(feature = "quic")]
+#[test]
+fn the_last_admitted_call_closes_the_server_not_the_first_to_finish() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    use active_rpc::transport::quic::{QuicClient, QuicServer};
+    use active_rpc::wire::Kind;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let server = QuicServer::start(2, move |envelope: Envelope| {
+        // Both calls are admitted before either answers. The first handler call
+        // holds the endpoint open while the second is queued behind the handler
+        // mutex, and the second then waits past the first call's close so a
+        // premature shutdown is not a race but a certain lost reply.
+        match handler_calls.fetch_add(1, Ordering::SeqCst) {
+            0 => std::thread::sleep(std::time::Duration::from_millis(150)),
+            _ => std::thread::sleep(std::time::Duration::from_millis(300)),
+        }
+        Envelope::response(envelope.request_id, active_rpc::Value::Null)
+    })
+    .expect("server");
+    let clients = (0..2)
+        .map(|_| QuicClient::connect(server.address(), server.certificate()).expect("client"))
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut threads = Vec::new();
+    for (index, client) in clients.into_iter().enumerate() {
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            let answer = client
+                .call(&Envelope::request(index as u64 + 1, "ping", Vec::new()))
+                .expect("every admitted call is answered");
+            assert_eq!(answer.kind, Kind::Response);
+        }));
+    }
+    for thread in threads {
+        thread.join().expect("client thread");
+    }
+    server.shutdown();
+}
+
+/// An error may carry id 0, the id a peer writes when the frame was refused
+/// before its id could be read. An error for another call and a response with
+/// id 0 are not answers to this call (round 13, R-09 #6).
+#[cfg(feature = "quic")]
+#[test]
+fn a_quic_error_id_zero_is_accepted_and_another_id_is_not() {
+    use active_rpc::transport::quic::{QuicClient, QuicServer};
+    use active_rpc::wire::Kind;
+    use active_rpc::Error as RpcError;
+
+    let unreadable = QuicServer::start(1, |_envelope| {
+        Envelope::error(0, &RpcError::Wire("the frame could not be read"))
+    })
+    .expect("server");
+    let client =
+        QuicClient::connect(unreadable.address(), unreadable.certificate()).expect("client");
+    let answer = client
+        .call(&Envelope::request(7, "ping", Vec::new()))
+        .expect("id 0 is legal for an error");
+    assert_eq!(answer.kind, Kind::Error);
+    drop(client);
+    unreadable.shutdown();
+
+    let for_another = QuicServer::start(1, |_envelope| {
+        Envelope::error(8, &RpcError::Wire("another call"))
+    })
+    .expect("server");
+    let client =
+        QuicClient::connect(for_another.address(), for_another.certificate()).expect("client");
+    let error = client
+        .call(&Envelope::request(7, "ping", Vec::new()))
+        .expect_err("an error for another call is refused");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+    drop(client);
+    for_another.shutdown();
+
+    let zero_response = QuicServer::start(1, |_envelope| {
+        Envelope::response(0, active_rpc::Value::Null)
+    })
+    .expect("server");
+    let client =
+        QuicClient::connect(zero_response.address(), zero_response.certificate()).expect("client");
+    let error = client
+        .call(&Envelope::request(7, "ping", Vec::new()))
+        .expect_err("a response with id 0 is refused");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+    drop(client);
+    zero_response.shutdown();
+}

@@ -35,7 +35,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use crate::error::{Error, Result};
 use crate::identity::PeerIdentity;
 use crate::transport::{frame, read_frame, MAX_FRAME_BYTES};
-use crate::wire::{Envelope, Kind, WireLimits};
+use crate::wire::{Envelope, WireLimits};
 
 /// A running QUIC server.
 pub struct QuicServer {
@@ -489,6 +489,11 @@ async fn serve<H>(
     H: FnMut(Envelope, Option<PeerIdentity>) -> Envelope + Send + 'static,
 {
     let served = Arc::new(AtomicUsize::new(0));
+    // Calls admitted and not yet answered. The endpoint closes when the budget
+    // is spent *and* this reaches zero: closing on the first stream that
+    // finished aborted a concurrent call's reply on another connection
+    // (round 47; a CI flake in `quic_dispatches_a_bound_capability_only_for_the_bound_peer`).
+    let active = Arc::new(AtomicUsize::new(0));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     // Body bytes every live stream holds, across every connection.
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -511,6 +516,7 @@ async fn serve<H>(
         let endpoint = endpoint.clone();
         let limits = Arc::clone(&limits);
         let inflight = Arc::clone(&inflight);
+        let active = Arc::clone(&active);
         tokio::spawn(async move {
             let _permit = permit;
             let Ok(connection) = tokio::time::timeout(HANDSHAKE_WAIT, incoming).await else {
@@ -521,7 +527,7 @@ async fn serve<H>(
                 Err(_) => return,
             };
             serve_connection(
-                &endpoint, &handler, &served, max_calls, &limits, &inflight, connection,
+                &endpoint, &handler, &served, &active, max_calls, &limits, &inflight, connection,
             )
             .await;
         });
@@ -533,6 +539,7 @@ async fn serve_connection<H>(
     endpoint: &quinn::Endpoint,
     handler: &Arc<Mutex<H>>,
     served: &Arc<AtomicUsize>,
+    active: &Arc<AtomicUsize>,
     max_calls: usize,
     limits: &Arc<std::sync::RwLock<WireLimits>>,
     inflight: &Arc<AtomicUsize>,
@@ -552,13 +559,14 @@ async fn serve_connection<H>(
         };
         let handler = Arc::clone(handler);
         let served = Arc::clone(served);
+        let active = Arc::clone(active);
         let limits = Arc::clone(limits);
         let inflight = Arc::clone(inflight);
         let peer = peer.clone();
         let endpoint = endpoint.clone();
         streams.spawn(async move {
             serve_stream(
-                &endpoint, handler, served, max_calls, limits, inflight, send, recv, peer,
+                &endpoint, handler, served, active, max_calls, limits, inflight, send, recv, peer,
             )
             .await;
         });
@@ -573,6 +581,7 @@ async fn serve_stream<H>(
     endpoint: &quinn::Endpoint,
     handler: Arc<Mutex<H>>,
     served: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
     max_calls: usize,
     limits: Arc<std::sync::RwLock<WireLimits>>,
     inflight: Arc<AtomicUsize>,
@@ -662,7 +671,8 @@ async fn serve_stream<H>(
             if current >= max_calls {
                 let error = Error::Transport("the server has served its calls".to_string());
                 reply(&mut send, &Envelope::error(envelope.request_id, &error)).await;
-                endpoint.close(0u32.into(), b"served");
+                // No close here: an admitted call may still be running, and the
+                // last one to finish closes the endpoint (round 47).
                 return;
             }
             match served.compare_exchange(
@@ -676,6 +686,13 @@ async fn serve_stream<H>(
             }
         }
     }
+    active.fetch_add(1, Ordering::SeqCst);
+    // The guard decrements when this stream finishes on any path; the last one
+    // to end closes the endpoint.
+    let mut call = CallGuard {
+        active: Arc::clone(&active),
+        finished: false,
+    };
     let request_id = envelope.request_id;
     let response = {
         let mut handler = match handler.lock() {
@@ -699,11 +716,13 @@ async fn serve_stream<H>(
         Ok(bytes) if bytes.len() > wire.max_bytes.min(MAX_FRAME_BYTES) => {
             let error = Error::Wire("response exceeds the size ceiling");
             reply(&mut send, &Envelope::error(request_id, &error)).await;
+            finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
             return;
         }
         Ok(_) => {}
         Err(error) => {
             reply(&mut send, &Envelope::error(request_id, &error)).await;
+            finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
             return;
         }
     }
@@ -711,10 +730,24 @@ async fn serve_stream<H>(
     // it grants parks `write_all` forever without this deadline. Reset the
     // stream instead of holding the task.
     reply(&mut send, &response).await;
-    if max_calls != 0 && served.load(Ordering::SeqCst) >= max_calls {
-        // Give the peer a moment to drain the stream before the endpoint
-        // closes; closing first would abort the response.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped()).await;
+    finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
+}
+
+/// Decrement the running count and, when the budget is spent and this was the
+/// last admitted call, let the peer read the reply before closing the endpoint.
+///
+/// Every post-admission return path ends here, so an early refusal cannot leave
+/// the server waiting for a close that never comes.
+async fn finish_call(
+    call: &mut CallGuard,
+    served: &Arc<AtomicUsize>,
+    max_calls: usize,
+    send: &mut quinn::SendStream,
+    endpoint: &quinn::Endpoint,
+) {
+    let running = call.finish();
+    if max_calls != 0 && served.load(Ordering::SeqCst) >= max_calls && running == 0 {
+        let _ = tokio::time::timeout(DRAIN_BEFORE_CLOSE, send.stopped()).await;
         endpoint.close(0u32.into(), b"served");
     }
 }
@@ -826,6 +859,37 @@ async fn read_frame_body(
 /// Every reply path uses this: a peer that advertises a one-byte receive window
 /// and never reads parks `write_all` after the first byte, so an unbounded early
 /// error reply held the task (and its connection permit) forever.
+/// How long the last served call waits for its peer to read the reply.
+const DRAIN_BEFORE_CLOSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Counts one admitted call, and closes the endpoint from the last one to end.
+///
+/// The serving task must outlive every admitted call even when its budget is
+/// already spent: closing in the stream that happened to finish first aborted a
+/// concurrent call's reply on another connection (round 47; seen as a CI flake
+/// in `quic_dispatches_a_bound_capability_only_for_the_bound_peer`). `finish`
+/// reports how many admitted calls are still running, so only the last one
+/// closes.
+struct CallGuard {
+    active: Arc<AtomicUsize>,
+    finished: bool,
+}
+
+impl CallGuard {
+    fn finish(&mut self) -> usize {
+        self.finished = true;
+        self.active.fetch_sub(1, Ordering::SeqCst).saturating_sub(1)
+    }
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 async fn reply(send: &mut quinn::SendStream, response: &Envelope) {
     let written = tokio::time::timeout(STREAM_WAIT, async {
         if send_envelope(send, response).await.is_err() {
@@ -992,12 +1056,7 @@ impl QuicClient {
         // An error carries id 0 when the server could not read the frame at
         // all (the length prefix is refused before there is an id to echo), so
         // that id is legal for an error and only there.
-        let belongs = match answer.kind {
-            Kind::Response => answer.request_id == envelope.request_id,
-            Kind::Error => answer.request_id == envelope.request_id || answer.request_id == 0,
-            _ => false,
-        };
-        if !belongs {
+        if !answer.answers(envelope.request_id) {
             return Err(Error::Wire("the QUIC answer belongs to another request"));
         }
         Ok(answer)

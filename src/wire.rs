@@ -514,6 +514,20 @@ impl Envelope {
         }
     }
 
+    /// Whether this envelope is the answer to `request_id`.
+    ///
+    /// A response must echo the id. An error may carry id `0`, the id a peer
+    /// writes when the frame was refused before it could be decoded far enough
+    /// to learn the caller's id. A request, or another call's answer, is never
+    /// this call's answer (round 13, R-09 #3).
+    pub fn answers(&self, request_id: u64) -> bool {
+        match self.kind {
+            Kind::Response => self.request_id == request_id,
+            Kind::Error => self.request_id == request_id || self.request_id == 0,
+            _ => false,
+        }
+    }
+
     /// Attach a capability-table delta and set the negotiation flag.
     pub fn with_cap_delta(mut self, delta: CapTableDelta) -> Self {
         self.cap_delta = Some(delta);

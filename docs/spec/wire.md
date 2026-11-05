@@ -428,7 +428,23 @@ transport must preserve when it forwards one:
 | Connect/gRPC | HTTP/1.1 `POST /active.rpc.v1.Agent/Call`, body framed as `[0][len u32 BE][envelope]`, content type `application/connect+active-infinity` or `application/grpc+active-infinity` | a malformed frame is a `400` with an `rpc/...` body; HTTP/1.1, one request per connection |
 
 A malformed frame is always an error at the frame boundary: no transport retries,
-guesses or forwards a partially decoded envelope.
+guesses or forwards a partially decoded envelope. A body that stops short of its
+declared `content-length` is `rpc/wire`, never a retryable `rpc/transport`: a
+caller that retried a mutating call would execute it twice. A frame that reaches
+the decoder intact but fails to decode also ends the session on TCP; a caller
+that ignores the error must not read the next frame as if the peer were healthy.
+
+An answer must belong to its call. A response echoes the request id; an error
+echoes it or carries id `0`, which is the id a peer writes when the frame was
+refused before its id could be read. `TcpTransport::call`,
+`SharedMemoryTransport::call`, `QuicClient::call`, the HTTP/2 client and the
+bridge client all enforce it; anything else (another call's answer, a response
+with id `0`, a request) is `rpc/wire`.
+
+A served TCP connection has a total lifetime (`DEFAULT_CONNECTION_LIFETIME`, ten
+minutes) as well as a per-frame deadline: a peer that sends a valid frame just
+inside every per-frame deadline must not hold a serial server forever.
+`serve_connection_within` takes an explicit deadline.
 
 One stream carries one frame. On QUIC the reader takes the announced length and
 then probes for trailing bytes with a `250 ms` window (`STREAM_TAIL_WAIT`): a
