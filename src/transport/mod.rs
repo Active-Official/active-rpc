@@ -44,7 +44,15 @@ pub const MAX_ERROR_BODY: usize = 64;
 ///
 /// Every other `rpc/…` token in the body becomes `rpc/provider`: a transport
 /// may report a transport condition, not an authority decision.
-const PEER_REFUSAL_CLASSES: &[&str] = &["rpc/transport", "rpc/backpressure", "rpc/provider"];
+/// `provider/reply-withheld` is here because a server decides it after its own
+/// handler ran: it is a provider class, not an authority decision, and a client
+/// that dropped it could never observe the contract (round 17, R16-4).
+const PEER_REFUSAL_CLASSES: &[&str] = &[
+    "rpc/transport",
+    "rpc/backpressure",
+    "rpc/provider",
+    "provider/reply-withheld",
+];
 
 /// Map a peer's refusal body to the matching error.
 ///
@@ -557,12 +565,26 @@ where
                         },
                     ),
                 };
-                if transport.send(&response).is_err() {
+                match transport.send(&response) {
+                    Ok(()) => served += 1,
+                    // A local refusal (the reply is past this transport's own
+                    // profile) wrote nothing: answer one small withheld envelope
+                    // so the caller learns the effect stands, instead of seeing
+                    // EOF and a retryable transport class (round 17, R16-2).
+                    Err(Error::Wire(_)) | Err(Error::CapabilityTable(_)) => {
+                        let withheld = Envelope::error(
+                            request_id,
+                            &Error::Provider {
+                                code: "provider/reply-withheld".to_string(),
+                            },
+                        );
+                        let _ = transport.send(&withheld);
+                        return Ok(served + 1);
+                    }
                     // The peer is gone; the connection is over, the server is
                     // not.
-                    return Ok(served);
+                    Err(_) => return Ok(served),
                 }
-                served += 1;
             }
             Ok(None) => return Ok(served),
             Err(error) => {

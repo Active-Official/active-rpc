@@ -734,7 +734,7 @@ async fn serve_stream<H>(
     });
     // The reply obeys the ceiling this server enforces on a request: a strict
     // profile must not emit a frame its own reader refuses (round 12, R-09 #2).
-    let encoded = response.encode();
+    let encoded = response.encode_with_limits(wire);
     match encoded {
         Ok(bytes) if bytes.len() > wire.max_bytes.min(MAX_FRAME_BYTES) => {
             let error = Error::Wire("response exceeds the size ceiling");

@@ -292,6 +292,10 @@ pub struct SharedMemoryTransport {
     segment: Arc<SharedSegment>,
     limits: WireLimits,
     written: u64,
+    /// Set when a frame was consumed but did not decode: the ring stays aligned,
+    /// but the peer has proven it writes frames this reader refuses, so the
+    /// session is refused like TCP's rather than read on (round 17, R16-8).
+    poisoned: bool,
 }
 
 impl SharedMemoryTransport {
@@ -301,6 +305,7 @@ impl SharedMemoryTransport {
             segment,
             limits: WireLimits::default(),
             written: 0,
+            poisoned: false,
         }
     }
 
@@ -348,10 +353,21 @@ impl Transport for SharedMemoryTransport {
     }
 
     fn recv(&mut self) -> Result<Option<Envelope>> {
+        if self.poisoned {
+            return Err(Error::Transport(
+                "the segment is poisoned by a frame that did not decode".to_string(),
+            ));
+        }
         let Some(frame) = self.segment.read()? else {
             return Ok(None);
         };
-        Ok(Some(Envelope::decode_with(&frame, self.limits)?))
+        match Envelope::decode_with(&frame, self.limits) {
+            Ok(envelope) => Ok(Some(envelope)),
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     fn bytes_written(&self) -> u64 {

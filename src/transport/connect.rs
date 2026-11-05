@@ -501,10 +501,12 @@ impl BridgeServer {
                     },
                 ),
             };
-        let bytes = match response.encode() {
+        // The handler ran: a refusal to build or frame its reply is a withheld
+        // reply, the same class HTTP/2 sends (round 17, R16-3).
+        let bytes = match response.encode_with_limits(self.limits) {
             Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = write_http_response(&mut stream, 500, error.code().as_bytes(), deadline);
+            Err(_) => {
+                let _ = write_http_response(&mut stream, 500, b"provider/reply-withheld", deadline);
                 drain_before_close(&mut stream);
                 return 0;
             }
@@ -513,14 +515,14 @@ impl BridgeServer {
         // request: a strict peer must not receive a frame its own reader
         // refuses (round 10, R-09 #5).
         if bytes.len() > MAX_BODY.min(self.limits.max_bytes) {
-            let _ = write_http_response(&mut stream, 413, b"rpc/wire", deadline);
+            let _ = write_http_response(&mut stream, 413, b"provider/reply-withheld", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
         let Ok(framed) = grpc_frame(&bytes) else {
             // The body was checked against `MAX_BODY` above, so this is the
-            // length conversion failing on a 32-bit target.
-            let _ = write_http_response(&mut stream, 413, b"rpc/wire", deadline);
+            // length conversion failing on a 32-bit target; the handler ran.
+            let _ = write_http_response(&mut stream, 413, b"provider/reply-withheld", deadline);
             drain_before_close(&mut stream);
             return 0;
         };
@@ -873,7 +875,12 @@ impl ConnectClient {
         // A black-hole peer must not hold a `with_deadline` client: the
         // connect itself is bounded (round 22, #3), and so is the resolve that
         // precedes it (round 23, #3).
-        let wait = self.deadline.unwrap_or(CONNECTION_WAIT);
+        // The client's default covers a legal exchange end to end: the server's
+        // request budget plus its reply budget plus the close grace, so an honest
+        // slow peer is not reported as a timeout (round 17, R16-9).
+        let wait = self
+            .deadline
+            .unwrap_or(CONNECTION_WAIT + CONNECTION_WAIT + std::time::Duration::from_millis(500));
         let deadline = std::time::Instant::now()
             .checked_add(wait)
             .unwrap_or_else(std::time::Instant::now);

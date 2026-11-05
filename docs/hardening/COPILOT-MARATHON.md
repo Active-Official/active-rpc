@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-44: round 44 found 2 highs, 3 mediums and 5 lows; all fixed or documented; round 45 must be clean | 299 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-16: round 16 found 1 high, 2 mediums and 6 lows; 6 fixed, 3 noted; round 17 must be clean | 127 fixed / 0 rejected / 5 noted (3 verification gaps in STATUS 17) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-17: round 17 found 3 mediums and 6 lows; 6 fixed, 3 noted; the withheld class now survives the client's refusal filter | 133 fixed / 0 rejected / 8 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -585,6 +585,27 @@ mediums, two lows and one documentation fix.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
+
+### R-09 transports - 2026-11-04 (round 17)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `f0fe964`. Round-16
+claims: two HOLD, one HOLD-without-test, one PARTIAL, one BROKEN. Verdict
+**PARTIAL**: three mediums and six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | all four server reply paths still encoded under the default profile, so a strict server emitted a reply its own reader refuses | **fixed**: `encode_with_limits(wire)` in the TCP, HTTP/2, QUIC and bridge servers |
+| 2 | medium | `serve_connection` treated a local encode refusal as "peer gone" and closed without a reply, so the caller saw EOF and a retryable transport class for a call whose effect landed | **fixed**: a local `rpc/wire` refusal answers one small `provider/reply-withheld` envelope and counts the call |
+| 3 | medium | the bridge's post-handler refusals still sent `rpc/wire`, unlike HTTP/2 | **fixed**: 500/413 carry `provider/reply-withheld` |
+| 4 | low | `PEER_REFUSAL_CLASSES` dropped the withheld body, so it arrived as `rpc/provider` and the kernel's withheld gate never fired | **fixed**: the class is in the allowlist (a provider class, not an authority decision); this made round 16's HTTP/2 fix effective end-to-end |
+| 5 | low | the QUIC client picks one resolved address and never retries the next | **noted**: resolution prefers IPv4; a stale first record is an operator/network condition, and multi-address racing is a client-policy feature for M-7 |
+| 6 | low | the bridge's success-path drain can cost up to 100 ms per connection for a client that does not half-close | **noted**: `connection: close` makes that client non-conforming; the drain is what keeps the 200 from being reset on Windows |
+| 7 | low | the bridge replies with the CONNECT media type even to a gRPC-typed request | **noted**: the in-tree client only sends CONNECT; a third-party gRPC client is out of the interop-only scope |
+| 8 | low | a shared-memory decode fault left the session readable, unlike TCP | **fixed**: the transport poisons on a decode fault |
+| 9 | low | the bridge client's 2 s default was shorter than a legal exchange (2 s request + 2 s reply + grace) | **fixed**: the default is `2 × CONNECTION_WAIT + 500 ms` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-09 transports - 2026-11-04 (round 16)
 

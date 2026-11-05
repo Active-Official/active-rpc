@@ -536,7 +536,7 @@ where
                     },
                 ),
             };
-        response.encode()
+        response.encode_with_limits(limits)
     });
     let encoded = match encoded {
         Ok(encoded) => encoded,
