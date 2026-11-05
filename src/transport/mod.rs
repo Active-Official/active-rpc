@@ -202,7 +202,12 @@ pub struct TcpTransport {
     /// Set when a write failed after it may have put bytes on the wire. Every
     /// later send would append a header to a half-written body, so the
     /// connection is unusable.
-    poisoned: bool,
+    send_poisoned: bool,
+    /// Set when a received frame was refused after its body was left unread.
+    /// The inbound stream is no longer on a frame boundary, but the outbound
+    /// half is independent: a server must still be able to send the error
+    /// envelope that names the fault (round 10, R-09 #3).
+    recv_poisoned: bool,
     /// Wall deadline for one received frame, set by `with_timeout`.
     frame_deadline: Option<std::time::Duration>,
 }
@@ -210,19 +215,33 @@ pub struct TcpTransport {
 /// Receive buffer for one connection.
 const TCP_READ_BUFFER: usize = 8 << 10;
 
+/// Default wall deadline for one frame on a connection that sets none.
+///
+/// The other transports have a bound; a bare `TcpTransport` used to have none,
+/// so a peer that sent a byte just inside the socket timeout held a frame
+/// forever (round 10, R-09 #2).
+pub const DEFAULT_FRAME_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl TcpTransport {
     /// Wrap an established stream.
     pub fn new(stream: TcpStream) -> Result<Self> {
         stream
             .set_nodelay(true)
             .map_err(|error| Error::Transport(error.to_string()))?;
+        // A default bound: a blocking `read` or `write_vectored` on a peer that
+        // accepted and then went silent parked a serial server forever. The
+        // other transports have a bound (bridge 2 s, QUIC 10 s, HTTP/2 60 s);
+        // `with_timeout` still tightens this one (round 10, R-09 #2).
+        let _ = stream.set_read_timeout(Some(DEFAULT_FRAME_WAIT));
+        let _ = stream.set_write_timeout(Some(DEFAULT_FRAME_WAIT));
         Ok(Self {
             stream: BufReader::with_capacity(TCP_READ_BUFFER, stream),
             inbox: VecDeque::new(),
             written: 0,
             limits: WireLimits::default(),
-            poisoned: false,
-            frame_deadline: None,
+            recv_poisoned: false,
+            send_poisoned: false,
+            frame_deadline: Some(DEFAULT_FRAME_WAIT),
         })
     }
 
@@ -246,9 +265,26 @@ impl TcpTransport {
     /// deadline, and a server that serves one connection at a time needs one on
     /// the accepted socket or its `--limit` is unreachable.
     pub fn connect_with_timeout(address: &str, timeout: std::time::Duration) -> Result<Self> {
-        let stream = TcpStream::connect(address)
-            .map_err(|error| Error::Transport(format!("connect: {error}")))?;
-        Self::with_timeout(stream, timeout)
+        use std::net::ToSocketAddrs;
+        let deadline = std::time::Instant::now() + timeout;
+        let addresses: Vec<std::net::SocketAddr> = address
+            .to_socket_addrs()
+            .map_err(|error| Error::Transport(format!("resolve: {error}")))?
+            .collect();
+        // `TcpStream::connect` has no bound: a black-holed SYN parked a caller
+        // that asked for a deadline forever. Each attempt gets what is left
+        // (round 10, R-09 #1). Resolution itself is the operator's endpoint and
+        // stays outside the bound, as it does for the bridge.
+        for address in addresses {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if let Ok(stream) = TcpStream::connect_timeout(&address, left) {
+                return Self::with_timeout(stream, timeout);
+            }
+        }
+        Err(Error::Transport("connect timed out".to_string()))
     }
 
     /// Wrap an accepted or connected stream with a read and write deadline.
@@ -273,7 +309,7 @@ impl Transport for TcpTransport {
     }
 
     fn send(&mut self, envelope: &Envelope) -> Result<()> {
-        if self.poisoned {
+        if self.send_poisoned {
             return Err(Error::Transport(
                 "the connection is poisoned by a partial frame".to_string(),
             ));
@@ -293,7 +329,7 @@ impl Transport for TcpTransport {
         if let Err(error) = write_frame(self.stream.get_mut(), &bytes) {
             // The header or the body (or part of either) may be on the wire, so
             // the peer's read position no longer matches a frame boundary.
-            self.poisoned = true;
+            self.send_poisoned = true;
             return Err(error);
         }
         self.written += (bytes.len() + 4) as u64;
@@ -301,7 +337,7 @@ impl Transport for TcpTransport {
     }
 
     fn recv(&mut self) -> Result<Option<Envelope>> {
-        if self.poisoned {
+        if self.recv_poisoned {
             return Err(Error::Transport(
                 "the connection is poisoned by a partial frame".to_string(),
             ));
@@ -331,7 +367,7 @@ impl Transport for TcpTransport {
                 // frame prefix (smuggling); the connection is poisoned instead
                 // (round 9, R-09 #6).
                 if matches!(error, Error::Wire(_)) {
-                    self.poisoned = true;
+                    self.recv_poisoned = true;
                 }
                 return Err(error);
             }
@@ -454,9 +490,11 @@ pub fn read_frame_before<R: Read>(
         match reader.read(&mut header[filled..]) {
             Ok(0) if filled == 0 => return Ok(None),
             Ok(0) => {
-                return Err(Error::Transport(
-                    "truncated frame header at end of stream".to_string(),
-                ))
+                // A truncated frame is a framing fault, as it is on QUIC and
+                // through the bridge: a retryable transport class made a
+                // hostile short frame look like a network hiccup
+                // (round 10, R-09 #4).
+                return Err(Error::Wire("truncated frame header"));
             }
             Ok(read) => filled += read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -486,9 +524,7 @@ pub fn read_frame_before<R: Read>(
         }
     }
     if body.len() != len {
-        return Err(Error::Transport(
-            "truncated frame body at end of stream".to_string(),
-        ));
+        return Err(Error::Wire("truncated frame body"));
     }
     Ok(Some(body))
 }

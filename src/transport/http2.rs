@@ -563,8 +563,8 @@ where
             b"rpc/transport",
         );
     }
-    if encoded.len() > MAX_BODY {
-        // The bridge answers 413 past `MAX_BODY`; the HTTP/2 server streamed
+    if encoded.len() > MAX_BODY.min(limits.max_bytes) {
+        // The bridge answers 413 past its ceiling; the HTTP/2 server streamed
         // whatever the kernel produced (round 26, #5).
         return respond_status(&mut respond, StatusCode::PAYLOAD_TOO_LARGE, b"rpc/wire");
     }

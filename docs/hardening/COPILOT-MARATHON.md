@@ -20,9 +20,9 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-43: round 43 found 1 high, 2 mediums and 3 lows, all fixed; rounds 44-45 must be clean | 263 fixed / 0 rejected / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-36: round 36 found 2 lows, all fixed; rounds 37-38 must be clean | 258 fixed / 3 rejected / 0 open (4 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-9: round 9 found 2 highs, 2 mediums and 2 lows, all fixed; rounds 10-11 must be clean | 84 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-44: round 44 found 1 high, 2 mediums and 4 lows, all fixed; rounds 45-46 must be clean | 270 fixed / 0 rejected / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-37: round 37 found 3 lows (2 fixed, 1 rejected); rounds 38-39 must be clean | 260 fixed / 4 rejected / 0 open (4 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-10: round 10 found 3 highs, 3 mediums and 1 low, all fixed; rounds 11-12 must be clean | 90 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -475,6 +475,25 @@ are closed.
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
 
+### R-07 domain operations - 2026-11-04 (round 44)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
+`c66870e`. Round-43 claims: four HOLD, two PARTIAL. One **high**, two mediums,
+four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | a restored capability lost its link to the authority tree (restore releases the only back-link), so `revoke` and `reintroduce_to` never reached it: a revoked parent left a live restored copy, and the retired peer kept its grant | **fixed**: `mint_restored` links the new id under every live ancestor in the child index (the budget-charged lineage stays empty, because the export already reserved the grant out of those meters); `a_revocation_reaches_a_restored_copy_of_a_descendant`, `a_rotation_reaches_a_restored_copy` |
+| 2 | medium | the record-id expansion ran once after the subtree walk, so a capability attenuated from a restored copy survived | **fixed**: the expansion is part of the same work stack, and a newly reached record id pushes every capability that shares it; the restoration test covers the grandchild |
+| 3 | medium | the record format depends on an undeclared `serde_json/preserve_order` feature that arrives transitively | **fixed**: the feature is declared in `Cargo.toml`, and `a_record_text_has_a_fixed_key_order` pins the exact key order |
+| 4 | low | with the canonical-text rule, an absent optional field is unrepresentable and the compatibility arm is dead | **documented** at the `publish` default (the writer always emits the field; the arm only serves an in-memory parse) |
+| 5 | low | a repeated `introduce_to` emitted `cap.introduced` again | **fixed**: the event is pushed only for a real binding change; `a_repeated_introduction_is_not_a_second_introduction` |
+| 6 | low | a clock-domain mismatch at export reported `rpc/revoked` and `cap.expired` for a capability that was neither | **fixed**: `rpc/persistence`, no event; `an_export_after_a_clock_switch_is_refused` asserts both |
+| 7 | low | `decode_capability_table` (table profile) and `_with(default)` (frame profile) disagree | **documented and pinned** as a deliberate profile split; `the_table_profile_and_the_frame_profile_are_named` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Three new tests fail against the pre-fix tree.
+
 ### R-07 domain operations - 2026-11-04 (round 43)
 
 Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
@@ -511,6 +530,28 @@ mediums, two lows and one documentation fix.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
+
+### R-09 transports - 2026-11-04 (round 10)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `c66870e`. All six round-9
+fixes HOLD. Three **highs**, three mediums and one low.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `connect_with_timeout` used the unbounded `TcpStream::connect`, so a black-holed SYN parked a caller that asked for a deadline | **fixed**: each resolved address gets `connect_timeout` with the time left; `a_connect_with_a_deadline_is_bounded` |
+| 2 | high | a default `TcpTransport` had no read or write bound at all | **fixed**: `DEFAULT_FRAME_WAIT` (30 s) on construction, which `with_timeout` still tightens |
+| 3 | high | a refused inbound frame poisoned the whole connection, so the server could not send the error envelope that names the fault | **fixed**: the poison flag is split (`recv_poisoned`/`send_poisoned`); `a_poisoned_receive_still_allows_the_error_reply` |
+| 4 | medium | a truncated TCP frame was `rpc/transport` while QUIC and the bridge report `rpc/wire` | **fixed**: a truncated header or body is a wire fault; `a_truncated_frame_is_a_wire_fault`, `a_partial_envelope_at_the_end_of_stream_is_refused` updated |
+| 5 | medium | the bridge and HTTP/2 servers bounded a reply by `MAX_BODY` but not by their own `limits.max_bytes` | **fixed**: both use the smaller bound |
+| 6 | medium | the raw `QuicClient::exchange` wrote any payload, bypassing the ceiling `call` enforces | **fixed**: the ceiling is checked before any I/O; `a_raw_quic_exchange_obeys_the_client_ceiling` |
+| 7 | low | the shared-memory writer checked `limits.max_bytes` but not `MAX_FRAME_BYTES` | **fixed**: the smaller ceiling |
+
+Residual (documented in `STATUS.md` 17): the truncated tests cover the polled
+path; a black-hole connect is tested against TEST-NET-1, whose failure mode
+depends on the network.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Three new tests fail against the pre-fix tree.
 
 ### R-09 transports - 2026-11-04 (round 9)
 
@@ -549,6 +590,20 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 37)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `c66870e`. Both round-36
+claims HOLD. No critical, high or medium; three lows, two fixed and one rejected.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the wasm adapter reported `rpc/method-not-granted` where MCP, HTTP and process report `rpc/invalid-argument` for the same wrong-method-plus-payload call, which fingerprints the adapter | **fixed**: payload before method, matching the other adapters |
+| 2 | low | `CapTableDelta::apply_to`'s removal-ceiling arm had no test and its ceiling is the default profile | **fixed**: `a_programmatic_delta_past_the_per_delta_ceiling_is_refused` covers the addition arm; the doc now states the default-profile ceiling and that an embedder with a tighter profile enforces it |
+| 3 | low | `SHELL_METACHARACTERS` omits space, tab and backslash, so a prefix-matched shell argument can carry extra words | **rejected**: `Command` passes each argument as one argv element, so a space does not split words and cannot introduce a command; adding it would refuse legitimate prefix grants such as `"-c foo bar"` while closing nothing. The blocked set already covers every command separator and substitution |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

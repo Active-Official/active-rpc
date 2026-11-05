@@ -100,7 +100,10 @@ fn a_partial_envelope_at_the_end_of_stream_is_refused() {
     bytes.extend_from_slice(&[1, 2, 3]);
     let error = read_frame(&mut std::io::Cursor::new(bytes), &WireLimits::default())
         .expect_err("a truncated body is an error");
-    assert_eq!(error.code(), "rpc/transport");
+    // A truncated frame is a framing fault on every transport: a retryable
+    // class made a hostile short frame look like a network hiccup
+    // (round 10, R-09 #4).
+    assert_eq!(error.code(), "rpc/wire", "{error}");
 }
 
 #[test]

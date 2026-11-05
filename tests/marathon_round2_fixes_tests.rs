@@ -230,7 +230,8 @@ fn a_record_keeps_the_clock_mode_its_deadline_was_taken_in() {
     let error = source
         .export_capability(&cap)
         .expect_err("the deadline belongs to the wall clock");
-    assert_eq!(error.code(), "rpc/revoked", "{error}");
+    // A domain mismatch is a durable refusal, not an expiry (round 44, F-6).
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
 
     let virtual_kernel = Agent::with_secret([0x43; 32]);
     virtual_kernel.set_durable_capabilities(true);

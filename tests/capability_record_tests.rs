@@ -1110,5 +1110,174 @@ fn an_export_after_a_clock_switch_is_refused() {
     let error = agent
         .export_capability(&cap)
         .expect_err("the deadline belongs to the other clock domain");
-    assert_eq!(error.code(), "rpc/revoked", "{error}");
+    // A domain mismatch is a durable refusal, not a revocation: the capability
+    // is neither revoked nor past its lease (round 44, F-6).
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+    assert!(
+        !agent
+            .events()
+            .iter()
+            .any(|event| matches!(event, active_rpc::kernel::Event::CapExpired(_))),
+        "no expiry is reported for a mode switch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 44
+// ---------------------------------------------------------------------------
+
+/// A restored copy of a descendant is part of the authority tree: revoking the
+/// ancestor reaches it, and so does a capability attenuated from it
+/// (round 44, F-1).
+#[test]
+fn a_revocation_reaches_a_restored_copy_of_a_descendant() {
+    let secret = [0x71; 32];
+    let (source, provider, parent) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let child = source.attenuate(&parent, attrs).expect("attenuate");
+    let record = source.export_capability(&child).expect("export");
+    drop(child);
+    source.run();
+
+    // Restore on the same kernel so the record and its lineage are known.
+    let restored = source.restore_capability(&record, &owner).expect("restore");
+    let grandchild = source
+        .attenuate(&restored, CapAttrs::new(&["echo"]))
+        .expect("attenuate from the restored copy");
+
+    source.revoke(&parent).expect("revoke the tree");
+
+    let lane = source
+        .create_lane("restored", Budget::default())
+        .expect("lane");
+    for cap in [&restored, &grandchild] {
+        let outcome = source.call_as(Some(owner.identity()), lane, cap, "echo", Vec::new());
+        let error = match outcome {
+            Err(error) => error,
+            Ok(promise) => {
+                source.run();
+                promise
+                    .value()
+                    .expect_err("the restored copy is revoked with its tree")
+            }
+        };
+        assert_eq!(error.code(), "rpc/revoked", "{error}");
+    }
+    let _ = (secret, provider);
+}
+
+/// A rotation moves the restored copy too: the peer it was bound to cannot use
+/// it afterwards, and the successor can (round 44, F-1).
+#[test]
+fn a_rotation_reaches_a_restored_copy() {
+    let (agent, _provider, parent) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let child = agent.attenuate(&parent, attrs).expect("attenuate");
+    let record = agent.export_capability(&child).expect("export");
+    drop(child);
+    agent.run();
+    let restored = agent.restore_capability(&record, &owner).expect("restore");
+
+    let old = peer(b"durable-owner");
+    let new = admitted(b"rotated-owner");
+    agent
+        .reintroduce_to(&parent, &old, &new)
+        .expect("rotate the binding");
+
+    let lane = agent
+        .create_lane("rotated", Budget::default())
+        .expect("lane");
+    // The successor may use the grant: the rotation moved the authority, it did
+    // not delete it.
+    let promise = agent
+        .call_as(Some(new.identity()), lane, &restored, "echo", Vec::new())
+        .expect("the successor's call is queued");
+    agent.run();
+    promise
+        .value()
+        .expect("the successor uses the restored grant");
+    // The retired peer may not.
+    if let Ok(promise) = agent.call_as(Some(owner.identity()), lane, &restored, "echo", Vec::new())
+    {
+        agent.run();
+        assert!(
+            promise.value().is_err(),
+            "the retired peer's restored copy must not answer"
+        );
+    }
+}
+
+/// Introducing a capability to the peer that already holds it is not a second
+/// introduction (round 44, F-5).
+#[test]
+fn a_repeated_introduction_is_not_a_second_introduction() {
+    use active_rpc::kernel::Event;
+
+    let (agent, provider, _bound) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let cap = agent
+        .mint(provider, 0, attrs)
+        .expect("an unbound durable cap");
+    agent.introduce_to(&cap, &owner).expect("introduce");
+    agent.introduce_to(&cap, &owner).expect("introduce again");
+    let count = agent
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::CapIntroduced { .. }))
+        .count();
+    assert_eq!(count, 1, "one introduction is one event");
+}
+
+/// The record's text has one key order, and a golden list pins it: the parser
+/// compares its input with this rendering, so a dependency that changed
+/// `serde_json`'s ordering would rewrite every record at rest
+/// (round 44, F-3).
+#[test]
+fn a_record_text_has_a_fixed_key_order() {
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    let text = record.to_json();
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let keys: Vec<&str> = parsed
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "format",
+            "provider",
+            "object",
+            "methods",
+            "budget",
+            "read_only",
+            "redact",
+            "path_scope",
+            "topics",
+            "publish",
+            "tool_policy",
+            "bound_to",
+            "expires_at",
+            "wall_clock",
+            "lease_ms",
+            "record_id",
+            "seal",
+        ],
+        "the writer's key order is part of the format"
+    );
+    // And the golden text parses back to itself.
+    assert_eq!(
+        CapabilityRecord::from_json(&text)
+            .expect("canonical text")
+            .to_json(),
+        text
+    );
 }

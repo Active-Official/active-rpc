@@ -586,18 +586,19 @@ impl Provider for WasmTool {
             // work (round 22, F-B).
             return Err(Error::BudgetExceeded("byte"));
         }
-        if call.method != "run" {
-            return Err(Error::MethodNotGranted {
-                method: call.method.clone(),
-            });
-        }
-        // Exactly one input, and nothing else: dropping arguments silently would
-        // let a caller believe the guest processed data it never saw, and a
-        // payload this adapter does not consume must not disappear either.
+        // The payload comes before the method, as in the MCP, HTTP and process
+        // adapters: the same malformed call must not report one code here and
+        // another there, because that difference fingerprints the adapter
+        // (round 37, L1).
         if !call.payload.is_empty() {
             return Err(Error::InvalidArgument(
                 "the wasm adapter reads its input from a single argument, not a payload",
             ));
+        }
+        if call.method != "run" {
+            return Err(Error::MethodNotGranted {
+                method: call.method.clone(),
+            });
         }
         if call.path_scope.is_some() {
             // The input is bytes and the kernel inspects only `Value::Path`: a

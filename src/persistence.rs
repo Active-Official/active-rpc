@@ -476,9 +476,11 @@ impl CapabilityRecord {
                 }
             }
         }
-        // A record written before the grant existed carries no field. The
-        // default narrows authority (no publishing) rather than widening it, and
-        // a record that names topics implies the grant.
+        // The writer always emits `publish`, so the canonical-text rule means
+        // an absent field is refused before this default can apply. The default
+        // stays as the reading of a parse that reaches here (a record built in
+        // memory), and it narrows authority (no publishing) rather than widening
+        // it; a record that names topics implies the grant (round 44, F-4).
         // A present field must have the type the record defines: `"publish":
         // "false"` used to parse as `true` (a non-empty string is not a bool, so
         // the default "topics imply publishing" applied), and a JSON-reading

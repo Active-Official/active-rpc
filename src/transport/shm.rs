@@ -336,7 +336,10 @@ impl Transport for SharedMemoryTransport {
 
     fn send(&mut self, envelope: &Envelope) -> Result<()> {
         let bytes = envelope.encode()?;
-        if bytes.len() > self.limits.max_bytes {
+        // The segment framing carries a 32-bit length and the peer reads at
+        // most `MAX_FRAME_BYTES`: a larger `limits` must not emit a frame no
+        // reader accepts (round 10, R-09 #7).
+        if bytes.len() > self.limits.max_bytes.min(crate::transport::MAX_FRAME_BYTES) {
             return Err(Error::Wire("envelope exceeds the size ceiling"));
         }
         self.segment.write(&bytes)?;

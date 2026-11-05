@@ -1118,7 +1118,14 @@ impl Agent {
         // Export obeys the same expiry rule as dispatch: a deadline minted in
         // the other clock domain cannot be read here, and ADR-0015's amendment
         // asks the operator to re-export from the target domain
-        // (round 43, F5).
+        // (round 43, F5). A domain mismatch is not an expiry: the capability is
+        // neither revoked nor past its lease, so it gets a durable refusal and
+        // no `cap.expired` on the tape (round 44, F-6).
+        if record.expires_at.is_some() && record.wall_clock != kernel.wall_clock {
+            return Err(Error::Persistence(
+                "the deadline belongs to another clock domain",
+            ));
+        }
         if is_expired(&kernel, &record) {
             kernel.push_event(Event::CapExpired(cap.id()));
             return Err(Error::Revoked(cap_token(cap.id())));
@@ -1464,7 +1471,24 @@ impl Agent {
         if let Some(store) = store {
             store.claim(&record.record_id)?;
         }
-        let restored = self.mint_restored(peer, provider, record.object, attrs)?;
+        // The export pin remembers where the credential stood. A record
+        // restored on another kernel has no local pin, so its grant starts a
+        // new tree there, which is correct: no ancestor of it is live here.
+        let lineage = self
+            .cell
+            .borrow()
+            .record_pins
+            .get(&record.record_id)
+            .map(|pin| {
+                // The exporter's own ancestors, then the exporter: the restored
+                // copy stands exactly where the exported capability stood, so
+                // every walk that reaches one reaches the other.
+                let mut lineage = pin.lineage.clone();
+                lineage.push(pin.cap);
+                lineage
+            })
+            .unwrap_or_default();
+        let restored = self.mint_restored(peer, provider, record.object, attrs, &lineage)?;
         self.cell
             .borrow_mut()
             .restored_records
@@ -1602,6 +1626,7 @@ impl Agent {
         provider: ProviderId,
         object: u64,
         attrs: CapAttrs,
+        lineage: &[CapId],
     ) -> Result<CapHandle> {
         if !peer.can_bind() {
             return Err(Error::Identity(
@@ -1615,6 +1640,9 @@ impl Agent {
             return Err(Error::InvalidArgument("capability grants no methods"));
         }
         check_method_names(&attrs)?;
+        if lineage.len() >= MAX_LINEAGE_DEPTH {
+            return Err(Error::Escalation("capability chain is too deep"));
+        }
         let mut kernel = self.cell.borrow_mut();
         if !kernel.providers.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
@@ -1630,8 +1658,26 @@ impl Agent {
         record.expires_at = expires_at;
         record.wall_clock = kernel.wall_clock;
         record.record_id = CapId::derive_record(&kernel.secret, serial, None);
+        if let Some(parent) = lineage.last() {
+            record.parent = Some(*parent);
+        }
+        // The restored grant stands where the exported capability stood: it is
+        // linked under every ancestor still live, so `revoke` and
+        // `reintroduce_to`, which walk the child index, reach it (round 44,
+        // F-1). Without this a revoked parent left a live restored copy behind,
+        // and the peer a rotation retired kept its grant.
+        //
+        // The link is the child index only: `lineage` also drives budget
+        // charging, and the export already reserved this grant out of every
+        // ancestor's meter, so charging them again would refuse a call the
+        // record is entitled to.
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.insert_cap_record(record);
+        for ancestor in lineage {
+            if kernel.caps.contains_key(ancestor) {
+                kernel.children.entry(*ancestor).or_default().insert(id);
+            }
+        }
         kernel.push_event(Event::CapMinted { cap: id, provider });
         // A restore is a mint of a sealed record: the trace names both, so an
         // operator reading only this tape sees where the authority came from.
@@ -1726,11 +1772,16 @@ impl Agent {
             .get(&cap.id())
             .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
         let descriptor = crate::wire::CapDescriptor::from_attrs(record.id, &record.attrs);
-        let introduced = record.id;
-        kernel.push_event(Event::CapIntroduced {
-            cap: introduced,
-            fingerprint,
-        });
+        // Introducing a capability to the peer that already holds it changes
+        // nothing: the tape must not report a second introduction
+        // (round 44, F-5).
+        if already_bound != Some(fingerprint) {
+            let introduced = record.id;
+            kernel.push_event(Event::CapIntroduced {
+                cap: introduced,
+                fingerprint,
+            });
+        }
         Ok(descriptor)
     }
 
@@ -5956,23 +6007,28 @@ fn descendants_of(children: &BTreeMap<CapId, BTreeSet<CapId>>, root: CapId) -> V
 fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
     let mut doomed = BTreeSet::new();
     let mut stack: Vec<CapId> = seeds.into_iter().collect();
+    // A record id expands the walk to every capability restored from it, and
+    // those capabilities' own descendants come with them: the expansion used to
+    // be a single pass after the walk, so a child attenuated from a restored
+    // copy survived (round 44, F-2).
+    let mut record_ids: BTreeSet<[u8; 32]> = BTreeSet::new();
     while let Some(id) = stack.pop() {
         if !doomed.insert(id) {
             continue;
         }
+        if let Some(record) = kernel.caps.get(&id) {
+            if record_ids.insert(record.record_id) {
+                // One scan per newly reached record id; the set is bounded by
+                // the capabilities that share it.
+                for (other, live) in &kernel.caps {
+                    if live.record_id == record.record_id {
+                        stack.push(*other);
+                    }
+                }
+            }
+        }
         if let Some(descendants) = kernel.children.get(&id) {
             stack.extend(descendants.iter().copied());
-        }
-    }
-    // Every capability restored from the same record is revoked with it: a peer
-    // that restored twice before the kill switch must not keep a copy.
-    let record_ids: BTreeSet<[u8; 32]> = doomed
-        .iter()
-        .filter_map(|id| kernel.caps.get(id).map(|record| record.record_id))
-        .collect();
-    for (id, record) in &kernel.caps {
-        if record_ids.contains(&record.record_id) {
-            doomed.insert(*id);
         }
     }
     // An exported record whose exporting capability was dropped before this

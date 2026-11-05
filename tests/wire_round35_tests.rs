@@ -133,3 +133,37 @@ fn a_programmatic_delta_past_the_per_delta_ceiling_is_refused() {
         .expect_err("past the per-delta ceiling");
     assert_eq!(error.code(), "rpc/capability-table", "{error}");
 }
+
+/// A standalone table is the table profile (`MAX_CAP_TABLE`); an envelope is
+/// the frame profile (`max_caps`). The wrapper accepts a 300-descriptor table
+/// that the default envelope profile refuses, and that asymmetry is deliberate
+/// and pinned here (round 44, F-7).
+#[test]
+fn the_table_profile_and_the_frame_profile_are_named() {
+    use active_rpc::wire::{decode_capability_table, decode_capability_table_with, MAX_CAP_TABLE};
+
+    let mut table = Vec::new();
+    for index in 1u32..=300 {
+        let mut id = [0u8; 16];
+        id[..4].copy_from_slice(&index.to_le_bytes());
+        table.push(CapDescriptor {
+            id: CapId(id),
+            methods: BTreeSet::from(["echo".to_string()]),
+            budget: Budget::default(),
+            read_only: false,
+            redact: false,
+            path_scope: None,
+        });
+    }
+    let bytes = active_rpc::wire::encode_capability_table(&table).expect("encode");
+    assert!(MAX_CAP_TABLE >= table.len());
+    assert_eq!(
+        decode_capability_table(&bytes)
+            .expect("table profile")
+            .len(),
+        300
+    );
+    let error = decode_capability_table_with(&bytes, &WireLimits::default())
+        .expect_err("the frame profile is 256 descriptors");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
+}

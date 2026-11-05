@@ -984,6 +984,12 @@ impl QuicClient {
 
     /// Send raw bytes (for malformed-frame tests) and return the raw response.
     pub fn exchange(&self, payload: &[u8]) -> Result<Vec<u8>> {
+        // The raw path obeys the same ceiling as `call`: a caller holding
+        // untrusted bytes must not write 100 MiB because it bypassed the
+        // envelope check (round 10, R-09 #6).
+        if payload.len() > self.limits.max_bytes.min(MAX_FRAME_BYTES).saturating_add(4) {
+            return Err(Error::Wire("frame exceeds the size ceiling"));
+        }
         let (endpoint, address, server_name) = (
             self.endpoint.clone(),
             self.address,

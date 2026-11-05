@@ -216,6 +216,12 @@ impl CapTableDelta {
 
     /// Apply to a base table after checking the base hash. Fail closed on an
     /// unknown base or a removal of an id that is not present.
+    ///
+    /// The per-delta ceilings are the default profile's (`max_caps`), the same
+    /// numbers the envelope writer and reader use: a delta this method applies
+    /// is one the wire can carry. An embedder that tightened its profile must
+    /// enforce that profile itself; the negotiated table's absolute ceiling is
+    /// [`MAX_CAP_TABLE`] (round 37, L2).
     pub fn apply_to(&self, base: &[CapDescriptor]) -> Result<Vec<CapDescriptor>> {
         if cap_table_hash(base)? != self.base {
             return Err(Error::CapabilityTable("cap-table delta base mismatch"));

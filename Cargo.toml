@@ -35,7 +35,11 @@ active-core = { version = "1.4.0" }
 thiserror = "1.0"
 blake3 = "1.5"
 getrandom = "0.3"
-serde_json = "1.0"
+# `preserve_order` is what the durable record's canonical text depends on: the
+# writer emits its fields in a fixed order and the parser re-renders that exact
+# text, so a transitive change to this feature would rewrite every record's
+# canonical form (DeepSeek F-3). Declared here so the dependency is explicit.
+serde_json = { version = "1.0", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"], optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }

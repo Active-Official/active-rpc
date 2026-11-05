@@ -509,7 +509,10 @@ impl BridgeServer {
                 return 0;
             }
         };
-        if bytes.len() > MAX_BODY {
+        // The reply obeys the same ceiling this server would enforce on a
+        // request: a strict peer must not receive a frame its own reader
+        // refuses (round 10, R-09 #5).
+        if bytes.len() > MAX_BODY.min(self.limits.max_bytes) {
             let _ = write_http_response(&mut stream, 413, b"rpc/wire", deadline);
             drain_before_close(&mut stream);
             return 0;
