@@ -21,9 +21,9 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-52: round 52 found 1 medium and 5 lows, all fixed or closed by design; round 53 must be clean | 345 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-53: round 53 found 1 medium and 4 lows, all fixed; round 54 must be clean | 351 fixed / 4 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-3: round 3 found 1 high, 4 mediums and 5 lows, all fixed; round 4 must be clean | 24 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
@@ -897,6 +897,22 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 53)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `05535dc`. Round-52
+claims: three HOLD, one PARTIAL. Verdict **PARTIAL**: one medium and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `try_new` accepted a base whose *scheme* carried a control character (`"ht\rtp://host"`), and a space or a non-ASCII byte in the authority, because the scan covered only the bytes after `://`; `Debug` then emitted the raw control character | **fixed**: the whole string must be printable ASCII, and the scheme must match RFC 3986 §3.1; an unusable base is never kept; `try_new_refuses_a_base_it_could_not_render_safely`, `a_forged_base_never_reaches_debug` |
+| 2 | low | the HTTP spec had no base invariant and no `rpc/tool-policy` row, and the `http://host/` case was undocumented | **fixed**: the base rule, the empty-authority and trailing-slash cases, and the `rpc/tool-policy` row are in `wire.md` |
+| 3 | low | an empty authority (`"http://"`) was admitted at construction and surfaced as a retryable `http/resolve` at dispatch | **fixed** by the same gate (`rest.is_empty()` or a leading `:` is invalid); covered by the round-53 construction test |
+| 4 | low | `ambiguous_path` did not reject `;` matrix parameters, which container peers strip before resolving (`/x;/../admin` reached `/admin`) | **fixed**: `;` is ambiguous; `a_matrix_parameter_in_an_allowlist_path_is_refused` |
+| 5 | low | `entropy_used()` under-reported a start-function draw on every early return of `WasmTool::call` | **fixed**: the counter is recorded on every return path, including instantiation, missing memory, fuel and entry faults; `a_start_function_draw_is_reported_when_it_traps` |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
@@ -2459,6 +2475,27 @@ logical message in one frame.
 Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
+
+### R-10 bulk transfer - 2026-11-05 (round 3)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `05535dc`. Verdict
+**PARTIAL**: one high, four mediums, five lows; every finding was real.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | provider state was one global slot: any holder of `plan` could read another object's metadata, wedge the provider for every peer, and revoking the capability left up to 1 GiB resident | **fixed**: transfers and completed bodies are keyed by the capability's object, `Provider::on_drop` releases both, and an incomplete transfer expires after `TRANSFER_IDLE_MS` (60 s) against the kernel-stamped `Call::now_ms`; `two_objects_hold_two_independent_transfers`, `a_dropped_capability_releases_its_bulk_state`, `an_idle_transfer_expires` |
+| 2 | medium | `put` and `plan` were O(chunks) per frame (a sum over every stored chunk plus a full `missing` scan, and a 256 KiB `Vec` for 1-byte chunks), so a 32 766-chunk plan cost ~5x10^8 map probes | **fixed**: `stored` and the missing count are maintained on insert, so a put is O(1); measured **270 ms for 32 766 puts** in a debug build (8.3 us per frame); `a_put_on_a_large_plan_is_bounded` |
+| 3 | medium | a retried `finish` after the body landed returned `rpc/bulk`, and a new transfer silently overwrote an untaken body | **fixed**: `finish` is idempotent per object (the same reply, no state error), and `plan` refuses while a completed body has not been taken; `a_repeated_finish_answers_with_the_same_reply` |
+| 4 | medium | the finish reply published the raw body digest as `hash`, which a relay can republish as a content address and so re-create the offline-guessing oracle the domain provider redacts | **fixed**: the field is `body_hash` (documented as a transfer digest, never a content address) and, when the body is a canonical Infinity image, `content` carries `active_infinity::content_hash`; `a_transferred_image_reports_the_redacted_content_address` |
+| 5 | medium | the documented context binding could never be used through the provider, which decoded with an empty context | **fixed**: `BulkProvider::with_context` supplies it; `a_context_bound_plan_is_admitted_by_the_provider` |
+| 6 | low | `finish` consumed the transfer before verifying it | **fixed**: `BulkReceiver::finish` assembles and verifies before releasing the chunks, and the provider re-inserts the transfer on any refusal; `a_finish_that_cannot_verify_keeps_the_chunks` |
+| 7 | low | a sender could build a plan over `MAX_TOTAL` that its own decoder refuses | **fixed**: both plan constructors apply the protocol ceiling; `a_plan_the_decoder_would_refuse_is_never_built` |
+| 8 | low | `missing` could return 65 536 elements (past `Budget::strict().max_array_len`), and a maximum plan frame exceeded the strict payload ceiling | **fixed**: `MAX_CHUNKS` is 32 766 so the plan frame fits 1 MiB, and `missing` answers a 1 024-index page with `more`/`remaining`; `a_resume_reply_is_paged` |
+| 9 | low | `with_budget`'s ceiling ignored the 53-byte per-frame overhead, so a grant of exactly `total` always failed on the last chunk | **documented**: `CHUNK_OVERHEAD`, the module doc, the spec and a test that a grant of `total + 53 x chunks` completes; `a_grant_that_covers_the_frames_is_enough` |
+| 10 | low | `expected_chunks` divided by an unvalidated chunk size and panicked on zero | **fixed**: it calls `check_chunk_size`; covered by the zero-chunk arm of the plan test |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-10 bulk transfer - 2026-11-02 (round 2, confirmation)
 

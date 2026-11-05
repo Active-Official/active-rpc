@@ -317,6 +317,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
 | `http/read:truncated`, `http/read:truncated-body` | the peer closed before a full line or body arrived |
 | `http/<status>` | the endpoint answered a status outside 2xx (3xx included: the adapter does not follow redirects) |
+| `rpc/tool-policy` | the base is not a printable scheme and authority (a path, query or fragment, a control character, an invalid scheme, or no authority at all); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; or the call carries a secret, a path scope or a module the adapter cannot send |
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `content-length` only for a method defined to carry content (`POST`, `PUT`,
@@ -330,8 +331,17 @@ Resolution of the base URL happens before the deadline starts and uses the
 system resolver’s own timeout, because the endpoint is the operator’s, not the
 peer’s. A server that drips a byte per timeout period cannot stretch the
 ceiling. A HEAD,
-204 or 304 reply is read as bodyless whatever its headers say. A path is
-refused if it contains a byte outside `0x21..=0x7e`, a dot segment, a percent
+204 or 304 reply is read as bodyless whatever its headers say. A base must be a printable scheme and an authority and nothing else: a path,
+query or fragment would either be dropped (retargeting the request at another
+resource on the same authority) or concatenated with every request path, and a
+control character would forge a request head or a log line. An empty authority,
+an invalid scheme, an `http://host/` trailing slash and any byte outside
+`0x21..=0x7e` are refused for the same reason. `HttpTool::try_new` refuses such a
+base at construction; `HttpTool::new` keeps no authority from it and refuses
+every call with `rpc/tool-policy`, so the fault is never reported as a
+retryable `http/resolve`. A path is
+refused if it contains a byte outside `0x21..=0x7e`, a dot segment, a `;` matrix
+parameter (container peers strip `;name=value` before resolving), a percent
 escape, a backslash, a double slash, a query or a fragment: the allow-list is an
 exact string and the peer normalizes, so an ambiguous entry could name a
 different resource. `HttpTool::try_new` refuses such an entry at construction and
@@ -558,8 +568,11 @@ little-endian unless stated.
 hashes, len(context), context)`. The context (normally the request id and
 capability id of the opening envelope) is **not transmitted**: both sides derive
 it, and a decoder recomputes the root and refuses a plan that does not match. A
-decoder also refuses a declared `total` above its ceiling and a
-`chunk_count` above 65 536 before allocating the hash list.
+decoder also refuses a declared `total` above its ceiling (1 GiB by protocol) and
+a `chunk_count` above 32 766 before allocating the hash list. The count is chosen
+so the plan frame fits `WireLimits::strict()`'s 1 MiB payload ceiling
+(`53 + 32 × 32 766 = 1 048 565`), so a full 1 GiB body needs a chunk of at least
+32 KiB.
 
 **Chunk** (`ARBC`):
 
@@ -593,9 +606,29 @@ root or total differs from the plan is `rpc/bulk`, so a body from another
 transfer cannot settle this one.
 
 A receiver assembles only after every index is present and the body verifies
-against the plan. The root proves the body matches the plan, not who chose the
-plan: a caller that must not accept a substituted plan pins the root it expects
-(`with_expected_root`, or the `context` above).
+against the plan. A `finish` that cannot succeed leaves the stored chunks in
+place: a refusal never destroys bytes the caller already paid to transfer. The
+root proves the body matches the plan, not who chose the plan: a caller that must
+not accept a substituted plan pins the root it expects (`with_expected_root`, or
+the `context` above). `BulkProvider::with_context` supplies that context on the
+provider side, because `Provider::invoke` carries no request id or capability id;
+without a context or a pinned root a transfer is checked against corruption only.
+
+**Provider state and replies.** The provider keys both its in-progress transfer
+and its completed body by the capability's **object**: two capabilities on one
+provider never share a transfer, and a peer that opens one cannot deny service to
+another. `Provider::on_drop` releases the object's transfer and any untaken body,
+and an incomplete transfer is released after 60 s of inactivity measured against
+the kernel-stamped `Call::now_ms`. `plan` refuses to open a new transfer for an
+object whose completed body has not been taken (`rpc/bulk`), so a body is never
+silently dropped. `missing` answers a window of 1 024 indexes with `more` and
+`remaining`, because `Budget::strict()` allows 1 024 array elements. `finish` is
+idempotent per object: a repeated marker returns the same reply instead of a
+refusal, because the effect already landed. The reply is `length`, `body_hash`
+(the raw Blake3 digest of the body: a transfer-integrity value, **never** a
+content address) and, when the body is a canonical Active Infinity image,
+`content`, the redacted content address the domain provider serves. A grant must
+cover `total + 53 × chunk_count` bytes to carry the frames, not just the body.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

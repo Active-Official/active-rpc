@@ -472,15 +472,21 @@ impl WasmTool {
         if reserved_fuel > granted {
             // A grant too small to pay for the guest's own memory is a fuel
             // shortfall, not a resource over a ceiling (round 19, L2).
+            self.last_random_used = store.data().random_used;
             return Err(provider("wasm/fuel"));
         }
-        store
-            .set_fuel(granted - reserved_fuel)
-            .map_err(|_| provider("wasm/fuel"))?;
+        if store.set_fuel(granted - reserved_fuel).is_err() {
+            self.last_random_used = store.data().random_used;
+            return Err(provider("wasm/fuel"));
+        }
         let instance = match linker.instantiate_and_start(&mut store, &self.module) {
             Ok(instance) => instance,
             Err(error) => {
                 self.log = std::mem::take(&mut store.data_mut().log);
+                // A start function can draw entropy before it traps: the metric
+                // is "bytes the last call drew", so it is recorded on every
+                // return, not only on success (round 53, L-4).
+                self.last_random_used = store.data().random_used;
                 return Err(classify_instantiation(error));
             }
         };
@@ -488,6 +494,7 @@ impl WasmTool {
             Some(memory) => memory,
             None => {
                 self.log = std::mem::take(&mut store.data_mut().log);
+                self.last_random_used = store.data().random_used;
                 return Err(provider("wasm/memory"));
             }
         };
@@ -501,21 +508,29 @@ impl WasmTool {
             // did not cover: a shortfall, not a resource over a ceiling
             // (round 20, L9).
             self.log = std::mem::take(&mut store.data_mut().log);
+            self.last_random_used = store.data().random_used;
             return Err(provider("wasm/fuel"));
         }
-        store
+        if store
             .set_fuel(remaining + (reserved_fuel - memory_fuel))
-            .map_err(|_| provider("wasm/fuel"))?;
+            .is_err()
         {
-            let data = memory.data_mut(&mut store);
-            if data.len() < input.len() {
-                return Err(provider("wasm/memory"));
-            }
-            data[INPUT_OFFSET..INPUT_OFFSET + input.len()].copy_from_slice(input);
+            self.last_random_used = store.data().random_used;
+            return Err(provider("wasm/fuel"));
         }
-        let run = instance
-            .get_typed_func::<i32, i32>(&store, "run")
-            .map_err(|_| provider("wasm/entry"))?;
+        if memory.data(&store).len() < input.len() {
+            self.last_random_used = store.data().random_used;
+            return Err(provider("wasm/memory"));
+        }
+        memory.data_mut(&mut store)[INPUT_OFFSET..INPUT_OFFSET + input.len()]
+            .copy_from_slice(input);
+        let run = match instance.get_typed_func::<i32, i32>(&store, "run") {
+            Ok(run) => run,
+            Err(_) => {
+                self.last_random_used = store.data().random_used;
+                return Err(provider("wasm/entry"));
+            }
+        };
         let returned = match run.call(&mut store, input.len() as i32) {
             Ok(value) => value,
             Err(error) => {

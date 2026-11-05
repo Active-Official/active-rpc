@@ -250,3 +250,67 @@ fn a_base_with_a_control_character_is_refused() {
     let error = tool.invoke(0, &call).expect_err("the base is a fault");
     assert_eq!(error.code(), "rpc/tool-policy", "{error}");
 }
+
+/// The construction gate covers the whole base, scheme included, and refuses an
+/// empty authority. `try_new` is the documented place a configuration fault is
+/// caught, so a base it cannot render safely must not reach `Debug` or a socket
+/// (round 53, M-1; round 53, L-2).
+#[test]
+fn try_new_refuses_a_base_it_could_not_render_safely() {
+    for base in [
+        "ht\rtp://host",
+        "http\r\n://host",
+        "http://ho st:9",
+        "http://ex\u{00e4}mple.test",
+        "http://",
+        "http://:9",
+        "://host",
+        "ht:tp://host",
+        "http://host/",
+    ] {
+        let error = active_rpc::tool::HttpTool::try_new(base, &[("GET", "/x")])
+            .err()
+            .unwrap_or_else(|| panic!("{base:?} was admitted"));
+        assert_eq!(error.code(), "rpc/tool-policy", "{base:?}: {error}");
+    }
+    active_rpc::tool::HttpTool::try_new("http://127.0.0.1:9", &[("GET", "/x")])
+        .expect("a plain base is admitted");
+}
+
+/// A control character before `://` is dropped at construction, so it can never
+/// forge a `Debug` line (round 53, M-1).
+#[test]
+fn a_forged_base_never_reaches_debug() {
+    let tool = active_rpc::tool::HttpTool::new("http\r\nX-Injected: 1://host", &[("GET", "/x")]);
+    let rendered = format!("{tool:?}");
+    assert!(
+        !rendered.contains("Injected"),
+        "the head leaked: {rendered}"
+    );
+    assert!(
+        !rendered.contains('\r') && !rendered.contains('\n'),
+        "a control character reached Debug: {rendered:?}"
+    );
+}
+
+/// A matrix parameter is not a dot segment but a container peer strips it
+/// before resolving, so the allowlist would name another resource
+/// (round 53, L-3).
+#[test]
+fn a_matrix_parameter_in_an_allowlist_path_is_refused() {
+    for path in ["/users/..;/admin", "/x;/../admin", "/a;b"] {
+        let error = active_rpc::tool::HttpTool::try_new("http://127.0.0.1:9", &[("GET", path)])
+            .err()
+            .unwrap_or_else(|| panic!("{path} was admitted"));
+        assert_eq!(error.code(), "rpc/tool-policy", "{path}: {error}");
+
+        // `new` drops the entry: a dead entry is safer than a silently widened
+        // one.
+        let mut tool = active_rpc::tool::HttpTool::new("http://127.0.0.1:9", &[("GET", path)]);
+        let call = Call::new("get", vec![Arg::Value(Value::Path(path.to_string()))]);
+        let error = tool
+            .invoke(0, &call)
+            .expect_err("the entry is not on the allowlist");
+        assert_eq!(error.code(), "rpc/tool-policy", "{path}: {error}");
+    }
+}

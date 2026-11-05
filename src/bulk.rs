@@ -61,9 +61,34 @@ pub const MAX_TOTAL: u64 = 1 << 30;
 /// Most chunks a plan may declare.
 ///
 /// The plan frame names one hash per chunk, so an unbounded count turns a small
-/// frame into a huge allocation. 65 536 chunks with the smallest useful chunk
-/// still describes a 1 GiB body at 16 KiB per chunk.
-pub const MAX_CHUNKS: u32 = 65_536;
+/// frame into a huge allocation. The bound is the size of the plan itself: the
+/// header and 32 bytes per chunk must stay inside `WireLimits::strict()`'s
+/// 1 MiB payload ceiling, so a plan is always a frame the strict profile can
+/// carry (`53 + 32 * 32 766 = 1 048 565`). A full 1 GiB body therefore needs a
+/// chunk of at least 32 KiB (round 3, F8).
+pub const MAX_CHUNKS: u32 = 32_766;
+
+/// Wire overhead of one chunk frame: magic, version, index, offset, length and
+/// hash.
+///
+/// A grant carries frames, not body bytes, so a body of `total` bytes needs
+/// `total + CHUNK_OVERHEAD * chunks` of grant to arrive at all
+/// (round 3, F9).
+pub const CHUNK_OVERHEAD: u64 = 4 + 1 + 4 + 8 + 4 + 32;
+
+/// How many missing indexes a `missing` reply lists.
+///
+/// `Budget::strict()` allows 1 024 elements in one list, and a 32 766-chunk
+/// plan cannot be resumed from a single unbounded reply, so the reply is a
+/// window and the caller repeats it (round 3, F8).
+pub const MISSING_PAGE: usize = 1_024;
+
+/// How long a transfer may sit idle before its slot is released.
+///
+/// The kernel stamps `Call::now_ms`, so expiry is deterministic and a peer that
+/// opens a transfer and sends nothing cannot hold the slot forever
+/// (round 3, F1).
+pub const TRANSFER_IDLE_MS: u64 = 60_000;
 
 const CHUNK_DOMAIN: &[u8] = b"active-rpc/bulk-chunk/v1\0";
 const ROOT_DOMAIN: &[u8] = b"active-rpc/bulk-root/v1\0";
@@ -132,8 +157,13 @@ impl BulkPlan {
     /// must derive the same bytes or its root check fails.
     pub fn new_with_context(bytes: &[u8], chunk: usize, context: &[u8]) -> Result<Self> {
         check_chunk_size(chunk)?;
-        let hashes: Vec<[u8; 32]> = bytes.chunks(chunk).map(chunk_hash).collect();
         let total = bytes.len() as u64;
+        if total > MAX_TOTAL {
+            // A sender must not build a plan its own decoder refuses
+            // (round 3, F7).
+            return Err(Error::Bulk("body exceeds the protocol ceiling"));
+        }
+        let hashes: Vec<[u8; 32]> = bytes.chunks(chunk).map(chunk_hash).collect();
         let chunks = expected_chunks(total, chunk)?;
         debug_assert_eq!(chunks as usize, hashes.len());
         let root = root_hash(chunk, total, &hashes, context);
@@ -163,6 +193,9 @@ impl BulkPlan {
         context: &[u8],
     ) -> Result<Self> {
         check_chunk_size(chunk)?;
+        if total > MAX_TOTAL {
+            return Err(Error::Bulk("body exceeds the protocol ceiling"));
+        }
         let expected = expected_chunks(total, chunk)?;
         if hashes.len() as u32 != expected {
             return Err(Error::Bulk("plan chunk count does not match the total"));
@@ -669,6 +702,9 @@ impl BulkSender {
 pub struct BulkReceiver {
     plan: BulkPlan,
     received: BTreeMap<u32, Vec<u8>>,
+    /// Bytes stored, maintained on insert so a status reply is O(1) rather
+    /// than a sum over every chunk (round 3, F2).
+    stored: u64,
     ceiling: u64,
     meter: Option<BudgetMeter>,
     expected_root: Option<[u8; 32]>,
@@ -680,7 +716,7 @@ impl std::fmt::Debug for BulkReceiver {
         f.debug_struct("BulkReceiver")
             .field("plan", &self.plan)
             .field("received", &self.received.len())
-            .field("bytes", &self.bytes_received())
+            .field("bytes", &self.stored)
             .field("ceiling", &self.ceiling)
             .finish()
     }
@@ -701,6 +737,7 @@ impl BulkReceiver {
         Ok(Self {
             plan,
             received: BTreeMap::new(),
+            stored: 0,
             ceiling,
             meter: None,
             expected_root: None,
@@ -754,6 +791,7 @@ impl BulkReceiver {
         if let Some(meter) = self.meter.as_mut() {
             meter.charge_bytes(frame.len() as u64)?;
         }
+        self.stored = self.stored.saturating_add(data.len() as u64);
         self.received.insert(index, data);
         Ok(index)
     }
@@ -773,20 +811,42 @@ impl BulkReceiver {
             return Ok(index);
         }
         charge(frame.len() as u64)?;
+        self.stored = self.stored.saturating_add(data.len() as u64);
         self.received.insert(index, data);
         Ok(index)
     }
 
     /// Indexes not yet received, in order.
+    ///
+    /// The whole list; a status reply on the provider path uses the bounded
+    /// [`BulkReceiver::missing_page`] instead.
     pub fn missing(&self) -> Vec<u32> {
         (0..self.plan.chunks)
             .filter(|index| !self.received.contains_key(index))
             .collect()
     }
 
-    /// Bytes accepted so far.
+    /// At most `page` indexes not yet received, lowest first.
+    ///
+    /// A resumed transfer of a plan with tens of thousands of chunks needs more
+    /// than one reply, and `Budget::strict()` allows 1 024 elements
+    /// (round 3, F8).
+    pub fn missing_page(&self, page: usize) -> Vec<u32> {
+        (0..self.plan.chunks)
+            .filter(|index| !self.received.contains_key(index))
+            .take(page)
+            .collect()
+    }
+
+    /// How many chunks are still missing. O(1): the count is derived from the
+    /// stored indexes, not from a scan (round 3, F2).
+    pub fn missing_count(&self) -> u64 {
+        self.plan.chunks as u64 - self.received.len() as u64
+    }
+
+    /// Bytes accepted so far. O(1): maintained on insert (round 3, F2).
     pub fn bytes_received(&self) -> u64 {
-        self.received.values().map(|data| data.len() as u64).sum()
+        self.stored
     }
 
     /// True when every chunk is present.
@@ -796,36 +856,34 @@ impl BulkReceiver {
 
     /// Assemble and verify the body.
     ///
-    /// Each chunk is moved out of the map as it is appended, so peak memory is
-    /// the body plus one chunk rather than twice the body.
-    pub fn finish(self) -> Result<Vec<u8>> {
-        let Self {
-            plan,
-            mut received,
-            ceiling,
-            expected_root,
-            ..
-        } = self;
-        if let Some(expected) = expected_root {
-            plan.require_root(expected)?;
+    /// Every refusal leaves the stored chunks intact: a finish that cannot
+    /// succeed must not destroy bytes the caller already paid for
+    /// (round 3, F6). A successful finish releases them, and peak memory is the
+    /// assembled body plus the stored chunks.
+    pub fn finish(&mut self) -> Result<Vec<u8>> {
+        if let Some(expected) = self.expected_root {
+            self.plan.require_root(expected)?;
         }
-        if received.len() as u32 != plan.chunks {
+        if self.received.len() as u32 != self.plan.chunks {
             return Err(Error::Bulk("body is incomplete"));
         }
-        if plan.total > ceiling {
+        if self.plan.total > self.ceiling {
             return Err(Error::Bulk("body exceeds the receiver ceiling"));
         }
-        let mut out = Vec::with_capacity(plan.total as usize);
-        for index in 0..plan.chunks {
-            let data = received
-                .remove(&index)
+        let mut out = Vec::with_capacity(self.plan.total as usize);
+        for index in 0..self.plan.chunks {
+            let data = self
+                .received
+                .get(&index)
                 .ok_or(Error::Bulk("body is incomplete"))?;
-            out.extend_from_slice(&data);
+            out.extend_from_slice(data);
         }
-        if out.len() as u64 != plan.total {
+        if out.len() as u64 != self.plan.total {
             return Err(Error::Bulk("body length does not match the plan"));
         }
-        plan.verify(&out)?;
+        self.plan.verify(&out)?;
+        self.received.clear();
+        self.stored = 0;
         Ok(out)
     }
 }
@@ -866,6 +924,75 @@ fn validate_chunk(
     Ok((index, chunk.data, false))
 }
 
+/// A completed bulk body and the digests computed for it.
+///
+/// `body_hash` is the raw Blake3 digest of the bytes: a transfer-integrity
+/// value, never a content address. For a body that is a canonical Active
+/// Infinity image, [`BulkBody::content_hash`] is the redacted content address
+/// the domain provider serves, so a relay that republishes a location does not
+/// re-create the offline-guessing oracle a raw digest is (round 3, F4).
+pub struct BulkBody {
+    body: Vec<u8>,
+    body_hash: [u8; 32],
+    content: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for BulkBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BulkBody")
+            .field("len", &self.body.len())
+            .field("body_hash", &hex(&self.body_hash))
+            .field("content", &self.content.as_ref().map(hex))
+            .finish()
+    }
+}
+
+impl BulkBody {
+    /// The assembled bytes.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Take the assembled bytes.
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+
+    /// Length in bytes.
+    pub fn len(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Whether the body is empty.
+    pub fn is_empty(&self) -> bool {
+        self.body.is_empty()
+    }
+
+    /// Raw Blake3 digest of the bytes. Never a content address.
+    pub fn body_hash(&self) -> [u8; 32] {
+        self.body_hash
+    }
+
+    /// The canonical, redacted content address, when the body is an Active
+    /// Infinity image.
+    pub fn content_hash(&self) -> Option<[u8; 32]> {
+        self.content
+    }
+}
+
+/// A transfer in progress for one object.
+struct ActiveTransfer {
+    plan: BulkPlan,
+    receiver: BulkReceiver,
+    last_ms: u64,
+}
+
+/// A body that finished and has not been taken by the host yet.
+struct CompletedTransfer {
+    body: BulkBody,
+    plan: BulkPlan,
+}
+
 /// A provider that receives a bulk body through ordinary calls.
 ///
 /// The plan, each chunk, the resume request and the finish marker travel as the
@@ -874,15 +1001,23 @@ fn validate_chunk(
 /// an envelope payload on ingress and the capability grants the methods, so a
 /// chunk costs the caller its grant and a peer without `put` cannot push one.
 ///
+/// State is keyed by the capability's object, and the kernel's drop
+/// notification releases it: two capabilities on one provider never share a
+/// transfer, and revoking the last capability does not leave a gigabyte of
+/// chunks resident (round 3, F1). An incomplete transfer is released after
+/// [`TRANSFER_IDLE_MS`] of inactivity, measured against the kernel's
+/// `Call::now_ms`.
+///
 /// The receiver here is deliberately unmetered: the bytes were charged when the
 /// envelope arrived, and charging again would double-count. A caller that feeds
 /// [`BulkReceiver`] directly uses [`BulkReceiver::with_budget`] or
 /// [`BulkReceiver::accept_charged`] instead.
 pub struct BulkProvider {
     expected_root: Option<[u8; 32]>,
+    context: Vec<u8>,
     ceiling: u64,
-    transfer: Option<(BulkPlan, BulkReceiver)>,
-    completed: Option<(Vec<u8>, [u8; 32])>,
+    transfers: BTreeMap<u64, ActiveTransfer>,
+    completed: BTreeMap<u64, CompletedTransfer>,
     calls: u64,
 }
 
@@ -890,12 +1025,10 @@ impl std::fmt::Debug for BulkProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BulkProvider")
             .field("pinned_root", &self.expected_root.is_some())
+            .field("context_bytes", &self.context.len())
             .field("ceiling", &self.ceiling)
-            .field("active", &self.transfer.is_some())
-            .field(
-                "completed",
-                &self.completed.as_ref().map(|(body, _)| body.len()),
-            )
+            .field("active", &self.transfers.keys().collect::<Vec<_>>())
+            .field("completed", &self.completed.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -906,18 +1039,42 @@ impl Default for BulkProvider {
     }
 }
 
+/// The `plan` reply for a transfer.
+fn plan_reply(plan: &BulkPlan, missing: u64) -> Response {
+    Response::Value(Value::map([
+        ("total", Value::Int(plan.total() as i64)),
+        ("chunk", Value::Int(plan.chunk_size() as i64)),
+        ("chunks", Value::Int(plan.chunk_count() as i64)),
+        ("root", Value::text(plan.root_hex())),
+        ("missing", Value::Int(missing as i64)),
+    ]))
+}
+
+/// The `finish` reply, and the same reply for a repeated marker.
+fn finish_reply(body: &BulkBody) -> Response {
+    let mut entries = BTreeMap::new();
+    entries.insert("length".to_string(), Value::Int(body.len() as i64));
+    entries.insert("body_hash".to_string(), Value::text(hex(&body.body_hash())));
+    if let Some(content) = body.content_hash() {
+        entries.insert("content".to_string(), Value::text(hex(&content)));
+    }
+    Response::Value(Value::Map(entries))
+}
+
 impl BulkProvider {
     /// A provider that accepts any internally consistent plan.
     ///
-    /// A transfer admitted this way is checked against corruption, not against
-    /// substitution: pin a root with [`BulkProvider::with_expected_root`] when
-    /// the plan arrives over a channel that is not already authenticated.
+    /// Without a context or a pinned root a transfer is checked against
+    /// corruption only: any peer that can reach `plan` chooses the body. Pin a
+    /// root with [`BulkProvider::with_expected_root`] or bind the plan to the
+    /// opening exchange with [`BulkProvider::with_context`].
     pub fn new() -> Self {
         Self {
             expected_root: None,
+            context: Vec::new(),
             ceiling: MAX_TOTAL,
-            transfer: None,
-            completed: None,
+            transfers: BTreeMap::new(),
+            completed: BTreeMap::new(),
             calls: 0,
         }
     }
@@ -929,65 +1086,102 @@ impl BulkProvider {
         provider
     }
 
+    /// Bind every plan to `context` (for example the request id and capability
+    /// id of the exchange that opened the transfer).
+    ///
+    /// The context is never transmitted: both sides derive it, so a plan cannot
+    /// float free of the envelope that authorized it. This is the provider-side
+    /// half of [`BulkPlan::new_with_context`], which the capability kernel cannot
+    /// supply on its own because `Provider::invoke` carries no request id
+    /// (round 3, F5).
+    pub fn with_context(mut self, context: Vec<u8>) -> Self {
+        self.context = context;
+        self
+    }
+
     /// Cap the body this provider assembles.
     pub fn with_ceiling(mut self, ceiling: u64) -> Self {
         self.ceiling = ceiling.min(MAX_TOTAL);
         self
     }
 
-    /// Take the last completed body and its content hash.
-    pub fn take_body(&mut self) -> Option<(Vec<u8>, [u8; 32])> {
-        self.completed.take()
+    /// Take the completed body for `object`, if the host has not taken it.
+    pub fn take_body(&mut self, object: u64) -> Option<BulkBody> {
+        self.completed.remove(&object).map(|done| done.body)
     }
 
-    /// The transfer in progress, if any.
-    pub fn active_root(&self) -> Option<[u8; 32]> {
-        self.transfer.as_ref().map(|(plan, _)| plan.root())
+    /// Whether a completed body is waiting for the host.
+    pub fn has_body(&self, object: u64) -> bool {
+        self.completed.contains_key(&object)
     }
 
-    fn plan_method(&mut self, call: &Call) -> Result<Response> {
-        let plan = BulkPlan::decode_for(&call.payload, self.ceiling, &[])?;
+    /// The transfer in progress for `object`, if any.
+    pub fn active_root(&self, object: u64) -> Option<[u8; 32]> {
+        self.transfers.get(&object).map(|active| active.plan.root())
+    }
+
+    /// Release an incomplete transfer that has been idle past the window.
+    fn expire(&mut self, object: u64, now_ms: u64) {
+        if let Some(active) = self.transfers.get(&object) {
+            if now_ms.saturating_sub(active.last_ms) > TRANSFER_IDLE_MS {
+                self.transfers.remove(&object);
+            }
+        }
+    }
+
+    /// Refuse a new plan while a finished body waits to be taken.
+    ///
+    /// Replacing it would silently drop bytes the caller paid to transfer
+    /// (round 3, F3).
+    fn require_taken(&self, object: u64) -> Result<()> {
+        if self.completed.contains_key(&object) {
+            return Err(Error::Bulk("the completed body has not been taken"));
+        }
+        Ok(())
+    }
+
+    fn plan_method(&mut self, object: u64, call: &Call) -> Result<Response> {
+        let plan = BulkPlan::decode_for(&call.payload, self.ceiling, &self.context)?;
         if let Some(expected) = self.expected_root {
             plan.require_root(expected)?;
         }
-        if let Some((active, receiver)) = &self.transfer {
+        self.expire(object, call.now_ms);
+        self.require_taken(object)?;
+        if let Some(active) = self.transfers.get_mut(&object) {
             // A second plan mid-transfer is either a retry of the same transfer
             // or a substitution, which is refused. A retry must not reset the
             // chunks already received: the caller paid for them, and a
             // retransmitted plan frame is ordinary on a flaky link.
-            if active.root() != plan.root() {
+            if active.plan.root() != plan.root() {
                 return Err(Error::Bulk("a different transfer is already active"));
             }
-            let plan = active.clone();
-            let missing = receiver.missing().len() as u64;
-            return Ok(Response::Value(Value::map([
-                ("total", Value::Int(plan.total() as i64)),
-                ("chunk", Value::Int(plan.chunk_size() as i64)),
-                ("chunks", Value::Int(plan.chunk_count() as i64)),
-                ("root", Value::text(plan.root_hex())),
-                ("missing", Value::Int(missing as i64)),
-            ])));
+            active.last_ms = call.now_ms;
+            return Ok(plan_reply(&active.plan, active.receiver.missing_count()));
         }
         let receiver = BulkReceiver::with_ceiling(plan.clone(), self.ceiling)?;
-        let missing = receiver.missing().len() as u64;
-        self.transfer = Some((plan.clone(), receiver));
-        Ok(Response::Value(Value::map([
-            ("total", Value::Int(plan.total() as i64)),
-            ("chunk", Value::Int(plan.chunk_size() as i64)),
-            ("chunks", Value::Int(plan.chunk_count() as i64)),
-            ("root", Value::text(plan.root_hex())),
-            ("missing", Value::Int(missing as i64)),
-        ])))
+        let missing = receiver.missing_count();
+        self.transfers.insert(
+            object,
+            ActiveTransfer {
+                plan,
+                receiver,
+                last_ms: call.now_ms,
+            },
+        );
+        let plan = &self.transfers[&object].plan;
+        Ok(plan_reply(plan, missing))
     }
 
-    fn put_method(&mut self, call: &Call) -> Result<Response> {
-        let (_, receiver) = self
-            .transfer
-            .as_mut()
+    fn put_method(&mut self, object: u64, call: &Call) -> Result<Response> {
+        self.expire(object, call.now_ms);
+        let active = self
+            .transfers
+            .get_mut(&object)
             .ok_or(Error::Bulk("no transfer is active"))?;
-        let index = receiver.accept(&call.payload)?;
-        let received = receiver.bytes_received();
-        let missing = receiver.missing().len() as u64;
+        let index = active.receiver.accept(&call.payload)?;
+        active.last_ms = call.now_ms;
+        let received = active.receiver.bytes_received();
+        let missing = active.receiver.missing_count();
         Ok(Response::Value(Value::map([
             ("index", Value::Int(index as i64)),
             ("received", Value::Int(received as i64)),
@@ -995,51 +1189,78 @@ impl BulkProvider {
         ])))
     }
 
-    fn missing_method(&mut self) -> Result<Response> {
-        let (plan, receiver) = self
-            .transfer
-            .as_ref()
+    fn missing_method(&mut self, object: u64, call: &Call) -> Result<Response> {
+        self.expire(object, call.now_ms);
+        let active = self
+            .transfers
+            .get(&object)
             .ok_or(Error::Bulk("no transfer is active"))?;
-        let missing: Vec<Value> = receiver
-            .missing()
+        let page = active.receiver.missing_page(MISSING_PAGE);
+        let more = active.receiver.missing_count() > page.len() as u64;
+        let missing: Vec<Value> = page
             .into_iter()
             .map(|index| Value::Int(index as i64))
             .collect();
         Ok(Response::Value(Value::map([
-            ("total", Value::Int(plan.total() as i64)),
+            ("total", Value::Int(active.plan.total() as i64)),
             ("missing", Value::list(missing)),
+            ("more", Value::Bool(more)),
+            (
+                "remaining",
+                Value::Int(active.receiver.missing_count() as i64),
+            ),
         ])))
     }
 
-    fn finish_method(&mut self, call: &Call) -> Result<Response> {
+    fn finish_method(&mut self, object: u64, call: &Call) -> Result<Response> {
+        // A repeated marker answers with the same reply: the effect landed, the
+        // caller cannot tell a lost answer from a lost request, and a retry must
+        // not be receipted as a refusal (round 3, F3).
+        if let Some(done) = self.completed.get(&object) {
+            BulkFinish::decode(&call.payload, &done.plan)?;
+            return Ok(finish_reply(&done.body));
+        }
+        self.expire(object, call.now_ms);
         // Validate before taking: a marker for another transfer, or a finish
         // that arrives before the last chunk, must not destroy the chunks the
-        // caller has already paid for. Only a successful finish consumes the
-        // transfer.
+        // caller has already paid for.
         {
-            let (plan, receiver) = self
-                .transfer
-                .as_ref()
+            let active = self
+                .transfers
+                .get(&object)
                 .ok_or(Error::Bulk("no transfer is active"))?;
             // The marker names the root and length the sender believes it sent;
             // a marker for another transfer must not settle this one.
-            BulkFinish::decode(&call.payload, plan)?;
-            if !receiver.is_complete() {
+            BulkFinish::decode(&call.payload, &active.plan)?;
+            if !active.receiver.is_complete() {
                 return Err(Error::Bulk("body is incomplete"));
             }
         }
-        let (_, receiver) = self
-            .transfer
-            .take()
+        let mut active = self
+            .transfers
+            .remove(&object)
             .ok_or(Error::Bulk("no transfer is active"))?;
-        let body = receiver.finish()?;
-        let hash = *blake3::hash(&body).as_bytes();
-        let length = body.len() as u64;
-        self.completed = Some((body, hash));
-        Ok(Response::Value(Value::map([
-            ("length", Value::Int(length as i64)),
-            ("hash", Value::text(hex(&hash))),
-        ])))
+        let body = match active.receiver.finish() {
+            Ok(body) => body,
+            Err(error) => {
+                // Every refusal leaves the transfer intact.
+                self.transfers.insert(object, active);
+                return Err(error);
+            }
+        };
+        let body_hash = *blake3::hash(&body).as_bytes();
+        let content = active_infinity::content_hash(&body).ok();
+        let done = CompletedTransfer {
+            body: BulkBody {
+                body,
+                body_hash,
+                content,
+            },
+            plan: active.plan,
+        };
+        let reply = finish_reply(&done.body);
+        self.completed.insert(object, done);
+        Ok(reply)
     }
 }
 
@@ -1064,13 +1285,21 @@ impl crate::kernel::Provider for BulkProvider {
         method != "missing"
     }
 
-    fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
+    /// A revoked capability must not leave a transfer behind: the chunks (up to
+    /// the protocol ceiling) and a completed body would stay resident for the
+    /// life of the process (round 3, F1).
+    fn on_drop(&mut self, object: u64, _cap: crate::cap::CapId) {
+        self.transfers.remove(&object);
+        self.completed.remove(&object);
+    }
+
+    fn invoke(&mut self, object: u64, call: &Call) -> Result<Response> {
         self.calls = self.calls.saturating_add(1);
         match call.method.as_str() {
-            "plan" => self.plan_method(call),
-            "put" => self.put_method(call),
-            "missing" => self.missing_method(),
-            "finish" => self.finish_method(call),
+            "plan" => self.plan_method(object, call),
+            "put" => self.put_method(object, call),
+            "missing" => self.missing_method(object, call),
+            "finish" => self.finish_method(object, call),
             other => Err(Error::MethodNotGranted {
                 method: other.to_string(),
             }),
@@ -1120,6 +1349,9 @@ fn check_chunk_size(chunk: usize) -> Result<()> {
 }
 
 fn expected_chunks(total: u64, chunk: usize) -> Result<u32> {
+    // This is the division sink for every ceiling check: a zero chunk panicked
+    // here, and the guard had been left to each caller (round 3, F10).
+    check_chunk_size(chunk)?;
     if total == 0 {
         return Ok(0);
     }

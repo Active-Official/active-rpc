@@ -2064,19 +2064,33 @@ impl HttpTool {
     ///
     /// The adapter sends the path verbatim and compares it as a string while a
     /// server normalizes: a dot segment, percent escape, query, fragment,
-    /// backslash, double slash or non-printable byte can name a different
-    /// resource than the allowlisted string (round 27, #4; round 29, F4).
+    /// backslash, double slash, matrix parameter or non-printable byte can name
+    /// a different resource than the allowlisted string (round 27, #4;
+    /// round 29, F4; round 53, L-3).
     fn ambiguous_path(path: &str) -> bool {
         !path.starts_with('/')
             || path.contains('%')
             || path.contains('?')
             || path.contains('#')
+            // Container peers strip `;name=value` from a segment before they
+            // resolve it, so `/x;/../admin` reaches `/admin` on the peer while
+            // the allowlist saw one string (round 53, L-3).
+            || path.contains(';')
             || path.contains('\\')
             || path.contains("//")
             || path
                 .split('/')
                 .any(|segment| segment == ".." || segment == ".")
             || path.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+    }
+
+    /// RFC 3986 §3.1: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
+    fn valid_scheme(scheme: &str) -> bool {
+        let mut bytes = scheme.bytes();
+        bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
     }
 
     /// Build a tool for `base` with an allowlist.
@@ -2095,22 +2109,30 @@ impl HttpTool {
         // character would inject a line into the request head and into `Debug`
         // (round 52, F-5).
         let base = base.into();
-        let (authority, base_invalid) = match base.split_once("://") {
-            Some((scheme, rest)) => {
+        // The scan covers the whole string, scheme included: a control
+        // character before `://` used to pass the construction gate and reach
+        // `Debug` as a forged log line (round 53, M-1). A space or a non-ASCII
+        // byte is refused for the same reason it is at dispatch.
+        let printable = base.bytes().all(|byte| (0x21..=0x7e).contains(&byte));
+        let (authority, base_invalid) = match base.split_once("://").filter(|_| printable) {
+            Some((scheme, rest)) if Self::valid_scheme(scheme) => {
                 let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
                 let has_tail = end != rest.len();
-                let control = rest.bytes().any(|byte| byte.is_ascii_control());
-                // A control character is never kept: it would reach Debug and a
-                // log line (round 52, F-5). A path or query tail leaves the
-                // authority nameable while the tool refuses (round 52, F-1).
-                let authority = if control {
+                // No authority, or only a port separator: `http://` and
+                // `http://:9` name the default host, which is not a base the
+                // operator wrote (round 53, L-2).
+                let empty_authority = rest.is_empty() || rest.starts_with(':');
+                // An unusable base is never kept: a path tail would retarget a
+                // request if the dispatch refusal were ever bypassed, and a
+                // control character would reach `Debug` (round 52, F-1/F-5).
+                let authority = if empty_authority {
                     String::new()
                 } else {
                     format!("{scheme}://{}", &rest[..end])
                 };
-                (authority, has_tail || control)
+                (authority, has_tail || empty_authority)
             }
-            None => (String::new(), true),
+            _ => (String::new(), true),
         };
         Self {
             base: authority,

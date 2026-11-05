@@ -134,6 +134,31 @@ fn declared_memory_is_charged_against_the_grant() {
     ));
 }
 
+/// A guest whose `start` draws entropy and then traps: the draw is still what
+/// the last call spent, so `entropy_used` reports it (round 53, L-4).
+const START_RANDOM_TRAP: &str = r#"
+(module
+  (import "env" "random" (func $random (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (func $s (drop (call $random (i32.const 0) (i32.const 8))) (unreachable))
+  (start $s)
+  (func (export "run") (param i32) (result i32) (i32.const 0)))
+"#;
+
+#[test]
+fn a_start_function_draw_is_reported_when_it_traps() {
+    let mut tool = tool(START_RANDOM_TRAP, WasmLimits::default());
+    let mut call = Call::new("run", vec![Arg::text("")]);
+    call.budget = Budget::default();
+    call.now_ms = 1;
+    let error = tool.invoke(0, &call).expect_err("the start function traps");
+    assert!(
+        error.to_string().contains("wasm/trap"),
+        "unexpected refusal: {error}"
+    );
+    assert_eq!(tool.entropy_used(), 8, "the start draw was not reported");
+}
+
 /// F3: a trap in `start` is a trap.
 #[test]
 fn a_start_trap_is_wasm_trap() {

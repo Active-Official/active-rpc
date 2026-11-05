@@ -47,7 +47,7 @@ fn a_substituted_plan_is_refused_by_the_pinned_root() {
         .invoke(0, &call)
         .expect_err("the provider refuses a substituted plan");
     assert_eq!(error.code(), "rpc/bulk");
-    assert!(provider.active_root().is_none());
+    assert!(provider.active_root(0).is_none());
 }
 
 /// The transfer context folds into the root and is never transmitted, so a plan
@@ -280,11 +280,14 @@ fn a_bulk_transfer_through_the_kernel_assembles_the_body() {
     for byte in expected {
         hex.push_str(&format!("{byte:02x}"));
     }
-    assert_eq!(finish_map.get("hash"), Some(&Value::text(hex)));
+    assert_eq!(finish_map.get("body_hash"), Some(&Value::text(hex)));
     assert_eq!(
         finish_map.get("length"),
         Some(&Value::Int(payload.len() as i64))
     );
+    // The body is not an Active Infinity image, so no content address is
+    // invented for it: a raw digest is never served as one (round 3, F4).
+    assert_eq!(finish_map.get("content"), None);
 }
 
 /// A capability that does not grant `put` cannot push a chunk, and a budget that
@@ -524,7 +527,7 @@ fn a_refused_finish_keeps_the_transfer() {
         active_rpc::Call::new("finish", Vec::new()).with_payload(BulkFinish::new(&plan).encode());
     let error = provider.invoke(0, &early).expect_err("incomplete");
     assert_eq!(error.code(), "rpc/bulk");
-    assert_eq!(provider.active_root(), Some(plan.root()));
+    assert_eq!(provider.active_root(0), Some(plan.root()));
 
     let last = sender.frame_at(plan.chunk_count() - 1).expect("frame");
     provider
@@ -540,7 +543,7 @@ fn a_refused_finish_keeps_the_transfer() {
         active_rpc::Call::new("finish", Vec::new()).with_payload(BulkFinish::new(&other).encode());
     let error = provider.invoke(0, &foreign).expect_err("another transfer");
     assert_eq!(error.code(), "rpc/bulk");
-    assert_eq!(provider.active_root(), Some(plan.root()));
+    assert_eq!(provider.active_root(0), Some(plan.root()));
 
     provider
         .invoke(
@@ -549,6 +552,6 @@ fn a_refused_finish_keeps_the_transfer() {
                 .with_payload(BulkFinish::new(&plan).encode()),
         )
         .expect("the complete body settles");
-    let (assembled, _) = provider.take_body().expect("body");
+    let assembled = provider.take_body(0).expect("body");
     assert_eq!(assembled.len(), plan.total() as usize);
 }

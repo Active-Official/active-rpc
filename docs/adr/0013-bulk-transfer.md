@@ -51,11 +51,24 @@ hash matches the bytes *and* the plan's announced hash.
 - `finish()` requires every chunk, checks the total length and re-verifies the
   body against the plan. A truncated or corrupted body never becomes a valid
   image.
+- `BulkProvider` holds state **per object**: two capabilities never share a
+  transfer, `Provider::on_drop` releases both the in-progress transfer and an
+  untaken completed body, and an incomplete transfer expires after 60 s of
+  inactivity measured against the kernel clock. `plan` refuses to start a new
+  transfer for an object whose completed body has not been taken, and `finish`
+  is idempotent per object so a lost answer can be retried. `missing` answers a
+  page of 1 024 indexes with `more` and `remaining`. The finish reply carries
+  `body_hash` (raw digest, never a content address) and `content` (the redacted
+  canonical content address) when the body is an Infinity image. The transfer
+  context is supplied by `BulkProvider::with_context`.
 - The **root is integrity, not authenticity**: `with_expected_root` pins the
   root the caller learned from the envelope, and a substituted plan is refused.
 - A configurable ceiling bounds the bytes a receiver will assemble; the default
-  is 1 GiB. `decode` checks the declared total and the chunk count (65 536)
-  before the hash vector is allocated.
+  is 1 GiB. `decode` checks the declared total and the chunk count (32 766, the
+  largest plan frame that fits `WireLimits::strict()`'s 1 MiB payload) before the
+  hash vector is allocated.
+- Every refusal inside `finish` leaves the chunks in place, so an error path
+  cannot destroy bytes the caller paid for.
 
 **Sender rules.** `frame_at(index)` is the streaming path; `frames_from(index)`
 and `frames_for(missing)` are the batch paths. The missing list is deduplicated
@@ -65,8 +78,9 @@ carries the hash it was built with, so a retransmission does not re-hash it.
 ## Consequences
 
 - Memory is `O(body)` at the sender (it already has the bytes) and
-  `O(received)` at the receiver, bounded by the ceiling; `finish` moves chunks
-  out of the map instead of holding two copies.
+  `O(received)` at the receiver, bounded by the ceiling. `finish` assembles
+  before it releases the stored chunks, so its peak is the body plus the stored
+  chunks: non-destructiveness on every refusal costs that one copy.
 - The per-chunk hash means a receiver verifies each chunk on arrival; the root
   proves the whole set. It is a two-level Merkle shape without the tree.
 - Authority stays on the ARP1 envelope: the provider is reached through a

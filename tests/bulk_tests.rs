@@ -54,7 +54,7 @@ fn an_empty_body_plans_to_zero_chunks_and_finishes_empty() {
     let sender = BulkSender::new(Vec::new(), 1024).expect("sender");
     assert_eq!(sender.plan().chunk_count(), 0);
     assert!(sender.frames().is_empty());
-    let receiver = BulkReceiver::new(sender.plan().clone()).expect("receiver");
+    let mut receiver = BulkReceiver::new(sender.plan().clone()).expect("receiver");
     assert!(receiver.is_complete());
     assert_eq!(receiver.finish().expect("finish"), Vec::<u8>::new());
 }
