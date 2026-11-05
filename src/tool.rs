@@ -1427,6 +1427,20 @@ impl<T: McpTransport> McpSession<T> {
                     code: "mcp/line-too-long".to_string(),
                 });
             }
+            // The answer shares the grant with the request and every skipped
+            // frame, and the parse is work the grant must authorise: a 1 MiB
+            // line under a 200-byte grant decoded into a tree of megabytes
+            // before the budget refused it (round 41, F1). A line that cannot
+            // fit the remainder is refused here, before the text scan and the
+            // parse. The line was consumed, so the stream is still aligned and
+            // the refusal does not poison the session; an unaffordable
+            // notification is the same refusal.
+            if let Some(grant) = grant {
+                let cap = grant.saturating_sub(spent).min(MAX_MCP_LINE_BYTES);
+                if line.len() > cap {
+                    return Err(Error::BudgetExceeded("byte"));
+                }
+            }
             // The node ceiling is enforced on the text before the tree exists:
             // a one-megabyte array of zeros decodes to half a million values,
             // and the HTTP adapter has refused that shape since round 13 while
@@ -1486,21 +1500,8 @@ impl<T: McpTransport> McpSession<T> {
                 // whatever id it reuses: answering it as our result lets a
                 // peer choose the shape of our answer (round 18, L-3).
                 Some(value) if value.as_u64() == Some(id) && !object.contains_key("method") => {
-                    // The request and every skipped frame spent part of the
-                    // grant; only the remainder is available to the answer
-                    // (round 33, H1; round 35, N1). The static ceiling always
-                    // caps one line, and a handshake with no grant (`None`) has
-                    // no sum bound at all: treating a grant at or above the
-                    // ceiling as if it did let a 1.5 MiB grant carry 1.8 MiB
-                    // (round 34, #1). The line was consumed and it is the
-                    // answer, so a grant refusal does not poison the session
-                    // (round 28, #2).
-                    let response_cap = grant.map_or(MAX_MCP_LINE_BYTES, |grant| {
-                        grant.saturating_sub(spent).min(MAX_MCP_LINE_BYTES)
-                    });
-                    if line.len() > response_cap {
-                        return Err(Error::BudgetExceeded("byte"));
-                    }
+                    // The grant bound was applied to the line before the parse
+                    // (round 41, F1), so the answer is already paid for.
                     let has_result = object.get("result").is_some();
                     let has_error = object.get("error").is_some();
                     if !has_result && !has_error {
@@ -1525,14 +1526,10 @@ impl<T: McpTransport> McpSession<T> {
                 // notifications do not break a spec-compliant server.
                 None if object.contains_key("method") => {
                     // The frame is buffered like any other, so it spends the
-                    // grant. Past it the stream is desynchronised: the answer
-                    // this call wants is still behind frames it could not
-                    // account for, so the session is poisoned.
+                    // grant. The line was already bounded by the remainder
+                    // before the parse, so this only reaches the grant itself
+                    // and never passes it (round 41, F1).
                     spent = spent.saturating_add(line.len());
-                    if grant.is_some_and(|grant| spent > grant) {
-                        self.poisoned = true;
-                        return Err(Error::BudgetExceeded("byte"));
-                    }
                     skipped += 1;
                     if skipped > MAX_MCP_NOTIFICATIONS {
                         self.poisoned = true;
@@ -1641,6 +1638,14 @@ impl<T: McpTransport> Provider for McpSession<T> {
         let arg_bytes: u64 = call.args.iter().map(Arg::wire_size).sum();
         if arg_bytes > call.budget.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
+        }
+        // The method before the tool lookup: an out-of-range object and a bad
+        // method reported the object refusal here while the other three
+        // reported the method, which fingerprints the adapter (round 41, F3).
+        if !self.tools.iter().any(|tool| tool.name == call.method) {
+            return Err(Error::MethodNotGranted {
+                method: call.method.clone(),
+            });
         }
         let index =
             usize::try_from(object).map_err(|_| Error::InvalidArgument("unknown MCP tool"))?;
@@ -2108,8 +2113,12 @@ impl HttpTool {
         // The head already spent part of the grant; the body may use the rest
         // (round 22, F-F).
         let body_cap = max_body.saturating_sub(header_bytes);
-        if body_cap == 0 {
-            return Err(capped("http/body-too-large", grant_bound));
+        if content_length == Some(0) {
+            // A declared empty body needs no room. Refusing it at the exact
+            // grant boundary while the same empty answer without a
+            // `content-length` succeeded let the peer choose the outcome by
+            // choosing a framing (round 41, F5).
+            return Ok((status, Vec::new()));
         }
         let body = match content_length {
             Some(length) => {
@@ -2372,14 +2381,23 @@ impl Provider for HttpTool {
                     }
                     {
                         // Same cap as the request line: JSON escaping can
-                        // multiply a text argument (round 40, F1).
-                        let cap = usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
-                        let mut writer = CappedWriter::new(cap);
+                        // multiply a text argument (round 40, F1). The static
+                        // request ceiling is part of the cap too, so an
+                        // artifact past it is never built; the refusal keeps
+                        // the tool-policy code the spec names for that ceiling
+                        // (round 41, F4).
+                        let grant_cap =
+                            usize::try_from(call.budget.max_bytes).unwrap_or(usize::MAX);
+                        let static_cap = self.max_request.min(MAX_REQUEST_BYTES);
+                        let static_bound = static_cap <= grant_cap;
+                        let mut writer = CappedWriter::new(grant_cap.min(static_cap));
                         if serde_json::to_writer(&mut writer, &value_to_json(&value)).is_err() {
-                            return Err(if writer.exceeded {
-                                Error::BudgetExceeded("byte")
-                            } else {
+                            return Err(if !writer.exceeded {
                                 Error::InvalidArgument("the HTTP body cannot be serialised")
+                            } else if static_bound {
+                                Error::ToolPolicy("request too large")
+                            } else {
+                                Error::BudgetExceeded("byte")
                             });
                         }
                         writer.out
@@ -2640,10 +2658,13 @@ fn has_nul(path: &std::path::Path) -> bool {
 /// gets a scrubbed environment (only what the caller allows), no shell, a pinned
 /// working directory and a byte-bounded stdout. Anything else is
 /// `rpc/tool-policy`.
-#[derive(Debug)]
+/// A local program under capability control.
+///
+/// `Debug` is written by hand: `env` conventionally holds a child's token, and
+/// a derived formatter would print every value into a log line or a panic
+/// message (round 41, F6).
 pub struct LocalProcess {
-    /// Absolute program path as given to [`LocalProcess::new`].
-    ///
+    /// Absolute program path as given to [`LocalProcess::new`].    ///
     /// Private: `invoke` runs the canonical path pinned at construction, so a
     /// later assignment would silently keep running the old binary
     /// (round 30, #6). The advertised form is [`LocalProcess::program`].
@@ -2668,6 +2689,27 @@ pub struct LocalProcess {
     pub calls: u64,
     /// Canonical program path pinned at construction.
     resolved: PathBuf,
+}
+
+impl std::fmt::Debug for LocalProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keys are configuration; values are credentials. A deployment log or
+        // a panic message must not carry a child's token (round 41, F6).
+        let mut env = std::collections::BTreeMap::new();
+        for key in self.env.keys() {
+            env.insert(key, "<redacted>");
+        }
+        formatter
+            .debug_struct("LocalProcess")
+            .field("program", &self.program)
+            .field("allow_args", &self.allow_args)
+            .field("env", &env)
+            .field("workdir", &self.workdir)
+            .field("max_output", &self.max_output)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("calls", &self.calls)
+            .finish()
+    }
 }
 
 impl LocalProcess {

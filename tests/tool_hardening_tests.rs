@@ -3075,17 +3075,19 @@ fn an_mcp_notification_spends_the_grant() {
     .expect("handshake");
     let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
     call.tool_allows_process = true;
-    // Four 1 KiB notifications do not fit the grant, so the first frames past
-    // it are refused.
     call.budget.max_bytes = 2_048;
-    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
-        .expect_err("the notifications are over the grant");
-    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
-    // The answer is still behind frames the call could not account for, so the
-    // session is desynchronised.
-    let again = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
-        .expect_err("the session is poisoned");
-    assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
+    // Four 1 KiB notifications do not fit the grant, so each is refused before
+    // the parse. The line was consumed, so the session stays frame-aligned and
+    // the answer is reachable once the frames are drained (round 41, F1 moved
+    // this check before the parse, which makes it non-poisoning).
+    // Each call's request line leaves room for one 1 KiB notification and not
+    // the next, so the two calls drain the four frames and each ends in the
+    // budget refusal.
+    for _ in 0..2 {
+        let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+            .expect_err("the notifications are over the grant");
+        assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    }
 }
 
 /// A notification past the grant fails the same way the answer does, and the

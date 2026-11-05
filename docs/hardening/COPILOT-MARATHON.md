@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-40: round 39 found 2 mediums and 2 lows, round 40 fixed its 1 medium and 1 low; round 41 must be clean | 269 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-41: round 41 found 1 medium and 5 lows, all fixed; round 42 must be clean | 275 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-13: round 13 (muse) found 1 high, 3 mediums and 2 lows, all fixed, plus a QUIC shutdown race found in CI; round 14 must be clean | 104 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -702,6 +702,30 @@ concurrent overshoot to observe.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 41)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash, `xhigh`, read-only at `eb053c6`. Round-40
+claims: (1) PARTIAL, (2) PARTIAL, (3) HOLD. Verdict **NOT CLEAN**: one medium and five
+lows, all confirmed and fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the MCP **answer** was grant-checked only after the text-complexity scan and `serde_json::from_str`, so a peer answered under a 200-byte grant could return a 1 MiB line that decoded into ~12 MiB before the budget refused it (the other three adapters bound the read) | **fixed**: the line is bounded by `grant - spent` before the scan and the parse, for the answer and for a notification alike; the line was consumed, so the refusal does not poison the session; `an_mcp_answer_past_the_grant_is_refused_before_the_parse` (pre-fix `rpc/provider`, post-fix `rpc/budget-exceeded`, twice in a row with no poison) |
+| 2 | low | the wasm adapter applied its per-argument shape/size loop before the method, so a bad method plus a non-text or over-budget argument reported a different code there | **fixed**: the `Arg::wire_size` sum runs first, then the method, then the shape loop; `the_wasm_adapter_reports_the_budget_before_the_method` |
+| 3 | low | MCP decoded the tool index before the method, so an out-of-range object plus a bad method was `rpc/invalid-argument` there and `rpc/method-not-granted` elsewhere | **fixed**: the method is checked against the discovered names first; `a_bad_mcp_method_is_reported_before_the_tool_index` |
+| 4 | low | the HTTP body cap was the grant only, so a body between `max_request` and the grant was fully serialized before the static ceiling refused it | **fixed**: the cap is `min(grant, max_request)`, the refusal keeps `rpc/tool-policy` as the spec names it; `the_http_static_request_ceiling_refuses_during_serialization` |
+| 5 | low | at the exact grant boundary a `content-length: 0` answer was `rpc/budget-exceeded` while the same empty answer read to end-of-stream succeeded, so the peer chose the outcome by choosing a framing | **fixed**: a declared empty body returns before the body-room check; `a_zero_length_http_body_fits_the_exact_grant` covers both framings |
+| 6 | low | `LocalProcess` derived `Debug` printed every `env` **value**, the conventional home of a child's token | **fixed**: a hand-written `Debug` prints the keys and `<redacted>`; `a_process_debug_does_not_print_environment_values` |
+
+Accepted residual: the MCP request line is charged to the grant with no envelope
+allowance (availability only); `MAX_MCP_QUEUED_LINES` × 1 MiB per session is
+deliberate; `StdioTransport` keeps its child alive until drop (documented).
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. Five of the six tests fail against the pre-fix tree; the HTTP static
+ceiling test pins the same code before and after (the fix removes the work, not the
+code).
 
 ### R-08 tools and MCP - 2026-11-04 (round 40)
 
