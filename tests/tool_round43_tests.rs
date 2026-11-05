@@ -170,3 +170,29 @@ fn the_wasm_adapter_refuses_an_input_past_its_abi_area() {
         .expect_err("the input is past the ABI area");
     assert_eq!(error.provider_code(), Some("wasm/input"), "{error}");
 }
+
+/// A child that kills itself has run: the refusal is a withheld reply, not a
+/// call that did not happen (round 44, M-2).
+#[cfg(not(windows))]
+#[test]
+fn a_child_killed_by_a_signal_withholds_the_reply() {
+    use active_rpc::tool::LocalProcess;
+
+    let script = "kill -9 $$";
+    let mut tool = LocalProcess::new("/bin/sh", &["-c", script]).expect("an absolute program");
+    let mut call = Call::new("run", vec![Arg::text("-c"), Arg::text(script)]);
+    call.tool_allows_process = true;
+    call.budget = Budget {
+        max_wall_ms: 5_000,
+        max_bytes: 1 << 20,
+        ..Budget::default()
+    };
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a signalled child has no exit status");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
+}

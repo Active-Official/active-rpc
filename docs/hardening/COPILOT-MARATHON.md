@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-43: round 43 found 5 highs, 1 medium and 4 lows, all fixed; round 44 must be clean | 290 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-44: round 44 found 2 highs, 3 mediums and 5 lows; all fixed or documented; round 45 must be clean | 299 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | rounds 1-16: round 16 found 1 high, 2 mediums and 6 lows; 6 fixed, 3 noted; round 17 must be clean | 127 fixed / 0 rejected / 5 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -781,6 +781,33 @@ concurrent overshoot to observe.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 44)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `92f6221`. Round-43
+claims: five HOLD, one BROKEN, one PARTIAL. Verdict **NOT CLEAN**: two highs, three
+mediums and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the primary reader-drain deadline (the `recv_timeout` arm) still returned a bare `rpc/timeout` after the child ran, so a leader that exits while a helper holds the pipe was receipted `Refused` and re-forked on retry | **fixed**: every post-spawn return is `provider/reply-withheld` (nine sites); the leader-exits test asserts it |
+| 2 | high | a stale `#[cfg(unix)]` expectation asserted `rpc/timeout` for the killed tree, so the Linux CI suite was red while the Windows gate was green | **fixed** in `5a82c75`; this round confirms it, and every process suite now also runs on Linux in the `rust:1.98` container |
+| 3 | medium | `process/thread:<err>` after a successful spawn was not withheld | **fixed** |
+| 4 | medium | `process/signalled` (the child ran and was killed) was not withheld | **fixed**; `a_child_killed_by_a_signal_withholds_the_reply` (Unix) and the older signal test updated |
+| 5 | medium | the spec's process table still advertised the pre-spawn classes for post-spawn refusals | **fixed**: one `provider/reply-withheld` row covers every post-spawn refusal, and the four stale rows are qualified |
+| 6 | low | `write_within` re-checked the deadline after the last chunk, so a fully written head could be reported as a pre-send timeout | **fixed**: the check runs only between chunks |
+| 7 | low | a closed writer at enqueue never took the frame, yet `after_send` was set, burning the idempotency key | **fixed**: `mcp/write:closed` poisons the session without claiming the effect |
+| 8 | low | a valid MCP `error.code` keeps `mcp/<code>` on a writable call, unlike HTTP | **documented** in `wire.md`: MCP reserves `result.isError` for a tool that ran and failed, so an `error` object is a decline |
+| 9 | low | the kernel's mutating axis for HTTP is the capability flag plus the dispatched method, so a `request`-with-`GET` is conservatively withheld | **documented** as deliberately over-conservative |
+| 10 | low | at `grant == MAX_MCP_LINE_BYTES` the writer said budget and the post-check said argument | **fixed**: the post-check uses the same `static_bound` rule |
+
+Accepted residuals: the withheld mapping erases the adapter's own class from the
+refusal metrics; Windows kills only the process-tree leader; a provider that
+declares `mutating=false` while acting has its claim rewritten to `rpc/provider`;
+the wasm adapter has no withheld path (its only durable effect is its own log).
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9; the full suite green on Linux in the `rust:1.98` container.
 
 ### R-08 tools and MCP - 2026-11-04 (round 43)
 

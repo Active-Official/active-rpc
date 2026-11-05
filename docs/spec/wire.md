@@ -336,20 +336,23 @@ answer is ignored before the JSON gates and the decode.
 | Code | Condition |
 |------|-----------|
 | `process/spawn:<err>` | the pinned program could not be started |
-| `process/wait:<err>` | waiting for the child failed |
+| `process/wait:<err>` | waiting for the child failed after it was spawned; reported as a withheld reply |
 | `process/cwd` | the working directory could not be pinned at construction |
-| `process/thread:<err>` | a pipe reader thread could not start; the child is killed |
-| `process/signalled` | the child died from a signal, so it has no exit status to report |
-| `rpc/budget-exceeded` | the wall or byte grant is zero, the input is past the byte grant, or the output reached the grant-derived ceiling |
-| `rpc/timeout` | the call exceeded the effective wall ceiling; the whole process group was killed |
+| `process/thread:<err>` | a pipe reader thread could not start; the child is killed and the refusal is a withheld reply |
+| `process/signalled` | the child died from a signal, so it has no exit status; a withheld reply |
+| `rpc/budget-exceeded` | the wall or byte grant is zero, or the input is past the byte grant (both before the spawn) |
 | `rpc/invalid-argument` | a construction path, a working directory, or an argument is not something the adapter can execute |
-| `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, a secret argument was passed, the output exceeded the effective ceiling, or process execution was not granted |
+| `rpc/tool-policy` | an argument is not allowlisted, a prefix-matched argument contains shell syntax, a secret argument was passed, or process execution was not granted |
+| `provider/reply-withheld` | every post-spawn refusal: the wall deadline (the whole process group is killed), an output stream past the effective ceiling, a reader thread failure, a wait fault, or a signalled child |
 
 The effective output ceiling is the smaller of `max_output`, 16 MiB and the
-capability byte grant, for both streams together. A grant-derived ceiling
-reports `rpc/budget-exceeded`; an adapter setting reports the policy code. The
-argument line is charged against the same grant, so a direct caller cannot pass
-a megabyte of argv under a one-byte grant.
+capability byte grant, for both streams together. The argument line is charged
+against the same grant, so a direct caller cannot pass a megabyte of argv under
+a one-byte grant. Every refusal decided after the spawn is
+`provider/reply-withheld`: the child ran, the effect may stand, and an
+idempotent retry must not fork it again. The pre-spawn refusals (a zero grant,
+the input past the grant, the allowlist, a secret argument, the missing process
+grant) keep their own class.
 
 `LocalProcess::new` requires an absolute program path. A bare name would be
 resolved from the parent's `PATH`, which is ambient authority: anything that can
@@ -473,6 +476,14 @@ the grant or the static ceiling) and to the process adapter (a deadline, an
 output overrun, a wait fault). The MCP session is poisoned in either case,
 because before parsing the client cannot tell an over-grant notification (whose
 answer is still queued) from the answer itself.
+
+Two deliberate asymmetries. A JSON-RPC `error` object from an MCP server keeps
+its `mcp/<code>` on a writable call: MCP reserves `result.isError` for a tool
+that ran and failed, so an `error` object is the tool declining, not a reply
+that was lost. And the kernel's mutating axis for the HTTP adapter is the
+capability flag plus the method it dispatched, so an HTTP `request` call is
+withheld even when its method text is `GET`: over-conservative, never a claim
+that a read had an effect.
 
 One stream carries one frame. On QUIC the reader takes the announced length and
 then probes for trailing bytes with a `250 ms` window (`STREAM_TAIL_WAIT`): a

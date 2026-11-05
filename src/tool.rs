@@ -855,7 +855,12 @@ fn write_within(
             Ok(written) => sent += written,
             Err(error) => return Err(map_http_write(error)),
         }
-        remaining_until(deadline)?;
+        if sent < bytes.len() {
+            // Only between chunks: a head that is fully on the wire, terminator
+            // included, must not be reported as a pre-send timeout (round 44,
+            // L-6). The next phase arms its own deadline.
+            remaining_until(deadline)?;
+        }
     }
     Ok(())
 }
@@ -1412,11 +1417,14 @@ impl<T: McpTransport> McpSession<T> {
             }
         }
         if line.len() > MAX_MCP_LINE_BYTES {
-            // Past the static ceiling: no budget can make this line legal, so
-            // it is a bad argument (round 27, #1).
-            return Err(Error::InvalidArgument(
-                "the MCP request exceeds the line ceiling",
-            ));
+            // Past the static ceiling: a bad argument unless the grant is the
+            // tighter bound at equality, where no larger grant helps and the
+            // budget is the honest class (round 27, #1; round 44, L-10).
+            return Err(if static_bound {
+                Error::InvalidArgument("the MCP request exceeds the line ceiling")
+            } else {
+                Error::BudgetExceeded("byte")
+            });
         }
         // The request spent part of the grant; only the remainder is available
         // to the answer (round 33, H1).
@@ -1440,14 +1448,21 @@ impl<T: McpTransport> McpSession<T> {
             // `mcp/queue` and `mcp/not-sent` are the exceptions: the writer
             // never took the frame, so the session stays usable
             // (round 29, F1; round 34, #7).
-            if !matches!(&error, Error::Provider { code }
-                if code == "mcp/queue" || code == "mcp/not-sent")
-            {
+            let handed_over = !matches!(&error, Error::Provider { code }
+                if code == "mcp/queue" || code == "mcp/not-sent" || code == "mcp/write:closed");
+            if handed_over {
                 self.poisoned = true;
                 // The writer took the frame, so it may have reached the peer:
                 // a writable call reports a withheld reply rather than a call
                 // that did not happen (round 43, F-5).
                 self.after_send = true;
+            } else if !matches!(&error, Error::Provider { code }
+                if code == "mcp/queue" || code == "mcp/not-sent")
+            {
+                // A closed writer never took the frame, but the session is
+                // unusable: poison it without claiming the effect (round 44,
+                // L-7).
+                self.poisoned = true;
             }
             return Err(error);
         }
@@ -3269,9 +3284,11 @@ impl Provider for LocalProcess {
         );
         if let Some(error) = spawn_error {
             kill_process_tree(&mut child);
-            return Err(Error::Provider {
+            // The child was already spawned, so it may have acted: the refusal is
+            // a withheld reply (round 44, M-1).
+            return Err(reply_withheld(Error::Provider {
                 code: format!("process/thread:{error}"),
-            });
+            }));
         }
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -3369,9 +3386,16 @@ impl Provider for LocalProcess {
         // A child killed by a signal has no exit code. Reporting `-1` as a
         // status made an externally killed mutating tool look successful in
         // the receipt (round 24, #3).
-        let status_code = status.code().ok_or(Error::Provider {
-            code: "process/signalled".to_string(),
-        })?;
+        // A signalled child ran to completion (something killed it): the
+        // effect may stand, so the class is a withheld reply (round 44, M-2).
+        let status_code = match status.code() {
+            Some(code) => code,
+            None => {
+                return Err(reply_withheld(Error::Provider {
+                    code: "process/signalled".to_string(),
+                }))
+            }
+        };
         map.insert("status".to_string(), Value::Int(i64::from(status_code)));
         // A binary stream is not text: transcoding it inserts replacement
         // characters, so two different byte strings would compare equal

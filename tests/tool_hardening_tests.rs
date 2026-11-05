@@ -2076,8 +2076,14 @@ fn a_signalled_child_is_a_provider_fault() {
     let error = tool
         .invoke(0, &call)
         .expect_err("a signalled child is not a success");
+    // The child ran and was killed by a signal: the refusal is a withheld reply
+    // (round 44, M-2).
     assert_eq!(error.code(), "rpc/provider", "{error}");
-    assert_eq!(error.provider_code(), Some("process/signalled"), "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
 }
 
 /// A byte grant below the shortest possible answer can never carry one, so the
