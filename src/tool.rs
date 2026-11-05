@@ -2070,8 +2070,10 @@ impl std::fmt::Debug for HttpTool {
 }
 
 impl HttpTool {
-    /// The configured base: `http://host:port`, or empty when the configured
-    /// value was unusable. A path, query or fragment is never part of it.
+    /// The configured base: `http://host:port`, or empty when the authority
+    /// itself was unusable. A path, query or fragment tail is not part of it:
+    /// such a base keeps its authority here for the operator's log while every
+    /// call is refused with `rpc/tool-policy`.
     pub fn base(&self) -> &str {
         &self.base
     }
@@ -2098,6 +2100,21 @@ impl HttpTool {
                 .split('/')
                 .any(|segment| segment == ".." || segment == ".")
             || path.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+    }
+
+    /// Whether `name` is a host `ToSocketAddrs` can parse: a DNS name, an IPv4
+    /// literal, or a bracketed IPv6 literal.
+    fn usable_host(name: &str) -> bool {
+        if let Some(inner) = name
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            return inner.parse::<std::net::Ipv6Addr>().is_ok();
+        }
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
     }
 
     /// Build a tool for `base` with an allowlist.
@@ -2131,11 +2148,13 @@ impl HttpTool {
                 let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
                 let has_tail = end != rest.len();
                 let host = &rest[..end];
+                // The host itself must be a DNS name, an IPv4 literal or a
+                // bracketed IPv6 literal: `host:extra:80` and `[::1:8080` used
+                // to pass this gate and then fail at dispatch as the retryable
+                // `http/resolve` class (round 55, M-1).
                 let usable = match host.rsplit_once(':') {
                     Some((name, port)) => {
-                        !name.is_empty()
-                            && !name.contains('@')
-                            && port.parse::<u16>().is_ok_and(|port| port != 0)
+                        Self::usable_host(name) && port.parse::<u16>().is_ok_and(|port| port != 0)
                     }
                     None => false,
                 };

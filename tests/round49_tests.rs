@@ -275,6 +275,10 @@ fn try_new_refuses_a_base_it_could_not_render_safely() {
         "http://host:99999",
         "http://host:0",
         "http://user:pw@host:80",
+        "http://user@host:80",
+        "http://host:extra:80",
+        "http://[::1:8080",
+        "http://ho%73t:80",
         "http://:80",
         "https://host:443",
         "ftp://host:21",
@@ -291,6 +295,10 @@ fn try_new_refuses_a_base_it_could_not_render_safely() {
     let upper = active_rpc::tool::HttpTool::try_new("HTTP://127.0.0.1:9", &[("GET", "/x")])
         .expect("an upper-case scheme is normalised");
     assert_eq!(upper.base(), "http://127.0.0.1:9");
+    // A bracketed IPv6 literal is a host this adapter can reach.
+    let v6 = active_rpc::tool::HttpTool::try_new("http://[::1]:9", &[("GET", "/x")])
+        .expect("a bracketed IPv6 literal is admitted");
+    assert_eq!(v6.base(), "http://[::1]:9");
 }
 
 /// A base that is refused at construction must also be refused at dispatch as a

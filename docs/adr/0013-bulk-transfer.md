@@ -51,22 +51,27 @@ hash matches the bytes *and* the plan's announced hash.
 - `finish()` requires every chunk, checks the total length and re-verifies the
   body against the plan. A truncated or corrupted body never becomes a valid
   image.
-- `BulkProvider` holds state **per object**: two capabilities never share a
-  transfer, `Provider::on_drop` releases both the in-progress transfer and an
-  untaken completed body, and an incomplete transfer expires after 60 s of
-  inactivity measured against the kernel clock. `plan` refuses to start a new
-  transfer for an object whose completed body has not been taken, and `finish`
-  is idempotent per object so a lost answer can be retried. `missing` answers a
-  page of 1 024 indexes with `more` and `remaining`. The finish reply carries
-  `body_hash` (raw digest, never a content address) and `content` (the redacted
-  canonical content address) when the body is an Infinity image. The transfer
-  context is supplied by `BulkProvider::with_context`.
+- `BulkProvider` holds state **per object** (what `Provider::invoke` carries);
+  attenuation preserves the object, so an object is expected to have one
+  principal and a delegated capability shares its slot. `Provider::on_drop`
+  releases both the in-progress transfer and an untaken completed body; an
+  incomplete transfer expires after 60 s of inactivity and an untaken body after
+  10 minutes, both against the kernel clock, and the digest reply outlives the
+  bytes. `plan` refuses to start a new transfer for an object whose completed
+  body has not been taken, and `finish` is idempotent per object so a lost answer
+  can be retried even after `take_body`. `missing` answers a page of 1 024
+  indexes with `more` and `remaining`, keeps the transfer alive and never expires
+  it. The finish reply carries `body_hash` (raw digest, never a content address)
+  and `content`: the canonical hash of the **redacted** image when the body is
+  an Infinity image. The transfer context is supplied by
+  `BulkProvider::with_context`, one per provider instance.
 - The **root is integrity, not authenticity**: `with_expected_root` pins the
   root the caller learned from the envelope, and a substituted plan is refused.
 - A configurable ceiling bounds the bytes a receiver will assemble; the default
-  is 1 GiB. `decode` checks the declared total and the chunk count (32 766, the
-  largest plan frame that fits `WireLimits::strict()`'s 1 MiB payload) before the
-  hash vector is allocated.
+  is 1 GiB. `decode` checks the declared total and the chunk count (32 760, the
+  largest plan **envelope** that fits `WireLimits::strict()`'s 1 MiB frame) before
+  the hash vector is allocated, and the plan constructor checks the count before
+  it hashes anything.
 - Every refusal inside `finish` leaves the chunks in place, so an error path
   cannot destroy bytes the caller paid for.
 
@@ -81,6 +86,10 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   `O(received)` at the receiver, bounded by the ceiling. `finish` assembles
   before it releases the stored chunks, so its peak is the body plus the stored
   chunks: non-destructiveness on every refusal costs that one copy.
+- The kernel meters ingress and egress against one grant, so a whole transfer
+  needs `BulkPlan::required_grant()`: the plan frame, the chunk frames, the
+  finish marker and a per-call reply allowance. `total + 53 x chunk_count` is the
+  chunk frames alone.
 - The per-chunk hash means a receiver verifies each chunk on arrival; the root
   proves the whole set. It is a two-level Merkle shape without the tree.
 - Authority stays on the ARP1 envelope: the provider is reached through a

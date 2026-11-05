@@ -123,10 +123,12 @@ fn a_dropped_capability_releases_its_bulk_state() {
 }
 
 /// An incomplete transfer past the idle window is released, so a peer that
-/// opens a transfer and sends nothing cannot hold the slot (round 3, F1).
+/// opens a transfer and sends nothing cannot hold the slot (round 3, F1). A
+/// resume poll never expires it and keeps it alive (round 4, L-1).
 #[test]
 fn an_idle_transfer_expires() {
     let plan = BulkPlan::new(&body(4_000, 5), 1_000).expect("plan");
+    let sender = BulkSender::new(body(4_000, 5), 1_000).expect("sender");
     let mut provider = BulkProvider::new();
     let mut open = call("plan", plan.encode());
     open.now_ms = 10_000;
@@ -140,9 +142,16 @@ fn an_idle_transfer_expires() {
         Some(&Value::Int(plan.chunk_count() as i64))
     );
 
+    // A late poll is answered too: `missing` never expires, so a read-only
+    // caller cannot destroy another capability's chunks.
     let mut late = call("missing", Vec::new());
-    late.now_ms = 10_000 + TRANSFER_IDLE_MS + 1;
-    let error = provider.invoke(1, &late).expect_err("the transfer is gone");
+    late.now_ms = 10_000 + 10 * TRANSFER_IDLE_MS;
+    provider.invoke(1, &late).expect("a poll never expires");
+
+    // A chunk write past the window does expire it, because it claims the slot.
+    let mut put = call("put", sender.frame_at(0).expect("frame"));
+    put.now_ms = 10_000 + 11 * TRANSFER_IDLE_MS + 1;
+    let error = provider.invoke(1, &put).expect_err("the transfer is gone");
     assert_eq!(error.code(), "rpc/bulk");
     assert_eq!(provider.active_root(1), None);
 }

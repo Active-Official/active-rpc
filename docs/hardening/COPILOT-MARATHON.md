@@ -21,9 +21,9 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-54: round 54 found 1 medium and 3 lows, all fixed; round 55 must be clean | 355 fixed / 4 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-55: round 55 found 1 medium and 4 lows (one rejected), all fixed; round 56 must be clean | 360 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-3: round 3 found 1 high, 4 mediums and 5 lows, all fixed; round 4 must be clean | 24 fixed / 0 rejected / 0 open | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-4: round 4 found 1 high, 4 mediums and 5 lows, all fixed; round 5 must be clean | 34 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
@@ -897,6 +897,24 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-05 (round 55)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `36ad2ba`. Round-54
+claims: one verified with a gap, three verified. Verdict **PARTIAL**: one medium
+and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the host half of the authority was never validated: `http://host:extra:80` and `http://[::1:8080` were admitted and then failed at dispatch as the retryable `http/resolve` class | **fixed**: the host must be a DNS name (letters, digits, `.`, `-`, `_`), an IPv4 literal, or a bracketed IPv6 literal that parses; `try_new_refuses_a_base_it_could_not_render_safely` covers the three shapes and a bracketed literal is asserted admitted |
+| 2 | low | `WasmTool::invoke` cleared the log but left the previous call's `last_random_used` | **fixed**: the metric is zeroed beside the log |
+| 3 | low | the `wasm/entry` and second `set_fuel` arms recorded the start function's entropy but discarded its log | **fixed**: both take the log, like their siblings |
+| 4 | low | `base()` and `wire.md` claimed `new` keeps no authority from an unusable base, while a tail-bearing base keeps it deliberately | **fixed**: the docs say the authority is dropped only when the authority itself is unusable |
+| 5 | low | the `rpc/tool-policy` row did not name the round-54 shapes (no port, port range, userinfo, scheme, host form) | **fixed**: the row lists them |
+| 6 | low | the userinfo entry looked like `******host:80`, so the predicate was untested | **rejected as stated**: the tree has `"http://user:pw@host:80"`; the reviewer's own reader redacted `user:pw@` in the text it quoted. A no-password form was added anyway (`"http://user@host:80"`) |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
@@ -2491,6 +2509,28 @@ logical message in one frame.
 Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
+
+### R-10 bulk transfer - 2026-11-05 (round 4)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `36ad2ba`. Four of
+the ten round-3 fixes did not hold. Verdict **PARTIAL**: one high, four mediums
+and five lows; every one is fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the finish reply published the raw canonical content address, which covers the secret heap: the redaction step was missing, and the round-3 test redacted the image *before* transferring, so it could never see the difference | **fixed**: `content` is `content_hash(redact_module(body))`; `the_content_address_is_the_redacted_hash` transfers an image that still holds `secret(...)`, asserts the fixture's raw and redacted hashes differ, and pins the redacted one in the reply and in `BulkBody::content_hash` |
+| 2 | medium | the documented grant (`total + 53 x chunks`) pays for the chunk frames only; the plan frame, finish marker and every reply share the same meter, so a transfer started with it dies with the grant spent | **fixed**: `BulkPlan::required_grant()` is the bound; a kernel test proves the frames-only formula fails and `required_grant()` completes; spec and ADR updated |
+| 3 | medium | state is per object while the spec promised per capability; attenuation preserves the object, so a delegated capability shares the slot | **fixed as documented**: the true contract (per object, one principal expected, a delegated capability observes and settles) is in the module doc, `wire.md` and ADR-0013; `a_delegated_capability_on_the_same_object_shares_the_transfer` pins it |
+| 4 | medium | `BulkPlan::new_with_context` collected the hash vector before checking the chunk count, so a gigabyte at a one-byte chunk reserved 34 GB and then refused | **fixed**: the count is checked before hashing; `a_plan_past_the_chunk_ceiling_is_refused_before_hashing` |
+| 5 | low | `missing` was declared non-mutating but called `expire`, so a read-only capability could destroy another capability's chunks, and a live poll never kept the transfer alive | **fixed**: `missing` refreshes `last_ms` and never expires; `a_resume_poll_keeps_the_transfer_alive` |
+| 6 | low | `MAX_CHUNKS` fit `max_payload` but not the strict 1 MiB `max_bytes` frame | **fixed**: 32 760, documented against the frame ceiling, and `the_maximal_plan_fits_a_strict_envelope` encodes and decodes the maximal plan under `WireLimits::strict()` |
+| 7 | low | `with_context` is one context per provider, not per exchange | **documented** in `wire.md` and the method doc; `the_transfer_context_is_one_per_provider` pins both halves |
+| 8 | low | finish idempotency ended at `take_body`, so a retried marker after the host took the body was `rpc/bulk` | **fixed**: a `FinishedTransfer` digest summary outlives the bytes; `a_repeated_finish_survives_take_body` |
+| 9 | low | a finished, untaken body never expired, so a TTL-expired capability held a gigabyte for the process lifetime | **fixed**: `COMPLETED_IDLE_MS` (10 min) releases the bytes and keeps the digest reply; `an_untaken_body_is_released_after_its_window` |
+| 10 | low | the `calls` counter was written and never read | **fixed**: `BulkProvider::calls()` exposes it; `the_provider_counts_admitted_calls` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-10 bulk transfer - 2026-11-05 (round 3)
 

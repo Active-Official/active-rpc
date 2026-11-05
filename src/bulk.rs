@@ -61,12 +61,14 @@ pub const MAX_TOTAL: u64 = 1 << 30;
 /// Most chunks a plan may declare.
 ///
 /// The plan frame names one hash per chunk, so an unbounded count turns a small
-/// frame into a huge allocation. The bound is the size of the plan itself: the
-/// header and 32 bytes per chunk must stay inside `WireLimits::strict()`'s
-/// 1 MiB payload ceiling, so a plan is always a frame the strict profile can
-/// carry (`53 + 32 * 32 766 = 1 048 565`). A full 1 GiB body therefore needs a
-/// chunk of at least 32 KiB (round 3, F8).
-pub const MAX_CHUNKS: u32 = 32_766;
+/// frame into a huge allocation. The bound is the size of the plan *envelope*
+/// under `WireLimits::strict()`: that profile caps the whole frame at 1 MiB
+/// (`max_bytes`, not only `max_payload`), so the header and 32 bytes per chunk
+/// must leave room for the envelope framing as well. A full 1 GiB body
+/// therefore needs a chunk of at least `1 << 30 / 32 760` bytes (round 3, F8;
+/// round 4, L-2). A test encodes and decodes the maximal plan under the strict
+/// profile.
+pub const MAX_CHUNKS: u32 = 32_760;
 
 /// Wire overhead of one chunk frame: magic, version, index, offset, length and
 /// hash.
@@ -82,6 +84,29 @@ pub const CHUNK_OVERHEAD: u64 = 4 + 1 + 4 + 8 + 4 + 32;
 /// plan cannot be resumed from a single unbounded reply, so the reply is a
 /// window and the caller repeats it (round 3, F8).
 pub const MISSING_PAGE: usize = 1_024;
+
+/// Wire overhead of a plan frame: magic, version, chunk size, total length,
+/// chunk count and the root hash.
+pub const PLAN_OVERHEAD: u64 = 4 + 1 + 4 + 8 + 4 + 32;
+
+/// Wire length of a finish marker: magic, version, total and root.
+pub const FINISH_LEN: u64 = 4 + 1 + 8 + 32;
+
+/// Per-call allowance for the provider's replies when a caller sizes a grant.
+///
+/// A place, put, missing or finish reply is a small map; 128 bytes covers every
+/// fixed shape with room to spare (a missing page is larger, but a caller that
+/// pages a 32 760-chunk plan also needs the grant for those replies and
+/// [`BulkPlan::required_grant`] is the conservative bound).
+pub const REPLY_ALLOWANCE: u64 = 128;
+
+/// How long a finished, untaken body is retained before its memory is released.
+///
+/// Longer than [`TRANSFER_IDLE_MS`] because the host polls for a completed body,
+/// and bounded so a capability that expires by TTL without being dropped cannot
+/// hold a gigabyte for the process lifetime (round 4, L-5). The digest reply
+/// stays answerable after the bytes are released.
+pub const COMPLETED_IDLE_MS: u64 = 600_000;
 
 /// How long a transfer may sit idle before its slot is released.
 ///
@@ -163,8 +188,11 @@ impl BulkPlan {
             // (round 3, F7).
             return Err(Error::Bulk("body exceeds the protocol ceiling"));
         }
-        let hashes: Vec<[u8; 32]> = bytes.chunks(chunk).map(chunk_hash).collect();
+        // The count is checked before the hash vector is built: a body of a
+        // gigabyte at a one-byte chunk used to allocate 34 GB of hashes and
+        // then refuse (round 4, M-4).
         let chunks = expected_chunks(total, chunk)?;
+        let hashes: Vec<[u8; 32]> = bytes.chunks(chunk).map(chunk_hash).collect();
         debug_assert_eq!(chunks as usize, hashes.len());
         let root = root_hash(chunk, total, &hashes, context);
         Ok(Self {
@@ -209,6 +237,22 @@ impl BulkPlan {
             root,
             context: context.to_vec(),
         })
+    }
+
+    /// The byte grant a whole transfer needs through a kernel.
+    ///
+    /// The kernel charges ingress and egress against one meter, so this covers
+    /// the plan frame, every chunk frame, the finish marker and a per-call reply
+    /// allowance. `total + CHUNK_OVERHEAD * chunks` covers the chunk frames
+    /// only: a transfer started with exactly that grant spends it on the plan
+    /// and the chunks and then cannot pay for a reply (round 4, M-2).
+    pub fn required_grant(&self) -> u64 {
+        let chunks = self.chunks as u64;
+        self.total
+            .saturating_add(CHUNK_OVERHEAD.saturating_mul(chunks))
+            .saturating_add(PLAN_OVERHEAD.saturating_add(32u64.saturating_mul(chunks)))
+            .saturating_add(FINISH_LEN)
+            .saturating_add(REPLY_ALLOWANCE.saturating_mul(chunks.saturating_add(3)))
     }
 
     /// Chunk size in bytes.
@@ -991,6 +1035,16 @@ struct ActiveTransfer {
 struct CompletedTransfer {
     body: BulkBody,
     plan: BulkPlan,
+    at_ms: u64,
+}
+
+/// The digest reply for a finished body, kept after the host takes the bytes so
+/// a retransmitted finish marker is still answered (round 4, L-4).
+struct FinishedTransfer {
+    plan: BulkPlan,
+    length: u64,
+    body_hash: [u8; 32],
+    content: Option<[u8; 32]>,
 }
 
 /// A provider that receives a bulk body through ordinary calls.
@@ -1001,12 +1055,14 @@ struct CompletedTransfer {
 /// an envelope payload on ingress and the capability grants the methods, so a
 /// chunk costs the caller its grant and a peer without `put` cannot push one.
 ///
-/// State is keyed by the capability's object, and the kernel's drop
-/// notification releases it: two capabilities on one provider never share a
-/// transfer, and revoking the last capability does not leave a gigabyte of
-/// chunks resident (round 3, F1). An incomplete transfer is released after
-/// [`TRANSFER_IDLE_MS`] of inactivity, measured against the kernel's
-/// `Call::now_ms`.
+/// State is keyed by the capability's **object**, which is what
+/// `Provider::invoke` carries, and the kernel's drop notification releases it:
+/// revoking the last capability cannot leave a gigabyte of chunks resident
+/// (round 3, F1). Attenuation preserves the object, so two capabilities derived
+/// from the same grant share one slot: the object is expected to have one
+/// principal. An incomplete transfer is released after [`TRANSFER_IDLE_MS`] of
+/// inactivity and a finished, untaken body after [`COMPLETED_IDLE_MS`], both
+/// measured against the kernel's `Call::now_ms`.
 ///
 /// The receiver here is deliberately unmetered: the bytes were charged when the
 /// envelope arrived, and charging again would double-count. A caller that feeds
@@ -1018,6 +1074,7 @@ pub struct BulkProvider {
     ceiling: u64,
     transfers: BTreeMap<u64, ActiveTransfer>,
     completed: BTreeMap<u64, CompletedTransfer>,
+    last_finished: BTreeMap<u64, FinishedTransfer>,
     calls: u64,
 }
 
@@ -1051,11 +1108,11 @@ fn plan_reply(plan: &BulkPlan, missing: u64) -> Response {
 }
 
 /// The `finish` reply, and the same reply for a repeated marker.
-fn finish_reply(body: &BulkBody) -> Response {
+fn finished_reply(length: u64, body_hash: [u8; 32], content: Option<[u8; 32]>) -> Response {
     let mut entries = BTreeMap::new();
-    entries.insert("length".to_string(), Value::Int(body.len() as i64));
-    entries.insert("body_hash".to_string(), Value::text(hex(&body.body_hash())));
-    if let Some(content) = body.content_hash() {
+    entries.insert("length".to_string(), Value::Int(length as i64));
+    entries.insert("body_hash".to_string(), Value::text(hex(&body_hash)));
+    if let Some(content) = content {
         entries.insert("content".to_string(), Value::text(hex(&content)));
     }
     Response::Value(Value::Map(entries))
@@ -1075,6 +1132,7 @@ impl BulkProvider {
             ceiling: MAX_TOTAL,
             transfers: BTreeMap::new(),
             completed: BTreeMap::new(),
+            last_finished: BTreeMap::new(),
             calls: 0,
         }
     }
@@ -1094,6 +1152,10 @@ impl BulkProvider {
     /// half of [`BulkPlan::new_with_context`], which the capability kernel cannot
     /// supply on its own because `Provider::invoke` carries no request id
     /// (round 3, F5).
+    ///
+    /// One context per provider instance: a provider that serves several objects
+    /// binds them all to the same context, so an exchange that needs its own
+    /// context uses its own provider (round 4, L-3).
     pub fn with_context(mut self, context: Vec<u8>) -> Self {
         self.context = context;
         self
@@ -1120,11 +1182,25 @@ impl BulkProvider {
         self.transfers.get(&object).map(|active| active.plan.root())
     }
 
-    /// Release an incomplete transfer that has been idle past the window.
+    /// Calls admitted by this provider, for observability.
+    pub fn calls(&self) -> u64 {
+        self.calls
+    }
+
+    /// Release an incomplete transfer, or a finished body, that has been idle
+    /// past its window.
+    ///
+    /// A released body keeps its digest reply in `last_finished`, so a retried
+    /// finish marker is answered even after the bytes are gone.
     fn expire(&mut self, object: u64, now_ms: u64) {
         if let Some(active) = self.transfers.get(&object) {
             if now_ms.saturating_sub(active.last_ms) > TRANSFER_IDLE_MS {
                 self.transfers.remove(&object);
+            }
+        }
+        if let Some(done) = self.completed.get(&object) {
+            if now_ms.saturating_sub(done.at_ms) > COMPLETED_IDLE_MS {
+                self.completed.remove(&object);
             }
         }
     }
@@ -1168,6 +1244,9 @@ impl BulkProvider {
                 last_ms: call.now_ms,
             },
         );
+        // A new transfer is a new exchange: the previous body's digest reply is
+        // no longer this object's answer.
+        self.last_finished.remove(&object);
         let plan = &self.transfers[&object].plan;
         Ok(plan_reply(plan, missing))
     }
@@ -1190,11 +1269,14 @@ impl BulkProvider {
     }
 
     fn missing_method(&mut self, object: u64, call: &Call) -> Result<Response> {
-        self.expire(object, call.now_ms);
+        // A live resume poll keeps the transfer alive, and a read-only caller
+        // cannot destroy another capability's chunks: `missing` refreshes the
+        // window and never expires (round 4, L-1).
         let active = self
             .transfers
-            .get(&object)
+            .get_mut(&object)
             .ok_or(Error::Bulk("no transfer is active"))?;
+        active.last_ms = call.now_ms;
         let page = active.receiver.missing_page(MISSING_PAGE);
         let more = active.receiver.missing_count() > page.len() as u64;
         let missing: Vec<Value> = page
@@ -1215,10 +1297,20 @@ impl BulkProvider {
     fn finish_method(&mut self, object: u64, call: &Call) -> Result<Response> {
         // A repeated marker answers with the same reply: the effect landed, the
         // caller cannot tell a lost answer from a lost request, and a retry must
-        // not be receipted as a refusal (round 3, F3).
+        // not be receipted as a refusal (round 3, F3). The digest summary
+        // outlives the bytes, so the answer survives `take_body` and the
+        // completed window (round 4, L-4, L-5).
         if let Some(done) = self.completed.get(&object) {
             BulkFinish::decode(&call.payload, &done.plan)?;
-            return Ok(finish_reply(&done.body));
+            return Ok(finished_reply(
+                done.body.len() as u64,
+                done.body.body_hash(),
+                done.body.content_hash(),
+            ));
+        }
+        if let Some(done) = self.last_finished.get(&object) {
+            BulkFinish::decode(&call.payload, &done.plan)?;
+            return Ok(finished_reply(done.length, done.body_hash, done.content));
         }
         self.expire(object, call.now_ms);
         // Validate before taking: a marker for another transfer, or a finish
@@ -1248,18 +1340,38 @@ impl BulkProvider {
                 return Err(error);
             }
         };
+        let length = body.len() as u64;
         let body_hash = *blake3::hash(&body).as_bytes();
-        let content = active_infinity::content_hash(&body).ok();
-        let done = CompletedTransfer {
-            body: BulkBody {
-                body,
+        // The canonical content address is computed over the *redacted* image.
+        // The raw hash covers the secret heap, so serving it would be the
+        // offline equality oracle the domain provider refuses to publish
+        // (round 4, H-1).
+        let content = crate::security::redact_module(&body)
+            .ok()
+            .and_then(|redacted| active_infinity::content_hash(&redacted).ok());
+        let plan = active.plan;
+        let reply = finished_reply(length, body_hash, content);
+        self.last_finished.insert(
+            object,
+            FinishedTransfer {
+                plan: plan.clone(),
+                length,
                 body_hash,
                 content,
             },
-            plan: active.plan,
-        };
-        let reply = finish_reply(&done.body);
-        self.completed.insert(object, done);
+        );
+        self.completed.insert(
+            object,
+            CompletedTransfer {
+                body: BulkBody {
+                    body,
+                    body_hash,
+                    content,
+                },
+                plan,
+                at_ms: call.now_ms,
+            },
+        );
         Ok(reply)
     }
 }
@@ -1281,7 +1393,9 @@ impl crate::kernel::Provider for BulkProvider {
     }
 
     fn mutating(&self, method: &str) -> bool {
-        // `missing` only reads the receiver's state.
+        // `missing` reads the receiver's state and refreshes the liveness stamp;
+        // it never consumes a chunk or a body, so a read-only capability may call
+        // it (round 4, L-1).
         method != "missing"
     }
 

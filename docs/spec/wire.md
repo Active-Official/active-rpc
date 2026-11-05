@@ -317,7 +317,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
 | `http/read:truncated`, `http/read:truncated-body` | the peer closed before a full line or body arrived |
 | `http/<status>` | the endpoint answered a status outside 2xx (3xx included: the adapter does not follow redirects) |
-| `rpc/tool-policy` | the base is not a printable scheme and authority (a path, query or fragment, a control character, an invalid scheme, or no authority at all); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; or the call carries a secret or a path scope the adapter cannot enforce |
+| `rpc/tool-policy` | the base is not `http://host:port` with a printable scheme and authority (a scheme other than `http`, a path, query or fragment, a control character, userinfo, no authority, no port, a port outside `1..=65535`, or a host that is not a DNS name or an IP literal); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; or the call carries a secret or a path scope the adapter cannot enforce |
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `content-length` only for a method defined to carry content (`POST`, `PUT`,
@@ -343,9 +343,10 @@ an empty authority, an `http://host/` trailing slash and any byte outside
 authority with `ToSocketAddrs`, which needs `host:port`, so a shape it cannot
 use would otherwise arrive as the retryable `http/resolve` class instead of a
 configuration fault. `HttpTool::try_new` refuses such a
-base at construction; `HttpTool::new` keeps no authority from it and refuses
-every call with `rpc/tool-policy`, so the fault is never reported as a
-retryable `http/resolve`. A path is
+base at construction. `HttpTool::new` refuses every call with
+`rpc/tool-policy`; it drops an authority that is itself unusable, and keeps a
+usable authority (for the operator's log) when only the tail was wrong, so the
+fault is never reported as a retryable `http/resolve`. A path is
 refused if it contains a byte outside `0x21..=0x7e`, a dot segment, a `;` matrix
 parameter (container peers strip `;name=value` before resolving), a percent
 escape, a backslash, a double slash, a query or a fragment: the allow-list is an
@@ -577,10 +578,12 @@ hashes, len(context), context)`. The context (normally the request id and
 capability id of the opening envelope) is **not transmitted**: both sides derive
 it, and a decoder recomputes the root and refuses a plan that does not match. A
 decoder also refuses a declared `total` above its ceiling (1 GiB by protocol) and
-a `chunk_count` above 32 766 before allocating the hash list. The count is chosen
-so the plan frame fits `WireLimits::strict()`'s 1 MiB payload ceiling
-(`53 + 32 × 32 766 = 1 048 565`), so a full 1 GiB body needs a chunk of at least
-32 KiB.
+a `chunk_count` above 32 760 before allocating the hash list. The count is chosen
+so the plan **envelope** fits `WireLimits::strict()`, which caps the whole frame
+at 1 MiB: the 53-byte header plus 32 bytes per chunk must leave room for the
+envelope framing too. A full 1 GiB body therefore needs a chunk of at least
+`1 073 741 824 / 32 760` bytes (32 777), and a test encodes and decodes the
+maximal plan under the strict profile.
 
 **Chunk** (`ARBC`):
 
@@ -621,22 +624,32 @@ not accept a substituted plan pins the root it expects (`with_expected_root`, or
 the `context` above). `BulkProvider::with_context` supplies that context on the
 provider side, because `Provider::invoke` carries no request id or capability id;
 without a context or a pinned root a transfer is checked against corruption only.
+A provider has one context, so an exchange that needs its own context (request
+id plus capability id) uses its own provider instance.
 
 **Provider state and replies.** The provider keys both its in-progress transfer
-and its completed body by the capability's **object**: two capabilities on one
-provider never share a transfer, and a peer that opens one cannot deny service to
-another. `Provider::on_drop` releases the object's transfer and any untaken body,
-and an incomplete transfer is released after 60 s of inactivity measured against
-the kernel-stamped `Call::now_ms`. `plan` refuses to open a new transfer for an
-object whose completed body has not been taken (`rpc/bulk`), so a body is never
-silently dropped. `missing` answers a window of 1 024 indexes with `more` and
-`remaining`, because `Budget::strict()` allows 1 024 array elements. `finish` is
-idempotent per object: a repeated marker returns the same reply instead of a
-refusal, because the effect already landed. The reply is `length`, `body_hash`
-(the raw Blake3 digest of the body: a transfer-integrity value, **never** a
-content address) and, when the body is a canonical Active Infinity image,
-`content`, the redacted content address the domain provider serves. A grant must
-cover `total + 53 × chunk_count` bytes to carry the frames, not just the body.
+and its completed body by the capability's **object**, which is what
+`Provider::invoke` carries. Attenuation preserves the object, so two capabilities
+derived from the same grant share one slot: an object is expected to have one
+principal, and a delegated capability observes and settles its parent's
+transfer. `Provider::on_drop` releases the object's transfer and any untaken
+body. An incomplete transfer is released after 60 s of inactivity, and a
+finished, untaken body after 10 minutes, both measured against the
+kernel-stamped `Call::now_ms`; the digest reply outlives the bytes. `plan`
+refuses to open a new transfer for an object whose completed body has not been
+taken (`rpc/bulk`), so a body is never silently dropped. `missing` answers a
+window of 1 024 indexes with `more` and `remaining` (because
+`Budget::strict()` allows 1 024 array elements), refreshes the idle window, and
+never expires a transfer: a read-only capability can poll but cannot destroy
+another capability's chunks. `finish` is idempotent per object: a repeated
+marker returns the same reply, even after the host takes the body, because the
+effect already landed. The reply is `length`, `body_hash` (the raw Blake3 digest
+of the body: a transfer-integrity value, **never** a content address) and, when
+the body is an Active Infinity image, `content`: the canonical content address
+of the **redacted** image, the same value the domain provider serves. A grant
+must cover `BulkPlan::required_grant()` bytes (plan frame, chunk frames, finish
+marker and a per-call reply allowance): `total + 53 × chunk_count` pays for the
+chunk frames only.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

@@ -518,6 +518,7 @@ impl WasmTool {
             .set_fuel(remaining + (reserved_fuel - memory_fuel))
             .is_err()
         {
+            self.log = std::mem::take(&mut store.data_mut().log);
             self.last_random_used = store.data().random_used;
             return Err(provider("wasm/fuel"));
         }
@@ -533,6 +534,7 @@ impl WasmTool {
         let run = match instance.get_typed_func::<i32, i32>(&store, "run") {
             Ok(run) => run,
             Err(_) => {
+                self.log = std::mem::take(&mut store.data_mut().log);
                 self.last_random_used = store.data().random_used;
                 return Err(provider("wasm/entry"));
             }
@@ -601,8 +603,10 @@ impl Provider for WasmTool {
     fn invoke(&mut self, _object: u64, call: &Call) -> Result<Response> {
         // Every refusal below returns before the child tool (and its cleared
         // log) exists, so the previous call's bytes would be attributed to this
-        // one. The kernel-facing path is the one an operator reads.
+        // one. The kernel-facing path is the one an operator reads. The entropy
+        // metric is per call for the same reason (round 55, L-2).
         self.log.clear();
+        self.last_random_used = 0;
         // Budget refusals come before any policy or argument rule, as in the
         // other adapters: a zero wall or byte grant does no work, and a method
         // or a payload must not be an oracle past an exhausted grant
