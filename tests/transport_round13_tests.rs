@@ -73,22 +73,6 @@ fn a_tcp_call_refuses_an_answer_to_another_request() {
     server.join().expect("server");
 }
 
-/// A shared segment has many writers, so the same id check applies there.
-#[test]
-fn a_shared_memory_call_refuses_an_answer_to_another_request() {
-    use active_rpc::transport::shm::{SharedMemoryTransport, SharedSegment};
-
-    let segment = SharedSegment::new(1 << 16);
-    let mut peer = SharedMemoryTransport::new(segment.clone());
-    peer.send(&Envelope::response(99, active_rpc::Value::Null))
-        .expect("the other writer's answer");
-    let mut client = SharedMemoryTransport::new(segment);
-    let error = client
-        .call(&Envelope::request(7, "ping", Vec::new()))
-        .expect_err("the answer belongs to another call");
-    assert_eq!(error.code(), "rpc/wire", "{error}");
-}
-
 /// A connection outlives its deadline only until the next frame: the loop
 /// returns instead of serving a peer that keeps the per-frame deadline alive
 /// forever (round 13, R-09 #4).
@@ -112,4 +96,57 @@ fn a_served_connection_stops_at_its_deadline() {
         .expect("server thread")
         .expect("a past deadline is not an error");
     assert_eq!(served, 0, "a connection past its deadline serves nothing");
+}
+
+/// A slow handler must not freeze the server runtime: streams waiting on the
+/// handler mutex would otherwise park every worker, and a fresh peer could not
+/// even finish its handshake (round 14, F-4).
+#[cfg(feature = "quic")]
+#[test]
+fn a_slow_handler_does_not_freeze_the_runtime() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use active_rpc::transport::quic::{QuicClient, QuicServer};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let server = QuicServer::start(0, move |envelope: Envelope| {
+        // Only the first call is slow: every later one queues behind it.
+        if handler_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(3_000));
+        }
+        Envelope::response(envelope.request_id, active_rpc::Value::Null)
+    })
+    .expect("server");
+
+    let waiters = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        * 2;
+    let mut threads = Vec::new();
+    for index in 0..waiters {
+        let address = server.address().to_string();
+        let certificate = server.certificate().clone();
+        threads.push(std::thread::spawn(move || {
+            let client = QuicClient::connect(&address, &certificate).expect("client");
+            let _ = client.call(&Envelope::request(100 + index as u64, "ping", Vec::new()));
+        }));
+    }
+    // Let every waiter reach the handler mutex.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let started = std::time::Instant::now();
+    let fresh = QuicClient::connect(server.address(), server.certificate())
+        .expect("a fresh peer still completes its handshake");
+    let handshake = started.elapsed();
+    drop(fresh);
+    assert!(
+        handshake < std::time::Duration::from_millis(2_000),
+        "a parked handler froze the runtime: the handshake took {handshake:?}"
+    );
+    for thread in threads {
+        thread.join().expect("waiter");
+    }
+    server.shutdown();
 }

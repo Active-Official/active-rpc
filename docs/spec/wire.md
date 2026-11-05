@@ -436,10 +436,11 @@ that ignores the error must not read the next frame as if the peer were healthy.
 
 An answer must belong to its call. A response echoes the request id; an error
 echoes it or carries id `0`, which is the id a peer writes when the frame was
-refused before its id could be read. `TcpTransport::call`,
-`SharedMemoryTransport::call`, `QuicClient::call`, the HTTP/2 client and the
-bridge client all enforce it; anything else (another call's answer, a response
-with id `0`, a request) is `rpc/wire`.
+refused before its id could be read. `TcpTransport::call`, `QuicClient::call`,
+`Http2Client::call` and `ConnectClient::call` all enforce it through
+`Envelope::answers`; anything else (another call's answer, a response with id
+`0`, a request) is `rpc/wire`. A shared-memory segment is one ring with no
+request/response pairing, so it offers `send`/`recv` only.
 
 A served TCP connection has a total lifetime (`DEFAULT_CONNECTION_LIFETIME`, ten
 minutes) as well as a per-frame deadline: a peer that sends a valid frame just

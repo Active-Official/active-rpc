@@ -22,7 +22,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | rounds 1-41: round 41 found 1 medium and 5 lows, all fixed; round 42 must be clean | 275 fixed / 5 rejected / 0 open (3 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-13: round 13 (muse) found 1 high, 3 mediums and 2 lows, all fixed, plus a QUIC shutdown race found in CI; round 14 must be clean | 104 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-14: round 14 found 1 high, 3 mediums and 7 lows; 10 fixed, 1 noted (retry classification); round 15 must be clean | 114 fixed / 0 rejected / 1 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -585,6 +585,38 @@ mediums, two lows and one documentation fix.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
+
+### R-09 transports - 2026-11-04 (round 14)
+
+Reviewer: CommandCode DeepSeek V4.1 Flash, `xhigh`, read-only at `e2cc8a7`, with
+measurements from probes outside the tree. Round-13 claims: three HOLD, two PARTIAL
+(the spec overclaimed `Error(0)` for HTTP/2 and the bridge; the QUIC admission was
+two steps), one HOLD with caveats. Verdict **NOT CLEAN**: one high, three mediums,
+seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `serve_connection` never reaped its stream `JoinSet`, so a long-lived connection retained every finished task (~2.4 KB per call; the reviewer measured 10 MB → 58 MB over 20 000 calls) | **fixed**: `try_join_next` drains the set before every accept, as HTTP/2 does; `a_slow_handler_does_not_freeze_the_runtime` plus the measured note |
+| 2 | medium | the new `SharedMemoryTransport::call` wrote the request into the single ring and then popped that same request as the "answer", so the peer never saw the call | **fixed**: the method is removed (a one-directional ring has no request/response pairing); the TCP `call` keeps the identity check; `wire.md` §6 says so |
+| 3 | medium | the QUIC admission was `compare_exchange` then a separate `active.fetch_add`, so a call admitted between the two was invisible to the closer and could have its reply cut | **fixed**: `active` is incremented before the admission decision and decremented on the refusal path |
+| 4 | medium | the QUIC handler mutex was taken inside an async task without `block_in_place`, so one slow provider plus N streams parked every worker and froze the runtime (HTTP/2 already mitigated this) | **fixed**: the handler runs under `tokio::task::block_in_place` |
+| 5 | low | the spec claimed HTTP/2 and the bridge accept `Error(id 0)`; they required exact equality | **fixed**: both use `Envelope::answers`; `a_bridge_error_with_id_zero_is_this_calls_answer` fails pre-fix |
+| 6 | low | `connect_with_timeout` used the leftover connect budget as the transport's frame deadline, so a slow connect produced a transport whose reads timed out after milliseconds | **fixed**: the frame deadline is the caller's timeout |
+| 7 | low | a failed per-read `set_read_timeout` re-arm was discarded, silently weakening the caller's frame deadline | **fixed**: the receive is poisoned and returns `rpc/transport` |
+| 8 | low | a round-13 edit split the `reply` doc comment, leaving it over `DRAIN_BEFORE_CLOSE` | **fixed**: the comment is back over `reply` |
+| 9 | low | `TcpTransport::inbox` was never filled (dead state) | **fixed**: removed |
+| 10 | low | a transport deadline is `rpc/transport`, which `wire.md` calls retryable, so a caller may retry a mutating call whose answer timed out after possible execution | **noted**: the classification question spans every transport and the kernel's deadline policy; changing the code alone would not settle whether a retry is safe. Recorded for the M-7 retry/idempotency pass |
+| 11 | low | the empty-ring `call` wording ("the peer closed") was wrong | **fixed** by removing the method |
+
+Accepted residuals: the id check is a confusion guard, not replay protection on a
+plaintext channel; `Error(0)` is accepted for every call (DoS only);
+`STREAM_TAIL_WAIT` makes one-frame-per-stream a timing property; `resolve_within`
+caps at 64 parked resolver threads; `read_frame` stays public with a `None`
+deadline; a served connection past its lifetime returns `Ok(served)` with no final
+error.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-09 transports - 2026-11-04 (round 13)
 

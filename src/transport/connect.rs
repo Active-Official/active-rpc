@@ -822,12 +822,10 @@ impl ConnectClient {
         }
         let answer = Envelope::decode_with(message, self.limits)?;
         // A bridge that mixes responses, replays one or echoes a request must
-        // not have it accepted as this call's answer (round 28, low).
-        if !matches!(
-            answer.kind,
-            crate::wire::Kind::Response | crate::wire::Kind::Error
-        ) || answer.request_id != envelope.request_id
-        {
+        // not have it accepted as this call's answer (round 28, low). One rule
+        // for every transport: an error may carry id 0, the id a peer writes
+        // when it could not read the frame (round 14, F-5).
+        if !answer.answers(envelope.request_id) {
             return Err(Error::Wire("the bridge answered a different request"));
         }
         Ok(answer)

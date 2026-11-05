@@ -327,25 +327,6 @@ impl SharedMemoryTransport {
             .pop_frame(|frame| Envelope::decode_with(frame, limits))?
             .transpose()
     }
-
-    /// Send one request and read its answer, which must belong to the call.
-    ///
-    /// The segment is shared with whoever holds it, so another writer can place
-    /// a frame between the request and its answer. The id check makes that a
-    /// `rpc/wire` refusal rather than a result the caller never received
-    /// (round 13, R-09 #3).
-    pub fn call(&mut self, envelope: &Envelope) -> Result<Envelope> {
-        Transport::send(self, envelope)?;
-        let Some(answer) = Transport::recv(self)? else {
-            return Err(Error::Transport(
-                "the peer closed before answering".to_string(),
-            ));
-        };
-        if !answer.answers(envelope.request_id) {
-            return Err(Error::Wire("the answer belongs to another request"));
-        }
-        Ok(answer)
-    }
 }
 
 impl Transport for SharedMemoryTransport {

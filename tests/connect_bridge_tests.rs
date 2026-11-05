@@ -839,3 +839,39 @@ fn a_truncated_bridge_response_is_a_wire_fault() {
     assert_eq!(error.code(), "rpc/wire", "{error}");
     server.join().expect("server");
 }
+
+/// An error may carry id 0 when the bridge could not read the frame far enough
+/// to learn the id; the bridge client accepts it, as QUIC, TCP and shared
+/// memory do (round 14, F-5).
+#[test]
+fn a_bridge_error_with_id_zero_is_this_calls_answer() {
+    use active_rpc::transport::connect::{grpc_frame, CONNECT_TYPE};
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut scratch = [0u8; 4096];
+        let _ = stream.read(&mut scratch);
+        let error = Envelope::error(0, &Error::Wire("the frame could not be read"));
+        let body = grpc_frame(&error.encode().expect("encode")).expect("frame");
+        let mut head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {CONNECT_TYPE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        head.extend_from_slice(&body);
+        stream.write_all(&head).expect("write");
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.read(&mut scratch);
+    });
+    let mut client = ConnectClient::connect(&address).expect("connect");
+    let answer = client
+        .call(&request(31, "echo", Vec::new()))
+        .expect("id 0 is legal for an error");
+    assert_eq!(answer.kind, Kind::Error);
+    assert_eq!(answer.method, "rpc/wire");
+    server.join().expect("server");
+}

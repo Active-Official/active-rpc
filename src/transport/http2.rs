@@ -828,12 +828,10 @@ impl Http2Client {
         }
         let answer = Envelope::decode_with(&response, self.limits)?;
         // Mirror the Connect client: a peer must not hand us another request's
-        // answer or a call envelope (round 29, low).
-        if !matches!(
-            answer.kind,
-            crate::wire::Kind::Response | crate::wire::Kind::Error
-        ) || answer.request_id != envelope.request_id
-        {
+        // answer or a call envelope (round 29, low). One rule for every
+        // transport: an error may carry id 0, the id a peer writes when it
+        // could not read the frame (round 14, F-5).
+        if !answer.answers(envelope.request_id) {
             return Err(Error::Wire("the peer answered a different request"));
         }
         Ok(answer)

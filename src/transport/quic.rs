@@ -553,6 +553,11 @@ async fn serve_connection<H>(
     // its own read deadline.
     let mut streams = tokio::task::JoinSet::new();
     loop {
+        // Reap finished streams before accepting another: `JoinSet` retains the
+        // output of every task until it is joined, so a single long-lived
+        // connection leaked about 2.4 KB per call (20 000 calls grew the server
+        // by ~48 MB; round 14, F-1). HTTP/2 reaps the same way.
+        while streams.try_join_next().is_some() {}
         let (send, recv) = match connection.accept_bi().await {
             Ok(stream) => stream,
             Err(_) => break,
@@ -665,6 +670,10 @@ async fn serve_stream<H>(
     // Admission control: count the slot before the handler runs. Counting
     // afterwards let concurrent streams all observe `served == 0` and overshoot
     // `max_calls` (audit ARPC-006).
+    // Count this call as running before the admission decision: the closer
+    // loads `served` and `active` separately, so a call admitted between the
+    // two was invisible and the endpoint could close under it (round 14, F-3).
+    active.fetch_add(1, Ordering::SeqCst);
     if max_calls != 0 {
         let mut current = served.load(Ordering::SeqCst);
         loop {
@@ -672,7 +681,9 @@ async fn serve_stream<H>(
                 let error = Error::Transport("the server has served its calls".to_string());
                 reply(&mut send, &Envelope::error(envelope.request_id, &error)).await;
                 // No close here: an admitted call may still be running, and the
-                // last one to finish closes the endpoint (round 47).
+                // last one to finish closes the endpoint (round 47). This
+                // stream is not admitted, so it leaves the count as it found it.
+                active.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
             match served.compare_exchange(
@@ -686,7 +697,6 @@ async fn serve_stream<H>(
             }
         }
     }
-    active.fetch_add(1, Ordering::SeqCst);
     // The guard decrements when this stream finishes on any path; the last one
     // to end closes the endpoint.
     let mut call = CallGuard {
@@ -694,8 +704,14 @@ async fn serve_stream<H>(
         finished: false,
     };
     let request_id = envelope.request_id;
-    let response = {
-        let mut handler = match handler.lock() {
+    // The handler is serialized by a `std::sync::Mutex`, so every other stream
+    // parked on it would hold an async worker: on the default worker count one
+    // slow provider call plus N streams froze the runtime, including this
+    // server's driver and timers. `block_in_place` hands the parked worker back
+    // to the runtime, as the HTTP/2 server already does (round 14, F-4).
+    let guarded_handler = Arc::clone(&handler);
+    let response = tokio::task::block_in_place(move || {
+        let mut handler = match guarded_handler.lock() {
             Ok(handler) => handler,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -708,7 +724,7 @@ async fn serve_stream<H>(
                 },
             ),
         }
-    };
+    });
     // The reply obeys the ceiling this server enforces on a request: a strict
     // profile must not emit a frame its own reader refuses (round 12, R-09 #2).
     let encoded = response.encode();
@@ -854,11 +870,6 @@ async fn read_frame_body(
     Ok(body)
 }
 
-/// Write one response and finish the stream, bounded.
-///
-/// Every reply path uses this: a peer that advertises a one-byte receive window
-/// and never reads parks `write_all` after the first byte, so an unbounded early
-/// error reply held the task (and its connection permit) forever.
 /// How long the last served call waits for its peer to read the reply.
 const DRAIN_BEFORE_CLOSE: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -890,6 +901,11 @@ impl Drop for CallGuard {
     }
 }
 
+/// Write one response and finish the stream, bounded.
+///
+/// Every reply path uses this: a peer that advertises a one-byte receive window
+/// and never reads parks `write_all` after the first byte, so an unbounded early
+/// error reply held the task (and its connection permit) forever.
 async fn reply(send: &mut quinn::SendStream, response: &Envelope) {
     let written = tokio::time::timeout(STREAM_WAIT, async {
         if send_envelope(send, response).await.is_err() {

@@ -196,7 +196,6 @@ impl Transport for InProcessTransport {
 #[derive(Debug)]
 pub struct TcpTransport {
     stream: BufReader<TcpStream>,
-    inbox: VecDeque<Envelope>,
     written: u64,
     limits: WireLimits,
     /// Set when a write failed after it may have put bytes on the wire. Every
@@ -242,7 +241,6 @@ impl TcpTransport {
             .map_err(|error| Error::Transport(format!("write timeout: {error}")))?;
         Ok(Self {
             stream: BufReader::with_capacity(TCP_READ_BUFFER, stream),
-            inbox: VecDeque::new(),
             written: 0,
             limits: WireLimits::default(),
             recv_poisoned: false,
@@ -314,7 +312,11 @@ impl TcpTransport {
                 break;
             }
             match TcpStream::connect_timeout(&address, left) {
-                Ok(stream) => return Self::with_timeout(stream, left.min(timeout)),
+                // The frame deadline is the caller's timeout, not the remainder
+                // of the connect budget: a connect that stalls for most of the
+                // budget used to yield a transport whose every read timed out
+                // after a few milliseconds (round 14, F-6).
+                Ok(stream) => return Self::with_timeout(stream, timeout),
                 Err(error) => last = Some(error),
             }
         }
@@ -385,9 +387,6 @@ impl Transport for TcpTransport {
                 "the connection is poisoned by a partial frame".to_string(),
             ));
         }
-        if let Some(envelope) = self.inbox.pop_front() {
-            return Ok(Some(envelope));
-        }
         // One deadline for the whole frame, and the socket timeout is re-armed
         // to the time left before each read: a blocked `read` would otherwise
         // outlive the deadline by its own timeout.
@@ -398,7 +397,14 @@ impl Transport for TcpTransport {
             let remaining = deadline
                 .saturating_duration_since(std::time::Instant::now())
                 .max(std::time::Duration::from_millis(1));
-            let _ = self.stream.get_ref().set_read_timeout(Some(remaining));
+            // The deadline is `frame_deadline` or the caller's; `remaining` is
+            // recomputed per read. A socket that refuses the value would keep
+            // the constructor's bound, silently weakening the caller's
+            // deadline, so a failed re-arm ends the receive (round 14, F-8).
+            if let Err(error) = self.stream.get_ref().set_read_timeout(Some(remaining)) {
+                self.recv_poisoned = true;
+                return Err(Error::Transport(format!("read deadline: {error}")));
+            }
         }
         // Count what the read consumed: any error after a byte has been taken
         // leaves the inbound stream off a frame boundary, whether it was a
