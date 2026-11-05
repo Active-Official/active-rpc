@@ -160,3 +160,34 @@ fn a_chosen_timeout_is_not_overwritten_by_the_default() {
     );
     client.join().ok();
 }
+
+/// The QUIC client accepts only an answer to its own call: a wrong id or a
+/// request kind is a wire fault, as it is on the bridge and HTTP/2
+/// (round 12, R-09 #1).
+#[cfg(feature = "quic")]
+#[test]
+fn a_quic_answer_must_belong_to_the_call() {
+    use active_rpc::transport::quic::{QuicClient, QuicServer};
+    use active_rpc::Value;
+
+    let wrong_id = QuicServer::start(1, |envelope| {
+        Envelope::response(envelope.request_id + 1, Value::Null)
+    })
+    .expect("server");
+    let client = QuicClient::connect(wrong_id.address(), wrong_id.certificate()).expect("client");
+    let error = client
+        .call(&Envelope::request(7, "ping", Vec::new()))
+        .expect_err("the answer is for another request");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+
+    let wrong_kind = QuicServer::start(1, |envelope| {
+        Envelope::request(envelope.request_id, "ping", Vec::new())
+    })
+    .expect("server");
+    let client =
+        QuicClient::connect(wrong_kind.address(), wrong_kind.certificate()).expect("client");
+    let error = client
+        .call(&Envelope::request(7, "ping", Vec::new()))
+        .expect_err("a request is not an answer");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+}

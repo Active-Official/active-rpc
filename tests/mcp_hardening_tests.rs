@@ -582,7 +582,7 @@ fn an_answer_past_the_byte_grant_is_refused() {
 /// handshake refuses it (round 38, #6).
 #[test]
 fn a_dot_only_tool_name_is_refused() {
-    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+    use active_rpc::tool::{McpSession, McpTransport};
 
     struct Scripted {
         replies: std::cell::RefCell<Vec<String>>,
@@ -609,6 +609,69 @@ fn a_dot_only_tool_name_is_refused() {
         Ok(_) => panic!("a dot-only tool name is not a tool"),
         Err(error) => error,
     };
-    assert_eq!(error.code(), "rpc/provider", "{error}");
-    let _ = MemoryTransport::new(std::collections::BTreeMap::new());
+    // The provider class alone would pass for any handshake fault; the inner
+    // code is what this test is about (round 39, F5).
+    assert_eq!(error.provider_code(), Some("mcp/tool-name"), "{error}");
+}
+
+/// The static line ceiling is a protocol limit: a line past it is
+/// `mcp/line-too-long` whatever the grant, and the session is poisoned
+/// (round 39, F1 — the rule is deliberate, and this pins it).
+#[test]
+fn a_line_past_the_static_ceiling_is_illegal_whatever_the_grant() {
+    use active_rpc::tool::{McpSession, McpTransport, MemoryTransport};
+
+    struct Huge {
+        inner: MemoryTransport,
+        replies: usize,
+    }
+    impl McpTransport for Huge {
+        fn send_line(&mut self, line: &str) -> active_rpc::error::Result<()> {
+            self.inner.send_line(line)
+        }
+        fn recv_line(&mut self) -> active_rpc::error::Result<String> {
+            self.inner.recv_line()
+        }
+        fn recv_line_within(
+            &mut self,
+            deadline: Option<std::time::Instant>,
+        ) -> active_rpc::error::Result<String> {
+            self.replies += 1;
+            if self.replies <= 2 {
+                return self.inner.recv_line_within(deadline);
+            }
+            Ok(format!(
+                r#"{{"jsonrpc":"2.0","id":3,"result":"{}"}}"#,
+                "x".repeat(2 << 20)
+            ))
+        }
+    }
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(Huge {
+        inner: MemoryTransport::new(responses),
+        replies: 0,
+    })
+    .expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    // Enough for the request line, far less than the answer: the static
+    // ceiling is what refuses, and it is a protocol limit regardless.
+    call.budget.max_bytes = 200;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("past the static ceiling");
+    assert_eq!(error.provider_code(), Some("mcp/line-too-long"), "{error}");
+    let again = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the session is poisoned");
+    assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
 }

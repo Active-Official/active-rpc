@@ -1421,3 +1421,74 @@ fn a_wide_revocation_is_linear() {
     );
     drop(children);
 }
+
+// ---------------------------------------------------------------------------
+// Round 46
+// ---------------------------------------------------------------------------
+
+/// The rotation selector uses the same ancestry: a retired peer's record behind
+/// a restored copy is tombstoned (round 46, F-1).
+#[test]
+fn a_rotation_reaches_a_record_behind_a_restored_copy() {
+    let (agent, _provider, root) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let parent = agent.attenuate(&root, attrs.clone()).expect("attenuate");
+    let source = agent.export_capability(&parent).expect("export");
+    drop(parent);
+    agent.run();
+    let restored = agent.restore_capability(&source, &owner).expect("restore");
+    let child = agent.attenuate(&restored, attrs).expect("child");
+    let record = agent.export_capability(&child).expect("export the child");
+    drop(child);
+    drop(restored);
+    agent.run();
+
+    let next = admitted(b"rotated-owner");
+    agent
+        .reintroduce_to(&root, &peer(b"durable-owner"), &next)
+        .expect("rotate");
+    assert!(
+        agent.record_is_tombstoned(&record.record_id),
+        "the retired peer's record stands under the rotated root"
+    );
+}
+
+/// A record exported from a descendant of a restored capability carries the
+/// whole tree: the restore's ancestors are tree edges, and the pin of a later
+/// export must name them or a revocation of the original root misses the
+/// record (round 46, F-1).
+#[test]
+fn a_record_exported_through_a_restored_copy_is_revoked_with_the_root() {
+    let (agent, _provider, root) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+
+    // root -> child -> export -> restore (the restored copy is a tree child of
+    // root with an empty budget lineage) -> descendant -> export.
+    let child = agent.attenuate(&root, attrs.clone()).expect("attenuate");
+    let first = agent.export_capability(&child).expect("export the child");
+    drop(child);
+    agent.run();
+    let restored = agent.restore_capability(&first, &owner).expect("restore");
+    let descendant = agent.attenuate(&restored, attrs).expect("attenuate");
+    let second = agent
+        .export_capability(&descendant)
+        .expect("export the descendant");
+    drop(descendant);
+    drop(restored);
+    agent.run();
+
+    agent.revoke(&root).expect("revoke the root");
+
+    assert!(
+        agent.record_is_tombstoned(&second.record_id),
+        "the record of the restored subtree is retired with the root"
+    );
+    let error = agent
+        .restore_capability(&second, &owner)
+        .expect_err("the record is tombstoned");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}

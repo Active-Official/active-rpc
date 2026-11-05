@@ -3152,3 +3152,51 @@ fn an_mcp_answer_beyond_the_notifications_is_a_budget_refusal() {
         .expect_err("the answer is past the remainder");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 39
+// ---------------------------------------------------------------------------
+
+/// The grant bounds the argument bytes before an adapter serializes them
+/// (round 39, F2). A direct call with a one-byte grant and a large map is a
+/// budget refusal, not a serialization.
+#[test]
+fn a_large_argument_under_a_small_grant_is_refused_before_serializing() {
+    use active_rpc::tool::{McpSession, MemoryTransport};
+
+    let mut responses = std::collections::BTreeMap::new();
+    responses.insert(
+        "initialize".to_string(),
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"stub"}}}"#
+            .to_string(),
+    );
+    responses.insert(
+        "tools/list".to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"echo"}]}}"#
+            .to_string(),
+    );
+    let mut session = McpSession::handshake(MemoryTransport::new(responses)).expect("handshake");
+    let mut map = std::collections::BTreeMap::new();
+    for index in 0..10_000 {
+        map.insert(format!("k{index}"), Value::text("v".repeat(64)));
+    }
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Map(map))]);
+    call.tool_allows_process = true;
+    call.budget.max_bytes = 1;
+    let error = active_rpc::kernel::Provider::invoke(&mut session, 0, &call)
+        .expect_err("the argument is past the grant");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+}
+
+/// The HTTP adapter reports the method refusal before an argument-shape
+/// refusal, as the other three adapters do (round 39, F3).
+#[test]
+fn the_http_adapter_checks_the_method_before_the_argument_shape() {
+    let mut tool = HttpTool::new("http://127.0.0.1:9", &[("GET", "/x")]);
+    let mut call = Call::new("not-a-method", vec![Arg::Value(Value::Int(1))]);
+    call.tool_allows_process = true;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the method is not granted");
+    assert_eq!(error.code(), "rpc/method-not-granted", "{error}");
+}

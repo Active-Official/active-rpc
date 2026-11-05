@@ -35,7 +35,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use crate::error::{Error, Result};
 use crate::identity::PeerIdentity;
 use crate::transport::{frame, read_frame, MAX_FRAME_BYTES};
-use crate::wire::{Envelope, WireLimits};
+use crate::wire::{Envelope, Kind, WireLimits};
 
 /// A running QUIC server.
 pub struct QuicServer {
@@ -692,6 +692,21 @@ async fn serve_stream<H>(
             ),
         }
     };
+    // The reply obeys the ceiling this server enforces on a request: a strict
+    // profile must not emit a frame its own reader refuses (round 12, R-09 #2).
+    let encoded = response.encode();
+    match encoded {
+        Ok(bytes) if bytes.len() > wire.max_bytes.min(MAX_FRAME_BYTES) => {
+            let error = Error::Wire("response exceeds the size ceiling");
+            reply(&mut send, &Envelope::error(request_id, &error)).await;
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            reply(&mut send, &Envelope::error(request_id, &error)).await;
+            return;
+        }
+    }
     // A peer controls its own receive window: a response larger than the credit
     // it grants parks `write_all` forever without this deadline. Reset the
     // stream instead of holding the task.
@@ -968,7 +983,24 @@ impl QuicClient {
         if cursor.position() != response.len() as u64 {
             return Err(Error::Wire("trailing bytes after the QUIC frame"));
         }
-        Envelope::decode_with(&body, self.limits)
+        let answer = Envelope::decode_with(&body, self.limits)?;
+        // The answer must be an answer to *this* call: a peer that replays
+        // another response, or answers with a request, would otherwise have its
+        // frame accepted as this call's result. The bridge and HTTP/2 clients
+        // already enforce it (round 12, R-09 #1).
+        //
+        // An error carries id 0 when the server could not read the frame at
+        // all (the length prefix is refused before there is an id to echo), so
+        // that id is legal for an error and only there.
+        let belongs = match answer.kind {
+            Kind::Response => answer.request_id == envelope.request_id,
+            Kind::Error => answer.request_id == envelope.request_id || answer.request_id == 0,
+            _ => false,
+        };
+        if !belongs {
+            return Err(Error::Wire("the QUIC answer belongs to another request"));
+        }
+        Ok(answer)
     }
 
     /// Bound one exchange in wall time.

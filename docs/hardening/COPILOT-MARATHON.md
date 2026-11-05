@@ -20,9 +20,9 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-04 | promises / pipeline | `src/promise.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 clean) | 36 fixed / 0 rejected / 0 open (residuals documented) | this commit |
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
-| R-07 | domain ops | `src/domain.rs` | rounds 1-45: round 45 found 3 mediums and 3 lows, all handled; round 46 must be clean | 276 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-38: round 38 found 1 high, 1 medium and 1 low, all fixed; round 39 must be clean | 263 fixed / 4 rejected / 0 open (4 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-11: round 11 found 1 high, 3 mediums and 1 low, all fixed; rounds 12-13 must be clean | 95 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
+| R-07 | domain ops | `src/domain.rs` | rounds 1-46: round 46 was cut short when the reviewer edited the tree; its finding was adopted with a test and round 46 is re-run read-only | 277 fixed / 1 noted / 0 open (residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-39: round 39 found 2 mediums and 2 lows fixed, 1 high rejected with reasoning; rounds 40-41 must be clean | 267 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | rounds 1-12: round 12 found 1 high, 1 medium and 1 low, all fixed; rounds 13-14 must be clean | 98 fixed / 0 rejected / 0 open (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -475,6 +475,19 @@ are closed.
 Gate: 88 suites / 868 tests all-features and no-default-features, clippy/fmt/doc
 clean; negative controls 9/9.
 
+### R-07 domain operations - 2026-11-04 (round 46, cut short)
+
+The reviewer began editing the tree (it wrote an unrequested fix for a record
+exported through a restored copy) and was stopped mid-round, so this round has
+no report. The change was reviewed here and kept: an export pin now carries the
+restored copy's tree ancestors, because `record.lineage` stops at the restored
+capability and a revocation of the original root missed the record of anything
+exported below it. `a_record_exported_through_a_restored_copy_is_revoked_with_the_root`
+fails without the change and passes with it.
+
+The reviewer script now states "Do NOT edit the working tree" explicitly; round
+46 must be re-run read-only.
+
 ### R-07 domain operations - 2026-11-04 (round 45)
 
 Reviewer: CommandCode DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at
@@ -548,6 +561,20 @@ mediums, two lows and one documentation fix.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
+
+### R-09 transports - 2026-11-04 (round 12)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `deeae79`. All five round-11
+fixes HOLD. One **high**, one medium and one low.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `QuicClient::call` returned a decoded envelope without checking its kind or `request_id`, so a replay or a request frame was accepted as this call's answer | **fixed**: an answer must be a response with the call's id, or an error with the call's id or id 0 (the server cannot echo an id for a frame it could not read); `a_quic_answer_must_belong_to_the_call` |
+| 2 | medium | the QUIC server replied without bounding the reply by its own limits | **fixed**: a reply past `limits.max_bytes.min(MAX_FRAME_BYTES)` is replaced by a `rpc/wire` error envelope |
+| 3 | low | an empty resolution reported "connect timed out" | **fixed**: "no address for <peer>" |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. The identity test fails against the pre-fix tree.
 
 ### R-09 transports - 2026-11-04 (round 11)
 
@@ -628,6 +655,22 @@ concurrent overshoot to observe.
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 39)
+
+Reviewer: Muse through the Copilot CLI, `xhigh`, at `deeae79`. All three round-38
+claims HOLD. One **high** (rejected with reasoning), two mediums, two lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | an answer past both the grant and the static 1 MiB ceiling hits the static refusal (`mcp/line-too-long`, poisoned) while the outgoing side prefers the grant | **rejected**: a line past the static ceiling is a protocol violation whatever the grant (round 32's rule), and `mcp/line-too-long` names the fault; a line past only the grant is already the non-poisoning `rpc/budget-exceeded`. `a_line_past_the_static_ceiling_is_illegal_whatever_the_grant` pins the rule and the spec row says "whatever the grant" |
+| 2 | medium | HTTP and MCP serialized the body or the request line before comparing it with the grant, so a one-byte grant could buy a ten-megabyte allocation | **fixed**: both sum `Arg::wire_size` first and refuse `rpc/budget-exceeded`; `a_large_argument_under_a_small_grant_is_refused_before_serializing` |
+| 3 | medium | HTTP ran the argument-shape loop before the method match while the other adapters check the method first | **fixed**: the method is refused first; `the_http_adapter_checks_the_method_before_the_argument_shape` |
+| 4 | low | `mcp/too-complex` had no spec row and the tool-name row implied `..` was accepted | **fixed**: both rows updated |
+| 5 | low | the dot-name test asserted the class only, so any provider fault passed | **fixed**: it asserts `mcp/tool-name` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9. The ordering test fails against the pre-fix tree.
 
 ### R-08 tools and MCP - 2026-11-04 (round 38)
 

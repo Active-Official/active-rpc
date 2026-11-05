@@ -270,6 +270,12 @@ impl TcpTransport {
         // a slow resolver used to park the caller past its own deadline and to
         // report every failure as "timed out" (round 11, R-09 #4).
         let addresses = crate::transport::connect::resolve_within(address, deadline)?;
+        if addresses.is_empty() {
+            // A name with no address is a configuration fault, not a network
+            // stall: the message must not send an operator to the network
+            // (round 12, R-09 #3).
+            return Err(Error::Transport(format!("no address for {address}")));
+        }
         let mut last: Option<std::io::Error> = None;
         // `TcpStream::connect` has no bound: a black-holed SYN parked a caller
         // that asked for a deadline forever. Each attempt gets what is left

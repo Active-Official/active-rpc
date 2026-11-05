@@ -1216,6 +1216,26 @@ impl Agent {
         let lineage = record.lineage.clone();
         let mut chain: Vec<CapId> = lineage.clone();
         chain.push(record.id);
+        // The pin's ancestry is the *tree* the credential stands in, not the
+        // budget chain. A restored capability's ancestors are tree edges, so
+        // `record.lineage` stops at the restored capability (round 44, F-1).
+        // Revocation and rotation select pins by this list, so a pin that
+        // stopped there let a record exported from a descendant of a restored
+        // copy survive the revocation (and the rotation) of the original root
+        // and restore live authority afterwards (round 46, F-1).
+        let mut pin_lineage = record.tree_ancestors.clone();
+        for id in &lineage {
+            if let Some(parent) = kernel.caps.get(id) {
+                for ancestor in &parent.tree_ancestors {
+                    if !pin_lineage.contains(ancestor) {
+                        pin_lineage.push(*ancestor);
+                    }
+                }
+            }
+            if !pin_lineage.contains(id) {
+                pin_lineage.push(*id);
+            }
+        }
         for id in &chain {
             let meter = meter_for(&kernel, *id)?
                 .ok_or(Error::Persistence("the capability has no meter"))?;
@@ -1274,7 +1294,7 @@ impl Agent {
                 object: pinned.1,
                 cap: cap.id(),
                 binding: record.bound_to,
-                lineage,
+                lineage: pin_lineage,
             },
         );
         *kernel.pin_counts.entry(pinned).or_insert(0) += 1;

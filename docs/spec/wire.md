@@ -245,13 +245,14 @@ past only the static 1 MiB ceiling is `rpc/invalid-argument` (a request) or
 | `mcp/eof` | the server closed its stdout |
 | `mcp/queue` | the writer queue stayed full until the ceiling; the frame never reached the writer, so the session stays usable |
 | `mcp/not-sent` | the deadline had passed before anything was written; the frame never reached the wire, so the session stays usable |
-| `mcp/line-too-long` | a line exceeded 1 MiB before parsing |
+| `mcp/line-too-long` | a line exceeded the static 1 MiB ceiling before parsing, whatever the grant; the session is poisoned |
 | `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer |
+| `mcp/too-complex` | the answer text holds more structural tokens than `MAX_JSON_NODES`, or the parsed tree does; the session is poisoned |
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |
 | `mcp/desync` | more than `MAX_MCP_NOTIFICATIONS` notification frames arrived for one request, or the session was already poisoned |
 | `mcp/bad-number` | a response line holds a numeric literal with no `Value` form: an integer outside `i64`, or a float that is not finite |
 | `mcp/initialize`, `mcp/initialize:<code>` | the server answered `initialize` with an error; the numeric code is kept when present |
-| `mcp/tool-name` | an advertised tool name is absent or empty, is not `[A-Za-z0-9_.-]{1,128}`, or two tools share a name |
+| `mcp/tool-name` | an advertised tool name is absent or empty, is not `[A-Za-z0-9_.-]{1,128}`, is made only of dots (`.`, `..`), or two tools share a name |
 | `mcp/tools` | the handshake result carries no `tools` array |
 | `mcp/tool-count` | the server advertised more than `MAX_MCP_TOOLS` (4 096) tools |
 | `mcp/spawn:<err>` | the child process could not be started |

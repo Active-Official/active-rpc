@@ -1606,6 +1606,13 @@ impl<T: McpTransport> Provider for McpSession<T> {
                 "a secret argument cannot be sent to an external peer",
             ));
         }
+        // The grant bounds the arguments before they are serialized: a JSON
+        // line built from a ten-megabyte map under a one-byte grant was work
+        // the budget refused only afterwards (round 39, F2).
+        let arg_bytes: u64 = call.args.iter().map(Arg::wire_size).sum();
+        if arg_bytes > call.budget.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
+        }
         if call.path_scope.is_some() {
             // JSON arguments are not `Value::Path`: the kernel cannot check
             // them, so a scope here would be inert (round 9, F-1).
@@ -2166,6 +2173,21 @@ impl Provider for HttpTool {
             return Err(Error::ToolPolicy(
                 "this adapter cannot enforce a path scope",
             ));
+        }
+        // The grant bounds the argument bytes before the adapter serializes
+        // them: a one-byte grant with a ten-megabyte map built the JSON first
+        // and only then refused (round 39, F2).
+        let arg_bytes: u64 = call.args.iter().map(Arg::wire_size).sum();
+        if arg_bytes > call.budget.max_bytes {
+            return Err(Error::BudgetExceeded("byte"));
+        }
+        // Method before shape: the other three adapters report the method
+        // refusal first, and the difference fingerprints the adapter for the
+        // same malformed call (round 39, F3).
+        if !matches!(call.method.as_str(), "get" | "post" | "request") {
+            return Err(Error::MethodNotGranted {
+                method: call.method.clone(),
+            });
         }
         let takes_method_text = call.method == "request";
         for arg in &call.args {
