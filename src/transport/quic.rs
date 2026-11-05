@@ -966,11 +966,6 @@ impl Drop for CallGuard {
 /// Every reply path uses this: a peer that advertises a one-byte receive window
 /// and never reads parks `write_all` after the first byte, so an unbounded early
 /// error reply held the task (and its connection permit) forever.
-/// Write one response and finish the stream, bounded.
-///
-/// Every reply path uses this: a peer that advertises a one-byte receive window
-/// and never reads parks `write_all` after the first byte, so an unbounded early
-/// error reply held the task (and its connection permit) forever.
 async fn reply(send: &mut quinn::SendStream, response: &Envelope) {
     let written = tokio::time::timeout(STREAM_WAIT, async {
         if send_envelope(send, response).await.is_err() {
@@ -1046,10 +1041,12 @@ async fn reply_encoded(send: &mut quinn::SendStream, bytes: &[u8]) {
             let _ = send.finish();
             return;
         };
-        let mut payload = Vec::with_capacity(bytes.len() + 4);
-        payload.extend_from_slice(&prefix);
-        payload.extend_from_slice(bytes);
-        if send.write_all(&payload).await.is_err() {
+        // Two writes, not a second buffer: a charged reply must not be copied
+        // again while it is held for a peer's credit (round 22, N3).
+        if send.write_all(&prefix).await.is_err() {
+            return;
+        }
+        if send.write_all(bytes).await.is_err() {
             return;
         }
         let _ = send.finish();
@@ -1347,7 +1344,7 @@ fn transport_config() -> quinn::TransportConfig {
 }
 #[cfg(test)]
 mod budget_tests {
-    use super::{ReplyBudget, MAX_INFLIGHT_BODY};
+    use super::{ReplyBudget, MAX_INFLIGHT_REPLY};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
@@ -1356,8 +1353,8 @@ mod budget_tests {
     #[test]
     fn the_reply_budget_admits_releases_and_refuses() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let first = ReplyBudget::try_reserve(&counter, MAX_INFLIGHT_BODY)
-            .expect("the whole ceiling fits once");
+        let first = ReplyBudget::try_reserve(&counter, MAX_INFLIGHT_REPLY)
+            .expect("the whole reply ceiling fits once");
         assert!(
             ReplyBudget::try_reserve(&counter, 1).is_none(),
             "a second byte is past the ceiling"

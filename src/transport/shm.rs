@@ -370,9 +370,25 @@ impl Transport for SharedMemoryTransport {
                 "the segment is poisoned by a frame that did not decode".to_string(),
             ));
         }
-        let Some(frame) = self.segment.read()? else {
-            return Ok(None);
+        let frame = match self.segment.read() {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                // A framing fault leaves the ring off a boundary: refuse the
+                // session like TCP instead of returning the same error forever
+                // (round 22, N5).
+                if matches!(error, Error::Wire(_)) {
+                    self.poisoned = true;
+                }
+                return Err(error);
+            }
         };
+        if frame.len() > self.limits.max_bytes.min(crate::transport::MAX_FRAME_BYTES) {
+            // Checked before the decode, and the frame was already copied out of
+            // the ring: a ceiling breach is a wire fault (round 22, N5).
+            self.poisoned = true;
+            return Err(Error::Wire("frame exceeds the size ceiling"));
+        }
         match Envelope::decode_with(&frame, self.limits) {
             Ok(envelope) => Ok(Some(envelope)),
             Err(error) => {

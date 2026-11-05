@@ -704,9 +704,14 @@ async fn respond_body(
             .min(std::time::Duration::from_secs(30));
     if encoded.is_empty() {
         // A zero-length body still has to end the stream, or the client waits
-        // for its inactivity timeout (round 21, finding 5).
-        let _ = send.send_data(bytes::Bytes::new(), true);
-        return Ok(true);
+        // for its inactivity timeout (round 21, finding 5). A failed send is
+        // not a served call (round 22, N4).
+        return match send.send_data(bytes::Bytes::new(), true) {
+            Ok(()) => Ok(true),
+            // A failed end-of-stream leaves the stream open for the
+            // connection's inactivity bound only; it is not re-sent.
+            Err(_) => Ok(false),
+        };
     }
     while offset < encoded.len() {
         let want = (encoded.len() - offset).min(PIECE);

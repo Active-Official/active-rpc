@@ -21,8 +21,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-48: round 47 was clean; round 48 found 1 medium and 8 lows, all fixed or noted; round 49 must be clean | 326 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
-| R-09 | transports | `src/transport/**` | rounds 1-20: round 20 found 1 medium and 6 lows, all fixed; round 21 must be clean | 151 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-50: round 49 was clean; round 50 found 2 mediums and 4 lows, all fixed; round 51 must be clean | 334 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
@@ -586,6 +586,36 @@ mediums, two lows and one documentation fix.
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9. Four new behavioural tests fail against the pre-fix tree.
 
+### R-09 transports - 2026-11-04 (round 22, clean)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `fb7ff12`. Verdict
+**CLEAN — no critical/high/medium**; one claimed fix was broken (a copied rather
+than moved doc block) and one partial, plus six lows, all closed here.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N1 | low | the reply doc paragraph was copied, not moved, so it appeared twice and `ReplyBudget` lost its lead | **fixed** |
+| N2 | low | the "sum of two budgets" claim had no spec row, and the unit test reserved the request ceiling | **fixed**: a `docs/spec/security.md` row for the reply ceiling; the test reserves `MAX_INFLIGHT_REPLY` |
+| N3 | low | `reply_encoded` copied the whole charged reply into a second buffer | **fixed**: it writes the prefix and the body in two writes, no second copy |
+| N4 | low | an empty HTTP/2 body that could not end its stream still counted as served | **fixed**: the send error returns `Ok(false)` |
+| N5 | low | a shared-memory framing fault never poisoned the session, and a frame was copied out of the ring before the ceiling was applied | **fixed**: a `Wire` fault poisons, and the length is checked before the decode |
+| N6 | low | a table past the byte ceiling returned `rpc/wire` while every other table limit returns `rpc/capability-table` | **fixed**: the table class |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-09 transports - 2026-11-04 (round 21)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `90b5779`. Verdict
+**PARTIAL**: no critical/high/medium, but three round-20 claims were overstated or
+incomplete — the round-20 entry's "both refusal arms" was true of one, the reply
+doc block was spliced onto `ReplyBudget`, and the shared-memory module contract
+still promised `rpc/transport`. All three are fixed in the commit reviewed by
+round 22, together with the lows the same round listed (oversize arm drops before
+its awaits, `reply_encoded` refuses rather than finishing empty, the empty
+HTTP/2 body ends its stream, the table decoder honours `max_bytes`, the drain cost
+is in the spec).
+
 ### R-09 transports - 2026-11-04 (round 20)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `02f6ec7`, with
@@ -867,6 +897,40 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 50)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `fb7ff12`. Round-49
+claims: four pass, two half. Verdict **PARTIAL**: two mediums and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | capping the number scan at eight spans made `text_fails_only_on_a_number` repair only a prefix: a body with nine out-of-range literals still failed to parse, so it was served as `Value::Text` instead of `http/bad-number` — one extra literal let the peer pick the class | **fixed**: the repair walks the text once and replaces every literal with no span vector, so the allocation bound the cap existed for is kept; `a_body_with_many_bad_literals_is_not_text` |
+| 2 | medium | a too-deep MCP answer returned raw `mcp/too-complex` after the post-send wrapper, so a writable call was receipted `Refused` and a retry re-executed the tool | **fixed**: it goes through the withheld mapping for a writable call |
+| 3 | low | `redacted_base` measured the path before stripping userinfo, so it reported the wrong length and invented a path | **fixed** |
+| 4 | low | the retryability list omitted `mcp/bad-number`, `mcp/bad-json` and `mcp/eof`, which do poison the session | **fixed** |
+| 5 | low | the `mcp/too-complex`, `http/too-complex` and `mcp/thread` rows did not mention the depth condition or the reader-slot ceiling | **fixed** |
+| 6 | low | a 129-field header block was `rpc/budget-exceeded` when the grant was the tighter byte ceiling, although a field count is never a grant matter | **fixed**: the count is its own `http/headers` refusal |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 49, clean)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `90b5779`. Verdict
+**CLEAN — no critical, high or medium**; six lows, all closed in the next commit.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the redacting `Debug` still printed the base verbatim, and a base can carry a token in its path | **fixed**: `redacted_base` prints scheme and authority with the path as a length; the test asserts it |
+| 2 | low | four of the five round-48 behavioural fixes had no regression test | **fixed**: a `write_within` unit test, the poisoned counter, the body depth and the segment/table classes in `tests/round49_tests.rs` |
+| 3 | low | the bad-number scan allocated one 16-byte span per two-byte literal | **fixed**: `MAX_NUMBER_SPANS` bounds it — and round 50 then found the cap made the repair wrong, which is fixed above |
+| 4 | low | a reply past the wire depth reached the kernel and was reported as a caller budget | **fixed**: both adapters classify it (`http/too-complex`, `mcp/too-complex` + poison) |
+| 5 | low | the MCP stdio reader took no reader slot, so a pipe-holding descendant leaks a thread per session on Windows | **fixed**: it acquires `ReaderSlot` and refuses with `mcp/thread:too many readers` |
+| 6 | low | two spec lines drifted (the header-flood grant arm, the retryability sentence) | **fixed** |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

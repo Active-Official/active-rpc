@@ -188,25 +188,75 @@ fn text_fails_only_on_a_number(text: &str) -> bool {
         // reports `bad-number` (round 16, F-1).
         return is_number_token(trimmed);
     }
-    let spans = bad_number_spans(text);
-    if spans.is_empty() {
-        return false;
+    match repair_bad_numbers(text) {
+        Some(repaired) => serde_json::from_str::<Json>(&repaired).is_ok(),
+        None => false,
     }
-    let mut repaired = String::with_capacity(text.len().saturating_sub(spans.len()));
-    let mut cursor = 0usize;
-    for (start, end) in spans {
-        // A span is replaced only when it really is one number token: the scan
-        // groups `1-2` or `1e` into a single span, and repairing those would
-        // report a framing fault as a bad number (round 33, M2).
-        if !is_number_token(&text[start..end]) {
-            return false;
+}
+
+/// Replace every unrepresentable literal with `0` in one pass.
+///
+/// No span vector: `bad_number_spans` is capped so a peer cannot make the scan
+/// allocate eight times its own size, and repairing only the capped prefix left
+/// a document with nine literals unparsed, so it was served as text (round 50,
+/// F-1). `None` when there is nothing to repair, or when a span is not one
+/// number token (the scan groups `1-2` or `1e`, and repairing those would report
+/// a framing fault as a bad number, round 33, M2).
+fn repair_bad_numbers(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut repaired = String::with_capacity(text.len());
+    let mut index = 0usize;
+    let mut last = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut replaced = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
         }
-        repaired.push_str(&text[cursor..start]);
-        repaired.push('0');
-        cursor = end;
+        match byte {
+            b'"' => {
+                in_string = true;
+                index += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    index += 1;
+                }
+                let literal = &text[start..index];
+                if literal.bytes().any(|byte| byte.is_ascii_digit())
+                    && literal_has_no_value_form(literal)
+                {
+                    if !is_number_token(literal) {
+                        return None;
+                    }
+                    repaired.push_str(&text[last..start]);
+                    repaired.push('0');
+                    last = index;
+                    replaced += 1;
+                }
+            }
+            _ => index += 1,
+        }
     }
-    repaired.push_str(&text[cursor..]);
-    serde_json::from_str::<Json>(&repaired).is_ok()
+    if replaced == 0 {
+        return None;
+    }
+    repaired.push_str(&text[last..]);
+    Some(repaired)
 }
 
 /// Whether `text` is exactly one JSON number token.
@@ -1882,11 +1932,15 @@ impl<T: McpTransport> Provider for McpSession<T> {
         if crate::kernel::value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
             // A tree past the wire shape is an illegal answer, not a caller
             // budget: the session is poisoned like any other malformed frame
-            // (round 49, L-4).
+            // (round 49, L-4), and a writable call reports it as withheld
+            // because the tool already ran (round 50, F-2).
             self.poisoned = true;
-            return Err(Error::Provider {
-                code: "mcp/too-complex".to_string(),
-            });
+            return Err(withhold_after_send(
+                Error::Provider {
+                    code: "mcp/too-complex".to_string(),
+                },
+                !call.read_only,
+            ));
         }
         Ok(Response::Value(value))
     }
@@ -1927,11 +1981,13 @@ fn redacted_base(base: &str) -> String {
     let Some((scheme, rest)) = base.split_once("://") else {
         return format!("<{} bytes>", base.len());
     };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    match rest.len().checked_sub(authority.len()) {
-        Some(tail) if tail > 0 => format!("{scheme}://{authority}/<{tail} bytes>"),
-        _ => format!("{scheme}://{authority}"),
+    let authority_raw = rest.split('/').next().unwrap_or(rest);
+    let authority = authority_raw.rsplit('@').next().unwrap_or(authority_raw);
+    let tail = rest.len().saturating_sub(authority_raw.len());
+    if tail > 0 {
+        format!("{scheme}://{authority}/<{} bytes>", tail.saturating_sub(1))
+    } else {
+        format!("{scheme}://{authority}")
     }
 }
 
@@ -2254,8 +2310,15 @@ impl HttpTool {
             }
             header_bytes = header_bytes.saturating_add(line.len());
             fields += 1;
-            if header_bytes > header_cap || fields > MAX_HTTP_HEADER_FIELDS {
+            if header_bytes > header_cap {
                 return Err(capped("http/headers", grant_bound));
+            }
+            if fields > MAX_HTTP_HEADER_FIELDS {
+                // A field *count* is never a grant matter: the same answer is a
+                // header fault whatever the byte grant (round 50, F-6).
+                return Err(Error::Provider {
+                    code: "http/headers".to_string(),
+                });
             }
             let Some((name, value)) = line.split_once(':') else {
                 // A header line without a colon is a framing fault: ignoring it

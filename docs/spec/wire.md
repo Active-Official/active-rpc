@@ -234,7 +234,8 @@ class stays local) and `rpc/budget-exceeded` with the dimension it measured
 An `McpSession` reports adapter failures as `rpc/provider` with one of these
 inner codes. Every one is a fail-closed refusal. None needs a new session except
 the ones that poison it (`mcp/line-too-long`, `mcp/too-complex`, `mcp/desync`,
-`mcp/id-mismatch`, `mcp/bad-response`, `mcp/write:closed`, `mcp/write:lost`); a
+`mcp/id-mismatch`, `mcp/bad-response`, `mcp/bad-number`, `mcp/bad-json`,
+`mcp/eof`, `mcp/write:closed`, `mcp/write:lost`); a
 JSON-RPC `error` from the server leaves the session usable, which is the
 asymmetry recorded below. The byte grant is checked first when it is the tighter
 bound: a line
@@ -258,7 +259,7 @@ handle and probe its policy.
 | `mcp/not-sent` | the deadline had passed before anything was written; the frame never reached the wire, so the session stays usable |
 | `mcp/line-too-long` | a line exceeded the static 1 MiB ceiling before parsing, whatever the grant; the session is poisoned |
 | `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer |
-| `mcp/too-complex` | the answer text holds more structural tokens than `MAX_JSON_NODES`, or the parsed tree does; the session is poisoned |
+| `mcp/too-complex` | the answer text holds more structural tokens than `MAX_JSON_NODES`, the parsed tree does, or the tree is past the wire depth; the session is poisoned, and a writable call reports it as a withheld reply |
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |
 | `mcp/desync` | more than `MAX_MCP_NOTIFICATIONS` notification frames arrived for one request, or the session was already poisoned |
 | `mcp/bad-number` | a response line holds a numeric literal with no `Value` form: an integer outside `i64`, or a float that is not finite |
@@ -271,7 +272,7 @@ handle and probe its policy.
 | `mcp/read:<err>`, `mcp/write:<err>`, `mcp/stdin`, `mcp/stdout` | transport I/O failed |
 | `mcp/write:closed` | the writer thread never took the frame (its queue was closed): the session is poisoned and the call is not reported as a withheld reply, because nothing left |
 | `mcp/write:lost` | the frame was handed to the writer, which then died before acknowledging it: the session is poisoned and a writable call is a withheld reply |
-| `mcp/thread:<err>` | a reader or writer thread could not start |
+| `mcp/thread:<err>` | a reader or writer thread could not start, or the process-wide reader-slot ceiling is spent (`too many readers`) |
 | `mcp/<code>` | the server returned a JSON-RPC error; `<code>` is its numeric code |
 
 A line past the capability's byte grant is `rpc/budget-exceeded` with dimension
@@ -306,7 +307,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/headers` | the header block exceeded 64 KiB or 128 fields, a field name is not an RFC 9110 token, a `content-length` was repeated, non-numeric or not digits, or a whitespace-only line appeared; a header flood past the capability's byte grant is `rpc/budget-exceeded` instead |
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
 | `http/bad-number` | a JSON number has no `Value` form: an integer outside `i64`, or a float that is not finite (a literal with a fraction or an exponent that overflows `f64`) |
-| `http/too-complex` | an object or array body has more than 2^20 structural tokens before parsing, or the decoded tree has more than 2^20 nodes |
+| `http/too-complex` | an object or array body has more than 2^20 structural tokens before parsing, the decoded tree has more than 2^20 nodes, or the tree is past the wire depth |
 | `http/body-too-large` | the response body exceeded `min(max_body, 64 MiB)`, by its declared length or by its stream; when the capability's byte grant is the tighter ceiling the refusal is `rpc/budget-exceeded` instead |
 | `http/line-too-long` | a status or header line exceeded its own cap; a grant-capped line is `rpc/budget-exceeded` |
 | `http/transfer-encoding` | a transfer coding other than `identity` |

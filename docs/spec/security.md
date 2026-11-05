@@ -61,6 +61,7 @@ that would violate one stops and needs an ADR.
 | Secret bytes in a module result | `subgraph`/`patch` return a **redacted** module: every secret node and every text that copies a secret literal becomes the marker before encoding, using the literal set of the module the capability was installed from | `domain::redacted_module_bytes`, `security::redact_derived` |
 | Guessable capability ids | the kernel secret comes from the OS CSPRNG | `Agent::new` |
 | Byte budget bypass | arguments and payload are measured and charged per call, then intersected with the lane budget | `Arg::wire_size`, `Kernel::call` |
+| Reply parking (QUIC) | request bodies and encoded replies have separate server-wide ceilings (`MAX_INFLIGHT_BODY` and `MAX_INFLIGHT_REPLY`, 256 MiB each), so one peer that grants no flow-control credit cannot park more than the sum | `BodyBudget`, `ReplyBudget` |
 | Lane budget bypass by queueing | capacity counts pending calls as well as completed ones | `Lane::has_capacity` |
 | Dropped capability still usable | last release removes the record | `HandleControl::release` |
 | Promise abuse (double resolve, cycle, unknown id) | single settlement, cycle detection before dispatch, id validation | `promise`, `Kernel::next_batch` |

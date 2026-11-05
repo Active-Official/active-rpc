@@ -1272,10 +1272,10 @@ pub fn decode_capability_table_with(
     bytes: &[u8],
     limits: &WireLimits,
 ) -> Result<Vec<CapDescriptor>> {
-    // The caller's byte ceiling applies here too: this decoder is public and
-    // documented for untrusted side channels (round 21, finding 6).
+    // The caller's byte ceiling applies here too, and its breach is the table
+    // class every other table limit uses (round 21, finding 6; round 22, N6).
     if bytes.len() > limits.max_bytes {
-        return Err(Error::Wire("envelope exceeds the size ceiling"));
+        return Err(Error::CapabilityTable("table exceeds the byte ceiling"));
     }
     let mut cursor = 0usize;
     let count = read_u32(bytes, &mut cursor)?;

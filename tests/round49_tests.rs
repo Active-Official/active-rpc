@@ -83,20 +83,6 @@ fn a_frame_that_cannot_fit_the_segment_is_a_wire_fault() {
     assert_eq!(error.code(), "rpc/wire", "{error}");
 }
 
-/// The table decoder honours the caller's byte ceiling, like every other
-/// decoder in the module (round 21, finding 6).
-#[test]
-fn a_table_past_the_byte_ceiling_is_refused() {
-    let bytes = [0u8; 64];
-    let limits = WireLimits {
-        max_bytes: 16,
-        ..WireLimits::strict()
-    };
-    let error = active_rpc::wire::decode_capability_table_with(&bytes, &limits)
-        .expect_err("past the byte ceiling");
-    assert_eq!(error.code(), "rpc/wire", "{error}");
-}
-
 /// The reply-budget ceiling is a second, independent budget (round 21,
 /// finding 3): `MAX_INFLIGHT_REPLY` is its own constant, not the request one.
 #[cfg(feature = "quic")]
@@ -107,4 +93,60 @@ fn the_reply_ceiling_is_its_own_constant() {
         256 << 20,
         "the reply ceiling is documented as its own bound"
     );
+}
+
+/// A malformed answer with many unrepresentable literals is still a bad number,
+/// not text: the repair covers every literal, not a capped prefix (round 50,
+/// F-1).
+#[test]
+fn a_body_with_many_bad_literals_is_not_text() {
+    use active_rpc::value::Response as ToolResponse;
+
+    let literals = ["1e400"; 12];
+    let body = format!("[{}]", literals.join(","));
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut socket, _) = listener.accept().expect("accept");
+        let mut scratch = [0u8; 4096];
+        let _ = socket.read(&mut scratch);
+        let _ = socket.write_all(response.as_bytes());
+        let _ = socket.flush();
+        let _ = socket.shutdown(std::net::Shutdown::Write);
+        let _ = socket.read(&mut scratch);
+    });
+    let mut tool = active_rpc::tool::HttpTool::new(format!("http://{address}"), &[("GET", "/x")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::Path("/x".to_string()))]);
+    call.read_only = true;
+    call.budget = Budget {
+        max_bytes: 1 << 20,
+        ..Budget::default()
+    };
+    let outcome = tool.invoke(0, &call);
+    match outcome {
+        Ok(ToolResponse::Value(Value::Text(_))) => panic!("a bad-number answer was served as text"),
+        Ok(other) => panic!("unexpected success: {other:?}"),
+        Err(error) => assert_eq!(error.provider_code(), Some("http/bad-number"), "{error}"),
+    }
+    drop(server);
+}
+
+/// A table past the byte ceiling uses the table class, like every other table
+/// limit (round 22, N6).
+#[test]
+fn a_table_past_the_byte_ceiling_is_a_table_fault() {
+    let bytes = [0u8; 64];
+    let limits = WireLimits {
+        max_bytes: 16,
+        ..WireLimits::strict()
+    };
+    let error = active_rpc::wire::decode_capability_table_with(&bytes, &limits)
+        .expect_err("past the byte ceiling");
+    assert_eq!(error.code(), "rpc/capability-table", "{error}");
 }
