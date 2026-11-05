@@ -459,7 +459,7 @@ fn a_json_body_past_the_token_ceiling_is_too_complex() {
     );
     fixed_response(listener, response.into_bytes());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/big")]);
-    tool.max_body = 4 << 20;
+    tool = tool.with_max_body(4 << 20);
     let error = tool
         .invoke(0, &http_get("/big", 20_000))
         .expect_err("a body past the token ceiling is refused");
@@ -479,7 +479,7 @@ fn a_json_body_past_the_token_ceiling_is_too_complex() {
         );
         fixed_response(listener, response.into_bytes());
         let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/bom")]);
-        tool.max_body = 4 << 20;
+        tool = tool.with_max_body(4 << 20);
         let error = tool
             .invoke(0, &http_get("/bom", 20_000))
             .expect_err("a prefix does not hide a huge body");
@@ -499,7 +499,7 @@ fn a_json_body_past_the_token_ceiling_is_too_complex() {
     );
     fixed_response(listener, response.into_bytes());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/bom")]);
-    tool.max_body = 4 << 20;
+    tool = tool.with_max_body(4 << 20);
     let error = tool
         .invoke(0, &http_get("/bom", 20_000))
         .expect_err("a BOM does not hide a huge body");
@@ -539,7 +539,7 @@ fn a_json_body_past_the_token_ceiling_is_too_complex() {
     );
     fixed_response(listener, response.into_bytes());
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/csv")]);
-    tool.max_body = 4 << 20;
+    tool = tool.with_max_body(4 << 20);
     let response = tool
         .invoke(0, &http_get("/csv", 20_000))
         .expect("a CSV answer is text");
@@ -670,7 +670,7 @@ fn a_response_head_past_the_byte_grant_is_refused() {
     // The adapter's own ceiling binds here, so the refusal is a provider
     // framing fault; a grant-bound cap answers `rpc/budget-exceeded` instead
     // (round 25, #7).
-    tool.max_body = 40;
+    tool = tool.with_max_body(40);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/small"))]);
     call.read_only = true;
     call.budget.max_bytes = 4096;
@@ -2507,7 +2507,7 @@ fn a_configured_tiny_body_ceiling_is_a_provider_refusal() {
         b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec(),
     );
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/tiny")]);
-    tool.max_body = 8;
+    tool = tool.with_max_body(8);
     let mut call = Call::new("get", vec![Arg::Value(Value::path("/tiny"))]);
     call.read_only = true;
     call.tool_allows_process = true;
@@ -3009,7 +3009,7 @@ fn an_http_share_under_the_static_ceiling_is_a_budget_refusal() {
         .into_bytes(),
     );
     let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", &path)]);
-    tool.max_body = 1_000;
+    tool = tool.with_max_body(1_000);
     let mut call = Call::new("get", vec![Arg::Value(Value::path(&path))]);
     call.read_only = true;
     call.tool_allows_process = true;

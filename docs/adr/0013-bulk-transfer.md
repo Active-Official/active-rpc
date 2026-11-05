@@ -68,10 +68,10 @@ hash matches the bytes *and* the plan's announced hash.
 - The **root is integrity, not authenticity**: `with_expected_root` pins the
   root the caller learned from the envelope, and a substituted plan is refused.
 - A configurable ceiling bounds the bytes a receiver will assemble; the default
-  is 1 GiB. `decode` checks the declared total and the chunk count (32 760, the
-  largest plan **envelope** that fits `WireLimits::strict()`'s 1 MiB frame) before
-  the hash vector is allocated, and the plan constructor checks the count before
-  it hashes anything.
+  is 1 GiB. `decode` checks the declared total and the chunk count (32 700, the
+  largest plan **envelope** that fits `WireLimits::strict()`'s 1 MiB frame with a
+  `max_path` descriptor and a cap delta) before the hash vector is allocated, and
+  the plan constructor checks the count before it hashes anything.
 - Every refusal inside `finish` leaves the chunks in place, so an error path
   cannot destroy bytes the caller paid for.
 
@@ -89,7 +89,13 @@ carries the hash it was built with, so a retransmission does not re-hash it.
 - The kernel meters ingress and egress against one grant, so a whole transfer
   needs `BulkPlan::required_grant()`: the plan frame, the chunk frames, the
   finish marker and a per-call reply allowance. `total + 53 x chunk_count` is the
-  chunk frames alone.
+  chunk frames alone. `BulkPlan::required_calls()` is the matching call bound,
+  including one `missing` page per 1 024 chunks for a resume.
+- `finish` is the one bulk path that reads the wall clock: the grant is a
+  *duration* (`max_wall_ms`), which `Call::now_ms` cannot express, so the
+  deadline is anchored at `Instant::now()` and re-checked between chunks and
+  before the verification pass. Every other lifetime is measured from the kernel
+  clock.
 - The per-chunk hash means a receiver verifies each chunk on arrival; the root
   proves the whole set. It is a two-level Merkle shape without the tree.
 - Authority stays on the ARP1 envelope: the provider is reached through a

@@ -1797,25 +1797,27 @@ impl Agent {
         let fingerprint = peer.fingerprint();
         let mut kernel = self.cell.borrow_mut();
         refresh_clock(&mut kernel);
-        let (revoked, expired, already_bound) = {
+        let (state, already_bound) = {
             let record = kernel
                 .caps
                 .get(&cap.id())
                 .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
-            (
-                record.revoked,
-                record.expires_at.is_some_and(|expires_at| {
-                    kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
-                }),
-                record.attrs.bound_to,
-            )
+            (liveness(&kernel, record), record.attrs.bound_to)
         };
-        if revoked {
-            return Err(Error::Revoked(cap_token(cap.id())));
-        }
-        if expired {
-            kernel.push_event(Event::CapExpired(cap.id()));
-            return Err(Error::Revoked(cap_token(cap.id())));
+        match state {
+            Liveness::Live => {}
+            Liveness::Dead => {
+                kernel.push_event(Event::CapExpired(cap.id()));
+                return Err(Error::Revoked(cap_token(cap.id())));
+            }
+            // Not an expiry: the capability may be live in the domain that
+            // minted its deadline, so binding it here would move authority this
+            // clock cannot judge (round 5, F2).
+            Liveness::ForeignClock => {
+                return Err(Error::Identity(
+                    "the capability's deadline is in another clock domain",
+                ))
+            }
         }
         match already_bound {
             Some(bound) if bound != fingerprint => {
@@ -1832,11 +1834,21 @@ impl Agent {
         let mut live: Vec<CapId> = vec![cap.id()];
         for id in &subtree {
             if let Some(child) = kernel.caps.get(id) {
-                // A revoked or expired record is dead authority: its binding is
-                // history, and letting it block the introduction would make a
-                // dead child permanent denial of service on a live capability.
-                if child.revoked || is_expired(&kernel, child) {
-                    continue;
+                match liveness(&kernel, child) {
+                    // A revoked or expired record is dead authority: its binding
+                    // is history, and letting it block the introduction would
+                    // make a dead child permanent denial of service on a live
+                    // capability.
+                    Liveness::Dead => continue,
+                    // A child judged in the other clock domain is neither dead
+                    // nor safe to bind: refusing the introduction leaves every
+                    // record as it was (round 5, F1).
+                    Liveness::ForeignClock => {
+                        return Err(Error::Identity(
+                            "a descendant's deadline is in another clock domain",
+                        ))
+                    }
+                    Liveness::Live => {}
                 }
                 if let Some(bound) = child.attrs.bound_to {
                     if bound != fingerprint {
@@ -1851,25 +1863,39 @@ impl Agent {
         // Only a live record is rebound. Rewriting a revoked or expired child's
         // binding moved authority between principals the moment a clock-domain
         // mismatch made that child readable again (round 4, F1).
+        let mut changed: Vec<CapId> = Vec::new();
         for id in &live {
             if let Some(child) = kernel.caps.get_mut(id) {
-                child.attrs.bound_to = Some(fingerprint);
+                if child.attrs.bound_to != Some(fingerprint) {
+                    child.attrs.bound_to = Some(fingerprint);
+                    changed.push(*id);
+                }
             }
         }
         let record = kernel
             .caps
             .get(&cap.id())
             .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
-        let descriptor = crate::wire::CapDescriptor::from_attrs(record.id, &record.attrs);
+        let root_id = record.id;
+        let descriptor = crate::wire::CapDescriptor::from_attrs(root_id, &record.attrs);
         // Introducing a capability to the peer that already holds it changes
         // nothing: the tape must not report a second introduction
         // (round 44, F-5).
         if already_bound != Some(fingerprint) {
-            let introduced = record.id;
             kernel.push_event(Event::CapIntroduced {
-                cap: introduced,
+                cap: root_id,
                 fingerprint,
             });
+        }
+        // The subtree changed binding too, and the tape has to explain it
+        // (round 5, F3).
+        for id in changed {
+            if id != root_id {
+                kernel.push_event(Event::CapIntroduced {
+                    cap: id,
+                    fingerprint,
+                });
+            }
         }
         Ok(descriptor)
     }
@@ -1911,25 +1937,24 @@ impl Agent {
         let to_fingerprint = to.fingerprint();
         let mut kernel = self.cell.borrow_mut();
         refresh_clock(&mut kernel);
-        let (revoked, expired, bound) = {
+        let (state, bound) = {
             let record = kernel
                 .caps
                 .get(&cap.id())
                 .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
-            (
-                record.revoked,
-                record.expires_at.is_some_and(|expires_at| {
-                    kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
-                }),
-                record.attrs.bound_to,
-            )
+            (liveness(&kernel, record), record.attrs.bound_to)
         };
-        if revoked {
-            return Err(Error::Revoked(cap_token(cap.id())));
-        }
-        if expired {
-            kernel.push_event(Event::CapExpired(cap.id()));
-            return Err(Error::Revoked(cap_token(cap.id())));
+        match state {
+            Liveness::Live => {}
+            Liveness::Dead => {
+                kernel.push_event(Event::CapExpired(cap.id()));
+                return Err(Error::Revoked(cap_token(cap.id())));
+            }
+            Liveness::ForeignClock => {
+                return Err(Error::Identity(
+                    "the capability's deadline is in another clock domain",
+                ))
+            }
         }
         if bound != Some(from_fingerprint) {
             return Err(Error::Identity(
@@ -1940,8 +1965,14 @@ impl Agent {
         let mut live: Vec<CapId> = vec![cap.id()];
         for id in &subtree {
             if let Some(child) = kernel.caps.get(id) {
-                if child.revoked || is_expired(&kernel, child) {
-                    continue;
+                match liveness(&kernel, child) {
+                    Liveness::Dead => continue,
+                    Liveness::ForeignClock => {
+                        return Err(Error::Identity(
+                            "a descendant's deadline is in another clock domain",
+                        ))
+                    }
+                    Liveness::Live => {}
                 }
                 // A descendant bound to a different peer is somebody else's
                 // authority; moving it would hand them a rotated identity.
@@ -1996,10 +2027,12 @@ impl Agent {
         // The tombstone set covers the whole subtree (a dead child's export is
         // still the old peer's authority), but only a live record is rebound
         // (round 4, F1).
+        let mut moved: Vec<CapId> = Vec::new();
         for id in &live {
             if let Some(child) = kernel.caps.get_mut(id) {
                 if child.attrs.bound_to == Some(from_fingerprint) {
                     child.attrs.bound_to = Some(to_fingerprint);
+                    moved.push(*id);
                 }
             }
         }
@@ -2015,6 +2048,15 @@ impl Agent {
         // authority move that did not happen (round 43, F4).
         if from_fingerprint != to_fingerprint {
             let rebound = record.id;
+            for id in moved {
+                if id != rebound {
+                    kernel.push_event(Event::CapRebound {
+                        cap: id,
+                        from: from_fingerprint,
+                        to: to_fingerprint,
+                    });
+                }
+            }
             kernel.push_event(Event::CapRebound {
                 cap: rebound,
                 from: from_fingerprint,
@@ -3881,6 +3923,52 @@ impl Agent {
             let error = Error::UnknownCapability(cap_token(cap.id()));
             self.record_refusal(lane, Some(cap.id()), &error);
             return Err(error);
+        }
+        // Identity is checked before any authority is measured: a capability
+        // bound to another peer answers `rpc/identity` whatever its arguments
+        // look like, so the refusal cannot be an oracle for the budget shape
+        // (round 5, F4).
+        {
+            let mut kernel = self.cell.borrow_mut();
+            refresh_clock(&mut kernel);
+            let (revoked, state, bound) = {
+                let record = kernel
+                    .caps
+                    .get(&cap.id())
+                    .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+                (
+                    record.revoked,
+                    liveness(&kernel, record),
+                    record.attrs.bound_to,
+                )
+            };
+            if revoked {
+                let error = Error::Revoked(cap_token(cap.id()));
+                Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                return Err(error);
+            }
+            match state {
+                Liveness::Live => {}
+                Liveness::Dead => {
+                    kernel.push_event(Event::CapExpired(cap.id()));
+                    let error = Error::Revoked(cap_token(cap.id()));
+                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    return Err(error);
+                }
+                Liveness::ForeignClock => {
+                    let error =
+                        Error::Identity("the capability's deadline is in another clock domain");
+                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    return Err(error);
+                }
+            }
+            if let Some(bound) = bound {
+                if !crate::identity::matches(crate::identity::presented_fingerprint(peer), bound) {
+                    let error = Error::Identity("capability is bound to a different peer identity");
+                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    return Err(error);
+                }
+            }
         }
         let shape_error = {
             let kernel = self.cell.borrow();
@@ -5961,6 +6049,34 @@ fn pad128(id: CapId) -> [u8; 16] {
 /// `set_latency(0)` does not advance at all, so a wall-clock deadline became
 /// unbounded at dispatch even though export and restore refuse the same
 /// mismatch (round 42, F4).
+/// Whether a record can be exercised here, is permanently dead, or cannot be
+/// judged in this clock domain.
+///
+/// A deadline minted under the other clock mode is not an expiry: the
+/// capability may be live in the domain that minted it, and switching the mode
+/// back revives it. Treating it as dead is how an introduction once rebound a
+/// live child to another principal (round 4, F1) and, after that was fixed, how
+/// it could leave one unbound for any peer (round 5, F1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    Live,
+    Dead,
+    ForeignClock,
+}
+
+fn liveness(kernel: &Kernel, record: &CapRecord) -> Liveness {
+    if record.revoked {
+        return Liveness::Dead;
+    }
+    if record.expires_at.is_some() && record.wall_clock != kernel.wall_clock {
+        return Liveness::ForeignClock;
+    }
+    if is_expired(kernel, record) {
+        return Liveness::Dead;
+    }
+    Liveness::Live
+}
+
 fn is_expired(kernel: &Kernel, record: &CapRecord) -> bool {
     record.expires_at.is_some_and(|expires_at| {
         kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock

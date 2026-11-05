@@ -50,12 +50,14 @@ fn an_introduction_does_not_revive_a_cross_domain_child_for_the_new_peer() {
     let child = agent.attenuate(&root, leased).expect("leased child");
     agent.introduce_to(&child, &bob).expect("bind child to bob");
 
-    // The lease is wall-clock, so under the virtual clock it cannot be read and
-    // the child is treated as expired for the length of the introduction.
+    // The lease is wall-clock, so under the virtual clock it cannot be read.
+    // Neither binding it nor leaving it unbound is safe, so the whole
+    // introduction is refused and every record keeps its binding.
     agent.use_wall_clock(false);
-    agent
+    let error = agent
         .introduce_to(&root, &alice)
-        .expect("the live root is introduced");
+        .expect_err("a foreign-clock descendant refuses the introduction");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
     agent.use_wall_clock(true);
 
     assert_eq!(
@@ -97,6 +99,73 @@ fn an_introduction_does_not_revive_a_cross_domain_child_for_the_new_peer() {
         Err(error) => Err(error),
     };
     let error = alice_call.expect_err("alice must not use bob's capability");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+}
+
+/// The tape explains every binding the introduction performed, not only the root
+/// (round 5, F3).
+#[test]
+fn an_introduction_reports_every_child_it_binds() {
+    let agent = Agent::with_secret([0x95; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(b"alice-round4e");
+    let root = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("root");
+    let child = agent
+        .attenuate(&root, CapAttrs::new(&["echo"]))
+        .expect("child");
+    let child_id = child.id();
+    agent.introduce_to(&root, &alice).expect("introduce");
+    let reported: Vec<_> = agent
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            active_rpc::Event::CapIntroduced { cap, fingerprint } if cap == child_id => {
+                Some(fingerprint)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![alice.fingerprint()],
+        "the child introduction is missing from the tape"
+    );
+}
+
+/// Identity is answered before any authority is measured: a wrong peer gets
+/// rpc/identity even when the arguments would also fail the budget shape
+/// (round 5, F4).
+#[test]
+fn a_wrong_peer_is_refused_before_the_argument_shape() {
+    let agent = Agent::with_secret([0x96; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let bob = admitted(b"bob-round4f");
+    let alice = admitted(b"alice-round4f");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.budget.max_nodes = 1;
+    let cap = agent.mint(provider, 0, attrs).expect("cap");
+    agent.introduce_to(&cap, &bob).expect("bind to bob");
+    let lane = agent.create_lane("order", Budget::default()).expect("lane");
+    // A map of two entries is over max_nodes; the peer is also wrong.
+    let wide = active_rpc::Value::map([
+        ("a", active_rpc::Value::Int(1)),
+        ("b", active_rpc::Value::Int(2)),
+    ]);
+    let error = match agent.call_as(
+        Some(alice.identity()),
+        lane,
+        &cap,
+        "echo",
+        vec![Arg::Value(wide)],
+    ) {
+        Ok(promise) => {
+            agent.run();
+            promise.value().expect_err("refused")
+        }
+        Err(error) => error,
+    };
     assert_eq!(error.code(), "rpc/identity", "{error}");
 }
 

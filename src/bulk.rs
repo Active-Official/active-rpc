@@ -65,12 +65,12 @@ pub const MAX_TOTAL: u64 = 1 << 30;
 /// under `WireLimits::strict()`: that profile caps the whole frame at 1 MiB
 /// (`max_bytes`, not only `max_payload`), so the header and 32 bytes per chunk
 /// must leave room for the envelope framing as well, and for a capability
-/// descriptor with a path scope plus a cap delta (a few hundred bytes). A full
-/// 1 GiB body therefore needs a chunk of at least `1 << 30 / 32 750` bytes
-/// (round 3, F8; round 4, L-2; round 5, F5). A test encodes and decodes the
-/// maximal plan under the strict profile with a descriptor and a delta
-/// attached.
-pub const MAX_CHUNKS: u32 = 32_750;
+/// descriptor with a `max_path`-length scope plus a one-entry cap delta (about
+/// 1.6 kB together). A full 1 GiB body therefore needs a chunk of at least
+/// `1 << 30 / 32 700` bytes, 32 836 (round 3, F8; round 4, L-2; round 5, F5;
+/// round 6, L4). A test encodes and decodes the maximal plan under the strict
+/// profile with such a descriptor and a delta attached.
+pub const MAX_CHUNKS: u32 = 32_700;
 
 /// Wire overhead of one chunk frame: magic, version, index, offset, length and
 /// hash.
@@ -264,14 +264,19 @@ impl BulkPlan {
             .saturating_add(REPLY_ALLOWANCE.saturating_mul(chunks.saturating_add(3)))
     }
 
-    /// The call grant a whole transfer needs through a kernel.
+    /// The call grant a whole transfer needs through a kernel, including a full
+    /// resume.
     ///
-    /// One `plan`, one `put` per chunk and one `finish`, so
-    /// `chunks + 2`. `Budget::default().max_calls` is 10 000, which a large body
-    /// with small chunks exceeds; the caller raises it with the grant
-    /// (round 5, F3).
+    /// `plan`, one `put` per chunk and `finish` (`chunks + 2`), plus one
+    /// `missing` page per 1 024 chunks for the resume the module advertises: a
+    /// caller that sizes its grant from this accessor can lose the connection
+    /// and finish rather than be refused mid-resume. `Budget::default()`
+    /// `.max_calls` is 10 000, which a large body with small chunks exceeds; the
+    /// caller raises it with the grant (round 5, F3; round 6, L8).
     pub fn required_calls(&self) -> u64 {
-        self.chunks as u64 + 2
+        let chunks = self.chunks as u64;
+        let pages = chunks.div_ceil(MISSING_PAGE as u64);
+        chunks.saturating_add(2).saturating_add(pages)
     }
 
     /// Chunk size in bytes.
@@ -454,7 +459,10 @@ impl BulkChunk {
     pub fn new(index: u32, chunk_size: usize, data: &[u8]) -> Self {
         Self {
             index,
-            offset: index as u64 * chunk_size as u64,
+            // A pair whose product is past `u64` names no plan position, so it
+            // becomes `u64::MAX`, which `validate_chunk` refuses. Panicking in
+            // a infallible constructor was the alternative (round 6, L3).
+            offset: (index as u64).saturating_mul(chunk_size as u64),
             hash: chunk_hash(data),
             data: data.to_vec(),
         }
@@ -953,8 +961,16 @@ impl BulkReceiver {
     /// The digest is fed while the body is assembled, so the provider does not
     /// re-hash a gigabyte after verification. A deadline that has already
     /// passed is `rpc/budget-exceeded("wall")` before any work, and the deadline
-    /// is re-checked between chunks (round 5, F4). The allocation is fallible:
-    /// a body the process cannot hold is a refusal, not an abort.
+    /// is re-checked between chunks and before the verification pass
+    /// (round 5, F4; round 6, L6). The allocation is fallible: a body the
+    /// process cannot hold is a refusal, not an abort.
+    ///
+    /// This is the one place a bulk provider reads the wall clock. Every other
+    /// lifetime is measured from `Call::now_ms`, but the grant is a *duration*
+    /// (`max_wall_ms`) that a timestamp cannot express, so the deadline is
+    /// derived from `Instant::now()`; a replay with the same timestamps can
+    /// therefore refuse on a loaded machine where it succeeded on an idle one
+    /// (round 6, L9).
     pub fn finish_within(
         &mut self,
         deadline: Option<std::time::Instant>,
@@ -988,6 +1004,11 @@ impl BulkReceiver {
         }
         if out.len() as u64 != self.plan.total {
             return Err(Error::Bulk("body length does not match the plan"));
+        }
+        // The verification pass re-hashes the whole body, so it is inside the
+        // deadline too (round 6, L6).
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(Error::BudgetExceeded("wall"));
         }
         self.plan.verify(&out)?;
         self.received.clear();
@@ -1099,9 +1120,13 @@ struct ActiveTransfer {
 }
 
 /// A body that finished and has not been taken by the host yet.
+///
+/// The plan is not retained: a marker check needs the root and the total, and a
+/// maximal plan would outweigh the body it describes (round 6, L2).
 struct CompletedTransfer {
     body: BulkBody,
-    plan: BulkPlan,
+    root: [u8; 32],
+    total: u64,
     at_ms: u64,
 }
 
@@ -1116,6 +1141,9 @@ struct FinishedTransfer {
     length: u64,
     body_hash: [u8; 32],
     content: Option<[u8; 32]>,
+    /// When the reply was recorded: the record is released with the same window
+    /// as an untaken body (round 6, L7).
+    at_ms: u64,
 }
 
 /// A provider that receives a bulk body through ordinary calls.
@@ -1286,6 +1314,11 @@ impl BulkProvider {
                 self.completed.remove(&object);
             }
         }
+        if let Some(done) = self.last_finished.get(&object) {
+            if stale(done.at_ms, COMPLETED_IDLE_MS) {
+                self.last_finished.remove(&object);
+            }
+        }
     }
 
     /// Release every object whose state has been idle past its window.
@@ -1299,6 +1332,7 @@ impl BulkProvider {
             .transfers
             .keys()
             .chain(self.completed.keys())
+            .chain(self.last_finished.keys())
             .copied()
             .collect();
         for object in objects {
@@ -1373,9 +1407,16 @@ impl BulkProvider {
     }
 
     fn missing_method(&mut self, object: u64, call: &Call) -> Result<Response> {
-        // A live resume poll keeps the transfer alive, and a read-only caller
-        // cannot destroy another capability's chunks: `missing` refreshes the
-        // window and never expires (round 4, L-1).
+        // A live resume poll keeps the idle window alive, and a read-only caller
+        // cannot destroy another capability's chunks by idleness (round 4,
+        // L-1). The absolute lifetime is different: polling must not hold a
+        // transfer past `MAX_TRANSFER_LIFETIME_MS` (round 6, M1).
+        let expired = self.transfers.get(&object).is_some_and(|active| {
+            call.now_ms.saturating_sub(active.created_ms) > MAX_TRANSFER_LIFETIME_MS
+        });
+        if expired {
+            self.transfers.remove(&object);
+        }
         let active = self
             .transfers
             .get_mut(&object)
@@ -1405,7 +1446,7 @@ impl BulkProvider {
         // outlives the bytes, so the answer survives `take_body` and the
         // completed window (round 4, L-4, L-5).
         if let Some(done) = self.completed.get(&object) {
-            BulkFinish::decode(&call.payload, &done.plan)?;
+            BulkFinish::decode_for(&call.payload, done.total, done.root)?;
             return Ok(finished_reply(
                 done.body.len() as u64,
                 done.body.body_hash(),
@@ -1475,6 +1516,7 @@ impl BulkProvider {
                 length,
                 body_hash,
                 content,
+                at_ms: call.now_ms,
             },
         );
         self.completed.insert(
@@ -1485,7 +1527,8 @@ impl BulkProvider {
                     body_hash,
                     content,
                 },
-                plan,
+                root: plan.root(),
+                total: plan.total(),
                 at_ms: call.now_ms,
             },
         );

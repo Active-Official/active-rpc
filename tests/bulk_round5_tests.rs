@@ -136,15 +136,18 @@ fn a_refreshed_transfer_still_hits_the_lifetime_bound() {
     assert_eq!(error.code(), "rpc/bulk");
 }
 
-/// The call grant is part of the contract: `chunks + 2` calls cannot carry a
-/// transfer, `chunks + 3` can (round 5, F3).
+/// The call grant is part of the contract: one call short cannot carry a
+/// transfer, the named grant can, and it counts the resume pages (round 5, F3;
+/// round 6, L8).
 #[test]
 fn the_call_grant_is_named() {
     let transfer = BulkTransfer::new(body(4_000, 46), 1_000).expect("transfer");
     let chunks = transfer.plan().chunk_count() as u64;
-    assert_eq!(transfer.plan().required_calls(), chunks + 2);
+    let pages = chunks.div_ceil(active_rpc::bulk::MISSING_PAGE as u64);
+    assert_eq!(transfer.plan().required_calls(), chunks + 2 + pages);
     assert!(run_kernel(&transfer, chunks + 1).is_err());
-    run_kernel(&transfer, chunks + 2).expect("the named call grant carries the transfer");
+    run_kernel(&transfer, transfer.plan().required_calls())
+        .expect("the named call grant carries the transfer");
 }
 
 fn run_kernel(transfer: &BulkTransfer, calls: u64) -> Result<(), Error> {

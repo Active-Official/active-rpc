@@ -261,7 +261,7 @@ handle and probe its policy.
 | `mcp/queue` | the writer queue stayed full until the ceiling; the frame never reached the writer, so the session stays usable |
 | `mcp/not-sent` | the deadline had passed before anything was written; the frame never reached the wire, so the session stays usable |
 | `mcp/line-too-long` | a line exceeded the static 1 MiB ceiling before parsing, whatever the grant; the session is poisoned |
-| `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer |
+| `mcp/bad-response` | the response is not a JSON object with `result` or `error`, has neither an `id` nor a `method`, or carries an `error` whose `code` is absent or not an integer; the session is poisoned in every case |
 | `mcp/too-complex` | the answer text holds more structural tokens than `MAX_JSON_NODES`, the tree does, the answer text nests past the wire depth before parsing, or the tree is past it; the session is poisoned, and a writable call reports it as a withheld reply |
 | `mcp/id-mismatch` | the response `id` is not the integer this client sent, or the frame is a server-initiated request |
 | `mcp/desync` | more than `MAX_MCP_NOTIFICATIONS` notification frames arrived for one request, or the session was already poisoned |
@@ -578,12 +578,13 @@ hashes, len(context), context)`. The context (normally the request id and
 capability id of the opening envelope) is **not transmitted**: both sides derive
 it, and a decoder recomputes the root and refuses a plan that does not match. A
 decoder also refuses a declared `total` above its ceiling (1 GiB by protocol) and
-a `chunk_count` above 32 760 before allocating the hash list. The count is chosen
+a `chunk_count` above 32 700 before allocating the hash list. The count is chosen
 so the plan **envelope** fits `WireLimits::strict()`, which caps the whole frame
 at 1 MiB: the 53-byte header plus 32 bytes per chunk must leave room for the
-envelope framing too. A full 1 GiB body therefore needs a chunk of at least
-`1 073 741 824 / 32 760` bytes (32 777), and a test encodes and decodes the
-maximal plan under the strict profile.
+envelope framing, a capability descriptor with a `max_path` scope and a one-entry
+cap delta (about 1.6 kB together). A full 1 GiB body therefore needs a chunk of
+at least `1 073 741 824 / 32 700` bytes (32 836), and a test encodes and decodes
+the maximal plan under the strict profile with such a descriptor and a delta.
 
 **Chunk** (`ARBC`):
 
@@ -633,23 +634,25 @@ and its completed body by the capability's **object**, which is what
 derived from the same grant share one slot: an object is expected to have one
 principal, and a delegated capability observes and settles its parent's
 transfer. `Provider::on_drop` releases the object's transfer and any untaken
-body. An incomplete transfer is released after 60 s of inactivity, and a
-finished, untaken body after 10 minutes, both measured against the
-kernel-stamped `Call::now_ms`; the digest reply outlives the bytes. `plan`
+body. An incomplete transfer is released after 60 s of inactivity and never later
+than 1 hour after it opened, a finished, untaken body after 10 minutes, and its
+digest reply with it, all measured against the kernel-stamped `Call::now_ms`. `plan`
 refuses to open a new transfer for an object whose completed body has not been
 taken (`rpc/bulk`), so a body is never silently dropped. `missing` answers a
 window of 1 024 indexes with `more` and `remaining` (because
 `Budget::strict()` allows 1 024 array elements), refreshes the idle window, and
-never expires a transfer: a read-only capability can poll but cannot destroy
-another capability's chunks. `finish` is idempotent per object: a repeated
+never expires a transfer by idleness: a read-only capability can poll but cannot
+destroy another capability's chunks. The absolute lifetime below still applies to
+a poll, so polling cannot hold a transfer forever. `finish` is idempotent per object: a repeated
 marker returns the same reply, even after the host takes the body, because the
 effect already landed. The reply is `length`, `body_hash` (the raw Blake3 digest
-of the body: a transfer-integrity value, **never** a content address) and, when
-the body is an Active Infinity image, `content`: the canonical content address
-of the **redacted** image, the same value the domain provider serves. A grant
-must cover `BulkPlan::required_grant()` bytes (plan frame, chunk frames, finish
-marker and a per-call reply allowance): `total + 53 × chunk_count` pays for the
-chunk frames only.
+of the body: a transfer-integrity value, **never** a content address; omitted for
+a redacting call) and, when the body is an Active Infinity image, `content`: the
+canonical content address of the **redacted** image, the same value the domain
+provider serves. A grant must cover `BulkPlan::required_grant()` bytes (plan
+frame, chunk frames, finish marker and a per-call reply allowance) and
+`BulkPlan::required_calls()` calls (one pass plus a full resume's `missing`
+pages): `total + 53 × chunk_count` pays for the chunk frames only.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

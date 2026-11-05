@@ -71,9 +71,10 @@ let server = QuicServer::start_with_identity(
 )?;
 ```
 
-- `Some(ca_der)` turns on client authentication; `None` accepts anonymous clients
-  and reports `None` as the peer identity, which makes every bound capability
-  unusable (fail closed).
+- `Some(ca_der)` turns on client authentication. `None` accepts anonymous
+  clients, so it is only accepted when the listener binds a loopback address;
+  every other `None` is refused at startup. An anonymous peer is reported as
+  `None`, which makes every bound capability unusable (fail closed).
 - `start_with_identity` mints nothing: `client_credentials()` and
   `issue_client_credentials()` return `None`/error, because the CA is yours.
 - The handler receives the authenticated peer. Dispatch with
@@ -85,8 +86,9 @@ let server = QuicServer::start_with_identity(
 ```rust
 use active_rpc::transport::quic::QuicClient;
 
-let client = QuicClient::connect_mutual_tls(
+let client = QuicClient::connect_mutual_tls_with_name(
     "rpc.internal:7443",
+    "rpc.internal",   // the name the server certificate covers (SNI)
     &ca_der,          // trust root for the server
     client_leaf_der,  // this agent's certificate
     client_key,       // PKCS#8 DER
@@ -117,11 +119,13 @@ client that presents none fails it as well.
    certificates and keys from files; the kernel never prints key material, and
    should not be given a path it cannot read.
 3. **Rotate before expiry.** A new leaf has a new fingerprint, so capabilities
-   bound to the old one are moved with `reintroduce_to(cap, &old_peer, &new_peer)`
-   (`introduce_to` refuses an already-bound capability). A rotation also
-   tombstones the durable records exported for the old peer, and only the live
-   subtree is rebound: a revoked or expired child keeps the binding it died
-   with. Plan the rotation window.
+   bound to the old one are moved with `reintroduce_to(cap, &old_peer, &new_peer)`.
+   `introduce_to` refuses a capability bound to a *different* peer (re-introducing
+   one to the peer that already holds it is a no-op). A rotation also tombstones
+   the durable records exported for the old peer, and only the live subtree is
+   rebound: a revoked or expired child keeps the binding it died with, and a
+   child holding a deadline from the other clock mode refuses the whole
+   operation instead of being rebound or left open. Plan the rotation window.
 4. **Revoke at the CA and at the kernel.** Dropping a certificate stops new
    handshakes; `Agent::revoke` stops existing capabilities immediately.
 5. **Pin the clock mode.** Mint leases after selecting the clock
@@ -131,10 +135,11 @@ client that presents none fails it as well.
    `AdmittedIdentity`, and `dispatch_envelope` is what enforces
    `require_identity`/`trust_loopback`. `call_as` trusts whatever peer handle the
    embedder passes, so a server that hands a peer straight to `call_as` has
-   applied no policy: admit first, then dispatch. A QUIC handler receives the
-   peer certificate but not the connection, so it must derive the loopback flag
-   from its own connection (`remote_addr().ip().is_loopback()`) before calling
-   `admit`.
+   applied no policy: admit first, then dispatch. The `FnMut(Envelope,
+   Option<PeerIdentity>)` handler signature carries the certificate, not the
+   connection, so the loopback flag has to be derived where the connection is
+   available (a `quinn::Connection::remote_address()`, for example) and passed
+   into `admit` there; a handler cannot infer it from the envelope.
 
 ## Evidence
 

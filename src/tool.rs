@@ -702,7 +702,11 @@ impl McpTransport for MemoryTransport {
             code: "mcp/bad-json".to_string(),
         })?;
         let method = request.get("method").and_then(Json::as_str).unwrap_or("");
-        let id = request.get("id").cloned().unwrap_or(Json::Null);
+        let Some(id) = request.get("id").cloned() else {
+            // A notification has no id and a server answers nothing, so the
+            // reply queue stays aligned with the next request (round 57, L-6).
+            return Ok(());
+        };
         let mut response = self.responses.get(method).cloned().unwrap_or_else(|| {
             json!({
                 "jsonrpc": "2.0",
@@ -1387,6 +1391,16 @@ impl<T: McpTransport> McpSession<T> {
             };
             return Err(Error::Provider { code });
         }
+        // MCP 2025-06-18 requires the client to confirm the lifecycle after
+        // `initialize`; a server that enforces it ignores every later call
+        // without this notification (round 57, L-6). It has no id, so no
+        // response is expected and the session stays aligned.
+        if !initialize.get("result").is_some_and(Json::is_object) {
+            return Err(Error::Provider {
+                code: "mcp/bad-response".to_string(),
+            });
+        }
+        session.notify_within("notifications/initialized", json!({}))?;
         let list = session.request_within("tools/list", json!({}), deadline, None)?;
         if let Some(error) = list.get("error") {
             // A failed list was reported as a missing array and the server's
@@ -1461,6 +1475,17 @@ impl<T: McpTransport> McpSession<T> {
             }
         }
         Ok(session)
+    }
+
+    /// Send a JSON-RPC notification: no id, so the server answers nothing.
+    fn notify_within(&mut self, method: &str, params: Json) -> Result<()> {
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|_| Error::InvalidArgument("the MCP notification cannot be serialised"))?;
+        self.transport.send_line(&line)
     }
 
     fn request_within(
@@ -1955,7 +1980,10 @@ impl<T: McpTransport> Provider for McpSession<T> {
             let Some(code) = error.get("code").and_then(Json::as_i64) else {
                 // A missing or non-integer code is a malformed answer, not
                 // code 0 (round 10, F-7). The answer arrived, so a writable
-                // call reports a withheld reply (round 43, F-3).
+                // call reports a withheld reply (round 43, F-3), and the
+                // session is poisoned like every other answer-side fault
+                // (round 57, L-3).
+                self.poisoned = true;
                 return Err(withhold_after_send(
                     Error::Provider {
                         code: "mcp/bad-response".to_string(),
@@ -2003,12 +2031,15 @@ pub struct HttpTool {
     /// control byte or a path after construction would otherwise desync
     /// `base_invalid` from the value `perform` and `Debug` use (round 54, L-1).
     base: String,
-    /// Allowed `(method, path)` pairs.
-    pub allow: BTreeSet<(String, String)>,
+    /// Allowed `(method, path)` pairs. Private: the allowlist is the tool's
+    /// whole authority, so an entry added after construction goes through
+    /// [`HttpTool::allow_path`], which applies the same ambiguity gate
+    /// (round 57, L-4).
+    allow: BTreeSet<(String, String)>,
     /// Maximum response bytes.
-    pub max_body: usize,
+    max_body: usize,
     /// Maximum request bytes.
-    pub max_request: usize,
+    max_request: usize,
     /// Calls served.
     pub calls: u64,
     /// Whether the last exchange put bytes on the wire. A refusal after that
@@ -2041,6 +2072,11 @@ fn redacted_base(base: &str) -> String {
     let authority_raw = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let authority = authority_raw.rsplit('@').next().unwrap_or(authority_raw);
     let tail = rest.len().saturating_sub(authority_raw.len());
+    // An operator needs the host, not a 64 KiB name in a log line
+    // (round 57, L-5).
+    if authority.len() > 128 {
+        return format!("{scheme}://<{} bytes>", authority.len());
+    }
     if tail > 0 {
         format!("{scheme}://{authority}/<{} bytes>", tail.saturating_sub(1))
     } else {
@@ -2076,6 +2112,43 @@ impl HttpTool {
     /// call is refused with `rpc/tool-policy`.
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// The response ceiling this tool enforces (clamped at use).
+    pub fn max_body(&self) -> usize {
+        self.max_body
+    }
+
+    /// The request ceiling this tool enforces (clamped at use).
+    pub fn max_request(&self) -> usize {
+        self.max_request
+    }
+
+    /// Set the response ceiling, clamped at use like the constructor's default.
+    pub fn with_max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body;
+        self
+    }
+
+    /// Set the request ceiling, clamped at use like the constructor's default.
+    pub fn with_max_request(mut self, max_request: usize) -> Self {
+        self.max_request = max_request;
+        self
+    }
+
+    /// Allow one `(method, path)` pair, with the same gate `try_new` applies.
+    ///
+    /// The allowlist is the tool's whole authority, so a later addition cannot
+    /// skip the ambiguity check the constructor enforces (round 57, L-4).
+    pub fn allow_path(&mut self, method: &str, path: &str) -> Result<()> {
+        if Self::ambiguous_path(path) {
+            return Err(Error::ToolPolicy(
+                "an allowlist entry has an ambiguous path",
+            ));
+        }
+        self.allow
+            .insert((method.to_ascii_uppercase(), path.to_string()));
+        Ok(())
     }
 
     /// Whether an exact-match allow-list entry is ambiguous for a peer.
@@ -2116,11 +2189,22 @@ impl HttpTool {
         {
             return inner.parse::<std::net::Ipv6Addr>().is_ok();
         }
-        if !name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte == b'.')
-        {
+        // A numeric-looking name must be a real IPv4 literal. `inet_aton` also
+        // reads hexadecimal labels (`0x7f.0.0.1`, `0x7f000001` are
+        // 127.0.0.1), so a name whose every label is decimal or `0x` hex would
+        // dial an address the text does not spell (round 56, M-1; round 57,
+        // M-1).
+        let numeric = !name.is_empty()
+            && name.split('.').all(|label| {
+                label.bytes().all(|byte| byte.is_ascii_digit())
+                    || label
+                        .strip_prefix("0x")
+                        .or_else(|| label.strip_prefix("0X"))
+                        .is_some_and(|hex| {
+                            !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+            });
+        if numeric {
             return name.parse::<std::net::Ipv4Addr>().is_ok();
         }
         // A DNS name: dot-separated labels, none empty, none starting or ending

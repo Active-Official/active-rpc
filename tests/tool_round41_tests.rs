@@ -145,8 +145,8 @@ fn serve_once(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
 fn the_http_static_request_ceiling_refuses_during_serialization() {
     let (address, server) =
         serve_once(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec());
-    let mut tool = HttpTool::new(format!("http://{address}"), &[("POST", "/safe")]);
-    tool.max_request = 64;
+    let mut tool =
+        HttpTool::new(format!("http://{address}"), &[("POST", "/safe")]).with_max_request(64);
     let mut call = Call::new(
         "post",
         vec![
