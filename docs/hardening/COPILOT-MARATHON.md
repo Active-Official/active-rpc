@@ -21,7 +21,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-50: round 49 was clean; round 50 found 2 mediums and 4 lows, all fixed; round 51 must be clean | 334 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-51: round 51 found 1 medium and 5 lows, all fixed; round 52 must be clean | 340 fixed / 5 rejected / 0 open (4 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-2: 12 + 2 findings | 14 fixed / 0 rejected / 0 open | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-3: 8 + 7 + 7 findings (2 + 2 dispositions partial) | 22 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
@@ -897,6 +897,23 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-04 (round 51)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `65d8489`. Round-50
+claims: four HOLD, one PARTIAL. Verdict **PARTIAL**: one medium and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a 2xx body nested past serde's own recursion limit (128) was served as `Value::Text`: a chain of arrays has no `,`/`:`, so the token gate passed it and only serde's failure decided the class | **fixed**: `json_text_too_deep` scans brackets outside strings before the parse in both adapters (`http/too-complex` withheld; `mcp/too-complex` + poison); `a_body_nested_past_the_parser_limit_is_too_complex`, and the deeply-nested handshake test now expects `mcp/too-complex` |
+| 2 | low | `redacted_base` printed a query-only base verbatim and mangled a query containing `@` | **fixed**: the cut is at `/`, `?` or `#`; `a_query_only_base_is_redacted` |
+| 3 | low | the poisoning list still omitted `mcp/write:<err>`, `mcp/no-response`, a receive timeout and the reader-slot refusal | **fixed**: the list names every answer-side fault and the post-hand-over write |
+| 4 | low | the `bad_number_spans` doc block had been absorbed by the constant | **fixed**: the const and the function each own their doc |
+| 5 | low | `base` was used verbatim for resolution and the `host:` field, so a path or trailing slash was `http/resolve` | **fixed**: the base is cut to its authority once, at construction |
+| 6 | low | three round-50 claims had no regression test | **fixed**: the nested-body and query-base tests above; the field-count case is covered by the header tests |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.

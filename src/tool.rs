@@ -93,12 +93,6 @@ pub fn json_has_unrepresentable_number(value: &Json) -> bool {
 
 /// Spans of numeric literals in `text` that no `Value` form represents.
 ///
-/// The scan runs bytewise outside strings. A literal with a fraction or an
-/// exponent must parse to a finite `f64`; an integer must parse to `i64` or
-/// `u64` (a `u64` past `i64::MAX` is caught by
-/// [`json_has_unrepresentable_number`] on the decoded tree). Scanning the text
-/// is what sees a literal the decoder would round, turn into an infinity, or
-/// refuse before any tree exists (round 15, F-1).
 /// Largest number of unrepresentable literals this scan collects.
 ///
 /// A document with more is either text or a refusal; collecting one 16-byte
@@ -106,6 +100,14 @@ pub fn json_has_unrepresentable_number(value: &Json) -> bool {
 /// outside the grant (round 49, L-3).
 const MAX_NUMBER_SPANS: usize = 8;
 
+/// Spans of numeric literals with no `Value` form, at most `MAX_NUMBER_SPANS`.
+///
+/// The scan runs bytewise outside strings. A literal with a fraction or an
+/// exponent must parse to a finite `f64`; an integer must parse to `i64` or
+/// `u64` (a `u64` past `i64::MAX` is caught by
+/// [`json_has_unrepresentable_number`] on the decoded tree). Scanning the text
+/// is what sees a literal the decoder would round, turn into an infinity, or
+/// refuse before any tree exists (round 15, F-1).
 fn bad_number_spans(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
@@ -163,6 +165,42 @@ fn literal_has_no_value_form(literal: &str) -> bool {
         return !matches!(literal.parse::<f64>(), Ok(value) if value.is_finite());
     }
     literal.parse::<i64>().is_err() && literal.parse::<u64>().is_err()
+}
+
+/// Whether a JSON text nests past `limit` brackets outside strings.
+///
+/// `json_text_too_complex` counts only `,` and `:`, so a chain of arrays has no
+/// tokens and reaches serde, which stops at its own recursion limit and fails:
+/// the HTTP adapter then served the answer as text (round 51, finding 1). This
+/// scan is allocation-free and runs before the parse.
+pub fn json_text_too_deep(text: &str, limit: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Whether a JSON text holds a numeric literal with no `Value` form.
@@ -1606,7 +1644,11 @@ impl<T: McpTransport> McpSession<T> {
             // and the HTTP adapter has refused that shape since round 13 while
             // this one built it (round 38, #4). The line is the peer's, so the
             // session is poisoned like any other illegal answer.
-            if json_text_too_complex(&line, MAX_JSON_NODES) {
+            if json_text_too_complex(&line, MAX_JSON_NODES)
+                || json_text_too_deep(&line, crate::wire::MAX_VALUE_DEPTH)
+            {
+                // A chain of arrays has no tokens, so the token gate alone let
+                // serde's own limit decide the class (round 51, finding 1).
                 self.poisoned = true;
                 return Err(Error::Provider {
                     code: "mcp/too-complex".to_string(),
@@ -1981,7 +2023,7 @@ fn redacted_base(base: &str) -> String {
     let Some((scheme, rest)) = base.split_once("://") else {
         return format!("<{} bytes>", base.len());
     };
-    let authority_raw = rest.split('/').next().unwrap_or(rest);
+    let authority_raw = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let authority = authority_raw.rsplit('@').next().unwrap_or(authority_raw);
     let tail = rest.len().saturating_sub(authority_raw.len());
     if tail > 0 {
@@ -2039,8 +2081,19 @@ impl HttpTool {
     /// silently widened one. [`HttpTool::try_new`] refuses at construction
     /// instead.
     pub fn new(base: impl Into<String>, allow: &[(&str, &str)]) -> Self {
+        // The base is a scheme and an authority: a path, query or fragment
+        // would be concatenated with every request path and reach the resolver
+        // (`http/resolve`) or the `host:` field (round 51, finding 5). It is cut
+        // here, once, so both uses see the same string.
+        let base = match base.into().split_once("://") {
+            Some((scheme, rest)) => {
+                let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+                format!("{scheme}://{}", &rest[..end])
+            }
+            None => String::new(),
+        };
         Self {
-            base: base.into(),
+            base,
             allow: allow
                 .iter()
                 // `invoke` uppercases the requested method, so a lowercase
@@ -2779,6 +2832,19 @@ impl Provider for HttpTool {
         // nodes without tokens) is answered from the tree with the same code
         // (round 16, F-2).
         let trimmed = json_text.trim_start();
+        if (trimmed.starts_with('{') || trimmed.starts_with('['))
+            && json_text_too_deep(json_text, crate::wire::MAX_VALUE_DEPTH)
+        {
+            // A chain of arrays has no tokens, so the token gate let it reach
+            // serde's own limit and the answer was served as text (round 51,
+            // finding 1).
+            return Err(withhold_after_send(
+                Error::Provider {
+                    code: "http/too-complex".to_string(),
+                },
+                mutating,
+            ));
+        }
         if (trimmed.starts_with('{') || trimmed.starts_with('['))
             && json_text_too_complex(json_text, MAX_JSON_NODES)
         {

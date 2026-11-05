@@ -150,3 +150,58 @@ fn a_table_past_the_byte_ceiling_is_a_table_fault() {
         .expect_err("past the byte ceiling");
     assert_eq!(error.code(), "rpc/capability-table", "{error}");
 }
+
+/// A 2xx body nested past serde's own limit is the documented `http/too-complex`,
+/// not text: a chain of arrays has no tokens, so only a depth scan sees it
+/// (round 51, finding 1).
+#[test]
+fn a_body_nested_past_the_parser_limit_is_too_complex() {
+    let mut nested = String::from("[");
+    for _ in 0..200 {
+        nested.push('[');
+    }
+    nested.push('0');
+    for _ in 0..201 {
+        nested.push(']');
+    }
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        nested.len(),
+        nested
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address").to_string();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut socket, _) = listener.accept().expect("accept");
+        let mut scratch = [0u8; 4096];
+        let _ = socket.read(&mut scratch);
+        let _ = socket.write_all(response.as_bytes());
+        let _ = socket.flush();
+        let _ = socket.shutdown(std::net::Shutdown::Write);
+        let _ = socket.read(&mut scratch);
+    });
+    let mut tool = active_rpc::tool::HttpTool::new(format!("http://{address}"), &[("GET", "/x")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::Path("/x".to_string()))]);
+    call.read_only = true;
+    call.budget = Budget {
+        max_bytes: 1 << 20,
+        ..Budget::default()
+    };
+    let error = tool.invoke(0, &call).expect_err("too deep to be text");
+    assert_eq!(error.provider_code(), Some("http/too-complex"), "{error}");
+    drop(server);
+}
+
+/// A query-only base is a credential home too: `Debug` cuts at `?` and `#`
+/// (round 51, finding 2).
+#[test]
+fn a_query_only_base_is_redacted() {
+    let tool = active_rpc::tool::HttpTool::new("http://127.0.0.1:9?token=CANARY", &[("GET", "/x")]);
+    let rendered = format!("{tool:?}");
+    assert!(!rendered.contains("CANARY"), "the query leaked: {rendered}");
+    assert!(rendered.contains("127.0.0.1:9"), "{rendered}");
+    // The base is cut to its authority at construction, so resolution sees an
+    // address rather than `host?query` (round 51, finding 5).
+    assert!(rendered.contains("http://127.0.0.1:9\""), "{rendered}");
+}

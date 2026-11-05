@@ -109,7 +109,9 @@ fn deeply_nested_json_is_rejected_without_a_stack_overflow() {
     }
     let line = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{nested}}}"#);
     let session = McpSession::handshake(Scripted::new(&[line.as_str()]));
-    assert_eq!(code(session), "mcp/bad-response");
+    // A chain of arrays has no tokens: the depth scan names it before the
+    // parse (round 51, finding 1).
+    assert_eq!(code(session), "mcp/too-complex");
 }
 
 #[test]

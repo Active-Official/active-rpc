@@ -233,9 +233,12 @@ class stays local) and `rpc/budget-exceeded` with the dimension it measured
 
 An `McpSession` reports adapter failures as `rpc/provider` with one of these
 inner codes. Every one is a fail-closed refusal. None needs a new session except
-the ones that poison it (`mcp/line-too-long`, `mcp/too-complex`, `mcp/desync`,
-`mcp/id-mismatch`, `mcp/bad-response`, `mcp/bad-number`, `mcp/bad-json`,
-`mcp/eof`, `mcp/write:closed`, `mcp/write:lost`); a
+the ones that poison it (every answer-side fault: `mcp/line-too-long`,
+`mcp/too-complex`, `mcp/desync`, `mcp/id-mismatch`, `mcp/bad-response`,
+`mcp/bad-number`, `mcp/bad-json`, `mcp/eof`, `mcp/no-response`; a write that fails
+after hand-over: `mcp/write:<err>` other than `mcp/write:closed`, which poisons
+without claiming an effect; and the reader-slot refusal `mcp/thread:too many
+readers`); a
 JSON-RPC `error` from the server leaves the session usable, which is the
 asymmetry recorded below. The byte grant is checked first when it is the tighter
 bound: a line
