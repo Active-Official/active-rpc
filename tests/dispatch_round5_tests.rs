@@ -183,9 +183,13 @@ fn cancelling_itself_is_on_the_tape() {
         1,
         "the executed-then-cancelled call has no receipt"
     );
+    // The provider ran (`runs == 1`), so the effect may stand and only the answer
+    // was withheld: the decision is `Admitted`, which is the rule the
+    // withheld-reply contract applies to a lost answer. A `Refused` here told an
+    // auditor the provider never ran (R-13 round 7, #4).
     assert_eq!(
         receipts[0].decision,
-        active_rpc::receipts::Decision::Refused("rpc/promise-cancelled".to_string())
+        active_rpc::receipts::Decision::Admitted
     );
 }
 

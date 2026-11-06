@@ -3266,23 +3266,25 @@ feature sets; fmt and doc clean.
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `cf5f969`. Of the
 round-6 claims, L1 (partly), L3 and L4 held; **L2 and L5 were never implemented**
-(the batch edit aborted after its first anchor failed, and the round-6 entry
-recorded them as fixed — the second occurrence of this mistake in the program, and
-the reason every edit is now verified in the file itself). Verdict **NOT CLEAN**:
-four mediums and four lows; no critical, no escalation.
+(the batch edit aborted after its first anchor failed while the round-6 entry
+recorded them as fixed). Verdict **NOT CLEAN**: four mediums and four lows; no
+critical and no escalation. Everything here is fixed and proved below except L8.
 
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
-| 1 | medium | the live-pid steal gate has **no upper bound**: a planted lock naming a live pid (`pid 1`) makes that log's lock unstealable for ever, so any user who can write the directory can stop the evidence pipeline | **open** — needs a bounded rule (steal once the age passes a small multiple of `LOCK_STALE_MS`, or verify the pid's start time) plus a test |
-| 2 | medium | M1 itself is open on every platform without `/proc` (Windows and macOS, i.e. the machine this gate runs on) and across pid namespaces | **open** — needs a portable liveness check or an explicit, documented platform limit |
-| 3 | medium | `LogLock::drop` reads the lock **unbounded** (`read_to_string`), so a symlink to `/dev/zero` planted after the lock is created makes the drop allocate without limit | **open** — use the bounded `read_lock` |
-| 4 | medium | a provider that cancels its own **running** mutating call receipts it as `Refused(promise-cancelled)` although the effect may have landed | **open** — the post-admission rule says such a call is `Admitted` |
-| 5 | low | L2: the reader still returns a boundary-aligned prefix at the bound | **open** (see above) |
-| 6 | low | L5: no claim-expiry code exists | **open** (see above) |
-| 7 | low | the round-2 "a dead writer's lock is stolen" fixture writes `pid 1 started 0`, which parses with **no pid**, so it never exercises the liveness branch | **open** — one-line fixture fix |
-| 8 | low | ADR-0021's B7 row still says "a lock older than `LOCK_STALE_MS` is stolen" and has no entry for rounds 3-6 | **open** |
+| 1 | medium | the live-pid steal gate had **no upper bound**: a planted lock naming a live pid made the log unstealable for ever | **fixed**: the rule is bounded by `LOCK_LIVE_GRACE_MS` (10 x the ceiling). `a_planted_live_pid_lock_is_stolen_after_the_grace` (a lock naming our own pid, aged 2 000 s, is stolen) and `a_live_pid_lock_inside_the_grace_is_not_stolen` (aged 200 s, honoured; Linux, where the pid probe is available) |
+| 2 | medium | M1 was open on every platform without `/proc`, and across pid namespaces | **fixed structurally**: the writer keeps its own lock fresh while it writes (`LogLock::touch` between `WRITE_CHUNK_BYTES` chunks, 1 MiB), so "older than the ceiling" means "no live writer is making progress" on every platform, and the pid probe is a Linux extra for a stopped process rather than the guarantee. Every append exercises the touch; a 4 MiB batch spans four of them |
+| 3 | medium | `LogLock::drop` parsed the lock with `read_to_string`, so a symlink to `/dev/zero` planted after the lock was created allocated without limit | **fixed**: the drop uses the bounded parser (`nonce_of`) |
+| 4 | medium | a provider that cancelled its **running** call was receipted `Refused(promise-cancelled)` although the provider ran and the effect may stand | **fixed**: both cancel paths seal `Admitted`, the rule the withheld-reply contract applies to a lost answer. `dispatch_round5_tests::cancelling_itself_is_on_the_tape` drives the running branch and asserted the old decision; it now asserts `Admitted` and fails on the pre-fix code |
+| 5 | low | L2: a reader returned a boundary-aligned prefix at the bound | **fixed**: a reader that exhausts its wait while a fresh lock is held refuses with "being written". `a_reader_refuses_instead_of_returning_a_prefix` fails when the arm is removed and passes with it |
+| 6 | low | L5: no claim-expiry code existed | **fixed**: a claim older than the ceiling is removed and the steal retried. `a_leftover_claim_does_not_make_a_stale_lock_permanently_unstealable` fails when the arm is removed |
+| 7 | low | the round-2 "a dead writer's lock is stolen" fixture wrote `pid 1 started 0`, which parses with no pid, so the liveness branch was never exercised | **fixed**: the fixture writes a real nonce and a pid no process can have |
+| 8 | low | ADR-0021's B7 row and the missing rounds 3-6 entries | **fixed**: an "Amendments (R-13, hostile rounds 3-7)" table records C1-C7 with their decisions, including the reader's retryable refusal |
 
-Next action: close 1-8, then two clean rounds.
+Gate: the full local gate green (fmt, both clippy sets, both test sets, doc,
+benches, fuzz, control plane, CLI, hardening status, 9/9 negative controls); the
+`rust:1.99` container runs the receipt suites, which include the two Linux-only
+liveness tests.
 
 ### R-13 receipts - 2026-11-06 (round 6)
 

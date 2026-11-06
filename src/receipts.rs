@@ -305,6 +305,22 @@ struct LogLock {
 /// that file stops the evidence pipeline.
 const LOCK_STALE_MS: u64 = 120_000;
 
+/// How long a lock that names a live pid is still honoured.
+///
+/// `judged_stale` refuses to steal a lock whose writer is alive, which is what
+/// keeps a stopped process from losing its lock (R-13 round 6, M1). Without a
+/// bound that rule is a denial of service: any user who can write the directory
+/// plants a lock naming a live pid and the log is unappendable for ever. Past
+/// this grace the age rule wins (R-13 round 7, #1).
+const LOCK_LIVE_GRACE_MS: u64 = 10 * LOCK_STALE_MS;
+
+/// Bytes written to the log between two refreshes of the lock's mtime.
+///
+/// A writer that keeps its lock fresh makes "older than the ceiling" mean "no
+/// live writer is making progress" on every platform, without asking the
+/// operating system about another process (R-13 round 7, #2).
+const WRITE_CHUNK_BYTES: usize = 1 << 20;
+
 /// How much of a lock file is read to find its nonce.
 ///
 /// A lock is one short line. A lock is also a file an attacker can plant, and a
@@ -328,6 +344,20 @@ impl LogLock {
     /// wins it, and the live lock is never moved: a loser cannot clobber a fresh
     /// lock, and the winner removes the lock only if its nonce is still the one
     /// it judged.
+    /// Refresh the lock's modification time.
+    ///
+    /// A writer holds the lock for one append and keeps it fresh while it works,
+    /// so the age rule means "no live writer is making progress" without a
+    /// platform-specific liveness probe. A failure here is not fatal: the age
+    /// rule is then the only guard, which is what it was before.
+    fn touch(&self) {
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.path) else {
+            return;
+        };
+        let _ =
+            file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()));
+    }
+
     fn acquire(log: &std::path::Path) -> Result<Self> {
         let path = lock_path(log);
         let nonce = format!(
@@ -368,13 +398,19 @@ impl LogLock {
                                     file_name_text(&path)
                                 ));
                                 // `create_new` picks exactly one stealer. The
-                                // loser waits: it must not remove anything.
-                                if std::fs::OpenOptions::new()
+                                // loser waits: it must not remove anything. A
+                                // claim older than the ceiling is a stealer that
+                                // died between claiming and removing, so it is
+                                // removed and the steal retried
+                                // (R-13 round 7, #6).
+                                let claimed = std::fs::OpenOptions::new()
                                     .write(true)
                                     .create_new(true)
-                                    .open(&claim)
-                                    .is_ok()
-                                {
+                                    .open(&claim);
+                                if claimed.is_err() && older_than_stale(&claim) {
+                                    let _ = std::fs::remove_file(&claim);
+                                }
+                                if claimed.is_ok() {
                                     // A writer can only replace the lock after it
                                     // is removed, so an unchanged nonce means no
                                     // one holds it and removing it is safe.
@@ -387,10 +423,11 @@ impl LogLock {
                             }
                         }
                     }
-                    // Backoff: 5 ms rising to 45 ms, 1.33 s in total (38 sleeps
-                    // across 40 attempts, two of which are steal attempts). The
-                    // wait only has to cover one append; a longer one is a lock
-                    // that a caller should see refused rather than a stall.
+                    // Backoff: 5 ms rising to 45 ms. A *failed* acquire sleeps
+                    // on all 40 attempts, which is 1.38 s; a won steal skips its
+                    // own sleep, so the successful path is shorter (R-13 round 7,
+                    // #4). The wait only has to cover one append; a longer one is
+                    // a lock a caller should see refused rather than a stall.
                     let step = u64::from(attempt.min(20));
                     std::thread::sleep(std::time::Duration::from_millis(5 + step * 2));
                 }
@@ -434,12 +471,15 @@ fn judged_stale(path: &std::path::Path) -> Option<String> {
         return None;
     }
     let (nonce, pid) = read_lock(&file)?;
-    // A lock that names a live writer is not abandoned, however old it looks: a
-    // stopped process or a batch slower than the ceiling still holds it, and
-    // stealing it writes a second chain into the file that no repair can read
-    // (R-13 round 6, M1). Where the platform does not expose another process's
-    // existence cheaply, the age rule stands alone.
-    if pid.is_some_and(process_is_alive) {
+    // A lock that names a live writer is not abandoned: a stopped process still
+    // holds it, and stealing it writes a second chain into the file that no
+    // repair can read (R-13 round 6, M1). The rule is bounded by
+    // `LOCK_LIVE_GRACE_MS`, because an unbounded one lets a planted lock naming
+    // a live pid stop the log for ever (R-13 round 7, #1). A writer that is
+    // making progress keeps its own lock fresh (`LogLock::touch`), so this branch
+    // only covers a process that cannot touch — which is why it is a grace and
+    // not the whole rule.
+    if pid.is_some_and(process_is_alive) && age_ms <= LOCK_LIVE_GRACE_MS {
         return None;
     }
     Some(nonce)
@@ -505,6 +545,21 @@ fn claim_name(nonce: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
+/// True when `path` exists and is older than the steal ceiling.
+///
+/// Used for a steal claim a dead stealer left behind: the claim protects one
+/// steal, so an ancient one protects nothing.
+fn older_than_stale(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age.as_millis() as u64 > LOCK_STALE_MS)
+}
+
 /// The file name of `path`, as text, for deriving a sibling name.
 fn file_name_text(path: &std::path::Path) -> String {
     path.file_name()
@@ -516,9 +571,10 @@ impl Drop for LogLock {
     fn drop(&mut self) {
         // Only the owner removes the lock: a stealer replaces the file, and
         // deleting a stolen lock would free a writer that is still appending.
-        let owned = std::fs::read_to_string(&self.path)
-            .map(|content| content.split_whitespace().next() == Some(self.nonce.as_str()))
-            .unwrap_or(false);
+        // Bounded: after the kernel created its lock, a local user with
+        // directory write can replace the path with a symlink to `/dev/zero`,
+        // and an unbounded read would allocate without limit (R-13 round 7, #3).
+        let owned = nonce_of(&self.path).as_deref() == Some(self.nonce.as_str());
         if owned {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -717,7 +773,7 @@ impl ReceiptLog {
         if receipts.is_empty() {
             return Ok(());
         }
-        let _lock = LogLock::acquire(&self.path)?;
+        let lock = LogLock::acquire(&self.path)?;
         // Re-read only when the file changed under us (a foreign writer appended
         // or replaced it); the common case is one stat and one write.
         let observed = std::fs::metadata(&self.path)
@@ -789,7 +845,7 @@ impl ReceiptLog {
         let total = observed
             .checked_add(out.len() as u64)
             .ok_or_else(|| Error::receipt("the receipt log is too large"))?;
-        self.write_all(&out)?;
+        self.write_all(&out, &lock)?;
         state.bytes = total;
         state.count = count;
         state.head = previous;
@@ -800,14 +856,24 @@ impl ReceiptLog {
         Ok(())
     }
 
-    fn write_all(&self, bytes: &[u8]) -> Result<()> {
+    fn write_all(&self, bytes: &[u8], lock: &LogLock) -> Result<()> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&self.path)
             .map_err(|_| Error::receipt("cannot open the receipt log for append"))?;
-        file.write_all(bytes)
-            .map_err(|_| Error::receipt("cannot append to the receipt log"))?;
+        // A batch larger than the stale ceiling on slow storage must not look
+        // abandoned while it is being written: refresh the lock between bounded
+        // chunks. The crash semantics are unchanged — a partial trailing record
+        // is what the reader already refuses and `repair` cuts.
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = (offset + WRITE_CHUNK_BYTES).min(bytes.len());
+            file.write_all(&bytes[offset..end])
+                .map_err(|_| Error::receipt("cannot append to the receipt log"))?;
+            offset = end;
+            lock.touch();
+        }
         file.sync_data()
             .map_err(|_| Error::receipt("cannot flush the receipt log"))?;
         Ok(())
@@ -1062,6 +1128,12 @@ fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogStat
         bytes = read_capped(path)?;
     }
     match walk_log(&bytes) {
+        // The bound ran out while a writer was still working: a complete walk is
+        // then a prefix of its batch, and returning it would publish a head the
+        // file has already moved past (R-13 round 7, #5).
+        Ok(_) if writer_active(path) => Err(Error::receipt(
+            "the receipt log is being written by another process",
+        )),
         Ok((receipts, state)) => Ok((bytes, receipts, state)),
         Err(error) => {
             if writer_active(path) {

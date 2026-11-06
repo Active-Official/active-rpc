@@ -4571,10 +4571,14 @@ impl Agent {
             // about to). Its phase 3 cannot settle a cancelled record, so record
             // the terminal state here, and seal the decision: the provider may
             // have run, and a receipt that says nothing hides that
-            // (round 5, #2).
+            // (round 5, #2). The decision is `Admitted`, not `Refused`: the
+            // request reached the provider, the effect may stand and only the
+            // answer was withheld — the same rule the withheld-reply contract
+            // applies to a lost answer. A `Refused` here told an auditor the
+            // provider never ran (R-13 round 7, #4).
             kernel.record_settled(promise.id);
             if kernel.receipts_enabled {
-                kernel.seal_receipt(&job, Some(&Error::PromiseCancelled(promise.id.0)));
+                kernel.seal_receipt(&job, None);
             }
             if let Some(stored) = kernel.jobs.get_mut(&job.id) {
                 stored.receipted = true;
@@ -4690,10 +4694,12 @@ impl Agent {
                 // The target's job is in the current batch and its provider is
                 // running. Its dispatch will discard the outcome, so without a
                 // receipt here the executed work leaves no decision on the tape
-                // (round 7, #1).
+                // (round 7, #1). `Admitted` for the same reason as `cancel`: the
+                // provider may have applied an effect and only the answer was
+                // withheld (R-13 round 7, #4).
                 if let Some(job) = kernel.jobs.values().find(|job| job.promise == *id).cloned() {
                     if !job.receipted && kernel.receipts_enabled {
-                        kernel.seal_receipt(&job, Some(&Error::PromiseCancelled(id.0)));
+                        kernel.seal_receipt(&job, None);
                     }
                     if let Some(stored) = kernel.jobs.get_mut(&job.id) {
                         stored.receipted = true;

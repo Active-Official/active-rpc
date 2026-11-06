@@ -138,3 +138,19 @@ authority, and a crash costs at most one record.
 - A log is evidence, not a signature: it proves internal consistency and kernel
   origin, not who holds the file. Authenticity of the file itself is the
   deployment's concern (sign the export with the release key).
+
+## Amendments (R-13, hostile rounds 3-7)
+
+| # | Sev | Finding | Decision |
+|---|-----|---------|----------|
+| C1 | high | the stale-lock steal judged one file and renamed another, so two stealers could delete each other's live lock | The judgement reads the age and the nonce through **one** handle, and the steal claims a `create_new` file named after the judged nonce (sanitised, so a planted nonce cannot steer it). The live lock is never moved; the winner removes it only when its nonce is unchanged |
+| C2 | medium | a lock old by time was stolen from a *live* writer, and the resulting chain could not be repaired | The writer keeps its own lock fresh while it writes (`LogLock::touch`, between `WRITE_CHUNK_BYTES` chunks), so "older than the ceiling" means "no live writer is making progress" on every platform. On Linux a lock naming a live pid is additionally honoured, but only for `LOCK_LIVE_GRACE_MS` (10 x the ceiling): an unbounded rule lets a planted lock naming a live pid stop the log for ever |
+| C3 | medium | a read that landed mid-append could return a boundary-aligned prefix of the batch, publishing a head the file had already moved past | A reader that exhausts its bounded wait (11 x 20 ms) while a writer still holds a fresh lock refuses with "being written" instead of returning; a caller retries |
+| C4 | medium | a provider that cancelled its own running call was receipted `Refused(promise-cancelled)` although the effect may have landed | A cancelled call that reached the provider is receipted `Admitted`, the same rule the withheld-reply contract applies to a lost answer |
+| C5 | low | a stealer killed between claiming and removing left a claim that made one stale lock unstealable for ever | A claim older than the steal ceiling is removed and the steal retried |
+| C6 | low | `LogLock::drop` read the lock with `read_to_string`, so a symlink to `/dev/zero` planted after the lock was created allocated without limit | The drop reads through the bounded lock parser |
+| C7 | low | an adopted sequence gap left the pre-gap receipts in the ring, so the window could never be exported | A non-zero gap clears the ring and counts the hole and the cleared records |
+
+The reader's refusal code is `rpc/receipt` with a message naming the writer; it is
+a retryable condition, not damage. A reader that must not retry should take the
+writer's lock (the CLI does, through `ReceiptLog`).

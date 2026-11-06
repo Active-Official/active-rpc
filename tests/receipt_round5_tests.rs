@@ -72,7 +72,18 @@ fn a_contended_steal_never_corrupts_the_log() {
         let path = path.clone();
         let next = std::sync::Arc::clone(&next);
         threads.push(std::thread::spawn(move || {
-            let log = ReceiptLog::open(&path).expect("open");
+            // A read that lands while another thread is appending refuses with
+            // "being written" rather than returning a prefix (R-13 round 7,
+            // #5), so a reader retries; that is what a caller does too.
+            let log = loop {
+                match ReceiptLog::open(&path) {
+                    Ok(log) => break log,
+                    Err(error) => {
+                        assert!(error.to_string().contains("being written"), "{error}");
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            };
             let mut refusals = 0;
             for _ in 0..20 {
                 let sequence = next.load(Ordering::SeqCst);
@@ -228,6 +239,130 @@ fn a_lock_whose_pid_is_alive_is_not_stolen() {
         started.elapsed() >= std::time::Duration::from_millis(1_000),
         "the caller waited the documented budget"
     );
+    assert!(lock.exists(), "the live writer still holds its lock");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock);
+}
+
+/// A lock that names a **live** writer is honoured, but not for ever: past the
+/// grace the age rule wins, so a planted lock naming a live pid cannot stop the
+/// evidence pipeline (R-13 round 7, #1).
+#[test]
+fn a_planted_live_pid_lock_is_stolen_after_the_grace() {
+    let path = scratch("planted");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let lock = lock_of(&path);
+    // Our own pid is alive; the lock is far older than the 10 x ceiling grace.
+    std::fs::write(
+        &lock,
+        format!("424242-1 pid {} started 1", std::process::id()).as_bytes(),
+    )
+    .expect("lock");
+    filetime_set(
+        &lock,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(2_000),
+    );
+
+    let log = ReceiptLog::open(&path).expect("open");
+    log.append(&receipt(1, "echo"))
+        .expect("a lock past the grace is stolen, whatever pid it names");
+    assert_eq!(
+        ReceiptLog::verify_bytes(&std::fs::read(&path).expect("read"))
+            .expect("walk")
+            .len(),
+        1
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock);
+}
+
+/// A reader that exhausts its bounded wait while a writer still holds a fresh
+/// lock refuses, instead of returning a boundary-aligned prefix of the batch
+/// (R-13 round 7, #5).
+#[test]
+fn a_reader_refuses_instead_of_returning_a_prefix() {
+    let path = scratch("prefix");
+    let log = ReceiptLog::create(&path).expect("create");
+    log.append(&receipt(1, "echo")).expect("append");
+    drop(log);
+    // A writer that holds the lock and does not release it within the bound.
+    let lock = lock_of(&path);
+    std::fs::write(&lock, b"7-1 pid 4294967294 started 1").expect("lock");
+
+    // `open` reads the whole log, so it is the first caller to meet the bound.
+    let started = std::time::Instant::now();
+    let error = match ReceiptLog::open(&path) {
+        Ok(_) => panic!("a fresh lock means the answer is not final"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/receipt");
+    assert!(
+        error.to_string().contains("being written"),
+        "the refusal names the writer: {error}"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(200),
+        "the reader waited its bounded window first"
+    );
+    let _ = std::fs::remove_file(&lock);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A steal claim left behind by a dead stealer expires, so it cannot make one
+/// stale lock unstealable for ever (R-13 round 7, #6).
+#[test]
+fn a_leftover_claim_does_not_make_a_stale_lock_permanently_unstealable() {
+    let path = scratch("claim");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let lock = lock_of(&path);
+    std::fs::write(&lock, b"555-1 pid 4294967294 started 1").expect("lock");
+    // The claim a killed stealer would leave behind: the exact name the steal
+    // derives from the judged nonce.
+    let claim = lock.with_file_name(format!(
+        "{}.steal-555-1",
+        lock.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&claim, b"").expect("claim");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    filetime_set(&lock, old);
+    filetime_set(&claim, old);
+
+    let log = ReceiptLog::open(&path).expect("open");
+    log.append(&receipt(1, "echo"))
+        .expect("the expired claim is cleared and the stale lock is stolen");
+    assert_eq!(
+        ReceiptLog::verify_bytes(&std::fs::read(&path).expect("read"))
+            .expect("walk")
+            .len(),
+        1
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock);
+}
+
+/// A lock that names a live writer keeps being honoured inside the grace.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_pid_lock_inside_the_grace_is_not_stolen() {
+    let path = scratch("grace");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let lock = lock_of(&path);
+    std::fs::write(
+        &lock,
+        format!("424243-1 pid {} started 1", std::process::id()).as_bytes(),
+    )
+    .expect("lock");
+    // Just past the ceiling (120 s) but well inside the grace (1 200 s).
+    filetime_set(
+        &lock,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(200),
+    );
+
+    let log = ReceiptLog::open(&path).expect("open");
+    let error = log
+        .append(&receipt(1, "echo"))
+        .expect_err("a live writer inside the grace is honoured");
+    assert_eq!(error.code(), "rpc/receipt");
     assert!(lock.exists(), "the live writer still holds its lock");
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&lock);

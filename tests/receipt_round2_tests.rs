@@ -305,7 +305,11 @@ fn a_stale_lock_is_stolen_instead_of_blocking_forever() {
 
     // A crashed writer leaves its lock behind; age it past the ceiling.
     let lock = path.with_extension("lock");
-    std::fs::write(&lock, b"pid 1 started 0").expect("lock");
+    // A real nonce and a pid no process can have: the first token is the
+    // nonce, and `pid 1 started 0` would parse as the nonce `pid` with no
+    // pid at all, so the liveness branch was never exercised (R-13 round 7,
+    // #7).
+    std::fs::write(&lock, b"999999-1 pid 4294967294 started 0").expect("lock");
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(&lock)
