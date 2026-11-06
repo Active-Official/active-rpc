@@ -258,7 +258,9 @@ fn attenuation_refuses_a_clock_mode_change() {
     let error = agent
         .attenuate(&cap, CapAttrs::new(&["echo"]).with_ttl_ms(1_000))
         .expect_err("the parent's deadline is in another domain");
-    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+    // One condition, one code: a deadline this clock cannot read is
+    // `rpc/identity` on every path (R-11 round 9, F1).
+    assert_eq!(error.code(), "rpc/identity", "{error}");
 }
 
 /// A provider that calls back into the agent from `on_drop` must not panic: the

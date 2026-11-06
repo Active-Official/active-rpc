@@ -24,8 +24,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-10: round 10 found 4 mediums and 4 lows, all fixed (two reply-degradation branches inspected, not unit-tested); round 11 must be clean | 83 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
-| R-11 | identity | `src/identity.rs` | rounds 1-8: round 8 found 1 high, 3 mediums and 4 lows, all fixed; rounds 9 and 10 must be clean to close | 53 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
-| R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
+| R-11 | identity | `src/identity.rs` | rounds 1-9: round 9 found 4 mediums, all fixed; rounds 10 and 11 must be clean to close | 57 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
+| R-12 | replay | `src/replay.rs` | rounds 1-4: round 4 found 1 medium and 7 lows (2 fixed, 6 recorded); round 5 must clear them | 30 fixed / 0 rejected / 6 noted | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
@@ -2771,6 +2771,21 @@ gives the format a consumer.
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
 
+### R-11 identity - 2026-11-06 (round 9)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `17c6519`. All
+round-8 dispositions hold. Verdict **PARTIAL**: four mediums.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a foreign-clock deadline answered four different codes across `call`/`send`/`publish`/`resolve`/`attenuate`/dispatch, and a queued call could answer two | **fixed**: `rpc/identity` on every path, with no `cap.expired`; `a_foreign_clock_deadline_answers_one_code` covers the call and attenuation paths, and the existing clock test asserts the call path |
+| 2 | medium | promise ownership was one-sided: an in-process promise (no recorded peer) was readable by any peer | **fixed**: the dispatch guard refuses whenever the calling job has a peer and the promise's owner differs (including `None`); `a_promise_of_another_peer_is_refused_at_dispatch` now uses an unbound capability so the owner check is the only possible refusal, and asserts the owner's own pipeline still works |
+| 3 | medium | `resolve_as` never checked the promise's recorded peer, so the out-of-band settlement path bypassed the rule | **fixed**: an answer must come from the peer that queued the call (an in-process promise cannot be answered by a peer at all); `an_out_of_band_answer_comes_from_the_queueing_peer` |
+| 4 | medium | the round-8 HIGH regression test was vacuous: the bound capability refused the other peer for the binding reason, so the promise guard could be deleted | **fixed** by the unbound-capability rewrite above |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-11 identity - 2026-11-05 (round 8)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `8da5591`.
@@ -2908,6 +2923,25 @@ processes sharing a certificate share a binding, and a receipt cannot name the
 audience of an unbound capability.
 
 Gate: `scripts/local_gate.sh` green; all-features 686 passed.
+
+### R-12 replay - 2026-11-06 (round 4)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `17c6519`. Rounds
+1-3 hold. Verdict **PARTIAL**: one medium and seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the recorder budgeted operations and input entries but never the captured events, so an event-heavy session retained a body over `MAX_PACKAGE_BYTES` and then failed at `encode` | **fixed**: `capture` charges every entry it pushes (label + 4-byte ordinal) before the push; `a_package_that_exists_always_encodes`, `a_large_trace_still_packages` |
+| 2 | low | the trace ceiling poisoned the session on the push instead of refusing the operation | **fixed**: `reserve_op` refuses when the next entry cannot fit, so the session stays packable |
+| 3 | low | `replay_trace` clones the package and the trace (3-4x a ceiling-sized package) | **recorded** for the next round: needs a trace-only accessor and a `poisoned()` getter |
+| 4 | low | the mismatch message omits the trace ordinal | **recorded** |
+| 5 | low | a zero-length destination is replaced without `--force` (TOCTOU) | **recorded** (CLI) |
+| 6 | low | no parent-directory fsync after the rename, and `dump` never replays before writing | **recorded** (CLI) |
+| 7 | low | the help omits `--force` and the default `session.arrp` | **recorded** (CLI) |
+| 8 | low | no golden ARRP byte vector pins the layout | **recorded** |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-12 replay - 2026-11-02 (round 3, fix verification)
 

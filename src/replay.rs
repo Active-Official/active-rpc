@@ -533,6 +533,13 @@ impl Recorder {
                 "the session exceeds the operation ceiling".into(),
             ));
         }
+        // Every operation adds at least its own trace entry, so the ceiling is
+        // predictable here: refusing keeps the session usable, where poisoning
+        // on the push destroyed a transcript that was still valid
+        // (round 4, L-2).
+        if self.trace.len() + 1 > MAX_TRACES {
+            return Err(Error::Replay("the trace exceeds the ceiling".into()));
+        }
         let addition = op_len(op)?
             .checked_add(trace_len(&input_event(op))?)
             .ok_or_else(|| Error::Replay("the package size overflows".into()))?;
@@ -610,6 +617,7 @@ impl Recorder {
             &mut self.seen_total,
             &mut self.trace,
             &mut self.ordinals,
+            &mut self.body,
         );
         if result.is_err() {
             self.poisoned = true;
@@ -822,6 +830,7 @@ fn capture(
     seen_total: &mut u64,
     trace: &mut Vec<Trace>,
     ordinals: &mut BTreeMap<CapId, u32>,
+    body: &mut usize,
 ) -> Result<()> {
     let Some(events) = agent.events_since(*seen_total) else {
         return Err(Error::Replay(
@@ -829,7 +838,17 @@ fn capture(
         ));
     };
     for event in &events {
-        trace.push(trace_of(event, ordinals));
+        let entry = trace_of(event, ordinals);
+        // The event entries are part of the encoded body, so they are charged
+        // here, not only at `encode` (round 4, M-1). An entry is its label plus
+        // the four-byte ordinal.
+        let addition = trace_len(&entry.event)?.saturating_add(4);
+        let next = body.saturating_add(addition);
+        if next > MAX_PACKAGE_BYTES - 32 {
+            return Err(Error::Replay("package exceeds the size ceiling".into()));
+        }
+        *body = next;
+        trace.push(entry);
     }
     *seen_total = agent.total_events();
     Ok(())

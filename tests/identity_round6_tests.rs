@@ -118,25 +118,25 @@ fn admitted(certificate: &[u8]) -> AdmittedIdentity {
         .expect("admitted")
 }
 
-/// A pipelined argument may only name a promise the same peer queued
-/// (round 8, F1).
+/// A pipelined argument may only name a promise the same peer queued, and the
+/// capability is unbound so the promise owner is the only possible refusal
+/// (round 8, F1; round 9, F4).
 #[test]
 fn a_promise_of_another_peer_is_refused_at_dispatch() {
     use active_rpc::PromiseId;
 
     let agent = Agent::with_secret([0xa6; 32]);
     let provider = agent.register(Box::new(Echo));
-    let alice = admitted(b"alice-round8");
-    let bob = admitted(b"bob-round8");
+    // No binding: a peer-identity refusal can only come from the promise.
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
-    agent.introduce_to(&cap, &alice).expect("bind to alice");
+    let alice = admitted(b"alice-round8");
+    let bob = admitted(b"bob-round8");
     let lane = agent
         .create_lane("shared", Budget::default())
         .expect("lane");
 
-    // Alice's promise in the lane Bob also uses.
     let alice_promise = agent
         .call_as(
             Some(alice.identity()),
@@ -149,7 +149,6 @@ fn a_promise_of_another_peer_is_refused_at_dispatch() {
     agent.run();
     alice_promise.value().expect("settles");
 
-    // Bob names it.
     let error = match agent.call_as(
         Some(bob.identity()),
         lane,
@@ -163,6 +162,102 @@ fn a_promise_of_another_peer_is_refused_at_dispatch() {
         }
         Err(error) => error,
     };
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+
+    // The same promise from its own peer is the value, not a refusal.
+    let reply = agent
+        .call_as(
+            Some(alice.identity()),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::Promise(PromiseId(alice_promise.id().0))],
+        )
+        .expect("alice may pipeline her own promise");
+    agent.run();
+    assert_eq!(
+        reply.value().expect("settles"),
+        active_rpc::Value::text("secret")
+    );
+}
+
+/// An out-of-band answer comes from the peer that queued the call
+/// (round 9, F3).
+#[test]
+fn an_out_of_band_answer_comes_from_the_queueing_peer() {
+    let agent = Agent::with_secret([0xaa; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    let alice = admitted(b"alice-round9");
+    let bob = admitted(b"bob-round9");
+    let lane = agent
+        .create_lane("resolve", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(
+            Some(alice.identity()),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::text("x")],
+        )
+        .expect("queued");
+    // Not run: the call is still pending, so `resolve_as` has a job to settle.
+    let error = agent
+        .resolve_as(
+            Some(bob.identity()),
+            &promise,
+            active_rpc::Value::text("forged"),
+        )
+        .expect_err("another peer cannot answer alice's call");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+    agent
+        .resolve_as(
+            Some(alice.identity()),
+            &promise,
+            active_rpc::Value::text("mine"),
+        )
+        .expect("the queueing peer answers");
+    agent.run();
+    assert_eq!(
+        promise.value().expect("settles"),
+        active_rpc::Value::text("mine")
+    );
+}
+
+/// A deadline this clock cannot read answers `rpc/identity` on every path and
+/// never stamps an expiry (round 9, F1).
+#[test]
+fn a_foreign_clock_deadline_answers_one_code() {
+    let agent = Agent::with_secret([0xab; 32]);
+    agent.use_wall_clock(true);
+    let provider = agent.register(Box::new(Echo));
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.ttl_ms = Some(600_000);
+    let cap = agent.mint(provider, 0, attrs).expect("cap");
+    let id = cap.id();
+    agent.use_wall_clock(false);
+    let lane = agent.create_lane("clock", Budget::default()).expect("lane");
+
+    let error = match agent.call_as(None, lane, &cap, "echo", Vec::new()) {
+        Ok(promise) => {
+            agent.run();
+            promise.value().expect_err("the deadline is unreadable")
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+    assert_eq!(
+        expired_events(&agent, id),
+        0,
+        "a foreign clock domain stamped cap.expired"
+    );
+    // Attenuation answers the same code.
+    let error = agent
+        .attenuate(&cap, CapAttrs::new(&["echo"]))
+        .expect_err("the parent's deadline is unreadable here");
     assert_eq!(error.code(), "rpc/identity", "{error}");
 }
 

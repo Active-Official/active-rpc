@@ -2126,8 +2126,9 @@ impl Agent {
         }
         if record.expires_at.is_some() && record.wall_clock != kernel.wall_clock {
             // The parent's absolute deadline lives in another clock domain; the
-            // clamp below would mix the two.
-            return Err(Error::InvalidArgument(
+            // clamp below would mix the two. One condition, one code
+            // (round 9, F1).
+            return Err(Error::Identity(
                 "the parent's deadline is in another clock domain",
             ));
         }
@@ -2640,12 +2641,15 @@ impl Agent {
             if record.expires_at.is_some_and(|expires_at| {
                 kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
             }) {
-                // A foreign-clock deadline is refused like an expiry but is not
-                // one: the capability may be live in its own domain
-                // (round 7, L2).
-                if record.wall_clock == kernel.wall_clock {
-                    kernel.push_event(Event::CapExpired(cap.id()));
+                // A deadline this clock cannot read is `rpc/identity` on every
+                // path; only a real expiry is `rpc/revoked` with an event
+                // (round 7, L2; round 9, F1).
+                if record.wall_clock != kernel.wall_clock {
+                    return Err(Error::Identity(
+                        "the capability's deadline is in another clock domain",
+                    ));
                 }
+                kernel.push_event(Event::CapExpired(cap.id()));
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
             if let Some(bound) = record.attrs.bound_to {
@@ -2795,9 +2799,12 @@ impl Agent {
         if record.expires_at.is_some_and(|expires_at| {
             kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
         }) {
-            if record.wall_clock == kernel.wall_clock {
-                kernel.push_event(Event::CapExpired(cap.id()));
+            if record.wall_clock != kernel.wall_clock {
+                return Err(Error::Identity(
+                    "the capability's deadline is in another clock domain",
+                ));
             }
+            kernel.push_event(Event::CapExpired(cap.id()));
             return Err(Error::Revoked(cap_token(cap.id())));
         }
         if let Some(bound) = record.attrs.bound_to {
@@ -3588,9 +3595,40 @@ impl Agent {
                         kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
                     }) =>
                 {
-                    return Err(Error::Revoked(cap_token(job.cap)))
+                    if record.wall_clock != kernel.wall_clock {
+                        return Err(Error::Identity(
+                            "the capability's deadline is in another clock domain",
+                        ));
+                    }
+                    return Err(Error::Revoked(cap_token(job.cap)));
                 }
                 Some(record) => {
+                    // The promise records who queued it: an out-of-band answer
+                    // is that peer's act, not any holder's (round 9, F3).
+                    match kernel
+                        .promises
+                        .get(&promise.id)
+                        .and_then(|record| record.identity)
+                    {
+                        Some(owner)
+                            if !crate::identity::matches(
+                                crate::identity::presented_fingerprint(peer),
+                                owner,
+                            ) =>
+                        {
+                            return Err(Error::Identity(
+                                "a promise can only be answered by the peer that queued it",
+                            ))
+                        }
+                        // An in-process promise has no recorded peer, so a peer
+                        // cannot answer it either.
+                        None if peer.is_some() => {
+                            return Err(Error::Identity(
+                                "a promise can only be answered by the peer that queued it",
+                            ))
+                        }
+                        _ => {}
+                    }
                     if let Some(bound) = record.attrs.bound_to {
                         if !crate::identity::matches(
                             crate::identity::presented_fingerprint(peer),
@@ -5006,9 +5044,12 @@ impl Agent {
                                 // A pipelined argument may only name a promise
                                 // the same peer queued: a shared lane would
                                 // otherwise let one peer read another's answer
-                                // through an echoing provider (round 8, F1).
+                                // through an echoing provider (round 8, F1). An
+                                // in-process promise has no recorded peer, and a
+                                // peer call must not read it either
+                                // (round 9, F2).
                                 Some(record)
-                                    if record.identity.is_some()
+                                    if job.identity.is_some()
                                         && record.identity != job.identity =>
                                 {
                                     failure =
@@ -5073,10 +5114,17 @@ impl Agent {
                         if record.expires_at.is_some_and(|expires_at| {
                             kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
                         }) {
-                            // The refusal is the same; the event is only for a
-                            // deadline this clock can read (round 7, L2).
-                            expired = record.wall_clock == kernel.wall_clock;
-                            Some(Error::Revoked(cap_token(record.id)))
+                            // One condition, one code: a foreign-clock deadline
+                            // is `rpc/identity` and never stamps an expiry
+                            // (round 9, F1).
+                            if record.wall_clock != kernel.wall_clock {
+                                Some(Error::Identity(
+                                    "the capability's deadline is in another clock domain",
+                                ))
+                            } else {
+                                expired = true;
+                                Some(Error::Revoked(cap_token(record.id)))
+                            }
                         } else {
                             failure
                         }
