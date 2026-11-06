@@ -198,6 +198,22 @@ pub enum Event {
         /// Fingerprint it is bound to now.
         to: [u8; FINGERPRINT_LEN],
     },
+    /// A rotation carried the peer's own work to the successor certificate.
+    ///
+    /// The binding event alone cannot distinguish a rotation that moved answers
+    /// from one that moved none, and a peer's promise or idempotency claim
+    /// changing owner is exactly what an auditor needs to see
+    /// (R-11 round 12, F5). Counts are `0` for a rotation that carried nothing.
+    RotationCarried {
+        /// Capability whose rotation carried the work (the one being rotated).
+        cap: CapId,
+        /// Queued jobs whose recorded caller moved.
+        jobs: u64,
+        /// Pending promise records whose owner moved.
+        promises: u64,
+        /// Cached idempotency claims that moved.
+        claims: u64,
+    },
     /// The last live handle of an *exported* durable capability was dropped.
     ///
     /// The sealed record can still be restored; a deployment that treats a
@@ -2087,24 +2103,38 @@ impl Agent {
         if from_fingerprint != to_fingerprint {
             let rebound: std::collections::BTreeSet<CapId> = moved.iter().copied().collect();
             let mut carried: Vec<PromiseId> = Vec::new();
+            let mut carried_jobs = 0u64;
             for job in kernel.jobs.values_mut() {
                 if rebound.contains(&job.cap) && job.identity == Some(from_fingerprint) {
                     job.identity = Some(to_fingerprint);
                     carried.push(job.promise);
+                    carried_jobs += 1;
                 }
             }
+            let mut carried_promises = 0u64;
             for id in carried {
                 if let Some(record) = kernel.promises.get_mut(&id) {
                     if record.identity == Some(from_fingerprint) {
                         record.identity = Some(to_fingerprint);
+                        carried_promises += 1;
                     }
                 }
             }
+            let mut claims = 0u64;
             for (key, entry) in kernel.idempotency.iter_mut() {
                 if rebound.contains(&key.0) && entry.3 == Some(from_fingerprint) {
                     entry.3 = Some(to_fingerprint);
+                    claims += 1;
                 }
             }
+            // The tape says what changed hands, not only that a binding did
+            // (R-11 round 12, F5).
+            kernel.push_event(Event::RotationCarried {
+                cap: cap.id(),
+                jobs: carried_jobs,
+                promises: carried_promises,
+                claims,
+            });
         }
         let record = kernel
             .caps
@@ -3745,18 +3775,33 @@ impl Agent {
                     return Err(error);
                 }
             }
-            let lane_budget = match kernel.lanes.get(&job.lane) {
-                Some(lane_record) if !lane_record.closed => lane_record.budget,
-                _ => return Err(Error::UnknownLane(job.lane.0)),
+            // The lane's current grant, copied out before anything records a
+            // refusal: recording takes the kernel mutably.
+            let lane_budget = kernel
+                .lanes
+                .get(&job.lane)
+                .filter(|record| !record.closed)
+                .map(|record| record.budget);
+            let Some(lane_budget) = lane_budget else {
+                let error = Error::UnknownLane(job.lane.0);
+                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                return Err(error);
             };
             let budget = job.call.budget.intersect(&lane_budget);
+            // An out-of-band answer is the one path where a peer chooses a value
+            // that becomes a promise's answer, so its budget and shape refusals
+            // must reach the metrics and the tape like every other refusal
+            // (R-11 round 12, F2).
             if let Some(error) = shape_refusal(&value, &budget) {
+                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
                 return Err(error);
             }
             // The absolute wire ceiling too: a redaction or a later clone walks
             // the value recursively (round 10, #1).
             if value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
-                return Err(Error::BudgetExceeded("depth"));
+                let error = Error::BudgetExceeded("depth");
+                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                return Err(error);
             }
         }
         drop(kernel);
@@ -3816,8 +3861,14 @@ impl Agent {
             // must not become the promise's answer. When the job is still in the
             // queue it is removed below, so the dispatch egress charge cannot
             // double-charge; a job already executing may be charged a second
-            // time, which errs on the refusing side.
-            self.charge_egress(job, value.wire_size())?;
+            // time, which errs on the refusing side. The refusal is counted and
+            // taped after the borrow `charge_egress` holds is dropped
+            // (R-11 round 12, F2).
+            if let Err(error) = self.charge_egress(job, value.wire_size()) {
+                let mut kernel = self.cell.borrow_mut();
+                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                return Err(error);
+            }
         }
         let mut kernel = self.cell.borrow_mut();
         let settled = {

@@ -926,6 +926,17 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             event: "cap.rebound".into(),
             cap: ordinal(*cap),
         },
+        Event::RotationCarried {
+            cap,
+            jobs,
+            promises,
+            claims,
+        } => Trace {
+            // The counts are the fact: a package that moved three answers must
+            // not compare equal to one that moved none.
+            event: format!("cap.rotation-carried:{jobs}/{promises}/{claims}"),
+            cap: ordinal(*cap),
+        },
         Event::CapIntroduced { cap, fingerprint } => Trace {
             // A 128-bit prefix of the peer's public fingerprint: two
             // introductions to different peers must not compare equal, and a

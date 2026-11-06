@@ -318,3 +318,262 @@ fn an_envelope_naming_a_promise_is_a_wire_refusal() {
         .expect_err("an envelope cannot carry a promise argument");
     assert_eq!(error.code(), "rpc/wire", "{error}");
 }
+
+/// A rotation moves the work of the capabilities it rebinds, and only those: a
+/// queued pipeline that spans a rotated capability and an unrotated sibling is
+/// refused at dispatch, with the rotation's own code and no partial side effect.
+/// The operator rotates every capability in a pipeline before the next dispatch
+/// (R-11 round 12, F1; `docs/deployment/identity.md` rule 3).
+#[test]
+fn a_rotation_refuses_a_pipeline_that_spans_two_capabilities() {
+    let agent = Agent::with_secret([0xb7; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let first = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("first cap");
+    let second = agent
+        .mint(provider, 1, CapAttrs::new(&["echo"]))
+        .expect("second cap");
+    agent.introduce_to(&first, &admitted(OLD)).expect("bind A");
+    agent.introduce_to(&second, &admitted(OLD)).expect("bind B");
+    let lane = agent
+        .create_lane("pipeline", Budget::default())
+        .expect("lane");
+
+    let produced = agent
+        .call_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &first,
+            "echo",
+            vec![Arg::text("value")],
+        )
+        .expect("producer queued");
+    let dependent = agent
+        .call_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &second,
+            "echo",
+            vec![Arg::Promise(produced.id())],
+        )
+        .expect("dependent queued");
+
+    // Rotate only the producing capability, then dispatch.
+    agent
+        .reintroduce_to(&first, &PeerIdentity::from_certificate(OLD), &admitted(NEW))
+        .expect("rotate A");
+    agent.run();
+    let error = dependent
+        .value()
+        .expect_err("the dependency's owner moved and the sibling did not");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+
+    // The documented procedure: rotate both before the next dispatch.
+    let agent = Agent::with_secret([0xb8; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let first = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("first cap");
+    let second = agent
+        .mint(provider, 1, CapAttrs::new(&["echo"]))
+        .expect("second cap");
+    agent.introduce_to(&first, &admitted(OLD)).expect("bind A");
+    agent.introduce_to(&second, &admitted(OLD)).expect("bind B");
+    let lane = agent
+        .create_lane("pipeline-2", Budget::default())
+        .expect("lane");
+    let produced = agent
+        .call_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &first,
+            "echo",
+            vec![Arg::text("value")],
+        )
+        .expect("producer queued");
+    let dependent = agent
+        .call_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &second,
+            "echo",
+            vec![Arg::Promise(produced.id())],
+        )
+        .expect("dependent queued");
+    agent
+        .reintroduce_to(&first, &PeerIdentity::from_certificate(OLD), &admitted(NEW))
+        .expect("rotate A");
+    agent
+        .reintroduce_to(
+            &second,
+            &PeerIdentity::from_certificate(OLD),
+            &admitted(NEW),
+        )
+        .expect("rotate B");
+    agent.run();
+    assert_eq!(
+        dependent.value().expect("the whole pipeline runs"),
+        active_rpc::Value::text("value")
+    );
+}
+
+/// An idempotency claim is scoped to the lane that holds it, and a rotation
+/// cannot move a lane: a retry on the same lane replays the promise, a retry on
+/// a new one is a new call. The deployment doc says so, and this pins it so the
+/// code and the doc cannot drift (R-11 round 12, F3).
+#[test]
+fn a_rotation_does_not_carry_a_claim_across_lanes() {
+    let agent = Agent::with_secret([0xb9; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &admitted(OLD)).expect("bind");
+    let lane = agent.create_lane("claim", Budget::default()).expect("lane");
+    let args = vec![Arg::text("an applied write")];
+    let first = agent
+        .call_idempotent_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &cap,
+            "echo",
+            args.clone(),
+            "lane-scoped",
+        )
+        .expect("first call");
+    agent.run();
+    first.value().expect("settles");
+    agent
+        .reintroduce_to(&cap, &PeerIdentity::from_certificate(OLD), &admitted(NEW))
+        .expect("rotate");
+
+    let replay = agent
+        .call_idempotent_as(
+            Some(&PeerIdentity::from_certificate(NEW)),
+            lane,
+            &cap,
+            "echo",
+            args.clone(),
+            "lane-scoped",
+        )
+        .expect("the same lane replays the claim");
+    assert_eq!(replay.id(), first.id(), "the claim follows the certificate");
+
+    let other = agent
+        .create_lane("claim-2", Budget::default())
+        .expect("second lane");
+    let fresh = agent
+        .call_idempotent_as(
+            Some(&PeerIdentity::from_certificate(NEW)),
+            other,
+            &cap,
+            "echo",
+            args,
+            "lane-scoped",
+        )
+        .expect("a new lane is a new key scope");
+    agent.run();
+    assert_ne!(
+        fresh.id(),
+        first.id(),
+        "a key is scoped to (capability, lane, method, key): a new lane is a new call"
+    );
+}
+
+/// A rotation says on the tape what it carried, so an auditor can tell a
+/// rotation that moved a peer's answers from one that moved none
+/// (R-11 round 12, F5).
+#[test]
+fn a_rotation_reports_the_work_it_carries() {
+    let agent = Agent::with_secret([0xba; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &admitted(OLD)).expect("bind");
+    let lane = agent
+        .create_lane("carried", Budget::default())
+        .expect("lane");
+    // One idempotent call leaves a queued job, a pending promise and a claim,
+    // all stamped with the old certificate.
+    let promise = agent
+        .call_idempotent_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::text("carried")],
+            "carried-key",
+        )
+        .expect("queued");
+    let _ = promise;
+    agent
+        .reintroduce_to(&cap, &PeerIdentity::from_certificate(OLD), &admitted(NEW))
+        .expect("rotate");
+    let carried = agent.events().into_iter().find_map(|event| match event {
+        Event::RotationCarried {
+            jobs,
+            promises,
+            claims,
+            ..
+        } => Some((jobs, promises, claims)),
+        _ => None,
+    });
+    assert_eq!(
+        carried,
+        Some((1, 1, 1)),
+        "the tape reports one job, one promise and one claim"
+    );
+}
+
+/// An out-of-band answer past the grant is refused, counted and taped like the
+/// same refusal on a call: a peer must not be able to probe the reply ceiling
+/// without a trace (R-11 round 12, F2).
+#[test]
+fn an_over_budget_answer_is_counted_and_taped() {
+    let agent = Agent::with_secret([0xbb; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.budget.max_bytes = 256;
+    let cap = agent.mint(provider, 0, attrs).expect("cap");
+    agent.introduce_to(&cap, &admitted(OLD)).expect("bind");
+    let lane = agent
+        .create_lane("answer", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::text("q")],
+        )
+        .expect("queued");
+
+    let before = agent.metrics();
+    let wide = active_rpc::Value::list((0..64).map(active_rpc::Value::Int));
+    let error = agent
+        .resolve_as(Some(&PeerIdentity::from_certificate(OLD)), &promise, wide)
+        .expect_err("an answer past the grant is refused");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    let after = agent.metrics();
+    assert_eq!(
+        after.calls_refused,
+        before.calls_refused + 1,
+        "the refusal is counted"
+    );
+    assert_eq!(
+        after.budget_exhaustions,
+        before.budget_exhaustions + 1,
+        "the budget dimension is counted"
+    );
+    let taped = agent
+        .events()
+        .into_iter()
+        .filter(|event| {
+            matches!(event, Event::CallRefused { code, .. } if code == "rpc/budget-exceeded")
+        })
+        .count();
+    assert_eq!(taped, 1, "exactly one refusal event");
+}

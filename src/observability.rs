@@ -213,6 +213,16 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.cap = Some(cap.correlation_id());
             trace.identity = Some(format!("{}->{}", hex(from), hex(to)));
         }
+        Event::RotationCarried {
+            cap,
+            jobs,
+            promises,
+            claims,
+        } => {
+            trace.event = "cap.rotation-carried";
+            trace.cap = Some(cap.correlation_id());
+            trace.detail = Some(format!("jobs {jobs} promises {promises} claims {claims}"));
+        }
         Event::CapIntroduced { cap, fingerprint } => {
             trace.event = "cap.introduced";
             trace.cap = Some(cap.correlation_id());

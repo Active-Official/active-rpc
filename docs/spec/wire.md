@@ -70,7 +70,7 @@ An envelope with trailing bytes after the capability table is refused.
 | Tag | Argument | Encoding |
 |----:|----------|----------|
 | 0 | value | value encoding below |
-| 1 | promise | `u64` promise id. An *envelope* never carries this kind: the decoder accepts it, and every envelope entry point refuses it as `rpc/wire` before any ownership check. The ownership rule above applies to argument lists the embedder built (`call_as`, `call_peer`). |
+| 1 | promise | `u64` promise id. An *envelope* never carries this kind: the decoder accepts it, and every envelope entry point refuses it as `rpc/wire` before any ownership check. The ownership rule above applies to argument lists the embedder built and queues for a peer, which is `call_as(Some(peer.identity()), ...)`; `call_peer` is a transport entry point and runs the authority-argument guard, so a promise argument never reaches it. |
 | 2 | capability | 16-byte capability id |
 
 A promise argument makes the call **pipelined**: the kernel keeps the dependent

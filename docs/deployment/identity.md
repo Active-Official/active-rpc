@@ -140,8 +140,16 @@ client that presents none fails it as well.
    binding: queued jobs, pending promises and cached idempotency claims stamped
    with the old fingerprint are moved to the successor, so a retry of a call the
    peer already made returns the same promise instead of `rpc/identity` (and a
-   retry with a fresh key would apply the mutation twice). Plan the rotation
-   window.
+   retry with a fresh key would apply the mutation twice). Two consequences to
+   plan for. First, the carry is scoped to the capabilities this call rebinds: a
+   queued pipeline that spans two capabilities of the same peer needs **both**
+   rotated before the next dispatch, or the dependent job is refused
+   `rpc/identity` (fail-closed, nothing half-applied). Second, an idempotency
+   claim is scoped to `(capability, lane, method, key)` and a rotation cannot
+   move a lane: a retry that arrives on a new connection, and therefore a new
+   lane, is a new call, so a peer retrying an applied mutation has to retry on
+   the lane that holds the claim or accept that the write may apply again. Plan
+   the rotation window.
 4. **Revoke at the CA and at the kernel.** Dropping a certificate stops new
    handshakes; `Agent::revoke` stops existing capabilities immediately.
 5. **Pin the clock mode.** Mint leases after selecting the clock

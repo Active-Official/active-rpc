@@ -2884,6 +2884,28 @@ gives the format a consumer.
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
 
+### R-11 identity - 2026-11-06 (round 12)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `2488619`. The
+round-11 medium verified: the rotation carry is real, correctly scoped to the
+rebound capabilities, and every claimed property held under seven break
+attempts (no escalation, no record outside the subtree, no job/promise identity
+disagreement, no anonymous-peer read, no legitimate refusal code change). Verdict
+**PARTIAL** on five lows, all fail-closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | low | a partial rotation strands a pipeline that spans two capabilities of one peer: rotating only the producer moves its promise owner while the sibling's job keeps the old fingerprint, so the dependent job is refused at dispatch | **documented and pinned**: `docs/deployment/identity.md` rule 3 states that every capability in a queued pipeline must be rotated before the next dispatch, and `a_rotation_refuses_a_pipeline_that_spans_two_capabilities` proves both halves (one rotation refuses `rpc/identity`; rotating both first runs the pipeline) |
+| F2 | low | an out-of-band answer refused by the lane, the value shape or the egress charge returned a bare `Err`: no counter, no event, so a peer could probe the reply ceiling without a trace | **fixed**: all three route through `record_refusal_in`; `an_over_budget_answer_is_counted_and_taped` asserts one `calls_refused`, one `budget_exhaustions` and exactly one `rpc/budget-exceeded` event |
+| F3 | low | the carried idempotency claim is keyed by lane, which a rotation cannot move, so a retry on a new connection re-applies the mutation | **documented and pinned**: rule 3 says the claim is scoped to `(capability, lane, method, key)` and a retry must use the lane that holds it; `a_rotation_does_not_carry_a_claim_across_lanes` proves the same-lane replay and the new-lane new call. Re-keying is a design change and stays out of scope |
+| F4 | low | `wire.md` named `call_peer` as a site where the promise-ownership rule applies, but that entry point runs the authority-argument guard and answers `rpc/wire` first | **fixed**: the paragraph names `call_as(Some(peer.identity()), ...)` and says why `call_peer` cannot reach the rule |
+| F5 | low | a rotation emitted `cap.rebound` but not what work it carried, so the tape could not tell a rotation that moved a peer's answers from one that moved none | **fixed**: additive `Event::RotationCarried { cap, jobs, promises, claims }`, mapped in `observability` and in the replay trace as `cap.rotation-carried:{jobs}/{promises}/{claims}` so a package that moved answers does not compare equal to one that moved none; `a_rotation_reports_the_work_it_carries` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; the
+`rust:1.99` Linux suite; control plane, CLI, fuzz; negative controls 9/9; the
+red-team battery green. `Event` is `#[non_exhaustive]`, so the new variant is an
+additive change to the observability surface, and the ARP1 bytes are unchanged.
+
 ### R-11 identity - 2026-11-06 (round 10)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `e41cd18`. The
