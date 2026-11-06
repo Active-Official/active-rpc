@@ -2596,6 +2596,20 @@ Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
 
+### R-10 bulk transfer - 2026-11-06 (round 17)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `cf5f969`. All six
+round-16 claims verified (including the per-chunk arithmetic: 8 118 ms for 1 GiB
+at 4 096 chunks). Verdict **not CLEAN**: one medium.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `abort` reports `dropped: true/false`, so a capability that grants only `abort` learns whether another principal has a transfer or an untaken body on the object — a one-bit cross-capability oracle, and the same family as RPC-11. The reviewer also notes the changelog block still describes the old freeze gate | **open** — reply with a constant shape (or record the observation as an instance of RPC-11) and correct the changelog paragraph |
+
+The reviewer could not find a way for a peer to exceed three assemblies (the
+wall is `cap ∩ lane` and fixed per capability), nor an `abort`-then-re-plan path
+without a re-upload, which confirms the round-16 accounting.
+
 ### R-10 bulk transfer - 2026-11-06 (round 16)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `2488619`. All
@@ -3230,6 +3244,28 @@ tree; the rate test pins the numbers the fixes are derived from.
 Gate: `cargo test --all-features` 648 passed, 0 failed; clippy clean on both
 feature sets; fmt and doc clean.
 
+### R-13 receipts - 2026-11-06 (round 7)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `cf5f969`. Of the
+round-6 claims, L1 (partly), L3 and L4 held; **L2 and L5 were never implemented**
+(the batch edit aborted after its first anchor failed, and the round-6 entry
+recorded them as fixed — the second occurrence of this mistake in the program, and
+the reason every edit is now verified in the file itself). Verdict **NOT CLEAN**:
+four mediums and four lows; no critical, no escalation.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the live-pid steal gate has **no upper bound**: a planted lock naming a live pid (`pid 1`) makes that log's lock unstealable for ever, so any user who can write the directory can stop the evidence pipeline | **open** — needs a bounded rule (steal once the age passes a small multiple of `LOCK_STALE_MS`, or verify the pid's start time) plus a test |
+| 2 | medium | M1 itself is open on every platform without `/proc` (Windows and macOS, i.e. the machine this gate runs on) and across pid namespaces | **open** — needs a portable liveness check or an explicit, documented platform limit |
+| 3 | medium | `LogLock::drop` reads the lock **unbounded** (`read_to_string`), so a symlink to `/dev/zero` planted after the lock is created makes the drop allocate without limit | **open** — use the bounded `read_lock` |
+| 4 | medium | a provider that cancels its own **running** mutating call receipts it as `Refused(promise-cancelled)` although the effect may have landed | **open** — the post-admission rule says such a call is `Admitted` |
+| 5 | low | L2: the reader still returns a boundary-aligned prefix at the bound | **open** (see above) |
+| 6 | low | L5: no claim-expiry code exists | **open** (see above) |
+| 7 | low | the round-2 "a dead writer's lock is stolen" fixture writes `pid 1 started 0`, which parses with **no pid**, so it never exercises the liveness branch | **open** — one-line fixture fix |
+| 8 | low | ADR-0021's B7 row still says "a lock older than `LOCK_STALE_MS` is stolen" and has no entry for rounds 3-6 | **open** |
+
+Next action: close 1-8, then two clean rounds.
+
 ### R-13 receipts - 2026-11-06 (round 6)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `3bed1ac`. Three
@@ -3239,11 +3275,11 @@ Verdict **not clean**: one medium and five lows.
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
 | M1 | medium | a lock old by *time* was stolen from a *live* writer: a stopped process or a batch slower than the ceiling held the lock, the stealer wrote a second chain, and `repair` refused the result — the whole log was lost | **fixed**: the lock names its writer's pid, and `judged_stale` refuses to steal while that pid is alive (where the kernel exposes it cheaply: `/proc`). `a_lock_whose_pid_is_alive_is_not_stolen` (Linux) ages a lock naming the test's own pid, asserts the append is refused after the documented wait and that the lock survives. A batch that outlives the ceiling on a non-Linux host is the residual this leaves |
-| L1 | low | the failing path sleeps on all 40 attempts (1.38 s), not 38 (1.33 s) | **fixed**: the comment states both paths and the round-4 bound is 1.5 s |
-| L2 | low | after the 220 ms bound a reader still returned a boundary-aligned prefix of a slow batch | **fixed**: if the lock is still fresh when the bound runs out, the reader refuses with "being written" instead of returning a prefix |
-| L3 | low | two ADRs still taught the master-secret MAC | **fixed**: ADR-0016 and ADR-0021 name `derive_receipt_key(secret)` |
-| L4 | low | `receipts_dropped` now conflates evicted, cleared and gap, and its doc claimed a window starts above 1 exactly when the counter is non-zero | **fixed**: the doc names the three terms and the restart case (a fresh kernel that adopts a sequence has dropped nothing) |
-| L5 | low | a stealer killed between creating its claim and removing it left that claim behind, making one stale lock unstealable forever | **fixed**: a claim older than the steal ceiling is removed and the steal retried |
+| L1 | low | the failing path sleeps on all 40 attempts (1.38 s), not 38 (1.33 s) | **not implemented**: the same batch edit aborted before this line (round 7 caught it). The round-4 bound is 2 s, not 1.5 s |
+| L2 | low | after the 220 ms bound a reader still returned a boundary-aligned prefix of a slow batch | **not implemented**: the edit aborted; round 7 found the reader still returns the prefix. Open |
+| L3 | low | two ADRs still taught the master-secret MAC | **fixed**: ADR-0016 and ADR-0021 name `derive_receipt_key(secret)` (round 7 verified) |
+| L4 | low | `receipts_dropped` now conflates evicted, cleared and gap, and its doc claimed a window starts above 1 exactly when the counter is non-zero | **fixed**: the doc names the three terms and the restart case (round 7 verified) |
+| L5 | low | a stealer killed between creating its claim and removing it left that claim behind, making one stale lock unstealable forever | **not implemented**: the edit aborted; round 7 found no claim-expiry code. Open |
 
 Gate: all receipt suites green on Windows and in the `rust:1.99` container (which
 also runs the Linux-only liveness test); the full local gate; negative controls
