@@ -2604,7 +2604,7 @@ at 4 096 chunks). Verdict **not CLEAN**: one medium.
 
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
-| 1 | medium | `abort` reports `dropped: true/false`, so a capability that grants only `abort` learns whether another principal has a transfer or an untaken body on the object — a one-bit cross-capability oracle, and the same family as RPC-11. The reviewer also notes the changelog block still describes the old freeze gate | **open** — reply with a constant shape (or record the observation as an instance of RPC-11) and correct the changelog paragraph |
+| 1 | medium | `abort` reports `dropped: true/false`, so a capability that grants only `abort` learns whether another principal has a transfer or an untaken body on the object — a one-bit cross-capability oracle, and the same family as RPC-11. The reviewer also notes the changelog block still describes the old freeze gate | **fixed**: the reply is one constant shape, `aborted: true`, so it reveals nothing; `a_sibling_capability_on_a_shared_object_can_abort` asserts the constant shape and that `dropped` is gone, and the changelog paragraph now describes the count-then-freeze rule and the strictly-wider-grant escape |
 
 The reviewer could not find a way for a peer to exceed three assemblies (the
 wall is `cap ∩ lane` and fixed per capability), nor an `abort`-then-re-plan path

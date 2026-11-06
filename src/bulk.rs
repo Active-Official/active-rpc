@@ -1706,12 +1706,16 @@ impl BulkProvider {
     /// decision the provider cannot overrule.
     fn abort_method(&mut self, object: u64, call: &Call) -> Result<Response> {
         self.expire(object, call.now_ms);
-        let mut dropped = self.transfers.remove(&object).is_some();
-        dropped |= self.completed.remove(&object).is_some();
-        dropped |= self.last_finished.remove(&object).is_some();
+        self.transfers.remove(&object);
+        self.completed.remove(&object);
+        self.last_finished.remove(&object);
+        // The reply is one constant shape. `dropped: true/false` told a
+        // capability that grants only `abort` whether another principal held a
+        // transfer or an untaken body on the object — a one-bit view of somebody
+        // else's state, the same family as RPC-11 (R-10 round 17).
         Ok(Response::Value(Value::map([(
-            "dropped",
-            Value::Bool(dropped),
+            "aborted",
+            Value::Bool(true),
         )])))
     }
 

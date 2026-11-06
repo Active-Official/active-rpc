@@ -159,14 +159,16 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
   the deadline before the first chunk, between chunks and after the last, and
   `finish_within` uses it, so an expired grant cannot buy a full-body hash.
 - **A refusal never destroys a paid body, and the caller has its own way out.**
-  A `finish` whose grant is below `BulkPlan::assembly_wall_ms()` gets three
-  attempts and is then frozen with `rpc/bulk` before any work - a same-root
-  `plan` frame does not clear the freeze, so a 53-byte frame cannot re-assemble
-  the body - and the new mutating `abort` method drops the object's transfer,
-  untaken body and digest reply instead of holding the slot until a window
-  expires. `required_wall_ms()` stays the recommended sizing and never asks for
-  less than the default grant; the freeze gates on the body's own wall, so a
-  deployment that mints narrow grants can still finish a small body.
+  Every `finish` that runs out of wall is counted, and once three have failed at
+  the same grant the transfer is frozen with `rpc/bulk` before any work: a
+  same-root `plan` frame does not clear the freeze, so a 53-byte frame cannot
+  re-assemble the body, and only a strictly wider grant does. `abort` is the
+  mutating method that discards the object's transfer, untaken body and digest
+  reply, answering one constant shape so it reveals nothing about another
+  capability's state. `assembly_wall_ms()` (bytes, a per-chunk term and slack) is
+  the wall each attempt is judged against and `required_wall_ms()` the sizing to
+  mint, which never asks for less than the default grant; a deployment that mints
+  narrow grants can still finish a small body.
 
 ### Kernel
 

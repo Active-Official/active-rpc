@@ -198,10 +198,11 @@ fn a_wedged_object_can_be_abandoned() {
     provider
         .invoke(1, &call("plan", held.plan_frame()))
         .expect("the freed ceiling admits the next transfer");
-    // Aborting again is idempotent rather than an error.
+    // Aborting again is idempotent rather than an error, and the reply is the
+    // same constant shape either way.
     provider
         .invoke(0, &call("abort", Vec::new()))
-        .expect("a second abort drops nothing");
+        .expect("a second abort is a no-op with the same answer");
 }
 
 /// The raw digest of a body is the offline equality oracle a redacting
@@ -287,9 +288,15 @@ fn a_sibling_capability_on_a_shared_object_can_abort() {
     send(&first, "put", transfer.chunk_frame(0).expect("chunk")).expect("chunk");
 
     let reply = send(&second, "abort", Vec::new()).expect("the sibling aborts");
+    // The reply is constant: a capability that grants only `abort` learns nothing
+    // about whether another principal held state on the object (R-10 round 17).
     assert!(
-        matches!(&reply, Value::Map(entries) if entries.get("dropped") == Some(&Value::Bool(true))),
-        "the sibling dropped the object's transfer: {reply:?}"
+        matches!(&reply, Value::Map(entries) if entries.get("aborted") == Some(&Value::Bool(true))),
+        "abort answers one constant shape: {reply:?}"
+    );
+    assert!(
+        !matches!(&reply, Value::Map(entries) if entries.contains_key("dropped")),
+        "the reply no longer reports whether anything was there: {reply:?}"
     );
     let error = send(&first, "finish", transfer.finish_frame())
         .expect_err("the transfer the sibling dropped is gone");

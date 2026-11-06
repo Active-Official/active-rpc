@@ -645,7 +645,9 @@ digest reply with it, all measured against the kernel-stamped `Call::now_ms`. `p
 refuses to open a new transfer for an object whose completed body has not been
 taken (`rpc/bulk`), so a body is never silently dropped inside its window.
 `abort` drops whatever the object holds — an open transfer, an untaken body
-and its digest reply — and answers `dropped` (false when there was nothing). It
+and its digest reply — and answers one constant shape, `aborted: true`, so a
+capability that grants only `abort` learns nothing about whether another
+principal held state on the object. It
 is the caller's own way out of a transfer it no longer wants or cannot finish:
 a refusal must never destroy a paid body, so the party that owns the object must
 be able to say so. It acts on the **object**, like every other bulk method, so
