@@ -92,7 +92,11 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   chunk frames alone. `BulkPlan::required_calls()` is the matching call bound,
   including one `missing` page per 1 024 chunks for a gaps-only resume; a caller
   that re-sends every frame uses `required_grant_with_resume()` and
-  `required_calls_with_resume()`, about two passes.
+  `required_calls_with_resume()`, about two passes. The wall grant is sized by
+  `required_wall_ms()` (three linear passes at a rate measured well above the
+  formula's assumption), the lane's cumulative `max_bytes` by
+  `required_lane_bytes()`, and a provider may bound the bytes it holds across
+  objects with `with_max_live_bytes`.
 - `finish` is the one bulk path that reads the wall clock: the grant is a
   *duration* (`max_wall_ms`), which `Call::now_ms` cannot express, so the
   deadline is anchored at `Instant::now()` and re-checked between chunks and

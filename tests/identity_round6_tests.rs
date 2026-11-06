@@ -32,6 +32,86 @@ impl Provider for Echo {
     }
 }
 
+/// A keyed dispatch from a peer's envelope applies the authority-argument guard,
+/// so an envelope cannot smuggle a promise or a capability into a provider
+/// through a retry (round 7, M-1).
+#[test]
+fn an_idempotent_envelope_cannot_carry_authority_arguments() {
+    use active_rpc::wire::{Envelope, Kind};
+
+    let agent = Agent::with_secret([0xa4; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(b"alice-round7");
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &alice).expect("bind to alice");
+    let lane = agent
+        .create_lane("idem-env", Budget::default())
+        .expect("lane");
+
+    for arg in [
+        Arg::Promise(active_rpc::PromiseId(0)),
+        Arg::Cap(active_rpc::CapId([3; 16])),
+    ] {
+        let envelope = Envelope::request(1, "echo", vec![arg]);
+        assert_eq!(envelope.kind, Kind::Request);
+        let error = match agent.call_idempotent_from_envelope(
+            Some(alice.identity()),
+            lane,
+            &cap,
+            &envelope,
+            "env-key",
+        ) {
+            Ok(promise) => {
+                agent.run();
+                promise.value().expect_err("the guard refuses the argument")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "rpc/wire", "{error}");
+    }
+
+    // The in-process variant with a concrete value still works, and the keyed
+    // call is the same one the envelope would carry.
+    let promise = agent
+        .call_idempotent_as(
+            Some(alice.identity()),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::text("ok")],
+            "env-key-2",
+        )
+        .expect("queued");
+    agent.run();
+    assert_eq!(
+        promise.value().expect("the call runs"),
+        active_rpc::Value::text("ok")
+    );
+}
+
+/// The same arguments through the peer-facing envelope guard are refused there
+/// too, so the idempotent entry point is not the only line of defence.
+#[test]
+fn an_envelope_still_refuses_authority_arguments() {
+    use active_rpc::wire::Envelope;
+
+    let agent = Agent::with_secret([0xa5; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(b"alice-round7b");
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &alice).expect("bind");
+    let lane = agent.create_lane("env", Budget::default()).expect("lane");
+    let envelope = Envelope::request(1, "echo", vec![Arg::Promise(active_rpc::PromiseId(0))]);
+    let error = agent
+        .call_from_envelope(Some(alice.identity()), lane, &cap, &envelope)
+        .expect_err("the envelope guard refuses it");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+}
+
 fn admitted(certificate: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::default()
         .admit(Some(&PeerIdentity::from_certificate(certificate)), false)

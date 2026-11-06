@@ -103,6 +103,13 @@ pub const FINISH_LEN: u64 = 4 + 1 + 8 + 32;
 /// [`BulkPlan::required_grant`] is the conservative bound).
 pub const REPLY_ALLOWANCE: u64 = 128;
 
+/// Throughput the wall-sizing formula assumes for one `finish` pass.
+///
+/// Measured at about 700 MiB/s on the reference host (256 MiB finishes in 372 ms,
+/// see `docs/spec/performance.md`); the formula assumes 128 MiB/s, a 5x margin
+/// (round 8, M1).
+pub const FINISH_BYTES_PER_MS: u64 = 128 * 1024 * 1024 / 1000;
+
 /// How long a finished, untaken body is retained before its memory is released.
 ///
 /// Longer than [`TRANSFER_IDLE_MS`] because the host polls for a completed body,
@@ -291,6 +298,17 @@ impl BulkPlan {
         (self.chunks as u64).saturating_mul(2).saturating_add(4)
     }
 
+    /// The lane's cumulative byte ceiling a transfer needs.
+    ///
+    /// The kernel meters a call against the narrower of the capability and the
+    /// lane, and a lane's `max_bytes` is cumulative over its life, so a lane
+    /// created with `Budget::default()` (64 MiB) cannot carry a larger body
+    /// whatever the capability says (round 8, M2). This is the no-resume bound;
+    /// add [`BulkPlan::required_grant_with_resume`] when a resume is expected.
+    pub fn required_lane_bytes(&self) -> u64 {
+        self.required_grant()
+    }
+
     /// The byte grant a transfer needs if it may have to resume.
     ///
     /// A resume re-sends the plan and the chunk frames, and every payload is
@@ -308,6 +326,19 @@ impl BulkPlan {
         self.required_grant()
             .saturating_add(pass)
             .saturating_add(REPLY_ALLOWANCE.saturating_mul(chunks.saturating_add(2)))
+    }
+
+    /// The wall grant a `finish` needs, in milliseconds.
+    ///
+    /// `finish` is linear in the body (assembly, verification and the digest)
+    /// and the content address adds the redaction pass. A grant below this bound
+    /// makes a large transfer permanently unfinishable, since attenuation can
+    /// only narrow it (round 8, M1). The bound assumes
+    /// [`FINISH_BYTES_PER_MS`], a 5x margin under the measured rate, and never
+    /// asks for less than the default grant.
+    pub fn required_wall_ms(&self) -> u64 {
+        let needed = self.total.div_ceil(FINISH_BYTES_PER_MS).saturating_add(100);
+        needed.max(Budget::default().max_wall_ms)
     }
 
     /// Chunk size in bytes.
@@ -1013,8 +1044,10 @@ impl BulkReceiver {
     /// re-hash a gigabyte after verification. A deadline that has already
     /// passed is `rpc/budget-exceeded("wall")` before any work, and the deadline
     /// is re-checked between chunks and before the verification pass
-    /// (round 5, F4; round 6, L6). The allocation is fallible: a body the
-    /// process cannot hold is a refusal, not an abort.
+    /// (round 5, F4; round 6, L6). The assembly allocation is fallible: a body
+    /// the process cannot hold is a refusal, not an abort. The content address
+    /// of a valid image allocates a second body-sized projection inside
+    /// `finish_method`, which is optional and skippable when the grant is spent.
     ///
     /// This is the one place a bulk provider reads the wall clock. Every other
     /// lifetime is measured from `Call::now_ms`, but the grant is a *duration*
@@ -1225,6 +1258,9 @@ pub struct BulkProvider {
     expected_root: Option<[u8; 32]>,
     context: Vec<u8>,
     ceiling: u64,
+    /// Provider-wide ceiling on the bytes held across every object; `0` means
+    /// no aggregate bound beyond the cap count (round 8, L5).
+    max_live_bytes: u64,
     transfers: BTreeMap<u64, ActiveTransfer>,
     completed: BTreeMap<u64, CompletedTransfer>,
     last_finished: BTreeMap<u64, FinishedTransfer>,
@@ -1290,6 +1326,7 @@ impl BulkProvider {
             expected_root: None,
             context: Vec::new(),
             ceiling: MAX_TOTAL,
+            max_live_bytes: 0,
             transfers: BTreeMap::new(),
             completed: BTreeMap::new(),
             last_finished: BTreeMap::new(),
@@ -1325,6 +1362,36 @@ impl BulkProvider {
     pub fn with_ceiling(mut self, ceiling: u64) -> Self {
         self.ceiling = ceiling.min(MAX_TOTAL);
         self
+    }
+
+    /// Bound the bytes held across every object (`0` keeps no aggregate bound).
+    ///
+    /// N objects each hold up to the protocol ceiling; a host that mints per
+    /// upload wants a provider-wide limit rather than one per object
+    /// (round 8, L5). The check runs when a transfer opens, so a transfer that
+    /// fits is never evicted mid-flight.
+    pub fn with_max_live_bytes(mut self, limit: u64) -> Self {
+        self.max_live_bytes = limit;
+        self
+    }
+
+    /// Bytes the provider is committed to hold: the announced total of every
+    /// open transfer plus every completed body.
+    ///
+    /// An open transfer reserves its plan's total, so the bound holds before a
+    /// chunk arrives (round 8, L5).
+    pub fn live_bytes(&self) -> u64 {
+        let pending: u64 = self
+            .transfers
+            .values()
+            .map(|active| active.plan.total())
+            .sum();
+        let done: u64 = self
+            .completed
+            .values()
+            .map(|done| done.body.len() as u64)
+            .sum();
+        pending.saturating_add(done)
     }
 
     /// Take the completed body for `object`, if the host has not taken it.
@@ -1413,6 +1480,12 @@ impl BulkProvider {
         // A new transfer is the moment to sweep every object: an abandoned
         // transfer on another object would otherwise wait for its own call.
         self.expire_idle(call.now_ms);
+        if self.max_live_bytes != 0 {
+            let live = self.live_bytes();
+            if live.saturating_add(plan.total()) > self.max_live_bytes {
+                return Err(Error::BudgetExceeded("byte"));
+            }
+        }
         self.require_taken(object)?;
         if let Some(active) = self.transfers.get_mut(&object) {
             // A second plan mid-transfer is either a retry of the same transfer
@@ -1475,6 +1548,12 @@ impl BulkProvider {
             .transfers
             .get_mut(&object)
             .ok_or(Error::Bulk("no transfer is active"))?;
+        // A resume request names gaps; the reply is the window below. A frame
+        // that names an index outside the plan is still refused, so the wire
+        // rule has a consumer (round 8, L1).
+        if !call.payload.is_empty() {
+            BulkRequest::decode(&call.payload, &active.plan)?;
+        }
         active.last_ms = call.now_ms;
         let page = active.receiver.missing_page(MISSING_PAGE);
         let more = active.receiver.missing_count() > page.len() as u64;
@@ -1562,9 +1641,17 @@ impl BulkProvider {
         let content = if spent {
             None
         } else {
-            crate::security::redact_module(&body)
-                .ok()
-                .and_then(|redacted| active_infinity::content_hash(&redacted).ok())
+            // A panic in the Infinity parser must not leave the object without
+            // a digest reply: the content address is optional, the record is
+            // not (round 8, L2). The allocation of the redacted projection is
+            // outside the fallible guarantee of `finish_within` (round 8, L4).
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::security::redact_module(&body)
+                    .ok()
+                    .and_then(|redacted| active_infinity::content_hash(&redacted).ok())
+            }))
+            .ok()
+            .flatten()
         };
         self.transfers.remove(&object);
         // A raw digest over a secret-bearing body is the value the domain

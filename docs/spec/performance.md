@@ -295,6 +295,22 @@ ids first, then copies each node once with references rewritten
 (`domain::restrict`). The result is byte-identical; the work is one clone per
 node instead of two.
 
+### Bulk finish cost
+
+`BulkReceiver::finish` assembles the body, verifies every chunk and feeds the
+body digest in one pass; the provider then computes the redacted content address.
+Measured on the reference host (release, `BulkSender` frames at 256 KiB):
+
+| Body | Chunks | Ingest | Finish | Finish rate |
+|---|---|---|---|---|
+| 64 MiB | 256 | 68.1 ms | 93.6 ms | ~717 kB/ms |
+| 256 MiB | 1 024 | 339.7 ms | 372.5 ms | ~721 kB/ms |
+
+The cost is linear in the body. `BulkPlan::required_wall_ms` assumes 128 MiB/s
+(about 5x under the measured rate) plus a 100 ms floor, so a documented-grant
+transfer finishes on this host with a wide margin and on a host a few times
+slower.
+
 ### The gate
 
 `scripts/perf_gate.py` enforces tail stability (p95 ≤ 4× p50, or 5x for a

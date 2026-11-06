@@ -21,10 +21,10 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-58: round 58 found 2 mediums and 6 lows, all fixed; round 59 must be clean | 379 fixed / 5 rejected / 0 open (5 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-59: round 59 found no critical/high/medium (CLEAN) and 3 lows, all fixed; round 60 must be clean to close | 382 fixed / 5 rejected / 0 open (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-7: round 7 found 2 mediums and 7 lows, all fixed; round 8 must be clean | 60 fixed / 0 rejected / 0 open (5 residuals recorded) | this commit |
-| R-11 | identity | `src/identity.rs` | rounds 1-6: round 6 found no critical/high/medium (CLEAN) and 7 lows, all fixed; round 7 must be clean to close | 40 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-8: round 8 found 2 mediums and 5 lows, all fixed; round 9 must be clean | 67 fixed / 0 rejected / 0 open (5 residuals recorded) | this commit |
+| R-11 | identity | `src/identity.rs` | rounds 1-7: round 7 found 1 medium and 4 lows, all fixed; round 8 must be clean to close | 45 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
@@ -897,6 +897,21 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-05 (round 59, first clean pass)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `b93585a`.
+Verdict **CLEAN**: every round-58 fix holds and no critical, high or medium
+finding was raised. Three lows were fixed anyway.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the mandatory `protocolVersion` check was in no spec, and `mcp/bad-response` reads as "malformed frame" rather than a version skew | **fixed**: the MCP section states the rule and the test asserts one frame was sent; `a_server_on_another_protocol_version_is_refused` |
+| 2 | low | the `http/body-too-large` row still said a tighter grant wins, while a length past the static 64 MiB ceiling is always that code | **fixed**: the row names the exception |
+| 3 | low | the eight round-58 fixes had no regression tests, the deadline-bearing notification least of all | **fixed**: `the_notification_carries_the_handshake_deadline` (a transport whose `send_line` panics), `the_dns_bounds_are_exact` (254/64/63) and `a_non_object_call_result_poisons` |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
@@ -2564,6 +2579,24 @@ Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
 
+### R-10 bulk transfer - 2026-11-05 (round 8)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `b93585a`. All
+nine round-7 claims verified. Verdict **PARTIAL**: two mediums and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `finish` has a wall requirement no accessor names, so a 1 GiB transfer sized by the documented grant is permanently unfinishable | **fixed**: `BulkPlan::required_wall_ms()` (measured at ~700 MiB/s, the formula assumes 128 MiB/s plus a floor), named in the spec and ADR; the measurement is in `performance.md`; `the_wall_bound_is_named` |
+| 2 | medium | the grant contract omits the lane, whose `max_bytes` is cumulative, so a default 64 MiB lane cannot carry a larger body whatever the capability says | **fixed**: `BulkPlan::required_lane_bytes()`, documented and tested; `the_lane_bound_is_named` |
+| 3 | low | `missing` never decoded its `ARBM` payload, so the documented frame had no consumer and its refusal rule was unenforced | **fixed**: the frame is validated (list ignored) and an off-plan index is `rpc/bulk`; `a_missing_frame_is_validated` |
+| 4 | low | a panic between `finish_within` and the record insert left an object that could never finish again | **fixed**: the content address runs under `catch_unwind` and a panic means no `content`, so the record is always written |
+| 5 | low | the spec said a body is "never silently dropped" while the 10-minute window releases it | **fixed**: the guarantee is scoped to the window |
+| 6 | low | the fallible-allocation guarantee stopped at the assembly, while the redaction allocates a second body | **documented** in `finish_within` and the ADR |
+| 7 | low | no provider-wide byte bound, and `expire_idle` only runs from `plan` | **fixed**: `with_max_live_bytes` reserves each open plan's total; `the_provider_can_bound_its_live_bytes` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-10 bulk transfer - 2026-11-05 (round 7)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `fe7aba2`. Verdict
@@ -2681,6 +2714,23 @@ gives the format a consumer.
 | B2 | medium | `finish` took the transfer before validating: a wrong marker or an early `finish` destroyed the received chunks | **fixed**: the marker and completeness are checked against a borrowed transfer, and only a successful finish consumes it; `a_refused_finish_keeps_the_transfer` |
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
+
+### R-11 identity - 2026-11-05 (round 7)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `b93585a`. All six
+round-6 dispositions verified; the deployment claims were checked against the
+code. Verdict **PARTIAL**: one medium and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the peer-facing keyed entry point (`call_idempotent_as*`) passed `from_peer = false`, so an envelope served through it could carry `Arg::Promise`/`Arg::Cap` past the authority-argument guard, and there was no guarded keyed entry point at all | **fixed**: `from_peer` is threaded through, `Agent::call_idempotent_from_envelope` passes `true`, and the in-process variants say so; `an_idempotent_envelope_cannot_carry_authority_arguments`, `an_envelope_still_refuses_authority_arguments` |
+| 2 | low | the wire table filed "bound to another peer" under `rpc/persistence` while the code returns `rpc/identity` | **fixed**: the row points at `rpc/identity` |
+| 3 | low | dispatch and the call paths stamped `cap.expired` for a foreign-clock deadline | **fixed**: the event is pushed only when the deadline is readable in this domain |
+| 4 | low | `AdmittedIdentity`'s doc claimed the type proves chain verification | **fixed**: it says what the transport reported, with the `from_certificate` caveat |
+| 5 | low | a policy admission refusal was invisible on the tape and in metrics | **fixed**: an `Identity` refusal counts `identity_refusals` and emits one `CallRefused` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-11 identity - 2026-11-05 (round 6, first clean pass)
 

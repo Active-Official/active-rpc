@@ -195,7 +195,7 @@ a message.
 | `rpc/identity` | the peer's authenticated identity is missing, does not match the capability's binding, or cannot be a binding at all (a zero or loopback digest); also an *in-process* misuse of a borrowed imported handle (it cannot export, introduce, rebind, attenuate or revoke the owner's authority) |
 | `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, or a completed body has not been taken. A state refusal is recoverable by planning again (or by the host taking the body); a hash or framing fault is not |
 | `rpc/replay` | a replay package is malformed, tampered with, or disagrees with the decisions it recorded |
-| `rpc/persistence` | a durable capability record is unsealed, already restored, bound to another peer, or names a provider this kernel does not have |
+| `rpc/persistence` | a durable capability record is unsealed, already restored, or names a provider this kernel does not have; a record restored by a different peer is `rpc/identity` |
 | `rpc/unresolvable-promise` | the promise can never settle |
 | `rpc/provider` | the provider failed the call |
 | `rpc/domain` | an Active or Infinity domain operation failed; the Active class (e.g. `X001`) is carried in the local `Display` only, not on the wire or in the trace |
@@ -232,7 +232,8 @@ class stays local) and `rpc/budget-exceeded` with the dimension it measured
 ### MCP adapter codes
 
 An `McpSession` reports adapter failures as `rpc/provider` with one of these
-inner codes. Every one is a fail-closed refusal. None needs a new session except
+inner codes. `initialize` must answer `protocolVersion` `2025-06-18`; anything
+else is `mcp/bad-response` before the lifecycle notification is sent. Every one is a fail-closed refusal. None needs a new session except
 the ones that poison it (every answer-side fault, including a receive deadline
 (`rpc/timeout` on the answer), `mcp/line-too-long`, `mcp/too-complex`,
 `mcp/desync`, `mcp/id-mismatch`, `mcp/bad-response`, `mcp/bad-number`, `mcp/eof`,
@@ -311,7 +312,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/header-not-utf8` | the status line or a header line is not UTF-8 |
 | `http/bad-number` | a JSON number has no `Value` form: an integer outside `i64`, or a float that is not finite (a literal with a fraction or an exponent that overflows `f64`) |
 | `http/too-complex` | an object or array body has more than 2^20 structural tokens before parsing, the decoded tree has more than 2^20 nodes, the answer text nests past the wire depth before parsing, or the tree is past it |
-| `http/body-too-large` | the response body exceeded `min(max_body, 64 MiB)`, by its declared length or by its stream; when the capability's byte grant is the tighter ceiling the refusal is `rpc/budget-exceeded` instead |
+| `http/body-too-large` | the response body exceeded `min(max_body, 64 MiB)`, by its declared length or by its stream; when the capability's byte grant is the tighter ceiling the refusal is `rpc/budget-exceeded` instead, except a declared length past the static 64 MiB ceiling, which is always this code because no grant can admit it |
 | `http/line-too-long` | a status or header line exceeded its own cap; a grant-capped line is `rpc/budget-exceeded` |
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
@@ -658,6 +659,13 @@ pages): `total + 53 × chunk_count` pays for the chunk frames only. A caller tha
 may reconnect and re-send every frame instead reserves
 `BulkPlan::required_grant_with_resume()` bytes and
 `BulkPlan::required_calls_with_resume()` calls, which is roughly two passes.
+Three more dimensions bound the same transfer: the wall grant must cover
+`BulkPlan::required_wall_ms()` (assembly, verification, digest and the redacted
+content address, linear in the body), the lane's cumulative `max_bytes` must
+cover `BulkPlan::required_lane_bytes()` (the kernel meters a call against the
+narrower of the capability and the lane), and a provider built with
+`with_max_live_bytes` refuses a plan that would push the bytes it holds past
+that bound.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

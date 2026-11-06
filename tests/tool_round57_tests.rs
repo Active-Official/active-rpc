@@ -195,3 +195,101 @@ fn a_non_object_initialize_result_is_refused() {
     };
     assert_eq!(error.provider_code(), Some("mcp/bad-response"), "{error}");
 }
+
+/// A server on another protocol version is refused before the lifecycle
+/// notification is sent (round 59, L-1).
+#[test]
+fn a_server_on_another_protocol_version_is_refused() {
+    let (transport, sent) = recorder(vec![
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}"#,
+    ]);
+    let error = match McpSession::handshake(transport) {
+        Ok(_) => panic!("an older version must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(error.provider_code(), Some("mcp/bad-response"), "{error}");
+    assert_eq!(sent.borrow().len(), 1, "the notification was sent anyway");
+}
+
+/// The lifecycle notification travels with the handshake deadline: a transport
+/// whose deadline-free `send_line` is unusable must not be used for it
+/// (round 59, L-3).
+#[test]
+fn the_notification_carries_the_handshake_deadline() {
+    struct DeadlineOnly {
+        answers: Vec<String>,
+        deadlines: Rc<RefCell<Vec<Option<std::time::Instant>>>>,
+    }
+    impl McpTransport for DeadlineOnly {
+        fn send_line(&mut self, _line: &str) -> Result<(), Error> {
+            panic!("the deadline-free send was used");
+        }
+        fn recv_line(&mut self) -> Result<String, Error> {
+            Ok(self.answers.remove(0))
+        }
+        fn send_line_within(
+            &mut self,
+            _line: &str,
+            deadline: Option<std::time::Instant>,
+        ) -> Result<(), Error> {
+            self.deadlines.borrow_mut().push(deadline);
+            Ok(())
+        }
+    }
+    let deadlines = Rc::new(RefCell::new(Vec::new()));
+    let transport = DeadlineOnly {
+        answers: vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#.to_string(),
+        ],
+        deadlines: Rc::clone(&deadlines),
+    };
+    McpSession::handshake(transport).expect("handshake");
+    let seen = deadlines.borrow();
+    assert_eq!(seen.len(), 3, "init, notification and tools/list");
+    assert!(
+        seen.iter().all(|deadline| deadline.is_some()),
+        "a frame was sent without a deadline"
+    );
+}
+
+/// The DNS bounds are exact (round 59, L-3).
+#[test]
+fn the_dns_bounds_are_exact() {
+    let long_name = format!("{}:80", "a".repeat(254));
+    assert!(
+        HttpTool::try_new(format!("http://{long_name}"), &[("GET", "/x")]).is_err(),
+        "a 254-byte name is refused"
+    );
+    let long_label = format!("{}:80", "a".repeat(64));
+    assert!(
+        HttpTool::try_new(format!("http://{long_label}"), &[("GET", "/x")]).is_err(),
+        "a 64-byte label is refused"
+    );
+    let ok_label = format!("{}:80", "a".repeat(63));
+    HttpTool::try_new(format!("http://{ok_label}"), &[("GET", "/x")])
+        .expect("a 63-byte label is a legal name");
+}
+
+/// A `tools/call` result that is not an object poisons the session
+/// (round 59, L-3).
+#[test]
+fn a_non_object_call_result_poisons() {
+    let (transport, _sent) = recorder(vec![
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo"}]}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"result":"ok"}"#,
+    ]);
+    let mut session = McpSession::handshake(transport).expect("handshake");
+    let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
+    call.read_only = true;
+    call.budget = Budget::default();
+    let error = session
+        .invoke(0, &call)
+        .expect_err("a string result is malformed");
+    assert_eq!(error.provider_code(), Some("mcp/bad-response"), "{error}");
+    let again = session
+        .invoke(0, &call)
+        .expect_err("the session is poisoned");
+    assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
+}

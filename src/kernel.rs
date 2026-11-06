@@ -1654,9 +1654,9 @@ impl Agent {
     ///
     /// The binding is recorded on the capability and enforced at dispatch: the
     /// same id presented by another peer, or with no identity, is refused with
-    /// `rpc/identity`. The parameter is an [`AdmittedIdentity`], which only
-    /// [`crate::identity::IdentityPolicy::admit`] can produce, so a caller
-    /// cannot bind a capability to an identity the transport never verified.
+    /// `rpc/identity`. The parameter is an [`AdmittedIdentity`]: an identity the
+    /// transport *reported* and `admit` accepted, which is record-keeping rather
+    /// than proof of the chain (see `PeerIdentity::from_certificate`).
     pub fn mint_bound(
         &self,
         peer: &AdmittedIdentity,
@@ -2640,7 +2640,12 @@ impl Agent {
             if record.expires_at.is_some_and(|expires_at| {
                 kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
             }) {
-                kernel.push_event(Event::CapExpired(cap.id()));
+                // A foreign-clock deadline is refused like an expiry but is not
+                // one: the capability may be live in its own domain
+                // (round 7, L2).
+                if record.wall_clock == kernel.wall_clock {
+                    kernel.push_event(Event::CapExpired(cap.id()));
+                }
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
             if let Some(bound) = record.attrs.bound_to {
@@ -2790,7 +2795,9 @@ impl Agent {
         if record.expires_at.is_some_and(|expires_at| {
             kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
         }) {
-            kernel.push_event(Event::CapExpired(cap.id()));
+            if record.wall_clock == kernel.wall_clock {
+                kernel.push_event(Event::CapExpired(cap.id()));
+            }
             return Err(Error::Revoked(cap_token(cap.id())));
         }
         if let Some(bound) = record.attrs.bound_to {
@@ -3175,8 +3182,11 @@ impl Agent {
             kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
         }) {
             // An expired capability is refused exactly like a revoked one. The
-            // event lets an operator see the difference.
-            kernel.push_event(Event::CapExpired(cap_id));
+            // event lets an operator see the difference, and only a deadline
+            // this clock can read is an expiry (round 7, L2).
+            if record.wall_clock == kernel.wall_clock {
+                kernel.push_event(Event::CapExpired(cap_id));
+            }
             return Err(Error::Revoked(cap_token(cap_id)));
         }
         // Identity binding is checked before any authority is exercised: a
@@ -3839,7 +3849,24 @@ impl Agent {
         cap: &CapHandle,
         envelope: &crate::wire::Envelope,
     ) -> Result<PromiseHandle> {
-        let admitted = policy.admit(peer, loopback)?;
+        let admitted = match policy.admit(peer, loopback) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                // An authentication refusal is an identity refusal an operator
+                // must be able to see (round 7, L4).
+                let mut kernel = self.cell.borrow_mut();
+                if matches!(error, Error::Identity(_)) {
+                    kernel.metrics.identity_refusals =
+                        kernel.metrics.identity_refusals.saturating_add(1);
+                }
+                kernel.push_event(Event::CallRefused {
+                    lane,
+                    cap: Some(cap.id()),
+                    code: error.code().to_string(),
+                });
+                return Err(error);
+            }
+        };
         self.call_from_envelope(Some(admitted.identity()), lane, cap, envelope)
     }
 
@@ -3861,7 +3888,17 @@ impl Agent {
         payload_bytes: u64,
         key: &str,
     ) -> Result<PromiseHandle> {
-        self.call_idempotent_inner(peer, lane, cap, method, args, payload_bytes, None, key)
+        self.call_idempotent_inner(
+            peer,
+            lane,
+            cap,
+            method,
+            args,
+            payload_bytes,
+            None,
+            key,
+            false,
+        )
     }
 
     /// [`Agent::call_idempotent_as`] for a call that carries a `body`.
@@ -3889,10 +3926,43 @@ impl Agent {
             body.len() as u64,
             Some(body),
             key,
+            false,
+        )
+    }
+
+    /// [`Agent::call_idempotent_as`] for a call decoded from a peer's envelope.
+    ///
+    /// This is the peer-facing keyed entry point: it applies the same
+    /// authority-argument guard as [`Agent::call_from_envelope`], so an envelope
+    /// can never carry `Arg::Promise` or `Arg::Cap` into a provider through a
+    /// retry (round 7, M-1).
+    pub fn call_idempotent_from_envelope(
+        &self,
+        peer: Option<&PeerIdentity>,
+        lane: LaneId,
+        cap: &CapHandle,
+        envelope: &crate::wire::Envelope,
+        key: &str,
+    ) -> Result<PromiseHandle> {
+        self.call_idempotent_inner(
+            peer,
+            lane,
+            cap,
+            &envelope.method,
+            envelope.args.clone(),
+            envelope.payload.len() as u64,
+            Some(&envelope.payload),
+            key,
+            true,
         )
     }
 
     /// The shared body of the keyed entries.
+    ///
+    /// `from_peer` selects the authority-argument guard: the `_as` variants are
+    /// in-process (they pass `false`), and
+    /// [`Agent::call_idempotent_from_envelope`] passes `true`. A dispatcher that
+    /// serves decoded envelopes must use the latter (round 7, M-1).
     #[allow(clippy::too_many_arguments)]
     fn call_idempotent_inner(
         &self,
@@ -3904,6 +3974,7 @@ impl Agent {
         payload_bytes: u64,
         body: Option<&[u8]>,
         key: &str,
+        from_peer: bool,
     ) -> Result<PromiseHandle> {
         // The method goes into the key map and the fingerprint, so its bound
         // is checked before anything copies it (round 7, F3).
@@ -4160,21 +4231,16 @@ impl Agent {
             self.record_refusal(lane, Some(cap.id()), &error);
             return Err(error);
         }
-        let promise = match body {
-            Some(bytes) => self.call_with_origin_payload(
-                peer,
-                lane,
-                cap,
-                method,
-                args,
-                payload_bytes,
-                bytes.to_vec(),
-                false,
-            )?,
-            // A size-only caller has no body to deliver: the charge is the only
-            // thing it can account for, and its doc says so.
-            None => self.call_as_with_payload(peer, lane, cap, method, args, payload_bytes)?,
-        };
+        let promise = self.call_with_origin_payload(
+            peer,
+            lane,
+            cap,
+            method,
+            args,
+            payload_bytes,
+            body.map(<[u8]>::to_vec).unwrap_or_default(),
+            from_peer,
+        )?;
         let id = promise.id();
         let mut kernel = self.cell.borrow_mut();
         kernel.idempotency.insert(
@@ -4983,7 +5049,9 @@ impl Agent {
                         if record.expires_at.is_some_and(|expires_at| {
                             kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
                         }) {
-                            expired = true;
+                            // The refusal is the same; the event is only for a
+                            // deadline this clock can read (round 7, L2).
+                            expired = record.wall_clock == kernel.wall_clock;
                             Some(Error::Revoked(cap_token(record.id)))
                         } else {
                             failure
