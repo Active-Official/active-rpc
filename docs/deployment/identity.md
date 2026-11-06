@@ -78,11 +78,15 @@ let server = QuicServer::start_with_identity(
 - `start_with_identity` mints nothing: `client_credentials()` and
   `issue_client_credentials()` return `None`/error, because the CA is yours.
 - The handler receives the authenticated peer. With `Some(ca_der)` the
-  handshake has already refused an anonymous peer, so
-  `agent.call_as(peer.as_ref(), ...)` and `publish_as` are the policy-free
-  fast path; with `None` (loopback only) the peer can be anonymous, so run
-  `IdentityPolicy::admit` and `dispatch_envelope` instead (rule 6 below).
-  Never pass `None` on a path that is supposed to be authenticated.
+  handshake has already refused an anonymous peer, so the policy step is
+  done; dispatch the decoded envelope with `dispatch_envelope` (or
+  `call_from_envelope`) so its arguments pass the authority-argument guard.
+  `call_as`/`call_peer` are for arguments this process built: they do not
+  guard envelope arguments, and a pipelined argument may only name a
+  promise the same peer queued. With `None` (loopback only) the peer can be
+  anonymous, so run `IdentityPolicy::admit` and `dispatch_envelope`
+  (rule 6 below). Never pass `None` on a path that is supposed to be
+  authenticated.
 
 ## Client
 

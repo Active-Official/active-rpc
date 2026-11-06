@@ -118,6 +118,137 @@ fn admitted(certificate: &[u8]) -> AdmittedIdentity {
         .expect("admitted")
 }
 
+/// A pipelined argument may only name a promise the same peer queued
+/// (round 8, F1).
+#[test]
+fn a_promise_of_another_peer_is_refused_at_dispatch() {
+    use active_rpc::PromiseId;
+
+    let agent = Agent::with_secret([0xa6; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(b"alice-round8");
+    let bob = admitted(b"bob-round8");
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &alice).expect("bind to alice");
+    let lane = agent
+        .create_lane("shared", Budget::default())
+        .expect("lane");
+
+    // Alice's promise in the lane Bob also uses.
+    let alice_promise = agent
+        .call_as(
+            Some(alice.identity()),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::text("secret")],
+        )
+        .expect("alice queues");
+    agent.run();
+    alice_promise.value().expect("settles");
+
+    // Bob names it.
+    let error = match agent.call_as(
+        Some(bob.identity()),
+        lane,
+        &cap,
+        "echo",
+        vec![Arg::Promise(PromiseId(alice_promise.id().0))],
+    ) {
+        Ok(promise) => {
+            agent.run();
+            promise.value().expect_err("another peer's promise")
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+}
+
+/// The typed peer gate applies the authority-argument guard too
+/// (round 8, F1).
+#[test]
+fn call_peer_refuses_authority_arguments() {
+    use active_rpc::PromiseId;
+
+    let agent = Agent::with_secret([0xa7; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(b"alice-round8b");
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &alice).expect("bind");
+    let lane = agent.create_lane("gate", Budget::default()).expect("lane");
+    let error = agent
+        .call_peer(lane, &cap, &alice, "echo", vec![Arg::Promise(PromiseId(0))])
+        .expect_err("a peer call cannot carry a promise argument");
+    assert_eq!(error.code(), "rpc/wire", "{error}");
+}
+
+/// The guard is counted and taped like every other refusal
+/// (round 8, F2).
+#[test]
+fn the_authority_guard_is_counted_and_taped() {
+    use active_rpc::wire::Envelope;
+    use active_rpc::{Event, PromiseId};
+
+    let agent = Agent::with_secret([0xa8; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let alice = admitted(b"alice-round8c");
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &alice).expect("bind");
+    let lane = agent
+        .create_lane("counted", Budget::default())
+        .expect("lane");
+    let before = agent.metrics();
+    let envelope = Envelope::request(1, "echo", vec![Arg::Promise(PromiseId(0))]);
+    let error = agent
+        .call_from_envelope(Some(alice.identity()), lane, &cap, &envelope)
+        .expect_err("the guard refuses it");
+    assert_eq!(error.code(), "rpc/wire");
+    let after = agent.metrics();
+    assert_eq!(
+        after.calls_refused,
+        before.calls_refused + 1,
+        "the refusal was not counted"
+    );
+    let refused: Vec<_> = agent
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, Event::CallRefused { code, .. } if code == "rpc/wire"))
+        .collect();
+    assert_eq!(refused.len(), 1, "exactly one refusal event");
+}
+
+/// A policy refusal is counted and taped through the shared helper
+/// (round 8, F5; the round-7 L4 claim).
+#[test]
+fn a_policy_refusal_is_counted() {
+    use active_rpc::identity::IdentityPolicy;
+    use active_rpc::wire::Envelope;
+
+    let agent = Agent::with_secret([0xa9; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("policy", Budget::default())
+        .expect("lane");
+    let before = agent.metrics();
+    let envelope = Envelope::request(1, "echo", Vec::new());
+    let error = agent
+        .dispatch_envelope(&IdentityPolicy::strict(), None, true, lane, &cap, &envelope)
+        .expect_err("an anonymous peer is refused");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+    let after = agent.metrics();
+    assert_eq!(after.identity_refusals, before.identity_refusals + 1);
+    assert_eq!(after.calls_refused, before.calls_refused + 1);
+}
+
 fn expired_events(agent: &Agent, id: active_rpc::CapId) -> usize {
     agent
         .events()

@@ -191,11 +191,15 @@ fn a_missing_frame_is_validated() {
 fn the_provider_can_bound_its_live_bytes() {
     let first = BulkTransfer::new(body(2_000, 83), 1_000).expect("first");
     let second = BulkTransfer::new(body(2_000, 84), 1_000).expect("second");
-    let mut provider = BulkProvider::new().with_max_live_bytes(3_000);
+    let mut provider = BulkProvider::new().with_max_live_bytes(4_000);
     provider
         .invoke(0, &call("plan", first.plan_frame()))
         .expect("first fits");
-    assert_eq!(provider.live_bytes(), 2_000, "the open plan is reserved");
+    assert_eq!(
+        provider.live_bytes(),
+        4_000,
+        "the plan and its assembly are reserved"
+    );
     assert!(
         provider
             .invoke(1, &call("plan", second.plan_frame()))
@@ -207,4 +211,56 @@ fn the_provider_can_bound_its_live_bytes() {
         128 * 1024 * 1024 / 1000,
         "the wall formula's rate"
     );
+}
+
+/// The lane's wall axis carries the same bound as the capability's
+/// (round 9, M1).
+#[test]
+fn the_lane_wall_is_named() {
+    let plan = active_rpc::bulk::BulkPlan::new(&body(4_000, 85), 1_000).expect("plan");
+    assert_eq!(plan.required_lane_wall_ms(), plan.required_wall_ms());
+    assert!(plan.required_lane_wall_ms() >= Budget::default().max_wall_ms);
+}
+
+/// Retrying the same plan under a live-bytes bound is not a second reservation
+/// (round 9, M2).
+#[test]
+fn a_plan_retry_does_not_double_reserve() {
+    let transfer = BulkTransfer::new(body(2_000, 86), 1_000).expect("transfer");
+    let limit = transfer.plan().total() * 2;
+    let mut provider = BulkProvider::new().with_max_live_bytes(limit);
+    provider
+        .invoke(0, &call("plan", transfer.plan_frame()))
+        .expect("first plan");
+    assert_eq!(provider.live_bytes(), limit, "two body copies reserved");
+    provider
+        .invoke(0, &call("plan", transfer.plan_frame()))
+        .expect("the identical plan is a retry, not a second reservation");
+    assert_eq!(provider.live_bytes(), limit);
+}
+
+/// A resume request names the indexes the reply contains (round 9, M3).
+#[test]
+fn a_missing_request_names_its_indexes() {
+    let transfer = BulkTransfer::new(body(10_000, 87), 1_000).expect("transfer");
+    let plan = transfer.plan().clone();
+    let mut provider = BulkProvider::new();
+    provider
+        .invoke(0, &call("plan", plan.encode()))
+        .expect("plan");
+    let request = BulkRequest::new(&[5]).encode();
+    let reply = match provider
+        .invoke(0, &call("missing", request))
+        .expect("missing")
+    {
+        active_rpc::Response::Value(value) => value,
+        other => panic!("unexpected reply {other:?}"),
+    };
+    match reply {
+        Value::Map(entries) => match entries.get("missing") {
+            Some(Value::List(items)) => assert_eq!(items, &vec![Value::Int(5)]),
+            other => panic!("unexpected missing list {other:?}"),
+        },
+        other => panic!("unexpected reply {other:?}"),
+    }
 }

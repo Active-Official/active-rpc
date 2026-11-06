@@ -298,6 +298,16 @@ impl BulkPlan {
         (self.chunks as u64).saturating_mul(2).saturating_add(4)
     }
 
+    /// The lane's wall grant a transfer needs.
+    ///
+    /// The kernel meters a call against the narrower of the capability and the
+    /// lane on every axis, so the lane's `max_wall_ms` must carry the same bound
+    /// as the capability's; a default lane (5 s) silently truncates it
+    /// (round 9, M1).
+    pub fn required_lane_wall_ms(&self) -> u64 {
+        self.required_wall_ms()
+    }
+
     /// The lane's cumulative byte ceiling a transfer needs.
     ///
     /// The kernel meters a call against the narrower of the capability and the
@@ -1011,6 +1021,11 @@ impl BulkReceiver {
             .collect()
     }
 
+    /// Whether `index` is still missing.
+    pub fn missing_contains(&self, index: u32) -> bool {
+        index < self.plan.chunks && !self.received.contains_key(&index)
+    }
+
     /// How many chunks are still missing. O(1): the count is derived from the
     /// stored indexes, not from a scan (round 3, F2).
     pub fn missing_count(&self) -> u64 {
@@ -1204,6 +1219,9 @@ struct ActiveTransfer {
     /// When the transfer opened: the idle window can be refreshed, this bound
     /// cannot (round 5, F2).
     created_ms: u64,
+    /// Finishes refused by the wall grant. Each one re-assembles the body, so a
+    /// caller cannot buy CPU with a 45-byte frame (round 9, M4).
+    wall_refusals: u8,
 }
 
 /// A body that finished and has not been taken by the host yet.
@@ -1381,10 +1399,13 @@ impl BulkProvider {
     /// An open transfer reserves its plan's total, so the bound holds before a
     /// chunk arrives (round 8, L5).
     pub fn live_bytes(&self) -> u64 {
+        // An open transfer reserves its plan's total *and* the assembly buffer a
+        // `finish` allocates, so the bound does not under-count the peak by
+        // half (round 9, M5).
         let pending: u64 = self
             .transfers
             .values()
-            .map(|active| active.plan.total())
+            .map(|active| active.plan.total().saturating_mul(2))
             .sum();
         let done: u64 = self
             .completed
@@ -1481,8 +1502,16 @@ impl BulkProvider {
         // transfer on another object would otherwise wait for its own call.
         self.expire_idle(call.now_ms);
         if self.max_live_bytes != 0 {
-            let live = self.live_bytes();
-            if live.saturating_add(plan.total()) > self.max_live_bytes {
+            // A retry of the same plan is not a second reservation: subtract
+            // this object's own commitment before adding the new one
+            // (round 9, M2).
+            let held = self.live_bytes().saturating_sub(
+                self.transfers
+                    .get(&object)
+                    .map_or(0, |active| active.plan.total().saturating_mul(2)),
+            );
+            if held.saturating_add(plan.total().saturating_mul(2)) > self.max_live_bytes {
+                // A budget class, like every other ceiling (round 9, L3).
                 return Err(Error::BudgetExceeded("byte"));
             }
         }
@@ -1507,6 +1536,7 @@ impl BulkProvider {
                 receiver,
                 last_ms: call.now_ms,
                 created_ms: call.now_ms,
+                wall_refusals: 0,
             },
         );
         // A new transfer is a new exchange: the previous body's digest reply is
@@ -1548,14 +1578,26 @@ impl BulkProvider {
             .transfers
             .get_mut(&object)
             .ok_or(Error::Bulk("no transfer is active"))?;
-        // A resume request names gaps; the reply is the window below. A frame
-        // that names an index outside the plan is still refused, so the wire
-        // rule has a consumer (round 8, L1).
-        if !call.payload.is_empty() {
-            BulkRequest::decode(&call.payload, &active.plan)?;
-        }
+        // A resume request names the gaps the sender wants; the reply is that
+        // set (page-capped), or the authoritative window when the frame is
+        // empty. An index outside the plan is refused (round 8, L1;
+        // round 9, M3).
+        let requested = if call.payload.is_empty() {
+            None
+        } else {
+            Some(BulkRequest::decode(&call.payload, &active.plan)?)
+        };
         active.last_ms = call.now_ms;
-        let page = active.receiver.missing_page(MISSING_PAGE);
+        let page: Vec<u32> = match requested {
+            Some(request) => request
+                .missing()
+                .iter()
+                .copied()
+                .filter(|index| active.receiver.missing_contains(*index))
+                .take(MISSING_PAGE)
+                .collect(),
+            None => active.receiver.missing_page(MISSING_PAGE),
+        };
         let more = active.receiver.missing_count() > page.len() as u64;
         let missing: Vec<Value> = page
             .into_iter()
@@ -1623,14 +1665,31 @@ impl BulkProvider {
         // redaction: a grant that has run out refuses before the work, and a
         // spent grant after assembly skips the content address instead of
         // running an unbounded pass (round 5, F4; round 7, L3).
-        let deadline = std::time::Instant::now()
-            .checked_add(std::time::Duration::from_millis(call.budget.max_wall_ms));
+        // A wall grant that cannot be added (u64::MAX) must fail closed rather
+        // than disable the check (round 9, L1).
+        let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_millis(
+            call.budget.max_wall_ms.min(MAX_TRANSFER_LIFETIME_MS),
+        ));
         let (body, body_hash) = {
             let active = self
                 .transfers
                 .get_mut(&object)
                 .ok_or(Error::Bulk("no transfer is active"))?;
-            active.receiver.finish_within(deadline)?
+            // Three wall refusals are enough: the body is re-assembled on every
+            // attempt, so a tiny grant must not buy repeated CPU
+            // (round 9, M4). The chunks stay.
+            if active.wall_refusals >= 3 {
+                return Err(Error::BudgetExceeded("wall"));
+            }
+            match active.receiver.finish_within(deadline) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    if matches!(&error, Error::BudgetExceeded("wall")) {
+                        active.wall_refusals = active.wall_refusals.saturating_add(1);
+                    }
+                    return Err(error);
+                }
+            }
         };
         let length = body.len() as u64;
         // The canonical content address is computed over the *redacted* image.

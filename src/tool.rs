@@ -587,7 +587,7 @@ const DEFAULT_HANDSHAKE_MS: u64 = DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS;
 ///
 /// The session consumes at most one answer per request, so a peer that streams
 /// notifications would otherwise fill host memory at pipe speed.
-pub const MAX_MCP_QUEUED_LINES: usize = 64;
+pub const MAX_MCP_QUEUED_LINES: usize = 8;
 
 /// Largest JSON-RPC line a session accepts, in bytes.
 ///
@@ -1616,6 +1616,15 @@ impl<T: McpTransport> McpSession<T> {
         // The request spent part of the grant; only the remainder is available
         // to the answer (round 33, H1).
         let sent_bytes = line.len();
+        // A grant that cannot hold even an empty answer would send the request,
+        // run the tool and then deterministically refuse the reply, burning the
+        // idempotency key for a call the adapter could have refused with
+        // nothing on the wire (round 60, L2).
+        if let Some(grant) = grant {
+            if grant.saturating_sub(sent_bytes) < 2 {
+                return Err(Error::BudgetExceeded("byte"));
+            }
+        }
         // A ceiling already spent means nothing has been written: the session
         // stays usable, and the caller may retry (round 5, #5). The code says
         // so, so a caller does not treat it as an in-flight timeout
@@ -2665,9 +2674,17 @@ impl HttpTool {
                             code: "http/headers".to_string(),
                         });
                     }
-                    let value: usize = trimmed.parse().map_err(|_| Error::Provider {
-                        code: "http/headers".to_string(),
-                    })?;
+                    // A length past the static ceiling is that class whatever
+                    // its size or the grant: parsing as `u128` covers every
+                    // decimal a peer can write, and a value over `u128` is
+                    // past every ceiling too (round 60, L1).
+                    let value: u128 = trimmed
+                        .parse()
+                        .map_err(|_| capped("http/body-too-large", false))?;
+                    if value > MAX_RESPONSE_BYTES as u128 {
+                        return Err(capped("http/body-too-large", false));
+                    }
+                    let value = value as usize;
                     if content_length.replace(value).is_some() {
                         return Err(Error::Provider {
                             code: "http/headers".to_string(),

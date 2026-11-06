@@ -293,3 +293,80 @@ fn a_non_object_call_result_poisons() {
         .expect_err("the session is poisoned");
     assert_eq!(again.provider_code(), Some("mcp/desync"), "{again}");
 }
+
+/// A declared length past `usize` is the static ceiling, not a framing fault
+/// (round 60, L-1).
+#[test]
+fn a_declared_length_past_usize_is_the_static_ceiling() {
+    use active_rpc::cap::CapId;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buffer);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 18446744073709551616\r\nconnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+        }
+    });
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/huge")]);
+    let mut call = Call::new("get", vec![Arg::Value(Value::Path("/huge".to_string()))]);
+    call.read_only = true;
+    call.budget = Budget {
+        max_bytes: 1 << 20,
+        ..Budget::default()
+    };
+    let _ = CapId([0; 16]);
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the length is past every ceiling");
+    assert_eq!(
+        error.provider_code(),
+        Some("http/body-too-large"),
+        "{error}"
+    );
+}
+
+/// A grant that cannot hold even an empty answer refuses before the wire
+/// (round 60, L-2).
+#[test]
+fn a_grant_that_cannot_hold_an_answer_is_refused_before_the_wire() {
+    fn session() -> (McpSession<Recorder>, Rc<RefCell<Vec<String>>>) {
+        let (transport, sent) = recorder(vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo"}]}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#,
+        ]);
+        (McpSession::handshake(transport).expect("handshake"), sent)
+    }
+
+    // Learn the request line length from a generous grant.
+    let (mut probe, sent) = session();
+    let mut call = Call::new("echo", vec![Arg::text("x".repeat(64))]);
+    call.read_only = true;
+    call.budget = Budget {
+        max_bytes: 1 << 20,
+        ..Budget::default()
+    };
+    probe.invoke(0, &call).expect("the call runs");
+    let line_len = sent.borrow().last().expect("the request line").len() as u64;
+
+    // One byte past the line leaves no room for an answer.
+    let (mut session, sent) = session();
+    let mut tight = Call::new("echo", vec![Arg::text("x".repeat(64))]);
+    tight.read_only = true;
+    tight.budget = Budget {
+        max_bytes: line_len + 1,
+        ..Budget::default()
+    };
+    let error = session
+        .invoke(0, &tight)
+        .expect_err("no room for the answer");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert_eq!(sent.borrow().len(), 3, "only the handshake was sent");
+}

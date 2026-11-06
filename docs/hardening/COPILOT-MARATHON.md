@@ -21,10 +21,10 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-59: round 59 found no critical/high/medium (CLEAN) and 3 lows, all fixed; round 60 must be clean to close | 382 fixed / 5 rejected / 0 open (5 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-8: round 8 found 2 mediums and 5 lows, all fixed; round 9 must be clean | 67 fixed / 0 rejected / 0 open (5 residuals recorded) | this commit |
-| R-11 | identity | `src/identity.rs` | rounds 1-7: round 7 found 1 medium and 4 lows, all fixed; round 8 must be clean to close | 45 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-9: round 9 found 5 mediums and 3 lows, all fixed; round 10 must be clean | 75 fixed / 0 rejected / 0 open (5 residuals recorded) | this commit |
+| R-11 | identity | `src/identity.rs` | rounds 1-8: round 8 found 1 high, 3 mediums and 4 lows, all fixed; rounds 9 and 10 must be clean to close | 53 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
@@ -897,6 +897,23 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-05 (round 60, clean - section closed)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `8da5591`.
+Verdict **CLEAN** (second consecutive): no critical, high or medium finding in the
+HTTP adapter, the MCP session or the wasm tool. Four lows were fixed before the
+close was cited.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | a `content-length` past `usize` was reported as a framing fault although it is past every ceiling | **fixed**: the value parses as `u128` and anything over the static ceiling is `http/body-too-large`; `a_declared_length_past_usize_is_the_static_ceiling` |
+| 2 | low | a grant that could not hold even an empty answer still sent the request, ran the tool, then withheld the reply and burned the key | **fixed**: fewer than 2 spare bytes refuses before the wire; `a_grant_that_cannot_hold_an_answer_is_refused_before_the_wire` |
+| 3 | low | the MCP reader queue was bounded in frames (64 x 1 MiB) | **fixed**: depth 8, documented as the byte bound it is |
+| 4 | low | the round-58 raw-read charge and writer slot had no test | **open, recorded**: the raw-read charge needs a stdio child that answers with padding, which the suite can only build on Unix; the charge is covered by inspection and the writer slot by the `LIVE_READERS` accounting |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
@@ -2579,6 +2596,26 @@ Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
 
+### R-10 bulk transfer - 2026-11-05 (round 9)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `8da5591`.
+All seven round-8 claims verified. Verdict **PARTIAL**: five mediums and three
+lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the wall bound was named for the capability only, while the kernel intersects it with the lane (default 5 s) | **fixed**: `required_lane_wall_ms()` and the spec state that both axes carry it; `the_lane_wall_is_named` |
+| 2 | medium | `with_max_live_bytes` double-counted an object's own reservation, so a legitimate plan retry was refused | **fixed**: the object's own commitment is subtracted first; `a_plan_retry_does_not_double_reserve` |
+| 3 | medium | `missing` validated the request frame and then ignored it | **fixed**: the reply names the requested indexes (page-capped); `a_missing_request_names_its_indexes` |
+| 4 | medium | a wall-refused `finish` re-assembles the whole body on every retry, so a 45-byte call buys a second of CPU | **fixed**: three wall refusals are allowed, then the provider refuses before assembling and keeps the chunks |
+| 5 | medium | `live_bytes` under-counted the real peak (stored chunks + assembly + projection) | **fixed**: each open transfer reserves twice its total; the doc says what the peak is |
+| 6 | low | a `u64::MAX` wall grant made `checked_add` fail, turning the wall check off | **fixed**: the grant is clamped to `MAX_TRANSFER_LIFETIME_MS` |
+| 7 | low | the "idempotent per object" sentence had an unstated exception (a new plan clears the digest reply) | **fixed**: the spec scopes it |
+| 8 | low | the live-bytes refusal class was unnamed | **fixed**: the spec says `rpc/budget-exceeded` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-10 bulk transfer - 2026-11-05 (round 8)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `b93585a`. All
@@ -2714,6 +2751,25 @@ gives the format a consumer.
 | B2 | medium | `finish` took the transfer before validating: a wrong marker or an early `finish` destroyed the received chunks | **fixed**: the marker and completeness are checked against a borrowed transfer, and only a successful finish consumes it; `a_refused_finish_keeps_the_transfer` |
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
+
+### R-11 identity - 2026-11-05 (round 8)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `8da5591`.
+Verdict **PARTIAL**: one high, three mediums and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `call_peer`/`call_as` skipped the authority-argument guard, and dispatch resolved `Arg::Promise` with no owner check, so a shared lane let one peer read another's answer | **fixed**: `call_peer` passes `from_peer = true`, the promise record remembers the peer that queued it, and dispatch refuses another peer's promise; `call_peer_refuses_authority_arguments`, `a_promise_of_another_peer_is_refused_at_dispatch`; the deployment doc sends envelope arguments through the envelope entry points |
+| 2 | medium | the guard returned before any bookkeeping, so a peer could hide an identity refusal behind `Arg::Promise` | **fixed**: the guard records the refusal; `the_authority_guard_is_counted_and_taped` |
+| 3 | medium | a foreign-clock deadline answered `rpc/revoked` on the call paths and `rpc/identity` on the keyed path | **fixed**: `rpc/identity` everywhere, with the error table saying so |
+| 4 | medium | the `rpc/identity` row promised a code `export` never returns | **fixed**: exporting a borrowed handle is `rpc/persistence` in the row |
+| 5 | low | `dispatch_envelope` hand-rolled its refusal and skipped `calls_refused` | **fixed**: `record_refusal_in`; `a_policy_refusal_is_counted` |
+| 6 | low | the round-7 L4 claim had no test, and neither did `call_peer` with authority args | **fixed**: both tests exist |
+| 7 | low | the envelope entry points did not require `Kind::Request` | **fixed**: `dispatch_envelope` refuses anything else |
+| 8 | low | `AdmittedIdentity` still read as an authority | **fixed**: the doc at both sites says what the transport reported |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-11 identity - 2026-11-05 (round 7)
 

@@ -184,7 +184,7 @@ a message.
 | `rpc/path-not-granted` | a path argument is outside the capability's scope |
 | `rpc/topic-not-granted` | a pub/sub topic is outside the capability's topic set |
 | `rpc/tool-policy` | the tool policy refuses the call |
-| `rpc/revoked` | the capability (or an ancestor) was revoked |
+| `rpc/revoked` | the capability (or an ancestor) was revoked or its lease ended in the clock domain that minted it; a lease from the other clock domain is `rpc/identity` |
 | `rpc/budget-exceeded` | a call, byte or lane budget is exhausted |
 | `rpc/unknown-lane` | the lane does not exist or was destroyed |
 | `rpc/unknown-channel` | the channel does not exist, or the lane is not subscribed to it |
@@ -192,7 +192,7 @@ a message.
 | `rpc/promise-cancelled` | the promise was cancelled |
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
 | `rpc/backpressure` | the local call queue or channel window is full |
-| `rpc/identity` | the peer's authenticated identity is missing, does not match the capability's binding, or cannot be a binding at all (a zero or loopback digest); also an *in-process* misuse of a borrowed imported handle (it cannot export, introduce, rebind, attenuate or revoke the owner's authority) |
+| `rpc/identity` | the peer's authenticated identity is missing, does not match the capability's binding, or cannot be a binding at all (a zero or loopback digest); a capability's deadline belongs to the other clock domain; a pipelined argument names another peer's promise; also an *in-process* misuse of a borrowed imported handle (it cannot introduce, rebind, attenuate or revoke the owner's authority; exporting one is `rpc/persistence`) |
 | `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, or a completed body has not been taken. A state refusal is recoverable by planning again (or by the host taking the body); a hash or framing fault is not |
 | `rpc/replay` | a replay package is malformed, tampered with, or disagrees with the decisions it recorded |
 | `rpc/persistence` | a durable capability record is unsealed, already restored, or names a provider this kernel does not have; a record restored by a different peer is `rpc/identity` |
@@ -641,14 +641,15 @@ body. An incomplete transfer is released after 60 s of inactivity and never late
 than 1 hour after it opened, a finished, untaken body after 10 minutes, and its
 digest reply with it, all measured against the kernel-stamped `Call::now_ms`. `plan`
 refuses to open a new transfer for an object whose completed body has not been
-taken (`rpc/bulk`), so a body is never silently dropped. `missing` answers a
-window of 1 024 indexes with `more` and `remaining` (because
-`Budget::strict()` allows 1 024 array elements), refreshes the idle window, and
-never expires a transfer by idleness: a read-only capability can poll but cannot
-destroy another capability's chunks. The absolute lifetime below still applies to
-a poll, so polling cannot hold a transfer forever. `finish` is idempotent per object: a repeated
-marker returns the same reply, even after the host takes the body, because the
-effect already landed. The reply is `length`, `body_hash` (the raw Blake3 digest
+taken (`rpc/bulk`), so a body is never silently dropped inside its window.
+`missing` answers the indexes the request frame names (page-capped at 1 024, with
+`more` and `remaining`; an empty payload asks for the lowest window), refreshes
+the idle window, and never expires a transfer by idleness: a read-only
+capability can poll but cannot destroy another capability's chunks. The absolute
+lifetime below still applies to a poll, so polling cannot hold a transfer
+forever. `finish` is idempotent per object until a new plan is accepted for it: a
+repeated marker returns the same reply, even after the host takes the body,
+because the effect already landed. The reply is `length`, `body_hash` (the raw Blake3 digest
 of the body: a transfer-integrity value, **never** a content address; omitted for
 a redacting call) and, when the body is an Active Infinity image, `content`: the
 canonical content address of the **redacted** image, the same value the domain
@@ -659,13 +660,17 @@ pages): `total + 53 × chunk_count` pays for the chunk frames only. A caller tha
 may reconnect and re-send every frame instead reserves
 `BulkPlan::required_grant_with_resume()` bytes and
 `BulkPlan::required_calls_with_resume()` calls, which is roughly two passes.
-Three more dimensions bound the same transfer: the wall grant must cover
+Four more dimensions bound the same transfer. The wall grant must cover
 `BulkPlan::required_wall_ms()` (assembly, verification, digest and the redacted
-content address, linear in the body), the lane's cumulative `max_bytes` must
-cover `BulkPlan::required_lane_bytes()` (the kernel meters a call against the
-narrower of the capability and the lane), and a provider built with
-`with_max_live_bytes` refuses a plan that would push the bytes it holds past
-that bound.
+content address, linear in the body) **on both the capability and the lane**,
+because the kernel meters a call against the narrower of the two
+(`required_lane_wall_ms()` is the same number). The lane's cumulative
+`max_bytes` must cover `BulkPlan::required_lane_bytes()`. A provider built with
+`with_max_live_bytes` refuses with `rpc/budget-exceeded` a plan that would push
+the bytes it holds past that bound, where each open transfer reserves twice its
+announced total (the stored chunks and the assembly buffer). A `finish` refused
+by the wall grant may be retried three times; after that the provider refuses it
+before assembling, because every attempt re-copies the body.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

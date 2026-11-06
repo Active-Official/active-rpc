@@ -61,6 +61,12 @@ pub struct PromiseRecord {
     /// trimming: the caller can still read it. `Agent::call` sets this to one
     /// when it returns the handle.
     pub handles: u32,
+    /// The peer that queued the producing call, as the transport presented it.
+    ///
+    /// Dispatch refuses a pipelined argument that names another peer's promise,
+    /// so a shared lane cannot become a channel for reading somebody else's
+    /// answer (R-11 round 8, F1).
+    pub identity: Option<[u8; crate::identity::FINGERPRINT_LEN]>,
 }
 
 impl PromiseRecord {
@@ -73,6 +79,19 @@ impl PromiseRecord {
             lane,
             // No handle owns a reference until `Agent::call` builds one.
             handles: 0,
+            identity: None,
+        }
+    }
+
+    /// Create a pending record that remembers the peer that queued it.
+    pub fn new_for(
+        id: PromiseId,
+        lane: u64,
+        identity: Option<[u8; crate::identity::FINGERPRINT_LEN]>,
+    ) -> Self {
+        Self {
+            identity,
+            ..Self::new(id, lane)
         }
     }
 

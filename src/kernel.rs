@@ -3094,9 +3094,11 @@ impl Agent {
                 .iter()
                 .any(|arg| matches!(arg, Arg::Promise(_) | Arg::Cap(_)))
         {
-            return Err(Error::Wire(
-                "an envelope cannot carry a promise or capability argument",
-            ));
+            // An uncounted refusal is an operator blind spot, and a peer could
+            // hide an identity refusal behind it (round 8, F2).
+            let error = Error::Wire("an envelope cannot carry a promise or capability argument");
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
         }
         let cap_id = cap.id();
         let result = self.call_inner_payload(peer, lane, cap, method, args, payload_bytes, payload);
@@ -3183,10 +3185,15 @@ impl Agent {
         }) {
             // An expired capability is refused exactly like a revoked one. The
             // event lets an operator see the difference, and only a deadline
-            // this clock can read is an expiry (round 7, L2).
-            if record.wall_clock == kernel.wall_clock {
-                kernel.push_event(Event::CapExpired(cap_id));
+            // this clock can read is an expiry (round 7, L2). A deadline from
+            // the other domain is `rpc/identity` on every path, so one call
+            // answers one code (round 8, F3).
+            if record.wall_clock != kernel.wall_clock {
+                return Err(Error::Identity(
+                    "the capability's deadline is in another clock domain",
+                ));
             }
+            kernel.push_event(Event::CapExpired(cap_id));
             return Err(Error::Revoked(cap_token(cap_id)));
         }
         // Identity binding is checked before any authority is exercised: a
@@ -3345,9 +3352,14 @@ impl Agent {
 
         let promise_id = PromiseId(kernel.next_promise);
         kernel.next_promise += 1;
-        kernel
-            .promises
-            .insert(promise_id, PromiseRecord::new(promise_id, lane.0));
+        kernel.promises.insert(
+            promise_id,
+            PromiseRecord::new_for(
+                promise_id,
+                lane.0,
+                crate::identity::presented_fingerprint(peer),
+            ),
+        );
 
         // The call is authorized at queue time, but the receipt is written at
         // dispatch: that is where revocation, expiry and identity are re-checked,
@@ -3827,7 +3839,10 @@ impl Agent {
         method: &str,
         args: Vec<Arg>,
     ) -> Result<PromiseHandle> {
-        self.call_as(Some(peer.identity()), lane, cap, method, args)
+        // The typed peer gate is a transport-facing entry point: its
+        // arguments can come from an envelope, so the authority guard applies
+        // (round 8, F1).
+        self.call_with_origin(Some(peer.identity()), lane, cap, method, args, 0, true)
     }
 
     /// Admit a transport peer under `policy`, then dispatch an envelope.
@@ -3849,21 +3864,18 @@ impl Agent {
         cap: &CapHandle,
         envelope: &crate::wire::Envelope,
     ) -> Result<PromiseHandle> {
+        if envelope.kind != crate::wire::Kind::Request {
+            let error = Error::Wire("an envelope entry point takes a request");
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
+        }
         let admitted = match policy.admit(peer, loopback) {
             Ok(admitted) => admitted,
             Err(error) => {
                 // An authentication refusal is an identity refusal an operator
                 // must be able to see (round 7, L4).
                 let mut kernel = self.cell.borrow_mut();
-                if matches!(error, Error::Identity(_)) {
-                    kernel.metrics.identity_refusals =
-                        kernel.metrics.identity_refusals.saturating_add(1);
-                }
-                kernel.push_event(Event::CallRefused {
-                    lane,
-                    cap: Some(cap.id()),
-                    code: error.code().to_string(),
-                });
+                Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
                 return Err(error);
             }
         };
@@ -4991,6 +5003,18 @@ impl Agent {
                     for arg in &job.call.args {
                         match arg {
                             Arg::Promise(id) => match kernel.promises.get(id) {
+                                // A pipelined argument may only name a promise
+                                // the same peer queued: a shared lane would
+                                // otherwise let one peer read another's answer
+                                // through an echoing provider (round 8, F1).
+                                Some(record)
+                                    if record.identity.is_some()
+                                        && record.identity != job.identity =>
+                                {
+                                    failure =
+                                        Some(Error::Identity("a promise belongs to another peer"));
+                                    break;
+                                }
                                 Some(record) if record.state.is_settled() => match &record.state {
                                     crate::promise::PromiseState::Resolved(value) => {
                                         // `Value::clone` recurses, so a deep value

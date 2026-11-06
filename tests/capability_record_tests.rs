@@ -997,7 +997,8 @@ fn a_wall_clock_deadline_does_not_survive_a_switch_to_virtual() {
         .create_lane("switch", Budget::default())
         .expect("lane");
     // The refusal may come at queue time or at dispatch; both are the same
-    // authority decision.
+    // authority decision, and a deadline this clock cannot read is
+    // `rpc/identity` on every path (R-11 round 8, F3).
     let error = match agent.call_as(None, lane, &cap, "echo", Vec::new()) {
         Err(error) => error,
         Ok(promise) => {
@@ -1007,7 +1008,7 @@ fn a_wall_clock_deadline_does_not_survive_a_switch_to_virtual() {
                 .expect_err("the deadline cannot be read in this domain")
         }
     };
-    assert_eq!(error.code(), "rpc/revoked", "{error}");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
 }
 
 // ---------------------------------------------------------------------------
