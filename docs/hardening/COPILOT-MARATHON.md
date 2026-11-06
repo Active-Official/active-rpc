@@ -23,7 +23,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-10: round 10 found 4 mediums and 4 lows, all fixed (two reply-degradation branches inspected, not unit-tested); round 11 must be clean | 83 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-11: round 11 found 2 mediums and 5 lows, all fixed; round 12 must be clean | 89 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-9: round 9 found 4 mediums, all fixed; rounds 10 and 11 must be clean to close | 57 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-4: round 4 found 1 medium and 7 lows (2 fixed, 6 recorded); round 5 must clear them | 30 fixed / 0 rejected / 6 noted | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
@@ -2595,6 +2595,24 @@ logical message in one frame.
 Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
+
+### R-10 bulk transfer - 2026-11-06 (round 11)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `8f25038`. Six of
+seven round-10 claims verified. Verdict **PARTIAL**: two mediums and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the documented recovery from an exhausted finish was unreachable: a same-root `plan` retry refreshed the idle window but did not clear the counter, so re-planning left the transfer wedged for the full hour | **fixed**: a same-root re-plan resets `wall_refusals`; `a_replan_recovers_an_exhausted_finish` |
+| 2 | medium | a refusal that did no work spent the three-attempt budget: a zero-millisecond grant refuses before the assembly, and three cheap frames exhausted a fully paid transfer | **fixed**: only a refusal entered before the deadline and reached it increments the counter; `a_zero_work_refusal_does_not_spend_the_budget` |
+| 3 | low | the `rpc/bulk` row did not list the new state refusal | **fixed**: the row names the exhausted finish and says a re-plan resets it |
+| 4 | low | `wire.md` still described the live reservation as two body copies, omitting the plan hash vector and the redaction copy | **fixed**: the paragraph names both, with the 53-byte header |
+| 5 | low | the parser probe ran outside `catch_unwind` after the chunks were released | **fixed**: the probe is inside the guard, and any panic reports `parser` |
+| 6 | low | the deadline chain could still yield `None` | **fixed**: it ends in an already-passed instant, which fails closed |
+| 7 | low | `plan` sweeps every object on every call | **recorded**: the order is correct (a stale reservation must not wedge a provider); a deadline-ordered sweep is a future optimisation |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-10 bulk transfer - 2026-11-05 (round 10)
 

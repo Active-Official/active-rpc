@@ -1537,6 +1537,10 @@ impl BulkProvider {
             if active.plan.root() != plan.root() {
                 return Err(Error::Bulk("a different transfer is already active"));
             }
+            // A re-plan is the documented recovery from an exhausted finish:
+            // the counter is per attempt batch, not per transfer
+            // (round 11, M-1).
+            active.wall_refusals = 0;
             active.last_ms = call.now_ms;
             return Ok(plan_reply(&active.plan, active.receiver.missing_count()));
         }
@@ -1699,7 +1703,10 @@ impl BulkProvider {
             .or_else(|| {
                 std::time::Instant::now()
                     .checked_add(std::time::Duration::from_millis(MAX_TRANSFER_LIFETIME_MS))
-            });
+            })
+            // A None deadline would mean no bound at all: an already-passed
+            // deadline fails closed instead (round 11, L-5).
+            .unwrap_or_else(std::time::Instant::now);
         let (body, body_hash) = {
             let active = self
                 .transfers
@@ -1713,10 +1720,14 @@ impl BulkProvider {
                 // and the caller recovers by re-planning (round 10, M-3).
                 return Err(Error::Bulk("finish is exhausted for this transfer"));
             }
-            match active.receiver.finish_within(deadline) {
+            let entered = std::time::Instant::now();
+            match active.receiver.finish_within(Some(deadline)) {
                 Ok(pair) => pair,
                 Err(error) => {
-                    if matches!(&error, Error::BudgetExceeded("wall")) {
+                    // Only a refusal that ran out of time *while working* spends
+                    // the budget: a deadline that had already passed did no work
+                    // (round 11, M-2).
+                    if matches!(&error, Error::BudgetExceeded("wall")) && entered < deadline {
                         active.wall_refusals = active.wall_refusals.saturating_add(1);
                     }
                     return Err(error);
@@ -1731,7 +1742,7 @@ impl BulkProvider {
         // A body that is not an image has no address, and saying so is not a
         // degradation. A spent grant or a parser fault are, and the reply says
         // which (round 10, M-4).
-        let spent = deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        let spent = std::time::Instant::now() >= deadline;
         let (content, content_error) = if spent {
             (None, Some("wall"))
         } else {
@@ -1739,20 +1750,25 @@ impl BulkProvider {
             // a digest reply: the content address is optional, the record is
             // not (round 8, L2). The allocation of the redacted projection is
             // outside the fallible guarantee of `finish_within` (round 8, L4).
+            // The classification probe runs inside the same guard: the chunks
+            // are already released, so an unwind here would leave a transfer
+            // that can never finish (round 11, L-3). `Err(true)` means the body
+            // decodes as an image but cannot be redacted; `Err(false)` means it
+            // is not an image at all.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::security::redact_module(&body)
-                    .map(|redacted| active_infinity::content_hash(&redacted))
-            })) {
-                Ok(Ok(Ok(address))) => (Some(address), None),
-                Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
-                    // Decoding a body that never was an image fails at its
-                    // header, so this costs nothing on the common path.
-                    if active_infinity::decode(&body).is_ok() {
-                        (None, Some("parser"))
-                    } else {
-                        (None, None)
-                    }
+                match crate::security::redact_module(&body) {
+                    Ok(redacted) => match active_infinity::content_hash(&redacted) {
+                        Ok(address) => Ok(Some(address)),
+                        Err(_) => Err(active_infinity::decode(&body).is_ok()),
+                    },
+                    Err(_) => Err(active_infinity::decode(&body).is_ok()),
                 }
+            })) {
+                Ok(Ok(Some(address))) => (Some(address), None),
+                Ok(Ok(None)) => (None, None),
+                Ok(Err(true)) => (None, Some("parser")),
+                Ok(Err(false)) => (None, None),
+                Err(_) => (None, Some("parser")),
             }
         };
         self.transfers.remove(&object);

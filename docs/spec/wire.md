@@ -673,9 +673,14 @@ because the kernel meters a call against the narrower of the two
 `max_bytes` must cover `BulkPlan::required_lane_bytes()`. A provider built with
 `with_max_live_bytes` refuses with `rpc/budget-exceeded` a plan that would push
 the bytes it holds past that bound, where each open transfer reserves twice its
-announced total (the stored chunks and the assembly buffer). A `finish` refused
-by the wall grant may be retried three times; after that the provider refuses it
-before assembling, because every attempt re-copies the body.
+announced total (the stored chunks and the assembly buffer) plus the plan's own
+hash vector (32 bytes per chunk and the 53-byte header), because the plan is
+retained for the whole transfer; a `finish` of an image adds a third, transient
+body copy for the redaction. A `finish` refused by the wall grant while it was
+working may be retried three times; after that the provider refuses it with
+`rpc/bulk` before assembling, because every attempt re-copies the body. Planning
+the same transfer again resets that budget; a refusal that did no work (the
+deadline had already passed) does not spend it.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.
