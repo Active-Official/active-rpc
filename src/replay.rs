@@ -498,6 +498,11 @@ impl Recorder {
         Ok(recorder)
     }
 
+    /// Whether a capture failed, so the session can no longer be packaged.
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Simulated provider latency, in milliseconds per batch.
     pub fn latency_ms(&self) -> u64 {
         self.latency_ms

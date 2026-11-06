@@ -193,7 +193,7 @@ a message.
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
 | `rpc/backpressure` | the local call queue or channel window is full |
 | `rpc/identity` | the peer's authenticated identity is missing, does not match the capability's binding, or cannot be a binding at all (a zero or loopback digest); a capability's deadline belongs to the other clock domain; a pipelined argument names another peer's promise; also an *in-process* misuse of a borrowed imported handle (it cannot introduce, rebind, attenuate or revoke the owner's authority; exporting one is `rpc/persistence`) |
-| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, or a completed body has not been taken. A state refusal is recoverable by planning again (or by the host taking the body); a hash or framing fault is not |
+| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, a completed body has not been taken, or a `finish` has spent its three under-resourced attempts. A state refusal is recoverable by planning again (for the slot) or, for an under-resourced finish, by granting `required_wall_ms()`; the chunks survive either way. A hash or framing fault is not |
 | `rpc/replay` | a replay package is malformed, tampered with, or disagrees with the decisions it recorded |
 | `rpc/persistence` | a durable capability record is unsealed, already restored, or names a provider this kernel does not have; a record restored by a different peer is `rpc/identity` |
 | `rpc/unresolvable-promise` | the promise can never settle |
@@ -676,12 +676,15 @@ the bytes it holds past that bound, where each open transfer reserves twice its
 announced total (the stored chunks and the assembly buffer) plus the plan's own
 hash vector (32 bytes per chunk and the 53-byte header), because the plan is
 retained for the whole transfer; a `finish` of an image adds a third, transient
-body copy for the redaction. A `finish` refused by the wall grant while it was
-working may be retried three times; after that the provider **releases the
-transfer** and answers `rpc/bulk`, because every attempt re-copies the body. The
-caller recovers by planning again and re-sending the body: the paid chunks are
-gone, so a 53-byte re-plan cannot buy another batch of assemblies. A refusal that
-did no work (the deadline had already passed) does not spend the budget.
+body copy for the redaction. A `finish` whose wall grant is below
+`BulkPlan::required_wall_ms()` is an under-resourced attempt: three of them may
+assemble the body, and after that the provider refuses it with `rpc/bulk` before
+any work, because a cheap frame must not buy repeated copies. The stored chunks
+are **never** destroyed by a refusal (a body the caller paid to transfer survives
+every refusal), and an attempt whose grant reaches `required_wall_ms()` is always
+allowed and resets that budget. A refusal that did no work (the deadline had
+already passed) does not spend it. The verification pass is inside the wall
+grant; the redaction pass of a valid image runs once it starts.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

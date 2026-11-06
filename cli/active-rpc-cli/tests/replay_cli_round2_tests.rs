@@ -164,3 +164,46 @@ fn replay_dump_replaces_a_destination_symlink_not_its_target() {
     assert_eq!(&bytes[..4], b"ARRP");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A destination that exists but is empty is still evidence the operator made:
+/// it is refused without `--force` (R-12 round 5, L-5).
+#[test]
+fn replay_dump_refuses_an_empty_destination_without_force() {
+    let dir = sandbox("empty-destination");
+    let path = dir.join("session.arrp");
+    std::fs::write(&path, b"").expect("plant an empty file");
+
+    let refused = run(&["replay", "dump", "--output", path.to_str().expect("utf8")]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("--force"), "{}", stderr(&refused));
+    assert_eq!(
+        std::fs::metadata(&path).expect("the file stays").len(),
+        0,
+        "the refusal wrote over it"
+    );
+
+    let forced = run(&[
+        "replay",
+        "dump",
+        "--output",
+        path.to_str().expect("utf8"),
+        "--force",
+    ]);
+    assert_eq!(forced.status.code(), Some(0), "{}", stderr(&forced));
+    assert!(std::fs::metadata(&path).expect("written").len() > 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A dumped package always runs: the CLI replays before writing
+/// (R-12 round 5, L-6).
+#[test]
+fn a_dumped_package_always_replays() {
+    let dir = sandbox("dump-replays");
+    let path = dir.join("session.arrp");
+    let path = path.to_str().expect("utf8");
+    let dump = run(&["replay", "dump", "--output", path]);
+    assert_eq!(dump.status.code(), Some(0), "{}", stderr(&dump));
+    let replay = run(&["replay", "run", path]);
+    assert_eq!(replay.status.code(), Some(0), "{}", stderr(&replay));
+    let _ = std::fs::remove_dir_all(&dir);
+}

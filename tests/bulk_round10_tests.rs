@@ -136,8 +136,8 @@ fn an_exhausted_finish_is_a_state_refusal() {
         .expect_err("the finish is exhausted, not the grant");
     assert_eq!(error.code(), "rpc/bulk", "{error}");
     assert!(
-        error.to_string().contains("exhausted"),
-        "the state fault names itself: {error}"
+        error.to_string().contains("wall grant"),
+        "the state fault names what it needs: {error}"
     );
 }
 

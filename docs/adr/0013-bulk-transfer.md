@@ -103,10 +103,12 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   may bound the bytes it holds across objects with `with_max_live_bytes`, where
   each open transfer reserves two body copies plus the retained plan hash
   vector.
-- A `finish` refused by the wall grant is retried at most three times and then
-  the transfer is **released** with `rpc/bulk`: re-copying a body on every tiny
-  grant is CPU the caller did not pay for, and the recovery is a new plan plus a
-  re-send, not a wider grant and not a cheap same-root retry.
+- A `finish` whose wall grant is below `required_wall_ms()` may assemble three
+  times; after that the provider refuses it with `rpc/bulk` before any work.
+  Re-copying a body on every tiny grant is CPU the caller did not pay for, and
+  the recovery is a grant at `required_wall_ms()`, not a cheap retry. The stored
+  chunks are never destroyed: the non-destructiveness rule outranks the throttle,
+  and a workable attempt is always allowed and resets the budget.
 - The finish reply carries `canonical`, and `content_error` when an image's
   address could not be computed (`wall` or `parser`); a degraded reply is
   recorded as degraded instead of looking like a body without an address.

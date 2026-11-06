@@ -1710,19 +1710,24 @@ impl BulkProvider {
             // A None deadline would mean no bound at all: an already-passed
             // deadline fails closed instead (round 11, L-5).
             .unwrap_or_else(std::time::Instant::now);
-        // Exhaustion releases the transfer: a re-plan then starts a fresh one
-        // and the caller re-sends its chunks, which is the honest cost of the
-        // failure. Resetting the counter on a same-root re-plan made the budget
-        // void — a 53-byte frame could re-assemble a fully paid body without
-        // bound (round 12, M-1).
-        if self
+        // A transfer whose grant is below `required_wall_ms` gets three
+        // assemblies and then only refusals: a cheap frame must not buy
+        // repeated CPU. The chunks are never released — a refusal must not
+        // destroy a body the caller paid to transfer — and an attempt with a
+        // sufficient grant is always allowed (round 13).
+        let required = self
             .transfers
             .get(&object)
-            .is_some_and(|active| active.wall_refusals >= 3)
+            .map_or(0, |active| active.plan.required_wall_ms());
+        let workable = required != 0 && call.budget.max_wall_ms >= required;
+        if !workable
+            && self
+                .transfers
+                .get(&object)
+                .is_some_and(|active| active.wall_refusals >= 3)
         {
-            self.transfers.remove(&object);
             return Err(Error::Bulk(
-                "finish is exhausted; the transfer was released",
+                "finish needs a wall grant of at least the plan's required wall",
             ));
         }
         let (body, body_hash) = {
@@ -1733,10 +1738,15 @@ impl BulkProvider {
             match active.receiver.finish_within(Some(deadline)) {
                 Ok(pair) => pair,
                 Err(error) => {
-                    // Only a refusal that ran out of time *while working* spends
-                    // the budget: a deadline that had already passed did no work
-                    // (round 11, M-2).
-                    if matches!(&error, Error::BudgetExceeded("wall")) && entered < deadline {
+                    // Only an under-resourced refusal that ran out of time
+                    // while working spends the budget: a deadline that had
+                    // already passed did no work, and a workable attempt is a
+                    // legitimate retry the caller paid for (round 11, M-2;
+                    // round 13).
+                    if !workable
+                        && matches!(&error, Error::BudgetExceeded("wall"))
+                        && entered < deadline
+                    {
                         active.wall_refusals = active.wall_refusals.saturating_add(1);
                     }
                     return Err(error);

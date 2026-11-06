@@ -2596,6 +2596,23 @@ Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
 
+### R-10 bulk transfer - 2026-11-06 (round 13)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `5316d13`. Ten of
+twelve round-12 claims verified. Verdict **PARTIAL**: two mediums and three
+lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | round 12's release broke non-destructiveness: a `finish` delegated to the provider (a `post`/`request` grant below the plan's wall) destroyed a body the caller had already paid to transfer, and the caller's only recovery was a full re-upload | **fixed**: the release is replaced by a throttle - an under-resourced `finish` (`max_wall_ms < required_wall_ms()`) may assemble three times, then is refused `rpc/bulk` **before any work with the chunks kept**; an attempt whose grant reaches `required_wall_ms()` is always allowed and resets the budget. The counter ignores a refusal entered after the deadline, so it stays one code per condition. `an_under_resourced_finish_is_throttled_without_losing_the_body` asserts the refusal, that `active_root` and every chunk survive, that a same-root re-plan does not clear the budget, and that `required_wall_ms()` then finishes; `a_replan_cannot_buy_unbounded_assemblies` counts only `rpc/budget-exceeded` and pins exactly three assemblies across a re-plan |
+| 2 | medium | the wall grant covered the assembly but not `BulkPlan::verify`, which re-hashes every chunk after the deadline has been passed - the measured cost of a spent grant was one full verification | **fixed**: `verify` delegates to `verify_within(bytes, deadline)` and `finish_within` passes its deadline, so the verification pass is inside the grant on every chunk; the spec paragraph says the verification is charged to the grant |
+| 3 | low | the `rpc/bulk` row still described the released transfer | **fixed**: the row names the under-resourced attempts and says the chunks survive either way |
+| 4 | low | ADR-0013's recovery text named a re-plan and a re-send | **fixed**: the ADR says the recovery is a grant at `required_wall_ms()`, and that non-destructiveness outranks the throttle |
+| 5 | low | a `content_error` of `wall` on an exhausted grant | **kept**: the reply still reports `wall` for a spent grant, which the round-12 note documents; the throttle now refuses before the assembly in the common case |
+
+Gate: all suites green on both feature sets (114 binaries); clippy both; fmt;
+doc; `rust:1.99` Linux suite; control plane, CLI, fuzz; negative controls 9/9.
+
 ### R-10 bulk transfer - 2026-11-06 (round 12)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `e41cd18`. Six of

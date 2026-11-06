@@ -71,3 +71,44 @@ fn a_mismatch_names_the_ordinal() {
     assert!(text.contains("cap Some(9)"), "{text}");
     assert!(text.contains("cap Some(0)"), "{text}");
 }
+
+/// The encoded layout is pinned byte for byte: a tag or field-order change must
+/// update this golden deliberately, because a round-trip alone is
+/// self-consistent (R-12 round 4, L-8).
+#[test]
+fn the_package_layout_is_pinned() {
+    use active_rpc::replay::{Op, ReplayPackage, Trace};
+    let package = ReplayPackage {
+        latency_ms: 7,
+        ops: vec![
+            Op::SetLatency(7),
+            Op::Mint {
+                methods: vec!["echo".to_string()],
+                ttl_ms: None,
+            },
+        ],
+        trace: vec![
+            Trace {
+                event: "lane.created".to_string(),
+                cap: None,
+            },
+            Trace {
+                event: "cap.minted".to_string(),
+                cap: Some(0),
+            },
+        ],
+    };
+    let bytes = package.encode().expect("encode");
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(bytes.len(), 110, "the encoded length moved");
+    assert_eq!(
+        hex,
+        "4152525001000007000000000000000200000001070000000000000002010004006563686f0002000000000c0000006c616e652e63726561746564010a0000006361702e6d696e74656400000000cfb09c66e5ce814d4282f92539fe64741f0fb9717c01d8615d4a61a05a87ffd5",
+        "the ARRP layout moved; update this golden only for a deliberate format change"
+    );
+    // And the pinned bytes decode to the same package.
+    let decoded = ReplayPackage::decode(&bytes).expect("decode");
+    assert_eq!(decoded.latency_ms, 7);
+    assert_eq!(decoded.ops.len(), 2);
+    assert_eq!(decoded.trace.len(), 2);
+}

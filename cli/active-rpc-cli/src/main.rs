@@ -1484,15 +1484,21 @@ fn replay(args: &[String]) -> CliResult {
             // log follows: a default path (`session.arrp`) makes an accidental
             // replacement likely.
             if !force {
-                match std::fs::metadata(&path) {
-                    Ok(metadata) if metadata.len() > 0 => {
-                        return Err(CliError::refused(format!(
-                            "{path:?} already holds a package; pass --force to replace it"
-                        )))
-                    }
-                    _ => {}
+                // Any existing entry is refused, not only a non-empty one: a
+                // zero-byte file (or a symlink to one) is still evidence the
+                // operator created, and `rename` would replace it
+                // (R-12 round 5, L-5).
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    return Err(CliError::refused(format!(
+                        "{path:?} already exists; pass --force to replace it"
+                    )));
                 }
             }
+            // Write an artifact that replays: a package this build refuses must
+            // never reach the disk (R-12 round 5, L-6).
+            package.replay().map_err(|error| {
+                CliError::refused(format!("the session does not replay: {}", error.code()))
+            })?;
             let encoded = package.encode().map_err(refusal)?;
             // Write beside the destination and rename, so an interrupted dump
             // leaves the old artifact intact instead of a truncated one.
@@ -1520,6 +1526,19 @@ fn replay(args: &[String]) -> CliResult {
             if let Err(error) = written {
                 let _ = std::fs::remove_file(&temporary);
                 return Err(CliError::transport(format!("cannot write {path}: {error}")));
+            }
+            // The rename is atomic but not durable until the parent directory is
+            // synced; without this a crash can leave the old name or no name
+            // (R-12 round 5, L-6).
+            #[cfg(unix)]
+            {
+                let parent = std::path::Path::new(&path)
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                if let Ok(directory) = std::fs::File::open(parent) {
+                    let _ = directory.sync_all();
+                }
             }
             out_line(format!(
                 "wrote {path} ops={} trace={}",
@@ -1996,9 +2015,10 @@ usage: active-rpc-cli <command> [options]
       Serve the Connect/gRPC interop bridge against the demo kernel.
   events [--plane URL] [--after ID] [--follow] [--interval-ms N]
       Tail the control-plane event stream (correlation ids only).
-  replay dump [--output PATH]
+  replay dump [--output PATH] [--force]
       Record a deterministic demo session (mint, calls, refusal, TTL expiry,
-      revocation) into a replay package.
+      revocation) into a replay package. The default path is session.arrp; an
+      existing file is refused unless --force is passed.
   replay run <package>
       Replay a package against a fresh kernel and compare every decision;
       a tampered or divergent package is refused.
