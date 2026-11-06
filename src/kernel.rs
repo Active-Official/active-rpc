@@ -3819,7 +3819,7 @@ impl Agent {
                 }))
                 .unwrap_or_else(|_| {
                     Err(Error::Provider {
-                        code: "wasm/trap".to_string(),
+                        code: "provider/egress-panic".to_string(),
                     })
                 });
                 checked?
@@ -5531,7 +5531,7 @@ impl Agent {
                             }))
                             .unwrap_or_else(|_| {
                                 Err(Error::Provider {
-                                    code: "wasm/trap".to_string(),
+                                    code: "provider/egress-panic".to_string(),
                                 })
                             });
                         match checked {

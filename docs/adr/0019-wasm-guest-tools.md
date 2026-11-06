@@ -60,9 +60,10 @@ imports:  none; a module that declares any import is refused
 | `wasm/memory` | the exported memory is missing or too small for the exchange |
 | `wasm/entry` | the `run` export is missing or has the wrong type |
 | `wasm/fuel` | the fuel budget was exhausted, in `start` or in `run` |
-| `wasm/trap` | the guest trapped for another reason |
-| `wasm/input` | the call input is missing, exceeds the input window, or is not one text/module argument |
-| `wasm/output` | the returned length is negative or over the ceiling |
+| `wasm/trap` | the guest trapped for another reason. This is the **wasm provider's** code only: the kernel's own egress panic (a redaction walk that unwinds for any provider) reports `provider/egress-panic`, so a receipt can still attribute a trap to a wasm guest |
+| `wasm/input` | the call input is missing, exceeds the input window, is not one text/module argument, or is a module image carrying a structural secret |
+| `wasm/output` | the guest returned a negative length, which is its own fault signal |
+| `wasm/output-limit` | the returned length is past the output ceiling (the static cap or the call's share); the adapter reports it as `rpc/budget-exceeded` when the grant is what bound it and as this code otherwise |
 
 ## Consequences
 

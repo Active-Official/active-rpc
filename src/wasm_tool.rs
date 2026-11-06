@@ -57,9 +57,16 @@ pub const FUEL_PER_MS: u64 = 5_000;
 
 /// Largest table a guest may declare or grow to, in elements.
 ///
-/// A table element is a 16-byte slot, so a 1 MiB ceiling is 16 MiB of host
-/// memory; without a ceiling a 140-byte module can ask for tens of gigabytes,
-/// and a failed allocation aborts the process instead of returning an error.
+/// A table element is a slot in the engine's element array; at 16 bytes each,
+/// the 65 536-element ceiling is about 1 MiB per table, and the store limiter's
+/// four-table budget bounds one call at about 4 MiB. Without a ceiling a
+/// 140-byte module can ask for tens of gigabytes, and a failed allocation aborts
+/// the process instead of returning an error.
+///
+/// Table memory is bounded by the limiter but is **not** fuel-charged the way
+/// linear memory is: a module's declared tables cannot be enumerated through the
+/// engine's public API, so the reservation cannot see them. The bound is the
+/// limiter's, and it is small (R-14 round 3, L-4).
 pub const MAX_TABLE_ELEMENTS: usize = 1 << 16;
 
 /// Smallest linear memory a caller may configure: enough for the input and
@@ -140,8 +147,10 @@ pub const MAX_RANDOM_PER_CALL: usize = 64 << 10;
 /// Fuel charged per KiB of linear memory the instance declares.
 ///
 /// Instantiating a guest materialises its declared memory, and wasmi charges no
-/// fuel for it: measured 5.5 ms (release) for the 16 MiB default and 90 ms for
-/// the 256 MiB ceiling, under a grant of any size. At the documented rate
+/// fuel for *instantiation*: measured 5.5 ms (release) for the 16 MiB default
+/// and 90 ms for the 256 MiB ceiling, under a grant of any size. A `memory.grow`
+/// inside `run` is a different path — the engine debits that one — which is why
+/// this reservation covers the declaration only. At the documented rate
 /// ([`FUEL_PER_MS`]) that is ~1.7 fuel per KiB; the charge is 2, so a 16 MiB
 /// guest costs one millisecond of grant and the ceiling costs sixteen.
 pub const FUEL_PER_MEMORY_KIB: u64 = 2;
@@ -216,6 +225,17 @@ impl WasmTool {
         if !host.accept_wat && !bytes.starts_with(b"\0asm") {
             return Err(provider("wasm/module"));
         }
+        // Text is parsed to binary here, so the module ceiling bounds what the
+        // engine compiles rather than the source that produced it: a 1 MiB cap on
+        // the text bounded nothing (R-14 round 3, L-5).
+        let binary = if bytes.starts_with(b"\0asm") {
+            std::borrow::Cow::Borrowed(bytes)
+        } else {
+            wat::parse_bytes(bytes).map_err(|_| provider("wasm/module"))?
+        };
+        if binary.len() > MAX_MODULE_BYTES {
+            return Err(provider("wasm/module"));
+        }
         if limits.fuel == 0 || limits.fuel > MAX_FUEL {
             return Err(provider("wasm/limits"));
         }
@@ -242,7 +262,7 @@ impl WasmTool {
         config.set_max_recursion_depth(MAX_RECURSION_DEPTH);
         config.set_max_stack_height(MAX_STACK_BYTES);
         let engine = Engine::new(&config);
-        let module = Module::new(&engine, bytes).map_err(|_| provider("wasm/module"))?;
+        let module = Module::new(&engine, &binary).map_err(|_| provider("wasm/module"))?;
         // The policy is about *functions*: an import with a granted name but the
         // wrong kind or signature is not a granted import, and accepting it
         // would rest the guarantee on the linker's own resolution instead of on
@@ -329,13 +349,35 @@ impl WasmTool {
         if input.len() > OUTPUT_OFFSET {
             return Err(provider("wasm/input"));
         }
-        // wasmi does not charge fuel for `memory.grow`, so the store limiter is
-        // what keeps a guest from allocating memory the grant never paid for.
-        // `invoke` has already capped `limits.fuel` to the call's grant, so the
-        // ceiling is what that fuel could buy at `FUEL_PER_MEMORY_KIB`
-        // (round 20, HIGH #1).
-        let affordable = (self.limits.fuel / FUEL_PER_MEMORY_KIB)
-            .saturating_mul(1024)
+        // The module's declared initial memory, read before anything is
+        // allocated: it is both the reservation below and the subtraction in the
+        // growth ceiling. The module's own declaration, not the configured
+        // ceiling, is what instantiation allocates (round 19, M1); a module with
+        // no exported memory falls back to the ceiling because its size is not
+        // knowable here.
+        let declared_kib = self
+            .module
+            .exports()
+            .find(|export| export.name() == "memory")
+            .and_then(|export| match export.ty() {
+                wasmi::ExternType::Memory(memory) => Some(memory.minimum()),
+                _ => None,
+            })
+            .map(|pages| pages.saturating_mul(64))
+            .unwrap_or((self.limits.max_memory_bytes as u64).div_ceil(1024));
+        let reserved_fuel = declared_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
+        // wasmi debits `memory.grow` against the store's fuel (measured: 233
+        // pages from a 30 000-fuel grant is refused out of fuel, while the same
+        // guest under a 1e6-fuel grant runs), so the engine is the accounting.
+        // The store limiter is the *bound*: it caps the total memory at the
+        // declared memory plus what the unspent fuel could buy, so a guest
+        // cannot reach a size the grant could never pay for even if the engine's
+        // rate changed (round 20, HIGH #1; R-14 round 3, M-1).
+        let spare_fuel = self.limits.fuel.saturating_sub(reserved_fuel);
+        let declared_bytes = declared_kib.saturating_mul(1024);
+        let growth = (spare_fuel / FUEL_PER_MEMORY_KIB).saturating_mul(1024);
+        let affordable = declared_bytes
+            .saturating_add(growth)
             .min(u64::try_from(self.limits.max_memory_bytes).unwrap_or(u64::MAX))
             .max(MIN_MEMORY_BYTES as u64) as usize;
         let limits = StoreLimitsBuilder::new()
@@ -455,22 +497,9 @@ impl WasmTool {
         // evidence (ADR-0019), not a success signal.
         // Reserve the module's declared initial memory before the instance
         // exists: a module that asks for 256 MiB must not spend the allocation
-        // (and its wall time) before the refusal (round 18, #1). The module's
-        // own declaration, not the configured ceiling, is what instantiation
-        // allocates; charging the ceiling refused a two-page module under a
-        // small grant (round 19, M1). A module with no exported memory falls
-        // back to the ceiling, because its size is not knowable here.
-        let declared_kib = self
-            .module
-            .exports()
-            .find(|export| export.name() == "memory")
-            .and_then(|export| match export.ty() {
-                wasmi::ExternType::Memory(memory) => Some(memory.minimum()),
-                _ => None,
-            })
-            .map(|pages| pages.saturating_mul(64))
-            .unwrap_or((self.limits.max_memory_bytes as u64).div_ceil(1024));
-        let reserved_fuel = declared_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
+        // (and its wall time) before the refusal (round 18, #1). Charging the
+        // ceiling instead refused a two-page module under a small grant
+        // (round 19, M1); the declaration was read before the store existed.
         let granted = store.get_fuel().unwrap_or(0);
         if reserved_fuel > granted {
             // A grant too small to pay for the guest's own memory is a fuel
@@ -672,7 +701,17 @@ impl Provider for WasmTool {
         for arg in &call.args {
             let bytes: &[u8] = match arg {
                 Arg::Value(Value::Text(text)) => text.as_bytes(),
-                Arg::Value(Value::Module(bytes)) => bytes,
+                // A module image can carry a structural secret, which the
+                // guest would read as plain input and could return mangled into
+                // an opaque blob the egress check cannot see. The rule "a secret
+                // is not a wasm argument" applies to this shape too
+                // (R-14 round 3, L-3).
+                Arg::Value(Value::Module(bytes)) => {
+                    if crate::security::module_carries_a_secret(bytes) {
+                        return Err(Error::ToolPolicy("a secret is not a wasm argument"));
+                    }
+                    bytes
+                }
                 // A secret is authority the capability did not grant to this
                 // adapter, a policy refusal rather than a malformed argument
                 // (round 20, L8).
@@ -733,7 +772,9 @@ impl Provider for WasmTool {
             host,
             log: Vec::new(),
             last_random_used: 0,
-            random_cap: share,
+            // Inheritance narrows: a child can never hold a wider entropy
+            // ceiling than its parent (R-14 round 3, L-2).
+            random_cap: self.random_cap.min(share),
             now_ms: call.now_ms,
         };
         let result = tool.call(&input);
@@ -811,7 +852,12 @@ fn classify_instantiation(error: wasmi::Error) -> Error {
         wasmi::errors::ErrorKind::Memory(_) | wasmi::errors::ErrorKind::Table(_) => {
             provider("wasm/limits")
         }
-        wasmi::errors::ErrorKind::Instantiation(_) => provider("wasm/import"),
+        // Everything else in this class is a structural instantiation failure
+        // (a missing or mismatched import that reached the linker, an unexpected
+        // start function). Reporting it as an import-policy refusal told an
+        // operator to change a grant that was never the problem
+        // (R-14 round 3, L-1).
+        wasmi::errors::ErrorKind::Instantiation(_) => provider("wasm/instantiate"),
         _ => provider("wasm/instantiate"),
     }
 }

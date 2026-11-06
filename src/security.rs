@@ -248,6 +248,17 @@ fn module_has_secret(bytes: &[u8]) -> Result<bool> {
     }))
 }
 
+/// True when a module image carries a structural secret.
+///
+/// `false` for bytes that are not an image: opaque data has no secret structure
+/// this walk can see. An adapter that must not hand secrets to third-party code
+/// asks this first — the wasm sandbox writes its input into guest memory, and a
+/// guest can return it mangled into an opaque blob the egress check passes
+/// through by design (R-14 round 3, L-3).
+pub fn module_carries_a_secret(bytes: &[u8]) -> bool {
+    module_has_secret(bytes).unwrap_or(true)
+}
+
 /// True when the bytes are an Active Infinity image.
 ///
 /// `Value::Module` also carries opaque provider output (a WASM tool's binary

@@ -214,7 +214,8 @@ A provider failure is `rpc/provider` with an inner code in the provider's own
 namespace. The kernel itself reports `rpc/provider` (a provider panicked or
 vanished), `wasm/trap` (a panic inside the kernel's own egress policy) and
 `provider/reply-withheld`; the domain provider reports `provider/redaction`
-and `provider/object`. An error envelope carries the inner code when it is
+and `provider/object`; `provider/egress-panic` is the kernel's own code for a
+panic inside the egress policy walk, which any provider can trigger. An error envelope carries the inner code when it is
 ASCII and at most 64 bytes (`Envelope::error`), and falls back to `rpc/provider`
 otherwise, so the destination field stays decodable under the strict profile.
 
@@ -224,6 +225,7 @@ otherwise, so the destination field stays decodable under the strict profile.
 | `provider/secret-material` | a provider reply would have carried structural secret material and the redaction policy refused it |
 | `provider/redaction` | the provider could not build its redacted projection (an encode fault in its own reply) |
 | `provider/object` | the capability names an object the provider no longer holds |
+| `provider/egress-panic` | the egress policy walk (redaction or the structural-secret check) unwound while inspecting this provider's reply; the reply is refused and the provider's own code never saw it. It is not attributed to any adapter, so a `wasm/trap` in a receipt is always the guest's |
 
 The domain provider reports `rpc/domain` where the evaluator failed (the Active
 class stays local) and `rpc/budget-exceeded` with the dimension it measured

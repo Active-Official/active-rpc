@@ -3171,6 +3171,26 @@ unexercised; `docs/spec/wire.md` now documents `ARRP`.
 Gate: `scripts/local_gate.sh` green (all-features 669, no-default, clippy both
 sets, fmt, doc, fuzz, control-plane, CLI, negative controls 9/9, MSRV 1.88).
 
+### R-14 wasm tools - 2026-11-06 (round 3)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `2488619`. All
+five round-2 claims held. Verdict **not clean**: one medium and seven lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M-1 | medium | `memory.grow` was "capped but never debited", so a guest could hold the memory its grant could buy and still spend its instruction budget (up to 2x the grant) | **refuted with a test**: wasmi debits `memory.grow` against the store's fuel. `a_memory_grow_is_paid_for_out_of_the_guest_fuel` shows the same guest refused `wasm/fuel` under a 30 000-fuel grant, a guest that does not grow running under that grant, and the growing guest running under 1e6 fuel — so the engine is the accounting. The store limiter stays the bound (declared memory plus the growth the unspent fuel could buy), and the two comments that asserted the engine charges nothing are corrected |
+| L-1 | low | every unmatched `InstantiationError` was reported as `wasm/import`, telling an operator to change a grant that was never the problem | **fixed**: the residual class is `wasm/instantiate`. No fixture reaches that class without a resource cause, so the change is a label with no dedicated test |
+| L-2 | low | `random_cap` was overwritten, not narrowed, so a child could inherit a wider entropy ceiling than its parent | **fixed**: `random_cap: self.random_cap.min(share)`. Unreachable today (no public setter, no nesting), so a test would assert a path that cannot be taken |
+| L-3 | low | a module argument could carry a structural secret into guest code, and a guest could return it mangled into an opaque blob the egress check passes | **fixed**: `security::module_carries_a_secret` (fail-closed) refuses such an argument as `rpc/tool-policy`; `a_secret_bearing_module_argument_is_refused` also pins that opaque bytes still reach the guest |
+| L-4 | low | declared tables were capped but not fuel-charged, `tables(4)` was 4x the documented table ceiling, and `MAX_TABLE_ELEMENTS`' arithmetic was 16x off | **documents corrected** and the residual stated: the limiter bounds one call at about 4 MiB of table slots, and a module's declared tables cannot be enumerated through the engine's public API, so the reservation cannot see them |
+| L-5 | low | with `accept_wat`, the 1 MiB ceiling bounded the source text, not the binary the engine compiles | **fixed**: `wat` becomes an optional dependency of the `wasm-tools` feature, the text is parsed first and the *binary* is bounded by `MAX_MODULE_BYTES`. (A text that expands past 1:1 is hard to construct, so the test is the code path, not a fixture.) |
+| L-6 | low | `wasm/trap` was also the kernel's code for its own egress-policy panic, so a receipt could not attribute a trap to a wasm guest | **fixed**: the kernel's two egress panic sites report `provider/egress-panic`, documented in `wire.md`; `wasm/trap` is now the wasm provider's alone |
+| L-7 | low | the ADR's error table omitted `wasm/output-limit` and still described `wasm/output` as "negative or over the ceiling" | **fixed**: the table splits the two codes and says when the adapter reports the budget class |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; the
+`rust:1.99` Linux suite; control plane, CLI, fuzz; negative controls 9/9; the
+red-team battery green.
+
 ### R-14 wasm tools - 2026-11-02 (round 2, confirmation)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `cb44d07`.
