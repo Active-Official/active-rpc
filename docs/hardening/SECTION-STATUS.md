@@ -24,7 +24,7 @@ Updated 2026-11-06 at `cf5f969`.
 | R-10 | bulk transfer | 17 | open | r16 fixed two mediums (wall-failure accounting, `abort` scope); r17 in flight |
 | R-11 | identity | 14 | open | r13 fixed two mediums (child-first rotation, event schema); r14 in flight |
 | R-12 | replay | 6 | **closed** | r5 and r6 CLEAN |
-| R-13 | receipts | 7 | open | r6 fixed one medium (live-pid lock steal); r7 in flight |
+| R-13 | receipts | 8 | open | r7 fixed four mediums; r8 fixed two mediums and five lows (lock ownership, one liveness predicate, quarantine steal, lossy lock parse); r9 needed for a first clean round |
 | R-14 | wasm tools | 3 | open | r3 refuted its medium with a test and fixed seven lows; r4 needed |
 | R-15 | observability | 2 | open | r2 had one high and two mediums, all fixed; r3 and r4 needed |
 | R-16 | security helpers | 3 | open | r3 had three mediums, all fixed; r4 and r5 needed |
