@@ -645,8 +645,11 @@ taken (`rpc/bulk`), so a body is never silently dropped inside its window.
 `abort` drops whatever the object holds — an open transfer, an untaken body
 and its digest reply — and answers `dropped` (false when there was nothing). It
 is the caller's own way out of a transfer it no longer wants or cannot finish:
-a refusal must never destroy a paid body, so the decision to discard one belongs
-to the party that paid for it. It is idempotent and needs no plan.
+a refusal must never destroy a paid body, so the party that owns the object must
+be able to say so. It acts on the **object**, like every other bulk method, so
+it inherits the object model's rule that an object has one principal: a host
+that mints a second capability on the same object gives that party the right to
+discard the object's state. It is idempotent and needs no plan.
 `missing` answers the indexes the request frame names (page-capped at 1 024, with
 `more` and `remaining`; an empty payload asks for the lowest window), refreshes
 the idle window, and never expires a transfer by idleness: a read-only
@@ -675,29 +678,33 @@ Four more dimensions bound the same transfer. The wall grant should cover
 content address, linear in the body) **on both the capability and the lane**,
 because the kernel meters a call against the narrower of the two
 (`required_lane_wall_ms()` is the same number). That is the recommended sizing;
-the hard floor is `BulkPlan::assembly_wall_ms()`, the body's own cost at the
-documented rate with 100 ms of slack, so a deployment that mints narrow grants
-can still finish a small body. The lane's cumulative
+`BulkPlan::assembly_wall_ms()` is the estimate the freeze is judged against — the
+body's own cost at the documented rate, a per-chunk term and 100 ms of slack —
+so a deployment that mints narrow grants can still finish a small body. The lane's cumulative
 `max_bytes` must cover `BulkPlan::required_lane_bytes()`. A provider built with
 `with_max_live_bytes` refuses with `rpc/budget-exceeded` a plan that would push
 the bytes it holds past that bound, where each open transfer reserves twice its
 announced total (the stored chunks and the assembly buffer) plus the plan's own
 hash vector (32 bytes per chunk and the 53-byte header), because the plan is
 retained for the whole transfer; a `finish` of an image adds a third, transient
-body copy for the redaction. A `finish` whose wall grant is below
-`BulkPlan::assembly_wall_ms()` is an under-resourced attempt: three of them may
-assemble the body, and after that the provider **freezes** the transfer and
-refuses it with `rpc/bulk` before any work, because a cheap frame must not buy
-repeated copies. The stored chunks are **never** destroyed by a refusal (a body
-the caller paid to transfer survives every refusal), and an attempt whose grant
-reaches the body's wall always runs and clears the refusal budget, so a caller
-that pays for the work never inherits the count of cheap attempts. A refusal
-that did no work (the deadline had already passed) does not spend it. A frozen
-transfer has two ways out: the host mints a grant at the body's wall, or the
-caller abandons it with `abort`. A same-root `plan` frame does **not** clear the
-freeze, which is what stops a 53-byte frame from re-assembling a paid body. The
-verification pass is inside the wall grant, chunk by chunk; the redaction pass
-of a valid image runs once it starts.
+body copy for the redaction. A `finish` that runs out of wall is counted: **every**
+such failure increments the transfer's count, whatever the grant, because an
+attempt that presents the body's own wall and still expires is evidence that the
+estimate is wrong for this host. After three failures at a grant the transfer
+refuses with `rpc/bulk` before any work, so three cheap frames cannot buy
+repeated copies, and repeating the same refused grant does not get a fresh
+allowance. The only thing that clears the count is a grant **strictly wider**
+than one that has already failed — a price the transfer has not refused — which
+is why the sizing to mint is `required_wall_ms()`. The stored chunks are
+**never** destroyed by a refusal (a body the caller paid to transfer survives
+every refusal), and a refusal that did no work (the deadline was already spent
+when the assembly was due to start) does not count. A frozen transfer has two
+ways out: the host mints a wider grant, or the caller abandons it with `abort`.
+A same-root `plan` frame does **not** clear the freeze, which is what stops a
+53-byte frame from re-assembling a paid body. The verification pass is inside
+the wall grant, chunk by chunk; the redaction pass of a valid image runs once it
+starts, and a reply degraded because the grant was spent (`content_error: wall`)
+is recomputed **once** on a later `finish` that still has wall left.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

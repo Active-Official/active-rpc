@@ -216,6 +216,14 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
   record (a provider-supplied stable key) and a resolver on restore; it is
   additive to the record format and is tracked as RPC-10 in the program
   residuals register.
+- **A provider cannot see who is calling.** `Call` carries the method, arguments,
+  policy flags, the effective budget, the payload and the kernel clock: no
+  capability id, lane or peer. Provider state is keyed by object, so the bulk
+  provider's `abort` is an object-scoped destructor and a host that mints a second
+  capability on the same object lets that party discard the first's transfer; the
+  object model's one-principal rule is the boundary. Closing this needs the
+  capability id (or the principal) in `Call`, an additive API change, and is
+  tracked as RPC-11 in the program residuals register.
 - **Timing.** Tool adapters and transports do real I/O and are outside the
   constant-time claim; the kernel itself has no secret-dependent comparison.
 

@@ -103,23 +103,30 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   may bound the bytes it holds across objects with `with_max_live_bytes`, where
   each open transfer reserves two body copies plus the retained plan hash
   vector.
-- A `finish` whose wall grant is below `assembly_wall_ms()` (the body's own cost
-  at the documented rate plus 100 ms) may assemble three times; after that the
-  provider **freezes** the transfer and refuses it with `rpc/bulk` before any
-  work. Re-copying a body on every tiny grant is CPU the caller did not pay for,
-  and a same-root `plan` frame does not clear the freeze, so a 53-byte frame
-  cannot buy another batch of assemblies. `required_wall_ms()` is the
-  *recommended* sizing — the floor of the default grant — while the freeze gates
-  on the body's own wall, so a narrow-profile deployment can still finish a small
-  body. The stored chunks are never destroyed by a refusal: the
-  non-destructiveness rule outranks the throttle, an attempt at the body's wall
-  always runs and clears the refusal budget, and `abort` is the caller's own way
-  to discard what it no longer wants.
-- A frozen transfer has exactly two ways out: a grant at the body's wall, which
-  the host mints (the peer cannot widen its own cap ∩ lane), or `abort`. Closing
-  the second is what makes the freeze safe to hold: without it the only release
-  is the idle or absolute window, and the object's slot and its reserved bytes
-  stay held until then.
+- Every `finish` that runs out of wall is counted, whatever its grant: an
+  attempt that presents `assembly_wall_ms()` and still expires is evidence that
+  the estimate is wrong for this host, not a payment to forget (R-10 round 16).
+  After three failures at a grant the provider **freezes** the transfer and
+  refuses it with `rpc/bulk` before any work, and a same-root `plan` frame does
+  not clear the freeze, so a 53-byte frame cannot buy another batch of
+  assemblies. The only thing that clears the count is a grant **strictly wider**
+  than one that has already failed — a price the transfer has not refused — so
+  the sizing to mint is `required_wall_ms()`: the body's own cost with a
+  per-chunk term and slack, never below the default grant. The stored chunks are
+  never destroyed by a refusal: the non-destructiveness rule outranks the
+  throttle, and `abort` is the caller's own way to discard what it no longer
+  wants.
+- A frozen transfer has exactly two ways out: a wider grant, which the host mints
+  (the peer cannot widen its own cap ∩ lane), or `abort`. Closing the second is
+  what makes the freeze safe to hold: without it the only release is the idle or
+  absolute window, and the object's slot and its reserved bytes stay held until
+  then. `abort` acts on the object, so a host that mints a second capability on a
+  shared object hands that party the right to discard it; the object model's
+  one-principal rule is the boundary, and a provider cannot see the capability id
+  today (recorded as RPC-11).
+- A reply degraded because the grant was spent (`content_error: wall`) is
+  recomputed once on a later `finish` that still has wall left, and the record
+  then says it did, so a replay loop cannot buy repeated redactions (round 16).
 - The finish reply carries `canonical`, and `content_error` when an image's
   address could not be computed (`wall` or `parser`); a degraded reply is
   recorded as degraded instead of looking like a body without an address.

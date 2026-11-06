@@ -146,7 +146,7 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
   and `BulkTransfer` drives a sender.
 - **Bounded peer input.** `frames_for` deduplicates and refuses a list longer than
   the plan; `frames_from` refuses a resume point past the plan; `decode` refuses
-  a declared total above the ceiling or more than 65 536 chunks before
+  a declared total above the ceiling or more than 32 700 chunks before
   allocating the hash list; `BulkChunk::try_new` refuses an oversized chunk.
 - **Peak memory and CPU.** `finish` moves chunks out of the map instead of holding
   two copies, and a chunk frame carries the hash it was built with, so a

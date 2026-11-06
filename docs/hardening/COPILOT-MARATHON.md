@@ -2596,6 +2596,31 @@ Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
 
+### R-10 bulk transfer - 2026-11-06 (round 16)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `2488619`. All
+five round-14/15 claims verified except one: the "did no work" exemption was a
+tautology. Verdict **PARTIAL**: two mediums and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | a "workable" attempt that fails at the wall cleared the counter before it ran and was gated out of the increment, so on a host slower than the estimate a caller could assemble the body without bound at the same grant | **fixed**: every wall failure counts, whatever its grant, and `wall_failed_at_ms` remembers the widest grant that failed; the count is cleared only by a grant **strictly wider** than that, which is a price the transfer has not refused. `throttle` is a pure function with a unit test (`the_wall_throttle_counts_every_failure_and_needs_a_wider_grant_to_clear`) covering the same grant, a narrower one, a strictly wider one and a zero grant; `repeating_a_refused_grant_does_not_get_a_free_pass` pins the provider behaviour. The exact host-dependence cannot be reproduced on this machine (that is the bug), so the decision is pinned by the unit test and the entry says so |
+| 2 | medium | `abort` is an object-scoped destructor: a host that mints two capabilities on one object lets the second discard the first's transfer, while the docs said the decision belongs to "the party that paid" | **documented and pinned**: `abort` acts on the object like every other bulk method, so it inherits the one-principal rule; `wire.md`, ADR-0013 and `STATUS.md` say it, `a_sibling_capability_on_a_shared_object_can_abort` pins the boundary, and the gap behind it (a provider cannot see the capability id) is recorded as **RPC-11** with its closure |
+| 3 | low | `entered < deadline` was a tautology (`deadline = entered + max_wall_ms`), so the documented "did no work" exemption was dead code and a zero-grant attempt was counted by accident | **fixed**: `started` is taken immediately before the assembly starts, and the increment tests `started < deadline`. `a_zero_grant_attempt_never_counts_against_the_budget` drives five zero-grant attempts, then three real ones, then the freeze |
+| 4 | low | `assembly_wall_ms` had no per-chunk term, so a maximal-chunk-count body measured only 1.3-1.7x its own wall | **fixed**: the bound adds `chunk_count.div_ceil(250)` (4 us per chunk, 131 ms at the 32 700 ceiling); `the_body_wall_is_the_bodys_own` now asserts that the same bytes in more chunks need strictly more wall |
+| 5 | low | a `wall`-degraded reply was permanent although the body was still resident | **fixed**: the completed fast path recomputes the address **once** when a later `finish` still has wall, records that it did, and then replays that answer. `a_wall_degraded_reply_is_recomputed_once` fails when the recompute is stripped and passes with it |
+| 6 | low | `CHANGELOG.md` said "more than 65 536 chunks" while `MAX_CHUNKS` is 32 700 | **fixed**: the number is corrected |
+
+The reviewer's probe answers confirmed what the earlier rounds had reasoned: a
+re-plan, a re-put, a second object, `call.redact` and `missing` buy no extra
+assembly; `abort` is refused to a read-only capability; the redaction pass is
+outside the grant by design (the reply degrades to `content_error: wall`, now
+recoverable once).
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; the
+`rust:1.99` Linux suite; control plane, CLI, fuzz; negative controls 9/9; the
+red-team battery green.
+
 ### R-10 bulk transfer - 2026-11-06 (round 15)
 
 The round-14 findings, closed. Two of them were defects in round 13's own work.

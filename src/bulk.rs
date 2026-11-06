@@ -115,27 +115,36 @@ pub const FINISH_BYTES_PER_MS: u64 = 128 * 1024 * 1024 / 1000;
 /// Each one may assemble, verify and classify the whole body, so the budget is
 /// what stops a 53-byte frame from buying a body-sized copy over and over
 /// (R-10 round 13). Three is the number the spec states.
-pub const WALL_REFUSAL_LIMIT: u32 = 3;
+pub const WALL_REFUSAL_LIMIT: u8 = 3;
 
 /// What the wall throttle decides for one `finish` attempt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Throttle {
-    /// The attempt may run. `workable` says its grant reaches the body's wall,
-    /// which also clears the transfer's refusal budget: a caller that paid for
-    /// the work must not inherit the count of cheap attempts (R-10 round 15).
-    Run { workable: bool },
-    /// Under-resourced attempts are spent: refuse before any work.
+    /// The attempt may run. `funded` says its grant is wider than any grant that
+    /// has already run out of wall, so it is a price this transfer has not
+    /// refused and it clears the failure count.
+    Run { funded: bool },
+    /// The wall attempts are spent: refuse before any work.
     Frozen,
 }
 
-/// Whether a `finish` attempt runs, given the body's wall, the caller's grant
-/// and the attempts already spent.
-fn throttle(body_wall_ms: u64, grant_wall_ms: u64, refusals: u8) -> Throttle {
-    let workable = grant_wall_ms >= body_wall_ms;
-    if !workable && u32::from(refusals) >= WALL_REFUSAL_LIMIT {
+/// Whether a `finish` attempt runs, given the caller's grant, the widest grant
+/// that has run out of wall, and the failures already counted.
+///
+/// Every wall failure counts, whatever its grant: an attempt that presents the
+/// body's own wall and still expires is evidence that the estimate is wrong for
+/// this host, not a payment that must be forgotten (R-10 round 16, #1). The only
+/// way to clear the count is a grant *strictly wider* than one that has already
+/// failed, which is a price the transfer has not refused. A transfer that keeps
+/// failing at the same grant freezes after [`WALL_REFUSAL_LIMIT`] failures and
+/// has the two documented ways out: a wider grant, or `abort`.
+fn throttle(grant_wall_ms: u64, failed_at_ms: u64, refusals: u8) -> Throttle {
+    if grant_wall_ms > failed_at_ms {
+        Throttle::Run { funded: true }
+    } else if refusals >= WALL_REFUSAL_LIMIT {
         Throttle::Frozen
     } else {
-        Throttle::Run { workable }
+        Throttle::Run { funded: false }
     }
 }
 
@@ -380,7 +389,16 @@ impl BulkPlan {
     /// whose grant is below it, and a caller that can obtain it always finishes
     /// (R-10 round 15, #2).
     pub fn assembly_wall_ms(&self) -> u64 {
-        self.total.div_ceil(FINISH_BYTES_PER_MS).saturating_add(100)
+        // The per-chunk term is not decoration: the verification pass builds and
+        // finalises one hash per chunk and both passes read the clock per chunk,
+        // so a maximal-chunk-count body measured 1.3-1.7x the byte-only estimate
+        // (R-10 round 16, #4). Four microseconds per chunk keeps a ~4x margin on
+        // top of the measured cost.
+        let per_chunk = u64::from(self.chunks).div_ceil(250);
+        self.total
+            .div_ceil(FINISH_BYTES_PER_MS)
+            .saturating_add(per_chunk)
+            .saturating_add(100)
     }
 
     /// The wall grant a `finish` should be sized for, in milliseconds.
@@ -1304,6 +1322,10 @@ struct ActiveTransfer {
     /// Finishes refused by the wall grant. Each one re-assembles the body, so a
     /// caller cannot buy CPU with a 45-byte frame (round 9, M4).
     wall_refusals: u8,
+    /// The widest wall grant that has run out of wall. A grant above it is a
+    /// price this transfer has not refused, and it clears the count
+    /// (R-10 round 16, #1).
+    wall_failed_at_ms: u64,
 }
 
 /// A body that finished and has not been taken by the host yet.
@@ -1315,6 +1337,10 @@ struct CompletedTransfer {
     root: [u8; 32],
     total: u64,
     at_ms: u64,
+    /// Whether a `wall`-degraded content address has already been recomputed
+    /// once. A replay may pay for one recomputation, never for a loop of them
+    /// (R-10 round 16, #5).
+    recomputed: bool,
 }
 
 /// The digest reply for a finished body, kept after the host takes the bytes so
@@ -1332,6 +1358,34 @@ struct FinishedTransfer {
     /// When the reply was recorded: the record is released with the same window
     /// as an untaken body (round 6, L7).
     at_ms: u64,
+}
+
+/// The content address of a body, if the body has one.
+///
+/// `(None, Some("wall"))` means the grant was spent before the classification
+/// started; `(None, None)` means the body is not an image;
+/// `(None, Some("parser"))` means it is an image the redaction refuses. A panic
+/// in the Infinity parser must not leave the object without a digest reply: the
+/// content address is optional, the record is not (round 8, L2). The probe runs
+/// inside `catch_unwind` because the caller releases the chunks, so an unwind
+/// would leave a transfer that can never finish (round 11, L-3).
+fn classify_body(body: &[u8]) -> (Option<[u8; 32]>, Option<&'static str>) {
+    let classified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match crate::security::redact_module(body) {
+            Ok(redacted) => match active_infinity::content_hash(&redacted) {
+                Ok(address) => Ok(Some(address)),
+                Err(_) => Err(active_infinity::decode(body).is_ok()),
+            },
+            Err(_) => Err(active_infinity::decode(body).is_ok()),
+        }
+    }));
+    match classified {
+        Ok(Ok(Some(address))) => (Some(address), None),
+        Ok(Ok(None)) => (None, None),
+        Ok(Err(true)) => (None, Some("parser")),
+        Ok(Err(false)) => (None, None),
+        Err(_) => (None, Some("parser")),
+    }
 }
 
 /// A provider that receives a bulk body through ordinary calls.
@@ -1628,6 +1682,7 @@ impl BulkProvider {
                 last_ms: call.now_ms,
                 created_ms: call.now_ms,
                 wall_refusals: 0,
+                wall_failed_at_ms: 0,
             },
         );
         // A new transfer is a new exchange: the previous body's digest reply is
@@ -1738,15 +1793,33 @@ impl BulkProvider {
         // not be receipted as a refusal (round 3, F3). The digest summary
         // outlives the bytes, so the answer survives `take_body` and the
         // completed window (round 4, L-4, L-5).
-        if let Some(done) = self.completed.get(&object) {
+        if let Some(done) = self.completed.get_mut(&object) {
             BulkFinish::decode_for(&call.payload, done.total, done.root)?;
-            return Ok(finished_reply(
+            // A reply degraded by a spent grant is not final while the body is
+            // still resident: one replay that can pay recomputes the address
+            // once, and the record then says it did (R-10 round 16, #5).
+            if !done.recomputed
+                && done.body.content_hash().is_none()
+                && done.body.content_error() == Some("wall")
+                && call.budget.max_wall_ms > 0
+            {
+                let (content, content_error) = classify_body(done.body.body());
+                done.recomputed = true;
+                done.body.content = content;
+                done.body.content_error = content_error;
+                if let Some(last) = self.last_finished.get_mut(&object) {
+                    last.content = content;
+                    last.content_error = content_error;
+                }
+            }
+            let reply = finished_reply(
                 done.body.len() as u64,
                 done.body.body_hash(),
                 done.body.content_hash(),
                 done.body.content_error(),
                 call.redact,
-            ));
+            );
+            return Ok(reply);
         }
         if let Some(done) = self.last_finished.get(&object) {
             BulkFinish::decode_for(&call.payload, done.total, done.root)?;
@@ -1801,36 +1874,42 @@ impl BulkProvider {
             // A None deadline would mean no bound at all: an already-passed
             // deadline fails closed instead (round 11, L-5).
             .unwrap_or_else(std::time::Instant::now);
-        // A transfer whose grant is below the wall the body can need gets
-        // three assemblies and then only refusals: a cheap frame must not buy
-        // repeated CPU. The bound is the body's own (`assembly_wall_ms`), so a
-        // small body stays finishable under a narrow grant; `required_wall_ms`
-        // is the recommended sizing. The chunks are never released by a
-        // refusal — a refusal must not destroy a body the caller paid to
-        // transfer — and an attempt whose grant reaches the bound is always
-        // allowed (R-10 round 13/15).
-        let (bound, refusals) = self.transfers.get(&object).map_or((0, 0), |active| {
-            (active.plan.assembly_wall_ms(), active.wall_refusals)
+        // A transfer that keeps running out of wall gets three assemblies and
+        // then only refusals: a cheap frame must not buy repeated CPU. Every
+        // failure counts, whatever its grant — an attempt that presents the
+        // body's own wall and still expires is evidence that the estimate is
+        // wrong for this host, not a payment to forget — and the only way to
+        // clear the count is a grant strictly wider than one that has already
+        // failed (R-10 round 13/15/16). The chunks are never released by a
+        // refusal: a refusal must not destroy a body the caller paid to
+        // transfer.
+        let (refusals, failed_at) = self.transfers.get(&object).map_or((0, 0), |active| {
+            (active.wall_refusals, active.wall_failed_at_ms)
         });
-        let workable = match throttle(bound, call.budget.max_wall_ms, refusals) {
+        let funded = match throttle(call.budget.max_wall_ms, failed_at, refusals) {
             // A state refusal, not a budget class: the transfer will not take
-            // another under-resourced attempt, and the same frame with the same
-            // grant is refused identically. The message names both ways out.
+            // another attempt at a grant it has already refused, and the same
+            // frame is refused identically. The message names both ways out.
             Throttle::Frozen => {
                 return Err(Error::Bulk(
-                    "finish is frozen after three under-resourced attempts: grant the body's wall or abort",
+                    "finish is frozen after three attempts at a refused wall grant: grant more wall or abort",
                 ))
             }
-            Throttle::Run { workable } => workable,
+            Throttle::Run { funded } => funded,
         };
-        if workable {
-            // A workable attempt is the caller honouring the contract, so it
-            // earns a fresh budget: three cheap refusals must not make a body
-            // unfinishable once the host widens the grant (round 15, #3).
+        if funded {
+            // A wider grant is a price the transfer has not refused, so three
+            // cheap failures must not make a body unfinishable once the host
+            // widens it (round 15, #3).
             if let Some(active) = self.transfers.get_mut(&object) {
                 active.wall_refusals = 0;
             }
         }
+        // The instant the assembly starts, not the instant the deadline was
+        // built: `entered < deadline` held for every positive grant and turned
+        // the documented "did no work" exemption into dead code
+        // (R-10 round 16, #3).
+        let started = std::time::Instant::now();
         let (body, body_hash) = {
             let active = self
                 .transfers
@@ -1839,16 +1918,14 @@ impl BulkProvider {
             match active.receiver.finish_within(Some(deadline)) {
                 Ok(pair) => pair,
                 Err(error) => {
-                    // Only an under-resourced refusal that ran out of time
-                    // while working spends the budget: a deadline that had
-                    // already passed did no work, and a workable attempt is a
-                    // legitimate retry the caller paid for (round 11, M-2;
-                    // round 13).
-                    if !workable
-                        && matches!(&error, Error::BudgetExceeded("wall"))
-                        && entered < deadline
-                    {
+                    // Every wall failure that did work counts, and the widest
+                    // one is remembered. A refusal that never started (the
+                    // deadline was already spent) did no work and is not
+                    // evidence about the grant (round 11, M-2; round 16, #1).
+                    if matches!(&error, Error::BudgetExceeded("wall")) && started < deadline {
                         active.wall_refusals = active.wall_refusals.saturating_add(1);
+                        active.wall_failed_at_ms =
+                            active.wall_failed_at_ms.max(call.budget.max_wall_ms);
                     }
                     return Err(error);
                 }
@@ -1866,30 +1943,7 @@ impl BulkProvider {
         let (content, content_error) = if spent {
             (None, Some("wall"))
         } else {
-            // A panic in the Infinity parser must not leave the object without
-            // a digest reply: the content address is optional, the record is
-            // not (round 8, L2). The allocation of the redacted projection is
-            // outside the fallible guarantee of `finish_within` (round 8, L4).
-            // The classification probe runs inside the same guard: the chunks
-            // are already released, so an unwind here would leave a transfer
-            // that can never finish (round 11, L-3). `Err(true)` means the body
-            // decodes as an image but cannot be redacted; `Err(false)` means it
-            // is not an image at all.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match crate::security::redact_module(&body) {
-                    Ok(redacted) => match active_infinity::content_hash(&redacted) {
-                        Ok(address) => Ok(Some(address)),
-                        Err(_) => Err(active_infinity::decode(&body).is_ok()),
-                    },
-                    Err(_) => Err(active_infinity::decode(&body).is_ok()),
-                }
-            })) {
-                Ok(Ok(Some(address))) => (Some(address), None),
-                Ok(Ok(None)) => (None, None),
-                Ok(Err(true)) => (None, Some("parser")),
-                Ok(Err(false)) => (None, None),
-                Err(_) => (None, Some("parser")),
-            }
+            classify_body(&body)
         };
         self.transfers.remove(&object);
         // A raw digest over a secret-bearing body is the value the domain
@@ -1920,6 +1974,10 @@ impl BulkProvider {
                 root,
                 total,
                 at_ms: call.now_ms,
+                // The reply this record is built from already ran the
+                // classification inside its grant, so a replay must not run it
+                // again (round 16, #5).
+                recomputed: false,
             },
         );
         Ok(reply)
@@ -2052,23 +2110,107 @@ fn hex(bytes: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod throttle_tests {
-    use super::{throttle, Throttle};
+    use super::{
+        throttle, BulkBody, BulkFinish, BulkPlan, BulkProvider, CompletedTransfer, Throttle,
+        WALL_REFUSAL_LIMIT,
+    };
+    use crate::kernel::Provider;
+    use crate::value::{Call, Response, Value};
 
-    /// The three cases a transfer can be in, and the reset a workable attempt
-    /// buys: a cheap attempt is counted, a paid one is not, and the freeze only
-    /// ever holds an under-resourced caller (R-10 round 13/15).
+    /// Every failure counts, whatever its grant, and only a *strictly wider*
+    /// grant clears the count: repeating an attempt at a grant the transfer has
+    /// already refused must freeze, which is what a "reaches the bound" reset
+    /// got wrong on a host slower than the estimate (R-10 round 13/15/16).
     #[test]
-    fn the_wall_throttle_counts_only_under_resourced_attempts() {
-        // Under the body's wall: three attempts, then the freeze.
-        assert_eq!(throttle(101, 100, 0), Throttle::Run { workable: false });
-        assert_eq!(throttle(101, 100, 2), Throttle::Run { workable: false });
-        assert_eq!(throttle(101, 100, 3), Throttle::Frozen);
-        // At or above it, an attempt always runs and reports it can pay, so the
-        // caller's budget is cleared however many cheap attempts came before.
-        assert_eq!(throttle(101, 101, 3), Throttle::Run { workable: true });
-        assert_eq!(throttle(101, 5_000, 9), Throttle::Run { workable: true });
-        // A zero grant is never workable, so it can freeze a transfer.
-        assert_eq!(throttle(101, 0, 0), Throttle::Run { workable: false });
-        assert_eq!(throttle(101, 0, 3), Throttle::Frozen);
+    fn the_wall_throttle_counts_every_failure_and_needs_a_wider_grant_to_clear() {
+        // A price the transfer has not refused always runs, however many
+        // failures came before it.
+        assert_eq!(throttle(8_000, 0, 0), Throttle::Run { funded: true });
+        assert_eq!(throttle(8_000, 1, 3), Throttle::Run { funded: true });
+        assert_eq!(throttle(8_001, 8_000, 9), Throttle::Run { funded: true });
+        // The same grant that already failed is counted, then frozen.
+        assert_eq!(throttle(132, 132, 0), Throttle::Run { funded: false });
+        assert_eq!(throttle(132, 132, 2), Throttle::Run { funded: false });
+        assert_eq!(throttle(132, 132, WALL_REFUSAL_LIMIT), Throttle::Frozen);
+        // So is a narrower one, and a zero grant on a fresh transfer is not a
+        // payment at all (it runs, does no work, and is not counted by the
+        // caller of this function).
+        assert_eq!(throttle(100, 132, 0), Throttle::Run { funded: false });
+        assert_eq!(throttle(100, 132, 3), Throttle::Frozen);
+        assert_eq!(throttle(0, 0, 0), Throttle::Run { funded: false });
+        assert_eq!(throttle(0, 132, 3), Throttle::Frozen);
+    }
+
+    /// A `wall`-degraded reply is not final while the body is resident: one
+    /// replay that can pay recomputes the address, and the record then refuses
+    /// to run the pass again, so a replay loop cannot buy repeated redactions
+    /// (R-10 round 16, #5). The fixture is the recorded state a spent grant
+    /// leaves behind; the entry point is the real `finish` method.
+    #[test]
+    fn a_wall_degraded_reply_is_recomputed_once() {
+        let module =
+            crate::domain::module_from_source("[app]\nname = \"bulk-r16\"\n", "bulk-r16.active")
+                .expect("module");
+        let image = active_infinity::encode(&module).expect("encode");
+        let plan = BulkPlan::new(&image, 4_096).expect("plan");
+        let mut provider = BulkProvider::new();
+        provider.completed.insert(
+            0,
+            CompletedTransfer {
+                body: BulkBody {
+                    body_hash: *blake3::hash(&image).as_bytes(),
+                    body: image,
+                    // The state a spent grant records: the address was never
+                    // computed, and the reply says why.
+                    content: None,
+                    content_error: Some("wall"),
+                },
+                root: plan.root(),
+                total: plan.total(),
+                at_ms: 0,
+                recomputed: false,
+            },
+        );
+        let marker = BulkFinish::new(&plan).encode();
+        let mut request = Call::new("finish", Vec::new()).with_payload(marker.clone());
+        request.now_ms = 1;
+
+        let reply = provider.invoke(0, &request).expect("the replay answers");
+        let Response::Value(Value::Map(entries)) = reply else {
+            panic!("a map reply");
+        };
+        assert!(
+            entries.contains_key("content"),
+            "the replay that can pay recomputes the address: {entries:?}"
+        );
+        assert!(
+            !entries.contains_key("content_error"),
+            "a recomputed address has no error: {entries:?}"
+        );
+        let recomputed = provider
+            .completed
+            .get(&0)
+            .expect("the record survives the replay")
+            .body
+            .content;
+        assert!(recomputed.is_some(), "the address is recorded");
+
+        // Break the body and mark the reply degraded again without clearing the
+        // one-shot flag: the shipped fast path must not run the pass again.
+        {
+            let done = provider.completed.get_mut(&0).expect("record");
+            done.body.body = vec![0u8; 8];
+            done.body.content = None;
+            done.body.content_error = Some("wall");
+        }
+        let reply = provider.invoke(0, &request).expect("the second replay");
+        let Response::Value(Value::Map(entries)) = reply else {
+            panic!("a map reply");
+        };
+        assert_eq!(
+            entries.get("content_error"),
+            Some(&Value::text("wall")),
+            "one recomputation per transfer, not one per replay"
+        );
     }
 }
