@@ -67,9 +67,10 @@ pub const MAX_TOTAL: u64 = 1 << 30;
 /// must leave room for the envelope framing as well, and for a capability
 /// descriptor with a `max_path`-length scope plus a one-entry cap delta (about
 /// 1.6 kB together). A full 1 GiB body therefore needs a chunk of at least
-/// `1 << 30 / 32 700` bytes, 32 836 (round 3, F8; round 4, L-2; round 5, F5;
-/// round 6, L4). A test encodes and decodes the maximal plan under the strict
-/// profile with such a descriptor and a delta attached.
+/// 32 837 bytes: `ceil(2^30 / 32 836)` is 32 701, one more than the ceiling
+/// (round 3, F8; round 4, L-2; round 5, F5; round 6, L4; round 7, L4). A test
+/// encodes and decodes the maximal plan under the strict profile with such a
+/// descriptor and a delta attached.
 pub const MAX_CHUNKS: u32 = 32_700;
 
 /// Wire overhead of one chunk frame: magic, version, index, offset, length and
@@ -82,9 +83,9 @@ pub const CHUNK_OVERHEAD: u64 = 4 + 1 + 4 + 8 + 4 + 32;
 
 /// How many missing indexes a `missing` reply lists.
 ///
-/// `Budget::strict()` allows 1 024 elements in one list, and a 32 766-chunk
-/// plan cannot be resumed from a single unbounded reply, so the reply is a
-/// window and the caller repeats it (round 3, F8).
+/// `Budget::strict()` allows 1 024 elements in one list, and a
+/// [`MAX_CHUNKS`]-chunk plan cannot be resumed from a single unbounded reply,
+/// so the reply is a window and the caller repeats it (round 3, F8).
 pub const MISSING_PAGE: usize = 1_024;
 
 /// Wire overhead of a plan frame: magic, version, chunk size, total length,
@@ -98,7 +99,7 @@ pub const FINISH_LEN: u64 = 4 + 1 + 8 + 32;
 ///
 /// A place, put, missing or finish reply is a small map; 128 bytes covers every
 /// fixed shape with room to spare (a missing page is larger, but a caller that
-/// pages a 32 760-chunk plan also needs the grant for those replies and
+/// pages a [`MAX_CHUNKS`]-chunk plan also needs the grant for those replies and
 /// [`BulkPlan::required_grant`] is the conservative bound).
 pub const REPLY_ALLOWANCE: u64 = 128;
 
@@ -268,15 +269,45 @@ impl BulkPlan {
     /// resume.
     ///
     /// `plan`, one `put` per chunk and `finish` (`chunks + 2`), plus one
-    /// `missing` page per 1 024 chunks for the resume the module advertises: a
-    /// caller that sizes its grant from this accessor can lose the connection
-    /// and finish rather than be refused mid-resume. `Budget::default()`
+    /// `missing` page per 1 024 chunks for the gaps-only resume the module
+    /// advertises: a caller that sizes its grant from this accessor can lose the
+    /// connection, ask what is missing and finish rather than be refused
+    /// mid-resume. A caller that re-sends every chunk instead uses
+    /// [`BulkPlan::required_calls_with_resume`]. `Budget::default()`
     /// `.max_calls` is 10 000, which a large body with small chunks exceeds; the
     /// caller raises it with the grant (round 5, F3; round 6, L8).
     pub fn required_calls(&self) -> u64 {
         let chunks = self.chunks as u64;
         let pages = chunks.div_ceil(MISSING_PAGE as u64);
         chunks.saturating_add(2).saturating_add(pages)
+    }
+
+    /// The call grant a transfer needs if the sender re-sends every chunk.
+    ///
+    /// Two `plan` frames, two `put` per chunk and one `finish`: the resume
+    /// [`BulkPlan::required_grant_with_resume`] pays for in bytes
+    /// (round 7, M2).
+    pub fn required_calls_with_resume(&self) -> u64 {
+        (self.chunks as u64).saturating_mul(2).saturating_add(4)
+    }
+
+    /// The byte grant a transfer needs if it may have to resume.
+    ///
+    /// A resume re-sends the plan and the chunk frames, and every payload is
+    /// charged on ingress again, so the worst case is two passes over the plan
+    /// and the chunk frames plus the marker and the replies (round 7, M2). The
+    /// plain [`BulkPlan::required_grant`] is the no-resume bound; this one is
+    /// not the default because it roughly doubles what a caller must reserve.
+    pub fn required_grant_with_resume(&self) -> u64 {
+        let chunks = self.chunks as u64;
+        let pass = self
+            .total
+            .saturating_add(CHUNK_OVERHEAD.saturating_mul(chunks))
+            .saturating_add(PLAN_OVERHEAD)
+            .saturating_add(32u64.saturating_mul(chunks));
+        self.required_grant()
+            .saturating_add(pass)
+            .saturating_add(REPLY_ALLOWANCE.saturating_mul(chunks.saturating_add(2)))
     }
 
     /// Chunk size in bytes.
@@ -464,6 +495,19 @@ impl BulkChunk {
             // a infallible constructor was the alternative (round 6, L3).
             offset: (index as u64).saturating_mul(chunk_size as u64),
             hash: chunk_hash(data),
+            data: data.to_vec(),
+        }
+    }
+
+    /// Build a chunk whose hash is already known (the sender's plan holds it).
+    ///
+    /// The receiver still validates the hash against the plan, so a wrong value
+    /// here is refused at the other end rather than trusted.
+    fn with_hash(index: u32, chunk_size: usize, data: &[u8], hash: [u8; 32]) -> Self {
+        Self {
+            index,
+            offset: (index as u64).saturating_mul(chunk_size as u64),
+            hash,
             data: data.to_vec(),
         }
     }
@@ -755,13 +799,17 @@ impl BulkSender {
     }
 
     /// One frame, for a streaming sender.
+    ///
+    /// The frame carries the hash the plan already holds: a retransmission or a
+    /// resume does not re-hash the body (round 7, L8).
     pub fn frame_at(&self, index: u32) -> Result<Vec<u8>> {
         if index >= self.plan.chunks {
             return Err(Error::Bulk("requested chunk is outside the plan"));
         }
         let start = index as usize * self.plan.chunk;
         let end = (start + self.plan.chunk).min(self.bytes.len());
-        Ok(BulkChunk::new(index, self.plan.chunk, &self.bytes[start..end]).encode())
+        let planned = self.plan.hashes[index as usize];
+        Ok(BulkChunk::with_hash(index, self.plan.chunk, &self.bytes[start..end], planned).encode())
     }
 
     /// Frames for exactly the indexes a receiver reports as missing.
@@ -876,11 +924,14 @@ impl BulkReceiver {
     /// charged before it is stored.
     pub fn accept(&mut self, frame: &[u8]) -> Result<u32> {
         let (index, data, duplicate) = validate_chunk(&self.plan, &self.received, frame)?;
+        if let Some(meter) = self.meter.as_mut() {
+            // A duplicate still costs the receiver a decode, a hash and an
+            // allocation, so it is charged like any other frame; a free replay
+            // was a bypass of the direct-use meter (round 7, L6).
+            meter.charge_bytes(frame.len() as u64)?;
+        }
         if duplicate {
             return Ok(index);
-        }
-        if let Some(meter) = self.meter.as_mut() {
-            meter.charge_bytes(frame.len() as u64)?;
         }
         self.stored = self.stored.saturating_add(data.len() as u64);
         self.received.insert(index, data);
@@ -898,10 +949,10 @@ impl BulkReceiver {
         charge: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<u32> {
         let (index, data, duplicate) = validate_chunk(&self.plan, &self.received, frame)?;
+        charge(frame.len() as u64)?;
         if duplicate {
             return Ok(index);
         }
-        charge(frame.len() as u64)?;
         self.stored = self.stored.saturating_add(data.len() as u64);
         self.received.insert(index, data);
         Ok(index)
@@ -1036,7 +1087,10 @@ fn validate_chunk(
         return Err(Error::Bulk("chunk offset does not match its index"));
     }
     let start = index as u64 * plan.chunk as u64;
-    let expected_len = (plan.total - start).min(plan.chunk as u64);
+    // A plan constructor makes `start < total`, but this is the one arithmetic
+    // check behind a caller-side invariant: a subtraction that panics is not a
+    // refusal (round 7, L5).
+    let expected_len = plan.total.saturating_sub(start).min(plan.chunk as u64);
     if chunk.data.len() as u64 != expected_len {
         return Err(Error::Bulk("chunk length does not match the plan"));
     }
@@ -1440,6 +1494,10 @@ impl BulkProvider {
     }
 
     fn finish_method(&mut self, object: u64, call: &Call) -> Result<Response> {
+        // Expiry runs before the idempotent fast paths: a peer that retried the
+        // marker every window kept an untaken body resident forever and, with
+        // `require_taken`, wedged the object (round 7, M1).
+        self.expire(object, call.now_ms);
         // A repeated marker answers with the same reply: the effect landed, the
         // caller cannot tell a lost answer from a lost request, and a retry must
         // not be receipted as a refusal (round 3, F3). The digest summary
@@ -1463,11 +1521,10 @@ impl BulkProvider {
                 call.redact,
             ));
         }
-        self.expire(object, call.now_ms);
         // Validate before taking: a marker for another transfer, or a finish
         // that arrives before the last chunk, must not destroy the chunks the
         // caller has already paid for.
-        {
+        let (root, total) = {
             let active = self
                 .transfers
                 .get(&object)
@@ -1478,32 +1535,38 @@ impl BulkProvider {
             if !active.receiver.is_complete() {
                 return Err(Error::Bulk("body is incomplete"));
             }
-        }
-        let mut active = self
-            .transfers
-            .remove(&object)
-            .ok_or(Error::Bulk("no transfer is active"))?;
-        // The wall grant bounds the assembly and the passes after it; a grant
-        // that has already run out refuses before the work (round 5, F4).
+            (active.plan.root(), active.plan.total())
+        };
+        // The transfer stays in the map until the reply is built: the chunks are
+        // released by `finish_within` on success, but a panic in the parser
+        // below must not leave the object with no record at all (round 7, L7).
+        // The wall grant bounds the assembly, the verification and the
+        // redaction: a grant that has run out refuses before the work, and a
+        // spent grant after assembly skips the content address instead of
+        // running an unbounded pass (round 5, F4; round 7, L3).
         let deadline = std::time::Instant::now()
             .checked_add(std::time::Duration::from_millis(call.budget.max_wall_ms));
-        let (body, body_hash) = match active.receiver.finish_within(deadline) {
-            Ok(pair) => pair,
-            Err(error) => {
-                // Every refusal leaves the transfer intact.
-                self.transfers.insert(object, active);
-                return Err(error);
-            }
+        let (body, body_hash) = {
+            let active = self
+                .transfers
+                .get_mut(&object)
+                .ok_or(Error::Bulk("no transfer is active"))?;
+            active.receiver.finish_within(deadline)?
         };
         let length = body.len() as u64;
         // The canonical content address is computed over the *redacted* image.
         // The raw hash covers the secret heap, so serving it would be the
         // offline equality oracle the domain provider refuses to publish
         // (round 4, H-1).
-        let content = crate::security::redact_module(&body)
-            .ok()
-            .and_then(|redacted| active_infinity::content_hash(&redacted).ok());
-        let plan = active.plan;
+        let spent = deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        let content = if spent {
+            None
+        } else {
+            crate::security::redact_module(&body)
+                .ok()
+                .and_then(|redacted| active_infinity::content_hash(&redacted).ok())
+        };
+        self.transfers.remove(&object);
         // A raw digest over a secret-bearing body is the value the domain
         // provider withholds from a redacting capability; `content` is the
         // redacted address and is enough (round 5 residual).
@@ -1511,8 +1574,8 @@ impl BulkProvider {
         self.last_finished.insert(
             object,
             FinishedTransfer {
-                root: plan.root(),
-                total: plan.total(),
+                root,
+                total,
                 length,
                 body_hash,
                 content,
@@ -1527,8 +1590,8 @@ impl BulkProvider {
                     body_hash,
                     content,
                 },
-                root: plan.root(),
-                total: plan.total(),
+                root,
+                total,
                 at_ms: call.now_ms,
             },
         );

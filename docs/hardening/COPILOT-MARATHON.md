@@ -21,10 +21,10 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-05 | lanes / channels | `src/lane.rs`, `src/channel.rs` | `CLEAN` (rounds 1-6; rounds 5 and 6 found no critical/high/medium) | 33 fixed / 0 rejected / 0 open (recv ambient settled by ADR-0024) | this commit |
 | R-06 | budget | `src/budget.rs` | `CLEAN` (rounds 1-13; rounds 12 and 13 clean) | 50 fixed / 0 rejected / 0 open (4 accepted designs documented) | this commit |
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
-| R-08 | tools / MCP | `src/tool.rs` | rounds 1-57: round 57 found 1 medium and 6 lows, all fixed; round 58 must be clean | 371 fixed / 5 rejected / 0 open (5 residuals documented) | this commit |
+| R-08 | tools / MCP | `src/tool.rs` | rounds 1-58: round 58 found 2 mediums and 6 lows, all fixed; round 59 must be clean | 379 fixed / 5 rejected / 0 open (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-6: round 6 found 1 medium and 8 lows, all fixed; round 7 must be clean | 51 fixed / 0 rejected / 0 open (5 residuals recorded) | this commit |
-| R-11 | identity | `src/identity.rs` | rounds 1-5: round 5 found 1 medium and 5 lows, all fixed; round 6 must be clean | 33 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-7: round 7 found 2 mediums and 7 lows, all fixed; round 8 must be clean | 60 fixed / 0 rejected / 0 open (5 residuals recorded) | this commit |
+| R-11 | identity | `src/identity.rs` | rounds 1-6: round 6 found no critical/high/medium (CLEAN) and 7 lows, all fixed; round 7 must be clean to close | 40 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
@@ -897,6 +897,26 @@ medium and four lows, all fixed.
 Two conversions are defensive and have no behavioural test: the shared-memory
 `u32` ceiling needs a 4 GiB payload to reach, and the reservation CAS needs
 concurrent overshoot to observe.
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
+### R-08 tools and MCP - 2026-11-05 (round 58)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `fe7aba2`. Round-57
+fixes hold (one doc claim was lost in a failed write and is restored here).
+Verdict **PARTIAL**: two mediums and six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the new lifecycle notification used `send_line`, the deadline-free trait method, so a transport written to the trait could block past the handshake ceiling | **fixed**: `notify_within` takes the deadline and calls `send_line_within`; the handshake passes its own |
+| 2 | medium | the stdio reader trimmed trailing whitespace, so skipped notifications were charged their trimmed length and a peer could make the host read ~16 MiB under a 512-byte grant | **fixed**: only the line terminator is stripped, so the charge is what was read |
+| 3 | low | `mcp/bad-json` and `mcp/no-response` were documented as session codes although only the in-memory test transport produces them | **fixed**: both rows say so |
+| 4 | low | a DNS name of any length was admitted and then failed as the retryable `http/resolve` class | **fixed**: labels 1..=63 bytes and at most 253 in all |
+| 5 | low | a body past the static 64 MiB ceiling was labelled a budget refusal when the grant was smaller | **fixed**: the static ceiling is always `http/body-too-large`; the grant-bound arm keeps its class |
+| 6 | low | writer threads were outside the `ReaderSlot` cap, and on Windows a descendant can hold stdin forever | **fixed**: the writer takes a slot too |
+| 7 | low | the handshake never checked the negotiated `protocolVersion` | **fixed**: a result that is not `2025-06-18` is `mcp/bad-response` (the lifecycle notification is that shape) |
+| 8 | low | a `tools/call` answer whose `result` was not an object was accepted as data | **fixed**: it poisons with `mcp/bad-response` |
 
 Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
 controls 9/9.
@@ -2544,6 +2564,26 @@ Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
 
+### R-10 bulk transfer - 2026-11-05 (round 7)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `fe7aba2`. Verdict
+**PARTIAL**: two mediums and seven lows, all fixed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the idempotent `finish` fast path ran before `expire`, so a peer that retried the marker every window pinned an untaken body forever and, with `require_taken`, wedged the object | **fixed**: expiry runs first; `a_retried_finish_cannot_pin_the_body` |
+| 2 | medium | `required_grant` sized one pass, so the documented grant could not carry the resume the docs advertise | **fixed**: `required_grant_with_resume` and `required_calls_with_resume` are the two-pass bounds, named in the spec and ADR; `the_resumed_grant_covers_two_passes` |
+| 3 | low | the wall grant did not cover the verification and redaction passes | **fixed**: checked before `verify`, and a spent grant after assembly skips the content address |
+| 4 | low | the quoted 1 GiB chunk floor was 32 836 (one over the ceiling) and two counts were stale | **fixed**: 32 837, with `the_documented_chunk_floor_is_exact` |
+| 5 | low | `validate_chunk` subtracted `total - start` unguarded | **fixed**: `saturating_sub` |
+| 6 | low | a replayed chunk frame was free at the receiver meter | **fixed**: duplicates are charged; `a_duplicate_frame_is_charged` |
+| 7 | low | the transfer was consumed before the redaction, so a parser panic lost a verified body | **fixed**: the transfer stays in the map until the reply is built |
+| 8 | low | the sender re-hashed every frame although the plan holds the hash | **fixed**: `frame_at` uses `BulkChunk::with_hash`; `a_frame_carries_the_planned_hash` |
+| 9 | low | the spec said request indexes are unique while the decoder dedups | **fixed**: the spec says duplicates are removed |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-10 bulk transfer - 2026-11-05 (round 6)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `9a739a7`. Round-5
@@ -2641,6 +2681,25 @@ gives the format a consumer.
 | B2 | medium | `finish` took the transfer before validating: a wrong marker or an early `finish` destroyed the received chunks | **fixed**: the marker and completeness are checked against a borrowed transfer, and only a successful finish consumes it; `a_refused_finish_keeps_the_transfer` |
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
+
+### R-11 identity - 2026-11-05 (round 6, first clean pass)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `fe7aba2`.
+Verdict **CLEAN**: no new critical, high or medium; the round-5 dispositions are
+real. Seven lows were fixed anyway.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | the round-5 refactor collapsed revoked and expired into one arm, so a revoked root stamped `cap.expired` on every introduction retry (enough to evict the whole tape) | **fixed**: `revoked` is carried and an expiry event is only pushed for a real expiry; `a_revoked_capability_is_not_reported_as_expired` |
+| 2 | low | the round-5 F4 test exercised `call_as`, not the idempotent path it credited | **fixed**: `an_idempotent_wrong_peer_is_refused_before_the_shape`, with a bound-peer control that gets `rpc/budget-exceeded` |
+| 3 | low | the rotation half of the foreign-clock rule and the "no `cap.expired`" half were untested | **fixed**: `a_rotation_refuses_a_foreign_clock_descendant` asserts the refusal, both bindings and zero expiry events |
+| 4 | low | ADR-0011 still said only "a revoked or expired descendant is skipped" | **fixed**: the third state and its refusal are documented |
+| 5 | low | the deployment doc claimed the CLI reads private keys | **fixed**: it reads certificates and has no mTLS client mode |
+| 6 | low | the Server section told operators to `call_as` while rule 6 says that applies no policy | **fixed**: the section says when `call_as` is the safe fast path and when to `admit` + `dispatch_envelope` |
+| 7 | low | `mint_bound` repeated `can_bind` with an unreachable second arm | **fixed**: one trust check |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-11 identity - 2026-11-05 (round 5)
 

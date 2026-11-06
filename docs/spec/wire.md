@@ -255,8 +255,8 @@ handle and probe its policy.
 
 | Code | Condition |
 |------|-----------|
-| `mcp/bad-json` | the request line could not be serialised (a client-side fault, not an answer; the session is poisoned) |
-| `mcp/no-response` | the transport returned nothing for a request |
+| `mcp/bad-json` | the in-memory test transport could not parse a request line; the real transports report a serialisation failure as `rpc/invalid-argument` before anything is written |
+| `mcp/no-response` | the in-memory test transport had no answer queued; a real transport reports `mcp/eof` or `mcp/read:<err>` instead |
 | `mcp/eof` | the server closed its stdout |
 | `mcp/queue` | the writer queue stayed full until the ceiling; the frame never reached the writer, so the session stays usable |
 | `mcp/not-sent` | the deadline had passed before anything was written; the frame never reached the wire, so the session stays usable |
@@ -583,7 +583,8 @@ so the plan **envelope** fits `WireLimits::strict()`, which caps the whole frame
 at 1 MiB: the 53-byte header plus 32 bytes per chunk must leave room for the
 envelope framing, a capability descriptor with a `max_path` scope and a one-entry
 cap delta (about 1.6 kB together). A full 1 GiB body therefore needs a chunk of
-at least `1 073 741 824 / 32 700` bytes (32 836), and a test encodes and decodes
+at least 32 837 bytes (`ceil(2^30 / 32 836)` is 32 701, one over the
+ceiling), and a test encodes and decodes
 the maximal plan under the strict profile with such a descriptor and a delta.
 
 **Chunk** (`ARBC`):
@@ -604,7 +605,8 @@ at 1 MiB, so the sender selects a chunk size under that profile.
 "ARBM" | version u8 | count u32 | index u32 * count
 ```
 
-Indexes are unique and below `chunk_count`; a request that names more indexes
+Indexes are below `chunk_count`; a duplicate is removed, so the decoded list can be
+shorter than the frame's count. A request that names more indexes
 than the plan has, or one outside it, is `rpc/bulk`.
 
 **Finish** (`ARBF`):
@@ -651,8 +653,11 @@ a redacting call) and, when the body is an Active Infinity image, `content`: the
 canonical content address of the **redacted** image, the same value the domain
 provider serves. A grant must cover `BulkPlan::required_grant()` bytes (plan
 frame, chunk frames, finish marker and a per-call reply allowance) and
-`BulkPlan::required_calls()` calls (one pass plus a full resume's `missing`
-pages): `total + 53 × chunk_count` pays for the chunk frames only.
+`BulkPlan::required_calls()` calls (one pass plus a gaps-only resume's `missing`
+pages): `total + 53 × chunk_count` pays for the chunk frames only. A caller that
+may reconnect and re-send every frame instead reserves
+`BulkPlan::required_grant_with_resume()` bytes and
+`BulkPlan::required_calls_with_resume()` calls, which is roughly two passes.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

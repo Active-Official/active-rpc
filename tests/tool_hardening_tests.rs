@@ -2347,8 +2347,14 @@ fn a_declared_length_past_the_grant_is_a_budget_refusal() {
     call.budget.max_bytes = 256;
     let error = tool
         .invoke(0, &call)
-        .expect_err("the body is past the grant");
-    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+        .expect_err("the body is past every ceiling");
+    // A length past the static 64 MiB ceiling is the provider's, whatever the
+    // grant says: no bigger budget can admit it (round 58, L-3).
+    assert_eq!(
+        error.provider_code(),
+        Some("http/body-too-large"),
+        "{error}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2460,11 +2466,13 @@ fn a_queue_full_mcp_send_does_not_poison_the_session() {
         r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#
             .to_string(),
     );
-    // The third send is the first `tools/call`; the fourth is the retry.
+    // The handshake sends initialize, the lifecycle notification and
+    // tools/list; the fourth send is the first `tools/call`, the fifth the
+    // retry.
     let transport = QueueOnce {
         inner: MemoryTransport::new(responses),
         sends: 0,
-        fail_at: 3,
+        fail_at: 4,
     };
     let mut session = McpSession::handshake(transport).expect("handshake");
     let mut call = Call::new("echo", vec![Arg::Value(Value::Int(1))]);
@@ -3068,7 +3076,7 @@ fn a_frame_that_was_never_sent_leaves_the_session_usable() {
             deadline: Option<std::time::Instant>,
         ) -> active_rpc::error::Result<()> {
             self.sends += 1;
-            if self.sends == 3 {
+            if self.sends == 4 {
                 return Err(active_rpc::error::Error::Provider {
                     code: "mcp/not-sent".to_string(),
                 });

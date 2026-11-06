@@ -206,7 +206,7 @@ fn a_tool_call_with_the_wrong_name_is_refused_before_the_wire() {
 fn a_hostile_tool_list_is_refused() {
     // A handshake that answers no tool array is malformed: an empty session
     // hid it and looked usable (R-08 round 7, #2).
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let hostile = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":"not an array"}}"#;
     let error = match McpSession::handshake(Scripted::new(&[initialize, hostile])) {
         Ok(_) => panic!("a non-array tool list is refused"),
@@ -242,7 +242,7 @@ fn tool_list_response(names: &str) -> String {
 fn a_tool_name_with_a_bidi_override_is_refused() {
     // `read` + RIGHT-TO-LEFT OVERRIDE + `pyf` renders as `read` in a UI while
     // the allow-list entry is a different string.
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(r#"[{"name":"read\u202Epyf"}]"#);
     let session = McpSession::handshake(Scripted::new(&[initialize, list.as_str()]));
     assert_eq!(code(session), "mcp/tool-name");
@@ -250,7 +250,7 @@ fn a_tool_name_with_a_bidi_override_is_refused() {
 
 #[test]
 fn a_tool_name_with_a_control_character_is_refused() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     for name in [
         r#"na\u0000me"#,
         r#"line\nbreak"#,
@@ -265,7 +265,7 @@ fn a_tool_name_with_a_control_character_is_refused() {
 
 #[test]
 fn an_overlong_tool_name_is_refused() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(&format!(
         r#"[{{"name":"{}"}}]"#,
         "a".repeat(active_rpc::tool::MAX_MCP_TOOL_NAME_BYTES + 1)
@@ -278,7 +278,7 @@ fn an_overlong_tool_name_is_refused() {
 fn duplicate_tool_names_are_refused() {
     // Two entries with one name make the allow-list ambiguous: the index
     // selects one entry and the name selects the other.
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(r#"[{"name":"read"},{"name":"read"}]"#);
     let session = McpSession::handshake(Scripted::new(&[initialize, list.as_str()]));
     assert_eq!(code(session), "mcp/tool-name");
@@ -286,7 +286,7 @@ fn duplicate_tool_names_are_refused() {
 
 #[test]
 fn a_tool_description_is_capped_and_stripped_of_control_characters() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(&format!(
         r#"[{{"name":"read","description":"esc\u001b[31mred\u200F{}"}}]"#,
         "x".repeat(active_rpc::tool::MAX_MCP_DESCRIPTION_BYTES)
@@ -329,7 +329,7 @@ fn a_tool_call_response_for_another_request_is_refused() {
 
 #[test]
 fn an_ordinary_tool_name_still_passes() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(r#"[{"name":"fs.read-file_2"}]"#);
     let session =
         McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
@@ -341,7 +341,7 @@ fn an_ordinary_tool_name_still_passes() {
 /// it and overshoot by its remaining bytes.
 #[test]
 fn a_multibyte_character_cannot_straddle_the_description_ceiling() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let prefix = "x".repeat(active_rpc::tool::MAX_MCP_DESCRIPTION_BYTES - 1);
     let list = tool_list_response(&format!(r#"[{{"name":"read","description":"{prefix}é"}}]"#));
     let session =
@@ -359,7 +359,7 @@ fn a_multibyte_character_cannot_straddle_the_description_ceiling() {
 /// on `\n`/`\r` only: an unscrubbed one renders as two records.
 #[test]
 fn a_description_cannot_inject_a_line_separator() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(
         r#"[{"name":"read","description":"ok\u2028fake record\u2029\u061C\u200B\uFEFF\u00AD"}]"#,
     );
@@ -386,7 +386,7 @@ fn a_description_cannot_inject_a_line_separator() {
 /// have no `id` and are not answers, so the session skips them.
 #[test]
 fn a_notification_before_the_response_is_skipped() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(r#"[{"name":"read"}]"#);
     let note = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}"#;
     let session = McpSession::handshake(Scripted::new(&[note, initialize, note, note, &list]))
@@ -399,7 +399,7 @@ fn a_notification_before_the_response_is_skipped() {
 /// that was already abandoned.
 #[test]
 fn a_notification_stream_poisons_the_session() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(r#"[{"name":"read"}]"#);
     let note = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
     let mut lines = vec![initialize.to_string(), list];
@@ -424,7 +424,7 @@ fn a_notification_stream_poisons_the_session() {
 /// skipped and the answer that follows is accepted.
 #[test]
 fn exactly_the_notification_ceiling_is_skipped() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(r#"[{"name":"read"}]"#);
     let note = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{}}"#;
     let mut lines = vec![initialize.to_string(), list];
@@ -445,7 +445,7 @@ fn exactly_the_notification_ceiling_is_skipped() {
 /// waiting forever, so the session fails closed.
 #[test]
 fn a_server_request_poisons_the_session() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(r#"[{"name":"read"}]"#);
     let request = r#"{"jsonrpc":"2.0","id":5,"method":"sampling/createMessage","params":{}}"#;
     let mut session =
@@ -462,7 +462,7 @@ fn a_server_request_poisons_the_session() {
 /// next line may answer a request that was already abandoned.
 #[test]
 fn a_framing_fault_poisons_the_session() {
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let list = tool_list_response(r#"[{"name":"read"}]"#);
     let garbage = "not a json line";
     let mut session =
@@ -517,7 +517,7 @@ fn an_expired_deadline_sends_no_frame() {
 fn has_method_does_not_rebuild_the_method_table() {
     use active_rpc::kernel::Provider;
 
-    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
     let count = active_rpc::tool::MAX_MCP_TOOLS;
     let mut tools = String::from("[");
     for index in 0..count {
@@ -757,7 +757,7 @@ fn a_closed_writer_does_not_claim_the_effect() {
         ) -> active_rpc::error::Result<()> {
             self.sends += 1;
             // The two handshake lines go out; the tool call meets a dead writer.
-            if self.sends <= 2 {
+            if self.sends <= 3 {
                 return Ok(());
             }
             Err(RpcError::Provider {
@@ -811,7 +811,7 @@ fn a_lost_write_ack_is_withheld_only_for_a_writable_call() {
             _deadline: Option<std::time::Instant>,
         ) -> active_rpc::error::Result<()> {
             self.sends += 1;
-            if self.sends <= 2 {
+            if self.sends <= 3 {
                 return Ok(());
             }
             Err(RpcError::Provider {

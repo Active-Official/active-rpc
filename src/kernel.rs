@@ -1677,11 +1677,8 @@ impl Agent {
                 "the capability is already bound to a different peer",
             ));
         }
-        if !peer.can_bind() {
-            return Err(Error::Identity(
-                "only a certificate peer can hold a binding",
-            ));
-        }
+        // One trust check is enough: the second `can_bind` here was unreachable
+        // (round 6, F7).
         self.mint(provider, object, attrs.bound_to(peer.fingerprint()))
     }
 
@@ -1797,17 +1794,26 @@ impl Agent {
         let fingerprint = peer.fingerprint();
         let mut kernel = self.cell.borrow_mut();
         refresh_clock(&mut kernel);
-        let (state, already_bound) = {
+        let (revoked, state, already_bound) = {
             let record = kernel
                 .caps
                 .get(&cap.id())
                 .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
-            (liveness(&kernel, record), record.attrs.bound_to)
+            (
+                record.revoked,
+                liveness(&kernel, record),
+                record.attrs.bound_to,
+            )
         };
         match state {
             Liveness::Live => {}
             Liveness::Dead => {
-                kernel.push_event(Event::CapExpired(cap.id()));
+                // A revocation is not an expiry: an introduction retry must not
+                // stamp `cap.expired` for a lease that never ended
+                // (round 6, F1).
+                if !revoked {
+                    kernel.push_event(Event::CapExpired(cap.id()));
+                }
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
             // Not an expiry: the capability may be live in the domain that
@@ -1937,17 +1943,23 @@ impl Agent {
         let to_fingerprint = to.fingerprint();
         let mut kernel = self.cell.borrow_mut();
         refresh_clock(&mut kernel);
-        let (state, bound) = {
+        let (revoked, state, bound) = {
             let record = kernel
                 .caps
                 .get(&cap.id())
                 .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
-            (liveness(&kernel, record), record.attrs.bound_to)
+            (
+                record.revoked,
+                liveness(&kernel, record),
+                record.attrs.bound_to,
+            )
         };
         match state {
             Liveness::Live => {}
             Liveness::Dead => {
-                kernel.push_event(Event::CapExpired(cap.id()));
+                if !revoked {
+                    kernel.push_event(Event::CapExpired(cap.id()));
+                }
                 return Err(Error::Revoked(cap_token(cap.id())));
             }
             Liveness::ForeignClock => {
@@ -4056,13 +4068,24 @@ impl Agent {
                         Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
                         return Err(error);
                     }
-                    if record.expires_at.is_some_and(|expires_at| {
-                        kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
-                    }) {
-                        kernel.push_event(Event::CapExpired(cap.id()));
-                        let error = Error::Revoked(cap_token(cap.id()));
-                        Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
-                        return Err(error);
+                    match liveness(&kernel, record) {
+                        Liveness::Live => {}
+                        Liveness::Dead => {
+                            kernel.push_event(Event::CapExpired(cap.id()));
+                            let error = Error::Revoked(cap_token(cap.id()));
+                            Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                            return Err(error);
+                        }
+                        // The pre-check above already refused this; the branch
+                        // keeps the class right if the order ever changes
+                        // (round 6 residual).
+                        Liveness::ForeignClock => {
+                            let error = Error::Identity(
+                                "the capability's deadline is in another clock domain",
+                            );
+                            Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                            return Err(error);
+                        }
                     }
                     if let Some(bound) = record.attrs.bound_to {
                         if !crate::identity::matches(

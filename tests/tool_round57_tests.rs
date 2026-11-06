@@ -69,12 +69,18 @@ fn every_unusable_base_is_refused_at_both_ends() {
 /// A long authority is named by its length, not printed whole (round 57, L-5).
 #[test]
 fn a_long_authority_is_not_printed_whole() {
-    let host = "a".repeat(200);
+    // Four labels of 60 bytes: a legal DNS name whose authority is long enough
+    // to be cut.
+    let label = "a".repeat(60);
+    let host = format!("{label}.{label}.{label}.{label}");
     let tool = HttpTool::new(format!("http://{host}:80"), &[("GET", "/x")]);
     let rendered = format!("{tool:?}");
-    // The authority is the host and its port.
-    assert!(rendered.contains("<203 bytes>"), "{rendered}");
-    assert!(!rendered.contains(&host), "the host leaked whole");
+    let authority = host.len() + 3;
+    assert!(
+        rendered.contains(&format!("<{authority} bytes>")),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(&label), "the host leaked whole");
 }
 
 /// The allowlist is the tool's authority: an entry added after construction

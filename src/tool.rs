@@ -1124,7 +1124,16 @@ impl StdioTransport {
                                 code: "mcp/line-too-long".to_string(),
                             })
                         }
-                        Ok(_) => Ok(line.trim_end().to_string()),
+                        Ok(_) => {
+                            // Strip the framing only. The byte grant is charged
+                            // on what the peer made the host read, so padding
+                            // still counts (round 58, M-2).
+                            let stripped = line
+                                .strip_suffix("\r\n")
+                                .or_else(|| line.strip_suffix('\n'))
+                                .unwrap_or(&line);
+                            Ok(stripped.to_string())
+                        }
                         Err(error) => Err(Error::Provider {
                             code: format!("mcp/read:{error}"),
                         }),
@@ -1150,9 +1159,20 @@ impl StdioTransport {
         // never holds a backlog (round 8, F1).
         let (writer, commands) =
             std::sync::mpsc::sync_channel::<(String, std::sync::mpsc::Sender<Result<()>>)>(1);
+        // The writer blocks in `write_all` when the server stops reading, and on
+        // Windows only the leader is killed, so a descendant can hold stdin for
+        // the life of the process. It takes the same process-wide slot as a
+        // reader (round 58, L-4).
+        let writer_slot = ReaderSlot::acquire().ok_or_else(|| {
+            kill_process_tree(&mut child);
+            Error::Provider {
+                code: "mcp/thread:too many readers".to_string(),
+            }
+        })?;
         std::thread::Builder::new()
             .name("active-rpc-mcp-writer".to_string())
             .spawn(move || {
+                let _slot = writer_slot;
                 let mut stdin = stdin;
                 while let Ok((line, reply)) = commands.recv() {
                     let outcome = stdin
@@ -1400,7 +1420,20 @@ impl<T: McpTransport> McpSession<T> {
                 code: "mcp/bad-response".to_string(),
             });
         }
-        session.notify_within("notifications/initialized", json!({}))?;
+        // The lifecycle notification below is the 2025-06-18 shape, so a server
+        // that negotiated another version is refused rather than silently
+        // downgraded (round 58, L-5).
+        if initialize
+            .get("result")
+            .and_then(|result| result.get("protocolVersion"))
+            .and_then(Json::as_str)
+            != Some("2025-06-18")
+        {
+            return Err(Error::Provider {
+                code: "mcp/bad-response".to_string(),
+            });
+        }
+        session.notify_within("notifications/initialized", json!({}), deadline)?;
         let list = session.request_within("tools/list", json!({}), deadline, None)?;
         if let Some(error) = list.get("error") {
             // A failed list was reported as a missing array and the server's
@@ -1478,14 +1511,24 @@ impl<T: McpTransport> McpSession<T> {
     }
 
     /// Send a JSON-RPC notification: no id, so the server answers nothing.
-    fn notify_within(&mut self, method: &str, params: Json) -> Result<()> {
+    ///
+    /// The deadline travels with it: a transport that writes to another process
+    /// overrides `send_line_within` precisely because `send_line` blocks when
+    /// the peer stops reading, and the handshake ceiling must cover every frame
+    /// it sends (round 58, M-1).
+    fn notify_within(
+        &mut self,
+        method: &str,
+        params: Json,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<()> {
         let line = serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
         }))
         .map_err(|_| Error::InvalidArgument("the MCP notification cannot be serialised"))?;
-        self.transport.send_line(&line)
+        self.transport.send_line_within(&line, deadline)
     }
 
     fn request_within(
@@ -1995,10 +2038,23 @@ impl<T: McpTransport> Provider for McpSession<T> {
                 code: format!("mcp/{code}"),
             });
         }
+        // The peer chooses the shape the kernel sees: a missing or non-object
+        // `result` is a malformed answer, not a value (round 58, L-6).
+        let Some(result) = response
+            .get("result")
+            .filter(|value| Json::is_object(value))
+        else {
+            self.poisoned = true;
+            return Err(withhold_after_send(
+                Error::Provider {
+                    code: "mcp/bad-response".to_string(),
+                },
+                !call.read_only,
+            ));
+        };
         // `request_within` already refused a response whose tree or text holds
         // a number with no `Value` form, so the result is representable here.
-        let result = response.get("result").cloned().unwrap_or(Json::Null);
-        let value = json_to_value(&result);
+        let value = json_to_value(result);
         if crate::kernel::value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
             // A tree past the wire shape is an illegal answer, not a caller
             // budget: the session is poisoned like any other malformed frame
@@ -2207,11 +2263,15 @@ impl HttpTool {
         if numeric {
             return name.parse::<std::net::Ipv4Addr>().is_ok();
         }
-        // A DNS name: dot-separated labels, none empty, none starting or ending
-        // with a hyphen.
+        // A DNS name: dot-separated labels of 1..=63 bytes, none starting or
+        // ending with a hyphen, at most 253 bytes in all. A longer name cannot
+        // resolve, and admitting it would report a configuration fault as the
+        // retryable `http/resolve` class (round 58, L-2).
         !name.is_empty()
+            && name.len() <= 253
             && name.split('.').all(|label| {
                 !label.is_empty()
+                    && label.len() <= 63
                     && !label.starts_with('-')
                     && !label.ends_with('-')
                     && label
@@ -2645,7 +2705,10 @@ impl HttpTool {
                 // sane ceiling would turn it into an allocation abort
                 // (round 11, #14).
                 if length > MAX_RESPONSE_BYTES {
-                    return Err(capped("http/body-too-large", grant_bound));
+                    // No grant can admit this body: the static ceiling is the
+                    // binding one, so the class is the provider's whatever the
+                    // grant says (round 58, L-3).
+                    return Err(capped("http/body-too-large", false));
                 }
                 if length > body_cap {
                     // The same code as the read-to-end arm: a peer must not

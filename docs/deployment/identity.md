@@ -77,9 +77,12 @@ let server = QuicServer::start_with_identity(
   `None`, which makes every bound capability unusable (fail closed).
 - `start_with_identity` mints nothing: `client_credentials()` and
   `issue_client_credentials()` return `None`/error, because the CA is yours.
-- The handler receives the authenticated peer. Dispatch with
-  `agent.call_as(peer.as_ref(), …)` or `publish_as`; never with `None` on a path
-  that is supposed to be authenticated.
+- The handler receives the authenticated peer. With `Some(ca_der)` the
+  handshake has already refused an anonymous peer, so
+  `agent.call_as(peer.as_ref(), ...)` and `publish_as` are the policy-free
+  fast path; with `None` (loopback only) the peer can be anonymous, so run
+  `IdentityPolicy::admit` and `dispatch_envelope` instead (rule 6 below).
+  Never pass `None` on a path that is supposed to be authenticated.
 
 ## Client
 
@@ -115,9 +118,10 @@ client that presents none fails it as well.
 
 1. **One leaf per agent.** Do not share a client certificate between processes:
    the fingerprint is the only identity the kernel sees.
-2. **Keep the private key off the wire and out of logs.** The CLI reads
-   certificates and keys from files; the kernel never prints key material, and
-   should not be given a path it cannot read.
+2. **Keep the private key off the wire and out of logs.** The CLI reads a
+   certificate (`--cert` as a trust root, `--cert-out` to write one); it has no
+   mTLS client mode and never takes a private key. A key stays in the
+   deployment's own file store, and the kernel never prints key material.
 3. **Rotate before expiry.** A new leaf has a new fingerprint, so capabilities
    bound to the old one are moved with `reintroduce_to(cap, &old_peer, &new_peer)`.
    `introduce_to` refuses a capability bound to a *different* peer (re-introducing

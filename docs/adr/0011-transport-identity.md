@@ -46,7 +46,11 @@ introduction is a bearer token with no audience.
    narrowing failure during attenuation, not for a rebind. `introduce_to` binds
    the capability **and every live capability derived from it**, so a child
    minted before the introduction cannot stay unbound; a revoked or expired
-   descendant is skipped, because dead authority must not block a live one.
+   descendant is skipped, because dead authority must not block a live one. A
+   descendant whose deadline belongs to the other clock domain is neither dead
+   nor bindable: it refuses the whole introduction or rotation (and the root's
+   own foreign-clock deadline refuses too), because binding it would move
+   authority this clock cannot judge and skipping it would leave it open.
 5. **QUIC mutual TLS is the first implementation.** `QuicServer::start_mutual_tls`
    verifies a client certificate against a CA and hands the identity to the
    handler. `QuicClient::connect_mutual_tls` presents a client certificate.
