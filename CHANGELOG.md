@@ -152,7 +152,21 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
   two copies, and a chunk frame carries the hash it was built with, so a
   retransmission does not re-hash the body.
 - **No body bytes in `Debug`.** `BulkPlan`, `BulkChunk`, `BulkSender`,
-  `BulkReceiver` and `BulkProvider` print shape only.
+  `BulkReceiver` and `BulkProvider` print shape only. `BulkBody` does not print
+  its raw digest either: that digest is the offline equality oracle a redacting
+  capability withholds.
+- **The wall grant covers the whole finish.** `BulkPlan::verify_within` checks
+  the deadline before the first chunk, between chunks and after the last, and
+  `finish_within` uses it, so an expired grant cannot buy a full-body hash.
+- **A refusal never destroys a paid body, and the caller has its own way out.**
+  A `finish` whose grant is below `BulkPlan::assembly_wall_ms()` gets three
+  attempts and is then frozen with `rpc/bulk` before any work - a same-root
+  `plan` frame does not clear the freeze, so a 53-byte frame cannot re-assemble
+  the body - and the new mutating `abort` method drops the object's transfer,
+  untaken body and digest reply instead of holding the slot until a window
+  expires. `required_wall_ms()` stays the recommended sizing and never asks for
+  less than the default grant; the freeze gates on the body's own wall, so a
+  deployment that mints narrow grants can still finish a small body.
 
 ### Kernel
 

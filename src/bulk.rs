@@ -110,6 +110,35 @@ pub const REPLY_ALLOWANCE: u64 = 128;
 /// (round 8, M1).
 pub const FINISH_BYTES_PER_MS: u64 = 128 * 1024 * 1024 / 1000;
 
+/// Under-resourced `finish` attempts a transfer tolerates before it freezes.
+///
+/// Each one may assemble, verify and classify the whole body, so the budget is
+/// what stops a 53-byte frame from buying a body-sized copy over and over
+/// (R-10 round 13). Three is the number the spec states.
+pub const WALL_REFUSAL_LIMIT: u32 = 3;
+
+/// What the wall throttle decides for one `finish` attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Throttle {
+    /// The attempt may run. `workable` says its grant reaches the body's wall,
+    /// which also clears the transfer's refusal budget: a caller that paid for
+    /// the work must not inherit the count of cheap attempts (R-10 round 15).
+    Run { workable: bool },
+    /// Under-resourced attempts are spent: refuse before any work.
+    Frozen,
+}
+
+/// Whether a `finish` attempt runs, given the body's wall, the caller's grant
+/// and the attempts already spent.
+fn throttle(body_wall_ms: u64, grant_wall_ms: u64, refusals: u8) -> Throttle {
+    let workable = grant_wall_ms >= body_wall_ms;
+    if !workable && u32::from(refusals) >= WALL_REFUSAL_LIMIT {
+        Throttle::Frozen
+    } else {
+        Throttle::Run { workable }
+    }
+}
+
 /// How long a finished, untaken body is retained before its memory is released.
 ///
 /// Longer than [`TRANSFER_IDLE_MS`] because the host polls for a completed body,
@@ -338,17 +367,31 @@ impl BulkPlan {
             .saturating_add(REPLY_ALLOWANCE.saturating_mul(chunks.saturating_add(2)))
     }
 
-    /// The wall grant a `finish` needs, in milliseconds.
+    /// The wall the body can be assembled, verified and classified under, in
+    /// milliseconds.
     ///
-    /// `finish` is linear in the body (assembly, verification and the digest)
-    /// and the content address adds the redaction pass. A grant below this bound
-    /// makes a large transfer permanently unfinishable, since attenuation can
-    /// only narrow it (round 8, M1). The bound assumes
-    /// [`FINISH_BYTES_PER_MS`], a 5x margin under the measured rate, and never
-    /// asks for less than the default grant.
+    /// `finish` is linear in the body: the assembly hashes every chunk, the
+    /// verification pass re-hashes it, and the content address adds the
+    /// redaction pass. [`FINISH_BYTES_PER_MS`] is a 5x margin under the measured
+    /// full-finish rate, so one pass at this rate covers all three. The bound
+    /// carries 100 ms of slack for the scheduling around them.
+    ///
+    /// This is the *reachable* bound: the provider throttles repeated attempts
+    /// whose grant is below it, and a caller that can obtain it always finishes
+    /// (R-10 round 15, #2).
+    pub fn assembly_wall_ms(&self) -> u64 {
+        self.total.div_ceil(FINISH_BYTES_PER_MS).saturating_add(100)
+    }
+
+    /// The wall grant a `finish` should be sized for, in milliseconds.
+    ///
+    /// A grant below this bound makes a large transfer permanently unfinishable,
+    /// since attenuation can only narrow it (round 8, M1). It never asks for
+    /// less than the default grant, because a deployment that mints capabilities
+    /// with the default expects every transfer to fit: [`Self::assembly_wall_ms`]
+    /// is the hard floor, this is the recommended sizing.
     pub fn required_wall_ms(&self) -> u64 {
-        let needed = self.total.div_ceil(FINISH_BYTES_PER_MS).saturating_add(100);
-        needed.max(Budget::default().max_wall_ms)
+        self.assembly_wall_ms().max(Budget::default().max_wall_ms)
     }
 
     /// Chunk size in bytes.
@@ -488,18 +531,42 @@ impl BulkPlan {
         })
     }
 
-    /// Verify a whole body against the plan.
-    pub fn verify(&self, bytes: &[u8]) -> Result<()> {
+    /// Verify a whole body against the plan, inside `deadline`.
+    ///
+    /// The pass re-hashes the whole body, so it is charged to the wall grant
+    /// like the assembly is: the deadline is checked before the first chunk,
+    /// between chunks and after the last one. A single check before the pass
+    /// left a caller with an expired grant paying one full body hash with no
+    /// bound at all (R-10 round 15, #1).
+    pub fn verify_within(&self, bytes: &[u8], deadline: Option<std::time::Instant>) -> Result<()> {
         if bytes.len() as u64 != self.total {
             return Err(Error::Bulk("body length does not match the plan"));
         }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(Error::BudgetExceeded("wall"));
+        }
         for (index, part) in bytes.chunks(self.chunk).enumerate() {
-            let expected = self.hashes[index];
-            if chunk_hash(part) != expected {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(Error::BudgetExceeded("wall"));
+            }
+            // A body of the planned length always has this many hashes; the
+            // lookup is fallible so a plan built by hand cannot panic here.
+            let Some(expected) = self.hashes.get(index) else {
+                return Err(Error::Bulk("chunk hash mismatch"));
+            };
+            if chunk_hash(part) != *expected {
                 return Err(Error::Bulk("chunk hash mismatch"));
             }
         }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(Error::BudgetExceeded("wall"));
+        }
         Ok(())
+    }
+
+    /// Verify a whole body against the plan, unbounded.
+    pub fn verify(&self, bytes: &[u8]) -> Result<()> {
+        self.verify_within(bytes, None)
     }
 }
 
@@ -1058,8 +1125,9 @@ impl BulkReceiver {
     /// The digest is fed while the body is assembled, so the provider does not
     /// re-hash a gigabyte after verification. A deadline that has already
     /// passed is `rpc/budget-exceeded("wall")` before any work, and the deadline
-    /// is re-checked between chunks and before the verification pass
-    /// (round 5, F4; round 6, L6). The assembly allocation is fallible: a body
+    /// is re-checked between chunks and inside the verification pass, chunk by
+    /// chunk (round 5, F4; round 6, L6; R-10 round 15). The assembly allocation
+    /// is fallible: a body
     /// the process cannot hold is a refusal, not an abort. The content address
     /// of a valid image allocates a second body-sized projection inside
     /// `finish_method`, which is optional and skippable when the grant is spent.
@@ -1105,11 +1173,8 @@ impl BulkReceiver {
             return Err(Error::Bulk("body length does not match the plan"));
         }
         // The verification pass re-hashes the whole body, so it is inside the
-        // deadline too (round 6, L6).
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            return Err(Error::BudgetExceeded("wall"));
-        }
-        self.plan.verify(&out)?;
+        // deadline too, chunk by chunk (round 6, L6; R-10 round 15, #1).
+        self.plan.verify_within(&out, deadline)?;
         self.received.clear();
         self.stored = 0;
         Ok((out, *hasher.finalize().as_bytes()))
@@ -1175,9 +1240,12 @@ pub struct BulkBody {
 
 impl std::fmt::Debug for BulkBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The raw digest is the value a redacting capability withholds: it is
+        // an offline equality oracle over the un-redacted bytes, so a host that
+        // logged a taken body with `{:?}` would republish it (round 15, #4).
+        // The reply carries it where the contract allows it.
         f.debug_struct("BulkBody")
             .field("len", &self.body.len())
-            .field("body_hash", &hex(&self.body_hash))
             .field("content", &self.content.as_ref().map(hex))
             .field("content_error", &self.content_error)
             .finish()
@@ -1569,6 +1637,29 @@ impl BulkProvider {
         Ok(plan_reply(plan, missing))
     }
 
+    /// Abandon whatever this object holds.
+    ///
+    /// A refusal must never destroy a body the caller paid to transfer, so the
+    /// caller needs its own way out: without one, a transfer whose finish cannot
+    /// be granted holds the object's slot, its reserved bytes in the provider's
+    /// live ceiling and its chunks until the idle or absolute window expires
+    /// (R-10 round 15, #2). An explicit `abort` is that party saying so, and it
+    /// is idempotent: an object with nothing to drop answers `dropped: false`.
+    ///
+    /// It drops a completed body the host has not taken as well: the caller paid
+    /// for the transfer and the reply for it, and asking to abandon it is a
+    /// decision the provider cannot overrule.
+    fn abort_method(&mut self, object: u64, call: &Call) -> Result<Response> {
+        self.expire(object, call.now_ms);
+        let mut dropped = self.transfers.remove(&object).is_some();
+        dropped |= self.completed.remove(&object).is_some();
+        dropped |= self.last_finished.remove(&object).is_some();
+        Ok(Response::Value(Value::map([(
+            "dropped",
+            Value::Bool(dropped),
+        )])))
+    }
+
     fn put_method(&mut self, object: u64, call: &Call) -> Result<Response> {
         self.expire(object, call.now_ms);
         let active = self
@@ -1710,25 +1801,35 @@ impl BulkProvider {
             // A None deadline would mean no bound at all: an already-passed
             // deadline fails closed instead (round 11, L-5).
             .unwrap_or_else(std::time::Instant::now);
-        // A transfer whose grant is below `required_wall_ms` gets three
-        // assemblies and then only refusals: a cheap frame must not buy
-        // repeated CPU. The chunks are never released — a refusal must not
-        // destroy a body the caller paid to transfer — and an attempt with a
-        // sufficient grant is always allowed (round 13).
-        let required = self
-            .transfers
-            .get(&object)
-            .map_or(0, |active| active.plan.required_wall_ms());
-        let workable = required != 0 && call.budget.max_wall_ms >= required;
-        if !workable
-            && self
-                .transfers
-                .get(&object)
-                .is_some_and(|active| active.wall_refusals >= 3)
-        {
-            return Err(Error::Bulk(
-                "finish needs a wall grant of at least the plan's required wall",
-            ));
+        // A transfer whose grant is below the wall the body can need gets
+        // three assemblies and then only refusals: a cheap frame must not buy
+        // repeated CPU. The bound is the body's own (`assembly_wall_ms`), so a
+        // small body stays finishable under a narrow grant; `required_wall_ms`
+        // is the recommended sizing. The chunks are never released by a
+        // refusal — a refusal must not destroy a body the caller paid to
+        // transfer — and an attempt whose grant reaches the bound is always
+        // allowed (R-10 round 13/15).
+        let (bound, refusals) = self.transfers.get(&object).map_or((0, 0), |active| {
+            (active.plan.assembly_wall_ms(), active.wall_refusals)
+        });
+        let workable = match throttle(bound, call.budget.max_wall_ms, refusals) {
+            // A state refusal, not a budget class: the transfer will not take
+            // another under-resourced attempt, and the same frame with the same
+            // grant is refused identically. The message names both ways out.
+            Throttle::Frozen => {
+                return Err(Error::Bulk(
+                    "finish is frozen after three under-resourced attempts: grant the body's wall or abort",
+                ))
+            }
+            Throttle::Run { workable } => workable,
+        };
+        if workable {
+            // A workable attempt is the caller honouring the contract, so it
+            // earns a fresh budget: three cheap refusals must not make a body
+            // unfinishable once the host widens the grant (round 15, #3).
+            if let Some(active) = self.transfers.get_mut(&object) {
+                active.wall_refusals = 0;
+            }
         }
         let (body, body_hash) = {
             let active = self
@@ -1831,14 +1932,14 @@ impl crate::kernel::Provider for BulkProvider {
     }
 
     fn methods(&self) -> Vec<String> {
-        ["plan", "put", "missing", "finish"]
+        ["plan", "put", "missing", "finish", "abort"]
             .iter()
             .map(|method| method.to_string())
             .collect()
     }
 
     fn has_method(&self, method: &str) -> bool {
-        matches!(method, "plan" | "put" | "missing" | "finish")
+        matches!(method, "plan" | "put" | "missing" | "finish" | "abort")
     }
 
     fn mutating(&self, method: &str) -> bool {
@@ -1864,6 +1965,7 @@ impl crate::kernel::Provider for BulkProvider {
             "put" => self.put_method(object, call),
             "missing" => self.missing_method(object, call),
             "finish" => self.finish_method(object, call),
+            "abort" => self.abort_method(object, call),
             other => Err(Error::MethodNotGranted {
                 method: other.to_string(),
             }),
@@ -1946,4 +2048,27 @@ fn hex(bytes: &[u8; 32]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::{throttle, Throttle};
+
+    /// The three cases a transfer can be in, and the reset a workable attempt
+    /// buys: a cheap attempt is counted, a paid one is not, and the freeze only
+    /// ever holds an under-resourced caller (R-10 round 13/15).
+    #[test]
+    fn the_wall_throttle_counts_only_under_resourced_attempts() {
+        // Under the body's wall: three attempts, then the freeze.
+        assert_eq!(throttle(101, 100, 0), Throttle::Run { workable: false });
+        assert_eq!(throttle(101, 100, 2), Throttle::Run { workable: false });
+        assert_eq!(throttle(101, 100, 3), Throttle::Frozen);
+        // At or above it, an attempt always runs and reports it can pay, so the
+        // caller's budget is cleared however many cheap attempts came before.
+        assert_eq!(throttle(101, 101, 3), Throttle::Run { workable: true });
+        assert_eq!(throttle(101, 5_000, 9), Throttle::Run { workable: true });
+        // A zero grant is never workable, so it can freeze a transfer.
+        assert_eq!(throttle(101, 0, 0), Throttle::Run { workable: false });
+        assert_eq!(throttle(101, 0, 3), Throttle::Frozen);
+    }
 }

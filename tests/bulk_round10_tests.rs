@@ -82,8 +82,10 @@ fn a_bad_frame_is_charged_before_validation() {
     assert!(!receiver.is_complete());
 }
 
-/// An exhausted finish is a state refusal, not a budget one: no grant can
-/// rescue it, and the caller recovers by re-planning (round 10, M-3).
+/// An exhausted finish is a state refusal, not a budget one: the transfer will
+/// not take another under-resourced attempt, so the caller either grants the
+/// body's wall (`assembly_wall_ms`) or aborts it. A re-plan does not clear the
+/// counter, and no refusal destroys the paid chunks (round 10, M-3; round 15).
 #[test]
 fn an_exhausted_finish_is_a_state_refusal() {
     // 64 MiB cannot be assembled inside a 1 ms grant on any host, so the
@@ -136,8 +138,12 @@ fn an_exhausted_finish_is_a_state_refusal() {
         .expect_err("the finish is exhausted, not the grant");
     assert_eq!(error.code(), "rpc/bulk", "{error}");
     assert!(
-        error.to_string().contains("wall grant"),
-        "the state fault names what it needs: {error}"
+        error.to_string().contains("frozen"),
+        "the state fault says the transfer is frozen: {error}"
+    );
+    assert!(
+        error.to_string().contains("abort"),
+        "the state fault names the way out: {error}"
     );
 }
 

@@ -436,7 +436,7 @@ fn promise_can_be_cancelled_or_resolved_once() {
     agent.cancel(&promise).unwrap();
     assert_eq!(promise.peek().unwrap_err().code(), "rpc/promise-cancelled");
     assert!(matches!(
-        active_rpc::kernel::promise_state(&agent, promise.id()),
+        active_rpc::kernel::promise_state(&promise),
         Some(PromiseState::Cancelled)
     ));
 

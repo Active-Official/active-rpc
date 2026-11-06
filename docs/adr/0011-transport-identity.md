@@ -34,6 +34,14 @@ introduction is a bearer token with no audience.
 3. **`CapAttrs::bound_to`** records the fingerprint a capability was introduced
    to. Dispatch (`call_as`, `call_peer`) refuses a bound capability when the
    presented identity is missing, anonymous or different (`rpc/identity`).
+   The binding covers the peer's *work* as well as the capability: a promise
+   records the peer that queued its call and an idempotency entry records the
+   peer that claimed its key, both as an origin flag plus a fingerprint, so a
+   shared lane cannot become a channel for reading another principal's answer or
+   replaying its key. A certificate rotation carries those records to the
+   successor alongside the capability, because the rotation is the documented
+   recovery for a renewed leaf: without it the peer's retry of an applied call
+   would fail forever and a fresh key would apply the mutation twice.
    Binding validates: a zero or loopback fingerprint is refused at mint, at
    attenuation and at export. `send_as` refuses to transfer a bound capability
    over a channel: a channel cannot prove who reads the message, so delegation

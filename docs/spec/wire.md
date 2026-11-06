@@ -70,7 +70,7 @@ An envelope with trailing bytes after the capability table is refused.
 | Tag | Argument | Encoding |
 |----:|----------|----------|
 | 0 | value | value encoding below |
-| 1 | promise | `u64` promise id |
+| 1 | promise | `u64` promise id. An *envelope* never carries this kind: the decoder accepts it, and every envelope entry point refuses it as `rpc/wire` before any ownership check. The ownership rule above applies to argument lists the embedder built (`call_as`, `call_peer`). |
 | 2 | capability | 16-byte capability id |
 
 A promise argument makes the call **pipelined**: the kernel keeps the dependent
@@ -192,8 +192,8 @@ a message.
 | `rpc/promise-cancelled` | the promise was cancelled |
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
 | `rpc/backpressure` | the local call queue or channel window is full |
-| `rpc/identity` | the peer's authenticated identity is missing, does not match the capability's binding, or cannot be a binding at all (a zero or loopback digest); a capability's deadline belongs to the other clock domain; a pipelined argument names another peer's promise; also an *in-process* misuse of a borrowed imported handle (it cannot introduce, rebind, attenuate or revoke the owner's authority; exporting one is `rpc/persistence`) |
-| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, a completed body has not been taken, or a `finish` has spent its three under-resourced attempts. A state refusal is recoverable by planning again (for the slot) or, for an under-resourced finish, by granting `required_wall_ms()`; the chunks survive either way. A hash or framing fault is not |
+| `rpc/identity` | the peer's authenticated identity is missing, does not match the capability's binding, or cannot be a binding at all (a zero or loopback digest); a capability's deadline belongs to the other clock domain; an out-of-band answer comes from a peer that did not queue the promise, or from one whose certificate has since rotated away; an *in-process* pipelined argument names a promise another principal queued; also an *in-process* misuse of a borrowed imported handle (it cannot introduce, rebind, attenuate or revoke the owner's authority; exporting one is `rpc/persistence`) |
+| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, a completed body has not been taken, or a `finish` is frozen because three under-resourced attempts are spent. A state refusal is recoverable by planning again for the slot, by granting the body's wall (`assembly_wall_ms`) or by `abort` for a frozen finish; a re-plan does not clear the freeze itself, and the chunks survive either way. A hash or framing fault is not |
 | `rpc/replay` | a replay package is malformed, tampered with, or disagrees with the decisions it recorded |
 | `rpc/persistence` | a durable capability record is unsealed, already restored, or names a provider this kernel does not have; a record restored by a different peer is `rpc/identity` |
 | `rpc/unresolvable-promise` | the promise can never settle |
@@ -561,11 +561,11 @@ that must prove "one frame only" should close the stream after the frame.
 
 A body larger than one frame travels as a plan plus chunk frames (ADR-0013).
 Each frame is the **payload of an ordinary ARP1 call** to a bulk provider:
-`plan` opens the transfer, `put` carries one chunk, `missing` asks for the gaps
-and `finish` closes it. That is what binds the transfer to authority and to the
-byte budget: the kernel charges an envelope payload on ingress, and a capability
-that does not grant `put` cannot push a chunk. The layouts below are
-little-endian unless stated.
+`plan` opens the transfer, `put` carries one chunk, `missing` asks for the gaps,
+`finish` closes it and `abort` discards it. That is what binds the transfer to
+authority and to the byte budget: the kernel charges an envelope payload on
+ingress, and a capability that does not grant `put` cannot push a chunk. The
+layouts below are little-endian unless stated.
 
 **Plan** (`ARBL`):
 
@@ -642,6 +642,11 @@ than 1 hour after it opened, a finished, untaken body after 10 minutes, and its
 digest reply with it, all measured against the kernel-stamped `Call::now_ms`. `plan`
 refuses to open a new transfer for an object whose completed body has not been
 taken (`rpc/bulk`), so a body is never silently dropped inside its window.
+`abort` drops whatever the object holds — an open transfer, an untaken body
+and its digest reply — and answers `dropped` (false when there was nothing). It
+is the caller's own way out of a transfer it no longer wants or cannot finish:
+a refusal must never destroy a paid body, so the decision to discard one belongs
+to the party that paid for it. It is idempotent and needs no plan.
 `missing` answers the indexes the request frame names (page-capped at 1 024, with
 `more` and `remaining`; an empty payload asks for the lowest window), refreshes
 the idle window, and never expires a transfer by idleness: a read-only
@@ -665,11 +670,14 @@ pages): `total + 53 × chunk_count` pays for the chunk frames only. A caller tha
 may reconnect and re-send every frame instead reserves
 `BulkPlan::required_grant_with_resume()` bytes and
 `BulkPlan::required_calls_with_resume()` calls, which is roughly two passes.
-Four more dimensions bound the same transfer. The wall grant must cover
+Four more dimensions bound the same transfer. The wall grant should cover
 `BulkPlan::required_wall_ms()` (assembly, verification, digest and the redacted
 content address, linear in the body) **on both the capability and the lane**,
 because the kernel meters a call against the narrower of the two
-(`required_lane_wall_ms()` is the same number). The lane's cumulative
+(`required_lane_wall_ms()` is the same number). That is the recommended sizing;
+the hard floor is `BulkPlan::assembly_wall_ms()`, the body's own cost at the
+documented rate with 100 ms of slack, so a deployment that mints narrow grants
+can still finish a small body. The lane's cumulative
 `max_bytes` must cover `BulkPlan::required_lane_bytes()`. A provider built with
 `with_max_live_bytes` refuses with `rpc/budget-exceeded` a plan that would push
 the bytes it holds past that bound, where each open transfer reserves twice its
@@ -677,14 +685,19 @@ announced total (the stored chunks and the assembly buffer) plus the plan's own
 hash vector (32 bytes per chunk and the 53-byte header), because the plan is
 retained for the whole transfer; a `finish` of an image adds a third, transient
 body copy for the redaction. A `finish` whose wall grant is below
-`BulkPlan::required_wall_ms()` is an under-resourced attempt: three of them may
-assemble the body, and after that the provider refuses it with `rpc/bulk` before
-any work, because a cheap frame must not buy repeated copies. The stored chunks
-are **never** destroyed by a refusal (a body the caller paid to transfer survives
-every refusal), and an attempt whose grant reaches `required_wall_ms()` is always
-allowed and resets that budget. A refusal that did no work (the deadline had
-already passed) does not spend it. The verification pass is inside the wall
-grant; the redaction pass of a valid image runs once it starts.
+`BulkPlan::assembly_wall_ms()` is an under-resourced attempt: three of them may
+assemble the body, and after that the provider **freezes** the transfer and
+refuses it with `rpc/bulk` before any work, because a cheap frame must not buy
+repeated copies. The stored chunks are **never** destroyed by a refusal (a body
+the caller paid to transfer survives every refusal), and an attempt whose grant
+reaches the body's wall always runs and clears the refusal budget, so a caller
+that pays for the work never inherits the count of cheap attempts. A refusal
+that did no work (the deadline had already passed) does not spend it. A frozen
+transfer has two ways out: the host mints a grant at the body's wall, or the
+caller abandons it with `abort`. A same-root `plan` frame does **not** clear the
+freeze, which is what stops a 53-byte frame from re-assembling a paid body. The
+verification pass is inside the wall grant, chunk by chunk; the redaction pass
+of a valid image runs once it starts.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

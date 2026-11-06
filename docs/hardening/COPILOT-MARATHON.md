@@ -2596,6 +2596,42 @@ Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
 
+### R-10 bulk transfer - 2026-11-06 (round 15)
+
+The round-14 findings, closed. Two of them were defects in round 13's own work.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | round 13's `verify_within` did not exist: `finish_within` checked the deadline once and then re-hashed the whole body unbounded | **fixed for real**: `BulkPlan::verify_within(bytes, deadline)` checks before the first chunk, between chunks and after the last; `verify` delegates with `None`; `finish_within` passes its deadline. `a_verification_that_outlives_the_grant_is_refused` (64 MiB, 1 ms deadline: `rpc/budget-exceeded`, and the same bytes verify unbounded as the control) and `a_spent_grant_is_refused_before_the_first_hash` (a spent deadline answers `wall`, not the hash verdict for bytes that were never hashed). Both fail on a build that ignores the deadline: proven by stripping the checks, running, and restoring |
+| 2 | medium | the freeze gated on `required_wall_ms()`, whose 5 s floor made a narrow-profile cap (below the default grant) unable to finish anything, and a frozen transfer had no caller-side route out: it held its slot and its reservation until the window expired | **fixed**: the gate is the body's own wall, `BulkPlan::assembly_wall_ms()` (total at the documented rate plus 100 ms), with `required_wall_ms()` kept as the recommended sizing; `abort` is a new mutating method that drops the object's transfer, untaken body and digest reply and answers `dropped`. `a_grant_above_the_bodys_wall_finishes_after_three_refusals` (three 1 ms refusals, then 1 s, which is under the 5 s recommendation and over the body's 132 ms), `a_wedged_object_can_be_abandoned` (the ceiling refuses a second object while the wedged transfer is resident, `abort` frees the slot and the reservation, a second abort is idempotent, and `has_method`/`methods`/`mutating` name it) and `the_body_wall_is_the_bodys_own` (101 ms for 2 KB, 8 101 ms for 1 GiB, and the recommendation never below the default grant) |
+| 3 | low | the docs promised that a workable attempt "resets the budget" and no reset existed | **fixed**: `throttle(body_wall, grant, refusals)` returns `Run { workable }` or `Frozen`, and a workable attempt clears `wall_refusals` before it runs. The decision is a pure function with a unit test (`the_wall_throttle_counts_only_under_resourced_attempts`); the mutation itself is not observable black-box, because a workable attempt either finishes the transfer or (on a machine slower than the 5x margin) leaves the count where the reset put it |
+| 4 | low | `Debug for BulkBody` printed the raw digest, which is the offline equality oracle a redacting capability withholds | **fixed**: the field is gone, with the reason in the code. `debug_of_a_body_never_shows_the_raw_digest` |
+| 5 | low | one condition answered two codes, and the `rpc/bulk` row's recovery clause plus the round-10 test comment contradicted round 13 | **decided, documented, test corrected**: the freeze stays `rpc/bulk` because it is a provider-state refusal (the same frame with the same grant is refused identically), the row now names the body's wall and `abort`, and the round-10 test asserts the message names both ways out |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; the `rust:1.99`
+Linux suite; control plane, CLI, fuzz; negative controls 9/9; red-team battery
+green (H2.33 rejects a `debug_assert!` in `src/`, which is why the repeated
+authority guard is a real refusal).
+
+### R-10 bulk transfer - 2026-11-06 (round 14)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `6b99d55`. One
+round-13 claim was false and the docs had recorded it as a fix. Verdict
+**PARTIAL**: two mediums and three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `verify_within` does not exist anywhere in the tree; `finish_within` calls `self.plan.verify(&out)` after one check, so the verification pass is unbounded and the spec's guarantee is a false contract | **fixed in round 15** (row 1 there) |
+| 2 | medium | the freeze can wedge a complete, paid body: `required_wall_ms()` floors at the 5 s default, a same-root re-plan keeps the counter, a different root is refused, there is no abort, and the peer cannot widen its own cap ∩ lane - so a narrow-profile deployment loses a body it could have finished, and one object's reservation can refuse plans on others | **fixed in round 15** (row 2 there) |
+| 3 | low | the docs said a workable attempt resets the budget; no reset existed | **fixed in round 15** |
+| 4 | low | `Debug for BulkBody` prints the raw digest | **fixed in round 15** |
+| 5 | low | one condition, two codes; stale recovery prose in the row, the ADR and a round-10 test comment | **fixed in round 15** |
+
+The reviewer also answered the probe questions the round-13 entry relied on:
+unbounded assemblies on a cheap grant were already impossible (re-plan keeps the
+counter), the counter is unreachable when the grant equals the bound (`>=`), and
+the wall grant covered only the *start* of the content classification.
+
 ### R-10 bulk transfer - 2026-11-06 (round 13)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `5316d13`. Ten of
@@ -2605,7 +2641,7 @@ lows.
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
 | 1 | medium | round 12's release broke non-destructiveness: a `finish` delegated to the provider (a `post`/`request` grant below the plan's wall) destroyed a body the caller had already paid to transfer, and the caller's only recovery was a full re-upload | **fixed**: the release is replaced by a throttle - an under-resourced `finish` (`max_wall_ms < required_wall_ms()`) may assemble three times, then is refused `rpc/bulk` **before any work with the chunks kept**; an attempt whose grant reaches `required_wall_ms()` is always allowed and resets the budget. The counter ignores a refusal entered after the deadline, so it stays one code per condition. `an_under_resourced_finish_is_throttled_without_losing_the_body` asserts the refusal, that `active_root` and every chunk survive, that a same-root re-plan does not clear the budget, and that `required_wall_ms()` then finishes; `a_replan_cannot_buy_unbounded_assemblies` counts only `rpc/budget-exceeded` and pins exactly three assemblies across a re-plan |
-| 2 | medium | the wall grant covered the assembly but not `BulkPlan::verify`, which re-hashes every chunk after the deadline has been passed - the measured cost of a spent grant was one full verification | **fixed**: `verify` delegates to `verify_within(bytes, deadline)` and `finish_within` passes its deadline, so the verification pass is inside the grant on every chunk; the spec paragraph says the verification is charged to the grant |
+| 2 | medium | the wall grant covered the assembly but not `BulkPlan::verify`, which re-hashes every chunk after the deadline has been passed - the measured cost of a spent grant was one full verification | **wrongly recorded as fixed**: round 13's edit to `BulkPlan::verify` never reached the tree (`git diff 5316d13 6b99d55 -- src/bulk.rs` shows only `finish_method`), so this row claimed a fix the code did not have until round 15. The round-14 review caught it. Lesson recorded: read the diff of the file the claim is about, not the diff summary |
 | 3 | low | the `rpc/bulk` row still described the released transfer | **fixed**: the row names the under-resourced attempts and says the chunks survive either way |
 | 4 | low | ADR-0013's recovery text named a re-plan and a re-send | **fixed**: the ADR says the recovery is a grant at `required_wall_ms()`, and that non-destructiveness outranks the throttle |
 | 5 | low | a `content_error` of `wall` on an exhausted grant | **kept**: the reply still reports `wall` for a spent grant, which the round-12 note documents; the throttle now refuses before the assembly in the common case |

@@ -1924,6 +1924,14 @@ impl Agent {
     /// consent out of band. The caller names the new admitted peer, and
     /// authority does not change: the same records, budgets, expiry and policy
     /// move to the new binding.
+    ///
+    /// The peer's **work** moves too: a job this peer queued, the promise it is
+    /// waiting on, and an idempotency key it claimed are stamped with the
+    /// fingerprint it presented, so a rotation carries them to the successor.
+    /// Without that, the renewal would break the one thing an idempotency key
+    /// exists for: the peer's retry of an applied mutating call would answer
+    /// `rpc/identity` until the claim is evicted, and its only alternative (a
+    /// fresh key) would apply the write twice (R-11 round 11, #1).
     pub fn reintroduce_to(
         &self,
         cap: &CapHandle,
@@ -2056,6 +2064,35 @@ impl Agent {
         }
         for record_id in records {
             mark_tombstoned(&mut kernel, record_id);
+        }
+        // The peer's own work is bound to the certificate as well, so a rotation
+        // has to carry it or the rotated peer's retry of an applied mutating call
+        // answers `rpc/identity` forever and it can never learn whether the
+        // mutation landed, while a fresh key would apply it twice (R-11 round 11,
+        // #1). Only records whose capability is in the rebound set move: a
+        // descendant bound to another peer was refused above, and an in-process
+        // promise carries no fingerprint to move.
+        if from_fingerprint != to_fingerprint {
+            let rebound: std::collections::BTreeSet<CapId> = moved.iter().copied().collect();
+            let mut carried: Vec<PromiseId> = Vec::new();
+            for job in kernel.jobs.values_mut() {
+                if rebound.contains(&job.cap) && job.identity == Some(from_fingerprint) {
+                    job.identity = Some(to_fingerprint);
+                    carried.push(job.promise);
+                }
+            }
+            for id in carried {
+                if let Some(record) = kernel.promises.get_mut(&id) {
+                    if record.identity == Some(from_fingerprint) {
+                        record.identity = Some(to_fingerprint);
+                    }
+                }
+            }
+            for (key, entry) in kernel.idempotency.iter_mut() {
+                if rebound.contains(&key.0) && entry.3 == Some(from_fingerprint) {
+                    entry.3 = Some(to_fingerprint);
+                }
+            }
         }
         let record = kernel
             .caps
@@ -3174,9 +3211,25 @@ impl Agent {
         payload: Vec<u8>,
         from_peer: bool,
     ) -> Result<PromiseHandle> {
-        // The promise and job record peer.is_some(), not this flag: call_as
-        // builds its arguments in-process yet still queues for a peer.
-        let _ = from_peer;
+        // Either selector alone is wrong: `call_as` builds its arguments
+        // in-process yet still queues for a peer (`peer.is_some()`), and a
+        // transport that decoded an envelope but could not name the peer
+        // (`from_peer`) must not have that peer's work filed as the agent's own,
+        // or it becomes indistinguishable from an in-process promise and key
+        // (R-11 round 11, #4).
+        //
+        // The guard is repeated rather than asserted: a release build compiles an
+        // assertion out, and this is the choke point every entry point reaches
+        // (the red-team battery, H2.33).
+        if from_peer
+            && args
+                .iter()
+                .any(|arg| matches!(arg, Arg::Promise(_) | Arg::Cap(_)))
+        {
+            let error = Error::Wire("an envelope cannot carry a promise or capability argument");
+            self.record_refusal(lane, Some(cap.id()), &error);
+            return Err(error);
+        }
         // A method name is caller-controlled text that reaches a refusal
         // message, an event and a receipt. A granted name is bounded at mint
         // (1..=1024 bytes), so a longer one cannot be granted and is refused
@@ -3383,7 +3436,7 @@ impl Agent {
             PromiseRecord::new_for(
                 promise_id,
                 lane.0,
-                peer.is_some(),
+                peer.is_some() || from_peer,
                 crate::identity::presented_fingerprint(peer),
             ),
         );
@@ -3428,7 +3481,7 @@ impl Agent {
             args_bytes,
             receipted: false,
             identity: crate::identity::presented_fingerprint(peer),
-            from_peer: peer.is_some(),
+            from_peer: peer.is_some() || from_peer,
         };
         kernel.jobs.insert(job_id, job);
         kernel.queue.push_back(job_id);
@@ -3563,9 +3616,10 @@ impl Agent {
 
     /// Resolve a pending promise manually (used by peers that answer out of band).
     ///
-    /// A capability bound to a peer can only be answered by that peer; use
-    /// [`Agent::resolve_as`] from a transport, which presents the verified
-    /// identity. This entry point presents none, so it refuses a bound call.
+    /// The answer carries the identity the transport presented, so
+    /// [`Agent::resolve_as`] is the entry point a transport uses. This one
+    /// presents none: it is the agent's own act, and it refuses the answer to
+    /// any promise a peer queued, bound or not (R-11 round 10/11).
     pub fn resolve(&self, promise: &PromiseHandle, value: Value) -> Result<()> {
         self.resolve_as(None, promise, value)
     }
@@ -3609,57 +3663,79 @@ impl Agent {
             }
         }
         if let Some(job) = &job {
-            let lane_budget = match kernel.caps.get(&job.cap) {
-                Some(record) if record.revoked => return Err(Error::Revoked(cap_token(job.cap))),
-                Some(record)
-                    if record.expires_at.is_some_and(|expires_at| {
-                        kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
-                    }) =>
-                {
-                    if record.wall_clock != kernel.wall_clock {
-                        return Err(Error::Identity(
-                            "the capability's deadline is in another clock domain",
-                        ));
-                    }
-                    return Err(Error::Revoked(cap_token(job.cap)));
-                }
-                Some(record) => {
-                    // The promise records who queued it: an out-of-band answer
-                    // is that peer's act, not any holder's (round 9, F3).
-                    if let Some(record) = kernel.promises.get(&promise.id) {
-                        // Origin and fingerprint both: an anonymous peer has no
-                        // fingerprint but is still a peer, and it may answer its
-                        // own call (round 10, F1).
-                        let same_origin = record.from_peer == peer.is_some();
-                        let same_peer = match record.identity {
-                            Some(owner) => crate::identity::matches(
-                                crate::identity::presented_fingerprint(peer),
-                                owner,
-                            ),
-                            None => crate::identity::presented_fingerprint(peer).is_none(),
-                        };
-                        if !same_origin || !same_peer {
-                            return Err(Error::Identity(
-                                "a promise can only be answered by the peer that queued it",
-                            ));
-                        }
-                    }
-                    if let Some(bound) = record.attrs.bound_to {
-                        if !crate::identity::matches(
-                            crate::identity::presented_fingerprint(peer),
-                            bound,
-                        ) {
-                            return Err(Error::Identity(
-                                "a bound capability's promise can only be answered by its peer",
-                            ));
-                        }
-                    }
-                    match kernel.lanes.get(&job.lane) {
-                        Some(lane_record) if !lane_record.closed => lane_record.budget,
-                        _ => return Err(Error::UnknownLane(job.lane.0)),
-                    }
-                }
+            // Everything the checks need is read out first: recording a refusal
+            // takes the kernel mutably, which a live capability borrow forbids
+            // (R-11 round 11, #5).
+            let (revoked, expires_at, wall_clock, bound_to) = match kernel.caps.get(&job.cap) {
+                Some(record) => (
+                    record.revoked,
+                    record.expires_at,
+                    record.wall_clock,
+                    record.attrs.bound_to,
+                ),
                 None => return Err(Error::UnknownCapability(cap_token(job.cap))),
+            };
+            if revoked {
+                Self::record_refusal_in(
+                    &mut kernel,
+                    job.lane,
+                    Some(job.cap),
+                    &Error::Revoked(cap_token(job.cap)),
+                );
+                return Err(Error::Revoked(cap_token(job.cap)));
+            }
+            if expires_at.is_some_and(|expires_at| {
+                kernel.now_ms >= expires_at || wall_clock != kernel.wall_clock
+            }) {
+                let error = if wall_clock != kernel.wall_clock {
+                    Error::Identity("the capability's deadline is in another clock domain")
+                } else {
+                    Error::Revoked(cap_token(job.cap))
+                };
+                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                return Err(error);
+            }
+            // The promise records who queued it: an out-of-band answer is that
+            // peer's act, not any holder's (round 9, F3).
+            let owner_refusal = match kernel.promises.get(&promise.id) {
+                Some(record) => {
+                    // Origin and fingerprint both: an anonymous peer has no
+                    // fingerprint but is still a peer, and it may answer its own
+                    // call (round 10, F1).
+                    let same_origin = record.from_peer == peer.is_some();
+                    let same_peer = match record.identity {
+                        Some(owner) => crate::identity::matches(
+                            crate::identity::presented_fingerprint(peer),
+                            owner,
+                        ),
+                        None => crate::identity::presented_fingerprint(peer).is_none(),
+                    };
+                    (!same_origin || !same_peer).then_some(Error::Identity(
+                        "a promise can only be answered by the peer that queued it",
+                    ))
+                }
+                // A record is created with its job and dropped only once settled
+                // and unowned, so a missing one here is a broken invariant.
+                // Skipping the ownership check would fail open in the one place
+                // a peer chooses an answer (R-11 round 11, #6).
+                None => Some(Error::UnknownPromise(promise.id.0)),
+            };
+            if let Some(error) = owner_refusal {
+                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                return Err(error);
+            }
+            if let Some(bound) = bound_to {
+                if !crate::identity::matches(crate::identity::presented_fingerprint(peer), bound) {
+                    let error = Error::Identity(
+                        "a bound capability's promise can only be answered by its peer",
+                    );
+                    Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                    return Err(error);
+                }
+            }
+            let lane_budget = match kernel.lanes.get(&job.lane) {
+                Some(lane_record) if !lane_record.closed => lane_record.budget,
+                _ => return Err(Error::UnknownLane(job.lane.0)),
             };
             let budget = job.call.budget.intersect(&lane_budget);
             if let Some(error) = shape_refusal(&value, &budget) {
@@ -4316,7 +4392,7 @@ impl Agent {
             (
                 id,
                 fingerprint,
-                peer.is_some(),
+                peer.is_some() || from_peer,
                 crate::identity::presented_fingerprint(peer),
             ),
         );
@@ -6850,12 +6926,18 @@ pub fn tool_policy_for(methods: &[&str]) -> ToolPolicy {
 }
 
 /// Promise state accessor for tests and diagnostics.
-pub fn promise_state(agent: &Agent, id: PromiseId) -> Option<PromiseState> {
-    agent
+///
+/// It takes the handle, not a bare id: ids are a per-kernel counter from zero,
+/// so an id-taking accessor is a read of any promise's state by a guessable
+/// number, which is the isolation the ownership rules exist to provide (R-11
+/// round 11, #9).
+pub fn promise_state(promise: &PromiseHandle) -> Option<PromiseState> {
+    promise
+        .agent()
         .cell
         .borrow()
         .promises
-        .get(&id)
+        .get(&promise.id())
         .map(|record| record.state.clone())
 }
 

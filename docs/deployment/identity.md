@@ -81,9 +81,12 @@ let server = QuicServer::start_with_identity(
   handshake has already refused an anonymous peer, so the policy step is
   done; dispatch the decoded envelope with `dispatch_envelope` (or
   `call_from_envelope`) so its arguments pass the authority-argument guard.
-  `call_as`/`call_peer` are for arguments this process built: they do not
-  guard envelope arguments, and a pipelined argument may only name a
-  promise the same peer queued. With `None` (loopback only) the peer can be
+  `call_as` is for arguments this process built: it does not run the
+  authority-argument guard, so never decode a peer's body into `Arg` and
+  forward it with `call_as`. `call_peer` is a transport entry point and does
+  run the guard, so an envelope cannot smuggle a promise or a capability
+  through it. On either path a pipelined argument may only name a promise the
+  same peer queued. With `None` (loopback only) the peer can be
   anonymous, so run `IdentityPolicy::admit` and `dispatch_envelope`
   (rule 6 below). Never pass `None` on a path that is supposed to be
   authenticated.
@@ -133,7 +136,12 @@ client that presents none fails it as well.
    the durable records exported for the old peer, and only the live subtree is
    rebound: a revoked or expired child keeps the binding it died with, and a
    child holding a deadline from the other clock mode refuses the whole
-   operation instead of being rebound or left open. Plan the rotation window.
+   operation instead of being rebound or left open. The peer's *work* follows the
+   binding: queued jobs, pending promises and cached idempotency claims stamped
+   with the old fingerprint are moved to the successor, so a retry of a call the
+   peer already made returns the same promise instead of `rpc/identity` (and a
+   retry with a fresh key would apply the mutation twice). Plan the rotation
+   window.
 4. **Revoke at the CA and at the kernel.** Dropping a certificate stops new
    handshakes; `Agent::revoke` stops existing capabilities immediately.
 5. **Pin the clock mode.** Mint leases after selecting the clock

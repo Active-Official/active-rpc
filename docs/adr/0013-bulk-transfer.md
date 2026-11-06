@@ -103,25 +103,40 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   may bound the bytes it holds across objects with `with_max_live_bytes`, where
   each open transfer reserves two body copies plus the retained plan hash
   vector.
-- A `finish` whose wall grant is below `required_wall_ms()` may assemble three
-  times; after that the provider refuses it with `rpc/bulk` before any work.
-  Re-copying a body on every tiny grant is CPU the caller did not pay for, and
-  the recovery is a grant at `required_wall_ms()`, not a cheap retry. The stored
-  chunks are never destroyed: the non-destructiveness rule outranks the throttle,
-  and a workable attempt is always allowed and resets the budget.
+- A `finish` whose wall grant is below `assembly_wall_ms()` (the body's own cost
+  at the documented rate plus 100 ms) may assemble three times; after that the
+  provider **freezes** the transfer and refuses it with `rpc/bulk` before any
+  work. Re-copying a body on every tiny grant is CPU the caller did not pay for,
+  and a same-root `plan` frame does not clear the freeze, so a 53-byte frame
+  cannot buy another batch of assemblies. `required_wall_ms()` is the
+  *recommended* sizing — the floor of the default grant — while the freeze gates
+  on the body's own wall, so a narrow-profile deployment can still finish a small
+  body. The stored chunks are never destroyed by a refusal: the
+  non-destructiveness rule outranks the throttle, an attempt at the body's wall
+  always runs and clears the refusal budget, and `abort` is the caller's own way
+  to discard what it no longer wants.
+- A frozen transfer has exactly two ways out: a grant at the body's wall, which
+  the host mints (the peer cannot widen its own cap ∩ lane), or `abort`. Closing
+  the second is what makes the freeze safe to hold: without it the only release
+  is the idle or absolute window, and the object's slot and its reserved bytes
+  stay held until then.
 - The finish reply carries `canonical`, and `content_error` when an image's
   address could not be computed (`wall` or `parser`); a degraded reply is
   recorded as degraded instead of looking like a body without an address.
 - `finish` is the one bulk path that reads the wall clock: the grant is a
   *duration* (`max_wall_ms`), which `Call::now_ms` cannot express, so the
-  deadline is anchored at `Instant::now()` and re-checked between chunks and
-  before the verification pass. Every other lifetime is measured from the kernel
-  clock.
+  deadline is anchored at `Instant::now()` and checked between chunks, inside
+  the verification pass (chunk by chunk, via `BulkPlan::verify_within`) and
+  before the redaction. Every other lifetime is measured from the kernel clock.
+  The redaction pass itself is not interruptible, which is why the grant is
+  sized for it and the reply degrades to `content_error: "wall"` when the grant
+  is spent before it starts.
 - The per-chunk hash means a receiver verifies each chunk on arrival; the root
   proves the whole set. It is a two-level Merkle shape without the tree.
 - Authority stays on the ARP1 envelope: the provider is reached through a
-  capability that grants `plan`/`put`/`finish`, and the ingress charge covers the
-  chunk bytes, so the module cannot become an ambient file channel.
+  capability that grants `plan`/`put`/`missing`/`finish`/`abort`, and the ingress
+  charge covers the chunk bytes, so the module cannot become an ambient file
+  channel.
 - A chunk frame is at most 8 MiB, while `WireLimits::strict()` caps an envelope
   body at 1 MiB: under that profile the sender must plan with chunks under the
   ceiling, or the frame is refused as `rpc/wire` before the provider sees it.
