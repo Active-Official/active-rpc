@@ -412,23 +412,12 @@ impl LogLock {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     if attempt % 20 == 0 {
+                        // `take_stale` moves the lock, verifies that the file it
+                        // moved is the one that was judged, and preserves
+                        // anything else (R-13 round 9, F1).
                         if let Some(judged) = judged_stale(&path) {
-                            if let Some(safe) = claim_name(&judged) {
-                                // Quarantine by `rename`: the rename is atomic
-                                // and only one stealer can win it, so no stealer
-                                // ever deletes a lock another one just took
-                                // (R-13 round 8, L2). The file that moved is the
-                                // file that was judged, and a writer displaced by
-                                // the move fails `still_holds` and refuses to
-                                // write, so two writers never append.
-                                let quarantine = path.with_file_name(format!(
-                                    "{}.stale-{safe}",
-                                    file_name_text(&path)
-                                ));
-                                if std::fs::rename(&path, &quarantine).is_ok() {
-                                    let _ = std::fs::remove_file(&quarantine);
-                                    continue;
-                                }
+                            if take_stale(&path, &judged) {
+                                continue;
                             }
                         }
                     }
@@ -492,6 +481,46 @@ fn lock_state(path: &std::path::Path) -> Option<(u64, String, Option<u32>)> {
         .unwrap_or(0);
     let (nonce, pid) = read_lock(&file)?;
     Some((age_ms, nonce, pid))
+}
+
+/// Quarantine a lock that was judged stale, and only that lock.
+///
+/// The rename is atomic and only one stealer can win it. The moved file is then
+/// checked against the nonce that was judged: a different nonce means a writer
+/// created a new lock between the judgement and the move, and that lock was never
+/// judged abandoned, so it is **preserved** — put back when the path is free,
+/// otherwise kept under an orphan name — and the call reports failure rather than
+/// deleting a live writer's lock (R-13 round 9, F1). A displaced writer fails
+/// `still_holds` and refuses to write, so two writers never append.
+///
+/// Returns true when the lock that was judged was removed.
+fn take_stale(path: &std::path::Path, judged: &str) -> bool {
+    let Some(safe) = claim_name(judged) else {
+        return false;
+    };
+    let quarantine = path.with_file_name(format!("{}.stale-{safe}", file_name_text(path)));
+    if std::fs::rename(path, &quarantine).is_err() {
+        return false;
+    }
+    if nonce_of(&quarantine).as_deref() == Some(judged) {
+        let _ = std::fs::remove_file(&quarantine);
+        return true;
+    }
+    // Not the file that was judged: never delete it.
+    if !path.exists() {
+        let _ = std::fs::rename(&quarantine, path);
+    } else {
+        let orphan = quarantine.with_file_name(format!(
+            "{}.orphan-{}",
+            file_name_text(&quarantine),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::rename(&quarantine, &orphan);
+    }
+    false
 }
 
 /// Whether a lock of that age, naming that pid, still belongs to a live writer.
@@ -663,7 +692,12 @@ impl ReceiptLog {
                 "a log cannot start that close to the sequence ceiling",
             ));
         }
-        let _lock = LogLock::acquire(&path)?;
+        let lock = LogLock::acquire(&path)?;
+        if !lock.still_holds() {
+            return Err(Error::receipt(
+                "the receipt log lock was displaced by another process",
+            ));
+        }
         // Any existing content is refused, not just content that looks like
         // records: a truncated file is still evidence, and silently replacing it
         // is exactly what `truncate` exists for.
@@ -975,7 +1009,12 @@ impl ReceiptLog {
     /// discarded.
     pub fn repair(path: impl Into<std::path::PathBuf>) -> Result<u64> {
         let path = path.into();
-        let _lock = LogLock::acquire(&path)?;
+        let lock = LogLock::acquire(&path)?;
+        if !lock.still_holds() {
+            return Err(Error::receipt(
+                "the receipt log lock was displaced by another process",
+            ));
+        }
         let bytes = read_capped(&path)?;
         // A log that already walks is intact: repair has nothing to do.
         if walk_log(&bytes).is_ok() {
@@ -1509,6 +1548,37 @@ mod lock_tests {
             "{}.lock",
             path.file_name().unwrap().to_string_lossy()
         ))
+    }
+
+    /// The steal removes only the lock it judged. A lock created between the
+    /// judgement and the move was never judged abandoned, so `take_stale`
+    /// preserves it and reports failure (R-13 round 9, F1).
+    #[test]
+    fn the_steal_never_removes_a_lock_it_did_not_judge() {
+        let path = scratch("judged");
+        let lock_path = lock_of(&path);
+        std::fs::write(&lock_path, b"fresh-1 pid 4294967294 started 1").expect("lock");
+
+        // `take_stale` takes the **lock** path, as `acquire` passes it.
+        assert!(
+            !super::take_stale(&lock_path, "judged-2"),
+            "a lock with another nonce is not the one judged"
+        );
+        let kept = std::fs::read_to_string(&lock_path).expect("the unjudged lock survives");
+        assert!(
+            kept.starts_with("fresh-1"),
+            "the live lock is intact: {kept}"
+        );
+
+        // The lock that *was* judged is removed, so a real stale lock still goes.
+        assert!(
+            super::take_stale(&lock_path, "fresh-1"),
+            "the judged nonce is the one removed"
+        );
+        assert!(!lock_path.exists(), "the judged lock is gone");
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Ownership is a property of the file the writer created: when the path is

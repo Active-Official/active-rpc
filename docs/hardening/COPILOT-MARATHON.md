@@ -3262,6 +3262,30 @@ tree; the rate test pins the numbers the fixes are derived from.
 Gate: `cargo test --all-features` 648 passed, 0 failed; clippy clean on both
 feature sets; fmt and doc clean.
 
+### R-13 receipts - 2026-11-06 (round 9)
+
+Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at
+`13f7b9c`. Claims for M1, M2, L1, L3, L4 and L5 held; L2's quarantine had
+reintroduced the round-5 flaw. Verdict **NOT CLEAN**: one high, four mediums and
+five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | the quarantine `rename` moved *whatever* was at the lock path: a lock a writer created between the judgement and the move was moved too, and `create`/`truncate`/`repair` wrote without re-checking ownership, so two chains could reach the log | **fixed**: `take_stale` moves the lock, re-reads the moved file's nonce, and **preserves** anything that is not the file it judged (put back when the path is free, otherwise kept under an orphan name) instead of deleting it; `create_locked` and `repair` now call `still_holds()` right after acquiring, like `append_inner`. `the_steal_never_removes_a_lock_it_did_not_judge` proves both halves |
+| F2 | medium | an unidentifiable or future-dated lock wedges the log for ever (a future mtime makes the age negative and the lock never stale) | **open** — clamp a future mtime to "now" in `lock_state`, and treat a lock whose first bytes carry no usable nonce as age-only after the grace |
+| F3 | medium | a reader now honours a live-pid lock for the 20-minute grace, which a writer can renew indefinitely (`touch`) | **open** — the reader needs its own bound (a lock that keeps being refreshed is a writer that keeps working, so this is a trade-off to state, or to cap with a maximum wait) |
+| F4 | medium | an in-flight **read-only** cancel is receipted `Refused` although dispatch admitted it and the provider ran | **open** — the truthful decision for a call that reached the provider is `Admitted` with the refusal visible in the promise state; the round-8 L4 split conflated "no effect" with "not admitted" |
+| F5 | medium | a blocking `open()` on a FIFO or another non-regular file at the lock or log path hangs readers, writers and `repair` | **open** — open with `O_NONBLOCK`-equivalent semantics where available, or refuse a non-regular lock/log by metadata before opening |
+| L1 | low | a malicious nonce pre-planted as a directory at `{lock}.stale-{nonce}` blocks the rename on Linux and Windows | **open** — the orphan fallback in `take_stale` covers the second move; the first rename still needs a unique suffix |
+| L2 | low | the log path is followed through symlinks on append and `set_len` | **open** |
+| L3 | low | the in-flight `cancel` seals without the `!job.receipted` guard that `cancel_tree` has | **open** |
+| L4 | low | ADR-0021 still describes the deleted claim mechanism, and the "leftover claim" test plants a name the code no longer uses | **open** — the test is now vacuous and should be repointed at `take_stale`'s orphan path |
+| L5 | low | `tail_holds_a_record` is O(64 KiB^2) in `repair`, and `repair` never refreshes its lock during a 64 MiB read | **open** |
+
+Gate: the full local gate green (fmt, both clippy sets, both test sets, doc,
+benches, fuzz, control plane, CLI, hardening status, 9/9 negative controls); the
+receipt suites pass in the `rust:1.99` container.
+
 ### R-13 receipts - 2026-11-06 (round 8)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `7279d13`. Claims
