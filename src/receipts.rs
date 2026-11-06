@@ -295,6 +295,12 @@ struct LogLock {
     path: std::path::PathBuf,
     /// Written into the lock file: the only proof that this holder may remove it.
     nonce: String,
+    /// The handle `create_new` returned.
+    ///
+    /// `touch` acts on this handle, not on the path: a lock path a local user
+    /// replaced with a symlink or another file must not be the thing a live
+    /// writer refreshes (R-13 round 8, L1).
+    file: Option<std::fs::File>,
 }
 
 /// Age after which a lock file is treated as abandoned.
@@ -351,11 +357,22 @@ impl LogLock {
     /// platform-specific liveness probe. A failure here is not fatal: the age
     /// rule is then the only guard, which is what it was before.
     fn touch(&self) {
-        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.path) else {
+        let Some(file) = &self.file else {
             return;
         };
         let _ =
             file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()));
+    }
+
+    /// Whether the lock path still names this holder's lock.
+    ///
+    /// The mtime of a lock is advisory, but **ownership** is checked before
+    /// every write: if the path no longer carries this nonce, another process
+    /// displaced this lock and a second writer may hold the path, so this writer
+    /// refuses rather than append a second chain into the file (R-13 round 8,
+    /// M1). The check is one bounded read of the path.
+    fn still_holds(&self) -> bool {
+        nonce_of(&self.path).as_deref() == Some(self.nonce.as_str())
     }
 
     fn acquire(log: &std::path::Path) -> Result<Self> {
@@ -387,37 +404,29 @@ impl LogLock {
                             .map(|elapsed| elapsed.as_millis())
                             .unwrap_or(0)
                     );
-                    return Ok(Self { path, nonce });
+                    return Ok(Self {
+                        path,
+                        nonce,
+                        file: Some(file),
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     if attempt % 20 == 0 {
                         if let Some(judged) = judged_stale(&path) {
                             if let Some(safe) = claim_name(&judged) {
-                                let claim = path.with_file_name(format!(
-                                    "{}.steal-{safe}",
+                                // Quarantine by `rename`: the rename is atomic
+                                // and only one stealer can win it, so no stealer
+                                // ever deletes a lock another one just took
+                                // (R-13 round 8, L2). The file that moved is the
+                                // file that was judged, and a writer displaced by
+                                // the move fails `still_holds` and refuses to
+                                // write, so two writers never append.
+                                let quarantine = path.with_file_name(format!(
+                                    "{}.stale-{safe}",
                                     file_name_text(&path)
                                 ));
-                                // `create_new` picks exactly one stealer. The
-                                // loser waits: it must not remove anything. A
-                                // claim older than the ceiling is a stealer that
-                                // died between claiming and removing, so it is
-                                // removed and the steal retried
-                                // (R-13 round 7, #6).
-                                let claimed = std::fs::OpenOptions::new()
-                                    .write(true)
-                                    .create_new(true)
-                                    .open(&claim);
-                                if claimed.is_err() && older_than_stale(&claim) {
-                                    let _ = std::fs::remove_file(&claim);
-                                }
-                                if claimed.is_ok() {
-                                    // A writer can only replace the lock after it
-                                    // is removed, so an unchanged nonce means no
-                                    // one holds it and removing it is safe.
-                                    if nonce_of(&path).as_deref() == Some(judged.as_str()) {
-                                        let _ = std::fs::remove_file(&path);
-                                    }
-                                    let _ = std::fs::remove_file(&claim);
+                                if std::fs::rename(&path, &quarantine).is_ok() {
+                                    let _ = std::fs::remove_file(&quarantine);
                                     continue;
                                 }
                             }
@@ -461,28 +470,40 @@ fn lock_path(log: &std::path::Path) -> std::path::PathBuf {
 /// describe one file here, which is what makes the judgement trustworthy
 /// (R-13 round 5, #1).
 fn judged_stale(path: &std::path::Path) -> Option<String> {
+    let (age_ms, nonce, pid) = lock_state(path)?;
+    if lock_is_live(age_ms, pid) {
+        return None;
+    }
+    Some(nonce)
+}
+
+/// The facts one open read gives: the lock's age, its nonce, and the pid it names
+/// when its creator wrote one.
+///
+/// One handle, so the age and the identity describe the same file (R-13 round 5,
+/// #1). Lossy text, so a lock with a stray non-UTF-8 byte is still identifiable
+/// and can still be stolen (R-13 round 8, L5).
+fn lock_state(path: &std::path::Path) -> Option<(u64, String, Option<u32>)> {
     let file = std::fs::File::open(path).ok()?;
     let modified = file.metadata().ok()?.modified().ok()?;
     let age_ms = modified
         .elapsed()
         .map(|age| age.as_millis() as u64)
         .unwrap_or(0);
-    if age_ms <= LOCK_STALE_MS {
-        return None;
-    }
     let (nonce, pid) = read_lock(&file)?;
-    // A lock that names a live writer is not abandoned: a stopped process still
-    // holds it, and stealing it writes a second chain into the file that no
-    // repair can read (R-13 round 6, M1). The rule is bounded by
-    // `LOCK_LIVE_GRACE_MS`, because an unbounded one lets a planted lock naming
-    // a live pid stop the log for ever (R-13 round 7, #1). A writer that is
-    // making progress keeps its own lock fresh (`LogLock::touch`), so this branch
-    // only covers a process that cannot touch — which is why it is a grace and
-    // not the whole rule.
-    if pid.is_some_and(process_is_alive) && age_ms <= LOCK_LIVE_GRACE_MS {
-        return None;
-    }
-    Some(nonce)
+    Some((age_ms, nonce, pid))
+}
+
+/// Whether a lock of that age, naming that pid, still belongs to a live writer.
+///
+/// The one rule the stealer and the reader share: a lock is live while it is
+/// younger than `LOCK_STALE_MS`, and it stays live past that while the pid it
+/// names is alive, bounded by `LOCK_LIVE_GRACE_MS` so a planted lock naming a
+/// live pid cannot stop the log for ever (R-13 rounds 6-8). A writer that is
+/// making progress keeps its own lock fresh (`LogLock::touch`), so the grace only
+/// covers a process that cannot touch.
+fn lock_is_live(age_ms: u64, pid: Option<u32>) -> bool {
+    age_ms <= LOCK_STALE_MS || (pid.is_some_and(process_is_alive) && age_ms <= LOCK_LIVE_GRACE_MS)
 }
 
 /// Whether `pid` names a live process.
@@ -508,12 +529,16 @@ fn process_is_alive(_pid: u32) -> bool {
 /// `{nonce} pid {pid} started {ms}`; a lock without a pid is still usable.
 fn read_lock(file: &std::fs::File) -> Option<(String, Option<u32>)> {
     use std::io::Read;
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     file.try_clone()
         .ok()?
         .take(MAX_LOCK_BYTES)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .ok()?;
+    // Lossy: a lock with a stray non-UTF-8 byte in its first bytes is still
+    // identifiable, so it can still be stolen instead of blocking for ever
+    // (R-13 round 8, L5).
+    let text = String::from_utf8_lossy(&bytes);
     let mut words = text.split_whitespace();
     let nonce = words.next()?.to_string();
     let mut pid = None;
@@ -543,21 +568,6 @@ fn claim_name(nonce: &str) -> Option<String> {
         .take(64)
         .collect();
     (!cleaned.is_empty()).then_some(cleaned)
-}
-
-/// True when `path` exists and is older than the steal ceiling.
-///
-/// Used for a steal claim a dead stealer left behind: the claim protects one
-/// steal, so an ancient one protects nothing.
-fn older_than_stale(path: &std::path::Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age.as_millis() as u64 > LOCK_STALE_MS)
 }
 
 /// The file name of `path`, as text, for deriving a sibling name.
@@ -774,6 +784,14 @@ impl ReceiptLog {
             return Ok(());
         }
         let lock = LogLock::acquire(&self.path)?;
+        if !lock.still_holds() {
+            // The path no longer carries our nonce: another process displaced
+            // this lock, and a second writer may hold the path. Refusing keeps
+            // one chain in the file (R-13 round 8, M1).
+            return Err(Error::receipt(
+                "the receipt log lock was displaced by another process",
+            ));
+        }
         // Re-read only when the file changed under us (a foreign writer appended
         // or replaced it); the common case is one stat and one write.
         let observed = std::fs::metadata(&self.path)
@@ -1072,25 +1090,16 @@ fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// How recently a writer must have held the lock for a reader to wait.
-///
-/// A reader does not take the writer's lock, so it uses the lock's age to tell a
-/// live append from a crashed writer's leftover (or a hostile file). An old lock
-/// must never make a reader report "being written".
-const WRITER_ACTIVE_MS: u64 = 10_000;
-
 /// True when a writer is, or very recently was, appending.
 fn writer_active(path: &std::path::Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(lock_path(path)) else {
+    // The stealer's own rule, so "not active" for a reader means "stealable" for
+    // a writer. A separate short window made the two disagree: a 30-second-old
+    // lock was final for a reader and live for a stealer, so a slow append read
+    // as a damaged log (R-13 round 8, M2).
+    let Some((age_ms, _nonce, pid)) = lock_state(&lock_path(path)) else {
         return false;
     };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    modified
-        .elapsed()
-        .map(|age| age.as_millis() as u64 <= WRITER_ACTIVE_MS)
-        .unwrap_or(false)
+    lock_is_live(age_ms, pid)
 }
 
 /// Read and walk a log, tolerating a read that lands mid-append.
@@ -1478,5 +1487,67 @@ mod claim_tests {
         assert_eq!(claim_name(""), None);
         let long = claim_name(&"x".repeat(200)).expect("a long nonce still names a claim");
         assert_eq!(long.len(), 64, "the name is bounded");
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::LogLock;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "active-rpc-lock-unit-{}-{name}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn lock_of(path: &std::path::Path) -> std::path::PathBuf {
+        path.with_file_name(format!(
+            "{}.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    /// Ownership is a property of the file the writer created: when the path is
+    /// replaced, the writer knows it no longer holds the lock and refuses rather
+    /// than append a second chain (R-13 round 8, M1). `touch` refreshes the
+    /// writer's own file, never the replacement (L1).
+    #[test]
+    fn a_writer_that_lost_its_lock_refuses_and_never_refreshes_the_replacement() {
+        let path = scratch("own");
+        std::fs::write(&path, b"").expect("log");
+        let lock = LogLock::acquire(&path).expect("the lock is free");
+        let lock_path = lock_of(&path);
+        assert!(lock.still_holds(), "a fresh lock owns the path");
+
+        // A local user replaces the lock path with another file, and the
+        // replacement's own mtime is the baseline the writer must not change.
+        std::fs::remove_file(&lock_path).expect("remove");
+        std::fs::write(&lock_path, b"foreign-1 pid 1 started 1").expect("replacement");
+        assert!(
+            !lock.still_holds(),
+            "the writer must see that the path no longer carries its nonce"
+        );
+        let before = std::fs::metadata(&lock_path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        lock.touch();
+        let after = std::fs::metadata(&lock_path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        assert_eq!(
+            before, after,
+            "touch followed the path and refreshed somebody else's file"
+        );
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
     }
 }

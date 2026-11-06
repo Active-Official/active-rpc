@@ -218,6 +218,8 @@ fn a_planted_staging_entry_does_not_redirect_the_header() {
 fn a_lock_whose_pid_is_alive_is_not_stolen() {
     let path = scratch("alive");
     drop(ReceiptLog::create(&path).expect("create"));
+    // Open first: a live lock is an active writer, so a reader would wait for it.
+    let log = ReceiptLog::open(&path).expect("open");
     let lock = lock_of(&path);
     std::fs::write(
         &lock,
@@ -229,7 +231,6 @@ fn a_lock_whose_pid_is_alive_is_not_stolen() {
         std::time::SystemTime::now() - std::time::Duration::from_secs(600),
     );
 
-    let log = ReceiptLog::open(&path).expect("open");
     let started = std::time::Instant::now();
     let error = log
         .append(&receipt(1, "echo"))
@@ -346,6 +347,7 @@ fn a_leftover_claim_does_not_make_a_stale_lock_permanently_unstealable() {
 fn a_live_pid_lock_inside_the_grace_is_not_stolen() {
     let path = scratch("grace");
     drop(ReceiptLog::create(&path).expect("create"));
+    let log = ReceiptLog::open(&path).expect("open");
     let lock = lock_of(&path);
     std::fs::write(
         &lock,
@@ -358,12 +360,71 @@ fn a_live_pid_lock_inside_the_grace_is_not_stolen() {
         std::time::SystemTime::now() - std::time::Duration::from_secs(200),
     );
 
-    let log = ReceiptLog::open(&path).expect("open");
     let error = log
         .append(&receipt(1, "echo"))
         .expect_err("a live writer inside the grace is honoured");
     assert_eq!(error.code(), "rpc/receipt");
     assert!(lock.exists(), "the live writer still holds its lock");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock);
+}
+
+/// The reader and the stealer share one rule: a lock younger than the stale
+/// ceiling still belongs to a writer, so a torn tail beside it is "being written",
+/// never "damaged" (R-13 round 8, M2).
+#[test]
+fn a_lock_inside_the_stale_window_is_treated_as_live() {
+    let path = scratch("window");
+    let log = ReceiptLog::create(&path).expect("create");
+    log.append(&receipt(1, "echo")).expect("append");
+    drop(log);
+    // A torn trailing record: what a reader would call damage if nobody wrote.
+    let mut bytes = std::fs::read(&path).expect("read");
+    bytes.extend_from_slice(&[0x40, 0x00, 0x00, 0x00, 0xff]);
+    std::fs::write(&path, &bytes).expect("torn tail");
+    // A lock 30 s old with a dead pid: past the old 10 s reader window, well
+    // inside the 120 s ceiling the stealer uses.
+    let lock = lock_of(&path);
+    std::fs::write(&lock, b"31-1 pid 4294967294 started 1").expect("lock");
+    filetime_set(
+        &lock,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(30),
+    );
+
+    let error = match ReceiptLog::open(&path) {
+        Ok(_) => panic!("a lock inside the stale window is a live writer's"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("being written"),
+        "the refusal names the writer, not damage: {error}"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock);
+}
+
+/// A lock with a stray non-UTF-8 byte is still identifiable, so it can still be
+/// stolen instead of blocking the log for ever (R-13 round 8, L5).
+#[test]
+fn a_lock_with_a_non_utf8_prefix_is_still_stolen() {
+    let path = scratch("lossy");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let lock = lock_of(&path);
+    std::fs::write(&lock, b"\xff\xfe4242 pid 4294967294 started 1").expect("lock");
+    filetime_set(
+        &lock,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+    );
+
+    let log = ReceiptLog::open(&path).expect("open");
+    log.append(&receipt(1, "echo"))
+        .expect("the lossy nonce is still a nonce, so the lock is stolen");
+    assert_eq!(
+        ReceiptLog::verify_bytes(&std::fs::read(&path).expect("read"))
+            .expect("walk")
+            .len(),
+        1
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&lock);
 }

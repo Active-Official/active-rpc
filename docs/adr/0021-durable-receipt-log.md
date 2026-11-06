@@ -150,7 +150,14 @@ authority, and a crash costs at most one record.
 | C5 | low | a stealer killed between claiming and removing left a claim that made one stale lock unstealable for ever | A claim older than the steal ceiling is removed and the steal retried |
 | C6 | low | `LogLock::drop` read the lock with `read_to_string`, so a symlink to `/dev/zero` planted after the lock was created allocated without limit | The drop reads through the bounded lock parser |
 | C7 | low | an adopted sequence gap left the pre-gap receipts in the ring, so the window could never be exported | A non-zero gap clears the ring and counts the hole and the cleared records |
+| C8 | medium | the steal decided by age alone once the grace passed, so an attacker who replaced the lock path could make the writer's `touch` fail and then steal a live lock | Ownership is checked before every write: the writer keeps the handle `create_new` returned and refuses when the path no longer carries its nonce (`LogLock::still_holds`). A displaced writer therefore stops instead of racing, which is the invariant that matters |
+| C9 | medium | the reader and the stealer used different windows (10 s vs 120 s), so a 30-second-old lock was final for a reader and live for a stealer: a slow append read as a damaged log | One predicate, `lock_is_live`, for both roles: a lock is live while it is younger than `LOCK_STALE_MS`, or older but naming a live pid within `LOCK_LIVE_GRACE_MS`. A reader that exhausts its wait refuses with "being written" |
+| C10 | low | `touch` followed the lock path, so a planted symlink made the writer refresh another file | `touch` acts on the handle the writer created |
+| C11 | low | the steal's check-then-remove was not atomic, and an expired claim let two live stealers through | The steal quarantines the lock by `rename` (atomic; one winner) and deletes the quarantined file; a displaced writer fails `still_holds` |
+| C12 | low | a lock with a non-UTF-8 byte in its first bytes was unidentifiable, so it could never be stolen | The lock is parsed as lossy text |
 
 The reader's refusal code is `rpc/receipt` with a message naming the writer; it is
-a retryable condition, not damage. A reader that must not retry should take the
-writer's lock (the CLI does, through `ReceiptLog`).
+a retryable condition, not damage. **A reader does not take the writer's lock**:
+`ReceiptLog::open`/`snapshot` read and walk without it, so `receipts verify` exits
+non-zero with "being written" while an append is in progress and an operator
+retries. The lock is the writer's alone.
