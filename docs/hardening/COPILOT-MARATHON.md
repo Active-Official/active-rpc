@@ -2884,6 +2884,25 @@ gives the format a consumer.
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
 
+### R-11 identity - 2026-11-06 (round 13)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `3bed1ac`. Five of
+the six round-12 claims confirmed. Verdict **NOT CLEAN**: two mediums and five
+lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M-1 | medium | a descendant already bound to the **successor** blocked its ancestor's rotation with "a descendant is bound to another peer", leaving the tree split and unrecoverable (child at the new certificate, root at the old one, and neither `introduce_to` nor `reintroduce_to` moves it) | **fixed**: the descendant check allows the successor (`other != from && other != to`), which is the order an operator rotating a tree child-first walks. `a_child_rotated_first_does_not_block_the_root` proves both halves: child then root end at the successor, and a descendant moved to a third peer still refuses the rotation |
+| M-2 | medium | the new `cap.rotation-carried` event was emitted but absent from the closed schema (`EVENT_NAMES`, the spec table, the `every_event` fixture), so the "a new variant does not build without a name" gate stayed green | **fixed**: the name, the spec row and the fixture; `every_event_name_is_documented_and_projected` now covers it for real |
+| L-1 | low | the doc said a partial rotation is "fail-closed, nothing half-applied"; the producing prefix has already run | **fixed**: the doc says the producing prefix stays applied and only the dependent jobs are refused |
+| L-2 | low | the round-12 test only exercised the egress branch, not the shape or lane branches | **fixed**: `an_answer_wider_than_the_grant_is_counted_and_taped` covers the shape branch (array ceiling). The lane branch is unreachable from the public API (`destroy_lane` fails the queued job before `resolve_as` can see a missing lane), so it stays defensive code |
+| L-3 | low | on a shared lane the queue-time dependency check compares only the lane, so a peer can distinguish "a promise exists in this lane" from "never minted" by the refusal code | **accepted**: the difference is one bit about a call the peer itself made, no value is ever delivered, and closing it means recording the origin mismatch at queue time, which is the next revision's job together with RPC-11 |
+| L-4 | low | `resolve_as` reported the capability's state before the promise's owner, so a foreign peer learned `rpc/revoked` vs `rpc/identity` for a promise it does not own | **fixed**: the ownership check runs first; `a_foreign_answer_on_a_revoked_capability_is_an_identity_refusal` shows the owner still learns the revocation and a foreign peer learns only that it does not own the promise |
+| L-5 | low | (a) the doc claimed a new connection implies a new lane; (b) the replay mapping for the new event is unreachable because no recorded operation rotates | **fixed (a)**: the doc says "a lane that does not hold the claim". **(b) recorded**: the replay arm exists for exhaustiveness, so a package can never carry the name today; it costs one arm and keeps the trace total |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; the
+`rust:1.99` Linux suite; control plane, CLI, fuzz; negative controls 9/9.
+
 ### R-11 identity - 2026-11-06 (round 12)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `2488619`. The
@@ -3210,6 +3229,25 @@ tree; the rate test pins the numbers the fixes are derived from.
 
 Gate: `cargo test --all-features` 648 passed, 0 failed; clippy clean on both
 feature sets; fmt and doc clean.
+
+### R-13 receipts - 2026-11-06 (round 6)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `3bed1ac`. Three
+round-5 claims held; the lock budget and the reader claim were partly wrong.
+Verdict **not clean**: one medium and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M1 | medium | a lock old by *time* was stolen from a *live* writer: a stopped process or a batch slower than the ceiling held the lock, the stealer wrote a second chain, and `repair` refused the result — the whole log was lost | **fixed**: the lock names its writer's pid, and `judged_stale` refuses to steal while that pid is alive (where the kernel exposes it cheaply: `/proc`). `a_lock_whose_pid_is_alive_is_not_stolen` (Linux) ages a lock naming the test's own pid, asserts the append is refused after the documented wait and that the lock survives. A batch that outlives the ceiling on a non-Linux host is the residual this leaves |
+| L1 | low | the failing path sleeps on all 40 attempts (1.38 s), not 38 (1.33 s) | **fixed**: the comment states both paths and the round-4 bound is 1.5 s |
+| L2 | low | after the 220 ms bound a reader still returned a boundary-aligned prefix of a slow batch | **fixed**: if the lock is still fresh when the bound runs out, the reader refuses with "being written" instead of returning a prefix |
+| L3 | low | two ADRs still taught the master-secret MAC | **fixed**: ADR-0016 and ADR-0021 name `derive_receipt_key(secret)` |
+| L4 | low | `receipts_dropped` now conflates evicted, cleared and gap, and its doc claimed a window starts above 1 exactly when the counter is non-zero | **fixed**: the doc names the three terms and the restart case (a fresh kernel that adopts a sequence has dropped nothing) |
+| L5 | low | a stealer killed between creating its claim and removing it left that claim behind, making one stale lock unstealable forever | **fixed**: a claim older than the steal ceiling is removed and the steal retried |
+
+Gate: all receipt suites green on Windows and in the `rust:1.99` container (which
+also runs the Linux-only liveness test); the full local gate; negative controls
+9/9; red-team battery green.
 
 ### R-13 receipts - 2026-11-06 (round 5)
 

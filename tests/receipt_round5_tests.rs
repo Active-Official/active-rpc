@@ -58,7 +58,7 @@ fn a_contended_steal_never_corrupts_the_log() {
     drop(ReceiptLog::create(&path).expect("create"));
     // A crashed writer's lock, aged past the steal ceiling.
     let lock = lock_of(&path);
-    std::fs::write(&lock, b"999-1 pid 999 started 1").expect("lock");
+    std::fs::write(&lock, b"999-1 pid 4294967294 started 1").expect("lock");
     filetime_set(
         &lock,
         std::time::SystemTime::now() - std::time::Duration::from_secs(600),
@@ -112,7 +112,9 @@ fn a_hostile_nonce_cannot_steer_the_steal_claim() {
     let path = scratch("hostile");
     drop(ReceiptLog::create(&path).expect("create"));
     let lock = lock_of(&path);
-    std::fs::write(&lock, b"../../escaped pid 1 started 1").expect("lock");
+    // A pid no process can have: a live pid is never stolen (round 6, M1), and
+    // this test is about the nonce, not the liveness rule.
+    std::fs::write(&lock, b"../../escaped pid 4294967294 started 1").expect("lock");
     filetime_set(
         &lock,
         std::time::SystemTime::now() - std::time::Duration::from_secs(600),
@@ -193,4 +195,40 @@ fn a_planted_staging_entry_does_not_redirect_the_header() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&planted);
     let _ = std::fs::remove_file(lock_of(&path));
+}
+
+/// A lock that names a live writer is not abandoned however old it looks: a
+/// stopped process or a slow batch still holds it, and stealing it writes a
+/// second chain into the file (R-13 round 6, M1). The liveness check exists only
+/// where the kernel exposes another process cheaply (`/proc`), so the assertion
+/// is Linux-only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lock_whose_pid_is_alive_is_not_stolen() {
+    let path = scratch("alive");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let lock = lock_of(&path);
+    std::fs::write(
+        &lock,
+        format!("424242 pid {} started 1", std::process::id()).as_bytes(),
+    )
+    .expect("lock");
+    filetime_set(
+        &lock,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+    );
+
+    let log = ReceiptLog::open(&path).expect("open");
+    let started = std::time::Instant::now();
+    let error = log
+        .append(&receipt(1, "echo"))
+        .expect_err("a live writer's lock is not stolen");
+    assert_eq!(error.code(), "rpc/receipt");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(1_000),
+        "the caller waited the documented budget"
+    );
+    assert!(lock.exists(), "the live writer still holds its lock");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock);
 }

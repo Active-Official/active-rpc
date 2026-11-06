@@ -54,6 +54,12 @@ fn every_event(cap: CapId) -> Vec<Event> {
         Event::CapExported(cap),
         Event::CapRestored(cap),
         Event::CapRecordOrphaned(cap),
+        Event::RotationCarried {
+            cap,
+            jobs: 1,
+            promises: 1,
+            claims: 0,
+        },
         Event::CapRebound {
             cap,
             from: [0x22; 32],

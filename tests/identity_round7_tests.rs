@@ -577,3 +577,147 @@ fn an_over_budget_answer_is_counted_and_taped() {
         .count();
     assert_eq!(taped, 1, "exactly one refusal event");
 }
+
+/// Rotating a tree child-first is the natural order, and it must not leave the
+/// root unrotatable: a descendant already bound to the successor is not "another
+/// peer" (R-11 round 13, M-1).
+#[test]
+fn a_child_rotated_first_does_not_block_the_root() {
+    let agent = Agent::with_secret([0xbc; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let root = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("root");
+    let child = agent
+        .attenuate(&root, CapAttrs::new(&["echo"]))
+        .expect("child");
+    agent
+        .introduce_to(&root, &admitted(OLD))
+        .expect("bind the tree");
+
+    // Child first, then the root: both end at the successor.
+    agent
+        .reintroduce_to(&child, &PeerIdentity::from_certificate(OLD), &admitted(NEW))
+        .expect("the child rotates");
+    agent
+        .reintroduce_to(&root, &PeerIdentity::from_certificate(OLD), &admitted(NEW))
+        .expect("the root still rotates after its child");
+    assert_eq!(
+        agent.cap_attrs(&child).expect("attrs").bound_to,
+        Some(admitted(NEW).fingerprint())
+    );
+    assert_eq!(
+        agent.cap_attrs(&root).expect("attrs").bound_to,
+        Some(admitted(NEW).fingerprint())
+    );
+
+    // A descendant bound to a third peer is still refused: it is somebody
+    // else's authority.
+    let agent = Agent::with_secret([0xbd; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let root = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("root");
+    let child = agent
+        .attenuate(&root, CapAttrs::new(&["echo"]))
+        .expect("child");
+    agent
+        .introduce_to(&root, &admitted(OLD))
+        .expect("bind the tree");
+    // The child moves to a third peer: it is no longer this rotation's to move.
+    agent
+        .reintroduce_to(
+            &child,
+            &PeerIdentity::from_certificate(OLD),
+            &admitted(b"a third peer certificate"),
+        )
+        .expect("the child moves to a third peer");
+    let error = agent
+        .reintroduce_to(&root, &PeerIdentity::from_certificate(OLD), &admitted(NEW))
+        .expect_err("a third peer's descendant refuses the rotation");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+}
+
+/// An answer whose shape the grant refuses is counted and taped on the
+/// out-of-band path too (R-11 round 12, F2; round 13, L-2).
+#[test]
+fn an_answer_wider_than_the_grant_is_counted_and_taped() {
+    let agent = Agent::with_secret([0xbe; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.budget.max_array_len = 4;
+    let cap = agent.mint(provider, 0, attrs).expect("cap");
+    agent.introduce_to(&cap, &admitted(OLD)).expect("bind");
+    let lane = agent.create_lane("shape", Budget::default()).expect("lane");
+    let promise = agent
+        .call_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::text("q")],
+        )
+        .expect("queued");
+
+    let before = agent.metrics();
+    let wide = active_rpc::Value::list((0..8).map(active_rpc::Value::Int));
+    let error = agent
+        .resolve_as(Some(&PeerIdentity::from_certificate(OLD)), &promise, wide)
+        .expect_err("eight elements exceed the array ceiling");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    let after = agent.metrics();
+    assert_eq!(after.calls_refused, before.calls_refused + 1);
+    assert_eq!(after.budget_exhaustions, before.budget_exhaustions + 1);
+    let taped = agent
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, Event::BudgetExhausted { .. }))
+        .count();
+    assert_eq!(taped, 1, "exactly one budget event");
+}
+
+/// Ownership is answered before the capability's own state: a peer that does not
+/// own the promise must not learn whether the capability is revoked
+/// (R-11 round 13, L-4).
+#[test]
+fn a_foreign_answer_on_a_revoked_capability_is_an_identity_refusal() {
+    let agent = Agent::with_secret([0xbf; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &admitted(OLD)).expect("bind");
+    let lane = agent
+        .create_lane("revoked", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::text("q")],
+        )
+        .expect("queued");
+    agent.revoke(&cap).expect("revoke");
+
+    // The owner still learns the revocation.
+    let error = agent
+        .resolve_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            &promise,
+            active_rpc::Value::text("mine"),
+        )
+        .expect_err("a revoked capability refuses the answer");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+
+    // Another peer learns nothing about the capability.
+    let error = agent
+        .resolve_as(
+            Some(&PeerIdentity::from_certificate(NEW)),
+            &promise,
+            active_rpc::Value::text("not mine"),
+        )
+        .expect_err("a foreign answer is refused");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+}

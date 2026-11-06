@@ -36,6 +36,7 @@ pub const EVENT_NAMES: &[&str] = &[
     "cap.restored",
     "cap.record-orphaned",
     "cap.rebound",
+    "cap.rotation-carried",
     "cap.introduced",
     "cap.transferred",
     "lane.created",

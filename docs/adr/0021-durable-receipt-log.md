@@ -131,7 +131,9 @@ authority, and a crash costs at most one record.
   batch is written with one `write_all` plus `sync_data`. 2 000 appends run in
   well under a second on a developer machine and the test
   `many_appends_stay_linear` bounds it.
-- The MAC is keyed by the kernel secret, so the same receipt cannot be
+- The MAC is keyed by the derived receipt key
+  (`derive_receipt_key(secret)`), never the master secret, which mints
+  capability ids, so the same receipt cannot be
   transplanted between kernels or edited without detection (`receipts_tests`).
 - A log is evidence, not a signature: it proves internal consistency and kernel
   origin, not who holds the file. Authenticity of the file itself is the

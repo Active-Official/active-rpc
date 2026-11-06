@@ -19,7 +19,7 @@ dispatch appends a `Receipt` to a bounded ring (`MAX_RECEIPTS = 1024`):
 sequence u64 | cap correlation id | method | at_ms u64 | decision | mac [32]
 ```
 
-- The mac is `blake3::keyed_hash(kernel_secret, domain || fields)`. It proves
+- The mac is `blake3::keyed_hash(derive_receipt_key(kernel_secret), domain || fields)`. It proves
   the record came from this kernel and was not edited; it is not a public-key
   signature and is not intended to convince a third party that never shared the
   secret.

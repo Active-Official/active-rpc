@@ -145,12 +145,12 @@ fn an_unidentifiable_lock_is_refused_within_a_bounded_time() {
         .expect_err("a lock without a nonce cannot be stolen");
     let elapsed = started.elapsed();
     assert_eq!(error.code(), "rpc/receipt");
-    // The documented budget is 1.33 s of backoff across 40 attempts. A
-    // ceiling of 2 s still catches a doubling, which the old 6 s bound could
-    // not (R-13 round 5, #4).
+    // The failing path sleeps on all 40 attempts: 1.38 s of backoff. A ceiling
+    // of 1.5 s catches a doubling, which the old 6 s bound could not
+    // (R-13 rounds 5-6).
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "the wait was {elapsed:?}, not the documented ~1.3 s"
+        elapsed < std::time::Duration::from_millis(1_500),
+        "the wait was {elapsed:?}, not the documented ~1.38 s"
     );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&lock);

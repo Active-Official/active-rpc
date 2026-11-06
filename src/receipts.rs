@@ -433,14 +433,40 @@ fn judged_stale(path: &std::path::Path) -> Option<String> {
     if age_ms <= LOCK_STALE_MS {
         return None;
     }
-    read_nonce(&file)
+    let (nonce, pid) = read_lock(&file)?;
+    // A lock that names a live writer is not abandoned, however old it looks: a
+    // stopped process or a batch slower than the ceiling still holds it, and
+    // stealing it writes a second chain into the file that no repair can read
+    // (R-13 round 6, M1). Where the platform does not expose another process's
+    // existence cheaply, the age rule stands alone.
+    if pid.is_some_and(process_is_alive) {
+        return None;
+    }
+    Some(nonce)
 }
 
-/// The first token of an open lock file: the nonce its creator wrote.
+/// Whether `pid` names a live process.
+///
+/// Cheap only where the kernel exposes it as a directory; elsewhere the age rule
+/// is the whole test, which is why `LOCK_STALE_MS` is generous.
+#[cfg(target_os = "linux")]
+fn process_is_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// See the Linux implementation: without a cheap existence check the age rule is
+/// the whole test.
+#[cfg(not(target_os = "linux"))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+/// The nonce and (when the creator wrote one) the pid of an open lock file.
 ///
 /// Bounded: a lock is one short line, and a hostile file must not make a reader
-/// allocate megabytes to discover that.
-fn read_nonce(file: &std::fs::File) -> Option<String> {
+/// allocate megabytes to discover that. The format is
+/// `{nonce} pid {pid} started {ms}`; a lock without a pid is still usable.
+fn read_lock(file: &std::fs::File) -> Option<(String, Option<u32>)> {
     use std::io::Read;
     let mut text = String::new();
     file.try_clone()
@@ -448,13 +474,22 @@ fn read_nonce(file: &std::fs::File) -> Option<String> {
         .take(MAX_LOCK_BYTES)
         .read_to_string(&mut text)
         .ok()?;
-    text.split_whitespace().next().map(str::to_string)
+    let mut words = text.split_whitespace();
+    let nonce = words.next()?.to_string();
+    let mut pid = None;
+    while let Some(word) = words.next() {
+        if word == "pid" {
+            pid = words.next().and_then(|value| value.parse().ok());
+            break;
+        }
+    }
+    Some((nonce, pid))
 }
 
 /// The nonce of the file at `path`, if it can be read.
 fn nonce_of(path: &std::path::Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
-    read_nonce(&file)
+    read_lock(&file).map(|(nonce, _)| nonce)
 }
 
 /// A nonce rendered safe to use in a file name.

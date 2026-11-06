@@ -1050,11 +1050,14 @@ impl Agent {
         Ok(())
     }
 
-    /// Receipts the ring evicted, or that disabling cleared.
+    /// Receipts the ring evicted, or that disabling cleared, plus any gap an
+    /// adopted sequence opened (`set_receipt_sequence`).
     ///
-    /// An exported window starts at a sequence above 1 exactly when this is
-    /// non-zero; without the counter an auditor could not tell a short session
-    /// from a truncated record.
+    /// Three terms share this counter because they answer one question: how much
+    /// history a window does not contain. A window can therefore start above 1
+    /// with the counter at zero — a fresh kernel that adopts a sequence before it
+    /// seals anything has dropped nothing — so an auditor reads the window's
+    /// start, not this counter alone (R-13 round 6, L4).
     pub fn receipts_dropped(&self) -> u64 {
         self.cell.borrow().receipts_dropped
     }
@@ -2029,11 +2032,16 @@ impl Agent {
                     Liveness::Live => {}
                 }
                 // A descendant bound to a different peer is somebody else's
-                // authority; moving it would hand them a rotated identity.
+                // authority; moving it would hand them a rotated identity. A
+                // descendant already bound to the *successor* is not in the way:
+                // its own rotation moved it (and its work) first, which is the
+                // order an operator rotating a tree child-first walks, and the
+                // refusal left the tree split with no way back
+                // (R-11 round 13, M-1).
                 if child
                     .attrs
                     .bound_to
-                    .is_some_and(|other| other != from_fingerprint)
+                    .is_some_and(|other| other != from_fingerprint && other != to_fingerprint)
                 {
                     return Err(Error::Identity("a descendant is bound to another peer"));
                 }
@@ -3705,6 +3713,38 @@ impl Agent {
             }
         }
         if let Some(job) = &job {
+            // Who may answer comes first: a capability's state is a fact about
+            // the capability, and a peer that does not own the promise must not
+            // learn it by guessing a promise id (R-11 round 13, L-4).
+            // The promise records who queued it: an out-of-band answer is that
+            // peer's act, not any holder's (round 9, F3).
+            let owner_refusal = match kernel.promises.get(&promise.id) {
+                Some(record) => {
+                    // Origin and fingerprint both: an anonymous peer has no
+                    // fingerprint but is still a peer, and it may answer its own
+                    // call (round 10, F1).
+                    let same_origin = record.from_peer == peer.is_some();
+                    let same_peer = match record.identity {
+                        Some(owner) => crate::identity::matches(
+                            crate::identity::presented_fingerprint(peer),
+                            owner,
+                        ),
+                        None => crate::identity::presented_fingerprint(peer).is_none(),
+                    };
+                    (!same_origin || !same_peer).then_some(Error::Identity(
+                        "a promise can only be answered by the peer that queued it",
+                    ))
+                }
+                // A record is created with its job and dropped only once settled
+                // and unowned, so a missing one here is a broken invariant.
+                // Skipping the ownership check would fail open in the one place
+                // a peer chooses an answer (R-11 round 11, #6).
+                None => Some(Error::UnknownPromise(promise.id.0)),
+            };
+            if let Some(error) = owner_refusal {
+                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                return Err(error);
+            }
             // Everything the checks need is read out first: recording a refusal
             // takes the kernel mutably, which a live capability borrow forbids
             // (R-11 round 11, #5).
@@ -3734,35 +3774,6 @@ impl Agent {
                 } else {
                     Error::Revoked(cap_token(job.cap))
                 };
-                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
-                return Err(error);
-            }
-            // The promise records who queued it: an out-of-band answer is that
-            // peer's act, not any holder's (round 9, F3).
-            let owner_refusal = match kernel.promises.get(&promise.id) {
-                Some(record) => {
-                    // Origin and fingerprint both: an anonymous peer has no
-                    // fingerprint but is still a peer, and it may answer its own
-                    // call (round 10, F1).
-                    let same_origin = record.from_peer == peer.is_some();
-                    let same_peer = match record.identity {
-                        Some(owner) => crate::identity::matches(
-                            crate::identity::presented_fingerprint(peer),
-                            owner,
-                        ),
-                        None => crate::identity::presented_fingerprint(peer).is_none(),
-                    };
-                    (!same_origin || !same_peer).then_some(Error::Identity(
-                        "a promise can only be answered by the peer that queued it",
-                    ))
-                }
-                // A record is created with its job and dropped only once settled
-                // and unowned, so a missing one here is a broken invariant.
-                // Skipping the ownership check would fail open in the one place
-                // a peer chooses an answer (R-11 round 11, #6).
-                None => Some(Error::UnknownPromise(promise.id.0)),
-            };
-            if let Some(error) = owner_refusal {
                 Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
                 return Err(error);
             }

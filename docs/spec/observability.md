@@ -60,6 +60,7 @@ authority.
 | `cap.restored` | `cap` | a sealed durable record was restored as a live capability (paired with `cap.minted`) |
 | `cap.record-orphaned` | `cap` | the last handle of an exported durable capability was dropped: the record is still restorable, and its object stays pinned until the record is restored |
 | `cap.rebound` | `cap`, `identity` | a capability was rebound from one authenticated peer to another (`from->to` fingerprints) |
+| `cap.rotation-carried` | `cap`, `detail` | a rotation carried the peer's own work to the successor certificate; `detail` is `jobs N promises N claims N`, so a rotation that moved a peer's answers is distinguishable from one that moved none |
 | `cap.introduced` | `cap`, `identity` | a capability was bound to an authenticated peer |
 | `cap.transferred` | `cap`, `channel` | a capability travelled on a channel |
 | `lane.created` | `lane` | a lane was created |
