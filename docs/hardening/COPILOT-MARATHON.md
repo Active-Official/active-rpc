@@ -24,8 +24,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
-| R-11 | identity | `src/identity.rs` | rounds 1-9: round 9 found 4 mediums, all fixed; rounds 10 and 11 must be clean to close | 57 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
-| R-12 | replay | `src/replay.rs` | rounds 1-4: round 4 found 1 medium and 7 lows (2 fixed, 6 recorded); round 5 must clear them | 30 fixed / 0 rejected / 6 noted | this commit |
+| R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
+| R-12 | replay | `src/replay.rs` | rounds 1-5: round 5 found no critical/high/medium (CLEAN) and 12 lows (2 fixed); round 6 must be clean to close | 32 fixed / 0 rejected / 10 noted | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
@@ -2806,6 +2806,25 @@ gives the format a consumer.
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
 
+### R-11 identity - 2026-11-06 (round 10)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `e41cd18`. The
+clock fix and the dispatch-owner test verified. Verdict **PARTIAL**: one high and
+six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `presented_fingerprint` returns `None` both for "no peer" and "an anonymous peer", so promise ownership, `resolve_as` ownership and idempotency ownership could not tell the agent's own in-process call from an identity-less peer: a handler forwarding decoded args with `call_as(None, ...)` let a peer pipeline a small sequential promise id and read the agent's value back | **fixed**: `Job`, `PromiseRecord` and the idempotency entry carry a peer-origin flag (`peer.is_some()`), dispatch and `resolve_as` compare origin **and** fingerprint, and an anonymous peer can still answer its own out-of-band call; `a_promise_of_another_peer_is_refused_at_dispatch` (unbound cap), `an_out_of_band_answer_comes_from_the_queueing_peer` |
+| 2 | low | `resolve_as` refusals were uncounted and untaped | **recorded** for the next round |
+| 3 | low | the spec's §2.1 describes promise pipelining while every envelope entry point refuses `Arg::Promise` | **recorded** (doc batch) |
+| 4 | low | the deployment doc misdescribes `call_peer` as unguarded | **recorded** (doc batch) |
+| 5 | low | a foreign-clock deadline is `rpc/persistence` at export/restore and `rpc/identity` elsewhere | **recorded** (doc batch) |
+| 6 | low | `introduce_to` does not retire exported records of the old binding, unlike `reintroduce_to` | **recorded** |
+| 7 | low | label defects: the `Liveness` doc split, `with_subject("")`, the policy-field interaction | **recorded** |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
+
 ### R-11 identity - 2026-11-06 (round 9)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `17c6519`. All
@@ -2958,6 +2977,22 @@ processes sharing a certificate share a binding, and a receipt cannot name the
 audience of an unbound capability.
 
 Gate: `scripts/local_gate.sh` green; all-features 686 passed.
+
+### R-12 replay - 2026-11-06 (round 5, first clean pass)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `e41cd18`.
+Verdict **CLEAN**: no critical, high or medium; twelve lows, none touching
+secrets, attenuation, revocation-at-dispatch, the canonical hash or the
+fail-closed parse.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | `replay_trace` cloned the package and the trace (3-4x a ceiling-sized package) | **fixed**: `into_parts` moves the trace and ops out; `a_mismatch_names_the_ordinal` |
+| 2 | low | a trace mismatch printed only the event, so an edited cap ordinal rendered as "X ... X" | **fixed**: the message names both ordinals |
+| 3-12 | low | trace-only accessor and `poisoned()` getter, CLI zero-length destination and `--force` TOCTOU, parent-directory fsync, replay-before-dump, help text, golden ARRP vector, and the replay-side lifecycle notes | **recorded** for round 6 |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-12 replay - 2026-11-06 (round 4)
 
