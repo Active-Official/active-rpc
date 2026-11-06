@@ -23,7 +23,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-9: round 9 found 5 mediums and 3 lows, all fixed; round 10 must be clean | 75 fixed / 0 rejected / 0 open (5 residuals recorded) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-10: round 10 found 4 mediums and 4 lows, all fixed (two reply-degradation branches inspected, not unit-tested); round 11 must be clean | 83 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-8: round 8 found 1 high, 3 mediums and 4 lows, all fixed; rounds 9 and 10 must be clean to close | 53 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-3: 9 + 11 + 8 findings (5 round-1 fixes were partial) | 28 fixed / 0 rejected / 0 open | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
@@ -2595,6 +2595,25 @@ logical message in one frame.
 Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
+
+### R-10 bulk transfer - 2026-11-05 (round 10)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `17c6519`. Six
+round-9 claims verified. Verdict **PARTIAL**: four mediums and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `live_bytes` counted two body copies but not the retained plan hash vector (32 bytes per chunk), so a one-byte-chunk plan held 16x what the bound accounted | **fixed**: `reserved_bytes(plan)` = 2 x total + header + 32 x chunks, used by `live_bytes` and the check; `the_live_bound_counts_the_plan` |
+| 2 | medium | the metered receiver charged after `BulkChunk::decode` + Blake3, so a wrong-hash frame bought a hash for free | **fixed**: the charge precedes validation in `accept` and `accept_charged`; the bad frame is charged and stores nothing; `a_bad_frame_is_charged_before_validation` |
+| 3 | medium | once the wall-refusal cap was spent, the refusal was `rpc/budget-exceeded("wall")` although no grant can rescue it | **fixed**: `rpc/bulk("finish is exhausted for this transfer")`, documented as a state refusal recovered by re-planning; `an_exhausted_finish_is_a_state_refusal` |
+| 4 | medium | a spent grant or a parser fault silently dropped `content`, and the reply is recorded and replayed, so the degradation was permanent and indistinguishable from "not an image" | **fixed**: the reply carries `canonical` and, when an image's address could not be computed, `content_error` (`wall` or `parser`); `a_reply_says_whether_the_body_is_canonical` covers the image and non-image shapes. The `wall`/`parser` branches are timing- and parser-dependent: recorded as inspected, not unit-tested (they need a clock seam). |
+| 5 | low | the live-bytes check preceded `require_taken` and the root check, so a state refusal could arrive as a budget fault | **fixed**: the state checks run first |
+| 6 | low | a failed `checked_add` left `deadline = None`, which is no wall bound at all | **fixed**: it falls back to the absolute lifetime |
+| 7 | low | the ADR omitted the lane-wall rule and kept the unscoped idempotency/`missing` wording | **fixed**: the ADR states the lane axis, the plan-hash reservation, the state refusal and the scoped wording |
+| 8 | low | the three-refusal control had no test | **fixed**: the fourth attempt's class is asserted |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-10 bulk transfer - 2026-11-05 (round 9)
 

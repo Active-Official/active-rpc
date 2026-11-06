@@ -649,11 +649,16 @@ capability can poll but cannot destroy another capability's chunks. The absolute
 lifetime below still applies to a poll, so polling cannot hold a transfer
 forever. `finish` is idempotent per object until a new plan is accepted for it: a
 repeated marker returns the same reply, even after the host takes the body,
-because the effect already landed. The reply is `length`, `body_hash` (the raw Blake3 digest
+because the effect already landed. The reply is `length`, `canonical` (whether
+the body has a content address), `body_hash` (the raw Blake3 digest
 of the body: a transfer-integrity value, **never** a content address; omitted for
 a redacting call) and, when the body is an Active Infinity image, `content`: the
 canonical content address of the **redacted** image, the same value the domain
-provider serves. A grant must cover `BulkPlan::required_grant()` bytes (plan
+provider serves. When the address could have been computed but was not,
+`canonical` is false and `content_error` says why (`wall`: the grant was spent
+during the assembly; `parser`: the body decodes as an image but cannot be
+redacted). The reply is recorded and replayed, so a degraded reply says so
+rather than looking like a body that is not an image. A grant must cover `BulkPlan::required_grant()` bytes (plan
 frame, chunk frames, finish marker and a per-call reply allowance) and
 `BulkPlan::required_calls()` calls (one pass plus a gaps-only resume's `missing`
 pages): `total + 53 × chunk_count` pays for the chunk frames only. A caller that

@@ -191,14 +191,16 @@ fn a_missing_frame_is_validated() {
 fn the_provider_can_bound_its_live_bytes() {
     let first = BulkTransfer::new(body(2_000, 83), 1_000).expect("first");
     let second = BulkTransfer::new(body(2_000, 84), 1_000).expect("second");
-    let mut provider = BulkProvider::new().with_max_live_bytes(4_000);
+    let plan = first.plan().clone();
+    let reserved = 2 * plan.total() + 53 + 32 * plan.chunk_count() as u64;
+    let mut provider = BulkProvider::new().with_max_live_bytes(reserved);
     provider
         .invoke(0, &call("plan", first.plan_frame()))
         .expect("first fits");
     assert_eq!(
         provider.live_bytes(),
-        4_000,
-        "the plan and its assembly are reserved"
+        reserved,
+        "the plan, its assembly and its hash vector are reserved"
     );
     assert!(
         provider
@@ -227,16 +229,18 @@ fn the_lane_wall_is_named() {
 #[test]
 fn a_plan_retry_does_not_double_reserve() {
     let transfer = BulkTransfer::new(body(2_000, 86), 1_000).expect("transfer");
-    let limit = transfer.plan().total() * 2;
-    let mut provider = BulkProvider::new().with_max_live_bytes(limit);
+    let plan = transfer.plan().clone();
+    // Two body copies plus the retained plan hash vector (round 10, M-1).
+    let reserved = 2 * plan.total() + 53 + 32 * plan.chunk_count() as u64;
+    let mut provider = BulkProvider::new().with_max_live_bytes(reserved);
     provider
-        .invoke(0, &call("plan", transfer.plan_frame()))
+        .invoke(0, &call("plan", plan.encode()))
         .expect("first plan");
-    assert_eq!(provider.live_bytes(), limit, "two body copies reserved");
+    assert_eq!(provider.live_bytes(), reserved, "the reservation is exact");
     provider
-        .invoke(0, &call("plan", transfer.plan_frame()))
+        .invoke(0, &call("plan", plan.encode()))
         .expect("the identical plan is a retry, not a second reservation");
-    assert_eq!(provider.live_bytes(), limit);
+    assert_eq!(provider.live_bytes(), reserved);
 }
 
 /// A resume request names the indexes the reply contains (round 9, M3).

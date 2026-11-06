@@ -46,8 +46,9 @@ hash matches the bytes *and* the plan's announced hash.
   idempotent); a duplicate with different bytes is refused.
 - `missing()` drives the resume request. A receiver reconstructed from the plan
   asks only for the gaps: a reconnect never restarts the body.
-- Each accepted frame is **charged before it is stored** (`with_budget`,
-  `accept_charged`); a refused charge leaves no state.
+- Each accepted frame is **charged before it is decoded** (`with_budget`,
+  `accept_charged`), because the decode and the hash are the work the charge
+  pays for; a refused charge leaves no state.
 - `finish()` requires every chunk, checks the total length and re-verifies the
   body against the plan. A truncated or corrupted body never becomes a valid
   image.
@@ -58,13 +59,14 @@ hash matches the bytes *and* the plan's announced hash.
   incomplete transfer expires after 60 s of inactivity and an untaken body after
   10 minutes, both against the kernel clock, and the digest reply outlives the
   bytes. `plan` refuses to start a new transfer for an object whose completed
-  body has not been taken, and `finish` is idempotent per object so a lost answer
-  can be retried even after `take_body`. `missing` answers a page of 1 024
-  indexes with `more` and `remaining`, keeps the transfer alive and never expires
-  it. The finish reply carries `body_hash` (raw digest, never a content address)
-  and `content`: the canonical hash of the **redacted** image when the body is
-  an Infinity image. The transfer context is supplied by
-  `BulkProvider::with_context`, one per provider instance.
+  body has not been taken, and `finish` is idempotent per object until a new
+  plan is accepted for it, so a lost answer can be retried even after
+  `take_body`. `missing` answers the indexes its request frame names (page-capped
+  at 1 024, with `more` and `remaining`), keeps the transfer alive and never
+  expires it by idleness. The finish reply carries `canonical`, `body_hash` (raw
+  digest, never a content address) and `content`: the canonical hash of the
+  **redacted** image when the body is an Infinity image. The transfer context is
+  supplied by `BulkProvider::with_context`, one per provider instance.
 - The **root is integrity, not authenticity**: `with_expected_root` pins the
   root the caller learned from the envelope, and a substituted plan is refused.
 - A configurable ceiling bounds the bytes a receiver will assemble; the default
@@ -94,9 +96,20 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   that re-sends every frame uses `required_grant_with_resume()` and
   `required_calls_with_resume()`, about two passes. The wall grant is sized by
   `required_wall_ms()` (three linear passes at a rate measured well above the
-  formula's assumption), the lane's cumulative `max_bytes` by
-  `required_lane_bytes()`, and a provider may bound the bytes it holds across
-  objects with `with_max_live_bytes`.
+  formula's assumption) **on both the capability and the lane**, because the
+  kernel meters a call against the narrower of the two and a default lane's 5 s
+  silently truncates it (`required_lane_wall_ms()` is the same number). The
+  lane's cumulative `max_bytes` must cover `required_lane_bytes()`. A provider
+  may bound the bytes it holds across objects with `with_max_live_bytes`, where
+  each open transfer reserves two body copies plus the retained plan hash
+  vector.
+- A `finish` refused by the wall grant is retried at most three times and then
+  refused with `rpc/bulk` before assembling: re-copying a body on every tiny
+  grant is CPU the caller did not pay for, and the recovery is a new plan, not a
+  wider grant.
+- The finish reply carries `canonical`, and `content_error` when an image's
+  address could not be computed (`wall` or `parser`); a degraded reply is
+  recorded as degraded instead of looking like a body without an address.
 - `finish` is the one bulk path that reads the wall clock: the grant is a
   *duration* (`max_wall_ms`), which `Call::now_ms` cannot express, so the
   deadline is anchored at `Instant::now()` and re-checked between chunks and

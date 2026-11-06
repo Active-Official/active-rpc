@@ -962,15 +962,14 @@ impl BulkReceiver {
     ///
     /// A duplicate with identical bytes is accepted (idempotent retransmission);
     /// a duplicate with different bytes is refused. With a budget, the frame is
-    /// charged before it is stored.
+    /// charged **before** it is validated: decoding and hashing it is the work
+    /// the charge pays for, so a wrong-hash frame is not free
+    /// (round 7, L6; round 10, M-2).
     pub fn accept(&mut self, frame: &[u8]) -> Result<u32> {
-        let (index, data, duplicate) = validate_chunk(&self.plan, &self.received, frame)?;
         if let Some(meter) = self.meter.as_mut() {
-            // A duplicate still costs the receiver a decode, a hash and an
-            // allocation, so it is charged like any other frame; a free replay
-            // was a bypass of the direct-use meter (round 7, L6).
             meter.charge_bytes(frame.len() as u64)?;
         }
+        let (index, data, duplicate) = validate_chunk(&self.plan, &self.received, frame)?;
         if duplicate {
             return Ok(index);
         }
@@ -979,18 +978,19 @@ impl BulkReceiver {
         Ok(index)
     }
 
-    /// Accept one chunk frame, charging it through `charge` first.
+    /// Accept one chunk frame, charging it through `charge` before the work.
     ///
     /// The callback is the integration point for a caller that meters bytes
-    /// somewhere else (a kernel lane, a capability). It runs after validation
-    /// and before the chunk is stored, so a refused charge leaves no state.
+    /// somewhere else (a kernel lane, a capability). It runs before validation,
+    /// because decoding and hashing the frame is the work it pays for; a
+    /// refused charge still leaves no state (round 10, M-2).
     pub fn accept_charged(
         &mut self,
         frame: &[u8],
         charge: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<u32> {
-        let (index, data, duplicate) = validate_chunk(&self.plan, &self.received, frame)?;
         charge(frame.len() as u64)?;
+        let (index, data, duplicate) = validate_chunk(&self.plan, &self.received, frame)?;
         if duplicate {
             return Ok(index);
         }
@@ -1166,6 +1166,11 @@ pub struct BulkBody {
     body: Vec<u8>,
     body_hash: [u8; 32],
     content: Option<[u8; 32]>,
+    /// Why the canonical address is missing, when it could have been computed
+    /// (`"wall"` for a spent grant, `"parser"` for a body that decodes as an
+    /// image but cannot be redacted). `None` alongside an absent `content`
+    /// means the body is not an image (round 10, M-4).
+    content_error: Option<&'static str>,
 }
 
 impl std::fmt::Debug for BulkBody {
@@ -1174,6 +1179,7 @@ impl std::fmt::Debug for BulkBody {
             .field("len", &self.body.len())
             .field("body_hash", &hex(&self.body_hash))
             .field("content", &self.content.as_ref().map(hex))
+            .field("content_error", &self.content_error)
             .finish()
     }
 }
@@ -1208,6 +1214,14 @@ impl BulkBody {
     /// Infinity image.
     pub fn content_hash(&self) -> Option<[u8; 32]> {
         self.content
+    }
+
+    /// Why [`BulkBody::content_hash`] is absent for an image that should have
+    /// one: `"wall"` (the grant was spent) or `"parser"` (the body decodes but
+    /// cannot be redacted). `None` with no address means the body is not an
+    /// image (round 10, M-4).
+    pub fn content_error(&self) -> Option<&'static str> {
+        self.content_error
     }
 }
 
@@ -1246,6 +1260,7 @@ struct FinishedTransfer {
     length: u64,
     body_hash: [u8; 32],
     content: Option<[u8; 32]>,
+    content_error: Option<&'static str>,
     /// When the reply was recorded: the record is released with the same window
     /// as an untaken body (round 6, L7).
     at_ms: u64,
@@ -1319,6 +1334,7 @@ fn finished_reply(
     length: u64,
     body_hash: [u8; 32],
     content: Option<[u8; 32]>,
+    content_error: Option<&'static str>,
     redact: bool,
 ) -> Response {
     let mut entries = BTreeMap::new();
@@ -1326,8 +1342,16 @@ fn finished_reply(
     if !redact {
         entries.insert("body_hash".to_string(), Value::text(hex(&body_hash)));
     }
+    // A client that keys on `content` must be able to tell "not an image" from
+    // "the address could not be computed now", because the reply is recorded
+    // and replayed: a spent grant would otherwise degrade it silently and
+    // permanently (round 10, M-4).
+    entries.insert("canonical".to_string(), Value::Bool(content.is_some()));
     if let Some(content) = content {
         entries.insert("content".to_string(), Value::text(hex(&content)));
+    }
+    if let Some(error) = content_error {
+        entries.insert("content_error".to_string(), Value::text(error));
     }
     Response::Value(Value::Map(entries))
 }
@@ -1399,13 +1423,13 @@ impl BulkProvider {
     /// An open transfer reserves its plan's total, so the bound holds before a
     /// chunk arrives (round 8, L5).
     pub fn live_bytes(&self) -> u64 {
-        // An open transfer reserves its plan's total *and* the assembly buffer a
-        // `finish` allocates, so the bound does not under-count the peak by
-        // half (round 9, M5).
+        // An open transfer reserves its plan's total, the assembly buffer a
+        // `finish` allocates and the plan's own hash vector
+        // (round 9, M5; round 10, M-1).
         let pending: u64 = self
             .transfers
             .values()
-            .map(|active| active.plan.total().saturating_mul(2))
+            .map(|active| reserved_bytes(&active.plan))
             .sum();
         let done: u64 = self
             .completed
@@ -1501,20 +1525,9 @@ impl BulkProvider {
         // A new transfer is the moment to sweep every object: an abandoned
         // transfer on another object would otherwise wait for its own call.
         self.expire_idle(call.now_ms);
-        if self.max_live_bytes != 0 {
-            // A retry of the same plan is not a second reservation: subtract
-            // this object's own commitment before adding the new one
-            // (round 9, M2).
-            let held = self.live_bytes().saturating_sub(
-                self.transfers
-                    .get(&object)
-                    .map_or(0, |active| active.plan.total().saturating_mul(2)),
-            );
-            if held.saturating_add(plan.total().saturating_mul(2)) > self.max_live_bytes {
-                // A budget class, like every other ceiling (round 9, L3).
-                return Err(Error::BudgetExceeded("byte"));
-            }
-        }
+        // The state refusals come before the byte ceiling: the same plan must
+        // not answer "not taken" or "another transfer" as a budget fault just
+        // because other objects hold bytes (round 10, L-1).
         self.require_taken(object)?;
         if let Some(active) = self.transfers.get_mut(&object) {
             // A second plan mid-transfer is either a retry of the same transfer
@@ -1526,6 +1539,13 @@ impl BulkProvider {
             }
             active.last_ms = call.now_ms;
             return Ok(plan_reply(&active.plan, active.receiver.missing_count()));
+        }
+        if self.max_live_bytes != 0 {
+            let held = self.live_bytes();
+            if held.saturating_add(reserved_bytes(&plan)) > self.max_live_bytes {
+                // A budget class, like every other ceiling (round 9, L3).
+                return Err(Error::BudgetExceeded("byte"));
+            }
         }
         let receiver = BulkReceiver::with_ceiling(plan.clone(), self.ceiling)?;
         let missing = receiver.missing_count();
@@ -1630,6 +1650,7 @@ impl BulkProvider {
                 done.body.len() as u64,
                 done.body.body_hash(),
                 done.body.content_hash(),
+                done.body.content_error(),
                 call.redact,
             ));
         }
@@ -1639,6 +1660,7 @@ impl BulkProvider {
                 done.length,
                 done.body_hash,
                 done.content,
+                done.content_error,
                 call.redact,
             ));
         }
@@ -1667,9 +1689,17 @@ impl BulkProvider {
         // running an unbounded pass (round 5, F4; round 7, L3).
         // A wall grant that cannot be added (u64::MAX) must fail closed rather
         // than disable the check (round 9, L1).
-        let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_millis(
-            call.budget.max_wall_ms.min(MAX_TRANSFER_LIFETIME_MS),
-        ));
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(
+                call.budget.max_wall_ms.min(MAX_TRANSFER_LIFETIME_MS),
+            ))
+            // `checked_add` cannot fail after the clamp on any sane clock, but
+            // a `None` here used to mean "no deadline at all": fall back to the
+            // absolute lifetime instead (round 10, L-2).
+            .or_else(|| {
+                std::time::Instant::now()
+                    .checked_add(std::time::Duration::from_millis(MAX_TRANSFER_LIFETIME_MS))
+            });
         let (body, body_hash) = {
             let active = self
                 .transfers
@@ -1679,7 +1709,9 @@ impl BulkProvider {
             // attempt, so a tiny grant must not buy repeated CPU
             // (round 9, M4). The chunks stay.
             if active.wall_refusals >= 3 {
-                return Err(Error::BudgetExceeded("wall"));
+                // A state refusal, not a budget one: no grant can rescue it,
+                // and the caller recovers by re-planning (round 10, M-3).
+                return Err(Error::Bulk("finish is exhausted for this transfer"));
             }
             match active.receiver.finish_within(deadline) {
                 Ok(pair) => pair,
@@ -1696,27 +1728,38 @@ impl BulkProvider {
         // The raw hash covers the secret heap, so serving it would be the
         // offline equality oracle the domain provider refuses to publish
         // (round 4, H-1).
+        // A body that is not an image has no address, and saying so is not a
+        // degradation. A spent grant or a parser fault are, and the reply says
+        // which (round 10, M-4).
         let spent = deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
-        let content = if spent {
-            None
+        let (content, content_error) = if spent {
+            (None, Some("wall"))
         } else {
             // A panic in the Infinity parser must not leave the object without
             // a digest reply: the content address is optional, the record is
             // not (round 8, L2). The allocation of the redacted projection is
             // outside the fallible guarantee of `finish_within` (round 8, L4).
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::security::redact_module(&body)
-                    .ok()
-                    .and_then(|redacted| active_infinity::content_hash(&redacted).ok())
-            }))
-            .ok()
-            .flatten()
+                    .map(|redacted| active_infinity::content_hash(&redacted))
+            })) {
+                Ok(Ok(Ok(address))) => (Some(address), None),
+                Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+                    // Decoding a body that never was an image fails at its
+                    // header, so this costs nothing on the common path.
+                    if active_infinity::decode(&body).is_ok() {
+                        (None, Some("parser"))
+                    } else {
+                        (None, None)
+                    }
+                }
+            }
         };
         self.transfers.remove(&object);
         // A raw digest over a secret-bearing body is the value the domain
         // provider withholds from a redacting capability; `content` is the
         // redacted address and is enough (round 5 residual).
-        let reply = finished_reply(length, body_hash, content, call.redact);
+        let reply = finished_reply(length, body_hash, content, content_error, call.redact);
         self.last_finished.insert(
             object,
             FinishedTransfer {
@@ -1725,6 +1768,7 @@ impl BulkProvider {
                 length,
                 body_hash,
                 content,
+                content_error,
                 at_ms: call.now_ms,
             },
         );
@@ -1735,6 +1779,7 @@ impl BulkProvider {
                     body,
                     body_hash,
                     content,
+                    content_error,
                 },
                 root,
                 total,
@@ -1823,6 +1868,19 @@ impl BulkTransfer {
     pub fn plan(&self) -> &BulkPlan {
         self.sender.plan()
     }
+}
+
+/// Bytes one open transfer reserves: the body, the assembly buffer and the
+/// plan's hash vector.
+///
+/// The plan is retained for the whole transfer (32 bytes per chunk plus the
+/// header), so a bound that counts only the body under-reports a
+/// maximal-chunk-count plan by up to 16x (round 10, M-1).
+fn reserved_bytes(plan: &BulkPlan) -> u64 {
+    plan.total()
+        .saturating_mul(2)
+        .saturating_add(PLAN_OVERHEAD)
+        .saturating_add(32u64.saturating_mul(plan.chunk_count() as u64))
 }
 
 fn check_chunk_size(chunk: usize) -> Result<()> {
