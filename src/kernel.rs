@@ -433,6 +433,12 @@ struct Job {
     /// waits must not hand the queued caller authority the operator withdrew
     /// after it was authorized.
     identity: Option<[u8; crate::identity::FINGERPRINT_LEN]>,
+    /// Whether a *peer* queued this call.
+    ///
+    /// A `None` identity is ambiguous: it is also the in-process caller, so
+    /// promise and idempotency ownership compare this flag as well as the
+    /// fingerprint (R-11 round 10, F1).
+    from_peer: bool,
 }
 
 /// The deterministic kernel: providers, capabilities, budgets and promises.
@@ -3108,7 +3114,16 @@ impl Agent {
             return Err(error);
         }
         let cap_id = cap.id();
-        let result = self.call_inner_payload(peer, lane, cap, method, args, payload_bytes, payload);
+        let result = self.call_inner_payload(
+            peer,
+            lane,
+            cap,
+            method,
+            args,
+            payload_bytes,
+            payload,
+            from_peer,
+        );
         if let Err(error) = &result {
             let mut kernel = self.cell.borrow_mut();
             kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
@@ -3157,7 +3172,11 @@ impl Agent {
         args: Vec<Arg>,
         payload_bytes: u64,
         payload: Vec<u8>,
+        from_peer: bool,
     ) -> Result<PromiseHandle> {
+        // The promise and job record peer.is_some(), not this flag: call_as
+        // builds its arguments in-process yet still queues for a peer.
+        let _ = from_peer;
         // A method name is caller-controlled text that reaches a refusal
         // message, an event and a receipt. A granted name is bounded at mint
         // (1..=1024 bytes), so a longer one cannot be granted and is refused
@@ -3364,6 +3383,7 @@ impl Agent {
             PromiseRecord::new_for(
                 promise_id,
                 lane.0,
+                peer.is_some(),
                 crate::identity::presented_fingerprint(peer),
             ),
         );
@@ -3408,6 +3428,7 @@ impl Agent {
             args_bytes,
             receipted: false,
             identity: crate::identity::presented_fingerprint(peer),
+            from_peer: peer.is_some(),
         };
         kernel.jobs.insert(job_id, job);
         kernel.queue.push_back(job_id);
@@ -3605,29 +3626,23 @@ impl Agent {
                 Some(record) => {
                     // The promise records who queued it: an out-of-band answer
                     // is that peer's act, not any holder's (round 9, F3).
-                    match kernel
-                        .promises
-                        .get(&promise.id)
-                        .and_then(|record| record.identity)
-                    {
-                        Some(owner)
-                            if !crate::identity::matches(
+                    if let Some(record) = kernel.promises.get(&promise.id) {
+                        // Origin and fingerprint both: an anonymous peer has no
+                        // fingerprint but is still a peer, and it may answer its
+                        // own call (round 10, F1).
+                        let same_origin = record.from_peer == peer.is_some();
+                        let same_peer = match record.identity {
+                            Some(owner) => crate::identity::matches(
                                 crate::identity::presented_fingerprint(peer),
                                 owner,
-                            ) =>
-                        {
+                            ),
+                            None => crate::identity::presented_fingerprint(peer).is_none(),
+                        };
+                        if !same_origin || !same_peer {
                             return Err(Error::Identity(
                                 "a promise can only be answered by the peer that queued it",
-                            ))
+                            ));
                         }
-                        // An in-process promise has no recorded peer, so a peer
-                        // cannot answer it either.
-                        None if peer.is_some() => {
-                            return Err(Error::Identity(
-                                "a promise can only be answered by the peer that queued it",
-                            ))
-                        }
-                        _ => {}
                     }
                     if let Some(bound) = record.attrs.bound_to {
                         if !crate::identity::matches(
@@ -4160,7 +4175,8 @@ impl Agent {
             // A replay re-uses a cached promise; the capability it names must
             // still be live now, not as of the last refresh.
             refresh_clock(&mut kernel);
-            if let Some((id, stored_args, stored_peer)) = kernel.idempotency.get(&map_key).copied()
+            if let Some((id, stored_args, stored_from_peer, stored_peer)) =
+                kernel.idempotency.get(&map_key).copied()
             {
                 if stored_args != fingerprint {
                     let error = Error::InvalidArgument(
@@ -4174,7 +4190,9 @@ impl Agent {
                 // the first caller, and dispatch would then refuse it — a
                 // confusing failure for a request that is simply not the same
                 // one.
-                if stored_peer != crate::identity::presented_fingerprint(peer) {
+                if stored_from_peer != peer.is_some()
+                    || stored_peer != crate::identity::presented_fingerprint(peer)
+                {
                     let error = Error::Identity("the idempotency key belongs to another peer");
                     Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
                     return Err(error);
@@ -4298,6 +4316,7 @@ impl Agent {
             (
                 id,
                 fingerprint,
+                peer.is_some(),
                 crate::identity::presented_fingerprint(peer),
             ),
         );
@@ -5049,8 +5068,8 @@ impl Agent {
                                 // peer call must not read it either
                                 // (round 9, F2).
                                 Some(record)
-                                    if job.identity.is_some()
-                                        && record.identity != job.identity =>
+                                    if record.from_peer != job.from_peer
+                                        || record.identity != job.identity =>
                                 {
                                     failure =
                                         Some(Error::Identity("a promise belongs to another peer"));
@@ -5816,7 +5835,7 @@ impl Kernel {
                     || self
                         .idempotency
                         .values()
-                        .any(|(mapped, _, _)| mapped == id);
+                        .any(|(mapped, _, _, _)| mapped == id);
                 if !pinned {
                     victim = Some(index);
                     break;
@@ -6647,7 +6666,7 @@ type IdempotencyKey = (CapId, LaneId, String, String);
 /// One cached idempotency claim: the promise, the request fingerprint, and the
 /// fingerprint of the peer that claimed the key (so a replay from another peer
 /// is refused at the hit rather than at dispatch).
-type IdempotencyEntry = (PromiseId, [u8; 32], Option<[u8; 32]>);
+type IdempotencyEntry = (PromiseId, [u8; 32], bool, Option<[u8; 32]>);
 
 /// True when a provider's value nests deeper than the wire accepts.
 ///

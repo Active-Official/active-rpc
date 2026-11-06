@@ -67,6 +67,12 @@ pub struct PromiseRecord {
     /// so a shared lane cannot become a channel for reading somebody else's
     /// answer (R-11 round 8, F1).
     pub identity: Option<[u8; crate::identity::FINGERPRINT_LEN]>,
+    /// Whether a *peer* queued the call, as opposed to the agent itself.
+    ///
+    /// `identity` is `None` both for an in-process call and for an anonymous
+    /// peer, so ownership needs this flag to tell them apart
+    /// (R-11 round 10, F1).
+    pub from_peer: bool,
 }
 
 impl PromiseRecord {
@@ -80,6 +86,7 @@ impl PromiseRecord {
             // No handle owns a reference until `Agent::call` builds one.
             handles: 0,
             identity: None,
+            from_peer: false,
         }
     }
 
@@ -87,9 +94,11 @@ impl PromiseRecord {
     pub fn new_for(
         id: PromiseId,
         lane: u64,
+        from_peer: bool,
         identity: Option<[u8; crate::identity::FINGERPRINT_LEN]>,
     ) -> Self {
         Self {
+            from_peer,
             identity,
             ..Self::new(id, lane)
         }

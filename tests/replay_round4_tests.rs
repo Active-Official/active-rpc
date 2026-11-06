@@ -51,3 +51,23 @@ fn a_large_trace_still_packages() {
     let decoded = active_rpc::replay::ReplayPackage::decode(&bytes).expect("decode");
     assert_eq!(decoded.ops.len(), package.ops.len());
 }
+
+/// A package edited in its cap ordinals alone is reported with the ordinal, not
+/// as two identical events (round 4, L-4).
+#[test]
+fn a_mismatch_names_the_ordinal() {
+    let mut recorder = Recorder::new(0).expect("recorder");
+    let cap = recorder.mint(&["echo"], None).expect("mint");
+    recorder.call(cap, "echo", 4).expect("call");
+    let mut package = recorder.package().expect("package");
+    let first = package
+        .trace
+        .iter()
+        .position(|entry| entry.cap.is_some())
+        .expect("a cap entry");
+    package.trace[first].cap = Some(9);
+    let error = package.replay().expect_err("the ordinal was edited");
+    let text = error.to_string();
+    assert!(text.contains("cap Some(9)"), "{text}");
+    assert!(text.contains("cap Some(0)"), "{text}");
+}

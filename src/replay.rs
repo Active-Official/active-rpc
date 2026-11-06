@@ -333,10 +333,15 @@ impl ReplayPackage {
         }
         for (index, (expected, actual)) in self.trace.iter().zip(trace.iter()).enumerate() {
             if expected != actual {
+                // The ordinal is part of the entry, so a message that prints only
+                // the event cannot explain a package edited in its cap ids
+                // (round 4, L-4).
                 return Err(Error::Replay(format!(
-                    "trace mismatch at entry {index}: recorded {}, replayed {}",
+                    "trace mismatch at entry {index}: recorded {} (cap {:?}), replayed {} (cap {:?})",
                     summary(&expected.event),
-                    summary(&actual.event)
+                    expected.cap,
+                    summary(&actual.event),
+                    actual.cap
                 )));
             }
         }
@@ -395,8 +400,10 @@ impl ReplayPackage {
                 }
             }?;
         }
-        let package = recorder.package()?;
-        Ok((recorder.trace().to_vec(), package.ops))
+        // Move the trace and the operations out: cloning them through
+        // `package()` doubled a ceiling-sized session in memory
+        // (round 4, L-3).
+        recorder.into_parts()
     }
 }
 
@@ -785,6 +792,20 @@ impl Recorder {
         // events: `package()` is where that loss is refused.
         self.capture_acted();
         outcome
+    }
+
+    /// The trace and the operations, moved out after the same checks
+    /// `package()` makes.
+    fn into_parts(self) -> Result<(Vec<Trace>, Vec<Op>)> {
+        if self.poisoned {
+            return Err(Error::Replay(
+                "the recorder lost events; the session cannot be packaged".into(),
+            ));
+        }
+        if self.body.saturating_add(32) > MAX_PACKAGE_BYTES {
+            return Err(Error::Replay("package exceeds the size ceiling".into()));
+        }
+        Ok((self.trace, self.ops))
     }
 
     /// The recorded package.
