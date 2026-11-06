@@ -139,3 +139,45 @@ fn a_direct_send_still_returns_the_queued_message() {
     assert_eq!(message.sequence, 0);
     assert_eq!(channel.peek(), Some(&message));
 }
+
+/// A refusal is attributed to the capability that caused it, or to the lane when
+/// a transfer names several: the round-3 reviewer's `caps.first()` tape blamed
+/// the first capability for the third one's refusal (R-15 round 3, #1).
+#[test]
+fn a_multi_capability_send_does_not_blame_the_first_capability() {
+    use active_rpc::Event;
+
+    let agent = Agent::with_secret([0x7f; 32]);
+    let provider = agent.register(Box::new(Sink));
+    let allowed = agent
+        .mint(provider, 0, CapAttrs::new(&["noop"]))
+        .expect("cap");
+    let revoked = agent
+        .mint(provider, 1, CapAttrs::new(&["noop"]))
+        .expect("cap");
+    agent.revoke(&revoked).expect("revoke");
+    let lane = agent
+        .create_lane("attribution", Budget::default())
+        .expect("lane");
+    let channel = agent
+        .create_channel("attribution", Direction::Both)
+        .expect("channel");
+
+    let error = agent
+        .send(lane, channel, Value::text("x"), &[allowed.clone(), revoked])
+        .expect_err("a revoked capability cannot be transferred");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+
+    let refused = agent
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            Event::CallRefused { cap, code, .. } if code == "rpc/revoked" => Some(cap),
+            _ => None,
+        })
+        .expect("the refusal is on the tape");
+    assert_eq!(
+        refused, None,
+        "a multi-capability refusal names the lane, not the first capability"
+    );
+}

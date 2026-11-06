@@ -2670,7 +2670,15 @@ impl Agent {
         caps: &[CapHandle],
     ) -> Result<u64> {
         let result = self.send_inner(peer, lane, channel, payload, caps);
-        self.note_refusal(lane, caps.first().map(CapHandle::id), result)
+        // Attribute the refusal only when the message carried one capability: a
+        // transfer names several, and a refusal caused by the third must not be
+        // taped against the first (R-15 round 3, #1). With several, the refusal
+        // is recorded against the lane alone, which is honest.
+        let cause = match caps {
+            [only] => Some(only.id()),
+            _ => None,
+        };
+        self.note_refusal(lane, cause, result)
     }
 
     fn send_inner(

@@ -3445,6 +3445,23 @@ binary output) because they do not decode as an image. Both are fixed.
 Gate: 643 all-features (74 suites), 583 no-default, control plane 46, CLI 33,
 clippy/fmt/doc clean. Commit `cb44d07`.
 
+### R-15 observability - 2026-11-06 (round 3)
+
+Reviewer: DeepSeek through the direct API (`deepseek-v4-pro`, the fallback while
+`deepseek-flash` returns the thinking-mode 400), read-only at `bec9eec`. The four
+round-2 claims held. Verdict **not clean**: one medium and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium (reported high, downgraded by the reviewer) | `send_as` attributed a refusal to `caps.first()`, so a refusal caused by the third capability was taped against the first | **fixed**: the refusal names the capability only when the message carried exactly one (`[only] => Some(only.id())`), and the lane alone otherwise. `a_multi_capability_send_does_not_blame_the_first_capability` asserts the tape's `cap` is `None`; the pre-fix code recorded `Some(first)` by construction |
+| 2 | low | `label()` uses `char::escape_debug`, which leaves U+2800 (braille blank) and the Hangul fillers U+115F/U+1160/U+FFA0 unescaped although `is_invisible_or_reordering` flags them | **open** — escape every character that predicate flags |
+| 3 | low | `record_refusal_in` lacks the `tool_refusals`/`backpressure_refusals` branches that `call_with_origin_payload`'s inline block has | **open** — one shared recorder |
+| 4 | low | four reachability-guarded `return Err(UnknownCapability)` sites in `call_idempotent_inner` bypass `record_refusal` | **open** |
+| 5 | low | `promise.rejected.code` can be `provider/reply-withheld`, outside the documented `rpc/...` set | **open** — document it as the one provider code a rejection may carry, or map it |
+
+Gate: the full local gate green after the fix (both clippy sets, both test sets,
+doc, benches, fuzz, control plane, CLI, hardening status, 9/9 negative controls).
+
 ### R-15 observability - 2026-11-02 (round 2, confirmation)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `af12e3a`.
