@@ -2908,10 +2908,10 @@ one medium and four lows.
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
 | 1 | medium | `resolve_as` skipped the ownership check when the producing job was gone (a settled promise), so a non-owner learned `unknown` / pending / settled for any guessed id — across lanes — and the probes counted as `promises_double_settled` instead of `identity_refusals`, losing the detection signal | **fixed**: the ownership gate runs before the job lookup, using the promise record's own lane and origin; `a_settled_promise_answers_only_its_owner` shows the owner still reaches `rpc/promise-resolved` and a stranger gets `rpc/identity` with the refusal counted |
-| 2 | low | the idempotency "used with different arguments" answer came before the key-owner check, so a second principal could probe another peer's key/argument fingerprint | **open** |
+| 2 | low | the idempotency "used with different arguments" answer came before the key-owner check, so a second principal could probe another peer's key/argument fingerprint | **fixed**: the owner check runs first, so a stranger gets `rpc/identity` whether or not the arguments match; `idempotency_tests` and `identity_round7_tests` stay green |
 | 3 | low | a rotation does not carry `PromiseRecord.identity` for a settled promise (no job), so the rotated peer cannot pipeline its own answered result | **open** — needs the promise record to carry its capability |
-| 4 | low | ADR-0011 never names `reintroduce_to`, and the operator guide does not warn that rotating a child to a third certificate refuses every ancestor rotation until it is rotated back | **open** |
-| 5 | low | `docs/spec/observability.md` describes `identity` as a capability introduction, but `cap.rebound` also fills it | **open** |
+| 4 | low | ADR-0011 never names `reintroduce_to`, and the operator guide does not warn that rotating a child to a third certificate refuses every ancestor rotation until it is rotated back | **fixed**: ADR-0011 names `reintroduce_to`, its owner scope and the successor-bound descendant rule; the guide's rule 3 says to rotate a tree child-first, all the way to the same successor |
+| 5 | low | `docs/spec/observability.md` describes `identity` as a capability introduction, but `cap.rebound` also fills it | **fixed**: the column says one fingerprint for `cap.introduced` and `from->to` for `cap.rebound` |
 
 Gate: full suite green on both feature sets; clippy both; fmt; the `rust:1.99`
 Linux suite in the next gate run.

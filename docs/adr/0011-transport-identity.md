@@ -42,6 +42,9 @@ introduction is a bearer token with no audience.
    successor alongside the capability, because the rotation is the documented
    recovery for a renewed leaf: without it the peer's retry of an applied call
    would fail forever and a fresh key would apply the mutation twice.
+   The entry point is `reintroduce_to(cap, &old_peer, &new_admitted)`: it is
+   owner-scoped, refuses a foreign-clock root or descendant, and allows a
+   descendant already at the successor so a tree can be rotated child-first.
    Binding validates: a zero or loopback fingerprint is refused at mint, at
    attenuation and at export. `send_as` refuses to transfer a bound capability
    over a channel: a channel cannot prove who reads the message, so delegation

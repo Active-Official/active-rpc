@@ -4351,10 +4351,15 @@ impl Agent {
             if let Some((id, stored_args, stored_from_peer, stored_peer)) =
                 kernel.idempotency.get(&map_key).copied()
             {
-                if stored_args != fingerprint {
-                    let error = Error::InvalidArgument(
-                        "the idempotency key was used with different arguments",
-                    );
+                // Who claimed the key comes first. The argument-fingerprint
+                // answer ("used with different arguments") is a fact about
+                // another principal's call, and a peer that guesses a key must not
+                // learn it: the owner check runs first, so the two answers are
+                // indistinguishable to a stranger (R-11 round 14, F2).
+                if stored_from_peer != peer.is_some()
+                    || stored_peer != crate::identity::presented_fingerprint(peer)
+                {
+                    let error = Error::Identity("the idempotency key belongs to another peer");
                     Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
                     return Err(error);
                 }
@@ -4363,10 +4368,10 @@ impl Agent {
                 // the first caller, and dispatch would then refuse it — a
                 // confusing failure for a request that is simply not the same
                 // one.
-                if stored_from_peer != peer.is_some()
-                    || stored_peer != crate::identity::presented_fingerprint(peer)
-                {
-                    let error = Error::Identity("the idempotency key belongs to another peer");
+                if stored_args != fingerprint {
+                    let error = Error::InvalidArgument(
+                        "the idempotency key was used with different arguments",
+                    );
                     Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
                     return Err(error);
                 }

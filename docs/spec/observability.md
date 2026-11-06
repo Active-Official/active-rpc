@@ -43,7 +43,7 @@ authority.
 | `channel_sequence` | u64 | a channel send or receive |
 | `code` | string | a refusal or rejection with a stable `rpc/...` code, projected from `Error::code` (a provider-authored code is always `rpc/provider`, never the provider's own text) |
 | `dimension` | string | a budget exhaustion or ceiling: `call`, `byte`, `lane call`, `lane byte`, `promises`, `jobs`, `caps`, `caps per message`, `lanes`, `channels`, `subscriptions`, `records`, `tombstones`, `nodes`, `keys`, `value`, `wall`, `depth`, `array_len`, `value_size`, `channel queue`, `args`, or `other` for a ceiling added without a label |
-| `identity` | string | a capability introduction; the peer fingerprint (a public label) |
+| `identity` | string | a capability's peer: one fingerprint (a public label) for `cap.introduced`, or `from->to` for `cap.rebound`, which carries the same field twice |
 | `detail` | string | a short, value-free explanation (`"3 jobs in 2 lanes"`) |
 
 ## Event names

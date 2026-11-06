@@ -150,8 +150,11 @@ client that presents none fails it as well.
    claim is scoped to `(capability, lane, method, key)` and a rotation cannot
    move a lane: a retry that arrives on a lane that does not hold the claim is a
    new call, so a peer retrying an applied mutation has to retry on the lane that
-   holds the claim or accept that the write may apply again. Plan the rotation
-   window.
+   holds the claim or accept that the write may apply again. Rotate a tree
+   **child-first, all the way to the same successor**: a child moved to a third
+   certificate is somebody else's authority, and every rotation of its ancestors is
+   then refused with `rpc/identity` until that child is rotated back. Plan the
+   rotation window.
 4. **Revoke at the CA and at the kernel.** Dropping a certificate stops new
    handshakes; `Agent::revoke` stops existing capabilities immediately.
 5. **Pin the clock mode.** Mint leases after selecting the clock
