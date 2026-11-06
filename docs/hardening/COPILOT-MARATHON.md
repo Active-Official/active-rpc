@@ -3262,6 +3262,25 @@ tree; the rate test pins the numbers the fixes are derived from.
 Gate: `cargo test --all-features` 648 passed, 0 failed; clippy clean on both
 feature sets; fmt and doc clean.
 
+### R-13 receipts - 2026-11-06 (round 8)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `7279d13`. Claims
+3, 4, 6, 7 and 8 verified; 1, 2 and 5 partly. Verdict **not CLEAN**: two mediums
+and five lows, all about the advisory lock's heuristics. **Open work.**
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M1 | medium | the grace bounds a *passive* planted lock but not an active one: a local writer can replace the lock path so every `touch` fails, then the age rule steals a live writer's lock and the chain becomes unrepairable | **open** — the durable answer is OS-level exclusivity (`flock`/`LockFileEx`), which `File::lock` offers only above the 1.88 MSRV; until then: `touch` must act on the writer's own handle (L1) so a replaced path cannot be refreshed, and a local user who can write the directory can always deny the log — record that as a residual |
+| M2 | medium | the reader and the stealer disagree (10 s vs 120 s): a 30 s-old lock is "not active" for a reader (prefix or "damaged") and "live" for a stealer | **open** — one predicate: `writer_active` uses `LOCK_STALE_MS`, so "not active" for a reader means "stealable" for a writer |
+| L1 | low | `touch` follows the path, not the file the writer created, so a planted symlink makes the writer refresh another file | **open** — hold the `File` from `acquire` in `LogLock` and `set_times` on it |
+| L2 | low | the steal's check-then-remove is not atomic, and an expired claim lets two live stealers reach it | **open** — quarantine by `rename` to a unique name derived from the judged nonce (only one rename wins), verify the nonce there, then delete |
+| L3 | low | ADR-0021 says the CLI takes the writer's lock; `receipts verify` does not, so it fails during a concurrent append | **open** — correct the ADR, document that a reader refusal is retryable, and retry in the CLI |
+| L4 | low | a cancelled running call is `Admitted` even for a read-only method, which produced nothing | **open** — record the method's mutability on the job at queue time and seal `Refused` for a read-only cancel |
+| L5 | low | a lock whose first 512 bytes are not valid UTF-8 is unidentifiable, so it can never be stolen | **open** — read bytes and take the first token lossily |
+
+Next: close M1, M2, L1-L5, then two clean rounds. The lock's remaining residual —
+an adversarial local writer can deny the log — is inherent without OS file locks.
+
 ### R-13 receipts - 2026-11-06 (round 7)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `cf5f969`. Of the
