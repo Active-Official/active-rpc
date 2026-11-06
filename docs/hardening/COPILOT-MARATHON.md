@@ -3169,6 +3169,26 @@ tree; the rate test pins the numbers the fixes are derived from.
 Gate: `cargo test --all-features` 648 passed, 0 failed; clippy clean on both
 feature sets; fmt and doc clean.
 
+### R-13 receipts - 2026-11-06 (round 5)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `2488619`, current
+tree. Four of the six round-4 claims held; the stale-lock claim did not. Verdict
+**PARTIAL**: one high, one medium and four lows. The section changed a lot after
+round 4 (the `ARRL` v2 log, the derived receipt key, the gap setter), and the
+audit covered the current code.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the stale-lock steal judged staleness through one open and read the nonce through a second, then renamed whatever was at the path: two stealers could delete each other's live lock and both append, and the rename-back could clobber a third writer | **fixed**: the age and the nonce are read through **one** handle (`judged_stale`), so the pair cannot describe two files; the steal claims a `create_new` file named after the judged nonce (sanitised, so a planted nonce cannot steer it out of the directory), so exactly one stealer wins, and the live lock is never moved. The winner removes the lock only if its nonce is unchanged — a writer can only replace the lock after it is removed, so an unchanged nonce means nobody holds it. `a_contended_steal_never_corrupts_the_log` runs eight threads against one stale lock and asserts the surviving file walks with a contiguous chain and every refusal is `rpc/receipt`; `a_claim_name_never_carries_a_separator` pins the sanitiser (`.`, `/`, `\\`, `:` dropped, 64-byte cap, empty refused); `a_hostile_nonce_cannot_steer_the_steal_claim` pins the end-to-end shape. The interleaving itself cannot be forced from outside the crate, so the fix is structural and the contended test pins its consequence |
+| 2 | medium | an adopted sequence gap left the pre-gap receipts in the ring, and the exported window `[1,2,3,10,11]` is one `append` refuses: the session could never be exported, and the only escape was `truncate` | **fixed**: a non-zero gap clears the ring and counts the hole **and** the cleared receipts, pushing `ReceiptsDropped`, so the window starts at the adopted sequence. `the_sequence_setter_refuses_a_rewind_and_an_impossible_start` now asserts the count, that the ring is empty, and that the next receipt carries sequence 10 |
+| 3 | low | the staging file for a new header was a fixed name opened with `File::create`, so a planted symlink redirected the write and turned the log path into a link | **fixed**: a unique name created with `create_new`; `a_planted_staging_entry_does_not_redirect_the_header` fails on the old shape (a directory at `<log>.writing` made `create` fail) |
+| 4 | low | the lock budget is 1.33 s but the comment and the round-4 entry claimed 1.8 s, and the test's 6 s bound could not catch a doubling | **fixed**: the comment states the arithmetic (38 sleeps across 40 attempts, two steal attempts) and the assertion is 2 s |
+| 5 | low | a boundary-aligned prefix of an in-flight batch could be returned as a whole snapshot, printing a head the file had already moved past | **fixed**: `read_stable` waits while a **fresh** lock exists (11 x 20 ms) and only then reports; `writer_active` gates on the lock's age, so a crashed writer's or a hostile stale lock never makes a reader fail. `a_reader_waits_while_a_fresh_lock_is_held` asserts the reader blocks until the lock goes |
+| 6 | low | the spec still taught `--secret-hex` (removed: it put the master secret on the command line) and ADR-0021 said `verify_macs(secret)` | **fixed**: `wire.md` names `--receipt-key-file` and the three modes (chain only, keyed, head pinned); the ADR says the verifier takes `derive_receipt_key(secret)` and that the key is symmetric, so a verifier can also forge |
+
+Gate: receipt suites green (7 files, 67 tests); the full local gate, the
+`rust:1.99` Linux suite, the red-team battery and the negative controls 9/9.
+
 ### R-13 receipts - 2026-11-02 (round 4, confirmation)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `cb44d07`.

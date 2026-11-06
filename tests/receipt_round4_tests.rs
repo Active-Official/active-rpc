@@ -145,9 +145,12 @@ fn an_unidentifiable_lock_is_refused_within_a_bounded_time() {
         .expect_err("a lock without a nonce cannot be stolen");
     let elapsed = started.elapsed();
     assert_eq!(error.code(), "rpc/receipt");
+    // The documented budget is 1.33 s of backoff across 40 attempts. A
+    // ceiling of 2 s still catches a doubling, which the old 6 s bound could
+    // not (R-13 round 5, #4).
     assert!(
-        elapsed < std::time::Duration::from_secs(6),
-        "the wait was {elapsed:?}, not the documented few seconds"
+        elapsed < std::time::Duration::from_secs(2),
+        "the wait was {elapsed:?}, not the documented ~1.3 s"
     );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&lock);
@@ -216,10 +219,26 @@ fn the_sequence_setter_refuses_a_rewind_and_an_impossible_start() {
         .expect_err("no log can hold that start");
     assert_eq!(error.code(), "rpc/invalid-argument");
 
-    // Forward is fine, and the gap is counted.
+    // Forward is fine, and the hole is counted: the six sequences that were
+    // never issued plus the three sealed receipts the ring has to drop, because
+    // a window cannot hold a gap and `append` would refuse it (R-13 round 5, #2).
     let before = agent.receipts_dropped();
     agent.set_receipt_sequence(10).expect("forward");
-    assert_eq!(agent.receipts_dropped(), before + 6);
+    assert_eq!(agent.receipts_dropped(), before + 9);
+    assert!(
+        agent.receipts().is_empty(),
+        "the pre-gap window is not exportable and must not be offered"
+    );
+    // The next receipt continues at the adopted sequence, so the whole window is
+    // a contiguous log from 10 onwards.
+    let promise = agent
+        .call(lane, &cap, "echo", Vec::new())
+        .expect("queued after the adoption");
+    agent.run();
+    let _ = promise.value();
+    let receipts = agent.receipts();
+    assert_eq!(receipts.first().map(|receipt| receipt.sequence), Some(10));
+    assert_eq!(receipts.len(), 1);
 }
 
 /// Set a file's modification time on every platform.

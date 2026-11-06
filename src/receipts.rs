@@ -305,17 +305,29 @@ struct LogLock {
 /// that file stops the evidence pipeline.
 const LOCK_STALE_MS: u64 = 120_000;
 
+/// How much of a lock file is read to find its nonce.
+///
+/// A lock is one short line. A lock is also a file an attacker can plant, and a
+/// reader must not allocate a gigabyte to discover that it holds no nonce.
+const MAX_LOCK_BYTES: u64 = 512;
+
 impl LogLock {
     /// Take the log's lock, waiting for a concurrent writer.
     ///
     /// `create_new` is atomic on every supported platform: one writer wins. The
     /// others retry with backoff, which covers a normal append (including a
     /// large batch and its `sync_data`), then refuse rather than corrupt the
-    /// chain. A lock older than `LOCK_STALE_MS` is stolen by *identity*: the
-    /// stealer reads the nonce it judged stale, renames the path away and
-    /// verifies the stolen file carries that nonce. A rename alone moved
-    /// whatever was at the path, so two stealers could each rename the other's
-    /// fresh lock and then both append.
+    /// chain.
+    ///
+    /// A lock older than `LOCK_STALE_MS` is stolen in two steps that cannot
+    /// identify one file and act on another (R-13 round 5, #1). The judgement
+    /// reads the age **and** the nonce through one open handle, so a writer that
+    /// replaced the lock between two opens cannot make the stealer judge one lock
+    /// and believe it identified another. The steal itself claims a
+    /// `create_new` file named after the judged nonce, so exactly one stealer
+    /// wins it, and the live lock is never moved: a loser cannot clobber a fresh
+    /// lock, and the winner removes the lock only if its nonce is still the one
+    /// it judged.
     fn acquire(log: &std::path::Path) -> Result<Self> {
         let path = lock_path(log);
         let nonce = format!(
@@ -349,28 +361,34 @@ impl LogLock {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     if attempt % 20 == 0 {
-                        if let Some(judged) = stale_nonce(&path) {
-                            let stolen = path.with_file_name(format!(
-                                "{}.steal-{nonce}",
-                                path.file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| "receipt-lock".to_string())
-                            ));
-                            if std::fs::rename(&path, &stolen).is_ok() {
-                                // Only remove the file that was judged stale. A
-                                // different nonce means a live writer created a
-                                // new lock between the judgement and the rename:
-                                // put it back and keep waiting.
-                                if nonce_of(&stolen).as_deref() == Some(judged.as_str()) {
-                                    let _ = std::fs::remove_file(&stolen);
-                                } else {
-                                    let _ = std::fs::rename(&stolen, &path);
+                        if let Some(judged) = judged_stale(&path) {
+                            if let Some(safe) = claim_name(&judged) {
+                                let claim = path.with_file_name(format!(
+                                    "{}.steal-{safe}",
+                                    file_name_text(&path)
+                                ));
+                                // `create_new` picks exactly one stealer. The
+                                // loser waits: it must not remove anything.
+                                if std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .create_new(true)
+                                    .open(&claim)
+                                    .is_ok()
+                                {
+                                    // A writer can only replace the lock after it
+                                    // is removed, so an unchanged nonce means no
+                                    // one holds it and removing it is safe.
+                                    if nonce_of(&path).as_deref() == Some(judged.as_str()) {
+                                        let _ = std::fs::remove_file(&path);
+                                    }
+                                    let _ = std::fs::remove_file(&claim);
+                                    continue;
                                 }
                             }
-                            continue;
                         }
                     }
-                    // Backoff: 5 ms rising to 45 ms, about 1.8 s in total. The
+                    // Backoff: 5 ms rising to 45 ms, 1.33 s in total (38 sleeps
+                    // across 40 attempts, two of which are steal attempts). The
                     // wait only has to cover one append; a longer one is a lock
                     // that a caller should see refused rather than a stall.
                     let step = u64::from(attempt.min(20));
@@ -398,35 +416,65 @@ fn lock_path(log: &std::path::Path) -> std::path::PathBuf {
     log.with_file_name(format!("{name}.lock"))
 }
 
-/// The nonce of a lock that is older than the stale ceiling.
+/// The nonce of a lock that is older than the stale ceiling, judged and read
+/// through **one** open handle.
 ///
 /// `None` when the lock is fresh, missing, or carries no readable nonce: a lock
-/// that cannot be identified cannot be stolen safely.
-fn stale_nonce(path: &std::path::Path) -> Option<String> {
-    if !stale(path) {
+/// that cannot be identified cannot be stolen safely. `metadata()` and the bytes
+/// describe one file here, which is what makes the judgement trustworthy
+/// (R-13 round 5, #1).
+fn judged_stale(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let modified = file.metadata().ok()?.modified().ok()?;
+    let age_ms = modified
+        .elapsed()
+        .map(|age| age.as_millis() as u64)
+        .unwrap_or(0);
+    if age_ms <= LOCK_STALE_MS {
         return None;
     }
-    nonce_of(path)
+    read_nonce(&file)
 }
 
-/// The first token of a lock file: the nonce the creator wrote.
-fn nonce_of(path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// The first token of an open lock file: the nonce its creator wrote.
+///
+/// Bounded: a lock is one short line, and a hostile file must not make a reader
+/// allocate megabytes to discover that.
+fn read_nonce(file: &std::fs::File) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    file.try_clone()
+        .ok()?
+        .take(MAX_LOCK_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
     text.split_whitespace().next().map(str::to_string)
 }
 
-/// True when a lock file is older than the stale ceiling.
-fn stale(path: &std::path::Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    modified
-        .elapsed()
-        .map(|age| age.as_millis() as u64 > LOCK_STALE_MS)
-        .unwrap_or(false)
+/// The nonce of the file at `path`, if it can be read.
+fn nonce_of(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    read_nonce(&file)
+}
+
+/// A nonce rendered safe to use in a file name.
+///
+/// A lock is a file an attacker can plant: a nonce with a separator or a `..`
+/// must not steer the claim path anywhere else.
+fn claim_name(nonce: &str) -> Option<String> {
+    let cleaned: String = nonce
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(64)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The file name of `path`, as text, for deriving a sibling name.
+fn file_name_text(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "receipt-lock".to_string())
 }
 
 impl Drop for LogLock {
@@ -543,16 +591,25 @@ impl ReceiptLog {
         header.extend_from_slice(&[0u8; 3]);
         header.extend_from_slice(&start_sequence.to_le_bytes());
         // Write beside the target and rename: a crash mid-header must not leave
-        // a file that `open`, `repair` and `create` all refuse.
+        // a file that `open`, `repair` and `create` all refuse. The staging name
+        // is unique and created with `create_new`: a fixed name is a symlink an
+        // attacker plants in the directory so the process truncates a privileged
+        // file and leaves the log path pointing at it (R-13 round 5, #3).
         let staging = path.with_file_name(format!(
-            "{}.writing",
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "receipts".to_string())
+            "{}.writing-{}-{}",
+            file_name_text(&path),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
         ));
         {
             use std::io::Write;
-            let mut file = std::fs::File::create(&staging)
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging)
                 .map_err(|_| Error::receipt("cannot create the receipt log"))?;
             let written = file.write_all(&header).and_then(|()| file.sync_all());
             if written.is_err() {
@@ -914,44 +971,73 @@ fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Read and walk a log, tolerating one read that lands mid-append.
+/// How recently a writer must have held the lock for a reader to wait.
 ///
-/// A reader does not take the writer's lock, so on a file system where a large
-/// batch is written in more than one syscall it can see a partial trailing
-/// record. That is a torn read, not a torn file: reading again once the writer
-/// has finished settles it, and a file that is really damaged fails twice.
+/// A reader does not take the writer's lock, so it uses the lock's age to tell a
+/// live append from a crashed writer's leftover (or a hostile file). An old lock
+/// must never make a reader report "being written".
+const WRITER_ACTIVE_MS: u64 = 10_000;
+
+/// True when a writer is, or very recently was, appending.
+fn writer_active(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(lock_path(path)) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified
+        .elapsed()
+        .map(|age| age.as_millis() as u64 <= WRITER_ACTIVE_MS)
+        .unwrap_or(false)
+}
+
+/// Read and walk a log, tolerating a read that lands mid-append.
+///
+/// A reader does not take the writer's lock, so a file system that writes a
+/// large batch in more than one syscall can expose two shapes: a torn trailing
+/// record (the walk fails) and a boundary-aligned prefix (the walk succeeds, but
+/// the file holds fewer records than the writer has already appended). Both
+/// settle when the writer finishes, so both wait — the second shape is what made
+/// a snapshot report a head the file had already moved past (R-13 round 5, #5).
+/// The wait is bounded, and a reader only waits while the lock is fresh: a
+/// damaged file with a stale lock still fails.
 fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogState)> {
     let mut bytes = read_capped(path)?;
-    let mut first = match walk_log(&bytes) {
-        Ok((receipts, state)) => return Ok((bytes, receipts, state)),
-        Err(error) => error,
-    };
-    // Wait while the writer is still making progress: a batch `write_all` plus
-    // `sync_data` routinely exceeds one fixed sleep, and calling an intact log
-    // damaged because a writer held it is what made `receipts verify` fail in
-    // CI. Bounded, so a genuinely torn file still fails.
-    for _ in 0..10 {
-        let length = bytes.len();
+    let mut last_error: Option<Error> = None;
+    let mut previous_len = 0usize;
+    for attempt in 0..11u32 {
+        let walked = walk_log(&bytes);
+        let active = writer_active(path);
+        match walked {
+            // A complete walk is final only when no writer is appending: while
+            // one is, the next record may already be on its way.
+            Ok((receipts, state)) if !active => return Ok((bytes, receipts, state)),
+            Ok(_) => {}
+            Err(error) => last_error = Some(error),
+        }
+        let grew = bytes.len() != previous_len;
+        previous_len = bytes.len();
+        if attempt > 0 && !active && !grew {
+            // Nothing is being written and the bytes stopped changing: the file
+            // is what it is.
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
         bytes = read_capped(path)?;
-        match walk_log(&bytes) {
-            Ok((receipts, state)) => return Ok((bytes, receipts, state)),
-            Err(error) => {
-                if bytes.len() == length {
-                    // No progress: the writer finished (or never started).
-                    return Err(error);
-                }
-                first = error;
+    }
+    match walk_log(&bytes) {
+        Ok((receipts, state)) => Ok((bytes, receipts, state)),
+        Err(error) => {
+            if writer_active(path) {
+                Err(Error::receipt(
+                    "the receipt log is being written by another process",
+                ))
+            } else {
+                Err(last_error.unwrap_or(error))
             }
         }
     }
-    // Still growing after the bound: a writer is active, which is not damage.
-    if std::path::Path::new(&lock_path(path)).exists() {
-        return Err(Error::receipt(
-            "the receipt log is being written by another process",
-        ));
-    }
-    Err(first)
 }
 
 /// Encode one record: `len u32 | sequence u64 | at_ms u64 | decision u8 |
@@ -1262,5 +1348,28 @@ pub fn decision_label(decision: &Decision) -> &'static str {
     match decision {
         Decision::Admitted => "admitted",
         Decision::Refused(_) => "refused",
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::claim_name;
+
+    /// A lock is a file an attacker can plant, and its nonce becomes part of the
+    /// steal's file name: only alphanumerics and dashes may survive, or a nonce
+    /// could steer the claim into another directory (R-13 round 5, #1).
+    #[test]
+    fn a_claim_name_never_carries_a_separator() {
+        assert_eq!(claim_name("1234-5678"), Some("1234-5678".to_string()));
+        assert_eq!(
+            claim_name("../../escaped"),
+            Some("escaped".to_string()),
+            "the separators are dropped, not followed"
+        );
+        assert_eq!(claim_name("a/b\\c:d"), Some("abcd".to_string()));
+        assert_eq!(claim_name("..."), None, "nothing usable is not a name");
+        assert_eq!(claim_name(""), None);
+        let long = claim_name(&"x".repeat(200)).expect("a long nonce still names a claim");
+        assert_eq!(long.len(), 64, "the name is bounded");
     }
 }

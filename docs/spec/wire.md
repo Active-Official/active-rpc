@@ -715,10 +715,15 @@ A durable audit log is not an ARP1 message, but it is a format peers and
 operators exchange, so its refusal class is part of the contract:
 `rpc/receipt`. The layout, chain rules and verification modes are in
 ADR-0021 (version 2). `receipts verify` checks the chain without the kernel
-secret; `--secret-hex` adds the keyed check over every receipt MAC, and
-`--expect-head` pins the chain head a verifier learned out of band, which is the
-only way to detect a truncated tail: any record-boundary prefix is a
-self-consistent shorter log.
+secret. Two additions change what the answer means: `--receipt-key-file` gives
+the verifier the derived receipt key
+(`Agent::receipt_key`, `derive_receipt_key`) and checks every receipt MAC — the
+key is symmetric, so a verifier that holds it can also forge, and it must never be
+the master secret, which mints capability ids; `--expect-head` pins the chain head
+a verifier learned out of band, which is the only way to detect a truncated tail,
+because any record-boundary prefix is a self-consistent shorter log. Chain only,
+keyed, or pinned: the three modes answer different questions and the reply says
+which one it answered.
 
 A record carries the decision the kernel took at dispatch
 (`admitted` or `refused` plus an `rpc/...` code), because a call that was queued

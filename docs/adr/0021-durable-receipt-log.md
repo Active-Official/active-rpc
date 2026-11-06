@@ -44,8 +44,12 @@ record: len u32 LE | sequence u64 | at_ms u64
   which the reader refuses; it cannot leave a broken link in the middle.
 - `verify_chain` needs no key: it checks magic, version, reserved bytes, record
   hashes, links and sequence continuity.
-- `verify_macs(secret)` additionally checks each `mac`, which proves the kernel
-  produced the receipt.
+- `verify_macs(&derive_receipt_key(secret))` additionally checks each `mac`,
+  which proves the kernel produced the receipt. The verifier takes the *derived*
+  receipt key, never the master secret: the secret also mints capability ids, and
+  handing it to a log checker would hand it authority. The key is symmetric, so a
+  verifier holding it can also forge; receipts are evidence against a file or a
+  process, not against in-process code.
 - `head_hash()` returns the chain head so an operator can pin it out of band;
   without pinning, deleting a whole suffix leaves a shorter but self-consistent
   log, which `verify_against(expected_head)` detects.
@@ -79,7 +83,8 @@ Two consequences follow from the review and are worth stating:
 
 - **Chain is not authenticity.** A chain-only verify proves the file was not
   edited or reordered; it does not prove the kernel wrote it. Only
-  `verify_macs` does, and only a party holding the secret can be sure.
+  `verify_macs` does with the derived key, and only a party holding that key can be
+sure.
 - **A prefix is a valid log.** Truncation is invisible to the chain by
   construction. Pinning the head is the operation that detects it, so an export
   should always publish its head next to the file.

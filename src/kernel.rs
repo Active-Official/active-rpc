@@ -1010,11 +1010,23 @@ impl Agent {
         }
         // A gap is a hole in the evidence, so it is counted like an eviction:
         // an auditor could not otherwise tell a continued log from a truncated
-        // one.
+        // one. The ring cannot hold a hole — the log format has no gap encoding,
+        // and `append` refuses a sequence that does not follow its own order — so
+        // a session that adopts a sequence after sealing receipts drops what it
+        // sealed instead of producing a window it could never export
+        // (R-13 round 5, #2).
         if kernel.next_receipt > 0 {
-            kernel.receipts_dropped = kernel
-                .receipts_dropped
-                .saturating_add(next - kernel.next_receipt - 1);
+            let gap = next - kernel.next_receipt - 1;
+            if gap > 0 {
+                let cleared = kernel.receipts.len() as u64;
+                kernel.receipts.clear();
+                kernel.receipts_dropped = kernel
+                    .receipts_dropped
+                    .saturating_add(gap)
+                    .saturating_add(cleared);
+                let total = kernel.receipts_dropped;
+                kernel.push_event(Event::ReceiptsDropped { count: total });
+            }
         }
         // `next_receipt` holds the last sequence issued, so the seal increments
         // before using it: storing `next - 1` makes the next receipt `next`.
