@@ -104,9 +104,9 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   each open transfer reserves two body copies plus the retained plan hash
   vector.
 - A `finish` refused by the wall grant is retried at most three times and then
-  refused with `rpc/bulk` before assembling: re-copying a body on every tiny
-  grant is CPU the caller did not pay for, and the recovery is a new plan, not a
-  wider grant.
+  the transfer is **released** with `rpc/bulk`: re-copying a body on every tiny
+  grant is CPU the caller did not pay for, and the recovery is a new plan plus a
+  re-send, not a wider grant and not a cheap same-root retry.
 - The finish reply carries `canonical`, and `content_error` when an image's
   address could not be computed (`wall` or `parser`); a degraded reply is
   recorded as degraded instead of looking like a body without an address.

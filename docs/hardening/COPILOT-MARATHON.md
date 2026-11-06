@@ -23,7 +23,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-11: round 11 found 2 mediums and 5 lows, all fixed; round 12 must be clean | 89 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-9: round 9 found 4 mediums, all fixed; rounds 10 and 11 must be clean to close | 57 fixed / 0 rejected / 0 open (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-4: round 4 found 1 medium and 7 lows (2 fixed, 6 recorded); round 5 must clear them | 30 fixed / 0 rejected / 6 noted | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
@@ -2595,6 +2595,23 @@ logical message in one frame.
 Residual risks (recorded): HTTP/2 and Connect carry no identity by design, the
 QUIC idle timeout is peer-resettable so slot count is the real connection cap,
 and the shm straddle/truncated branches remain fuzzer-only.
+
+### R-10 bulk transfer - 2026-11-06 (round 12)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `e41cd18`. Six of
+seven round-11 claims verified. Verdict **PARTIAL**: one medium and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the three-attempt wall budget was void: a 53-byte same-root `plan` reset the counter in place, so a fully paid body could be re-assembled without bound (a ~1000x amplification over one upload) | **fixed**: an exhausted finish **releases the transfer**, so a re-plan starts a fresh one and the caller re-sends its chunks; a same-root retry no longer resets the counter; `an_exhausted_finish_releases_the_transfer` asserts the release, that the paid chunks are not resumable (`missing` is the whole body) and that a re-send finishes |
+| 2 | low | the `rpc/bulk` row did not name the exhausted finish | **fixed**: the row names it |
+| 3 | low | a spent grant reported `content_error: "wall"` as if the body were not an image | **documented**: `wall` means "spent before classification, so the reply does not say" |
+| 4 | low | the wall grant does not bound the redaction pass | **documented**: the comment and spec say the grant covers the assembly and verification |
+| 5 | low | "did no work" was a sub-millisecond race | **fixed**: the deadline is anchored at the same instant the counter compares, so it is `grant > 0` |
+| 6 | low | `BulkChunk::try_new` accepted a chunk size past `MAX_CHUNK` | **fixed**: it applies `check_chunk_size` |
+
+Gate: all suites green on both feature sets; clippy both; fmt; doc; negative
+controls 9/9.
 
 ### R-10 bulk transfer - 2026-11-06 (round 11)
 

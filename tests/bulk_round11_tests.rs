@@ -43,10 +43,10 @@ fn finish(
     }
 }
 
-/// After three real wall refusals the finish is a state fault, and re-planning
-/// the same transfer clears it (round 11, M-1).
+/// After three real wall refusals the finish is a state fault, and the transfer
+/// is released so a re-plan starts fresh (round 11, M-1; round 12, M-1).
 #[test]
-fn a_replan_recovers_an_exhausted_finish() {
+fn an_exhausted_finish_releases_the_transfer() {
     // 8 MiB cannot be assembled inside 1 ms on any host, so each attempt does
     // work and spends the budget.
     let transfer = BulkTransfer::new(body(8 << 20, 95), 256 * 1024).expect("transfer");
@@ -59,12 +59,32 @@ fn a_replan_recovers_an_exhausted_finish() {
     let code = finish(&mut provider, &transfer, 1).expect_err("the finish is exhausted");
     assert_eq!(code, "rpc/bulk", "the exhausted state is a state fault");
 
-    // The documented recovery: re-plan the same root, then finish with a real
-    // grant.
-    provider
+    // The transfer is gone: a 53-byte re-plan cannot resume the paid chunks.
+    assert_eq!(
+        provider.active_root(0),
+        None,
+        "the transfer was not released"
+    );
+    let reply = match provider
         .invoke(0, &call("plan", transfer.plan_frame()))
-        .expect("the re-plan is accepted");
-    finish(&mut provider, &transfer, 60_000).expect("the transfer finishes after the re-plan");
+        .expect("the re-plan starts a new transfer")
+    {
+        active_rpc::Response::Value(active_rpc::Value::Map(entries)) => entries,
+        other => panic!("unexpected reply {other:?}"),
+    };
+    assert_eq!(
+        reply.get("missing"),
+        Some(&active_rpc::Value::Int(transfer.plan().chunk_count() as i64)),
+        "the released chunks must not be resumable"
+    );
+
+    // Re-sending the body is the documented recovery.
+    for index in 0..transfer.plan().chunk_count() {
+        provider
+            .invoke(0, &call("put", transfer.chunk_frame(index).expect("chunk")))
+            .expect("chunk");
+    }
+    finish(&mut provider, &transfer, 60_000).expect("the re-sent transfer finishes");
 }
 
 /// A deadline that had already passed does no work, so it does not spend the

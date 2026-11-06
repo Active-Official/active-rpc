@@ -656,8 +656,8 @@ a redacting call) and, when the body is an Active Infinity image, `content`: the
 canonical content address of the **redacted** image, the same value the domain
 provider serves. When the address could have been computed but was not,
 `canonical` is false and `content_error` says why (`wall`: the grant was spent
-during the assembly; `parser`: the body decodes as an image but cannot be
-redacted). The reply is recorded and replayed, so a degraded reply says so
+before classification, so the reply does not say whether the body is an image;
+`parser`: an image that cannot be redacted). The reply is recorded and replayed, so a degraded reply says so
 rather than looking like a body that is not an image. A grant must cover `BulkPlan::required_grant()` bytes (plan
 frame, chunk frames, finish marker and a per-call reply allowance) and
 `BulkPlan::required_calls()` calls (one pass plus a gaps-only resume's `missing`
@@ -677,10 +677,11 @@ announced total (the stored chunks and the assembly buffer) plus the plan's own
 hash vector (32 bytes per chunk and the 53-byte header), because the plan is
 retained for the whole transfer; a `finish` of an image adds a third, transient
 body copy for the redaction. A `finish` refused by the wall grant while it was
-working may be retried three times; after that the provider refuses it with
-`rpc/bulk` before assembling, because every attempt re-copies the body. Planning
-the same transfer again resets that budget; a refusal that did no work (the
-deadline had already passed) does not spend it.
+working may be retried three times; after that the provider **releases the
+transfer** and answers `rpc/bulk`, because every attempt re-copies the body. The
+caller recovers by planning again and re-sending the body: the paid chunks are
+gone, so a 53-byte re-plan cannot buy another batch of assemblies. A refusal that
+did no work (the deadline had already passed) does not spend the budget.
 
 A bulk body is data, never authority: authority stays on the ARP1 envelope that
 opens the transfer.

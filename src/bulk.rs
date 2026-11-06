@@ -558,9 +558,9 @@ impl BulkChunk {
         if data.len() > MAX_CHUNK {
             return Err(Error::Bulk("chunk exceeds the ceiling"));
         }
-        if chunk_size == 0 {
-            return Err(Error::Bulk("chunk size is outside the supported range"));
-        }
+        // The same range `new` relies on: a chunk past `MAX_CHUNK` names no
+        // wire-legal plan (round 12, L-5).
+        check_chunk_size(chunk_size)?;
         // The refusing constructor must not panic on a pair whose product is
         // past `u64` (round 5, F6).
         let offset = (index as u64)
@@ -1537,10 +1537,9 @@ impl BulkProvider {
             if active.plan.root() != plan.root() {
                 return Err(Error::Bulk("a different transfer is already active"));
             }
-            // A re-plan is the documented recovery from an exhausted finish:
-            // the counter is per attempt batch, not per transfer
-            // (round 11, M-1).
-            active.wall_refusals = 0;
+            // The attempt budget is kept: the same chunks are still stored, so
+            // this is the same transfer (round 12, M-1). Only an exhausted
+            // transfer is released, and a re-plan after that is a new one.
             active.last_ms = call.now_ms;
             return Ok(plan_reply(&active.plan, active.receiver.missing_count()));
         }
@@ -1692,8 +1691,12 @@ impl BulkProvider {
         // spent grant after assembly skips the content address instead of
         // running an unbounded pass (round 5, F4; round 7, L3).
         // A wall grant that cannot be added (u64::MAX) must fail closed rather
-        // than disable the check (round 9, L1).
-        let deadline = std::time::Instant::now()
+        // than disable the check (round 9, L1). The instant is the same one the
+        // attempt counter compares below, so "did this attempt have time to
+        // work" is deterministic rather than a sub-millisecond race
+        // (round 12, L-4).
+        let entered = std::time::Instant::now();
+        let deadline = entered
             .checked_add(std::time::Duration::from_millis(
                 call.budget.max_wall_ms.min(MAX_TRANSFER_LIFETIME_MS),
             ))
@@ -1707,20 +1710,26 @@ impl BulkProvider {
             // A None deadline would mean no bound at all: an already-passed
             // deadline fails closed instead (round 11, L-5).
             .unwrap_or_else(std::time::Instant::now);
+        // Exhaustion releases the transfer: a re-plan then starts a fresh one
+        // and the caller re-sends its chunks, which is the honest cost of the
+        // failure. Resetting the counter on a same-root re-plan made the budget
+        // void — a 53-byte frame could re-assemble a fully paid body without
+        // bound (round 12, M-1).
+        if self
+            .transfers
+            .get(&object)
+            .is_some_and(|active| active.wall_refusals >= 3)
+        {
+            self.transfers.remove(&object);
+            return Err(Error::Bulk(
+                "finish is exhausted; the transfer was released",
+            ));
+        }
         let (body, body_hash) = {
             let active = self
                 .transfers
                 .get_mut(&object)
                 .ok_or(Error::Bulk("no transfer is active"))?;
-            // Three wall refusals are enough: the body is re-assembled on every
-            // attempt, so a tiny grant must not buy repeated CPU
-            // (round 9, M4). The chunks stay.
-            if active.wall_refusals >= 3 {
-                // A state refusal, not a budget one: no grant can rescue it,
-                // and the caller recovers by re-planning (round 10, M-3).
-                return Err(Error::Bulk("finish is exhausted for this transfer"));
-            }
-            let entered = std::time::Instant::now();
             match active.receiver.finish_within(Some(deadline)) {
                 Ok(pair) => pair,
                 Err(error) => {
