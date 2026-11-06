@@ -721,3 +721,59 @@ fn a_foreign_answer_on_a_revoked_capability_is_an_identity_refusal() {
         .expect_err("a foreign answer is refused");
     assert_eq!(error.code(), "rpc/identity", "{error}");
 }
+
+/// Ownership is a property of the promise, not of its producing job: a promise
+/// that has settled still answers only its owner, so a guessed id does not even
+/// tell a stranger whether it exists (R-11 round 14, F1).
+#[test]
+fn a_settled_promise_answers_only_its_owner() {
+    let agent = Agent::with_secret([0xc1; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    agent.introduce_to(&cap, &admitted(OLD)).expect("bind");
+    let lane = agent
+        .create_lane("settled", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::text("first")],
+        )
+        .expect("queued");
+    agent.run();
+    promise
+        .value()
+        .expect("the call settles, so its job is gone");
+
+    // The owner still reaches the settle path for its own promise.
+    let error = agent
+        .resolve_as(
+            Some(&PeerIdentity::from_certificate(OLD)),
+            &promise,
+            active_rpc::Value::text("again"),
+        )
+        .expect_err("a settled promise cannot be answered twice");
+    assert_eq!(error.code(), "rpc/promise-resolved", "{error}");
+
+    // A stranger learns only that it does not own the promise.
+    let before = agent.metrics();
+    let error = agent
+        .resolve_as(
+            Some(&PeerIdentity::from_certificate(NEW)),
+            &promise,
+            active_rpc::Value::text("not mine"),
+        )
+        .expect_err("a settled promise still answers only its owner");
+    assert_eq!(error.code(), "rpc/identity", "{error}");
+    let after = agent.metrics();
+    assert_eq!(
+        after.identity_refusals,
+        before.identity_refusals + 1,
+        "the probe is the signal an operator needs"
+    );
+}

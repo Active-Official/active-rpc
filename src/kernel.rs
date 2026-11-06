@@ -3699,6 +3699,29 @@ impl Agent {
             .values()
             .find(|job| job.promise == promise.id)
             .cloned();
+        // Who may answer is a property of the promise, not of its producing job:
+        // a settled promise has no job, and without this gate a non-owner could
+        // learn its state — and so its existence — by guessing an id, across
+        // lanes (R-11 round 14, F1).
+        let owner_of_record = kernel.promises.get(&promise.id).map(|record| {
+            let same_origin = record.from_peer == peer.is_some();
+            let same_peer = match record.identity {
+                Some(owner) => {
+                    crate::identity::matches(crate::identity::presented_fingerprint(peer), owner)
+                }
+                None => crate::identity::presented_fingerprint(peer).is_none(),
+            };
+            (record.lane, same_origin && same_peer)
+        });
+        if let Some((record_lane, owned)) = owner_of_record {
+            if !owned {
+                let error =
+                    Error::Identity("a promise can only be answered by the peer that queued it");
+                let lane = LaneId(record_lane);
+                Self::record_refusal_in(&mut kernel, lane, None, &error);
+                return Err(error);
+            }
+        }
         if job.is_none() {
             // A pending promise always has a job. One without a job is already
             // settled (the settle below reports that); a pending one is a broken

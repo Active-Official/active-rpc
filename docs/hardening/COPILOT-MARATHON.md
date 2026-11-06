@@ -2898,6 +2898,24 @@ gives the format a consumer.
 
 Gate: `scripts/local_gate.sh` green; bulk suites 12 + 16.
 
+### R-11 identity - 2026-11-06 (round 14)
+
+Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `cf5f969`. Both
+round-13 mediums verified sound (no double carry from a successor-bound
+descendant; the event is in every consumer of the schema). Verdict **NOT CLEAN**:
+one medium and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `resolve_as` skipped the ownership check when the producing job was gone (a settled promise), so a non-owner learned `unknown` / pending / settled for any guessed id — across lanes — and the probes counted as `promises_double_settled` instead of `identity_refusals`, losing the detection signal | **fixed**: the ownership gate runs before the job lookup, using the promise record's own lane and origin; `a_settled_promise_answers_only_its_owner` shows the owner still reaches `rpc/promise-resolved` and a stranger gets `rpc/identity` with the refusal counted |
+| 2 | low | the idempotency "used with different arguments" answer came before the key-owner check, so a second principal could probe another peer's key/argument fingerprint | **open** |
+| 3 | low | a rotation does not carry `PromiseRecord.identity` for a settled promise (no job), so the rotated peer cannot pipeline its own answered result | **open** — needs the promise record to carry its capability |
+| 4 | low | ADR-0011 never names `reintroduce_to`, and the operator guide does not warn that rotating a child to a third certificate refuses every ancestor rotation until it is rotated back | **open** |
+| 5 | low | `docs/spec/observability.md` describes `identity` as a capability introduction, but `cap.rebound` also fills it | **open** |
+
+Gate: full suite green on both feature sets; clippy both; fmt; the `rust:1.99`
+Linux suite in the next gate run.
+
 ### R-11 identity - 2026-11-06 (round 13)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `3bed1ac`. Five of
