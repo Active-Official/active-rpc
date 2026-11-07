@@ -339,3 +339,50 @@ async fn logs_since_reports_a_ring_gap() {
     assert!(body["oldest"].as_u64().is_some());
     assert_eq!(body["gap"], serde_json::json!(false));
 }
+
+/// A wrapped ring must say so even when a protected event pins `oldest`
+/// (R-19 round 3, M1).
+#[tokio::test]
+async fn a_wrapped_ring_reports_a_gap_and_truncation() {
+    let app = app(spawn_worker(false));
+    // Each scenario run records a protected result plus progress events; enough
+    // runs wrap the 500-event ring.
+    for _ in 0..600 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/demo/scenario/round-trip")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let since = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/logs/since?id=0")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let body = body_json(since).await;
+    assert_eq!(body["gap"], serde_json::json!(true), "{body}");
+    let tail = app
+        .oneshot(
+            Request::builder()
+                .uri("/logs/tail?n=500")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let body = body_json(tail).await;
+    assert_eq!(body["truncated"], serde_json::json!(true), "{body}");
+}

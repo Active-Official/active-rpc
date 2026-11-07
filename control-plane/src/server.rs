@@ -456,6 +456,21 @@ async fn events(State(state): State<AppState>) -> impl IntoResponse {
     Json(snapshot(&state).events)
 }
 
+/// Whether a cursor has a hole in front of it.
+///
+/// The ring's `oldest` cannot answer this: a protected event pins the front
+/// while later ids are evicted, so a cursor just below the pinned front was
+/// told "no gap" over a real hole. The highest evicted id can answer it
+/// (R-19 round 3, M1).
+fn ring_gap(cursor: u64, dropped_through: u64) -> bool {
+    cursor < dropped_through
+}
+
+/// Whether the ring has dropped any event at all.
+fn ring_truncated(dropped_through: u64) -> bool {
+    dropped_through > 0
+}
+
 async fn logs_tail(
     State(state): State<AppState>,
     Query(query): Query<TailQuery>,
@@ -467,8 +482,10 @@ async fn logs_tail(
     let cursor = events.last().map(|event| event.id).unwrap_or(0);
     let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
     // `truncated` says the 500-event ring has already dropped history: a poller
-    // that asks for a tail is looking at a window, not at the whole run.
-    let truncated = start > 0 || events.first().is_some_and(|event| event.id > oldest);
+    // that asks for a tail is looking at a window, not at the whole run. A
+    // protected event can pin `oldest`, so the eviction counter decides
+    // (R-19 round 3, M1).
+    let truncated = ring_truncated(snapshot.dropped_through);
     Json(json!({
         "count": events.len(),
         "cursor": cursor,
@@ -485,17 +502,18 @@ async fn logs_since(
     let snapshot = snapshot(&state);
     let cursor = query.id.unwrap_or(0);
     let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
-    let retained = snapshot.events.len();
+    let dropped_through = snapshot.dropped_through;
     let events: Vec<_> = snapshot
         .events
         .into_iter()
         .filter(|event| event.id > cursor)
         .collect();
     let next = events.last().map(|event| event.id).unwrap_or(cursor);
-    // A cursor older than the oldest retained id means the ring wrapped and the
-    // caller is missing events it will never see. Reporting them as a silent
-    // jump is how an operator reads "quiet" when the plane was busy.
-    let gap = retained > 0 && cursor.saturating_add(1) < oldest;
+    // Any id at or below `dropped_through` is gone for ever. Comparing with
+    // `oldest` alone missed it: a protected event pins the front while later
+    // ids are evicted, so the poller was told "no gap" over a real hole
+    // (R-19 round 3, M1).
+    let gap = ring_gap(cursor, dropped_through);
     Json(json!({
         "count": events.len(),
         "cursor": next,
@@ -899,5 +917,29 @@ mod tests {
         ));
         assert!(!same_origin("null", Some("127.0.0.1:8787")));
         assert!(!same_origin("ftp://127.0.0.1:8787", Some("127.0.0.1:8787")));
+    }
+}
+
+#[cfg(test)]
+mod ring_arithmetic_tests {
+    use super::{ring_gap, ring_truncated};
+
+    #[test]
+    fn a_cursor_below_the_dropped_high_water_mark_is_a_gap() {
+        // A protected event can pin `oldest` at 37 while ids up to 40 were
+        // dropped: a cursor at 36 has a hole in front of it even though
+        // `cursor + 1 == oldest` (R-19 round 3, M1).
+        assert!(ring_gap(36, 40));
+        assert!(ring_gap(0, 1));
+        // A cursor at or past the high-water mark has nothing missing.
+        assert!(!ring_gap(40, 40));
+        assert!(!ring_gap(41, 40));
+        assert!(!ring_gap(0, 0));
+    }
+
+    #[test]
+    fn truncation_is_any_eviction() {
+        assert!(!ring_truncated(0));
+        assert!(ring_truncated(1));
     }
 }

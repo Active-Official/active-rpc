@@ -180,9 +180,13 @@ names the round where the rule lives.
 | R11 | medium | an in-flight out-of-band resolve marked the job receipted without sealing | the pre-mark applies only while the job is queued; dispatch seals through the flag |
 | R11 | low | text ownership could be copied by a local user; `Drop` checked then unlinked; a FIFO blocked the write opens; the parent directory was not flushed | ownership is the held handle's `(dev, ino)` on unix; `Drop` renames to a claim before verifying; `open_log_write` uses `O_NOFOLLOW` and the handle's type; the parent is flushed on unix |
 | R12 | high | the header install was a *replacing* rename | the exclusive hard link above |
-| R12 | medium | ownership was checked once per batch, not per 1 MiB chunk | re-checked before each chunk and before the final flush |
-| R12 | medium | the log path was checked, then re-opened; `repair` truncated through the new object | one verified handle per operation: `O_NOFOLLOW`, `fstat` regular-file, then read/write/`set_len` on that handle |
-| R12 | medium | a reader could accept bytes read before its liveness probe | the probe runs before and after the read, and the length must equal the bytes walked |
+| R12/R13 | medium | ownership was checked once per batch, not per 1 MiB chunk | re-checked before each chunk and before the final flush (`write_all`) |
+| R12/R13 | medium | the log path was checked, then re-opened; `repair` truncated through the new object | one verified handle per operation: `O_NOFOLLOW` on unix, `fstat` regular-file, then read/write/`set_len` on that handle; `repair` reads and truncates the same file |
+| R12/R13 | medium | a reader could accept bytes read before its liveness probe, or a same-length replacement | the probe runs before and after the read, the length must equal the bytes walked, and on unix the path's `(dev, ino)` must still be the handle that was read |
+| R13 | medium | `truncate` removed the old log before installing, and a filesystem without hard links could never install | `replacing` is one atomic rename under the lock; a zero-length file is removed before the exclusive link, and an unsupported link names that cause |
+| R13 | medium | the sweep looked for `<log>.lock`-prefixed staging files, which production never creates | the sweep strips `.lock` and matches the log stem |
+| R13 | medium | a cancel that ran while receipts were off marked the job receipted without sealing, so dispatch skipped it later | the flag is set only when a receipt was actually sealed, on every path (resolve, cancel, fail, dispatch) |
+| R13 | low | the sweep read a future mtime as fresh | it reads as aged, like `lock_state`; an undeletable entry does not spend the budget |
 | R12 | low | a planted fresh lock suppressed verification with an unhelpful message; leftovers were never swept; the unauthenticated writer was the ordinary one | the refusal names the lock's age, owner and pid (escaped); `acquire` sweeps aged claim/stale/orphan/staging files; the unauthenticated writers are documented and `append_verified` is the deployment path |
 
 Accepted residuals: the check-then-open race on the lock path (a local user with

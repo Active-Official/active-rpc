@@ -24,13 +24,13 @@ Updated 2026-11-06 at `cf5f969`.
 | R-10 | bulk transfer | 17 | open | r16 fixed two mediums (wall-failure accounting, `abort` scope); r17 in flight |
 | R-11 | identity | 14 | open | r13 fixed two mediums (child-first rotation, event schema); r14 in flight |
 | R-12 | replay | 6 | **closed** | r5 and r6 CLEAN |
-| R-13 | receipts | 12 | open | r12 found the install still a replacing rename (high), a per-batch ownership check and a check-then-open on the log path (mediums), all fixed with `O_NOFOLLOW` handles, an exclusive link and per-chunk checks; r13 and r14 must be clean |
+| R-13 | receipts | 13 | open | r13 found two round-12 claims absent from the tree (the per-chunk check and the `O_NOFOLLOW` handle) plus three mediums, all fixed with tests; r14 and r15 must be clean |
 | R-14 | wasm tools | 5 | **closed** | r3's medium was refuted with a test; r4 and r5 CLEAN |
 | R-15 | observability | 5 | **closed** | r2's high and mediums fixed; r4 and r5 CLEAN |
 | R-16 | security helpers | 12 | open | r12 found a tainted blob's media type surviving every projection (high) and a quadratic address scan, both fixed; r13 and r14 must be clean |
 | R-17 | introduction / topics | 8 | open | r8 corrected the memory estimate (map leaf nodes, double-charged list slots, deque guard) and made `intro()` skip an undescribable provider instead of failing; r9 and r10 must be clean |
 | R-18 | CLI | 2 | open | r2 had one high and eight mediums, all fixed; r3 and r4 needed |
-| R-19 | control plane | 2 | open | r2 had two highs and six mediums, all fixed; r3 and r4 needed |
+| R-19 | control plane | 3 | open | r3's M1 (the audit-gap signal was wrong when a protected event pinned `oldest`) is fixed and tested; M2, M3 and nine lows are open |
 | R-20 | fuzz program | 4 | open | r4 found a swallowed panic on the replay wrapper (high), three target/CI mediums and nine lows, all fixed; the corpus is deduplicated and carries the header-latency seed; r5 and r6 must be clean |
 
 ## What "closed" means here

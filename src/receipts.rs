@@ -695,6 +695,39 @@ fn nonce_of(path: &std::path::Path) -> Option<String> {
 /// A link planted in the log's directory would make every append write through
 /// it (and `repair` truncate through it), so the type is checked without
 /// following it (R-13 round 9, L2).
+/// Open the log for writing through a handle that is verified to be a regular
+/// file.
+///
+/// The path check before an open cannot be atomic with it, so the open itself
+/// refuses a symlink (`O_NOFOLLOW`) and the handle's own metadata decides
+/// (R-13 round 13, F2). `read` adds `O_RDONLY`-style access for `repair`, which
+/// walks and truncates the same inode.
+fn open_log_write(path: &std::path::Path, append: bool, read: bool) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if read {
+        options.read(true);
+    }
+    if append {
+        options.append(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| Error::receipt("cannot open the receipt log for writing"))?;
+    let meta = file
+        .metadata()
+        .map_err(|_| Error::receipt("cannot inspect the receipt log"))?;
+    if !meta.file_type().is_file() {
+        return Err(Error::receipt("the receipt log is not a regular file"));
+    }
+    Ok(file)
+}
+
 /// Refuse a log path that is not a regular file, before opening it for write.
 ///
 /// A symlink check alone lets a FIFO or a device block the open; the type rule
@@ -750,8 +783,23 @@ fn install_staged(
         ));
     }
     if replacing {
-        // `truncate` asks to replace the log, so the old name goes first; the
-        // link below then refuses to clobber anything created in between.
+        // `truncate` asked to replace the log: one atomic rename under the held
+        // lock. Removing the old name first left a window with no log at all,
+        // and a filesystem without hard links could never install (R-13 round
+        // 13, F3).
+        std::fs::rename(staging, path).map_err(|_| {
+            let _ = std::fs::remove_file(staging);
+            Error::receipt("cannot install the receipt log header")
+        })?;
+        sync_parent(path);
+        return Ok(());
+    }
+    // A zero-length file is not evidence (the caller checked that); removing it
+    // under the lock lets the exclusive link succeed, as the old rename did.
+    if std::fs::metadata(path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(false)
+    {
         let _ = std::fs::remove_file(path);
     }
     // A `rename` *replaces* its destination: a creator that passes the check
@@ -768,6 +816,17 @@ fn install_staged(
             let _ = std::fs::remove_file(staging);
             Err(Error::receipt(
                 "the receipt log was created by another writer",
+            ))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            let _ = std::fs::remove_file(staging);
+            Err(Error::receipt(
+                "this filesystem does not support an exclusive log install",
             ))
         }
         Err(_) => {
@@ -807,6 +866,12 @@ fn sweep_leftovers(lock: &std::path::Path) {
     else {
         return;
     };
+    // The lock is `<log>.lock`; staging and claim files hang off the log stem,
+    // so a sweep keyed on the lock name never matched them (R-13 round 13, F4).
+    let stem = name
+        .strip_suffix(".lock")
+        .unwrap_or(name.as_str())
+        .to_string();
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
@@ -818,22 +883,31 @@ fn sweep_leftovers(lock: &std::path::Path) {
         }
         let file = entry.file_name();
         let file = file.to_string_lossy();
-        let Some(rest) = file.strip_prefix(name.as_str()) else {
+        let Some(rest) = file.strip_prefix(stem.as_str()) else {
             continue;
         };
         if !(rest.starts_with(".done-")
             || rest.starts_with(".stale-")
             || rest.starts_with(".orphan-")
-            || rest.starts_with(".writing-"))
+            || rest.starts_with(".writing-")
+            || rest.starts_with(".lock.done-")
+            || rest.starts_with(".lock.stale-")
+            || rest.starts_with(".lock.orphan-")
+            || rest.starts_with(".lock.writing-"))
         {
             continue;
         }
+        // A future mtime is a planted file, the same reading `lock_state`
+        // gives it; treating it as fresh let one entry stall the sweep for good
+        // (R-13 round 13, F8).
         let aged = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
             .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age.as_millis() as u64 >= LOCK_STALE_MS);
+            .is_some_and(|modified| match now.duration_since(modified) {
+                Ok(age) => age.as_millis() as u64 >= LOCK_STALE_MS,
+                Err(_) => true,
+            });
         if aged && std::fs::remove_file(entry.path()).is_ok() {
             budget -= 1;
         }
@@ -1206,21 +1280,31 @@ impl ReceiptLog {
             ));
         }
         refuse_writable_regular(&self.path)?;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .map_err(|_| Error::receipt("cannot open the receipt log for append"))?;
+        let mut file = open_log_write(&self.path, true, false)?;
         // A batch larger than the stale ceiling on slow storage must not look
         // abandoned while it is being written: refresh the lock between bounded
         // chunks. The crash semantics are unchanged — a partial trailing record
         // is what the reader already refuses and `repair` cuts.
         let mut offset = 0;
         while offset < bytes.len() {
+            // Per chunk, not once per batch: a displaced writer that keeps
+            // appending interleaves a second chain inside the records, which
+            // `repair` refuses to cut (R-13 round 13, F1).
+            if !lock.still_holds() {
+                return Err(Error::receipt(
+                    "the receipt log lock was displaced by another process",
+                ));
+            }
             let end = (offset + WRITE_CHUNK_BYTES).min(bytes.len());
             file.write_all(&bytes[offset..end])
                 .map_err(|_| Error::receipt("cannot append to the receipt log"))?;
             offset = end;
             lock.touch();
+        }
+        if !lock.still_holds() {
+            return Err(Error::receipt(
+                "the receipt log lock was displaced by another process",
+            ));
         }
         file.sync_data()
             .map_err(|_| Error::receipt("cannot flush the receipt log"))?;
@@ -1311,7 +1395,22 @@ impl ReceiptLog {
                 "the receipt log lock was displaced by another process",
             ));
         }
-        let bytes = read_capped(&path)?;
+        // One handle for the walk and the truncation. The bytes are read from
+        // the very file `set_len` will act on, so a path swapped between a read
+        // and a later open cannot be truncated (R-13 round 13, F2).
+        refuse_writable_regular(&path)?;
+        let mut file = open_log_write(&path, false, true)?;
+        let mut bytes = Vec::new();
+        {
+            use std::io::Read;
+            file.by_ref()
+                .take(MAX_LOG_BYTES.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|_| Error::receipt("cannot read the receipt log to repair it"))?;
+        }
+        if bytes.len() as u64 > MAX_LOG_BYTES {
+            return Err(Error::receipt("the receipt log is too large"));
+        }
         // A log that already walks is intact: repair has nothing to do.
         if walk_log(&bytes).is_ok() {
             return Ok(0);
@@ -1334,14 +1433,6 @@ impl ReceiptLog {
         let remaining = tail.len();
         // The prefix must itself be a valid log, or the cut would keep damage.
         let (_, state) = walk_log(&bytes[..good_end])?;
-        // Before the open: a FIFO at the path passes a symlink check and
-        // `open(O_WRONLY)` blocks for ever, in the one tool an operator runs
-        // after damage (R-13 round 11, L-5).
-        refuse_writable_regular(&path)?;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|_| Error::receipt("cannot open the receipt log to repair it"))?;
         // The same check as the append: a repair that lost its lock must not
         // truncate a log another writer now owns (R-13 round 10, A).
         if !lock.still_holds() {
@@ -1432,6 +1523,49 @@ fn read_tail_head(path: &std::path::Path) -> Option<[u8; 32]> {
 /// Read a log file under the size ceiling, refusing a larger one without
 /// allocating it.
 fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
+    read_capped_with_identity(path).map(|(bytes, _)| bytes)
+}
+
+/// The identity of an open file on unix: `(dev, ino)`.
+#[cfg(unix)]
+fn file_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata().ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// The identity of a path on unix, without following a link.
+#[cfg(unix)]
+fn path_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Whether the path still names the file that was read.
+///
+/// On unix `(dev, ino)` decides; elsewhere the read and the length check are
+/// all that is available (the residual the ADR records).
+fn same_identity(path: &std::path::Path, identity: Option<(u64, u64)>) -> bool {
+    #[cfg(unix)]
+    {
+        identity.is_some() && path_identity(path) == identity
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, identity);
+        true
+    }
+}
+
+/// The bytes read, and the identity of the handle that read them.
+type ReadLog = (Vec<u8>, Option<(u64, u64)>);
+
+/// Read the log and report the identity of the handle that was read.
+fn read_capped_with_identity(path: &std::path::Path) -> Result<ReadLog> {
     use std::io::Read;
     // Opening a FIFO or a device here would block for ever: refuse anything that
     // is not a regular file, without following a link (R-13 round 9, F5).
@@ -1442,6 +1576,16 @@ fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
     }
     let file =
         std::fs::File::open(path).map_err(|_| Error::receipt("cannot read the receipt log"))?;
+    let identity = {
+        #[cfg(unix)]
+        {
+            file_identity(&file)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    };
     let mut bytes = Vec::new();
     file.take(MAX_LOG_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -1449,7 +1593,7 @@ fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
     if bytes.len() as u64 > MAX_LOG_BYTES {
         return Err(Error::receipt("the receipt log exceeds the size ceiling"));
     }
-    Ok(bytes)
+    Ok((bytes, identity))
 }
 
 /// True when a writer is, or very recently was, appending.
@@ -1485,16 +1629,19 @@ fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogStat
             std::thread::sleep(std::time::Duration::from_millis(20));
             continue;
         }
-        let bytes = read_capped(path)?;
+        let (bytes, identity) = read_capped_with_identity(path)?;
         let walked = walk_log(&bytes);
         let length_now = std::fs::metadata(path)
             .map(|metadata| metadata.len())
             .unwrap_or(u64::MAX);
         let active = writer_active(path);
+        let same_file = same_identity(path, identity);
         match walked {
-            // A complete walk is final only when no writer is appending and the
-            // path still holds exactly the bytes that were walked.
-            Ok((receipts, state)) if !active && length_now == bytes.len() as u64 => {
+            // A complete walk is final only when no writer is appending, the
+            // path still holds exactly the bytes that were walked, and it is
+            // still the file that was read (a same-length replacement between
+            // the read and the stat is a different log).
+            Ok((receipts, state)) if !active && length_now == bytes.len() as u64 && same_file => {
                 return Ok((bytes, receipts, state));
             }
             Ok(_) => {}
@@ -1509,17 +1656,18 @@ fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogStat
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let bytes = read_capped(path)?;
+    let (bytes, identity) = read_capped_with_identity(path)?;
     let length_now = std::fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(u64::MAX);
     let active = writer_active(path);
+    let same_file = same_identity(path, identity);
     match walk_log(&bytes) {
         // The bound ran out while a writer was still working, or the file moved
         // under the read: a complete walk of the old bytes is a prefix of its
         // batch, and returning it would publish a head the file has already
         // moved past (R-13 round 7, #5; round 12, F4).
-        Ok(_) if active || length_now != bytes.len() as u64 => {
+        Ok(_) if active || length_now != bytes.len() as u64 || !same_file => {
             Err(Error::receipt(writer_description(path)))
         }
         Ok((receipts, state)) => Ok((bytes, receipts, state)),
@@ -2097,10 +2245,16 @@ mod round11_tests {
             std::fs::write(file, b"leftover").expect("leftover");
             age(file, 600);
         }
+        // The staging file production actually writes is `<log>.writing-…`,
+        // not `<log>.lock.writing-…`: the sweep must match the log stem
+        // (R-13 round 13, F4).
+        let staging = dir.join(format!("{}.writing-7-8", file_name_text(&path)));
+        std::fs::write(&staging, b"staged").expect("staging");
+        age(&staging, 600);
         let fresh = dir.join(format!("{name}.writing-9-9"));
         std::fs::write(&fresh, b"live").expect("fresh");
         drop(LogLock::acquire(&path).expect("lock"));
-        for file in &aged {
+        for file in aged.iter().chain(std::iter::once(&staging)) {
             assert!(!file.exists(), "{} survived the sweep", file.display());
         }
         assert!(fresh.exists(), "a live staging file is not swept");
@@ -2117,6 +2271,41 @@ mod round11_tests {
                 std::time::SystemTime::now() - std::time::Duration::from_secs(seconds),
             ))
             .expect("set the mtime");
+    }
+
+    /// `O_NOFOLLOW` is the only step that can be atomic with the open: the
+    /// helper refuses a link on its own, without the path check (F2).
+    #[cfg(unix)]
+    #[test]
+    fn the_write_open_refuses_a_symlink() {
+        let dir = scratch_dir("nofollow");
+        let target = dir.join("victim");
+        std::fs::write(&target, b"keep").expect("victim");
+        let link = dir.join("log.arrl");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let error = open_log_write(&link, true, false).expect_err("refused");
+        assert_eq!(error.code(), "rpc/receipt");
+        assert_eq!(std::fs::read(&target).expect("victim"), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `repair` truncates the file it walked, never a link planted at the path
+    /// (F2).
+    #[cfg(unix)]
+    #[test]
+    fn repair_never_truncates_through_a_symlink() {
+        let dir = scratch_dir("repair-link");
+        let target = dir.join("victim");
+        std::fs::write(&target, vec![0x41u8; 4096]).expect("victim");
+        let link = dir.join("log.arrl");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(ReceiptLog::repair(&link).is_err());
+        assert_eq!(
+            std::fs::read(&target).expect("victim").len(),
+            4096,
+            "the victim was truncated through the link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {

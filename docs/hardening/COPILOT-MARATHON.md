@@ -26,13 +26,13 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-5: round 5 found no critical/high/medium (CLEAN) and 12 lows (2 fixed); round 6 must be clean to close | 32 fixed / 0 rejected / 10 noted | this commit |
-| R-13 | receipts | `src/receipts.rs` | rounds 1-11: round 10's high and two mediums fixed at `68f29ab`, its five lows fixed in round 11; r11's re-audit is owed | 59 fixed / 0 rejected / 1 residual (the check-then-open race needs a unix `O_NOFOLLOW`) | this commit |
+| R-13 | receipts | `src/receipts.rs` | rounds 1-13: r13 found two highs (the per-chunk check and the verified handle were claimed but absent) and three mediums, all fixed; r14 and r15 must be clean | 73 fixed / 0 rejected / 1 residual (no OS-level lock) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-12: r12 found the media type of a tainted blob surviving every projection (high) and a quadratic address scan, both fixed; r13 and r14 must be clean | 52 fixed / 0 rejected / 5 noted | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-8: r8 corrected the memory estimate (map nodes, list slots, deque guard) and the introduction's blast radius, all fixed; r9 and r10 must be clean | 63 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
-| R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
+| R-19 | control-plane | `control-plane/**` | rounds 1-3: r3's M1 (the audit gap) is fixed with tests; M2/M3 and nine lows are open | 37 fixed / 0 rejected / 0 open (3 documented) | this commit |
 | R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
 
 ## Cross-cutting passes (after the sections)
@@ -49,6 +49,38 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-13 receipts - 2026-11-06 (round 13)
+
+Reviewer: DeepSeek through Token Harbor, `max`, read-only at `62b2713`. Two
+round-12 claims were false: the per-chunk ownership check and the
+`O_NOFOLLOW` handle were never in the tree (a patch script aborted between its
+anchors). Verdict **NOT CLEAN**: two highs, three mediums and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `write_all` checked ownership once per batch; a displaced writer kept appending a second chain, which `repair` refuses to cut | **fixed**: re-checked before every 1 MiB chunk and before the final flush. `write_all` is the shipped path; the state it guards is proved by `a_displaced_lock_cannot_write` |
+| 2 | high | the log path was checked and then re-opened; `repair` could `set_len` a substituted file | **fixed**: `open_log_write` opens with `O_NOFOLLOW` on unix, verifies the handle is a regular file; `repair` reads the bytes from the same handle it truncates. `receipts::round11_tests::{the_write_open_refuses_a_symlink, repair_never_truncates_through_a_symlink}` (unix) |
+| 3 | medium | the install's `replacing` path removed the log before linking, and a zero-length log made `create` fail | **fixed**: `replacing` is one atomic rename under the lock; a zero-length file is removed before the exclusive link; an unsupported link names its cause |
+| 4 | medium | the sweep matched `<log>.lock`-prefixed names, while staging files are `<log>.writing-...` | **fixed**: the sweep strips `.lock` and matches the log stem; the test plants the real staging name |
+| 5 | medium | both cancel paths set `receipted` without sealing, so a cancel taken while receipts were off suppressed dispatch's seal later | **fixed**: the flag follows a real seal on every path. `receipt_round3_tests::a_cancel_while_receipts_were_disabled_still_yields_one_receipt`; negative control records zero |
+| 6 | medium | the ADR and commit message asserted controls that did not exist | **fixed**: the rounds table now describes the per-chunk check, the verified handle, the atomic replace and the sweep stem that are in the tree |
+| 7 | low | the reader compared length only, so a same-length replacement published a foreign head | **fixed on unix**: the handle's `(dev, ino)` must still be the path's (the non-unix residual is in the ADR) |
+| 8 | low | the sweep read a future mtime as fresh, and an undeletable entry stalled it | **fixed**: a future mtime reads as aged, and an undeletable entry does not spend the budget |
+| 9 | low | `record_receipt` set the flag even when the ring was exhausted and sealed nothing | **fixed**: `seal_receipt` returns whether it recorded, and the flag follows it |
+
+Gate: `scripts/local_gate.sh --no-msrv` green; Linux clippy and the receipt unit
+tests green in `rust:1.99` (the two symlink tests are unix-only). R-13 needs r14
+and r15 clean.
+
+### R-19 control plane - 2026-11-06 (round 3, fix pass 1)
+
+Round-3 finding M1 (the audit-gap signal was wrong in steady state) is closed;
+M2, M3 and the lows are open.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M1 | medium | a protected event pinned `oldest`, so `/logs/since` said `gap:false` over a real hole, and `/logs/tail`'s `truncated` was vacuous | **fixed**: `PlaneCore` tracks `dropped_through` (the highest evicted id), `record()` sets it and `audit_gap` on every eviction, the snapshot carries it, and `logs/since` compares a cursor with it while `logs/tail` reports `truncated = dropped_through > 0`. `plane::ring_tests::an_eviction_behind_a_protected_front_is_a_gap`, `server::ring_arithmetic_tests`, and `api_tests::a_wrapped_ring_reports_a_gap_and_truncation` (600 scenario runs wrap the ring). Negative controls: dropping the eviction record fails the first, a false `ring_gap` fails the second, the old `truncated` fails the third |
 
 ### R-17 introduction and topics - 2026-11-06 (round 8)
 

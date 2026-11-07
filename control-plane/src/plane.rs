@@ -244,6 +244,9 @@ pub struct Snapshot {
     pub infinity: InfinityView,
     pub engines: EngineView,
     pub events: Vec<UiEvent>,
+    /// Highest event id the ring has evicted. `logs/since` compares a cursor
+    /// with it; `logs/tail` reports `truncated` from it (R-19 round 3, M1).
+    pub dropped_through: u64,
     pub last_scenario: Option<ScenarioResult>,
     pub scenario_results: Vec<ScenarioResult>,
     pub scenarios: Vec<ScenarioDef>,
@@ -533,6 +536,9 @@ pub struct PlaneCore {
     events: VecDeque<UiEvent>,
     kernel_events_seen: u64,
     next_event_id: u64,
+    /// Highest event id the ring has evicted, ever. A cursor below it is a
+    /// cursor with a hole in front of it (R-19 round 3, M1).
+    dropped_through: u64,
     last_scenario: Option<ScenarioResult>,
     scenario_results: BTreeMap<String, ScenarioResult>,
     promise_chain: Vec<u64>,
@@ -962,6 +968,7 @@ impl PlaneCore {
             events: VecDeque::new(),
             kernel_events_seen: 0,
             next_event_id: 1,
+            dropped_through: 0,
             last_scenario: None,
             scenario_results: BTreeMap::new(),
             promise_chain: Vec::new(),
@@ -1020,14 +1027,23 @@ impl PlaneCore {
                     "scenario" | "benchmark" | "refusals"
                 ) || candidate.code.as_deref() == Some("rpc/audit-gap")
             };
-            if let Some(index) = self
+            // Whichever event goes, the id it carried is a hole from now on:
+            // `oldest` cannot describe it (a protected event can pin the front
+            // while later ids disappear), so the highest evicted id is what
+            // `logs/since` compares a cursor against (R-19 round 3, M1).
+            let evicted = if let Some(index) = self
                 .events
                 .iter()
                 .position(|candidate| !protected(candidate))
             {
-                self.events.remove(index);
+                self.events.remove(index)
             } else {
-                self.events.pop_front();
+                self.events.pop_front()
+            };
+            if let Some(evicted) = evicted {
+                self.dropped_through = self.dropped_through.max(evicted.id);
+                // The audit trail lost an event it will never show again.
+                self.audit_gap = true;
             }
         }
         self.events.push_back(event);
@@ -1684,6 +1700,7 @@ impl PlaneCore {
             },
             engines: self.engines(),
             events: self.events.iter().cloned().collect(),
+            dropped_through: self.dropped_through,
             last_scenario: self.last_scenario.clone(),
             scenario_results: self.scenario_results.values().cloned().collect(),
             scenarios: SCENARIOS.to_vec(),
@@ -3029,4 +3046,38 @@ impl Default for PlaneCore {
 
 pub fn now_millis() -> u64 {
     now_ms()
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    /// A protected event pins `oldest`, so an eviction behind it is invisible to
+    /// a comparison with `oldest`; the eviction counter is what the server
+    /// compares a cursor against (R-19 round 3, M1).
+    #[test]
+    fn an_eviction_behind_a_protected_front_is_a_gap() {
+        let mut core = PlaneCore::new();
+        // Start from an empty ring so the protected event is the front, which
+        // is the shape the production ring reaches: `new()` already recorded
+        // its own status events.
+        core.events.clear();
+        core.note("scenario", None, "pinned", None, None, Some("round-trip"));
+        let pinned = core.events.front().map(|event| event.id).expect("pinned");
+        for index in 0..(EVENT_TAIL + 25) {
+            core.note("progress", None, format!("event {index}"), None, None, None);
+        }
+        assert_eq!(
+            core.events.front().map(|event| event.id),
+            Some(pinned),
+            "the protected event still pins the front"
+        );
+        assert!(
+            core.dropped_through > pinned,
+            "the ring dropped ids while `oldest` did not move"
+        );
+        assert!(core.audit_gap, "the audit trail lost events");
+        assert!(pinned < core.dropped_through);
+        assert_eq!(core.snapshot().dropped_through, core.dropped_through);
+    }
 }

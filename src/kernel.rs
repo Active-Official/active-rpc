@@ -4207,7 +4207,7 @@ impl Agent {
         // so exactly one of resolve and dispatch seals the single admission
         // (R-13 round 11, M-2).
         if let Some(job) = &job {
-            if kernel.queue.contains(&job.id) {
+            if kernel.queue.contains(&job.id) && kernel.receipts_enabled {
                 if let Some(stored) = kernel.jobs.get_mut(&job.id) {
                     stored.receipted = true;
                 }
@@ -4878,18 +4878,18 @@ impl Agent {
             // applies to a lost answer. A `Refused` here told an auditor the
             // provider never ran (R-13 round 7, #4).
             kernel.record_settled(promise.id);
-            if kernel.receipts_enabled && !job.receipted {
-                // The receipt records the decision dispatch took, and the call
-                // reached the provider: no answer is delivered, but nothing was
-                // refused either, so the decision is `Admitted` for a read-only
-                // call as much as for a mutating one. A `Refused` here would deny
-                // an admission the tape already made (R-13 round 9, F4). The
-                // `receipted` guard matches `cancel_tree`: one job, one receipt
-                // (R-13 round 9, L3).
-                kernel.seal_receipt(&job, None);
-            }
-            if let Some(stored) = kernel.jobs.get_mut(&job.id) {
-                stored.receipted = true;
+            // The receipt records the decision dispatch took, and the call
+            // reached the provider: no answer is delivered, but nothing was
+            // refused either, so the decision is `Admitted` for a read-only
+            // call as much as for a mutating one. A `Refused` here would deny an
+            // admission the tape already made (R-13 round 9, F4). The flag is
+            // set only when a receipt was sealed, so a cancel taken while
+            // receipts were off does not suppress dispatch's seal later
+            // (R-13 round 13, F5).
+            if kernel.receipts_enabled && !job.receipted && kernel.seal_receipt(&job, None) {
+                if let Some(stored) = kernel.jobs.get_mut(&job.id) {
+                    stored.receipted = true;
+                }
             }
         }
         Ok(())
@@ -5006,13 +5006,14 @@ impl Agent {
                 // provider may have applied an effect and only the answer was
                 // withheld (R-13 round 7, #4).
                 if let Some(job) = kernel.jobs.values().find(|job| job.promise == *id).cloned() {
-                    if !job.receipted && kernel.receipts_enabled {
-                        // The same rule as `cancel`: dispatch admitted the call
-                        // and the provider ran (R-13 round 9, F4).
-                        kernel.seal_receipt(&job, None);
-                    }
-                    if let Some(stored) = kernel.jobs.get_mut(&job.id) {
-                        stored.receipted = true;
+                    // The same rule as `cancel`: dispatch admitted the call and
+                    // the provider ran, and the flag follows a real seal
+                    // (R-13 round 9, F4; round 13, F5).
+                    if !job.receipted && kernel.receipts_enabled && kernel.seal_receipt(&job, None)
+                    {
+                        if let Some(stored) = kernel.jobs.get_mut(&job.id) {
+                            stored.receipted = true;
+                        }
                     }
                 }
             }
@@ -5513,9 +5514,12 @@ impl Agent {
         {
             return;
         }
-        kernel.seal_receipt(job, refusal);
-        if let Some(stored) = kernel.jobs.get_mut(&job.id) {
-            stored.receipted = true;
+        // The flag records that a receipt exists, so it is set only when the
+        // ring actually took one (sequence exhaustion has no room for it).
+        if kernel.seal_receipt(job, refusal) {
+            if let Some(stored) = kernel.jobs.get_mut(&job.id) {
+                stored.receipted = true;
+            }
         }
     }
 
@@ -6612,9 +6616,10 @@ impl Kernel {
         let Some(job) = self.jobs.get(&job_id).filter(|job| !job.receipted).cloned() else {
             return;
         };
-        self.seal_receipt(&job, Some(error));
-        if let Some(stored) = self.jobs.get_mut(&job_id) {
-            stored.receipted = true;
+        if self.seal_receipt(&job, Some(error)) {
+            if let Some(stored) = self.jobs.get_mut(&job_id) {
+                stored.receipted = true;
+            }
         }
     }
 
@@ -6622,7 +6627,7 @@ impl Kernel {
     ///
     /// Lives on `Kernel` so both the dispatch path (which borrows the cell) and
     /// `fail_job` (which is `&mut self`) record through the same code.
-    fn seal_receipt(&mut self, job: &Job, refusal: Option<&Error>) {
+    fn seal_receipt(&mut self, job: &Job, refusal: Option<&Error>) -> bool {
         // A receipt records when the decision was taken. Only dispatch used to
         // advance the virtual clock, so a kernel that continued a log across a
         // restart and then refused a call before any dispatch sealed `at_ms = 0`
@@ -6635,7 +6640,7 @@ impl Kernel {
             // The sequence space is exhausted; a repeated sequence would make
             // every later export fail, so the ring stops recording instead.
             self.receipts_dropped = self.receipts_dropped.saturating_add(1);
-            return;
+            return false;
         };
         self.next_receipt = next;
         let decision = match refusal {
@@ -6663,6 +6668,7 @@ impl Kernel {
                 self.push_event(Event::ReceiptsDropped { count: total });
             }
         }
+        true
     }
 
     fn fail_job(&mut self, job_id: u64, error: Error, events: bool) {
