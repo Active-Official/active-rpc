@@ -400,6 +400,38 @@ fn a_provider_the_introduction_cannot_name_is_skipped_not_fatal() {
     );
 }
 
+/// A provider over the introduction's method ceiling is left out, the healthy
+/// surface is still described, and the omission is taped once, not per call
+/// (R-17 round 9, F-3 and F-9).
+#[test]
+fn a_provider_with_too_many_methods_is_skipped_and_taped_once() {
+    let agent = Agent::new();
+    agent.register(Box::new(Adapter {
+        name: "huge",
+        methods: (0..=active_rpc::intro::MAX_METHODS_PER_PROVIDER)
+            .map(|index| format!("m{index}"))
+            .collect(),
+    }));
+    agent.register(Box::new(Adapter {
+        name: "good",
+        methods: vec!["y".to_string()],
+    }));
+    let bytes = agent
+        .intro()
+        .expect("one huge surface does not deny the rest");
+    let module = active_infinity::decode(&bytes).expect("a valid module");
+    let json = active_infinity::interop::to_redacted_json(&module).expect("json");
+    assert!(json.contains("\"good\""), "{json}");
+    assert!(!json.contains("\"huge\""), "{json}");
+    agent.intro().expect("a second description");
+    let skips = agent
+        .trace()
+        .iter()
+        .filter(|event| event.event() == "intro.skipped")
+        .count();
+    assert_eq!(skips, 1, "one skip event per provider, not per call");
+}
+
 #[test]
 fn a_refused_receive_is_recorded() {
     let agent = Agent::new();

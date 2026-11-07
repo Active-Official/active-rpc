@@ -49,6 +49,10 @@ fn queued_size(payload: &Value, caps: &[CapId], topic: Option<&str>) -> u64 {
     // actually pins (R-17 rounds 6-7, N-1 and F-1).
     MESSAGE_OVERHEAD
         .saturating_add(payload.memory_bytes())
+        // The charge counts the ids, not the vector's spare capacity: the
+        // release path sees a `&[CapId]` and must subtract exactly this, and a
+        // capacity term here would need the capacity carried into every
+        // subtract (R-17 round 9, F-7; the bounded overhang is recorded).
         .saturating_add((caps.len() as u64).saturating_mul(16))
         .saturating_add(topic.map_or(0, |name| name.len() as u64))
 }
@@ -174,6 +178,14 @@ impl Channel {
         self.queue.len()
     }
 
+    /// Records the queue can hold before it reallocates.
+    ///
+    /// A drained channel rebuilds its buffer, so this is the resident record
+    /// capacity an operator's memory budget is about (R-17 round 9, F-1).
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
     /// Whether the channel accepts sends.
     pub fn can_send(&self) -> bool {
         self.direction.can_send() && !self.closed
@@ -279,12 +291,6 @@ impl Channel {
         if self.closed {
             return Err(Error::InvalidArgument("channel is closed"));
         }
-        // The kernel gates depth before it queues, but the type is public: a
-        // host-built value deeper than the wire ceiling cannot round-trip and
-        // aborts on the recursive `Drop` (R-17 round 8, residual).
-        if crate::kernel::value_too_deep(&payload, crate::wire::MAX_VALUE_DEPTH) {
-            return Err(Error::BudgetExceeded("depth"));
-        }
         if !self.direction.can_send() {
             return Err(Error::InvalidArgument("channel is receive-only"));
         }
@@ -299,6 +305,13 @@ impl Channel {
             // A full channel is backpressure, not a spent budget: the sender's
             // grant is untouched and the same call can be retried later.
             return Err(Error::Backpressure("channel byte ceiling reached"));
+        }
+        // A payload deeper than the wire ceiling cannot round-trip, and a
+        // `Channel` must never take ownership of one; the check sits after the
+        // direction and capacity checks so those keep their own classes
+        // (R-17 round 9, F-4/F-5).
+        if crate::kernel::value_too_deep(&payload, crate::wire::MAX_VALUE_DEPTH) {
+            return Err(Error::BudgetExceeded("depth"));
         }
         let message = Message {
             from,
@@ -365,18 +378,25 @@ impl Channel {
                 // both counters near zero (R-17 rounds 5 and 7, L-4 and F-4).
                 // Rebuilding from the live records is exact; the 4x guard makes
                 // it amortised, so a request/response channel does not churn.
-                // 2x, not 4x: a deque at len 1025 in a 4096-slot buffer is
-                // about four times its live records, and the charge is per
-                // message (R-17 round 8, #3).
+                // Rebuild only below a quarter occupancy, into twice the live
+                // records: the rebuild leaves 2x headroom, so the next take
+                // cannot satisfy the guard again; a 2x threshold with an exact
+                // rebuild fired on every message, copying the queue each time
+                // (R-17 round 9, F-1).
                 if self.queue.capacity() > 64
-                    && self.queue.len().saturating_mul(2) <= self.queue.capacity()
+                    && self.queue.len().saturating_mul(4) < self.queue.capacity()
                 {
                     // `VecDeque::from_iter` may reuse the consumed iterator's
                     // buffer (observed: capacity stayed 1024 after a rebuild),
                     // so build the replacement through a `Vec` and an exact
                     // `with_capacity`.
                     let live: Vec<Message> = std::mem::take(&mut self.queue).into_iter().collect();
-                    let mut fresh = std::collections::VecDeque::with_capacity(live.len());
+                    // Twice the live records: rebuilding to exactly `len` made
+                    // the next push grow and the next take rebuild again, an
+                    // allocation per message at the equilibrium (R-17 round 9,
+                    // F-1).
+                    let target = live.len().saturating_mul(2).max(64);
+                    let mut fresh = std::collections::VecDeque::with_capacity(target);
                     fresh.extend(live);
                     self.queue = fresh;
                 }

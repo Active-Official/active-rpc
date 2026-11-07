@@ -14,12 +14,14 @@ use active_rpc::value::Value;
 struct Live;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
+static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 // SAFETY: every method forwards to the system allocator unchanged; the counter
 // is the only addition, and it is atomic.
 unsafe impl GlobalAlloc for Live {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         LIVE.fetch_add(layout.size(), Ordering::SeqCst);
+        ALLOCS.fetch_add(1, Ordering::SeqCst);
         System.alloc(layout)
     }
 
@@ -128,4 +130,64 @@ fn a_list_is_not_charged_its_slots_twice() {
         "the slots are charged twice: {charged}"
     );
     drop(value);
+}
+
+/// A standing queue must keep its capacity across message pairs: an exact
+/// rebuild at the 2x threshold fired on every take, copying the whole queue
+/// (R-17 round 9, F-1).
+#[test]
+fn a_steady_queue_keeps_its_capacity() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let mut channel = Channel::new(ChannelId(3), "steady", Direction::Both);
+    for _ in 0..2_048 {
+        channel
+            .send_sequence(LaneId(1), Value::Null, Vec::new())
+            .expect("send");
+    }
+    for _ in 0..1_024 {
+        channel.recv().expect("recv").expect("message");
+    }
+    let capacity = channel.capacity();
+    for _ in 0..1_000 {
+        channel
+            .send_sequence(LaneId(1), Value::Null, Vec::new())
+            .expect("send");
+        channel.recv().expect("recv").expect("message");
+    }
+    assert_eq!(
+        channel.capacity(),
+        capacity,
+        "the queue rebuilt or grew while its occupancy was steady"
+    );
+}
+
+/// The depth refusal keeps the direction and capacity classes (R-17 round 9,
+/// F-4).
+#[test]
+fn a_deep_payload_does_not_reclassify_a_direction_or_capacity_refusal() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let mut deep = Value::Null;
+    for _ in 0..(active_rpc::wire::MAX_VALUE_DEPTH + 1) {
+        deep = Value::List(vec![deep]);
+    }
+    let mut receive_only = Channel::new(ChannelId(4), "in", Direction::Receive);
+    assert_eq!(
+        receive_only
+            .send_sequence(LaneId(1), deep.clone(), Vec::new())
+            .expect_err("receive-only")
+            .code(),
+        "rpc/invalid-argument"
+    );
+
+    let mut full = Channel::new(ChannelId(5), "full", Direction::Both);
+    for _ in 0..active_rpc::channel::MAX_QUEUED_PER_CHANNEL {
+        full.send_sequence(LaneId(1), Value::Null, Vec::new())
+            .expect("fill");
+    }
+    assert_eq!(
+        full.send_sequence(LaneId(1), deep, Vec::new())
+            .expect_err("full")
+            .code(),
+        "rpc/backpressure"
+    );
 }

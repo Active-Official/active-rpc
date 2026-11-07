@@ -274,6 +274,10 @@ pub fn redact_value(value: Value) -> Value {
 pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
     let module =
         active_infinity::decode(bytes).map_err(|error| Error::Payload(error.code().to_string()))?;
+    // The raw image's own content address: a provider can copy it into a text,
+    // and it is an equality oracle over the secret heap just like a blob's
+    // (R-16 round 13, F2).
+    let own = active_infinity::content_hash(bytes).ok();
     if !module_holds_secret(&module) {
         // Nothing to rewrite. The bytes go back untouched, so a non-secret
         // streamed module keeps its flag and its identity (R-16 round 7, L-4),
@@ -299,7 +303,8 @@ pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut module = active_infinity::decode(&redacted)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     module.set_provenance(None);
-    sanitize_tainted_blobs(&mut module);
+    let extra: &[[u8; 32]] = own.as_slice();
+    sanitize_tainted_blobs(&mut module, extra);
 
     let redacted = active_infinity::encode(&module)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
@@ -327,13 +332,25 @@ pub fn redact_derived(
     module: &mut active_infinity::InfinityModule,
     redactor: &active_infinity::interop::Redactor,
 ) -> Result<()> {
+    redact_derived_with(module, redactor, &[])
+}
+
+/// [`redact_derived`] with extra addresses to scrub.
+///
+/// The domain passes the pre-patch content address: a text that quotes it is a
+/// lineage oracle even though it names no blob (R-16 round 13, F3).
+pub fn redact_derived_with(
+    module: &mut active_infinity::InfinityModule,
+    redactor: &active_infinity::interop::Redactor,
+    extra: &[[u8; 32]],
+) -> Result<()> {
     redactor
         .redact(module)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     // The library redacts a tainted blob's media type, not its content
     // address; a cone or a patched reply is still a projection that leaves the
     // kernel (R-16 round 9, F-2).
-    sanitize_tainted_blobs(module);
+    sanitize_tainted_blobs(module, extra);
     Ok(())
 }
 
@@ -396,33 +413,38 @@ pub(crate) fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
 /// Strip every secret-derived field from a tainted blob in a projection.
 ///
 /// A tainted blob's hash is `blake3(secret bytes)` and its size is a length
-/// signal; the library's redactor rewrites only the media type. The projection
-/// therefore drops the address, the size and any payload, plus every annotation
-/// that names the node, and clears the taint flag: what remains carries no
+/// signal; the library's *image* redactor leaves all of the fields alone (only
+/// its JSON projection writes the marker), so this pass drops the address, the
+/// size, any payload and the media type, replaces every annotation or text that
+/// names those addresses, and clears the taint flag: what remains carries no
 /// secret-derived material, so a non-redacting caller can receive it
-/// (R-16 rounds 9-10).
-pub(crate) fn sanitize_tainted_blobs(module: &mut active_infinity::InfinityModule) {
+/// (R-16 rounds 9-13).
+pub(crate) fn sanitize_tainted_blobs(
+    module: &mut active_infinity::InfinityModule,
+    extra: &[[u8; 32]],
+) {
     let mut doomed: BTreeSet<active_infinity::NodeId> = BTreeSet::new();
-    let mut addresses: BTreeSet<[u8; 64]> = BTreeSet::new();
+    let mut addresses = address_keys(extra);
     for index in 0..module.node_count() {
         let id = active_infinity::NodeId(index as u32);
         if module.get(id).is_some_and(is_tainted_blob) {
             doomed.insert(id);
             if let Some(active_infinity::Inode::Blob { hash, .. }) = module.get(id) {
-                if let Ok(key) =
-                    <[u8; 64]>::try_from(active_infinity::ir::hash_hex(hash).as_bytes())
-                {
-                    addresses.insert(key);
-                }
+                addresses.insert(hex_key(hash));
             }
         }
     }
-    if doomed.is_empty() {
+    if doomed.is_empty() && addresses.is_empty() {
         return;
     }
+    // A text copy of an address carries what the blob fields no longer do. The
+    // library's redactor rewrites secret literals, not an address the provider
+    // copied into a string, an identifier, an env name, a field key or a
+    // literal interpolation (R-16 round 13, F1).
+    scrub_text_copies(module, &addresses);
     // An annotation is free text about its subject: one attached to the blob,
     // or one whose text quotes the address, carries what the fields no longer
-    // do. An `AiImmutable` flag carries no text, so it stays (R-16 rounds 10-12).
+    // do. An `AiImmutable` flag carries no text, so it stays (R-16 rounds 10-13).
     let kept: Vec<active_infinity::Annotation> = module
         .annotations()
         .iter()
@@ -458,33 +480,80 @@ pub(crate) fn sanitize_tainted_blobs(module: &mut active_infinity::InfinityModul
             *size = 0;
             *payload = None;
             *tainted = false;
-            // The media type is an operator-facing label the codec replaces in
-            // its own projections because it can be secret-derived; a
-            // projection here uses a fixed one too (R-16 round 12, F1).
-            *media_type = "application/octet-stream".to_string();
+            // The codec's own JSON projection writes the marker for a tainted
+            // blob's media type; use the same placeholder (R-16 round 13, F6).
+            *media_type = SECRET_MARKER.to_string();
         }
     }
 }
 
-/// The free text an annotation carries, if it carries any.
-pub(crate) fn annotation_text(kind: &active_infinity::AnnotationKind) -> Option<&str> {
-    match kind {
-        active_infinity::AnnotationKind::Intent(text) => Some(text),
-        active_infinity::AnnotationKind::Constraint { source, .. } => Some(source),
-        active_infinity::AnnotationKind::AiImmutable(_) => None,
+/// The 64-byte lowercase hex key of a hash.
+fn hex_key(hash: &[u8; 32]) -> [u8; 64] {
+    let hex = active_infinity::ir::hash_hex(hash);
+    let mut key = [0u8; 64];
+    // The formatter always produces 64 lowercase hex characters; a zero key on
+    // a hypothetical change can only over-scrub, never under-scrub
+    // (R-16 round 13, F7).
+    key.copy_from_slice(&hex.as_bytes()[..64.min(hex.len())]);
+    key
+}
+
+/// The addresses to scrub: the caller's extra hashes, lowercased by
+/// [`hex_key`].
+fn address_keys(extra: &[[u8; 32]]) -> BTreeSet<[u8; 64]> {
+    extra.iter().map(hex_key).collect()
+}
+
+/// Replace every text node that names an address with the marker.
+fn scrub_text_copies(module: &mut active_infinity::InfinityModule, addresses: &BTreeSet<[u8; 64]>) {
+    if addresses.is_empty() {
+        return;
+    }
+    for index in 0..module.node_count() {
+        let id = active_infinity::NodeId(index as u32);
+        let hit = match module.get(id) {
+            Some(active_infinity::Inode::Str(text)) | Some(active_infinity::Inode::Ident(text)) => {
+                text_names_an_address(text, addresses)
+            }
+            Some(active_infinity::Inode::Env { name, .. }) => {
+                text_names_an_address(name, addresses)
+            }
+            Some(active_infinity::Inode::Table { fields })
+            | Some(active_infinity::Inode::SchemaTable { fields, .. }) => fields
+                .iter()
+                .any(|(name, _)| text_names_an_address(name, addresses)),
+            Some(active_infinity::Inode::Interpolate { parts }) => {
+                parts.iter().any(|part| match part {
+                    active_infinity::InterpPart::Literal(text) => {
+                        text_names_an_address(text, addresses)
+                    }
+                    active_infinity::InterpPart::Expr(_) => false,
+                })
+            }
+            Some(active_infinity::Inode::SchemaField(spec)) => spec
+                .deprecated
+                .as_deref()
+                .is_some_and(|text| text_names_an_address(text, addresses)),
+            _ => false,
+        };
+        // A text or key that names the address is replaced whole: renaming one
+        // key could collide with another, and the node's shape is not evidence
+        // worth keeping.
+        if hit {
+            if let Ok(node) = module.node_mut(id) {
+                *node = active_infinity::Inode::Str(SECRET_MARKER.to_string());
+            }
+        }
     }
 }
 
-/// Whether `text` contains one of the addresses, in one linear pass.
-///
-/// A 64-character hex address is matched by sliding a 64-byte window against a
-/// set, so the cost is the text length rather than the number of blobs times
-/// the text length (R-16 round 12, F2).
+/// Whether `text` contains one of the addresses, in one linear pass, ignoring
+/// ASCII case.
 pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) -> bool {
     if addresses.is_empty() {
         return false;
     }
-    let bytes = text.as_bytes();
+    let bytes: Vec<u8> = text.bytes().map(|byte| byte.to_ascii_lowercase()).collect();
     if bytes.len() < 64 {
         return false;
     }
@@ -496,6 +565,15 @@ pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) 
         }
     }
     false
+}
+
+/// The free text an annotation carries, if it carries any.
+pub(crate) fn annotation_text(kind: &active_infinity::AnnotationKind) -> Option<&str> {
+    match kind {
+        active_infinity::AnnotationKind::Intent(text) => Some(text),
+        active_infinity::AnnotationKind::Constraint { source, .. } => Some(source),
+        active_infinity::AnnotationKind::AiImmutable(_) => None,
+    }
 }
 
 /// True when a module image carries a structural secret.

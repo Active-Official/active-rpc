@@ -26,8 +26,10 @@ kernel or adapter and asserts an invariant, not only "did not crash".
 
 The transplant invariant holds across kernels with **different** secrets. Two
 kernels sharing a secret are one authority domain and derive the same ids by
-design (`SECURITY.md`), so the target perturbs seed byte 0 before building the
-second kernel. `tests/fuzz_regression_tests.rs` pins both halves of that rule.
+design (`SECURITY.md`), so the target flips seed byte 0 before building the
+second kernel. `tests/fuzz_regression_tests.rs` pins the seed pair that
+collided on 2026-10-31 (a 44-byte seed and a one-byte seed expand to the same
+32 bytes) and the header-latency seed.
 
 ## Running
 
@@ -86,8 +88,8 @@ capability the first kernel had minted itself.
 | Lane | Bound | Artifacts |
 |---|---|---|
 | Pull request and `main` | 2 000 runs per target | uploaded on failure |
-| Nightly (`fuzz-nightly.yml`) | 10 minutes per target | `fuzz/artifacts` and the grown corpus, always |
-| Nightly matrix (`nightly.yml`) | 200 000 runs per target, 120-minute job timeout | per-target artifact |
+| Nightly (`fuzz-nightly.yml`) | 7 minutes per target (`FUZZ_SECONDS: 420`) | `fuzz/artifacts` and the grown corpus, always |
+| Nightly matrix (`nightly.yml`) | 200 000 runs or 15 minutes per target, 120-minute job timeout | the crash input always; the grown corpus only on failure |
 
 A crash, an assertion failure or a panic fails the lane. The corpus cache is
 committed rather than carried between runs, so a regression is reproducible from

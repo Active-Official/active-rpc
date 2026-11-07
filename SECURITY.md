@@ -87,9 +87,11 @@ capability id at rest (it is a bearer token).
   (R-16 round 7), and the `content_hash` projection does the same (round 8).
   A **tainted blob** is secret material too: its bytes are secret-derived and
   its `hash` is `blake3` over them, so a projection drops the address, the size,
-  the payload and every annotation that names it, and the domain treats a
+  the payload, replaces the media type with the marker and drops every
+  annotation that names it; a text, identifier, env name or field name that
+  quotes the address (in either case) is replaced too. The domain treats a
   module that holds one as secret-bearing for hashing, provenance, patching and
-  metadata (R-16 rounds 9-11).
+  metadata (R-16 rounds 9-13).
   Bytes that do not claim to be an image are opaque by declaration (a WASM
   guest's binary output,
   a provider's blob): the value model cannot tell them from arbitrary data, so a

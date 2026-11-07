@@ -22,6 +22,24 @@ use active_rpc::{Budget, CapAttrs, CapId};
 mod common;
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: a minted capability reaches the provider and its
+    // reply comes back. Without it a kernel that refuses every call satisfies
+    // every refusal assertion below (R-20 round 5, F7).
+    {
+        let control = common::agent(&[0x01]);
+        let provider = control.register(Box::new(common::Echo::default()));
+        let lane = control
+            .create_lane("control", Budget::default())
+            .expect("the control lane");
+        let cap = common::mint(&control, provider, &["ping"], Budget::default());
+        let promise = control
+            .call(lane, &cap, "ping", vec![])
+            .expect("the control call is admitted");
+        assert_eq!(
+            promise.value().expect("the control call resolves"),
+            active_rpc::Value::text("pong")
+        );
+    }
     if data.is_empty() {
         return;
     }

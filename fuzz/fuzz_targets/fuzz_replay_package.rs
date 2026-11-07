@@ -117,6 +117,15 @@ fuzz_target!(|data: &[u8]| {
         // reaches the op/trace parser, so a panic must fail the target
         // (R-20 round 4, #1). A refusal is the replay class.
         match ReplayPackage::decode(&wrapped) {
+            // Decoding is half the contract: a package the body parser accepts
+            // must re-encode to a package that decodes back to itself. The old
+            // `Ok(_)` arm proved only "decodes or refuses" (R-20 round 5, F13).
+            Ok(package) if package.ops.len() <= REPLAY_OP_CEILING => {
+                let encoded = package.encode().expect("a decoded package re-encodes");
+                let again = ReplayPackage::decode(&encoded)
+                    .expect("a freshly encoded package must decode");
+                assert_eq!(again, package, "re-encode changed the package");
+            }
             Ok(_) => {}
             Err(error) => assert_eq!(error.code(), "rpc/replay", "{error}"),
         }

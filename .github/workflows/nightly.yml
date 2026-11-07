@@ -44,7 +44,7 @@ jobs:
         target: ${{ fromJSON(needs.plan.outputs.targets) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly, pinned 2026-11-07 (R-20 round 5, F11)
       - name: Install clang (libFuzzer runtime)
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Install cargo-fuzz
@@ -52,25 +52,37 @@ jobs:
         # night with the job token (R-20 round 4, #4).
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Long campaign
-        run: cargo fuzz run "${{ matrix.target }}" -- -runs=200000 -max_len=65536 -print_final_stats=1
+        # `-max_total_time` bounds the campaign in-process: a cancelled job
+        # skips its `always()` upload, so a job-timeout could lose the
+        # crashing input the step exists to keep (R-20 round 5, F12).
+        run: cargo fuzz run "${{ matrix.target }}" -- -runs=200000 -max_total_time=900 -max_len=65536 -print_final_stats=1
       # A crash input is the only thing that makes a nightly failure
       # reproducible: `fuzz/artifacts` is gitignored, so without this step the
       # artifact dies with the runner.
-      - name: Upload artifacts and corpus
+      - name: Upload the crash input
         if: always()
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: fuzz-${{ matrix.target }}
-          path: |
-            fuzz/artifacts
-            fuzz/corpus
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+      # The grown corpus is 3 000+ committed seeds plus this run's
+      # additions: sixteen of those a night drowns the artifact list, so
+      # it is kept only when the run failed (R-20 round 5, F10). The long
+      # single-lane campaign in fuzz-nightly.yml keeps the corpus.
+      - name: Upload the grown corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus
           if-no-files-found: ignore
 
   coverage:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
       - name: Install cargo-llvm-cov
         # Pinned for the same reason as cargo-fuzz.
         run: cargo install cargo-llvm-cov --version 0.6.19 --locked

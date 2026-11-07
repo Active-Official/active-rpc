@@ -336,7 +336,7 @@ fn a_tainted_blobs_media_type_and_quoted_address_do_not_survive() {
             _ => None,
         })
         .expect("the projection still carries the blob");
-    assert_eq!(media_type, "application/octet-stream");
+    assert_eq!(media_type, active_rpc::security::SECRET_MARKER);
     assert!(!tainted, "the sanitized projection is not tainted");
     assert_eq!(
         decoded.annotations().len(),
@@ -348,4 +348,49 @@ fn a_tainted_blobs_media_type_and_quoted_address_do_not_survive() {
         decoded.annotations()[0].kind,
         active_infinity::AnnotationKind::AiImmutable(true)
     ));
+}
+
+/// A text copy of a tainted blob's address is scrubbed in every case: an
+/// uppercase string, a field name, and an extra address the caller names
+/// (R-16 round 13, F1-F3).
+#[test]
+fn a_text_copy_of_an_address_is_scrubbed() {
+    let mut module = InfinityModule::new();
+    let blob = module.push(Inode::Blob {
+        hash: BLOB_HASH,
+        size: 8,
+        tainted: true,
+        media_type: "application/octet-stream".to_string(),
+        payload: None,
+    });
+    let shout = module.push(Inode::Str(hash_hex(&BLOB_HASH).to_uppercase()));
+    let root = module.push(Inode::Table {
+        fields: vec![
+            ("blob".to_string(), blob),
+            (format!("addr{}", hash_hex(&BLOB_HASH)), shout),
+        ],
+    });
+    module.set_root(Some(root));
+    let raw = encode(&module).expect("encode");
+    let redacted = active_rpc::security::redact_module(&raw).expect("redact");
+    let printed = String::from_utf8_lossy(&redacted).to_lowercase();
+    assert!(
+        !printed.contains(&hash_hex(&BLOB_HASH)),
+        "an address survived as a text or a field name"
+    );
+
+    // An address the caller names (a pre-patch lineage or the image's own) is
+    // scrubbed by the derived-module helper too.
+    let patch_hash = [0x6bu8; 32];
+    let mut derived = InfinityModule::new();
+    let text = derived.push(Inode::Str(hash_hex(&patch_hash)));
+    derived.set_root(Some(text));
+    let redactor = active_rpc::security::redactor_for(&derived);
+    active_rpc::security::redact_derived_with(&mut derived, &redactor, &[patch_hash])
+        .expect("redact");
+    let printed = String::from_utf8_lossy(&encode(&derived).expect("encode")).to_lowercase();
+    assert!(
+        !printed.contains(&hash_hex(&patch_hash)),
+        "the extra address survived"
+    );
 }

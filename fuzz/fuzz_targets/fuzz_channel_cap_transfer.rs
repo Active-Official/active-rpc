@@ -29,6 +29,20 @@ fn direction(byte: u8) -> Direction {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: a bidirectional channel carries a payload. With
+    // every send and receive refusing, the direction assertions below hold
+    // vacuously (R-20 round 5, F7).
+    {
+        let mut control = Channel::new(ChannelId(0), "control", Direction::Both);
+        control
+            .send(LaneId(0), Value::Int(9), Vec::new())
+            .expect("a bidirectional channel accepts a send");
+        let message = control
+            .recv()
+            .expect("receive")
+            .expect("the sent message is queued");
+        assert_eq!(message.payload, Value::Int(9), "the payload survives");
+    }
     if data.is_empty() {
         return;
     }

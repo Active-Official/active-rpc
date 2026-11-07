@@ -30,6 +30,23 @@ fn the_header_latency_seed_is_refused_by_that_rule_alone() {
     assert!(error.to_string().contains("header latency"), "{error}");
 }
 
+#[path = "../fuzz/fuzz_targets/common.rs"]
+mod common;
+
+/// The transplant rule only means something across distinct secrets. The
+/// committed seed is the 2026-10-31 crash: its 44 leading `0x06` bytes cycle
+/// into the same 32-byte secret as a one-byte `0x06` seed, so the harness's
+/// "other" kernel was the *same* authority domain. The target now flips byte
+/// 0, and this pins both halves of why it must (R-20 round 5, F9).
+#[test]
+fn the_transplant_seed_collides_unless_a_byte_is_flipped() {
+    let bytes = repo("fuzz/corpus/fuzz_capability_lifecycle/c10-transplant-distinct-secret.bin");
+    assert_eq!(common::secret(&bytes), common::secret(&[0x06]));
+    let mut flipped = bytes.clone();
+    flipped[0] ^= 0xff;
+    assert_ne!(common::secret(&bytes), common::secret(&flipped));
+}
+
 /// Two seeds that are byte-identical burn campaign time and hide a missing
 /// case behind a name that suggests it exists.
 #[test]

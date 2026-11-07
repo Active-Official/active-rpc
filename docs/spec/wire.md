@@ -447,7 +447,9 @@ transport must preserve when it forwards one:
   controls, zero-width and tag characters), checked at the grant, at publish and
   inside `Channel` itself. A channel name follows the 128-byte object rule; a
   provider name follows the introduction's 1..=1024-byte bound and its character
-  rule (no control, invisible or reordering characters).
+  rule (no control, invisible or reordering characters), and the introduction
+  lists at most the registered surface: a provider whose own name or methods
+  cannot be carried is omitted and taped as `intro.skipped` (ADR-0017).
 - **A bound capability needs its peer.** A capability bound with `mint_bound`
   publishes only through `Agent::publish_as`, and the presented peer fingerprint
   must match the binding (`rpc/identity`). A channel cannot prove who published,

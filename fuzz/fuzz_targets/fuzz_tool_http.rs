@@ -36,6 +36,45 @@ fn policy() -> ToolPolicy {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: the allowed path reaches the transport, so its
+    // refusal is a transport class and never a policy one. A tool that refused
+    // every path used to pass (R-20 round 5, F7).
+    {
+        let tool = HttpTool::new("http://127.0.0.1:1", &[("GET", "/safe")]);
+        let control = common::agent(&[0x04]);
+        let provider = control.register(Box::new(tool));
+        let lane = control
+            .create_lane("control", Budget::default())
+            .expect("the control lane");
+        let cap = control
+            .mint(
+                provider,
+                0,
+                CapAttrs::new(&["get"])
+                    .with_budget(Budget::default())
+                    .with_tool_policy(policy()),
+            )
+            .expect("the control method is granted");
+        let promise = control
+            .call(
+                lane,
+                &cap,
+                "get",
+                vec![Arg::Value(Value::path("/safe".to_string()))],
+            )
+            .expect("the control call is queued");
+        let error = promise
+            .value()
+            .expect_err("port 1 is closed, so the allowed path must fail at the transport");
+        assert!(
+            matches!(
+                error.code(),
+                "rpc/provider" | "rpc/transport" | "rpc/timeout" | "rpc/transport-unavailable"
+            ),
+            "the allowed path was refused by policy: {}",
+            error.code()
+        );
+    }
     if data.is_empty() {
         return;
     }

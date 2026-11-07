@@ -27,6 +27,24 @@ fn nested(depth: usize) -> Value {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: under the default budget a call is admitted and
+    // resolves, so a lane that refuses everything cannot pass the ceiling
+    // assertions below (R-20 round 5, F7).
+    {
+        let control = common::agent(&[0x03]);
+        let provider = control.register(Box::new(common::Echo::default()));
+        let lane = control
+            .create_lane("control", Budget::default())
+            .expect("the control lane");
+        let cap = common::mint(&control, provider, &["ping"], Budget::default());
+        let promise = control
+            .call(lane, &cap, "ping", vec![])
+            .expect("the control call is admitted");
+        assert_eq!(
+            promise.value().expect("the control call resolves"),
+            Value::text("pong")
+        );
+    }
     if data.is_empty() {
         return;
     }

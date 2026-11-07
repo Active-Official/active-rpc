@@ -52,6 +52,13 @@ Table {
   documented configuration); each is listed once, their method lists break the
   tie, and a durable record that names that provider stays unrestorable because
   a name no longer identifies one instance (R-17 round 4).
+- **An undescribable provider is omitted, not fatal.** A provider whose name or
+  methods the module cannot carry (the validation below, or more than 4 096
+  methods) is left out of the description and taped as `intro.skipped`; the
+  module therefore lists *at most* the registered surface. A peer reading an
+  introduction cannot tell a kernel with no such provider from one that left it
+  out: the tape is the operator's evidence, and the omission is one event per
+  provider, not per call (R-17 rounds 8-9).
 - **Names are validated.** A peer, provider or method name is 1..=1024 bytes and
   free of control, invisible and reordering characters (U+2028/U+2029, bidi
   controls, zero-width and tag characters), at the same boundary as a capability

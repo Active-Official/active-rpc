@@ -45,6 +45,37 @@ fn granted(grants: &Option<Vec<&'static str>>, topic: &str) -> bool {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: a publish inside an unrestricted grant is
+    // delivered. A channel or capability that refused every topic used to pass
+    // every assertion below (R-20 round 5, F7).
+    {
+        let control = common::agent(&[0x06]);
+        let provider = control.register(Box::new(common::Echo::default()));
+        let lane = control
+            .create_lane("control", Budget::default())
+            .expect("the control lane");
+        let channel = control
+            .create_channel("control", Direction::Both)
+            .expect("the control channel");
+        control
+            .subscribe(lane, channel)
+            .expect("the control lane subscribes");
+        let cap = control
+            .mint(
+                provider,
+                0,
+                CapAttrs::new(&["echo"]).allow_publish(),
+            )
+            .expect("the control capability");
+        control
+            .publish(lane, channel, &cap, "alpha", active_rpc::Value::text("control"))
+            .expect("an unrestricted capability publishes");
+        let message = control
+            .recv_topic(lane, channel, "alpha")
+            .expect("receive")
+            .expect("the published message is queued");
+        assert_eq!(message.payload, active_rpc::Value::text("control"));
+    }
     if data.is_empty() {
         return;
     }

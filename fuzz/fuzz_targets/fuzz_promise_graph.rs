@@ -19,6 +19,27 @@ use active_rpc::{Arg, Budget, Value};
 mod common;
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: a call resolves and a pipelined call on it
+    // resolves too. Without it a kernel that refuses every call satisfies
+    // every assertion below (R-20 round 5, F7).
+    {
+        let control = common::agent(&[0x02]);
+        let provider = control.register(Box::new(common::Echo::default()));
+        let lane = control
+            .create_lane("control", Budget::default())
+            .expect("the control lane");
+        let cap = common::mint(&control, provider, &["ping", "echo"], Budget::default());
+        let first = control
+            .call(lane, &cap, "ping", vec![])
+            .expect("the control call is admitted");
+        let second = control
+            .call(lane, &cap, "echo", vec![Arg::Promise(first.id())])
+            .expect("the pipelined call is admitted");
+        assert_eq!(
+            second.value().expect("the pipelined call resolves"),
+            Value::text("pong")
+        );
+    }
     if data.is_empty() {
         return;
     }

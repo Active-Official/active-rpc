@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -125,6 +126,19 @@ def main() -> int:
             if os.name == "nt"
             else ["--user", f"{os.getuid()}:{os.getgid()}"]
         )
+        # The image's CARGO_HOME is root-owned. A non-root `cargo fuzz build`
+        # cannot take its package-cache lock, so the lane would fail before
+        # fuzzing; the cache lives in the writable mount (R-20 round 5, F2).
+        env = (
+            []
+            if os.name == "nt"
+            else [
+                "-e",
+                "CARGO_HOME=/work/fuzz/target/cargo-home",
+                "-e",
+                "RUSTUP_HOME=/usr/local/rustup",
+            ]
+        )
         try:
             result = run(
                 [
@@ -134,6 +148,7 @@ def main() -> int:
                     "--name",
                     name,
                     *user,
+                    *env,
                     "-v",
                     f"{root}:/work",
                     "-w",

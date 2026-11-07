@@ -244,6 +244,26 @@ fn writer(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: the reader must accept a well-formed log. Without
+    // it a `walk_log` that refuses every log passed the lane (R-20 round 5, F3).
+    {
+        let path = scratch("control");
+        let _ = std::fs::remove_file(&path);
+        let log = ReceiptLog::create(&path).expect("create");
+        let receipt = Receipt {
+            sequence: 1,
+            cap: "0011223344556677".to_string(),
+            method: "echo".to_string(),
+            at_ms: 1,
+            decision: Decision::Admitted,
+            mac: [0u8; 32],
+        };
+        log.append(&receipt).expect("append");
+        let bytes = std::fs::read(&path).expect("read");
+        let read = ReceiptLog::verify_bytes(&bytes).expect("the fixed log verifies");
+        assert_eq!(read, vec![receipt]);
+        let _ = std::fs::remove_file(&path);
+    }
     match ReceiptLog::verify_bytes(data) {
         Ok(receipts) => {
             let start = u64::from_le_bytes(data[8..16].try_into().expect("header start"));

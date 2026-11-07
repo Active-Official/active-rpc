@@ -31,6 +31,33 @@ fn policy() -> ToolPolicy {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: an allow-listed argument runs and its output
+    // comes back. A policy that refused every argument used to pass
+    // (R-20 round 5, F7).
+    {
+        let tool = LocalProcess::new("/bin/sh", &["ok"]).expect("an absolute program");
+        let control = common::agent(&[0x05]);
+        let provider = control.register(Box::new(tool));
+        let lane = control
+            .create_lane("control", Budget::default())
+            .expect("the control lane");
+        let cap = control
+            .mint(
+                provider,
+                0,
+                CapAttrs::new(&["run"])
+                    .with_budget(Budget::default())
+                    .with_tool_policy(policy()),
+            )
+            .expect("the control method is granted");
+        let promise = control
+            .call(lane, &cap, "run", vec![Arg::text("ok")])
+            .expect("the control call is queued");
+        assert!(
+            promise.value().is_ok(),
+            "the allow-listed argument was refused"
+        );
+    }
     if data.is_empty() {
         return;
     }

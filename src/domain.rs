@@ -402,7 +402,9 @@ impl ModuleProvider {
                 // secret node with the marker leaves nothing to taint, and the
                 // metadata filter below needs the original cone.
                 let tainted = call.redact.then(|| tainted_nodes(&sub));
-                security::redact_derived(&mut sub, &slot.redactor).map_err(redaction_fault)?;
+                let own: &[[u8; 32]] = slot.hash.as_slice();
+                security::redact_derived_with(&mut sub, &slot.redactor, own)
+                    .map_err(redaction_fault)?;
                 // A secret-bearing module carries a raw content address in its
                 // provenance; that is an offline oracle, so the cone drops it
                 // for every capability (round 13, H2).
@@ -547,7 +549,9 @@ impl ModuleProvider {
                     // As in `subgraph`: the reply is a projection, and a copy of
                     // a secret literal in the cone is still the secret.
                     let tainted = call.redact.then(|| tainted_nodes(&cone));
-                    security::redact_derived(&mut cone, &slot.redactor).map_err(redaction_fault)?;
+                    let own: &[[u8; 32]] = parent_hash.as_slice();
+                    security::redact_derived_with(&mut cone, &slot.redactor, own)
+                        .map_err(redaction_fault)?;
                     // The provenance names the pre-patch image, so the
                     // pre-patch secret set decides too (round 14, H1).
                     let holds_secret = slot.held_secret || security::module_holds_secret(&patched);
@@ -756,7 +760,8 @@ impl ModuleProvider {
                             }
                             // A tainted blob's hash is secret-derived whatever
                             // the module's provenance says (round 9, F-2).
-                            crate::security::sanitize_tainted_blobs(&mut redacted);
+                            let extra: &[[u8; 32]] = slot.hash.as_slice();
+                            crate::security::sanitize_tainted_blobs(&mut redacted, extra);
                             let redacted_bytes = encode(&redacted).map_err(|error| {
                                 redaction_fault(Error::Payload(error.code().to_string()))
                             })?;
@@ -860,6 +865,10 @@ impl ModuleProvider {
                 if call.redact {
                     tainted_ids.extend(tainted_nodes(module));
                 }
+                // The scan below is linear in the metadata text, so a grant
+                // that has already spent its wall budget refuses before it
+                // starts (R-16 round 13, F4).
+                check_wall_budget(started, call)?;
                 let mut out = Vec::new();
                 let mut hidden_seen = false;
                 for annotation in module.annotations() {
@@ -1916,6 +1925,12 @@ fn evaluator_fault(error: &active_infinity::Error) -> Error {
         // the Active core cannot represent, secret material it refuses), not a
         // redaction collision; the redaction sites raise `provider/redaction`
         // themselves (round 39, L-2).
+        // The evaluator's own redaction step: the provider produced text the
+        // redactor refused, which is a provider fault, not the caller's
+        // (R-16 round 13, F5).
+        active_infinity::Error::Encode("redaction") => Error::Provider {
+            code: "provider/redaction".to_string(),
+        },
         active_infinity::Error::Encode(_) => Error::Domain("active/encode"),
         other => Error::Payload(other.code().to_string()),
     }
@@ -1949,7 +1964,7 @@ fn evaluate_for_caller(
     // redactor actually wrote for a secret node.
     let mut redacted = module.clone();
     security::redact_derived(&mut redacted, redactor)
-        .map_err(|error| active_infinity::Error::Encode(error.code()))?;
+        .map_err(|_| active_infinity::Error::Encode("redaction"))?;
     // Every text the redactor wrote for a secret node: the marker for a normal
     // secret, the empty string when a secret is a substring of the marker. One
     // placeholder from the first secret missed the second case when a module
@@ -1958,7 +1973,7 @@ fn evaluate_for_caller(
     // read from a redacted copy of the source (round 15, #6).
     let mut redacted_source = source.clone();
     security::redact_derived(&mut redacted_source, redactor)
-        .map_err(|error| active_infinity::Error::Encode(error.code()))?;
+        .map_err(|_| active_infinity::Error::Encode("redaction"))?;
     let placeholders: BTreeSet<String> = (0..source.node_count())
         .map(|index| NodeId(index as u32))
         .filter(|id| source.get(*id).is_some_and(|node| node.is_secret()))

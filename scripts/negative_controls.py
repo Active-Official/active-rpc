@@ -139,6 +139,31 @@ CONTROLS = [
         "test": "a_promise_record_refuses_a_second_settlement",
         "why": "A promise accepts a second settlement, so the second resolve no longer errors.",
     },
+    {
+        # The receipt fuzz target's fixed control, driven through the shipped
+        # reader from a test CI runs. A reader that refuses every log passed the
+        # campaign; this makes that regression a test failure (R-20 round 5,
+        # F3/F7).
+        "id": "R-20-receipt-reader",
+        "invariant": "R-20",
+        "file": "src/receipts.rs",
+        "find": "    pub fn verify_bytes(bytes: &[u8]) -> Result<Vec<Receipt>> {\n        walk_log(bytes).map(|(receipts, _)| receipts)\n",
+        "replace": "    pub fn verify_bytes(bytes: &[u8]) -> Result<Vec<Receipt>> {\n        if true {\n            let _ = bytes;\n            return Ok(Vec::new());\n        }\n        walk_log(bytes).map(|(receipts, _)| receipts)\n",
+        "suite": "fuzz_controls_tests",
+        "test": "a_well_formed_receipt_log_reads_back",
+        "why": "The ARRL reader returns no records for any log, so a total-refusal regression is green.",
+    },
+    {
+        # The transport framing target's ring control (R-20 round 5, F4).
+        "id": "R-20-shm-reader",
+        "invariant": "R-20",
+        "file": "src/transport/shm.rs",
+        "find": "    pub fn read(&self) -> Result<Option<Vec<u8>>> {\n",
+        "replace": "    pub fn read(&self) -> Result<Option<Vec<u8>>> {\n        if true {\n            return Ok(None);\n        }\n",
+        "suite": "fuzz_controls_tests",
+        "test": "a_written_shared_memory_frame_reads_back",
+        "why": "The ring reader returns nothing for a written frame, so the framing target's assertions hold vacuously.",
+    },
 ]
 
 

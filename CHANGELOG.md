@@ -2,8 +2,9 @@
 
 ## Unreleased - 2.3.0
 
-Additive API (minor bump per ADR-0006): `Event::ReceiptsDropped` and
-`#[non_exhaustive]` on `Event`, the `ARRL` v2 log, a purpose-separate receipt
+Additive API (minor bump per ADR-0006): `Event::ReceiptsDropped`,
+`Event::IntroSkipped`, `Value::memory_bytes`, `Channel::capacity`, `Shape::nodes`
+and `#[non_exhaustive]` on `Event`, the `ARRL` v2 log, a purpose-separate receipt
 key, `ReceiptLog::snapshot`/`repair_tail`, `Snapshot`, `derive_receipt_key`,
 `Agent::receipt_key`/`set_receipt_sequence`, and `Receipt::fields_are_representable`.
 

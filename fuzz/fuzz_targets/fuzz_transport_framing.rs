@@ -21,6 +21,21 @@ use active_rpc::transport::connect::{grpc_frame, grpc_unframe};
 use active_rpc::transport::shm::SharedSegment;
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive controls: a written frame must be readable and a framed
+    // message must round-trip. Without them every assertion below holds when
+    // every call refuses (R-20 round 5, F4).
+    {
+        let ring = SharedSegment::new(1024);
+        ring.write(b"frame").expect("the fixed frame fits");
+        let read = ring.read().expect("read").expect("a frame");
+        assert_eq!(read, b"frame");
+        ring.advance().expect("advance");
+        assert_eq!(ring.consumed(), ring.produced());
+        let framed = grpc_frame(b"hello").expect("frame");
+        let (message, tail) = grpc_unframe(&framed).expect("unframe");
+        assert_eq!(message, b"hello");
+        assert!(tail.is_empty());
+    }
     if data.is_empty() {
         return;
     }

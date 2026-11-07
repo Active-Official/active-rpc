@@ -522,6 +522,8 @@ pub struct Kernel {
     /// the receipt key without being handed the authority that mints ids.
     receipt_key: [u8; 32],
     providers: BTreeMap<ProviderId, Box<dyn Provider>>,
+    /// Providers whose surface `intro` already reported as undescribable.
+    intro_skipped: BTreeSet<ProviderId>,
     /// The surface each provider declared at registration.
     ///
     /// Kept apart from `providers`, which is temporarily emptied for a
@@ -1040,6 +1042,7 @@ impl Agent {
             receipt_key: crate::receipts::derive_receipt_key(&secret),
             providers: BTreeMap::new(),
             facts: BTreeMap::new(),
+            intro_skipped: BTreeSet::new(),
             caps: BTreeMap::new(),
             meters: BTreeMap::new(),
             promises: BTreeMap::new(),
@@ -1123,6 +1126,13 @@ impl Agent {
         {
             let kernel = self.cell.borrow();
             for (id, facts) in &kernel.facts {
+                // The count check before the copy: the whole point of the
+                // ceiling is not to materialise a million-name surface
+                // (R-17 round 9, F-3).
+                if facts.methods.len() > crate::intro::MAX_METHODS_PER_PROVIDER {
+                    skipped.push((*id, "a provider advertises too many methods".to_string()));
+                    continue;
+                }
                 let methods: Vec<String> = facts.methods.iter().cloned().collect();
                 match crate::intro::surface_error(&facts.name, &methods) {
                     None => surface.push((facts.name.clone(), methods)),
@@ -1133,7 +1143,12 @@ impl Agent {
         if !skipped.is_empty() {
             let mut kernel = self.cell.borrow_mut();
             for (provider, reason) in skipped {
-                kernel.push_event(Event::IntroSkipped { provider, reason });
+                // Once per provider, not once per call: an introspection loop
+                // would otherwise flush real audit records out of the tape
+                // (R-17 round 9, F-9).
+                if kernel.intro_skipped.insert(provider) {
+                    kernel.push_event(Event::IntroSkipped { provider, reason });
+                }
             }
         }
         crate::intro::build(

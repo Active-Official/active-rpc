@@ -33,7 +33,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-8: r8 corrected the memory estimate (map nodes, list slots, deque guard) and the introduction's blast radius, all fixed; r9 and r10 must be clean | 63 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-3: r3's M1 (the audit gap) is fixed with tests; M2/M3 and nine lows are open | 37 fixed / 0 rejected / 0 open (3 documented) | this commit |
-| R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
+| R-20 | fuzz | `fuzz/**` | rounds 1-5: r5 found the local lane's missing `import os` (high) and the decoder controls' absence, all fixed; r6 and r7 must be clean | 46 fixed / 0 rejected / 1 noted (2 residuals) | this commit |
 
 ## Cross-cutting passes (after the sections)
 
@@ -134,6 +134,39 @@ Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. Verdict
 | F10 | low | an answer delivered while receipts were disabled suppressed the dispatch receipt for ever | **fixed**: dispatch seals through the `receipted` flag alone; `receipt_round3_tests::an_in_flight_resolve_while_receipts_were_disabled_still_yields_one_receipt` (negative control: zero receipts) |
 
 Gate: green; both feature sets; fmt and doc clean. R-13 needs r13 and r14 clean.
+
+### R-20 fuzz program - 2026-11-07 (round 5)
+
+Reviewer: DeepSeek through CommandCode (`deepseek/deepseek-v4.1-flash`, `max`),
+read-only at `bb476c8`. Verdict **NOT CLEAN**: one high, five mediums and seven
+lows. The high was a regression from round 4: `scripts/fuzz_docker.py` used
+`os` without importing it, so every `--target`/`--all` run died with
+`NameError`, and that script is the only fuzz lane a Windows host has.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `scripts/fuzz_docker.py` used `os` without importing it, so every container run died before starting | **fixed**: `import os`; `the_local_lane_builds_a_container_command_for_a_target` drives the shipped `main()` with `subprocess.run` replaced, and `--list` is executed too |
+| F2 | medium | `--user uid:gid` against the image's root-owned `CARGO_HOME` made the lane unable to build | **fixed**: `CARGO_HOME=/work/fuzz/target/cargo-home` and `RUSTUP_HOME=/usr/local/rustup` in the container env; asserted by the same harness |
+| F3 | medium | the `ARRL` target had no fixed positive control: a `walk_log` that refused every log passed | **fixed**: a fixed log is written, read back and compared; `tests/fuzz_controls_tests.rs` repeats it and `R-20-receipt-reader` proves the test fails on a stubbed reader |
+| F4 | medium | the framing target passed with every call refusing (ring write/read, gRPC unframe) | **fixed**: a fixed frame round-trips through the ring and `grpc_frame`/`grpc_unframe`; `R-20-shm-reader` is the negative control |
+| F5 | medium | the per-lane target check was dead code (`assert!` before `if derives { continue; }`) | **fixed**: the test now executes each lane's here-doc with Python and requires set equality with `fuzz/Cargo.toml`; a hand-copied list fails it (proved by mutation) |
+| F6 | medium | a mixed-case target name passed every static check and was run by no lane | **fixed**: `manifest_targets()` uses the lanes' charset, and the executed derivations must equal it |
+| F7 | medium | the decoder-target list was hand-copied and a comment satisfied the check | **fixed**: the list is gone; every one of the sixteen targets now has a fixed control before its guard, and the region must assert an outcome |
+| F8 | low | the token/tool check passed on a comment or a second unpinned install | **fixed**: no write scope, every `cargo install` line pinned and `--locked`, every toolchain ref a 40-hex commit |
+| F9 | low | the README said 10 minutes where the lane runs 7, and claimed a transplant pin the regression file did not have | **fixed**: 7 minutes; the transplant collision is now pinned by `the_transplant_seed_collides_unless_a_byte_is_flipped` |
+| F10 | low | sixteen corpus uploads a night | **fixed**: the crash input always, the grown corpus only on failure |
+| F11 | low | `cargo-audit`/`cargo-deny` and all four `dtolnay/rust-toolchain` refs were unpinned | **fixed**: `cargo-audit 0.22.2`, `cargo-deny 0.20.2`, and every toolchain ref pinned to a commit with its channel in a comment |
+| F12 | low | the `always()` upload cannot run after a job timeout, and the campaign was run-bounded only | **fixed**: `-max_total_time=900` bounds the campaign in-process |
+| F13 | low | the wrapped replay decode discarded the package on the success path | **fixed**: re-encode and re-decode must return the same package |
+
+Verification: the three new static/execution tests were each broken on purpose
+(no `import os`, a hand-copied lane list, a removed control) and failed at the
+intended assertion. `scripts/negative_controls.py` is 11/11 with the two new
+entries. Docker smoke of `fuzz_receipt_log` and `fuzz_transport_framing` ran
+under the fixed lane.
+
+Gate: green; both feature sets; fmt, doc, fuzz clippy clean. R-20 needs r6 and
+r7 clean.
 
 ### R-20 fuzz program - 2026-11-06 (round 4)
 
