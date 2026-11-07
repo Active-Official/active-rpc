@@ -168,6 +168,25 @@ close.
 
 Gate: green; control-plane 28 integration + 21 unit tests; fmt and clippy clean.
 
+### R-10 bulk transfer - 2026-11-07 (round 14)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `a6b18e4`. Verdict
+**NOT CLEAN**: two mediums and six lows. Round 13's fixes were present, but the
+funded branch of the throttle had no allowance.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | medium | a grant at the estimate was funded on every attempt, so a 45-byte finish frame bought an unbounded sequence of full assemblies | **fixed**: `funded_runs` counts funded assemblies and `FUNDED_ASSEMBLY_LIMIT = 2` freezes after them; the unit test pins the allowance at and above the estimate |
+| F2 | medium | `put` charges from the unvalidated payload length and charges an idempotent duplicate again, so at the documented minimal bound every retransmission is refused | **open for r15**: the charge must move after the chunk is validated and skipped for a duplicate |
+| F3 | low | the same pre-validation growth is a one-byte occupancy oracle | **open with F2** |
+| F4 | low | the live-byte/vector docs still say one vector and strictly wider | **open for r15** |
+| F5 | low | `with_max_live_bytes(L)` cannot complete a body above about L/2 | **open for r15** |
+| F6 | low | the degraded-reply gate has no negative test (the fixture is too small to trip it) | **open for r15** |
+| F7 | low | the fuzz control only reaches the funded branch | **open for r15** |
+| F8 | low | `frames_from` re-hashes every chunk, contradicting the ADR | **open for r15** |
+
+R-10 needs r15 (with F2/F3 fixed) and r16 clean.
+
 ### R-10 bulk transfer - 2026-11-07 (round 13)
 
 Reviewer: DeepSeek through CommandCode (`max`), read-only at `c506437`. Verdict
@@ -186,6 +205,26 @@ it.
 | 8 | low | the H2.33 gate scans for the literal `debug_assert!` | **fixed**: the scan uses the `debug_assert` prefix and the two debug-only assertions in `src/` are real assertions |
 
 Verdict after the fix pass: every r13 finding is closed; r14 must be clean.
+
+### R-12 replay - 2026-11-07 (round 7)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `a6b18e4`. Verdict
+**NOT CLEAN**: four mediums and four lows. The round-6 revoke skip and the two
+small fixes held, but the skip left a pin scan behind it and the new decode
+ceiling is decoder-only.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | medium | a refused `attenuate`/`call`/`revoke` clones the handle before `reserve_op`, so the clone's retain/release events land in the next op's capture and the package fails its own replay | **open for r8**: the recorder must capture the clone's events with the refused op (or not clone) |
+| F2 | medium | `MAX_DECODE_BYTES` is enforced only by the decoder, so a legal recording can be encoded into an artifact decode refuses | **open for r8**: charge the same objects in `encode` (and refuse at record time) |
+| F3 | medium | replay itself still peaks at ~391 MB for a ~15.8 MB package: it builds a second kernel whose `CapAttrs` copy every method string, and a second trace | **open for r8**: budget the replay-side objects |
+| F4 | medium | every `revoke_subtree` still scanned all `record_pins` for orphans, so a repeated revoke was O(pins) | **fixed**: a call that newly revokes nothing returns before the scan (`newly_doomed == 0`); no pin can newly match when nothing changed |
+| F5 | low | `tombstone_record`, `restore_capability_with` and `durable_ceiling_reached` scan every cap | **open for r8** |
+| F6 | low | the phantom-byte fix has no regression test and its comment cites a test that does not exist | **open for r8** |
+| F7 | low | `mint_restored` links under a revoked ancestor without a defensive check | **open for r8** |
+| F8 | low | `ReplayPackage`'s public fields let a hand-built package bypass `MAX_OPS`/`MAX_TRACES` in `replay()` | **open for r8** |
+
+R-12 needs r8 (with F1-F3 fixed) and r9 clean.
 
 ### R-12 replay - 2026-11-07 (round 6)
 

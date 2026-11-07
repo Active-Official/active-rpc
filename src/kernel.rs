@@ -7206,10 +7206,16 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
     // walk expands by lookup instead of scanning every capability per reached
     // record id (round 45, F-1; round 47, F3).
     let mut record_ids: BTreeSet<[u8; 32]> = BTreeSet::new();
+    // Every node this call newly revokes. A call that revokes nothing (the
+    // repeated `Revoke` a replay makes) cannot create an orphan, so it must not
+    // scan the pin table: that scan is O(pins) per call and made the skip in
+    // the walk below pointless at the pin ceiling (R-12 round 7, F4).
+    let mut newly_doomed = 0usize;
     while let Some(id) = stack.pop() {
         if !doomed.insert(id) {
             continue;
         }
+        newly_doomed += 1;
         // A node already revoked had its whole subtree revoked with it: a new
         // child cannot appear under it (attenuation from a revoked capability
         // is refused, and a revoked durable record is tombstoned). The
@@ -7230,6 +7236,11 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         if let Some(descendants) = kernel.children.get(&id) {
             stack.extend(descendants.iter().copied());
         }
+    }
+    if newly_doomed == 0 {
+        // Nothing changed: no pin can newly match, and every event for these
+        // ids was emitted by the call that revoked them.
+        return;
     }
     // An exported record whose exporting capability was dropped before this
     // revocation has no live record to match, so the subtree walk cannot see

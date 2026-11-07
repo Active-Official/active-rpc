@@ -117,6 +117,15 @@ pub const FINISH_BYTES_PER_MS: u64 = 128 * 1024 * 1024 / 1000;
 /// (R-10 round 13). Three is the number the spec states.
 pub const WALL_REFUSAL_LIMIT: u8 = 3;
 
+/// Funded assemblies a transfer may run.
+///
+/// A grant at the estimate always runs, which is correct, but the frame that
+/// asks for it is 45 bytes: a caller paying the estimate on every attempt got
+/// an unbounded sequence of full assemblies, each costing the estimate in CPU
+/// (R-10 round 14, F1). Two attempts cover a host that is briefly slower than
+/// the estimate; `abort` is the way out after that.
+pub const FUNDED_ASSEMBLY_LIMIT: u8 = 2;
+
 /// What the wall throttle decides for one `finish` attempt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Throttle {
@@ -140,10 +149,13 @@ enum Throttle {
 /// time, so the freeze never engaged (R-10 round 13, F1). The transfer freezes
 /// after [`WALL_REFUSAL_LIMIT`] sub-estimate failures and has the two
 /// documented ways out: a grant at the estimate, or `abort`.
-fn throttle(grant_wall_ms: u64, estimate_ms: u64, refusals: u8) -> Throttle {
-    if grant_wall_ms >= estimate_ms {
+fn throttle(grant_wall_ms: u64, estimate_ms: u64, refusals: u8, funded_runs: u8) -> Throttle {
+    if grant_wall_ms >= estimate_ms && funded_runs < FUNDED_ASSEMBLY_LIMIT {
         Throttle::Run { funded: true }
-    } else if refusals >= WALL_REFUSAL_LIMIT {
+    } else if refusals >= WALL_REFUSAL_LIMIT || grant_wall_ms >= estimate_ms {
+        // The cheap attempts are spent, or the funded ones are: a grant that
+        // could pay is refused once its allowance is used, so no sequence of
+        // 45-byte frames buys another assembly.
         Throttle::Frozen
     } else {
         Throttle::Run { funded: false }
@@ -1326,6 +1338,9 @@ struct ActiveTransfer {
     /// Finishes refused by the wall grant. Each one re-assembles the body, so a
     /// caller cannot buy CPU with a 45-byte frame (round 9, M4).
     wall_refusals: u8,
+    /// Funded assemblies already run: a grant at the estimate is a
+    /// spent-once allowance, not a licence to loop (R-10 round 14, F1).
+    funded_runs: u8,
 }
 
 /// A body that finished and has not been taken by the host yet.
@@ -1690,6 +1705,7 @@ impl BulkProvider {
                 last_ms: call.now_ms,
                 created_ms: call.now_ms,
                 wall_refusals: 0,
+                funded_runs: 0,
             },
         );
         // A new transfer is a new exchange: the previous body's digest reply is
@@ -1925,13 +1941,20 @@ impl BulkProvider {
         // failed (R-10 round 13/15/16). The chunks are never released by a
         // refusal: a refusal must not destroy a body the caller paid to
         // transfer.
-        let (refusals, estimate) = self.transfers.get(&object).map_or((0, 0), |active| {
-            (
-                active.wall_refusals,
-                active.receiver.plan().assembly_wall_ms(),
-            )
-        });
-        let funded = match throttle(call.budget.max_wall_ms, estimate, refusals) {
+        let (refusals, estimate, funded_runs) =
+            self.transfers.get(&object).map_or((0, 0, 0), |active| {
+                (
+                    active.wall_refusals,
+                    active.receiver.plan().assembly_wall_ms(),
+                    active.funded_runs,
+                )
+            });
+        let funded = match throttle(
+            call.budget.max_wall_ms,
+            estimate,
+            refusals,
+            funded_runs,
+        ) {
             // A state refusal, not a budget class: the transfer will not take
             // another attempt at a grant below the body's estimate, and the
             // same frame is refused identically. The message names both ways
@@ -1946,9 +1969,11 @@ impl BulkProvider {
         if funded {
             // A wider grant is a price the transfer has not refused, so three
             // cheap failures must not make a body unfinishable once the host
-            // widens it (round 15, #3).
+            // widens it (round 15, #3). The funded allowance is spent here, so
+            // repeating the same grant cannot loop.
             if let Some(active) = self.transfers.get_mut(&object) {
                 active.wall_refusals = 0;
+                active.funded_runs = active.funded_runs.saturating_add(1);
             }
         }
         // The instant the assembly starts, not the instant the deadline was
@@ -2165,37 +2190,47 @@ fn hex(bytes: &[u8; 32]) -> String {
 mod throttle_tests {
     use super::{
         throttle, BulkBody, BulkFinish, BulkPlan, BulkProvider, CompletedTransfer, Throttle,
-        WALL_REFUSAL_LIMIT,
+        FUNDED_ASSEMBLY_LIMIT, WALL_REFUSAL_LIMIT,
     };
     use crate::kernel::Provider;
     use crate::value::{Call, Response, Value};
 
-    /// A grant at the body's estimate always runs and clears the count; every
+    /// A grant at the body's estimate runs up to a spent-once allowance; every
     /// grant below it is counted, and escalating one millisecond at a time
     /// reaches the freeze instead of buying another full assembly each step
-    /// (R-10 round 13, F1).
+    /// (R-10 round 13, F1; the allowance is round 14, F1).
     #[test]
     fn the_wall_throttle_funds_the_estimate_and_counts_everything_below_it() {
         // A grant that can pay the estimate runs, however many failures came
         // before it, and at equality too.
-        assert_eq!(throttle(8_000, 132, 0), Throttle::Run { funded: true });
-        assert_eq!(throttle(132, 132, 0), Throttle::Run { funded: true });
+        assert_eq!(throttle(8_000, 132, 0, 0), Throttle::Run { funded: true });
+        assert_eq!(throttle(132, 132, 0, 0), Throttle::Run { funded: true });
         assert_eq!(
-            throttle(132, 132, WALL_REFUSAL_LIMIT),
+            throttle(132, 132, WALL_REFUSAL_LIMIT, 0),
             Throttle::Run { funded: true }
+        );
+        // The funded allowance is spent: the same price no longer buys an
+        // assembly, so a 45-byte replay cannot loop over a full body.
+        assert_eq!(
+            throttle(132, 132, 0, FUNDED_ASSEMBLY_LIMIT),
+            Throttle::Frozen
+        );
+        assert_eq!(
+            throttle(8_000, 132, 0, FUNDED_ASSEMBLY_LIMIT),
+            Throttle::Frozen
         );
         // One millisecond below the estimate is not a price: it runs, is
         // counted, and clears nothing.
-        assert_eq!(throttle(131, 132, 0), Throttle::Run { funded: false });
-        assert_eq!(throttle(1, 132, 0), Throttle::Run { funded: false });
-        assert_eq!(throttle(2, 132, 1), Throttle::Run { funded: false });
-        assert_eq!(throttle(3, 132, 2), Throttle::Run { funded: false });
+        assert_eq!(throttle(131, 132, 0, 0), Throttle::Run { funded: false });
+        assert_eq!(throttle(1, 132, 0, 0), Throttle::Run { funded: false });
+        assert_eq!(throttle(2, 132, 1, 0), Throttle::Run { funded: false });
+        assert_eq!(throttle(3, 132, 2, 0), Throttle::Run { funded: false });
         // The escalation freezes at the third counted failure.
-        assert_eq!(throttle(3, 132, WALL_REFUSAL_LIMIT), Throttle::Frozen);
-        assert_eq!(throttle(131, 132, WALL_REFUSAL_LIMIT), Throttle::Frozen);
+        assert_eq!(throttle(3, 132, WALL_REFUSAL_LIMIT, 0), Throttle::Frozen);
+        assert_eq!(throttle(131, 132, WALL_REFUSAL_LIMIT, 0), Throttle::Frozen);
         // No transfer at all reads as an estimate of zero, so the attempt runs
         // and the state check answers `rpc/bulk`.
-        assert_eq!(throttle(0, 0, 0), Throttle::Run { funded: true });
+        assert_eq!(throttle(0, 0, 0, 0), Throttle::Run { funded: true });
     }
 
     /// A `wall`-degraded reply is not final while the body is resident: one
