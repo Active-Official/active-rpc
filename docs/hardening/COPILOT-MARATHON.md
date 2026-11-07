@@ -168,6 +168,35 @@ close.
 
 Gate: green; control-plane 28 integration + 21 unit tests; fmt and clippy clean.
 
+### R-10 bulk transfer - 2026-11-07 (round 13)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `c506437`. Verdict
+**NOT CLEAN**: one medium, six lows in the section and one gate defect outside
+it.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the wall throttle can be walked: a 1 ms widening clears `wall_refusals` and buys another full assembly, so the three-attempt freeze never engages | **open for r14**: the widening must not reset the attempt count |
+| 2 | low | `put` checks `max_live_bytes` before the active-transfer state, so a no-transfer `put` answers `rpc/budget-exceeded` and leaks occupancy | **open for r14** |
+| 3 | low | two full plans are retained per transfer while `reserved_bytes` counts one; `plan.clone()` is a peer-sized infallible allocation | **open for r14** |
+| 4 | low | the wall-degraded reply recompute is gated on `max_wall_ms > 0`, not on wall sufficient for the classification | **open for r14** |
+| 5 | low | `live_bytes`' doc says the announced total; the code reserves 2x stored plus the vector | **open for r14** |
+| 6 | low | a stale comment says an exhausted transfer is released, which the ADR contradicts | **open for r14** |
+| 7 | low | the bulk fuzz target never drives `BulkProvider` or `BulkFinish` | **open for r14** |
+| 8 | low | the H2.33 gate scans for the literal `debug_assert!` and misses `_eq!`/`_ne!` | **open for r14** |
+
+### R-12 replay - 2026-11-07 (round 6)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `c506437`. Verdict
+**NOT CLEAN**: one medium, three lows, and the status table claimed a round-6
+clean that had never been recorded.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| D1 | process | `SECTION-STATUS.md` said "r5 and r6 CLEAN" with no round-6 entry | **fixed in the table**: R-12 is open until this round's findings are fixed and the next round is clean |
+| M1 | medium | the replay path is quadratic for a crafted trace | **open for r7** |
+| L1-L3 | low | three smaller findings | **open for r7** |
+
 ### R-13 receipts - 2026-11-07 (round 15)
 
 Reviewer: DeepSeek through CommandCode (`max`), read-only at `c506437` (two
