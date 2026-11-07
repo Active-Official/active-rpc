@@ -1887,22 +1887,26 @@ impl PlaneCore {
         if !low(&self.agent, &self.echo_cap) && !low(&self.agent, &self.module_cap) {
             return;
         }
-        for cap in [&self.echo_cap, &self.module_cap] {
-            let _ = self.agent.revoke(cap);
-        }
+        // Mint first, revoke after, one cap at a time: revoking before a mint
+        // that can fail left the plane with no live fixture at all, and the
+        // round-4 patch for this was lost (the reviewer caught it in r5).
+        let old_echo = self.echo_cap.clone();
         if let Ok(cap) = self.agent.mint(
             self.echo_provider,
             0,
             CapAttrs::new(&["echo", "ping"]).with_budget(fixture_budget()),
         ) {
             self.echo_cap = cap;
+            let _ = self.agent.revoke(&old_echo);
         }
+        let old_module = self.module_cap.clone();
         if let Ok(cap) = self.agent.mint(
             self.module_provider,
             self.module_object,
             CapAttrs::new(active_rpc::MODULE_METHODS).with_budget(fixture_budget()),
         ) {
             self.module_cap = cap;
+            let _ = self.agent.revoke(&old_module);
         }
         // The display table holds clones minted at startup: point the live rows
         // at the handles the scenarios now use.

@@ -32,7 +32,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-15: r15 found the evaluate fast path, the label leak and the binary hex scan (highs), fixed; F3's projection-side assertion, F5, F6 and F9 are open for r16 | 66 fixed / 0 rejected / 5 noted (4 open) | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-10: r10 found the residency charge (medium) and four lows, all fixed; r11 and r12 must be clean | 68 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
-| R-19 | control-plane | `control-plane/**` | rounds 1-4: r4 found the lane grant (high), nine mediums and eight lows, all fixed; r5 and r6 must be clean | 76 fixed / 0 rejected / 0 open (3 documented) | this commit |
+| R-19 | control-plane | `control-plane/**` | rounds 1-5: r5 found two round-4 fixes missing and three partial (F1 fixed now); F2/F6/F8/F15 and the r5 test gaps are open for r6 | 77 fixed / 0 rejected / 7 open (3 documented) | this commit |
 | R-20 | fuzz | `fuzz/**` | rounds 1-6: r6 found the control gate and five controls could pass on a broken implementation (high + mediums), all fixed; r7 and r8 must be clean | 58 fixed / 0 rejected / 1 noted (4 residuals) | this commit |
 
 ## Cross-cutting passes (after the sections)
@@ -134,6 +134,25 @@ Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. Verdict
 | F10 | low | an answer delivered while receipts were disabled suppressed the dispatch receipt for ever | **fixed**: dispatch seals through the `receipted` flag alone; `receipt_round3_tests::an_in_flight_resolve_while_receipts_were_disabled_still_yields_one_receipt` (negative control: zero receipts) |
 
 Gate: green; both feature sets; fmt and doc clean. R-13 needs r13 and r14 clean.
+
+### R-19 control plane - 2026-11-07 (round 5)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `a6b18e4`. Verdict
+**NOT CLEAN**: round 4's F7 and F15 were not in the tree, and several fixes were
+partial.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | medium | `refresh_fixtures` still revoked before minting (the round-4 edit was lost) | **fixed**: each cap is minted first and its predecessor revoked only on success |
+| F2 | medium | `/status-module` stamped only the outer JSON field; the AINF bytes and `redacted_json` still said `ok` | **open for r6** |
+| F6 | medium | `caps_live` still counts revoked handles and the attenuated row overstates its grant | **open for r6** |
+| F8 | medium | a previous-epoch cursor *below* `newest` still skips events | **open for r6** |
+| F15 | low | the embedded MCP snapshot guard was not in the tree (the round-4 patch script aborted) | **open for r6** |
+| F5/F10 | low | the dashboard split and the HTTP-stub cap are held but untested | **open for r6 (tests)** |
+| F9 | low | `health.ok`'s grant is blind to bytes and to the module/tool/stub caps | **open for r6** |
+
+The r5 report's full table is the next round's work list. R-19 needs r6 (with
+F2/F6/F8 fixed) and r7 clean.
 
 ### R-19 control plane - 2026-11-07 (round 4)
 
