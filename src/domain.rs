@@ -176,14 +176,23 @@ impl ModuleProvider {
     }
 
     /// Read a module back (tests and local callers).
+    ///
+    /// This is the **owner's** view: the provider is the host's object, so an
+    /// in-process caller that already holds the `Agent` sees the arena, secret
+    /// nodes included. Nothing on the wire path returns it; a capability's
+    /// methods go through the redaction and content-address rules instead
+    /// (R-16 round 5, #4).
     pub fn module(&self, object: u64) -> Option<&InfinityModule> {
         self.modules.get(&object).map(|slot| &slot.module)
     }
 
-    /// The cached canonical hash of a module, when it has been computed.
+    /// The cached **raw** canonical digest of a module, when it has been computed.
     ///
-    /// `None` means "not computed yet"; it does not mean the module has no
-    /// hash. `content_hash` fills it.
+    /// This is the in-process owner's cache probe (the M-4.1 invariant is "one
+    /// encode per version"), and it is deliberately the *raw* value: for a
+    /// secret-bearing module it is the offline equality oracle, so a capability
+    /// never serves it — `content_hash` is the address a caller sees, and it is
+    /// the redacted projection. `None` means "not computed yet".
     pub fn cached_hash(&self, object: u64) -> Option<[u8; 32]> {
         self.modules.get(&object).and_then(|slot| slot.hash)
     }

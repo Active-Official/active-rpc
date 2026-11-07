@@ -59,10 +59,13 @@ fn a_deep_active_value_converts_without_recursing() {
             break;
         }
     }
+    // The wire rule refuses a container deeper than the cap, so a value at
+    // exactly the cap survives (R-16 round 6, #3).
     assert!(
-        (1..=active_rpc::wire::MAX_VALUE_DEPTH).contains(&depth),
+        depth <= active_rpc::wire::MAX_VALUE_DEPTH + 1,
         "the conversion is bounded by the wire cap: {depth}"
     );
+    assert!(depth > 10, "the conversion kept the nesting: {depth}");
 }
 
 /// A `Response::Module` prints its length, never its bytes (R-16 round 5, #2).
@@ -76,5 +79,79 @@ fn a_module_response_prints_no_bytes() {
     assert!(
         printed.len() < 64,
         "the payload is not in the line: {printed}"
+    );
+}
+
+/// A redacting caller never receives a magic-prefixed payload that could not be
+/// redacted: the arm that returns opaque bytes is unreachable for anything that
+/// claims to be an image (R-16 round 6, #1).
+#[test]
+fn a_corrupted_image_is_not_returned_by_redaction() {
+    use active_infinity::{encode, InfinityModule, Inode};
+    use active_rpc::security::redact_value;
+
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(active_infinity::SecretBytes::new(b"canary")));
+    module.set_root(Some(secret));
+    let mut image = encode(&module).expect("encode");
+    let last = image.len() - 1;
+    image[last] ^= 0xFF;
+    assert!(
+        active_infinity::decode(&image).is_err(),
+        "the fixture is corrupt"
+    );
+
+    let redacted = redact_value(Value::Module(image.clone()));
+    assert_eq!(
+        redacted,
+        Value::Secret,
+        "an image that cannot be redacted collapses"
+    );
+    let printed = format!("{redacted:?}");
+    assert!(
+        !printed.contains("canary"),
+        "no secret material survives: {printed}"
+    );
+
+    // An intact image is redacted, not collapsed, and its secret is gone.
+    let intact = encode(&module).expect("encode");
+    let redacted = redact_value(Value::Module(intact));
+    match &redacted {
+        Value::Module(bytes) => {
+            let walked = String::from_utf8_lossy(bytes);
+            assert!(
+                !walked.contains("canary"),
+                "the redaction removed the secret"
+            );
+        }
+        other => panic!("an intact image redacts: {other:?}"),
+    }
+
+    // Opaque bytes stay opaque: the accepted residual.
+    let opaque = Value::Module(b"not an image".to_vec());
+    assert_eq!(redact_value(opaque.clone()), opaque);
+}
+
+/// The non-redacting egress validates a decodable image, so a trailing tail that
+/// a receiver refuses cannot cross it (R-16 round 6, #2).
+#[test]
+fn an_image_with_a_trailing_byte_is_refused_by_the_egress() {
+    use active_infinity::{encode, InfinityModule, Inode};
+    use active_rpc::security::assert_no_structural_secrets;
+
+    let mut module = InfinityModule::new();
+    let root = module.push(Inode::Str("value".to_string()));
+    module.set_root(Some(root));
+    let mut image = encode(&module).expect("encode");
+    assert_no_structural_secrets(&Value::Module(image.clone())).expect("the image is valid");
+
+    image.push(0x7F);
+    let error = assert_no_structural_secrets(&Value::Module(image))
+        .expect_err("a trailing tail is refused");
+    // The image is refused as secret-material (it fails to decode, so it
+    // cannot be proven secret-free), which is an `rpc/provider` class.
+    assert!(
+        error.code() == "rpc/provider" || error.code() == "rpc/payload",
+        "the refusal is a payload fault: {error}"
     );
 }

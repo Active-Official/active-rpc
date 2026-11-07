@@ -3416,6 +3416,23 @@ Gate: full `gate-rpc.sh` green — all-features and no-default suites, clippy on
 both sets, fmt, doc, the fuzz and control-plane and CLI manifests, and
 `python scripts/negative_controls.py --check` 9/9.
 
+### R-16 security helpers - 2026-11-06 (round 6)
+
+Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at
+`7358d44`. The round-5 mediums verified, but one gate kept the old predicate.
+Verdict **NOT CLEAN**: one medium and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | the redaction gate still classified by `decode` alone, so a secret-bearing image that fails to decode was returned **verbatim** to a `redact = 1` capability: the mode that promises confidentiality leaked what the other mode now refuses | **fixed**: one predicate, `claims_infinity_image` (decodes, or carries the magic), is used by both `module_has_secret` and `redact_value`; `a_corrupted_image_is_not_returned_by_redaction` asserts the corrupted image collapses to `Value::Secret`, that an intact image redacts without its secret, and that opaque bytes still pass |
+| 2 | low | the wired non-redacting egress proved decodability, not validity, so an image plus a trailing tail crossed a boundary whose receiver refuses it | **fixed**: `assert_no_structural_secrets` validates a decodable image with `check_module_payload`; `an_image_with_a_trailing_byte_is_refused_by_the_egress` |
+| 3 | low | the conversion truncated at `depth >= LIMIT` while the wire rule refuses `depth > LIMIT`, so a legitimate shape at the cap became `Null` | **fixed**: the comparison matches the wire; the deep-value test asserts the cap boundary |
+| 4 | low | a corrupted image is reported by the bulk provider as "not an image" (`content_error: null`) | **open** — the bulk reply's classification should say `parser` for a magic-prefixed payload that does not decode |
+| 5 | low | `ModuleProvider::module` hands out the raw secret-bearing arena | **documented** as the owner's view (see round 5, #4): the provider is the host's object, and no wire path returns it |
+
+Gate: the full local gate green after the fixes (both clippy sets, both test sets,
+doc, benches, fuzz, control plane, CLI, hardening status, 9/9 negative controls).
+
 ### R-16 security helpers - 2026-11-06 (round 5)
 
 Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at
@@ -3427,7 +3444,7 @@ hold at HEAD. Verdict **NOT CLEAN**: two mediums and four lows; no critical/high
 | 1 | medium | an image-looking payload that fails `decode` was classified **opaque**, so a corrupted secret-bearing image bypassed every secret gate and the wasm argument guard | **fixed**: bytes that start with the image magic and do not decode are classified secret-carrying (fail closed); opaque bytes without the magic keep the accepted residual. `a_corrupted_image_is_not_treated_as_opaque` (flips a byte of a real image and asserts the guard still refuses it) |
 | 2 | medium | `Response` derived `Debug`, so `Response::Module` printed its bytes (the round-3 claim covered `Value` and `Arg`, not `Response`) | **fixed**: a hand-written `Debug` prints the shape (`len`) only; `a_module_response_prints_no_bytes` |
 | 3 | low | `check_module_payload` is coextensive with `decode`, so the non-redacting egress still admits a decodable non-canonical image the receiver's install gate refuses | **open** — the honest statement is that the egress proves decodability, not canonicity |
-| 4 | low | public in-process accessors hand out raw secret material (`DomainProvider::module`, `cached_hash`) | **open** — `Agent` is the host's authority object, but a raw content address of a secret-bearing module is the oracle `content_hash` refuses; the accessor needs to return the redacted address |
+| 4 | low | public in-process accessors hand out raw secret material (`DomainProvider::module`, `cached_hash`) | **accepted, documented**: `cached_hash` stays the raw cache probe the M-4.1 tests measure (one encode per version), and both accessors are documented as the in-process owner's view; the address a capability is served is `content_hash`, the redacted projection |
 | 5 | low | `redact_module`/`redact_value` re-encode through default options, dropping `FLAG_STREAMED`, so a non-secret module's bytes can change under redaction | **open** |
 | 6 | low | public `from_active_value` recursed without a depth guard, so a deep `active_core::Value` aborted the process | **fixed**: the conversion is an explicit stack bounded by `MAX_VALUE_DEPTH`, so neither the walk nor the resulting drop can overflow; `a_deep_active_value_converts_without_recursing` builds 100 000 levels |
 

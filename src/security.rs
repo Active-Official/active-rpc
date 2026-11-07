@@ -81,13 +81,13 @@ pub fn from_active_value(value: &active_core::Value) -> Value {
     let mut out: Vec<Value> = Vec::new();
     while let Some(frame) = work.pop() {
         match frame {
-            Frame::Value(ActiveValue::Array(items), depth) if depth >= LIMIT => {
+            Frame::Value(ActiveValue::Array(items), depth) if depth > LIMIT => {
                 // Past the ceiling the shape is truncated to the cap rather
                 // than carried deeper: the wire cannot express it either.
                 out.push(Value::Null);
                 let _ = items;
             }
-            Frame::Value(ActiveValue::Table(entries), depth) if depth >= LIMIT => {
+            Frame::Value(ActiveValue::Table(entries), depth) if depth > LIMIT => {
                 out.push(Value::Null);
                 let _ = entries;
             }
@@ -229,8 +229,11 @@ pub fn redact_value(value: Value) -> Value {
                 // marker.
                 Value::Module(bytes) => done.push(match redact_module(&bytes) {
                     Ok(redacted) => Value::Module(redacted),
-                    Err(_) if !is_infinity_image(&bytes) => Value::Module(bytes),
+                    Err(_) if !claims_infinity_image(&bytes) => Value::Module(bytes),
                     // An image that cannot be redacted is not safe to hand back.
+                    // This arm is reachable now: before the predicate was
+                    // shared, a magic-prefixed payload that failed to decode was
+                    // returned verbatim to a redacting caller (R-16 round 6, #1).
                     Err(_) => Value::Secret,
                 }),
                 other => done.push(other),
@@ -294,15 +297,25 @@ pub fn redact_derived(
         .map_err(|error| Error::Payload(error.code().to_string()))
 }
 
+/// True when a payload claims to be an Infinity image.
+///
+/// A payload that decodes is one. A payload that starts with the image magic but
+/// does not decode also claims to be one, and it cannot be proven secret-free:
+/// a corrupted secret-bearing image would otherwise be classified opaque and
+/// pass every gate. The two gates (secret detection and redaction) must use the
+/// same predicate, or the mode that promises confidentiality treats the shape
+/// the other mode refuses (R-16 rounds 5-6).
+fn claims_infinity_image(bytes: &[u8]) -> bool {
+    is_infinity_image(bytes) || bytes.starts_with(&active_infinity::MAGIC)
+}
+
 /// True when a module holds a node marked secret.
 fn module_has_secret(bytes: &[u8]) -> Result<bool> {
     // Opaque bytes are not an Infinity image and carry no secret structure.
     let Ok(module) = active_infinity::decode(bytes) else {
-        // Except when they claim to be one. A payload that starts with the
-        // image magic and fails to decode cannot be proven secret-free: a
-        // corrupted secret-bearing image would otherwise be classified opaque
-        // and pass every gate (R-16 round 5, #1).
-        return Ok(bytes.starts_with(&active_infinity::MAGIC));
+        // A payload that claims to be an image and cannot be decoded fails
+        // closed (R-16 round 5, #1).
+        return Ok(claims_infinity_image(bytes));
     };
     Ok((0..module.node_count()).any(|index| {
         module
@@ -370,6 +383,12 @@ pub fn assert_no_structural_secrets(value: &Value) -> Result<()> {
                     return Err(Error::Provider {
                         code: "provider/secret-material".to_string(),
                     });
+                }
+                // A decodable image must also be *valid*: `decode` tolerates a
+                // trailing tail, and a receiver's install gate refuses what this
+                // gate would otherwise pass (R-16 round 6, #2).
+                if is_infinity_image(bytes) {
+                    check_module_payload(bytes)?;
                 }
             }
             Value::Null
