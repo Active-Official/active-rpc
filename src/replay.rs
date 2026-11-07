@@ -875,9 +875,13 @@ fn capture(
     for event in &events {
         let entry = trace_of(event, ordinals);
         // The event entries are part of the encoded body, so they are charged
-        // here, not only at `encode` (round 4, M-1). An entry is its label plus
-        // the four-byte ordinal.
-        let addition = trace_len(&entry.event)?.saturating_add(4);
+        // here, not only at `encode` (round 4, M-1). An entry is its flag and
+        // length (`trace_len`), plus the four-byte ordinal only when it names a
+        // capability: the recorder charged four phantom bytes for every
+        // cap-less entry, so a large session could refuse a package that fits
+        // (R-12 round 6, L1).
+        let addition =
+            trace_len(&entry.event)?.saturating_add(if entry.cap.is_some() { 4 } else { 0 });
         let next = body.saturating_add(addition);
         if next > MAX_PACKAGE_BYTES - 32 {
             return Err(Error::Replay("package exceeds the size ceiling".into()));

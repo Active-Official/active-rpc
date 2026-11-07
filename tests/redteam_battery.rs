@@ -752,7 +752,11 @@ fn h2_33_cfg() -> std::result::Result<(), String> {
             } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
                 files += 1;
                 let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-                let debug_only = text.contains("debug_assert!")
+                // `debug_assert` as a prefix: the literal form missed
+                // `debug_assert_eq!` and `debug_assert_ne!`, so two debug-only
+                // assertions lived in `src/` while this gate was green
+                // (R-10 round 13, gate finding).
+                let debug_only = text.contains("debug_assert")
                     || text.contains("cfg!(debug_assertions)")
                     || text.contains("cfg(debug_assertions)");
                 if debug_only {

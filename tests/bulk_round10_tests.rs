@@ -43,8 +43,10 @@ fn drive(provider: &mut BulkProvider, transfer: &BulkTransfer, object: u64, now_
 fn the_live_bound_counts_the_plan_and_not_an_unpaid_total() {
     let transfer = BulkTransfer::new(body(10, 90), 1).expect("transfer");
     let plan = transfer.plan().clone();
-    // `PLAN_OVERHEAD` (53) plus one 32-byte hash per chunk.
-    let vector = 53 + 32 * plan.chunk_count() as u64;
+    // `PLAN_OVERHEAD` (53) plus two 32-byte hash vectors per chunk: the
+    // transfer retains the plan it was opened with and the receiver's own copy
+    // (R-10 round 13, F3).
+    let vector = 53 + 64 * plan.chunk_count() as u64;
     assert!(
         vector > 2 * plan.total(),
         "the fixture must be vector-heavy"

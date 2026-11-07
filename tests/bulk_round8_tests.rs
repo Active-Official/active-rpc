@@ -193,7 +193,9 @@ fn the_provider_can_bound_its_live_bytes() {
     let first = BulkTransfer::new(body(2_000, 83), 1_000).expect("first");
     let second = BulkTransfer::new(body(2_000, 84), 1_000).expect("second");
     let plan = first.plan().clone();
-    let vector = 53 + 32 * plan.chunk_count() as u64;
+    // Two 32-byte hash vectors per chunk: the transfer retains the plan it
+    // was opened with and the receiver's own copy (R-10 round 13, F3).
+    let vector = 53 + 64 * plan.chunk_count() as u64;
     // Room for one announced plan's vector, not for two.
     let mut provider = BulkProvider::new().with_max_live_bytes(vector * 2 - 1);
     provider
@@ -234,7 +236,7 @@ fn a_plan_retry_does_not_double_reserve() {
     let plan = transfer.plan().clone();
     // The retained plan hash vector, which is what an unpaid plan reserves
     // (round 10, M-1; round 18, #1).
-    let reserved = 53 + 32 * plan.chunk_count() as u64;
+    let reserved = 53 + 64 * plan.chunk_count() as u64;
     let mut provider = BulkProvider::new().with_max_live_bytes(reserved);
     provider
         .invoke(0, &call("plan", plan.encode()))

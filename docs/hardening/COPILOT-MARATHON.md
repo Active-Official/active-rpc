@@ -176,14 +176,16 @@ it.
 
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
-| 1 | medium | the wall throttle can be walked: a 1 ms widening clears `wall_refusals` and buys another full assembly, so the three-attempt freeze never engages | **open for r14**: the widening must not reset the attempt count |
-| 2 | low | `put` checks `max_live_bytes` before the active-transfer state, so a no-transfer `put` answers `rpc/budget-exceeded` and leaks occupancy | **open for r14** |
-| 3 | low | two full plans are retained per transfer while `reserved_bytes` counts one; `plan.clone()` is a peer-sized infallible allocation | **open for r14** |
-| 4 | low | the wall-degraded reply recompute is gated on `max_wall_ms > 0`, not on wall sufficient for the classification | **open for r14** |
-| 5 | low | `live_bytes`' doc says the announced total; the code reserves 2x stored plus the vector | **open for r14** |
-| 6 | low | a stale comment says an exhausted transfer is released, which the ADR contradicts | **open for r14** |
-| 7 | low | the bulk fuzz target never drives `BulkProvider` or `BulkFinish` | **open for r14** |
-| 8 | low | the H2.33 gate scans for the literal `debug_assert!` and misses `_eq!`/`_ne!` | **open for r14** |
+| 1 | medium | the wall throttle can be walked: a 1 ms widening clears `wall_refusals` and buys another full assembly, so the three-attempt freeze never engages | **fixed**: `throttle` funds only a grant at the plan's `assembly_wall_ms`; everything below it is counted and cannot clear the count. `escalating_the_grant_by_a_millisecond_does_not_buy_more_assemblies` (8 MiB, walls 1..3, then 4, then estimate-1, then the estimate) fails when the freeze is disabled |
+| 2 | low | `put` checks `max_live_bytes` before the active-transfer state | **fixed**: the state check answers first (`a_put_without_a_transfer_is_a_state_refusal_even_at_the_live_bound`) |
+| 3 | low | two full plans are retained per transfer while `reserved_bytes` counts one | **fixed (stopgap)**: the vector is charged twice and the accounting test states the doubled bound; removing `ActiveTransfer.plan` entirely is recorded for r14 |
+| 4 | low | the wall-degraded reply recompute is gated on `max_wall_ms > 0` | **fixed**: the gate is the body's own byte estimate |
+| 5 | low | `live_bytes`' doc said the announced total | **fixed**: the doc states twice the stored bytes plus the vector |
+| 6 | low | a stale comment said an exhausted transfer is released | **fixed**: the comment states the freeze and the survivor chunks |
+| 7 | low | the bulk fuzz target never drove `BulkProvider` | **fixed**: the control runs plan, put and finish through the provider |
+| 8 | low | the H2.33 gate scans for the literal `debug_assert!` | **fixed**: the scan uses the `debug_assert` prefix and the two debug-only assertions in `src/` are real assertions |
+
+Verdict after the fix pass: every r13 finding is closed; r14 must be clean.
 
 ### R-12 replay - 2026-11-07 (round 6)
 
@@ -194,8 +196,10 @@ clean that had never been recorded.
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
 | D1 | process | `SECTION-STATUS.md` said "r5 and r6 CLEAN" with no round-6 entry | **fixed in the table**: R-12 is open until this round's findings are fixed and the next round is clean |
-| M1 | medium | the replay path is quadratic for a crafted trace | **open for r7** |
-| L1-L3 | low | three smaller findings | **open for r7** |
+| M1 | medium | a repeated `Revoke` of an already-revoked subtree re-walked it (84 000 x 16 000 node visits at the ceilings) | **fixed**: `revoke_subtree` does not descend into a revoked node (no child can appear under one). `repeated_revokes_of_a_revoked_subtree_are_linear` (8 001 nodes, 2 000 revokes, < 5 s) fails when the skip is removed |
+| L1 | low | the body estimate charged four phantom bytes per cap-less trace entry | **fixed**: the ordinal is charged only when the entry names a capability |
+| L2 | low | the body cap is not a memory cap: a ~19 MB package peaks ~370 MB in `replay run` | **open for r7** |
+| L3 | low | `CapRecord::clone` before the cheap attenuation checks copies ~6.4 GB for 100 000 ops | **open for r7** |
 
 ### R-13 receipts - 2026-11-07 (round 15)
 

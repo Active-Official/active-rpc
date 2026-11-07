@@ -6486,7 +6486,7 @@ impl Kernel {
             // drain must empty both, which is cheap to assert on every drop; a
             // per-object cross-check would restore the quadratic scan this
             // counter removed.
-            debug_assert_eq!(
+            assert_eq!(
                 kernel.caps.is_empty(),
                 kernel.object_records.is_empty(),
                 "the per-object record count disagrees with the registry"
@@ -7192,6 +7192,15 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
     let mut record_ids: BTreeSet<[u8; 32]> = BTreeSet::new();
     while let Some(id) = stack.pop() {
         if !doomed.insert(id) {
+            continue;
+        }
+        // A node already revoked had its whole subtree revoked with it: a new
+        // child cannot appear under it (attenuation from a revoked capability
+        // is refused, and a revoked durable record is tombstoned). The
+        // `children` list is pruned only when a record drops, so descending
+        // again made a repeated `Revoke` walk the same 16 000-node subtree
+        // 84 000 times — quadratic replay (R-12 round 6, M1).
+        if kernel.caps.get(&id).is_some_and(|record| record.revoked) {
             continue;
         }
         let record_id = kernel.caps.get(&id).map(|record| record.record_id);

@@ -26,6 +26,33 @@ fuzz_target!(|data: &[u8]| {
         }
         assert!(receiver.is_complete());
         assert_eq!(receiver.finish().expect("finish"), body);
+        // The authority-bearing consumer, not only the codec: a provider that
+        // refuses every call used to pass a target that never touched it
+        // (R-10 round 13, F7). One transfer runs plan, put and finish.
+        {
+            use active_rpc::bulk::{BulkProvider, BulkTransfer};
+            use active_rpc::kernel::Provider;
+            use active_rpc::value::Call;
+            let transfer =
+                BulkTransfer::new(body.clone(), 4).expect("the control transfer");
+            let mut provider = BulkProvider::new();
+            provider
+                .invoke(0, &Call::new("plan", Vec::new()).with_payload(transfer.plan_frame()))
+                .expect("the control plan");
+            for index in 0..transfer.plan().chunk_count() {
+                provider
+                    .invoke(
+                        0,
+                        &Call::new("put", Vec::new())
+                            .with_payload(transfer.chunk_frame(index).expect("frame")),
+                    )
+                    .expect("the control chunk");
+            }
+            let finished = provider
+                .invoke(0, &Call::new("finish", Vec::new()).with_payload(transfer.finish_frame()))
+                .expect("the control finish");
+            assert!(matches!(finished, active_rpc::value::Response::Value(_)));
+        }
     }
     if let Ok(plan) = BulkPlan::decode(data) {
         let _ = plan.chunk_count();

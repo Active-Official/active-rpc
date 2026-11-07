@@ -21,9 +21,9 @@ Updated 2026-11-06 at `cf5f969`.
 | R-07 | domain providers | 47 | clean | r47 CLEAN (six claims held, four lows fixed) |
 | R-08 | tools / MCP | 60 | **closed** | r59 and r60 CLEAN |
 | R-09 | transports | 23 | **closed** | r22 and r23 CLEAN |
-| R-10 | bulk transfer | 13 | open | r13 found the wall throttle can be walked by a 1 ms widening (medium) and six lows; all open for r14 |
+| R-10 | bulk transfer | 13 | open | r13's wall-throttle medium and seven lows are fixed; r14 and r15 must be clean |
 | R-11 | identity | 14 | open | r13 fixed two mediums (child-first rotation, event schema); r14 in flight |
-| R-12 | replay | 6 | open | r6 found a quadratic replay path (medium) and three lows; r6's verdict is recorded in the marathon log and the section reopens until they are fixed |
+| R-12 | replay | 6 | open | r6's quadratic revoke (medium) and the phantom-byte estimate are fixed; L2 (memory peak) and L3 (record clone) are open for r7 |
 | R-13 | receipts | 13 | open | r13 found two round-12 claims absent from the tree (the per-chunk check and the `O_NOFOLLOW` handle) plus three mediums, all fixed with tests; r14 and r15 must be clean |
 | R-14 | wasm tools | 5 | **closed** | r3's medium was refuted with a test; r4 and r5 CLEAN |
 | R-15 | observability | 5 | **closed** | r2's high and mediums fixed; r4 and r5 CLEAN |

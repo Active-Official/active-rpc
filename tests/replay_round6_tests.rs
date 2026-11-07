@@ -1,0 +1,67 @@
+//! R-12 replay round 6: a repeated revoke of an already-revoked subtree must not
+//! re-walk it.
+
+use std::time::Instant;
+
+use active_rpc::{Agent, Budget, CapAttrs};
+
+/// The first revoke walks the subtree; every later revoke of the same node must
+/// be constant work. The reviewer's package used 16 000 children and 84 000
+/// revokes (1.4e9 node visits); this fixture is smaller but the same shape, and
+/// the bound is wide enough that only a re-walk can exceed it
+/// (R-12 round 6, M1).
+#[test]
+fn repeated_revokes_of_a_revoked_subtree_are_linear() {
+    let agent = Agent::new();
+    let provider = agent.register(Box::new(Echo));
+    let lane = agent
+        .create_lane("replay", Budget::default())
+        .expect("lane");
+    let root = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("root");
+    let mut children = Vec::with_capacity(8_000);
+    for _ in 0..8_000 {
+        children.push(
+            agent
+                .attenuate(&root, CapAttrs::new(&["echo"]))
+                .expect("child"),
+        );
+    }
+    // The first revoke marks all 8 001 nodes.
+    agent.revoke(&root).expect("the first revoke");
+    let started = Instant::now();
+    for _ in 0..2_000 {
+        // A revoked capability is refused, and the refusal must not re-walk.
+        let _ = agent.revoke(&root);
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "2 000 repeated revokes of an 8 001-node subtree took {elapsed:?}: the walk is quadratic"
+    );
+    let _ = (lane, children);
+}
+
+struct Echo;
+
+impl active_rpc::kernel::Provider for Echo {
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+    fn methods(&self) -> Vec<String> {
+        vec!["echo".to_string()]
+    }
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+    fn invoke(
+        &mut self,
+        _object: u64,
+        _call: &active_rpc::value::Call,
+    ) -> active_rpc::Result<active_rpc::value::Response> {
+        Ok(active_rpc::value::Response::Value(active_rpc::Value::text(
+            "ok",
+        )))
+    }
+}
