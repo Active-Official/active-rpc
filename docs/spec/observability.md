@@ -70,7 +70,7 @@ authority.
 | `batch.dispatched` | `provider`, `detail` | one provider round-trip carrying a batch |
 | `job.completed` | `job`, `lane` | a dispatched job finished |
 | `promise.resolved` | `promise` | a promise settled with a value |
-| `promise.rejected` | `promise`, `code` | a promise settled with an error |
+| `promise.rejected` | `promise`, `code` | a promise settled with an error; the code is an `rpc/...` class, except that a withheld reply is `provider/reply-withheld` (the kernel authors that one, so the tape says what actually happened) |
 | `channel.send` | `channel`, `channel_sequence` | a message was sent |
 | `channel.created` | `channel` | a channel was created |
 | `channel.subscribed` | `lane`, `channel` | a lane gained read access to a channel |

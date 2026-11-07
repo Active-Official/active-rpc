@@ -2633,6 +2633,20 @@ impl Agent {
         if matches!(error, Error::Identity(_)) {
             kernel.metrics.identity_refusals = kernel.metrics.identity_refusals.saturating_add(1);
         }
+        // The same classes the inline recorder in `call_with_origin_payload`
+        // counts: a refusal routed through here must not be invisible in the
+        // metrics an operator reads (R-15 round 3, #3).
+        if let (Error::ToolPolicy(reason), Some(cap_id)) = (error, cap) {
+            kernel.metrics.tool_refusals = kernel.metrics.tool_refusals.saturating_add(1);
+            kernel.push_event(Event::ToolRefused {
+                cap: cap_id,
+                reason: (*reason).to_string(),
+            });
+        }
+        // Backpressure is *not* counted here: `send_inner`/`publish_inner` count
+        // it where the window is found, and both are wrapped by `note_refusal`,
+        // so counting it again would double every full-queue refusal
+        // (R-15 round 3, #3).
         kernel.push_event(Event::CallRefused {
             lane,
             cap,
@@ -4301,12 +4315,13 @@ impl Agent {
         }
         let shape_error = {
             let kernel = self.cell.borrow();
-            let cap_budget = kernel
-                .caps
-                .get(&cap.id())
-                .ok_or(Error::UnknownCapability(cap_token(cap.id())))?
-                .attrs
-                .budget;
+            let Some(cap_budget) = kernel.caps.get(&cap.id()).map(|record| record.attrs.budget)
+            else {
+                drop(kernel);
+                let error = Error::UnknownCapability(cap_token(cap.id()));
+                self.record_refusal(lane, Some(cap.id()), &error);
+                return Err(error);
+            };
             // The lane may be narrower than the capability: gating on the cap
             // alone would let a wide capability hash a value that the lane will
             // refuse (round 6, #4).
@@ -4384,16 +4399,20 @@ impl Agent {
                     return Err(error);
                 }
                 {
-                    let record = kernel
-                        .caps
-                        .get(&cap.id())
-                        .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+                    let record = match kernel.caps.get(&cap.id()) {
+                        Some(record) => record.clone(),
+                        None => {
+                            let error = Error::UnknownCapability(cap_token(cap.id()));
+                            Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                            return Err(error);
+                        }
+                    };
                     if record.revoked {
                         let error = Error::Revoked(cap_token(cap.id()));
                         Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
                         return Err(error);
                     }
-                    match liveness(&kernel, record) {
+                    match liveness(&kernel, &record) {
                         Liveness::Live => {}
                         Liveness::Dead => {
                             kernel.push_event(Event::CapExpired(cap.id()));
@@ -4444,10 +4463,15 @@ impl Agent {
                     // becomes a way past the current ceiling (round 10, #3).
                     let current = match (kernel.caps.get(&cap.id()), kernel.lanes.get(&lane)) {
                         (Some(record), Some(lane_record)) => {
-                            record.attrs.budget.intersect(&lane_record.budget)
+                            Some(record.attrs.budget.intersect(&lane_record.budget))
                         }
-                        (Some(record), None) => record.attrs.budget,
-                        _ => return Err(Error::UnknownCapability(cap_token(cap.id()))),
+                        (Some(record), None) => Some(record.attrs.budget),
+                        _ => None,
+                    };
+                    let Some(current) = current else {
+                        let error = Error::UnknownCapability(cap_token(cap.id()));
+                        Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                        return Err(error);
                     };
                     let over = match kernel.promises.get(&id) {
                         Some(record) => match &record.state {

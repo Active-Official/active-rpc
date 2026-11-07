@@ -472,7 +472,14 @@ pub fn label(text: &str) -> String {
     let budget = MAX_LABEL_BYTES - '…'.len_utf8();
     let mut out = String::with_capacity(MAX_LABEL_BYTES);
     for ch in text.chars() {
-        let piece: String = ch.escape_debug().collect();
+        // `escape_debug` leaves some invisible characters alone (U+2800, the
+        // Hangul fillers), so anything the crate's own rule flags is rendered as
+        // an explicit escape (R-15 round 3, #2).
+        let piece: String = if ch.is_control() || crate::security::is_invisible_or_reordering(ch) {
+            format!("\\u{{{:x}}}", ch as u32)
+        } else {
+            ch.escape_debug().collect()
+        };
         if out.len() + piece.len() > budget {
             out.push('…');
             return out;

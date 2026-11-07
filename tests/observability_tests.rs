@@ -434,3 +434,28 @@ fn a_label_escapes_invisible_and_reordering_characters() {
         assert!(!label.contains(hostile), "raw {hostile:?} in {label:?}");
     }
 }
+
+/// `label` escapes every character the crate's invisibility rule flags, not only
+/// the ones `escape_debug` happens to handle: a braille blank or a Hangul filler
+/// is invisible in a terminal too (R-15 round 3, #2).
+#[test]
+fn a_label_escapes_every_invisible_character() {
+    for raw in ["\u{2800}", "\u{115f}", "\u{ffa0}", "\u{202e}"] {
+        let text = format!("a{raw}b");
+        let escaped = active_rpc::observability::label(&text);
+        assert!(!escaped.contains(raw), "{raw:?} survived as {escaped:?}");
+        assert!(
+            escaped.contains("\\u{"),
+            "the escape is explicit: {escaped:?}"
+        );
+        assert!(
+            escaped.starts_with('a'),
+            "the visible text stays: {escaped:?}"
+        );
+    }
+    // A plain ASCII label is unchanged, which is the fast path.
+    assert_eq!(
+        active_rpc::observability::label("rpc/revoked"),
+        "rpc/revoked"
+    );
+}
