@@ -728,8 +728,20 @@ impl ProviderFacts {
 /// caught panic would leave `dispatching` set and the provider removed, so
 /// every later `run()` would be a no-op and queued work would never settle.
 fn deliver_pending_drops(cell: &KernelCell) {
+    /// Puts an entry and the entries after it back on the queue.
+    fn requeue(
+        cell: &KernelCell,
+        entry: (ProviderId, u64, CapId),
+        rest: std::collections::VecDeque<(ProviderId, u64, CapId)>,
+    ) {
+        if let Ok(mut kernel) = cell.try_borrow_mut() {
+            kernel.deferred_drops.push(entry);
+            kernel.deferred_drops.extend(rest);
+        }
+    }
+
     for _ in 0..65_536 {
-        let pending: Vec<(ProviderId, u64, CapId)> = {
+        let mut pending: std::collections::VecDeque<(ProviderId, u64, CapId)> = {
             let Ok(mut kernel) = cell.try_borrow_mut() else {
                 return;
             };
@@ -738,35 +750,38 @@ fn deliver_pending_drops(cell: &KernelCell) {
                 // flushes when it is done.
                 return;
             }
-            std::mem::take(&mut kernel.deferred_drops)
+            std::mem::take(&mut kernel.deferred_drops).into()
         };
         if pending.is_empty() {
             return;
         }
         let mut requeued = 0usize;
-        for (provider_id, object, cap) in pending {
-            let already_delivering = match cell.try_borrow_mut() {
+        while let Some(entry) = pending.pop_front() {
+            let (provider_id, object, cap) = entry;
+            // Take the marker before the provider: an early return must not
+            // leave a provider marked as delivering for ever (that wedged it)
+            // and must not abandon the entries after this one (R-17 round 6,
+            // N-2).
+            let marked_here = match cell.try_borrow_mut() {
                 Ok(mut kernel) => {
                     if kernel.delivering.contains(&provider_id) {
-                        true
+                        false
                     } else {
                         kernel.delivering.insert(provider_id);
-                        false
+                        true
                     }
                 }
                 Err(_) => {
-                    if let Ok(mut kernel) = cell.try_borrow_mut() {
-                        kernel.deferred_drops.push((provider_id, object, cap));
-                    }
+                    requeue(cell, entry, pending);
                     return;
                 }
             };
-            if already_delivering {
+            if !marked_here {
                 // A drop raised from inside this provider's own `on_drop`. The
                 // provider is not in the registry while its callback runs, so
                 // the entry waits for the outer delivery to finish.
                 if let Ok(mut kernel) = cell.try_borrow_mut() {
-                    kernel.deferred_drops.push((provider_id, object, cap));
+                    kernel.deferred_drops.push(entry);
                 }
                 requeued += 1;
                 continue;
@@ -774,11 +789,10 @@ fn deliver_pending_drops(cell: &KernelCell) {
             let provider = match cell.try_borrow_mut() {
                 Ok(mut kernel) => kernel.providers.remove(&provider_id),
                 Err(_) => {
-                    // Put the entry back: it was already taken out of the
-                    // queue, and losing it would strand the notification.
                     if let Ok(mut kernel) = cell.try_borrow_mut() {
-                        kernel.deferred_drops.push((provider_id, object, cap));
+                        kernel.delivering.remove(&provider_id);
                     }
+                    requeue(cell, entry, pending);
                     return;
                 }
             };
@@ -808,6 +822,9 @@ fn deliver_pending_drops(cell: &KernelCell) {
                 // The callback may have dropped handles, which queue more work.
                 kernel.apply_deferred_refops();
             } else {
+                // A provider that kept a `Ref` alive across `on_drop` owns this
+                // borrow conflict; the registry cannot take the provider back
+                // until it releases, and there is no queue to wait on here.
                 return;
             }
         }
@@ -1225,11 +1242,6 @@ impl Agent {
             .get(&record.provider)
             .map(|facts| facts.name.clone())
             .ok_or_else(|| Error::persistence("the provider is no longer registered"))?;
-        // Restore resolves a provider by name, so a record naming one of two
-        // providers is a credential no kernel can spend. Refuse before the
-        // reserve, like every other record that cannot be built (R-17 round 4,
-        // #5).
-
         // Restore resolves a provider by name, so a record naming one of two
         // providers is a credential no kernel can spend. Refuse before the
         // reserve, like every other record that cannot be built (R-17 round 4,
@@ -1729,7 +1741,7 @@ impl Agent {
         }
         check_method_names(&attrs)?;
         let mut kernel = self.cell.borrow_mut();
-        // `facts` is the registry, exactly as in `mint` (R-17 round 4, #7).
+        // `facts` is the registry, as in `Agent::mint` (R-17 round 4, #7).
         if !kernel.facts.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
         }
@@ -1815,7 +1827,7 @@ impl Agent {
             return Err(Error::Escalation("capability chain is too deep"));
         }
         let mut kernel = self.cell.borrow_mut();
-        // `facts` is the registry, exactly as in `mint` (R-17 round 4, #7).
+        // `facts` is the registry, as in `Agent::mint` (R-17 round 4, #7).
         if !kernel.facts.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
         }
@@ -5004,11 +5016,16 @@ impl Agent {
             }
             Err(_) => {
                 // The guard restored the provider before this point; the tape
-                // says why it briefly vanished (R-17 round 5, L-2).
-                self.cell.borrow_mut().push_event(Event::ProviderPanicked {
-                    provider,
-                    phase: "take_drop_notifications".to_string(),
-                });
+                // says why it briefly vanished (R-17 round 5, L-2). The borrow
+                // is `try_`, like every other guard here: this path exists to
+                // contain a provider panic and must not unwind itself
+                // (R-17 round 6, N-3).
+                if let Ok(mut kernel) = self.cell.try_borrow_mut() {
+                    kernel.push_event(Event::ProviderPanicked {
+                        provider,
+                        phase: "take_drop_notifications".to_string(),
+                    });
+                }
                 Vec::new()
             }
         }

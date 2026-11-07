@@ -79,6 +79,14 @@ struct ModuleSlot {
     /// and every "does this module hold a secret" decision uses it
     /// (round 27, critical).
     redactor: active_infinity::interop::Redactor,
+    /// Whether the module holds secret material of any kind: a `Secret` node
+    /// (the redactor's literal set) or a tainted blob, whose address is
+    /// secret-derived (R-16 round 10, Finding 1).
+    ///
+    /// Sticky: a patch that removes the last secret keeps the flag, exactly as
+    /// the install-time redactor stays, so a module cannot declassify itself by
+    /// removing the node that made it secret.
+    held_secret: bool,
 }
 
 /// A provider that serves domain operations on Infinity modules.
@@ -133,6 +141,7 @@ impl ModuleProvider {
             .map_err(|error| Error::Payload(error.code().to_string()))?;
         check_names(&module)?;
         let redactor = security::redactor_for(&module);
+        let held_secret = !redactor.is_empty() || security::module_holds_secret(&module);
         let walk_weight = walk_weight(&module);
         Ok(self.install_slot(ModuleSlot {
             module,
@@ -140,6 +149,7 @@ impl ModuleProvider {
             walk_weight,
             redacted_hash: None,
             redactor,
+            held_secret,
         }))
     }
 
@@ -158,6 +168,7 @@ impl ModuleProvider {
         let hash = active_infinity::content_hash(bytes)
             .map_err(|error| Error::Payload(error.code().to_string()))?;
         let redactor = security::redactor_for(&module);
+        let held_secret = !redactor.is_empty() || security::module_holds_secret(&module);
         let walk_weight = walk_weight(&module);
         Ok(self.install_slot(ModuleSlot {
             module,
@@ -165,6 +176,7 @@ impl ModuleProvider {
             walk_weight,
             redacted_hash: None,
             redactor,
+            held_secret,
         }))
     }
 
@@ -394,7 +406,7 @@ impl ModuleProvider {
                 // A secret-bearing module carries a raw content address in its
                 // provenance; that is an offline oracle, so the cone drops it
                 // for every capability (round 13, H2).
-                let holds_secret = !slot.redactor.is_empty();
+                let holds_secret = slot.held_secret;
                 if call.redact || holds_secret {
                     // A redacting cone is data only: provenance (producer,
                     // entries and the parent content address) describes the
@@ -498,7 +510,7 @@ impl ModuleProvider {
                     // The producer chain survives: the new module records the
                     // old content address as its parent and keeps the entries
                     // (and the identities) the module already carried.
-                    let held_secret = !slot.redactor.is_empty();
+                    let held_secret = slot.held_secret;
                     let previous = patched.provenance().cloned();
                     patched.set_provenance(Some(Provenance {
                         producer: previous
@@ -538,8 +550,7 @@ impl ModuleProvider {
                     security::redact_derived(&mut cone, &slot.redactor).map_err(redaction_fault)?;
                     // The provenance names the pre-patch image, so the
                     // pre-patch secret set decides too (round 14, H1).
-                    let holds_secret = !slot.redactor.is_empty()
-                        || patched.nodes().iter().any(|node| node.is_secret());
+                    let holds_secret = slot.held_secret || security::module_holds_secret(&patched);
                     if call.redact {
                         // The provenance records the parent's content address,
                         // and a redacting caller may not receive a hash of an
@@ -588,6 +599,10 @@ impl ModuleProvider {
                 let hash = active_infinity::content_hash(&canonical)
                     .map_err(|error| Error::Payload(error.code().to_string()))?;
                 let weight = walk_weight(&decoded);
+                // Sticky: the pre-patch module may have held secret material the
+                // patch removed, and its addresses are still what the new
+                // provenance names (R-16 round 10, Finding 1).
+                slot.held_secret |= security::module_holds_secret(&decoded);
                 slot.module = decoded;
                 slot.hash = Some(hash);
                 slot.walk_weight = weight;
@@ -685,7 +700,7 @@ impl ModuleProvider {
                 // low-entropy secret even for a caller that cannot read the
                 // bytes. The redacted hash still proves structural identity
                 // (round 12, F4).
-                let holds_secret = !slot.redactor.is_empty();
+                let holds_secret = slot.held_secret;
                 // Fill the slot cache first: it holds the raw canonical hash,
                 // which is the module's identity and the parent of a later
                 // patch. The answer below may be the redacted one.
@@ -700,6 +715,17 @@ impl ModuleProvider {
                         hash
                     }
                 };
+                if !holds_secret {
+                    // Nothing to redact: the redacted projection is the module
+                    // itself, so the answer is the stored hash -- including a
+                    // streamed image, which a re-encode would not reproduce
+                    // (R-16 round 10, Finding 3).
+                    check_wall_budget(started, call)?;
+                    return Ok(Response::Value(Value::Text(format!(
+                        "blake3:{}",
+                        hex32(&hash)
+                    ))));
+                }
                 if call.redact || holds_secret {
                     // A module that holds a secret is hashed in redacted form
                     // for every capability: the raw hash covers the secret heap
@@ -730,7 +756,7 @@ impl ModuleProvider {
                             }
                             // A tainted blob's hash is secret-derived whatever
                             // the module's provenance says (round 9, F-2).
-                            crate::security::erase_tainted_blob_addresses(&mut redacted);
+                            crate::security::sanitize_tainted_blobs(&mut redacted);
                             let redacted_bytes = encode(&redacted).map_err(|error| {
                                 redaction_fault(Error::Payload(error.code().to_string()))
                             })?;
@@ -783,14 +809,14 @@ impl ModuleProvider {
                     let live = module
                         .nodes()
                         .iter()
-                        .filter(|node| node.is_secret())
+                        .filter(|node| node.is_secret() || security::is_tainted_blob(node))
                         .count() as i64;
                     // The install-time redactor still hides literals after a
                     // patch removed the last secret node, so `0` would
                     // contradict every other method (round 30, L-6). A
                     // non-redacting caller may know the count; it may not learn
                     // "zero" when the module is treated as secret-bearing.
-                    let reported = if live == 0 && !slot.redactor.is_empty() {
+                    let reported = if live == 0 && slot.held_secret {
                         1
                     } else {
                         live
@@ -858,7 +884,7 @@ impl ModuleProvider {
                 // A raw content address over the secret heap is an offline
                 // oracle, so a secret-bearing module hides it from every
                 // capability, exactly like `content_hash` (round 13, H2).
-                let holds_secret = !slot.redactor.is_empty();
+                let holds_secret = slot.held_secret;
                 Ok(match slot.module.provenance() {
                     None => {
                         // Every arm charges the ceiling; this one returned
@@ -1789,7 +1815,7 @@ fn tainted_nodes(module: &InfinityModule) -> BTreeSet<NodeId> {
     let mut tainted = vec![false; count];
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     for (index, node) in module.nodes().iter().enumerate() {
-        if node.is_secret() {
+        if node.is_secret() || security::is_tainted_blob(node) {
             tainted[index] = true;
             queue.push_back(index);
         }
@@ -1892,7 +1918,7 @@ fn evaluate_for_caller(
     // A redacting capability and a plain one therefore see the same structure;
     // the marker is content-free for both, and `VALUE_MARKER` maps it back to
     // `Value::Secret` so the caller can tell it from data.
-    if redactor.is_empty() {
+    if redactor.is_empty() && !security::module_holds_secret(module) {
         return active_infinity::interop::evaluate(module, budget);
     }
     // The placeholder is not always `***SECRET***`: when a secret is a

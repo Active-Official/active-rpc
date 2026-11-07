@@ -43,8 +43,18 @@ pub const MESSAGE_OVERHEAD: u64 = std::mem::size_of::<Message>() as u64;
 /// Bytes one queued message is charged: its record, payload, transferred ids
 /// and topic name.
 fn queued_size(payload: &Value, caps: &[CapId], topic: Option<&str>) -> u64 {
+    // The wire size is not the memory size: the queue stores one `Value` per
+    // node, 32 bytes inline, while a null costs one wire byte. Charging only
+    // the wire image let a null-heavy message hold 32x what its ceiling said
+    // (R-17 round 6, N-1).
+    let shape = payload.shape();
     MESSAGE_OVERHEAD
-        .saturating_add(payload.wire_size())
+        .saturating_add(shape.size)
+        .saturating_add(
+            shape
+                .nodes
+                .saturating_mul(std::mem::size_of::<Value>() as u64),
+        )
         .saturating_add((caps.len() as u64).saturating_mul(16))
         .saturating_add(topic.map_or(0, |name| name.len() as u64))
 }
@@ -349,11 +359,14 @@ impl Channel {
                 self.received += 1;
                 let bytes = queued_size(&message.payload, &message.caps, message.topic.as_deref());
                 self.queued_bytes = self.queued_bytes.saturating_sub(bytes);
-                if self.queue.is_empty() {
-                    // A drained channel must not keep the records' allocation: with
-                    // 4 096 channels that is ~1.6 GiB resident while both counters
-                    // read zero (R-17 round 5, L-4).
-                    self.queue.shrink_to_fit();
+                if self.queue.is_empty() && self.queue.capacity() > 64 {
+                    // A drained channel must not keep a large allocation: with
+                    // 4 096 channels that is ~1.6 GiB resident while both
+                    // counters read zero (R-17 round 5, L-4). A fresh small
+                    // buffer releases it without churning the allocator on a
+                    // request/response channel (round 6 residual; `shrink_to`
+                    // left the old allocation in place for this capacity).
+                    self.queue = std::collections::VecDeque::with_capacity(64);
                 }
                 Ok(Some(message))
             }

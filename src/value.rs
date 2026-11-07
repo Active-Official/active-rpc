@@ -323,6 +323,7 @@ impl Value {
         while let Some(item) = work.pop() {
             match item {
                 Work::Visit(value, depth) => {
+                    shape.nodes = shape.nodes.saturating_add(1);
                     let scalar = match value {
                         Value::Null | Value::Secret => Some(1u64),
                         Value::Bool(_) => Some(2),
@@ -421,6 +422,12 @@ pub struct Shape {
     pub widest: u64,
     /// Bytes the value occupies on the wire, matching [`Value::wire_size`].
     pub size: u64,
+    /// Values in the tree, every scalar and every container counted once.
+    ///
+    /// A queued value is not its wire image: the kernel stores one `Value`
+    /// (32 bytes inline) per node, so a channel's memory ceiling must charge
+    /// this as well as `size` (R-17 round 6, N-1).
+    pub nodes: u64,
 }
 
 /// One call argument.

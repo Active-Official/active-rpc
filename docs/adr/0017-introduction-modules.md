@@ -53,8 +53,9 @@ Table {
   tie, and a durable record that names that provider stays unrestorable because
   a name no longer identifies one instance (R-17 round 4).
 - **Names are validated.** A peer, provider or method name is 1..=1024 bytes and
-  free of control characters, at the same boundary as a capability method name:
-  every one of them reaches a module, a fingerprint and a log line.
+  free of control, invisible and reordering characters (U+2028/U+2029, bidi
+  controls, zero-width and tag characters), at the same boundary as a capability
+  method name: every one of them reaches a module, a fingerprint and a log line.
 - **The binding is one-way for the recipient, and revocable by the owner.**
   `introduce_to` writes `bound_to` into the live records of the subtree,
   including the root, so after an introduction the local kernel can no longer

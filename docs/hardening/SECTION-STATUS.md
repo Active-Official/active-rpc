@@ -27,8 +27,8 @@ Updated 2026-11-06 at `cf5f969`.
 | R-13 | receipts | 11 | open | r10's high and two mediums fixed at `68f29ab` (ownership re-checked before every mutation, future timestamps, type-checked readers); its five lows fixed in round 11; r11's audit must come back clean, then r12 |
 | R-14 | wasm tools | 5 | **closed** | r3's medium was refuted with a test; r4 and r5 CLEAN |
 | R-15 | observability | 5 | **closed** | r2's high and mediums fixed; r4 and r5 CLEAN |
-| R-16 | security helpers | 9 | open | r9 found two mediums the round-8 fix introduced or left (the secret-free digest over-reach, the tainted blob address) and five lows, all fixed or recorded; r10 and r11 must be clean |
-| R-17 | introduction / topics | 5 | open | r5 CLEAN (no critical/high/medium), six lows fixed (drain flush and panic containment, record-bytes docs, queue shrink, one provider-name bound, receive refusals recorded); r6 must be clean to close |
+| R-16 | security helpers | 10 | open | r10 found one high (a tainted-blob-only module was secret-free to every domain projection) and the taint-set medium, all fixed with the sticky `held_secret` predicate; r11 and r12 must be clean |
+| R-17 | introduction / topics | 6 | open | r6 found one medium (the channel counters charged wire bytes, not the 32-byte inline values) and four lows, all fixed; r7 and r8 must be clean |
 | R-18 | CLI | 2 | open | r2 had one high and eight mediums, all fixed; r3 and r4 needed |
 | R-19 | control plane | 2 | open | r2 had two highs and six mediums, all fixed; r3 and r4 needed |
 | R-20 | fuzz program | 2 | open | r2 had three highs and three mediums, all fixed; r3 and r4 needed |

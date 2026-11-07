@@ -446,7 +446,8 @@ transport must preserve when it forwards one:
   the characters that reorder or hide rendered text (U+2028/U+2029, bidi
   controls, zero-width and tag characters), checked at the grant, at publish and
   inside `Channel` itself. A channel name follows the 128-byte object rule; a
-  provider name follows the introduction's 1..=1024-byte rule.
+  provider name follows the introduction's 1..=1024-byte bound and its character
+  rule (no control, invisible or reordering characters).
 - **A bound capability needs its peer.** A capability bound with `mint_bound`
   publishes only through `Agent::publish_as`, and the presented peer fingerprint
   must match the binding (`rpc/identity`). A channel cannot prove who published,

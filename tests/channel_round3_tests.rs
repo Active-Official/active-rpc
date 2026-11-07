@@ -9,7 +9,8 @@
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::channel::{
-    Channel, ChannelId, Direction, Message, MAX_QUEUED_PER_CHANNEL, MESSAGE_OVERHEAD,
+    Channel, ChannelId, Direction, Message, MAX_QUEUED_BYTES, MAX_QUEUED_PER_CHANNEL,
+    MESSAGE_OVERHEAD,
 };
 use active_rpc::kernel::{Provider, MAX_CHANNELS, MAX_QUEUED_CHANNEL_BYTES};
 use active_rpc::lane::LaneId;
@@ -69,6 +70,56 @@ fn the_kernel_byte_ceiling_binds_before_the_structural_worst_case() {
         "the global channel ceiling ({MAX_QUEUED_CHANNEL_BYTES} bytes) must bind \
          before {worst_case} record bytes"
     );
+}
+
+/// A record's charge is its memory, not its wire image: a null costs one wire
+/// byte and 32 bytes inline, so a null-heavy message must pay the difference
+/// (R-17 round 6, N-1).
+#[test]
+fn a_null_heavy_record_is_charged_the_memory_it_holds() {
+    let value = Value::List(
+        (0..100)
+            .map(|_| Value::List(vec![Value::Null; 1_000]))
+            .collect(),
+    );
+    let nodes = 100u64 * 1_000 + 100 + 1;
+    let charged = Channel::message_bytes(&value, &[], None);
+    assert!(
+        charged >= nodes.saturating_mul(std::mem::size_of::<Value>() as u64),
+        "the record's inline values are not charged: {charged} for {nodes} nodes"
+    );
+
+    // A record whose wire image fits a channel but whose memory does not is
+    // refused before anything is queued.
+    let agent = Agent::with_secret([0x56; 32]);
+    let channel = agent
+        .create_channel("nulls", Direction::Both)
+        .expect("channel");
+    let lane = agent
+        .create_lane(
+            "nulls",
+            Budget {
+                max_value_size: u64::MAX,
+                max_bytes: u64::MAX,
+                ..Budget::default()
+            },
+        )
+        .expect("lane");
+    agent.subscribe(lane, channel).expect("subscribe");
+    let heavy = Value::List(
+        (0..21)
+            .map(|_| Value::List(vec![Value::Null; 100_000]))
+            .collect(),
+    );
+    assert!(
+        heavy.wire_size() < MAX_QUEUED_BYTES,
+        "the wire image fits, the memory does not"
+    );
+    let error = agent
+        .send(lane, channel, heavy, &[])
+        .expect_err("the record's memory exceeds the channel ceiling");
+    assert_eq!(error.code(), "rpc/backpressure", "{error}");
+    assert_eq!(agent.queued_channel_bytes(), 0, "nothing was queued");
 }
 
 /// The kernel-wide counter adds and subtracts the same quantity, so a send,

@@ -299,7 +299,7 @@ pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut module = active_infinity::decode(&redacted)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     module.set_provenance(None);
-    erase_tainted_blob_addresses(&mut module);
+    sanitize_tainted_blobs(&mut module);
 
     let redacted = active_infinity::encode(&module)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
@@ -333,7 +333,7 @@ pub fn redact_derived(
     // The library redacts a tainted blob's media type, not its content
     // address; a cone or a patched reply is still a projection that leaves the
     // kernel (R-16 round 9, F-2).
-    erase_tainted_blob_addresses(module);
+    sanitize_tainted_blobs(module);
     Ok(())
 }
 
@@ -379,7 +379,7 @@ fn inspect_module(bytes: &[u8]) -> ModuleKind {
 /// A `Secret`/`SecretRef` node is the obvious case. A **tainted blob** is the
 /// other: its bytes are secret-derived and its `hash` is a content address over
 /// them, which the codec keeps through redaction (R-16 round 9, F-2).
-fn module_holds_secret(module: &active_infinity::InfinityModule) -> bool {
+pub(crate) fn module_holds_secret(module: &active_infinity::InfinityModule) -> bool {
     (0..module.node_count()).any(|index| {
         module
             .get(active_infinity::NodeId(index as u32))
@@ -389,27 +389,58 @@ fn module_holds_secret(module: &active_infinity::InfinityModule) -> bool {
     })
 }
 
-fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
+pub(crate) fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
     matches!(node, active_infinity::Inode::Blob { tainted: true, .. })
 }
 
-/// Zero the content address of every tainted blob.
+/// Strip every secret-derived field from a tainted blob in a projection.
 ///
-/// A tainted blob's hash is `blake3(secret bytes)` by definition, and the
-/// library's redactor rewrites only its media type: leaving the hash in a
-/// projection hands the caller an offline equality oracle (R-16 round 9, F-2).
-pub(crate) fn erase_tainted_blob_addresses(module: &mut active_infinity::InfinityModule) {
-    for index in 0..module.node_count() {
-        let Ok(node) = module.node_mut(active_infinity::NodeId(index as u32)) else {
+/// A tainted blob's hash is `blake3(secret bytes)` and its size is a length
+/// signal; the library's redactor rewrites only the media type. The projection
+/// therefore drops the address, the size and any payload, plus every annotation
+/// that names the node, and clears the taint flag: what remains carries no
+/// secret-derived material, so a non-redacting caller can receive it
+/// (R-16 rounds 9-10).
+pub(crate) fn sanitize_tainted_blobs(module: &mut active_infinity::InfinityModule) {
+    let doomed: Vec<active_infinity::NodeId> = (0..module.node_count())
+        .filter(|index| {
+            module
+                .get(active_infinity::NodeId(*index as u32))
+                .is_some_and(is_tainted_blob)
+        })
+        .map(|index| active_infinity::NodeId(index as u32))
+        .collect();
+    if doomed.is_empty() {
+        return;
+    }
+    // An annotation is free text about its subject: one that names the blob may
+    // carry the address the fields no longer do (R-16 round 10, Finding 2).
+    let kept: Vec<active_infinity::Annotation> = module
+        .annotations()
+        .iter()
+        .filter(|annotation| !doomed.contains(&annotation.node))
+        .cloned()
+        .collect();
+    module.clear_annotations();
+    for annotation in kept {
+        module.annotate(annotation.node, annotation.kind);
+    }
+    for id in doomed {
+        let Ok(node) = module.node_mut(id) else {
             continue;
         };
         if let active_infinity::Inode::Blob {
             hash,
-            tainted: true,
+            size,
+            tainted,
+            payload,
             ..
         } = node
         {
             *hash = [0u8; 32];
+            *size = 0;
+            *payload = None;
+            *tainted = false;
         }
     }
 }

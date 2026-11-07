@@ -109,10 +109,15 @@ fn a_publish_refused_on_a_full_channel_charges_nothing() {
         )
         .expect("lane");
     // Fill the channel to its byte ceiling with one message.
-    // A text value costs its tag, a length prefix and its bytes, and the queue
-    // charges the message record too (R-17 round 3): the message fills the
-    // channel exactly.
-    let filler = Value::text("x".repeat(MAX_QUEUED_BYTES as usize - 5 - MESSAGE_OVERHEAD as usize));
+    // A text value costs its tag, a length prefix and its bytes; the queue
+    // charges the message record and the value's inline node too (R-17 rounds
+    // 3 and 6): the message fills the channel exactly.
+    let filler = Value::text("x".repeat(
+        MAX_QUEUED_BYTES as usize
+            - 5
+            - MESSAGE_OVERHEAD as usize
+            - std::mem::size_of::<Value>() as usize,
+    ));
     agent
         .send(lane, channel, filler, &[])
         .expect("the ceiling itself fits");

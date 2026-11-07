@@ -29,8 +29,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-13 | receipts | `src/receipts.rs` | rounds 1-11: round 10's high and two mediums fixed at `68f29ab`, its five lows fixed in round 11; r11's re-audit is owed | 59 fixed / 0 rejected / 1 residual (the check-then-open race needs a unix `O_NOFOLLOW`) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-9: r9 found two mediums (the secret-free digest over-reach, the tainted blob address) and five lows, all fixed or recorded; r10 and r11 must be clean | 38 fixed / 0 rejected / 4 noted (no store wired by default; virtual-epoch deadline; opaque module bytes; `hiding_placeholder`) | this commit |
-| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs` | rounds 1-5: r5 CLEAN (no critical/high/medium), six lows fixed; r6 must be clean to close | 46 fixed / 0 rejected / 0 open (6 residuals recorded) | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-10: r10 found one high (a tainted-blob-only module was treated as secret-free in every domain projection) and the taint-set medium, all fixed; r11 and r12 must be clean | 42 fixed / 0 rejected / 4 noted | this commit |
+| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs` | rounds 1-6: r6 found one medium (the per-node memory charge) and four lows, all fixed; r7 and r8 must be clean to close | 51 fixed / 0 rejected / 0 open (7 residuals recorded) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
 | R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
@@ -49,6 +49,46 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-17 introduction and topics - 2026-11-06 (round 6)
+
+Reviewer: DeepSeek (`deepseek-flash`) through the direct API, `xhigh`, read-only
+at `a53175f`. All five round-5 dispositions held (the drop flush, the docs, the
+shrink, the one name bound, the recorded receive refusals). Verdict **NOT CLEAN**:
+one medium and three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| N-1 | medium | the channel counters charged the *wire* size per node (one byte for `Null`) while the queue stores one `Value` per node inline (32 bytes), so a null-heavy message held ~32x what its ceiling said | **fixed**: `Shape` gained `nodes` (one walk, no extra pass) and `queued_size` charges `nodes * size_of::<Value>()` plus the wire image; `channel_round3_tests::a_null_heavy_record_is_charged_the_memory_it_holds` pins both the arithmetic and a kernel send refused by the per-channel ceiling. Negative control: dropping the node term fails it |
+| N-2 | low | `deliver_pending_drops` took the whole queue and its early returns abandoned the tail, left `delivering` set (wedging the provider) and could drop a provider while `facts` still advertised it | **fixed**: a deque with a `requeue` helper puts the current entry and the tail back on every exit, every path clears the marker it set, and the provider is reinserted before the conflict return |
+| N-3 | low | `take_drops`' panic path used `borrow_mut`, so the function that contains a provider panic could unwind itself | **fixed**: `try_borrow_mut`; a lost event is better than a lost answer |
+| N-4 | low | both normative docs under-stated the name rule (control characters only) | **fixed**: ADR-0017 and `wire.md` name the invisible and reordering characters too |
+| N-5 | low (nits) | a five-line comment block was pasted twice; a comment in `mint_bound` referred to itself | **fixed** |
+| - | residual | `shrink_to_fit`/`shrink_to` did not release the drained deque under this capacity | **fixed**: an empty channel above 64 records gets a fresh small `VecDeque`; the live-bytes test still fails without it |
+
+Gate: `scripts/local_gate.sh --no-msrv` green; `cargo test --all-features` green
+on both feature sets; fmt and doc clean. R-17 needs r7 and r8 clean.
+
+### R-16 security helpers - 2026-11-06 (round 10)
+
+Reviewer: DeepSeek (`deepseek-flash`) through the direct API, `xhigh`, read-only
+at `a53175f`. Round-9 F-3, F-4 and F-5 held; **F-1 and F-2 were partial**: the
+domain's "does this module hold a secret" predicate is the literal redactor, not
+`security::module_holds_secret`, so a module whose only secret material is a
+tainted blob was treated as secret-free everywhere. Verdict **NOT CLEAN**: one
+high, one medium and lows; `persistence.rs` CLEAN.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F-1 | high | a tainted-blob-only module has an empty `Redactor`, so `content_hash` returned the raw digest (which covers `blake3(secret)` in the blob), `provenance` returned the parent address, `patch` recorded the raw pre-patch address, and `stats` said zero secrets | **fixed**: `ModuleSlot` carries a sticky `held_secret` (`!redactor.is_empty() || security::module_holds_secret`), set at install and OR-ed after every patch; every projection reads it; `stats` counts tainted blobs; the evaluator only takes the direct path when the module is genuinely secret-free. `security_round10_tests::{a_tainted_blob_only_module_is_not_secret_free, a_patch_cannot_declassify_a_tainted_blob}`. Negative control: restoring `!slot.redactor.is_empty()` fails the digest assertion |
+| F-2 | medium | the domain's taint set was seeded from `is_secret()` only, so an annotation or binding naming a tainted blob survived redaction, and the generic helper dropped neither | **fixed**: the seed includes tainted blobs; `sanitize_tainted_blobs` drops annotations naming the blob and clears its hash, size, payload and taint flag (the projection carries no secret-derived material). `an_annotation_on_a_tainted_blob_is_hidden` |
+| F-3 | low | a streamed secret-free image under a redacting capability got the digest of a non-streamed re-encoding | **fixed**: when `!held_secret`, `content_hash` answers the stored hash directly (the redacted projection is the module). `a_streamed_secret_free_image_keeps_its_address`. Negative control fails without the early return |
+| F-4 | low | the round-9 sanitizer erased only the hash, leaving `size` (a length signal) and any payload | **fixed** by F-2's sanitizer |
+| F-5 | low | the taint-set/metadata carrier was untested | **fixed** by F-2's test |
+| - | residual | `hiding_placeholder` (a secret inside the marker) and a byte bound on the projection walk | **recorded** |
+
+Gate: `scripts/local_gate.sh --no-msrv` green; `cargo test --all-features` green
+on both feature sets; fmt and doc clean. R-16 needs r11 and r12 clean.
 
 ### R-17 introduction and topics - 2026-11-06 (round 5)
 
