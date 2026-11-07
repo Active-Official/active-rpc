@@ -88,10 +88,19 @@ capability id at rest (it is a bearer token).
   A **tainted blob** is secret material too: its bytes are secret-derived and
   its `hash` is `blake3` over them, so a projection drops the address, the size,
   the payload, replaces the media type with the marker and drops every
-  annotation that names it; a text, identifier, env name or field name that
-  quotes the address (in either case) is replaced too. The domain treats a
-  module that holds one as secret-bearing for hashing, provenance, patching and
-  metadata (R-16 rounds 9-13).
+  annotation that names it. Every text carrier is scanned, not a list of them: a
+  string, identifier, env name, table or schema field key, interpolated literal,
+  binding name, constraint or enum member, unit name, patch path, schema type
+  list or blob media type that quotes the address is rewritten in place, in
+  either case and with `-`, `:` or zero-width separators. A second blob with the
+  same identity, a payload that embeds the address and an extension payload that
+  copies it are dropped as well. The address set is sticky on the slot, so a
+  patch that removes the blob cannot declassify a hash an annotation or the
+  provenance still quotes, and the provenance's own text fields are scrubbed.
+  The encoded projection is then re-read and refused (`provider/redaction`) if
+  any address survives in raw or hex form: the field pass is a list, the byte
+  check is not. The domain treats a module that holds one as secret-bearing for
+  hashing, provenance, patching and metadata (R-16 rounds 9-14).
   Bytes that do not claim to be an image are opaque by declaration (a WASM
   guest's binary output,
   a provider's blob): the value model cannot tell them from arbitrary data, so a

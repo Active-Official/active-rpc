@@ -87,6 +87,13 @@ struct ModuleSlot {
     /// the install-time redactor stays, so a module cannot declassify itself by
     /// removing the node that made it secret.
     held_secret: bool,
+    /// Every tainted blob address the slot has ever held.
+    ///
+    /// Sticky with `held_secret`: a patch can replace the blob with an integer,
+    /// and a projection that rebuilt the address set from the post-write module
+    /// would then declassify a hash the reply may still quote
+    /// (R-16 round 14, F2).
+    secret_addresses: BTreeSet<[u8; 32]>,
 }
 
 /// A provider that serves domain operations on Infinity modules.
@@ -143,6 +150,7 @@ impl ModuleProvider {
         let redactor = security::redactor_for(&module);
         let held_secret = !redactor.is_empty() || security::module_holds_secret(&module);
         let walk_weight = walk_weight(&module);
+        let secret_addresses = security::tainted_blob_addresses(&module);
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
@@ -150,6 +158,7 @@ impl ModuleProvider {
             redacted_hash: None,
             redactor,
             held_secret,
+            secret_addresses,
         }))
     }
 
@@ -170,6 +179,7 @@ impl ModuleProvider {
         let redactor = security::redactor_for(&module);
         let held_secret = !redactor.is_empty() || security::module_holds_secret(&module);
         let walk_weight = walk_weight(&module);
+        let secret_addresses = security::tainted_blob_addresses(&module);
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
@@ -177,6 +187,7 @@ impl ModuleProvider {
             redacted_hash: None,
             redactor,
             held_secret,
+            secret_addresses,
         }))
     }
 
@@ -402,8 +413,15 @@ impl ModuleProvider {
                 // secret node with the marker leaves nothing to taint, and the
                 // metadata filter below needs the original cone.
                 let tainted = call.redact.then(|| tainted_nodes(&sub));
-                let own: &[[u8; 32]] = slot.hash.as_slice();
-                security::redact_derived_with(&mut sub, &slot.redactor, own)
+                // The slot's own address is an oracle only with the sticky
+                // secret set, and a secret-free slot must not have its literal
+                // replaced (R-16 round 14, F7).
+                let mut own: Vec<[u8; 32]> = Vec::new();
+                if slot.held_secret {
+                    own.extend(slot.secret_addresses.iter().copied());
+                    own.extend(slot.hash);
+                }
+                security::redact_derived_with(&mut sub, &slot.redactor, &own)
                     .map_err(redaction_fault)?;
                 // A secret-bearing module carries a raw content address in its
                 // provenance; that is an offline oracle, so the cone drops it
@@ -549,8 +567,12 @@ impl ModuleProvider {
                     // As in `subgraph`: the reply is a projection, and a copy of
                     // a secret literal in the cone is still the secret.
                     let tainted = call.redact.then(|| tainted_nodes(&cone));
-                    let own: &[[u8; 32]] = parent_hash.as_slice();
-                    security::redact_derived_with(&mut cone, &slot.redactor, own)
+                    let mut own: Vec<[u8; 32]> = Vec::new();
+                    if slot.held_secret || security::module_holds_secret(&patched) {
+                        own.extend(slot.secret_addresses.iter().copied());
+                        own.extend(parent_hash);
+                    }
+                    security::redact_derived_with(&mut cone, &slot.redactor, &own)
                         .map_err(redaction_fault)?;
                     // The provenance names the pre-patch image, so the
                     // pre-patch secret set decides too (round 14, H1).
@@ -607,6 +629,8 @@ impl ModuleProvider {
                 // patch removed, and its addresses are still what the new
                 // provenance names (R-16 round 10, Finding 1).
                 slot.held_secret |= security::module_holds_secret(&decoded);
+                slot.secret_addresses
+                    .extend(security::tainted_blob_addresses(&decoded));
                 slot.module = decoded;
                 slot.hash = Some(hash);
                 slot.walk_weight = weight;
@@ -760,8 +784,10 @@ impl ModuleProvider {
                             }
                             // A tainted blob's hash is secret-derived whatever
                             // the module's provenance says (round 9, F-2).
-                            let extra: &[[u8; 32]] = slot.hash.as_slice();
-                            crate::security::sanitize_tainted_blobs(&mut redacted, extra);
+                            let mut extra: Vec<[u8; 32]> =
+                                slot.secret_addresses.iter().copied().collect();
+                            extra.extend(slot.hash);
+                            crate::security::sanitize_tainted_blobs(&mut redacted, &extra);
                             let redacted_bytes = encode(&redacted).map_err(|error| {
                                 redaction_fault(Error::Payload(error.code().to_string()))
                             })?;
@@ -844,9 +870,22 @@ impl ModuleProvider {
                 // annotation that names it -- as its subject, or with the hex
                 // address in its text -- is hidden from every capability, not
                 // only a redacting one (R-16 round 11, Findings 1 and 4).
+                // The scan below is linear in the metadata text, so a grant
+                // that has already spent its wall budget refuses before any of
+                // the walks start (R-16 round 14, F10).
+                check_wall_budget(started, call)?;
                 let mut tainted_ids: BTreeSet<NodeId> = BTreeSet::new();
                 let mut hidden_addresses: BTreeSet<[u8; 64]> = BTreeSet::new();
                 if slot.held_secret {
+                    // Sticky: a patch may have removed the blob whose address
+                    // an annotation still quotes (R-16 round 14, F2).
+                    for address in &slot.secret_addresses {
+                        if let Ok(key) =
+                            <[u8; 64]>::try_from(active_infinity::ir::hash_hex(address).as_bytes())
+                        {
+                            hidden_addresses.insert(key);
+                        }
+                    }
                     for index in 0..module.node_count() {
                         let id = NodeId(index as u32);
                         if module.get(id).is_some_and(security::is_tainted_blob) {
@@ -865,10 +904,6 @@ impl ModuleProvider {
                 if call.redact {
                     tainted_ids.extend(tainted_nodes(module));
                 }
-                // The scan below is linear in the metadata text, so a grant
-                // that has already spent its wall budget refuses before it
-                // starts (R-16 round 13, F4).
-                check_wall_budget(started, call)?;
                 let mut out = Vec::new();
                 let mut hidden_seen = false;
                 for annotation in module.annotations() {
@@ -933,10 +968,32 @@ impl ModuleProvider {
                             // Every content address is an oracle over an image
                             // the caller may not read: the parent, and the
                             // `Input` lineage entries a patch carries forward
-                            // (round 7 #2, round 8 #2).
-                            map.retain(|_, value| {
-                                !matches!(value, Value::Text(text) if text.contains("blake3:"))
-                            });
+                            // (round 7 #2, round 8 #2). A bare-hex address in a
+                            // producer string, a tool name or an entry key is
+                            // the same oracle, so every text value and key is
+                            // scrubbed, not only one carrying the prefix
+                            // (R-16 round 14, F3).
+                            let mut addresses: Vec<[u8; 32]> =
+                                slot.secret_addresses.iter().copied().collect();
+                            if holds_secret {
+                                addresses.extend(slot.hash);
+                            }
+                            let mut scrubbed = std::collections::BTreeMap::new();
+                            for (key, value) in map {
+                                if security::text_names_any_address(&key, &addresses) {
+                                    continue;
+                                }
+                                let key = security::scrub_any_addresses(&key, &addresses);
+                                let value = match value {
+                                    Value::Text(text) if text.contains("blake3:") => continue,
+                                    Value::Text(text) => Value::Text(
+                                        security::scrub_any_addresses(&text, &addresses),
+                                    ),
+                                    other => other,
+                                };
+                                scrubbed.insert(key, value);
+                            }
+                            map = scrubbed;
                         }
                         let timestamp = i64::try_from(prov.timestamp_ms).unwrap_or(i64::MAX);
                         map.insert("timestamp_ms".to_string(), Value::Int(timestamp));
@@ -2348,6 +2405,16 @@ mod evaluator_fault_tests {
         let error = evaluator_fault(&active_infinity::Error::Encode("duplicate key"));
         assert_eq!(error.code(), "rpc/domain", "{error}");
         assert!(error.to_string().contains("active/encode"), "{error}");
+    }
+
+    /// A redaction collision inside the evaluator is the provider's fault, not
+    /// a domain fault: the caller is told the reply was withheld because it
+    /// could not be redacted (R-16 round 14, F8; R-16 round 13, F5).
+    #[test]
+    fn an_evaluator_redaction_failure_is_the_providers_fault() {
+        let error = evaluator_fault(&active_infinity::Error::Encode("redaction"));
+        assert_eq!(error.code(), "rpc/provider", "{error}");
+        assert!(error.to_string().contains("provider/redaction"), "{error}");
     }
 
     #[test]

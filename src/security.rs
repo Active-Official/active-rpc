@@ -304,12 +304,75 @@ pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     module.set_provenance(None);
     let extra: &[[u8; 32]] = own.as_slice();
-    sanitize_tainted_blobs(&mut module, extra);
+    let addresses = sanitize_tainted_blobs(&mut module, extra);
 
     let redacted = active_infinity::encode(&module)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     check_module_payload(&redacted)?;
+    assert_no_address_bytes(&redacted, &addresses)?;
     Ok(redacted)
+}
+
+/// Refuse a redacted image that still carries one of its own addresses.
+///
+/// The field pass — the library's, then this module's — is a list, and a list
+/// drifts: a new carrier, a payload, an extension or a future `Inode` variant
+/// can hold the address while every arm says it cannot. The encoded bytes are
+/// the one thing the caller receives, so the last check reads them: an address
+/// in raw or hex form means the projection failed closed (R-16 round 14, F1-F4).
+fn assert_no_address_bytes(bytes: &[u8], addresses: &BTreeSet<[u8; 32]>) -> Result<()> {
+    if addresses.is_empty() {
+        return Ok(());
+    }
+    // The encoded image is binary, so a UTF-8 view is not available: the hex
+    // form is searched as bytes, in both cases (R-16 round 14, F1).
+    let mut text_carries = false;
+    for key in address_keys_from_raw(addresses) {
+        let upper: Vec<u8> = key.iter().map(u8::to_ascii_uppercase).collect();
+        let first = key[0];
+        let first_upper = first.to_ascii_uppercase();
+        for (index, byte) in bytes.iter().enumerate() {
+            if (*byte == first || *byte == first_upper) && bytes.len() - index >= 64 {
+                let window = &bytes[index..index + 64];
+                if window == key.as_slice() || window == upper.as_slice() {
+                    text_carries = true;
+                    break;
+                }
+            }
+        }
+        if text_carries {
+            break;
+        }
+    }
+    let mut raw_carries = false;
+    for address in addresses {
+        // A first-byte prefilter: one compare per byte on average, so a 64 MiB
+        // image is one linear pass rather than `len * |set|` 32-byte compares.
+        let first = address[0];
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == first
+                && bytes.len() - index >= 32
+                && bytes[index..index + 32] == address[..]
+            {
+                raw_carries = true;
+                break;
+            }
+        }
+        if raw_carries {
+            break;
+        }
+    }
+    if text_carries || raw_carries {
+        return Err(Error::Provider {
+            code: "provider/redaction".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The hex keys of a raw address set.
+fn address_keys_from_raw(raw: &BTreeSet<[u8; 32]>) -> BTreeSet<[u8; 64]> {
+    raw.iter().map(hex_key).collect()
 }
 
 /// A redactor for the literals `module` names.
@@ -406,6 +469,27 @@ pub(crate) fn module_holds_secret(module: &active_infinity::InfinityModule) -> b
     })
 }
 
+/// Every tainted blob's address in `module`.
+///
+/// The domain keeps this set for the life of a slot: a patch can remove the
+/// blob, and a projection that recomputes the set from the post-write module
+/// then finds nothing to scrub while the address is still in a binding, a
+/// constraint or the provenance (R-16 round 14, F2).
+pub(crate) fn tainted_blob_addresses(
+    module: &active_infinity::InfinityModule,
+) -> BTreeSet<[u8; 32]> {
+    let mut addresses = BTreeSet::new();
+    for index in 0..module.node_count() {
+        let id = active_infinity::NodeId(index as u32);
+        if let Some(active_infinity::Inode::Blob { hash, .. }) = module.get(id) {
+            if is_tainted_blob(module.get(id).expect("the node was just read")) {
+                addresses.insert(*hash);
+            }
+        }
+    }
+    addresses
+}
+
 pub(crate) fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
     matches!(node, active_infinity::Inode::Blob { tainted: true, .. })
 }
@@ -422,8 +506,9 @@ pub(crate) fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
 pub(crate) fn sanitize_tainted_blobs(
     module: &mut active_infinity::InfinityModule,
     extra: &[[u8; 32]],
-) {
+) -> BTreeSet<[u8; 32]> {
     let mut doomed: BTreeSet<active_infinity::NodeId> = BTreeSet::new();
+    let mut raw: BTreeSet<[u8; 32]> = extra.iter().copied().collect();
     let mut addresses = address_keys(extra);
     for index in 0..module.node_count() {
         let id = active_infinity::NodeId(index as u32);
@@ -431,11 +516,37 @@ pub(crate) fn sanitize_tainted_blobs(
             doomed.insert(id);
             if let Some(active_infinity::Inode::Blob { hash, .. }) = module.get(id) {
                 addresses.insert(hex_key(hash));
+                raw.insert(*hash);
             }
         }
     }
+    // A second untainted blob with the same hash is the same address, and one
+    // whose payload or media type carries it is the same oracle. Both are
+    // doomed too (R-16 round 14, F4).
+    for index in 0..module.node_count() {
+        let id = active_infinity::NodeId(index as u32);
+        let Some(active_infinity::Inode::Blob {
+            hash,
+            media_type,
+            payload,
+            ..
+        }) = module.get(id)
+        else {
+            continue;
+        };
+        let duplicate = addresses.contains(&hex_key(hash));
+        let media = text_names_an_address(media_type, &addresses);
+        let binary = payload
+            .as_deref()
+            .is_some_and(|bytes| bytes_carry_an_address(bytes, &addresses));
+        if duplicate || media || binary {
+            addresses.insert(hex_key(hash));
+            raw.insert(*hash);
+            doomed.insert(id);
+        }
+    }
     if doomed.is_empty() && addresses.is_empty() {
-        return;
+        return raw;
     }
     // A text copy of an address carries what the blob fields no longer do. The
     // library's redactor rewrites secret literals, not an address the provider
@@ -485,16 +596,34 @@ pub(crate) fn sanitize_tainted_blobs(
             *media_type = SECRET_MARKER.to_string();
         }
     }
+    // An extension payload is opaque to the module's own redactor: a copy there
+    // survives every field pass, so the extension is dropped rather than edited
+    // (its bytes are the value) (R-16 round 14, F4).
+    let extensions = module.extensions().to_vec();
+    if extensions
+        .iter()
+        .any(|(_, bytes)| bytes_carry_an_address(bytes, &addresses))
+    {
+        let kept: Vec<(u64, Vec<u8>)> = extensions
+            .into_iter()
+            .filter(|(_, bytes)| !bytes_carry_an_address(bytes, &addresses))
+            .collect();
+        module.set_extensions(kept);
+    }
+    raw
 }
 
 /// The 64-byte lowercase hex key of a hash.
 fn hex_key(hash: &[u8; 32]) -> [u8; 64] {
     let hex = active_infinity::ir::hash_hex(hash);
     let mut key = [0u8; 64];
-    // The formatter always produces 64 lowercase hex characters; a zero key on
-    // a hypothetical change can only over-scrub, never under-scrub
-    // (R-16 round 13, F7).
-    key.copy_from_slice(&hex.as_bytes()[..64.min(hex.len())]);
+    // The formatter produces 64 lowercase hex characters. A shorter one leaves
+    // a zero tail rather than panicking the way `copy_from_slice` on a
+    // mismatched length would; a zero key matches no text, so the only effect
+    // is a missed scrub, not an over-scrub (R-16 round 14, F9).
+    let bytes = hex.as_bytes();
+    let len = bytes.len().min(64);
+    key[..len].copy_from_slice(&bytes[..len]);
     key
 }
 
@@ -504,59 +633,209 @@ fn address_keys(extra: &[[u8; 32]]) -> BTreeSet<[u8; 64]> {
     extra.iter().map(hex_key).collect()
 }
 
-/// Replace every text node that names an address with the marker.
+/// Replace the address in every text carrier, in place.
+///
+/// The round-13 pass covered `Str`, `Ident`, `Env`, table keys, interpolated
+/// literals and `SchemaField.deprecated`; a binding name, a constraint, an enum
+/// member, a unit name, a patch path, a schema type list or a blob media type
+/// carried the same address untouched (R-16 round 14, F1). The text is rewritten
+/// rather than the node replaced, so a `SchemaField` keeps its constraints and a
+/// table keeps its shape (F6).
 fn scrub_text_copies(module: &mut active_infinity::InfinityModule, addresses: &BTreeSet<[u8; 64]>) {
     if addresses.is_empty() {
         return;
     }
+    let bindings: Vec<(String, active_infinity::NodeId)> = module.bindings().to_vec();
+    if bindings
+        .iter()
+        .any(|(name, _)| text_names_an_address(name, addresses))
+    {
+        module.clear_bindings();
+        for (name, id) in bindings {
+            module.bind(scrub_addresses(&name, addresses), id);
+        }
+    }
     for index in 0..module.node_count() {
         let id = active_infinity::NodeId(index as u32);
-        let hit = match module.get(id) {
-            Some(active_infinity::Inode::Str(text)) | Some(active_infinity::Inode::Ident(text)) => {
-                text_names_an_address(text, addresses)
-            }
-            Some(active_infinity::Inode::Env { name, .. }) => {
-                text_names_an_address(name, addresses)
-            }
-            Some(active_infinity::Inode::Table { fields })
-            | Some(active_infinity::Inode::SchemaTable { fields, .. }) => fields
-                .iter()
-                .any(|(name, _)| text_names_an_address(name, addresses)),
-            Some(active_infinity::Inode::Interpolate { parts }) => {
-                parts.iter().any(|part| match part {
-                    active_infinity::InterpPart::Literal(text) => {
-                        text_names_an_address(text, addresses)
-                    }
-                    active_infinity::InterpPart::Expr(_) => false,
-                })
-            }
-            Some(active_infinity::Inode::SchemaField(spec)) => spec
-                .deprecated
-                .as_deref()
-                .is_some_and(|text| text_names_an_address(text, addresses)),
-            _ => false,
+        let Ok(node) = module.node_mut(id) else {
+            continue;
         };
-        // A text or key that names the address is replaced whole: renaming one
-        // key could collide with another, and the node's shape is not evidence
-        // worth keeping.
-        if hit {
-            if let Ok(node) = module.node_mut(id) {
-                *node = active_infinity::Inode::Str(SECRET_MARKER.to_string());
+        match node {
+            active_infinity::Inode::Str(text) | active_infinity::Inode::Ident(text) => {
+                *text = scrub_addresses(text, addresses);
             }
+            active_infinity::Inode::Env { name, .. } => {
+                *name = scrub_addresses(name, addresses);
+            }
+            active_infinity::Inode::Table { fields }
+            | active_infinity::Inode::SchemaTable { fields, .. } => {
+                scrub_field_keys(fields, addresses);
+            }
+            active_infinity::Inode::Interpolate { parts } => {
+                for part in parts.iter_mut() {
+                    if let active_infinity::InterpPart::Literal(text) = part {
+                        *text = scrub_addresses(text, addresses);
+                    }
+                }
+            }
+            active_infinity::Inode::Constrained { constraint, .. } => match constraint {
+                active_infinity::Constraint::Enum(members) => {
+                    for member in members.iter_mut() {
+                        *member = scrub_addresses(member, addresses);
+                    }
+                }
+                active_infinity::Constraint::Pattern(text)
+                | active_infinity::Constraint::Custom(text) => {
+                    *text = scrub_addresses(text, addresses);
+                }
+                active_infinity::Constraint::MinMax { .. } | active_infinity::Constraint::Odd => {}
+            },
+            active_infinity::Inode::Patch(operation) => match operation {
+                active_infinity::PatchOp::Set { path, .. }
+                | active_infinity::PatchOp::Remove { path } => {
+                    *path = scrub_addresses(path, addresses);
+                }
+                active_infinity::PatchOp::Rename { from, to } => {
+                    *from = scrub_addresses(from, addresses);
+                    *to = scrub_addresses(to, addresses);
+                }
+            },
+            active_infinity::Inode::SchemaField(spec) => {
+                if let active_infinity::TypeSpec::Enum(members) = &mut spec.typ {
+                    for member in members.iter_mut() {
+                        *member = scrub_addresses(member, addresses);
+                    }
+                }
+                if let Some(text) = spec.deprecated.as_mut() {
+                    *text = scrub_addresses(text, addresses);
+                }
+            }
+            active_infinity::Inode::Quantity {
+                unit: active_infinity::UnitTag::Named(name),
+                ..
+            } => {
+                *name = scrub_addresses(name, addresses);
+            }
+            active_infinity::Inode::Quantity { .. } => {}
+            active_infinity::Inode::Blob {
+                media_type,
+                payload,
+                ..
+            } => {
+                *media_type = scrub_addresses(media_type, addresses);
+                if let Some(bytes) = payload.as_mut() {
+                    // A payload that carries the address is a binary copy of it;
+                    // the payload is dropped rather than edited, because its
+                    // length defines the blob identity (R-16 round 14, F4).
+                    if bytes_carry_an_address(bytes, addresses) {
+                        *payload = None;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
 
-/// Whether `text` contains one of the addresses, in one linear pass, ignoring
-/// ASCII case.
+/// Rewrite table keys that name an address and drop a collision the rewrite
+/// introduces.
+fn scrub_field_keys(
+    fields: &mut Vec<(String, active_infinity::NodeId)>,
+    addresses: &BTreeSet<[u8; 64]>,
+) {
+    for (name, _) in fields.iter_mut() {
+        *name = scrub_addresses(name, addresses);
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    fields.retain(|(name, _)| seen.insert(name.clone()));
+}
+
+/// Replace every occurrence of an address in `text` with the marker.
+///
+/// A contiguous occurrence is rewritten in place, so prose that quotes an
+/// address keeps its sentence. A separated copy cannot be cut without
+/// reconstructing the separators, so the whole text becomes the marker
+/// (R-16 round 14, F5).
+fn scrub_addresses(text: &str, addresses: &BTreeSet<[u8; 64]>) -> String {
+    if !text_names_an_address(text, addresses) {
+        return text.to_string();
+    }
+    let scrubbed = scrub_contiguous(text, addresses);
+    if text_names_an_address(&scrubbed, addresses) {
+        return SECRET_MARKER.to_string();
+    }
+    scrubbed
+}
+
+/// Rewrite the contiguous occurrences, leaving separated ones to the caller.
+fn scrub_contiguous(text: &str, addresses: &BTreeSet<[u8; 64]>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes.len() - index >= 64 {
+            let mut key = [0u8; 64];
+            for (slot, byte) in key.iter_mut().zip(&bytes[index..index + 64]) {
+                *slot = byte.to_ascii_lowercase();
+            }
+            if addresses.contains(&key) {
+                out.push_str(SECRET_MARKER);
+                index += 64;
+                continue;
+            }
+        }
+        // Copy one UTF-8 character, not one byte.
+        let step = text[index..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&text[index..index + step]);
+        index += step;
+    }
+    out
+}
+
+/// One hex digit's value; a non-digit reads as zero, which cannot match.
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Whether `bytes` contains an address, raw or in hex.
+fn bytes_carry_an_address(bytes: &[u8], addresses: &BTreeSet<[u8; 64]>) -> bool {
+    if bytes.len() < 32 {
+        return false;
+    }
+    let mut windows = BTreeSet::new();
+    for address in addresses {
+        let mut raw = [0u8; 32];
+        for (slot, pair) in raw.iter_mut().zip(address.chunks(2)) {
+            if let [high, low] = pair {
+                *slot = (hex_nibble(*high) << 4) | hex_nibble(*low);
+            }
+        }
+        windows.insert(raw);
+    }
+    bytes.windows(32).any(|window| {
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(window);
+        windows.contains(&raw)
+    }) || std::str::from_utf8(bytes).is_ok_and(|text| text_names_an_address(text, addresses))
+}
+
+/// Whether `text` contains one of the addresses, contiguous or separated.
+///
+/// Contiguous matching alone let a hyphenated, colon-separated or
+/// zero-width-split copy through; each decodes to the same address and is the
+/// same equality oracle (R-16 round 14, F5). A run of hex digits with those
+/// separators between them is compared as one token; the separators do not
+/// include whitespace, so ordinary prose cannot form a token by accident.
 pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) -> bool {
-    if addresses.is_empty() {
+    if addresses.is_empty() || text.len() < 64 {
         return false;
     }
     let bytes: Vec<u8> = text.bytes().map(|byte| byte.to_ascii_lowercase()).collect();
-    if bytes.len() < 64 {
-        return false;
-    }
     let mut key = [0u8; 64];
     for window in bytes.windows(64) {
         key.copy_from_slice(window);
@@ -564,7 +843,46 @@ pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) 
             return true;
         }
     }
+    // Separated copies: collect hex digits across `-`, `:` and the zero-width
+    // family, and check every 64-digit window of the collected run.
+    let mut run: Vec<u8> = Vec::with_capacity(64);
+    for character in text.chars() {
+        if character.is_ascii_hexdigit() {
+            run.push(character.to_ascii_lowercase() as u8);
+            if run.len() > 64 {
+                run.remove(0);
+            }
+            if run.len() == 64 {
+                key.copy_from_slice(&run);
+                if addresses.contains(&key) {
+                    return true;
+                }
+            }
+        } else if !is_address_separator(character) {
+            run.clear();
+        }
+    }
     false
+}
+
+/// Characters a decoder ignores inside a hex address.
+fn is_address_separator(character: char) -> bool {
+    matches!(
+        character,
+        '-' | ':' | '_' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
+    )
+}
+
+/// [text_names_an_address] for a raw address set.
+pub(crate) fn text_names_any_address(text: &str, addresses: &[[u8; 32]]) -> bool {
+    let hex: BTreeSet<[u8; 64]> = addresses.iter().map(hex_key).collect();
+    text_names_an_address(text, &hex)
+}
+
+/// [scrub_addresses] for a raw address set.
+pub(crate) fn scrub_any_addresses(text: &str, addresses: &[[u8; 32]]) -> String {
+    let hex: BTreeSet<[u8; 64]> = addresses.iter().map(hex_key).collect();
+    scrub_addresses(text, &hex)
 }
 
 /// The free text an annotation carries, if it carries any.

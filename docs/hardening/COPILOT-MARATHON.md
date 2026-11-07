@@ -29,7 +29,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-13 | receipts | `src/receipts.rs` | rounds 1-13: r13 found two highs (the per-chunk check and the verified handle were claimed but absent) and three mediums, all fixed; r14 and r15 must be clean | 73 fixed / 0 rejected / 1 residual (no OS-level lock) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-12: r12 found the media type of a tainted blob surviving every projection (high) and a quadratic address scan, both fixed; r13 and r14 must be clean | 52 fixed / 0 rejected / 5 noted | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-14: r14 found four highs (uncovered carriers, the non-sticky address set, the provenance text, binary copies), all fixed; r15 and r16 must be clean | 63 fixed / 0 rejected / 5 noted | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-10: r10 found the residency charge (medium) and four lows, all fixed; r11 and r12 must be clean | 68 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-3: M1-M3 and all nine lows fixed (round 3's M2 panic boundary, M3 lifetime fixtures); r4 and r5 must be clean | 49 fixed / 0 rejected / 0 open (3 documented) | this commit |
@@ -134,6 +134,35 @@ Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. Verdict
 | F10 | low | an answer delivered while receipts were disabled suppressed the dispatch receipt for ever | **fixed**: dispatch seals through the `receipted` flag alone; `receipt_round3_tests::an_in_flight_resolve_while_receipts_were_disabled_still_yields_one_receipt` (negative control: zero receipts) |
 
 Gate: green; both feature sets; fmt and doc clean. R-13 needs r13 and r14 clean.
+
+### R-16 security helpers - 2026-11-07 (round 14)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `58b0a4e`. Verdict
+**NOT CLEAN**: four highs, two mediums and five lows. The round-13 field pass
+covered a list of carriers and the library covered another; everything outside
+both lists kept the address, and the set was rebuilt from the post-write module.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | the scrub missed binding names, constraints, enum members, unit names, patch paths, schema type lists and blob media types | **fixed**: `scrub_text_copies` covers every `Inode` text carrier and the module's bindings, rewriting text in place; `an_address_in_every_text_carrier_is_scrubbed` |
+| F2 | high | the address set came from the current module, so a patch that removed the blob declassified its hash in annotations and projections | **fixed**: `ModuleSlot::secret_addresses` is sticky (seeded at install, extended on patch) and feeds the annotation filter and every projection; `a_removed_blobs_address_stays_out_of_every_projection` |
+| F3 | high | `provenance` returned bare-hex addresses in producer/model/tool and entry keys/values | **fixed**: the held-secret provenance map is scrubbed key by key and value by value; `a_provenance_text_that_names_an_address_is_scrubbed` |
+| F4 | high | a duplicate untainted blob, a payload that embeds the address and an extension payload kept it | **fixed**: duplicate identities and carriers are doomed, the payload is dropped and a carrier extension is dropped; the encoded image is then refused (`provider/redaction`) if any address survives raw or hex; `a_payload_that_embeds_an_address_is_dropped`, `an_extension_that_copies_an_address_is_dropped`, `a_duplicate_identity_is_refused_rather_than_published` |
+| F5 | medium | hyphenated, colon-separated and zero-width-split copies never matched | **fixed**: the scan collects hex across those separators and the rewrite falls back to the whole text; `a_separated_copy_of_an_address_is_scrubbed` |
+| F6 | medium | replacing a whole node turned a `SchemaField` into a string and dropped its constraints | **fixed**: text is rewritten in place, so shape and constraints survive (the same carrier test asserts the field is still a `SchemaField`) |
+| F7 | low | the own-address extra was passed for secret-free modules, so a caller's own literal was replaced in the reply | **fixed**: the extra is built only when the slot is secret-bearing |
+| F8 | low | the `Encode("redaction")` to `provider/redaction` mapping had no test | **fixed**: `an_evaluator_redaction_failure_is_the_providers_fault` |
+| F9 | low | `hex_key` could panic on a short hex formatter | **fixed**: a length-checked copy that leaves a zero tail |
+| F10 | low | the wall check ran after the taint walk | **fixed**: it is the first statement of the annotations method |
+| F11 | low | the image's own-hash extra is unreachable | **kept but gated** on `held_secret`, with F7; the sticky set is what covers removed blobs |
+
+Every new test was shown to fail on a mutated tree (a disabled constraint arm,
+a disabled sticky seed, a disabled provenance scrub, a disabled separated scan,
+a disabled extension drop). `SECURITY.md` and `docs/spec/security.md` state the
+carrier rule, the sticky set and the byte-level refusal.
+
+Gate: green; both feature sets; fmt, clippy and doc clean. R-16 needs r15 and
+r16 clean.
 
 ### R-19 control plane - 2026-11-07 (round 3 fixes)
 
