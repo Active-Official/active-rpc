@@ -199,7 +199,7 @@ clean that had never been recorded.
 | M1 | medium | a repeated `Revoke` of an already-revoked subtree re-walked it (84 000 x 16 000 node visits at the ceilings) | **fixed**: `revoke_subtree` does not descend into a revoked node (no child can appear under one). `repeated_revokes_of_a_revoked_subtree_are_linear` (8 001 nodes, 2 000 revokes, < 5 s) fails when the skip is removed |
 | L1 | low | the body estimate charged four phantom bytes per cap-less trace entry | **fixed**: the ordinal is charged only when the entry names a capability |
 | L2 | low | the body cap is not a memory cap: a ~19 MB package peaks ~370 MB in `replay run` | **open for r7** |
-| L3 | low | `CapRecord::clone` before the cheap attenuation checks copies ~6.4 GB for 100 000 ops | **open for r7** |
+| L3 | low | `CapRecord::clone` before the cheap attenuation checks copies ~6.4 GB for 100 000 ops | **fixed**: the checks run on a borrow and only the fields the child needs are copied (provider, object, lineage, expiry); the deep attrs copy happens once inside `attenuate`, as it must |
 
 ### R-13 receipts - 2026-11-07 (round 15)
 

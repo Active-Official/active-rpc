@@ -2481,61 +2481,80 @@ impl Agent {
         let parent_id = parent.id();
         let mut kernel = self.cell.borrow_mut();
         refresh_clock(&mut kernel);
-        let record = kernel
-            .caps
-            .get(&parent_id)
-            .ok_or(Error::UnknownCapability(cap_token(parent_id)))?
-            .clone();
-        if record.revoked {
-            return Err(Error::Revoked(cap_token(parent_id)));
-        }
-        if record.wall_clock == kernel.wall_clock && is_expired(&kernel, &record) {
+        // Read-only checks on a borrow, then only the fields the child needs
+        // are copied. Cloning the whole record up front copied up to 64 method
+        // names of 1 KiB each per attenuation, ~6.4 GB for 100 000 ops
+        // (R-12 round 6, L3).
+        let expired_now = {
+            let record = kernel
+                .caps
+                .get(&parent_id)
+                .ok_or(Error::UnknownCapability(cap_token(parent_id)))?;
+            if record.revoked {
+                return Err(Error::Revoked(cap_token(parent_id)));
+            }
+            record.wall_clock == kernel.wall_clock && is_expired(&kernel, record)
+        };
+        if expired_now {
             // Only a deadline this clock can read is "expired"; a deadline from
             // the other domain is the dedicated refusal below, which names the
             // mismatch instead of reporting a revocation (round 42, F4).
             kernel.push_event(Event::CapExpired(parent_id));
             return Err(Error::Revoked(cap_token(parent_id)));
         }
-        attrs.budget.check()?;
-        if !kernel.allow_durable
-            && (record.attrs.persistence == CapPersistence::Durable
-                || attrs.persistence == CapPersistence::Durable)
-        {
-            return Err(Error::persistence(
-                "durable capabilities are not enabled for this agent",
-            ));
-        }
-        if attrs.persistence == CapPersistence::Durable && durable_ceiling_reached(&kernel) {
-            return Err(Error::BudgetExceeded("tombstones"));
-        }
-        if kernel.caps.len() >= MAX_CAPS {
-            return Err(Error::BudgetExceeded("caps"));
-        }
-        if record.lineage.len() >= MAX_LINEAGE_DEPTH {
-            return Err(Error::Escalation("capability chain is too deep"));
-        }
-        if record.expires_at.is_some() && record.wall_clock != kernel.wall_clock {
-            // The parent's absolute deadline lives in another clock domain; the
-            // clamp below would mix the two. One condition, one code
-            // (round 9, F1).
-            return Err(Error::Identity(
-                "the parent's deadline is in another clock domain",
-            ));
-        }
-        let attrs = record.attrs.attenuate(attrs)?;
-        check_binding(&attrs)?;
-        check_method_names(&attrs)?;
+        let (provider, object, lineage, expires_at, attrs) = {
+            let record = kernel
+                .caps
+                .get(&parent_id)
+                .ok_or(Error::UnknownCapability(cap_token(parent_id)))?;
+            attrs.budget.check()?;
+            if !kernel.allow_durable
+                && (record.attrs.persistence == CapPersistence::Durable
+                    || attrs.persistence == CapPersistence::Durable)
+            {
+                return Err(Error::persistence(
+                    "durable capabilities are not enabled for this agent",
+                ));
+            }
+            if attrs.persistence == CapPersistence::Durable && durable_ceiling_reached(&kernel) {
+                return Err(Error::BudgetExceeded("tombstones"));
+            }
+            if kernel.caps.len() >= MAX_CAPS {
+                return Err(Error::BudgetExceeded("caps"));
+            }
+            if record.lineage.len() >= MAX_LINEAGE_DEPTH {
+                return Err(Error::Escalation("capability chain is too deep"));
+            }
+            if record.expires_at.is_some() && record.wall_clock != kernel.wall_clock {
+                // The parent's absolute deadline lives in another clock
+                // domain; the clamp below would mix the two. One condition,
+                // one code (round 9, F1).
+                return Err(Error::Identity(
+                    "the parent's deadline is in another clock domain",
+                ));
+            }
+            let attrs = record.attrs.attenuate(attrs)?;
+            check_binding(&attrs)?;
+            check_method_names(&attrs)?;
+            (
+                record.provider,
+                record.object,
+                record.lineage.clone(),
+                record.expires_at,
+                attrs,
+            )
+        };
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, Some(&parent_id));
-        let mut child = CapRecord::new(id, record.provider, record.object, attrs.clone());
+        let mut child = CapRecord::new(id, provider, object, attrs.clone());
         child.parent = Some(parent_id);
         child.record_id = CapId::derive_record(&kernel.secret, serial, Some(&parent_id));
-        child.lineage = record.lineage.clone();
+        child.lineage = lineage;
         child.lineage.push(parent_id);
         // A derived capability never outlives its parent: keep the parent's
         // absolute expiry when the child asked for a longer (or no) lifetime.
-        child.expires_at = match (record.expires_at, attrs.ttl_ms) {
+        child.expires_at = match (expires_at, attrs.ttl_ms) {
             (Some(parent_expiry), Some(ttl)) => {
                 Some(parent_expiry.min(kernel.now_ms.saturating_add(ttl)))
             }
@@ -2555,10 +2574,7 @@ impl Agent {
         }
         kernel.meters.insert(id, BudgetMeter::new(attrs.budget));
         kernel.insert_cap_record(child);
-        kernel.push_event(Event::CapMinted {
-            cap: id,
-            provider: record.provider,
-        });
+        kernel.push_event(Event::CapMinted { cap: id, provider });
         Ok(CapHandle::new(Rc::clone(&self.control), id))
     }
 
