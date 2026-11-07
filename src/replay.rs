@@ -46,6 +46,15 @@ pub const MAX_METHODS: usize = 64;
 /// total needs its own ceiling.
 pub const MAX_PACKAGE_BYTES: usize = 64 << 20;
 
+/// Ceiling on the decoded heap a package may describe, in bytes.
+///
+/// The body ceiling bounds the bytes on the wire, not the objects they
+/// describe: a 19 MB package of one-byte strings expands to ~370 MB of `Op`,
+/// `Trace`, `String` and method-vector allocations (R-12 round 6, L2). The
+/// decoder charges every object it builds against this ceiling and refuses a
+/// package that would expand past it.
+pub const MAX_DECODE_BYTES: usize = 128 << 20;
+
 /// Largest sum of declared argument sizes in one package, in bytes.
 ///
 /// Replay synthesizes an argument of the declared size for each call, so the
@@ -211,6 +220,14 @@ impl ReplayPackage {
 
     /// Decode and verify a package.
     pub fn decode(bytes: &[u8]) -> Result<ReplayPackage> {
+        Self::decode_with_ceiling(bytes, MAX_DECODE_BYTES)
+    }
+
+    /// [Self::decode] with the decoded-heap ceiling the caller supplies.
+    ///
+    /// The test drives the real parser with a small ceiling; production calls
+    /// [`Self::decode`] with [`MAX_DECODE_BYTES`].
+    fn decode_with_ceiling(bytes: &[u8], decode_ceiling: usize) -> Result<ReplayPackage> {
         const MIN: usize = 4 + 1 + 2 + 8 + 4 + 4 + 32;
         if bytes.len() < MIN {
             return Err(Error::Replay("package is shorter than its header".into()));
@@ -240,6 +257,8 @@ impl ReplayPackage {
         }
         let mut ops = Vec::with_capacity(op_count.min(1024));
         let mut arg_total: u64 = 0;
+        // The decoded heap this package describes, charged as it is built.
+        let mut decoded_bytes: usize = 0;
         for _ in 0..op_count {
             let tag = reader.u8()?;
             let op = match tag {
@@ -281,6 +300,21 @@ impl ReplayPackage {
                     return Err(Error::Replay(format!("unknown operation tag {other}")));
                 }
             };
+            // One `Op` plus its method strings and their heap headers.
+            let methods: usize = match &op {
+                Op::Mint { methods, .. } | Op::Attenuate { methods, .. } => methods
+                    .iter()
+                    .map(|method| method.len().saturating_add(32))
+                    .sum(),
+                Op::Call { method, .. } => method.len().saturating_add(32),
+                Op::SetLatency(_) | Op::Revoke { .. } => 0,
+            };
+            decoded_bytes = decoded_bytes.saturating_add(96).saturating_add(methods);
+            if decoded_bytes > decode_ceiling {
+                return Err(Error::Replay(
+                    "the package expands beyond the decode ceiling".into(),
+                ));
+            }
             ops.push(op);
         }
         let trace_count = reader.u32()? as usize;
@@ -299,6 +333,14 @@ impl ReplayPackage {
             } else {
                 None
             };
+            decoded_bytes = decoded_bytes
+                .saturating_add(48)
+                .saturating_add(event.len().saturating_add(32));
+            if decoded_bytes > decode_ceiling {
+                return Err(Error::Replay(
+                    "the package expands beyond the decode ceiling".into(),
+                ));
+            }
             trace.push(Trace { event, cap });
         }
         if !reader.is_empty() {
@@ -1370,5 +1412,35 @@ mod tests {
         assert!(left.event.starts_with("cap.introduced:"));
         // 32 hex characters, plus the prefix and the colon.
         assert_eq!(left.event.len(), "cap.introduced:".len() + 32);
+    }
+}
+
+#[cfg(test)]
+mod decode_ceiling_tests {
+    use super::*;
+
+    /// The decoded heap a package describes is bounded, not only its bytes:
+    /// the test drives the real parser with a tiny ceiling, so a package that
+    /// expands past it is refused before the objects are built
+    /// (R-12 round 6, L2).
+    #[test]
+    fn a_package_that_expands_past_the_ceiling_is_refused() {
+        let mut recorder = Recorder::new(1).expect("recorder");
+        let cap = recorder.mint(&["echo"], None).expect("mint");
+        recorder.call(cap, "echo", 0).expect("call");
+        let bytes = recorder
+            .package()
+            .expect("package")
+            .encode()
+            .expect("encode");
+        // The shipped ceiling accepts a small package.
+        ReplayPackage::decode(&bytes).expect("the package decodes");
+        let error = ReplayPackage::decode_with_ceiling(&bytes, 1)
+            .expect_err("a one-byte ceiling refuses it");
+        assert_eq!(error.code(), "rpc/replay", "{error}");
+        assert!(
+            error.to_string().contains("decode ceiling"),
+            "the refusal names the ceiling: {error}"
+        );
     }
 }
