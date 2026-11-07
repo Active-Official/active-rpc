@@ -457,3 +457,37 @@ fn a_future_dated_lock_is_not_immortal() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&lock);
 }
+
+/// A symlink planted at the log path must not receive the append: the writer
+/// refuses it instead of following the link (R-13 round 9, L2). Unix-only,
+/// because creating a symlink on Windows needs a privilege the test cannot ask
+/// for.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_log_path_is_refused() {
+    let path = scratch("symlink");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let target = scratch("symlink-target");
+    std::fs::write(&target, b"").expect("target");
+    let moved = path.with_extension("moved");
+    std::fs::rename(&path, &moved).expect("move the real log");
+    std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+    let log = ReceiptLog::open(&moved).expect("open the real log");
+    let error = log
+        .append(&receipt(1, "echo"))
+        .expect_err("a symlinked log path is refused");
+    assert_eq!(error.code(), "rpc/receipt");
+    assert!(
+        error.to_string().contains("symlink"),
+        "the refusal names the link: {error}"
+    );
+    assert_eq!(
+        std::fs::metadata(&target).expect("stat").len(),
+        0,
+        "nothing was written through the link"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&moved);
+}

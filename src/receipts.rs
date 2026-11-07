@@ -634,6 +634,20 @@ fn nonce_of(path: &std::path::Path) -> Option<String> {
 ///
 /// A lock is a file an attacker can plant: a nonce with a separator or a `..`
 /// must not steer the claim path anywhere else.
+/// Refuse a log path that is a symlink.
+///
+/// A link planted in the log's directory would make every append write through
+/// it (and `repair` truncate through it), so the type is checked without
+/// following it (R-13 round 9, L2).
+fn refuse_symlink(path: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(Error::receipt("the receipt log path is a symlink"))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn claim_name(nonce: &str) -> Option<String> {
     let cleaned: String = nonce
         .chars()
@@ -954,6 +968,7 @@ impl ReceiptLog {
 
     fn write_all(&self, bytes: &[u8], lock: &LogLock) -> Result<()> {
         use std::io::Write;
+        refuse_symlink(&self.path)?;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&self.path)
@@ -1086,6 +1101,7 @@ impl ReceiptLog {
             .write(true)
             .open(&path)
             .map_err(|_| Error::receipt("cannot open the receipt log to repair it"))?;
+        refuse_symlink(&path)?;
         file.set_len(good_end as u64)
             .map_err(|_| Error::receipt("cannot truncate the damaged tail"))?;
         file.sync_all()
@@ -1507,8 +1523,27 @@ fn walk_log(bytes: &[u8]) -> Result<(Vec<Receipt>, LogState)> {
 /// at most the bytes of one unfinished record, which decode to nothing.
 fn tail_holds_a_record(tail: &[u8]) -> bool {
     let window = tail.len().min(MAX_LOG_RECORD);
-    for offset in 0..window {
-        if decode_record(&tail[..window], offset).is_ok() {
+    if window < MIN_LOG_RECORD {
+        return false;
+    }
+    let bytes = &tail[..window];
+    // A random offset almost never declares a length a record could have, and
+    // the decoder hashes whatever it is handed: without this pre-filter `repair`
+    // paid O(window^2) of hashing on a damaged tail (R-13 round 9, L5).
+    for offset in 0..window.saturating_sub(4) {
+        let declared = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        if !(MIN_LOG_RECORD..=MAX_LOG_RECORD).contains(&declared) {
+            continue;
+        }
+        if offset.saturating_add(declared) > window {
+            continue;
+        }
+        if decode_record(bytes, offset).is_ok() {
             return true;
         }
     }

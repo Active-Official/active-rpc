@@ -4590,12 +4590,14 @@ impl Agent {
             // applies to a lost answer. A `Refused` here told an auditor the
             // provider never ran (R-13 round 7, #4).
             kernel.record_settled(promise.id);
-            if kernel.receipts_enabled {
+            if kernel.receipts_enabled && !job.receipted {
                 // The receipt records the decision dispatch took, and the call
                 // reached the provider: no answer is delivered, but nothing was
                 // refused either, so the decision is `Admitted` for a read-only
                 // call as much as for a mutating one. A `Refused` here would deny
-                // an admission the tape already made (R-13 round 9, F4).
+                // an admission the tape already made (R-13 round 9, F4). The
+                // `receipted` guard matches `cancel_tree`: one job, one receipt
+                // (R-13 round 9, L3).
                 kernel.seal_receipt(&job, None);
             }
             if let Some(stored) = kernel.jobs.get_mut(&job.id) {
