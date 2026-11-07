@@ -395,7 +395,7 @@ impl LogLock {
                     use std::io::Write;
                     // The nonce proves ownership on drop; the pid and the start
                     // time are diagnostics for an operator who finds a lock.
-                    let _ = writeln!(
+                    let written = writeln!(
                         file,
                         "{nonce} pid {} started {}",
                         std::process::id(),
@@ -404,6 +404,15 @@ impl LogLock {
                             .map(|elapsed| elapsed.as_millis())
                             .unwrap_or(0)
                     );
+                    if written.is_err() {
+                        // An empty lock looks like an interrupted creator, wedges
+                        // the log for the grace, and the writer's own
+                        // `still_holds` would report a misleading "displaced"
+                        // (R-13 round 10, E).
+                        drop(file);
+                        let _ = std::fs::remove_file(&path);
+                        return Err(Error::receipt("cannot write the receipt lock"));
+                    }
                     return Ok(Self {
                         path,
                         nonce,
@@ -512,10 +521,11 @@ fn take_stale(path: &std::path::Path, judged: &str) -> bool {
         // quarantine path derivable without letting the file choose it.
         "unidentified".to_string()
     } else {
-        match claim_name(judged) {
-            Some(safe) => safe,
-            None => return false,
-        }
+        // A nonce that no claim name can render is still `judged`: the match
+        // below compares the raw text, and the quarantine name comes from a
+        // fixed token, so returning `false` here wedged the log for ever
+        // (R-13 round 10, D).
+        claim_name(judged).unwrap_or_else(|| "unidentified".to_string())
     };
     let quarantine = path.with_file_name(format!("{}.stale-{safe}", file_name_text(path)));
     // A name a local user pre-planted (as a directory, or a file the rename

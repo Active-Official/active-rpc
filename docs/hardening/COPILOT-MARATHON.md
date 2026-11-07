@@ -26,11 +26,11 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-5: round 5 found no critical/high/medium (CLEAN) and 12 lows (2 fixed); round 6 must be clean to close | 32 fixed / 0 rejected / 10 noted | this commit |
-| R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
+| R-13 | receipts | `src/receipts.rs` | rounds 1-11: round 10's high and two mediums fixed at `68f29ab`, its five lows fixed in round 11; r11's re-audit is owed | 59 fixed / 0 rejected / 1 residual (the check-then-open race needs a unix `O_NOFOLLOW`) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-8: round 8 found one high (the `content_hash` provenance oracle) and five lows, all fixed; r9 and r10 must be clean to close | 33 fixed / 0 rejected / 2 noted (no store wired by default; virtual-epoch deadline; opaque module bytes) | this commit |
-| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs` | rounds 1-4: round 4 found a round-3 regression (the kernel channel counter) and four mediums, all fixed; r5 and r6 must be clean to close | 40 fixed / 0 rejected / 0 open (6 residuals recorded) | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-9: r9 found two mediums (the secret-free digest over-reach, the tainted blob address) and five lows, all fixed or recorded; r10 and r11 must be clean | 38 fixed / 0 rejected / 4 noted (no store wired by default; virtual-epoch deadline; opaque module bytes; `hiding_placeholder`) | this commit |
+| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs` | rounds 1-5: r5 CLEAN (no critical/high/medium), six lows fixed; r6 must be clean to close | 46 fixed / 0 rejected / 0 open (6 residuals recorded) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
 | R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
@@ -49,6 +49,58 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-17 introduction and topics - 2026-11-06 (round 5)
+
+Reviewer: DeepSeek (`deepseek-flash`) through the direct API, `xhigh`, read-only
+at `d2a9346`. All six round-4 dispositions held, including the counter question:
+the reviewer proved `stored == payload + MESSAGE_OVERHEAD` in both paths and that
+every release uses the same function. **No critical, high or medium** — the first
+clean round. Six lows, all fixed in this pass.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| L-1 | low | `take_drops` never flushed the deferred queue after the drain, so a drop raised inside the drain was delivered only by unrelated traffic | **fixed**: the drain calls `deliver_pending_drops` after the guard restores the provider; `intro_round4_tests::a_drop_raised_during_a_drain_is_delivered_on_the_next_drain` no longer needs `agent.run()` |
+| L-2 | low | a panicking `take_drop_notifications` unwound into the caller with no `provider.panicked` on the tape | **fixed**: the drain is `catch_unwind`-contained, the guard restores the provider, the event is pushed with the phase, and the drain answers empty; `a_panicking_drain_restores_the_provider_and_is_on_the_tape` |
+| L-3 | low | five rustdoc sites still called `queued_bytes` "payload bytes" after it became the stored record | **fixed**: all five say "stored message-record bytes", matching `wire.md` |
+| L-4 | low | a drained channel kept the deque's allocation (~1.6 GiB across 4 096 channels while both counters read zero) | **fixed**: `take_at` shrinks an empty queue; `tests/channel_shrink_tests.rs` counts live bytes and fails without it (`103316 -> 102292`) |
+| L-5 | low | a provider name of 129..1024 bytes registered and introspected but could never be exported (the record parser allowed 128) | **fixed**: the record parser uses `intro::MAX_NAME_BYTES`, and `wire.md` distinguishes the channel rule (128) from the provider rule (1024); `a_provider_name_at_the_introduction_bound_round_trips_a_record` |
+| L-6 | low | refused `recv`/`recv_topic` were recorded nowhere, so a lane scanning channel ids was invisible | **fixed**: both entry points record the refusal after releasing the borrow; `a_refused_receive_is_recorded` |
+
+Gate: `scripts/local_gate.sh --no-msrv` green; `cargo test --all-features` green
+on both feature sets; fmt and doc clean. R-17 needs one more clean round.
+
+### R-16 security helpers - 2026-11-06 (round 9)
+
+Reviewer: DeepSeek (`deepseek-flash`) through the direct API, `xhigh`, read-only
+at `d2a9346`. Round-8 dispositions 2, 3, 4, 5 and 6 held; disposition 1 was
+correct for secret-bearing modules but **over-reached** to secret-free ones, and
+a second address class survived redaction. Verdict **NOT CLEAN**: two mediums and
+five lows; `persistence.rs` CLEAN.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F-1 | medium | the round-8 drop of provenance ran for a *redacting* caller of a secret-free module too, so `content_hash` answered a digest that is not the module's content address (a fetch-by-address flow silently misses) | **fixed**: the drop is gated on `holds_secret`; `domain_round10_tests::a_redacting_capability_gets_the_true_address_of_a_secret_free_module`. Negative control: the unconditional drop fails it |
+| F-2 | medium | a tainted blob's `hash` is `blake3(secret)` by contract and the library's redactor rewrites only its media type, so a redacted image or a redacted digest carried the oracle | **fixed**: `security::module_holds_secret` counts a tainted blob as secret material, and `erase_tainted_blob_addresses` zeroes the hash in `redact_module`, `redact_derived` and the domain's redacted digest; `security_round9_tests::a_tainted_blob_address_does_not_survive_redaction`. Negative control: removing the erase fails it |
+| F-3 | low | the round-8 comment block was pasted twice | **fixed** |
+| F-4 | low | `is_infinity_image` was documented as a shape test although it is the validating decode | **fixed**: the doc says so and points at `claims_infinity_image` as the gate |
+| F-5 | low | the tri-state claim was tested through `module_carries_a_secret` only | **fixed**: `both_egress_gates_classify_a_module_the_same_way` runs the five shapes through both gates and pins the exact codes |
+| F-6 | low (residual) | the library substitutes `""` for a secret that is a substring of the marker, so redacted bytes depend on that relationship | **recorded**: a library-level property of `hiding_placeholder`; closing it needs the codec to use a fixed placeholder, outside this section |
+| F-7 | low (residual) | projection work is bounded by node count, not bytes, so one large `Str` can make the first redacted hash clone, redact and hash the whole image | **recorded**: bounded to once per module by the cache; a byte term in `walk_weight` is the follow-up |
+
+Gate: `scripts/local_gate.sh --no-msrv` green; `cargo test --all-features` green
+on both feature sets; fmt and doc clean.
+
+### R-13 receipts - 2026-11-06 (round 11, fix pass)
+
+The five lows round 10 recorded, closed while the R-17/R-16 re-audits ran:
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| D | low | a stale lock whose nonce renders no claim name was unstealable, so one punctuation-only file wedged the log for ever | **fixed**: the quarantine name falls back to `unidentified` (the raw nonce still decides the match); `receipt_round5_tests::a_stale_lock_with_an_unrenderable_nonce_is_stealable`; negative control: restoring `return false` fails the append with "locked by another writer" |
+| E | low | a failed `writeln!` left an empty lock, which read as an interrupted creator and made the writer's own `still_holds` report a misleading "displaced" | **fixed**: the error propagates and the half-written lock is removed |
+| F | low | `record_receipt` sealed without consulting `receipted`, so the one-job-one-receipt rule rested only on `resolved_out_of_band` | **fixed**: the seal is guarded by the stored flag, the same guard the queued and cancel paths use (latent today) |
+| G | low | ADR-0021's C14 claimed type checks the opens did not all perform | **partly already fixed**: `read_header_start`, `read_tail_head`, `nonce_of`, `read_capped` and `lock_state` all type-check today; the ADR now says the check is not atomic with the open and records the `O_NOFOLLOW`/`fstat` fix as the residual that closes it |
 
 ### R-16 security helpers - 2026-11-06 (round 8)
 

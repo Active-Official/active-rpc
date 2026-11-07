@@ -70,7 +70,7 @@ pub const MAX_LINEAGE_DEPTH: usize = 64;
 /// Largest idempotency key a caller may present.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 
-/// Aggregate payload bytes every channel in one kernel may hold.
+/// Aggregate stored message-record bytes every channel in one kernel may hold.
 ///
 /// The per-channel ceiling alone is not a memory bound: 4 096 channels of 64 MiB
 /// is 256 GiB. This counter is what a sender actually pays for.
@@ -582,7 +582,7 @@ pub struct Kernel {
     dispatching: bool,
     /// Providers whose `on_drop` is running right now.
     delivering: BTreeSet<ProviderId>,
-    /// Payload bytes queued across every channel.
+    /// Stored message-record bytes queued across every channel.
     queued_channel_bytes: u64,
     /// Cached idempotency claims: the promise, the request fingerprint, and the
     /// fingerprint of the peer that claimed the key.
@@ -3148,50 +3148,75 @@ impl Agent {
         channel: ChannelId,
         topic: &str,
     ) -> Result<Option<Message>> {
-        let mut kernel = self.cell.borrow_mut();
-        check_subscriber(&kernel, lane, channel)?;
-        // A topic the channel could never hold is invalid text, not "no
-        // message". The subscriber check comes first so an unsubscribed lane
-        // still cannot tell an invalid topic from a valid one.
-        check_topic(topic)?;
-        let record = kernel
-            .channels
-            .get_mut(&channel)
-            .ok_or(Error::UnknownChannel(channel.0))?;
-        let message = record.recv_topic(topic)?;
-        if let Some(message) = &message {
-            let bytes =
-                Channel::message_bytes(&message.payload, &message.caps, message.topic.as_deref());
-            kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_sub(bytes);
-            kernel.push_event(Event::ChannelRecv {
-                channel,
-                sequence: message.sequence,
-            });
+        let outcome = {
+            let mut kernel = self.cell.borrow_mut();
+            (|| -> Result<Option<Message>> {
+                check_subscriber(&kernel, lane, channel)?;
+                // A topic the channel could never hold is invalid text, not "no
+                // message". The subscriber check comes first so an unsubscribed
+                // lane still cannot tell an invalid topic from a valid one.
+                check_topic(topic)?;
+                let record = kernel
+                    .channels
+                    .get_mut(&channel)
+                    .ok_or(Error::UnknownChannel(channel.0))?;
+                let message = record.recv_topic(topic)?;
+                if let Some(message) = &message {
+                    let bytes = Channel::message_bytes(
+                        &message.payload,
+                        &message.caps,
+                        message.topic.as_deref(),
+                    );
+                    kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_sub(bytes);
+                    kernel.push_event(Event::ChannelRecv {
+                        channel,
+                        sequence: message.sequence,
+                    });
+                }
+                Ok(message)
+            })()
+        };
+        if let Err(error) = &outcome {
+            // A refused receive is a refusal like any other: a lane scanning
+            // channel ids must not be invisible in the metrics (R-17 round 5,
+            // L-6).
+            self.record_refusal(lane, None, error);
         }
-        Ok(message)
+        outcome
     }
 
     /// Receive the next message on a channel, as `lane`.
     ///
     /// `lane` must be subscribed to the channel; see [`Agent::recv_topic`].
     pub fn recv(&self, lane: LaneId, channel: ChannelId) -> Result<Option<Message>> {
-        let mut kernel = self.cell.borrow_mut();
-        check_subscriber(&kernel, lane, channel)?;
-        let record = kernel
-            .channels
-            .get_mut(&channel)
-            .ok_or(Error::UnknownChannel(channel.0))?;
-        let message = record.recv()?;
-        if let Some(message) = &message {
-            let bytes =
-                Channel::message_bytes(&message.payload, &message.caps, message.topic.as_deref());
-            kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_sub(bytes);
-            kernel.push_event(Event::ChannelRecv {
-                channel,
-                sequence: message.sequence,
-            });
+        let outcome = {
+            let mut kernel = self.cell.borrow_mut();
+            (|| -> Result<Option<Message>> {
+                check_subscriber(&kernel, lane, channel)?;
+                let record = kernel
+                    .channels
+                    .get_mut(&channel)
+                    .ok_or(Error::UnknownChannel(channel.0))?;
+                let message = record.recv()?;
+                if let Some(message) = &message {
+                    let bytes = Channel::message_bytes(
+                        &message.payload,
+                        &message.caps,
+                        message.topic.as_deref(),
+                    );
+                    kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_sub(bytes);
+                    kernel.push_event(Event::ChannelRecv {
+                        channel,
+                        sequence: message.sequence,
+                    });
+                }
+                Ok(message)
+            })()
+        };
+        if let Err(error) = &outcome {
+            self.record_refusal(lane, None, error);
         }
-        Ok(message)
+        outcome
     }
 
     /// Issue a call. The returned promise is pending until the kernel runs.
@@ -4961,14 +4986,35 @@ impl Agent {
             record: Some(record),
             marked,
         };
-        guard
-            .record
-            .as_mut()
-            .expect("just set")
-            .take_drop_notifications()
+        let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            guard
+                .record
+                .as_mut()
+                .expect("just set")
+                .take_drop_notifications()
+        }));
+        drop(guard);
+        match drained {
+            Ok(drops) => {
+                // A drop raised inside the drain was requeued while the
+                // provider was checked out; deliver it now instead of waiting
+                // for unrelated traffic (R-17 round 5, L-1).
+                deliver_pending_drops(&self.cell);
+                drops
+            }
+            Err(_) => {
+                // The guard restored the provider before this point; the tape
+                // says why it briefly vanished (R-17 round 5, L-2).
+                self.cell.borrow_mut().push_event(Event::ProviderPanicked {
+                    provider,
+                    phase: "take_drop_notifications".to_string(),
+                });
+                Vec::new()
+            }
+        }
     }
 
-    /// Payload bytes queued across every channel in this kernel.
+    /// Stored message-record bytes queued across every channel in this kernel.
     ///
     /// This is the counter the kernel-wide channel ceiling compares against,
     /// and it charges each message's whole record, exactly like the per-channel
@@ -5307,6 +5353,16 @@ impl Agent {
     fn record_receipt(&self, job: &Job, refusal: Option<&Error>) {
         let mut kernel = self.cell.borrow_mut();
         if !kernel.receipts_enabled {
+            return;
+        }
+        // One job, one receipt: the queued and cancel paths already guard on
+        // this flag, and dispatch relied only on `resolved_out_of_band`, one
+        // refactor away from a second decision for one call (R-13 round 10, F).
+        if kernel
+            .jobs
+            .get(&job.id)
+            .is_some_and(|stored| stored.receipted)
+        {
             return;
         }
         kernel.seal_receipt(job, refusal);

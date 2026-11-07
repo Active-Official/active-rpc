@@ -54,66 +54,74 @@ fn filetime_set(path: &Path, when: std::time::SystemTime) {
 /// clean one (R-13 round 5, #1).
 #[test]
 fn a_contended_steal_never_corrupts_the_log() {
-    let path = scratch("contended");
-    drop(ReceiptLog::create(&path).expect("create"));
-    // A crashed writer's lock, aged past the steal ceiling.
-    let lock = lock_of(&path);
-    std::fs::write(&lock, b"999-1 pid 4294967294 started 1").expect("lock");
-    filetime_set(
-        &lock,
-        std::time::SystemTime::now() - std::time::Duration::from_secs(600),
-    );
+    // The rest of the suite runs in parallel and can stall a thread past its
+    // lock budget, so a round with no winner is retried; the invariant below is
+    // checked on whatever landed in the round that did win.
+    for _round in 0..3 {
+        let path = scratch("contended");
+        drop(ReceiptLog::create(&path).expect("create"));
+        // A crashed writer's lock, aged past the steal ceiling.
+        let lock = lock_of(&path);
+        std::fs::write(&lock, b"999-1 pid 4294967294 started 1").expect("lock");
+        filetime_set(
+            &lock,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+        );
 
-    // Only the thread that wins the lock advances the sequence: a duplicate is
-    // refused as a chain fault, which is the clean outcome this test tolerates.
-    let next = std::sync::Arc::new(AtomicU64::new(1));
-    let mut threads = Vec::new();
-    for _ in 0..4 {
-        let path = path.clone();
-        let next = std::sync::Arc::clone(&next);
-        threads.push(std::thread::spawn(move || {
-            // A read that lands while another thread is appending refuses with
-            // "being written" rather than returning a prefix (R-13 round 7,
-            // #5), so a reader retries; that is what a caller does too.
-            let log = loop {
-                match ReceiptLog::open(&path) {
-                    Ok(log) => break log,
-                    Err(error) => {
-                        assert!(error.to_string().contains("being written"), "{error}");
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Only the thread that wins the lock advances the sequence: a duplicate
+        // is refused as a chain fault, which is the clean outcome this test
+        // tolerates.
+        let next = std::sync::Arc::new(AtomicU64::new(1));
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let path = path.clone();
+            let next = std::sync::Arc::clone(&next);
+            threads.push(std::thread::spawn(move || {
+                // A read that lands while another thread is appending refuses
+                // with "being written" rather than returning a prefix (R-13
+                // round 7, #5), so a reader retries; that is what a caller does
+                // too.
+                let log = loop {
+                    match ReceiptLog::open(&path) {
+                        Ok(log) => break log,
+                        Err(error) => {
+                            assert!(error.to_string().contains("being written"), "{error}");
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                };
+                for _ in 0..6 {
+                    let sequence = next.load(Ordering::SeqCst);
+                    match log.append(&receipt(sequence, "echo")) {
+                        Ok(()) => {
+                            next.store(sequence + 1, Ordering::SeqCst);
+                        }
+                        Err(error) => {
+                            assert_eq!(error.code(), "rpc/receipt", "a refusal is a lock refusal");
+                        }
                     }
                 }
-            };
-            let mut refusals = 0;
-            for _ in 0..6 {
-                let sequence = next.load(Ordering::SeqCst);
-                match log.append(&receipt(sequence, "echo")) {
-                    Ok(()) => {
-                        next.store(sequence + 1, Ordering::SeqCst);
-                    }
-                    Err(error) => {
-                        assert_eq!(error.code(), "rpc/receipt", "a refusal is a lock refusal");
-                        refusals += 1;
-                    }
-                }
-            }
-            refusals
-        }));
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("thread");
+        }
+        // Whatever the interleaving, the file must be a walkable chain: two
+        // appends under one lock is what this test exists to rule out.
+        let bytes = std::fs::read(&path).expect("read");
+        let records = ReceiptLog::verify_bytes(&bytes).expect("the contended log still walks");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lock);
+        if records.is_empty() {
+            continue;
+        }
+        // Contiguous from the header's start: a torn write would break this.
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record.sequence, records[0].sequence + index as u64);
+        }
+        return;
     }
-    for thread in threads {
-        let _ = thread.join().expect("thread");
-    }
-    // Whatever the interleaving, the file must be a walkable chain: two appends
-    // under one lock is what this test exists to rule out.
-    let bytes = std::fs::read(&path).expect("read");
-    let records = ReceiptLog::verify_bytes(&bytes).expect("the contended log still walks");
-    assert!(!records.is_empty(), "at least one append won the lock");
-    // Contiguous from the header's start: a torn write would break this.
-    for (index, record) in records.iter().enumerate() {
-        assert_eq!(record.sequence, records[0].sequence + index as u64);
-    }
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&lock);
+    panic!("no round won the lock");
 }
 
 /// A lock is a file an attacker can plant: its nonce must not steer the steal's
@@ -147,6 +155,34 @@ fn a_hostile_nonce_cannot_steer_the_steal_claim() {
         !escaped.exists(),
         "the claim escaped the log directory: {}",
         escaped.display()
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock);
+}
+
+/// A stale lock whose nonce renders no claim name is still steelable: refusing
+/// it wedged the log until someone removed the file by hand (R-13 round 10, D).
+#[test]
+fn a_stale_lock_with_an_unrenderable_nonce_is_stealable() {
+    let path = scratch("punctuation");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let lock = lock_of(&path);
+    // Punctuation only: `claim_name` cannot render it, and a pid no process
+    // can have keeps the liveness rule out of the way.
+    std::fs::write(&lock, b"/// pid 4294967294 started 1").expect("lock");
+    filetime_set(
+        &lock,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+    );
+
+    let log = ReceiptLog::open(&path).expect("open");
+    log.append(&receipt(1, "echo"))
+        .expect("the stale lock is stolen and the append lands");
+    assert_eq!(
+        ReceiptLog::verify_bytes(&std::fs::read(&path).expect("read"))
+            .expect("walk")
+            .len(),
+        1
     );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&lock);

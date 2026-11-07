@@ -412,7 +412,10 @@ impl CapabilityRecord {
         let provider = value
             .get("provider")
             .and_then(Json::as_str)
-            .filter(|name| crate::security::valid_text(name, 128))
+            // The same bound the introduction module applies to a provider
+            // name: a kernel could describe a 129-byte name but never export a
+            // record for it, so the two disagreed (R-17 round 5, L-5).
+            .filter(|name| crate::security::valid_text(name, crate::intro::MAX_NAME_BYTES))
             .ok_or_else(|| Error::persistence("provider name is missing or out of range"))?;
         let object = value
             .get("object")

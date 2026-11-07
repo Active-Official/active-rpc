@@ -24,11 +24,11 @@ Updated 2026-11-06 at `cf5f969`.
 | R-10 | bulk transfer | 17 | open | r16 fixed two mediums (wall-failure accounting, `abort` scope); r17 in flight |
 | R-11 | identity | 14 | open | r13 fixed two mediums (child-first rotation, event schema); r14 in flight |
 | R-12 | replay | 6 | **closed** | r5 and r6 CLEAN |
-| R-13 | receipts | 8 | open | r7 fixed four mediums; r8 fixed two mediums and five lows (lock ownership, one liveness predicate, quarantine steal, lossy lock parse); r9 needed for a first clean round |
+| R-13 | receipts | 11 | open | r10's high and two mediums fixed at `68f29ab` (ownership re-checked before every mutation, future timestamps, type-checked readers); its five lows fixed in round 11; r11's audit must come back clean, then r12 |
 | R-14 | wasm tools | 5 | **closed** | r3's medium was refuted with a test; r4 and r5 CLEAN |
 | R-15 | observability | 5 | **closed** | r2's high and mediums fixed; r4 and r5 CLEAN |
-| R-16 | security helpers | 8 | open | r8 one high (the `content_hash` projection hashed provenance, the same oracle class the bytes path had closed) and five lows, all fixed; r9 and r10 must be clean |
-| R-17 | introduction / topics | 4 | open | r4 found a round-3 regression (the kernel-wide channel counter added a different quantity than it subtracted) and four mediums (drain check-out, duplicate adapter names, ambiguous export), all fixed; r5 and r6 must be clean |
+| R-16 | security helpers | 9 | open | r9 found two mediums the round-8 fix introduced or left (the secret-free digest over-reach, the tainted blob address) and five lows, all fixed or recorded; r10 and r11 must be clean |
+| R-17 | introduction / topics | 5 | open | r5 CLEAN (no critical/high/medium), six lows fixed (drain flush and panic containment, record-bytes docs, queue shrink, one provider-name bound, receive refusals recorded); r6 must be clean to close |
 | R-18 | CLI | 2 | open | r2 had one high and eight mediums, all fixed; r3 and r4 needed |
 | R-19 | control plane | 2 | open | r2 had two highs and six mediums, all fixed; r3 and r4 needed |
 | R-20 | fuzz program | 2 | open | r2 had three highs and three mediums, all fixed; r3 and r4 needed |

@@ -31,8 +31,8 @@ CONTROLS = [
         # (one implementation, so a fix in one place cannot drift). The anchor
         # follows the code.
         "file": "src/security.rs",
-        "find": "    redactor\n        .redact(module)\n        .map_err(|error| Error::Payload(error.code().to_string()))\n",
-        "replace": "    Ok(())\n",
+        "find": "    redactor\n        .redact(module)\n        .map_err(|error| Error::Payload(error.code().to_string()))?;\n",
+        "replace": "",
         "suite": "redteam_tests",
         "test": "review_module_payloads_redact_a_secret_copy",
         "why": "Module payload redaction is disabled; the subgraph response carries the canary.",

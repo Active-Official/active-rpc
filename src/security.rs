@@ -299,6 +299,8 @@ pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut module = active_infinity::decode(&redacted)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     module.set_provenance(None);
+    erase_tainted_blob_addresses(&mut module);
+
     let redacted = active_infinity::encode(&module)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     check_module_payload(&redacted)?;
@@ -327,7 +329,12 @@ pub fn redact_derived(
 ) -> Result<()> {
     redactor
         .redact(module)
-        .map_err(|error| Error::Payload(error.code().to_string()))
+        .map_err(|error| Error::Payload(error.code().to_string()))?;
+    // The library redacts a tainted blob's media type, not its content
+    // address; a cone or a patched reply is still a projection that leaves the
+    // kernel (R-16 round 9, F-2).
+    erase_tainted_blob_addresses(module);
+    Ok(())
 }
 
 /// True when a payload claims to be an Infinity image.
@@ -367,15 +374,44 @@ fn inspect_module(bytes: &[u8]) -> ModuleKind {
     }
 }
 
-/// True when a decoded module holds a node marked secret.
+/// True when a decoded module holds secret material.
+///
+/// A `Secret`/`SecretRef` node is the obvious case. A **tainted blob** is the
+/// other: its bytes are secret-derived and its `hash` is a content address over
+/// them, which the codec keeps through redaction (R-16 round 9, F-2).
 fn module_holds_secret(module: &active_infinity::InfinityModule) -> bool {
     (0..module.node_count()).any(|index| {
         module
             .get(active_infinity::NodeId(index as u32))
             // A node the decoder counts but cannot materialise cannot be
             // proven secret-free, so it fails closed (round 3, F-1).
-            .is_none_or(|node| node.is_secret())
+            .is_none_or(|node| node.is_secret() || is_tainted_blob(node))
     })
+}
+
+fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
+    matches!(node, active_infinity::Inode::Blob { tainted: true, .. })
+}
+
+/// Zero the content address of every tainted blob.
+///
+/// A tainted blob's hash is `blake3(secret bytes)` by definition, and the
+/// library's redactor rewrites only its media type: leaving the hash in a
+/// projection hands the caller an offline equality oracle (R-16 round 9, F-2).
+pub(crate) fn erase_tainted_blob_addresses(module: &mut active_infinity::InfinityModule) {
+    for index in 0..module.node_count() {
+        let Ok(node) = module.node_mut(active_infinity::NodeId(index as u32)) else {
+            continue;
+        };
+        if let active_infinity::Inode::Blob {
+            hash,
+            tainted: true,
+            ..
+        } = node
+        {
+            *hash = [0u8; 32];
+        }
+    }
 }
 
 /// True when a module image carries a structural secret.
@@ -398,10 +434,14 @@ pub fn module_carries_a_secret(bytes: &[u8]) -> bool {
     }
 }
 
-/// True when the bytes are an Active Infinity image.
+/// True when the bytes decode as an Active Infinity image.
 ///
-/// `Value::Module` also carries opaque provider output (a WASM tool's binary
-/// result), which has no secret structure to redact.
+/// This is the **validating** form, not a shape test: `decode` checks the
+/// header and rejects a trailing tail, so a payload that merely starts with the
+/// magic is `false` here and `true` in `claims_infinity_image`, which is the
+/// predicate the gates use (R-16 round 9, F-4). `Value::Module` also carries
+/// opaque provider output (a WASM tool's binary result), which has no secret
+/// structure to redact.
 pub fn is_infinity_image(bytes: &[u8]) -> bool {
     active_infinity::decode(bytes).is_ok()
 }

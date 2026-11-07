@@ -1195,6 +1195,48 @@ fn a_secret_bearing_content_hash_ignores_provenance() {
     );
 }
 
+/// A redacting capability asking for the hash of a secret-free module must get
+/// the module's true content address: nothing needed redaction, and a fetch by
+/// address would otherwise silently miss (R-16 round 9, F-1).
+#[test]
+fn a_redacting_capability_gets_the_true_address_of_a_secret_free_module() {
+    use active_infinity::{ProvEntry, ProvValue, Provenance};
+
+    let mut module = InfinityModule::new();
+    let value = module.push(Inode::Str("plain".to_string()));
+    let root = module.push(Inode::Table {
+        fields: vec![("a".to_string(), value)],
+    });
+    module.set_root(Some(root));
+    module.set_provenance(Some(Provenance {
+        producer: Some("test".to_string()),
+        timestamp_ms: 1,
+        model: None,
+        tool: None,
+        parent: Some([0x71; 32]),
+        entries: vec![ProvEntry {
+            key: "lineage".to_string(),
+            value: ProvValue::Hash([0x72; 32]),
+        }],
+    }));
+    let raw = active_infinity::encode(&module).expect("encode");
+
+    let (agent, cap, lane) = install(module, &["content_hash"], None, true);
+    let promise = agent
+        .call(lane, &cap, "content_hash", Vec::new())
+        .expect("queued");
+    agent.run();
+    let Value::Text(answer) = promise.value().expect("hash") else {
+        panic!("a text digest");
+    };
+    let expected = active_infinity::content_hash(&raw).expect("hash");
+    assert_eq!(
+        answer,
+        format!("blake3:{}", active_infinity::ir::hash_hex(&expected)),
+        "a secret-free module's digest is its true content address"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Round 19
 // ---------------------------------------------------------------------------

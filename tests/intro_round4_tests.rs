@@ -119,7 +119,7 @@ fn a_drain_leaves_the_providers_queued_work_alone() {
 }
 
 #[test]
-fn a_drop_raised_during_a_drain_is_delivered_later() {
+fn a_drop_raised_during_a_drain_is_delivered_on_the_next_drain() {
     let agent = Agent::new();
     let held: Rc<RefCell<Option<CapHandle>>> = Rc::new(RefCell::new(None));
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -132,13 +132,56 @@ fn a_drop_raised_during_a_drain_is_delivered_later() {
     *held.borrow_mut() = Some(cap);
 
     // The drain drops the last handle; with the provider checked out the
-    // notification waits instead of being discarded.
+    // notification waits instead of being discarded, and the drain flushes it
+    // itself -- no unrelated traffic is needed (R-17 round 5, L-1).
     assert!(agent.take_drops(id).is_empty());
-    agent.run();
     assert_eq!(
         agent.take_drops(id),
         vec![(7, cap_id)],
-        "the drop raised during the drain is delivered on the next pass"
+        "the drop raised during the drain is delivered by the next drain"
+    );
+}
+
+/// A provider that panics in the drain must be restored, taped, and answered
+/// with an empty list (R-17 round 5, L-2).
+struct PanickingDrain;
+
+impl Provider for PanickingDrain {
+    fn name(&self) -> &'static str {
+        "panicking"
+    }
+    fn methods(&self) -> Vec<String> {
+        vec!["noop".to_string()]
+    }
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::text("ok")))
+    }
+    fn take_drop_notifications(&mut self) -> Vec<(u64, CapId)> {
+        panic!("the drain panics");
+    }
+}
+
+#[test]
+fn a_panicking_drain_restores_the_provider_and_is_on_the_tape() {
+    let agent = Agent::new();
+    let id = agent.register(Box::new(PanickingDrain));
+    assert!(
+        agent.take_drops(id).is_empty(),
+        "a panicking drain answers empty"
+    );
+    // The provider is back in the registry and still servable.
+    agent
+        .mint(id, 0, CapAttrs::new(&["noop"]))
+        .expect("the provider was restored");
+    assert!(
+        agent
+            .trace()
+            .iter()
+            .any(|event| event.event() == "provider.panicked"),
+        "the panic is on the tape"
     );
 }
 
@@ -213,6 +256,65 @@ fn a_provider_may_mint_for_itself_while_it_is_dispatching() {
         *minted.borrow(),
         Some(true),
         "the provider is registered while it is checked out for its own call"
+    );
+}
+
+/// The provider-name bound the introduction applies is the one the sealed-record
+/// parser accepts, so a name a kernel can describe is one it can persist
+/// (R-17 round 5, L-5).
+#[test]
+fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
+    let name: &'static str = Box::leak("p".repeat(200).into_boxed_str());
+    let agent = Agent::with_secret([0x55; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x98; 32]);
+    let provider = agent.register(Box::new(Adapter {
+        name,
+        methods: vec!["noop".to_string()],
+    }));
+    let owner = IdentityPolicy::default()
+        .admit(
+            Some(&PeerIdentity::from_certificate(b"long-name-owner")),
+            true,
+        )
+        .expect("admit");
+    let mut attrs = CapAttrs::new(&["noop"]);
+    attrs.persistence = CapPersistence::Durable;
+    let cap = agent.mint_bound(&owner, provider, 0, attrs).expect("cap");
+    let record = agent
+        .export_capability(&cap)
+        .expect("a name the introduction accepts is persistable");
+    drop(cap);
+    agent
+        .restore_capability(&record, &owner)
+        .expect("and restorable");
+    assert!(!agent.intro().expect("intro").is_empty());
+}
+
+/// A refused receive is a refusal like any other (R-17 round 5, L-6).
+#[test]
+fn a_refused_receive_is_recorded() {
+    let agent = Agent::new();
+    let channel = agent
+        .create_channel("quiet", active_rpc::channel::Direction::Both)
+        .expect("channel");
+    let lane = agent
+        .create_lane("outsider", Budget::default())
+        .expect("lane");
+    let before = agent.metrics().calls_refused;
+    let error = agent.recv(lane, channel).expect_err("not subscribed");
+    assert_eq!(error.code(), "rpc/unknown-channel");
+    assert_eq!(
+        agent.metrics().calls_refused,
+        before + 1,
+        "the refusal is in the metrics"
+    );
+    assert!(
+        agent
+            .trace()
+            .iter()
+            .any(|event| event.event() == "call.refused"),
+        "and on the tape"
     );
 }
 

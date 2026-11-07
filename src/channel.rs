@@ -113,7 +113,7 @@ pub struct ChannelStats {
     pub direction: Direction,
     /// Messages queued and not yet received.
     pub queued: usize,
-    /// Payload bytes currently queued.
+    /// Stored message-record bytes currently queued.
     pub queued_bytes: u64,
     /// Total messages sent (including those already received).
     pub sent: u64,
@@ -140,7 +140,7 @@ pub struct Channel {
     closed: bool,
     /// Lanes subscribed to this channel.
     pub subscribers: BTreeSet<u64>,
-    /// Payload bytes currently queued.
+    /// Stored message-record bytes currently queued.
     queued_bytes: u64,
     /// Total messages sent (including those already received).
     pub sent: u64,
@@ -229,7 +229,7 @@ impl Channel {
         self.queued_bytes.saturating_add(bytes) <= MAX_QUEUED_BYTES
     }
 
-    /// Payload bytes a message with this shape would occupy.
+    /// Stored message-record bytes a message with this shape occupies.
     pub fn message_bytes(payload: &Value, caps: &[CapId], topic: Option<&str>) -> u64 {
         queued_size(payload, caps, topic)
     }
@@ -349,6 +349,12 @@ impl Channel {
                 self.received += 1;
                 let bytes = queued_size(&message.payload, &message.caps, message.topic.as_deref());
                 self.queued_bytes = self.queued_bytes.saturating_sub(bytes);
+                if self.queue.is_empty() {
+                    // A drained channel must not keep the records' allocation: with
+                    // 4 096 channels that is ~1.6 GiB resident while both counters
+                    // read zero (R-17 round 5, L-4).
+                    self.queue.shrink_to_fit();
+                }
                 Ok(Some(message))
             }
             None => Ok(None),
@@ -375,7 +381,7 @@ impl Channel {
         }
     }
 
-    /// Payload bytes currently queued.
+    /// Stored message-record bytes currently queued.
     pub fn queued_bytes(&self) -> u64 {
         self.queued_bytes
     }

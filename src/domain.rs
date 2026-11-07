@@ -718,17 +718,19 @@ impl ModuleProvider {
                             let mut redacted = slot.module.clone();
                             crate::security::redact_derived(&mut redacted, &slot.redactor)
                                 .map_err(redaction_fault)?;
-                            // Provenance names the pre-redaction image: its
-                            // `parent` and `Hash` entries are content
-                            // addresses over the secret heap, so hashing them
-                            // rebuilt exactly the oracle this branch exists to
-                            // close (R-16 round 8, #1).
-                            // Provenance names the pre-redaction image: its
-                            // `parent` and `Hash` entries are content
-                            // addresses over the secret heap, so hashing them
-                            // rebuilt exactly the oracle this branch exists to
-                            // close (R-16 round 8, #1).
-                            redacted.set_provenance(None);
+                            // Only a secret-bearing module has something to
+                            // hide: its provenance names the pre-redaction
+                            // image, and those addresses are an offline oracle.
+                            // A secret-free module's redacted projection *is*
+                            // the module, so its digest must stay the true
+                            // content address a `fetch by address` flow uses
+                            // (R-16 round 8, #1; round 9, F-1).
+                            if holds_secret {
+                                redacted.set_provenance(None);
+                            }
+                            // A tainted blob's hash is secret-derived whatever
+                            // the module's provenance says (round 9, F-2).
+                            crate::security::erase_tainted_blob_addresses(&mut redacted);
                             let redacted_bytes = encode(&redacted).map_err(|error| {
                                 redaction_fault(Error::Payload(error.code().to_string()))
                             })?;
