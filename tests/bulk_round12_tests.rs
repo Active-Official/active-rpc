@@ -447,3 +447,41 @@ fn a_redacting_finish_omits_the_raw_digest() {
         "the reply still says how much was stored: {entries:?}"
     );
 }
+
+/// A body that claims to be an image and cannot be parsed reports a parser
+/// fault, not "this is not an image" (R-16 round 6, #4).
+#[test]
+fn a_corrupted_image_body_reports_a_parser_error() {
+    use active_infinity::{encode, InfinityModule, Inode};
+
+    let mut module = InfinityModule::new();
+    let root = module.push(Inode::Str("value".to_string()));
+    module.set_root(Some(root));
+    let mut image = encode(&module).expect("encode");
+    let last = image.len() - 1;
+    image[last] ^= 0xFF;
+    assert!(
+        active_infinity::decode(&image).is_err(),
+        "the fixture is corrupt"
+    );
+
+    let transfer = BulkTransfer::new(image, 1_000).expect("transfer");
+    let mut provider = BulkProvider::new();
+    drive(&mut provider, &transfer);
+    let reply = provider
+        .invoke(0, &with_wall("finish", transfer.finish_frame(), 60_000))
+        .expect("finish");
+    let active_rpc::Response::Value(Value::Map(entries)) = reply else {
+        panic!("a map reply");
+    };
+    assert_eq!(
+        entries.get("canonical"),
+        Some(&Value::Bool(false)),
+        "a corrupt image has no address: {entries:?}"
+    );
+    assert_eq!(
+        entries.get("content_error"),
+        Some(&Value::text("parser")),
+        "the reply says why: {entries:?}"
+    );
+}

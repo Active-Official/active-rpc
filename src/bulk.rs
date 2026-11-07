@@ -1374,9 +1374,11 @@ fn classify_body(body: &[u8]) -> (Option<[u8; 32]>, Option<&'static str>) {
         match crate::security::redact_module(body) {
             Ok(redacted) => match active_infinity::content_hash(&redacted) {
                 Ok(address) => Ok(Some(address)),
-                Err(_) => Err(active_infinity::decode(body).is_ok()),
+                // The image redacted but its address failed: a parser fault
+                // unless it does not even claim to be an image (R-16 round 6, #4).
+                Err(_) => Err(crate::security::claims_infinity_image(body)),
             },
-            Err(_) => Err(active_infinity::decode(body).is_ok()),
+            Err(_) => Err(crate::security::claims_infinity_image(body)),
         }
     }));
     match classified {

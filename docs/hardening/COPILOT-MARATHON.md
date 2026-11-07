@@ -3416,6 +3416,36 @@ Gate: full `gate-rpc.sh` green — all-features and no-default suites, clippy on
 both sets, fmt, doc, the fuzz and control-plane and CLI manifests, and
 `python scripts/negative_controls.py --check` 9/9.
 
+### R-14 wasm tools - 2026-11-06 (round 5)
+
+Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at
+`588cf3b`. **CLEAN** — no critical, high or medium. The round-3 M-1 refutation was
+re-derived independently (the limiter admits the grow, so the `wasm/fuel` refusal
+is the engine's) and the two grow tests jointly pin "charged only after a
+successful grow". **R-14 closes** (rounds 4 and 5 clean).
+
+Seven lows recorded, three fixed here:
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | low | `wire.md` still said the kernel's egress panic reports `wasm/trap`, contradicting the `provider/egress-panic` paragraph in the same section | **fixed**: the stale clause is gone |
+| 2 | low | the ADR's `wasm/input` row claimed three conditions that return `rpc/invalid-argument` or `rpc/tool-policy` | **fixed**: the row keeps "exceeds the input window" and names the adapter codes for the rest |
+| 3 | low | `module_carries_a_secret` decodes but does not `validate`, so a decodable-but-invalid image is treated by the node walk | **accepted**: the guard's contract is "no secret node", and validation at this gate duplicates the egress validation added in R-16 round 6 |
+| 4-7 | low | the `wasm/instantiate` class has no fixture, `random_cap`'s narrowing is dead code, and two ADR rows are imprecise | **recorded** |
+
+### R-15 observability - 2026-11-06 (round 5)
+
+Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at
+`588cf3b`. **CLEAN** — no critical, high or medium. All five round-3/4 claims held,
+with the counter walk confirming no double count. **R-15 closes** (rounds 4 and 5
+clean).
+
+Six lows recorded: an unrecorded `resolve` refusal for a dropped capability; two
+`observability.md` rows whose semantics do not match what the kernel emits
+(`call.refused`, `job.completed`); `receipts.dropped` sampling; an event-less
+`promises_double_settled`; the shared recorder's unreachable `ToolPolicy` arm when
+`cap` is None; and two counters that use `+= 1` where every other counter
+saturates. The `+= 1` pair is fixed; the rest are recorded for the next round.
+
 ### R-16 security helpers - 2026-11-06 (round 6)
 
 Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at
@@ -3427,7 +3457,7 @@ Verdict **NOT CLEAN**: one medium and four lows.
 | 1 | medium | the redaction gate still classified by `decode` alone, so a secret-bearing image that fails to decode was returned **verbatim** to a `redact = 1` capability: the mode that promises confidentiality leaked what the other mode now refuses | **fixed**: one predicate, `claims_infinity_image` (decodes, or carries the magic), is used by both `module_has_secret` and `redact_value`; `a_corrupted_image_is_not_returned_by_redaction` asserts the corrupted image collapses to `Value::Secret`, that an intact image redacts without its secret, and that opaque bytes still pass |
 | 2 | low | the wired non-redacting egress proved decodability, not validity, so an image plus a trailing tail crossed a boundary whose receiver refuses it | **fixed**: `assert_no_structural_secrets` validates a decodable image with `check_module_payload`; `an_image_with_a_trailing_byte_is_refused_by_the_egress` |
 | 3 | low | the conversion truncated at `depth >= LIMIT` while the wire rule refuses `depth > LIMIT`, so a legitimate shape at the cap became `Null` | **fixed**: the comparison matches the wire; the deep-value test asserts the cap boundary |
-| 4 | low | a corrupted image is reported by the bulk provider as "not an image" (`content_error: null`) | **open** — the bulk reply's classification should say `parser` for a magic-prefixed payload that does not decode |
+| 4 | low | a corrupted image is reported by the bulk provider as "not an image" (`content_error: null`) | **fixed**: the bulk classification shares `claims_infinity_image`, so a magic-prefixed payload that does not decode reports `content_error: "parser"`; `a_corrupted_image_body_reports_a_parser_error` |
 | 5 | low | `ModuleProvider::module` hands out the raw secret-bearing arena | **documented** as the owner's view (see round 5, #4): the provider is the host's object, and no wire path returns it |
 
 Gate: the full local gate green after the fixes (both clippy sets, both test sets,

@@ -305,7 +305,7 @@ pub fn redact_derived(
 /// pass every gate. The two gates (secret detection and redaction) must use the
 /// same predicate, or the mode that promises confidentiality treats the shape
 /// the other mode refuses (R-16 rounds 5-6).
-fn claims_infinity_image(bytes: &[u8]) -> bool {
+pub(crate) fn claims_infinity_image(bytes: &[u8]) -> bool {
     is_infinity_image(bytes) || bytes.starts_with(&active_infinity::MAGIC)
 }
 
