@@ -4,11 +4,9 @@
 use std::path::PathBuf;
 
 use active_rpc::kernel::Provider;
-#[cfg(unix)]
 use active_rpc::receipts::LOG_HEADER_LEN;
 use active_rpc::receipts::{Decision, ReceiptLog};
 use active_rpc::value::{Call, Response};
-#[cfg(unix)]
 use active_rpc::Receipt;
 use active_rpc::{Agent, Budget, CapAttrs, Error};
 
@@ -22,7 +20,6 @@ fn scratch(name: &str) -> PathBuf {
     path
 }
 
-#[cfg(unix)]
 fn receipt(sequence: u64) -> Receipt {
     Receipt {
         sequence,
@@ -137,4 +134,24 @@ fn a_receipt_records_the_providers_own_code() {
         Decision::Refused("wasm/trap".to_string()),
         "the receipt collapsed the provider code"
     );
+}
+
+/// R-13 round 15, F1: an in-place edit keeps the inode, the length, the header
+/// and the trailing head. The modification time does not, so the append
+/// re-walks and refuses the broken chain.
+#[test]
+fn an_interior_edit_through_the_same_path_is_not_trusted() {
+    let path = scratch("inplace");
+    let log = ReceiptLog::create(&path).expect("create");
+    for sequence in 1..=3 {
+        log.append(&receipt(sequence)).expect("append");
+    }
+    let mut bytes = std::fs::read(&path).expect("read");
+    bytes[LOG_HEADER_LEN + 20] ^= 0xff;
+    std::fs::write(&path, &bytes).expect("rewrite in place");
+    assert!(
+        log.append(&receipt(4)).is_err(),
+        "the fast path trusted an in-place edit"
+    );
+    let _ = std::fs::remove_file(&path);
 }

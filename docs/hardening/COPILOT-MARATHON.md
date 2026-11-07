@@ -177,7 +177,7 @@ write keeps the inode and the other three checks.
 
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
-| F1 | high | an interior edit written through the log's own path (or a hard link) keeps length, header, tail and inode, so the append fast path trusts a file no reader can walk again | **partial**: the cache also records the modification time, which an ordinary in-place write changes; a writer that can set it back is the authenticity residual ADR-0021 records. The full fix (re-walk every append, or an OS lock) is recorded for r16 |
+| F1 | high | an interior edit written through the log's own path (or a hard link) keeps length, header, tail and inode, so the append fast path trusts a file no reader can walk again | **fixed for an ordinary write**: `LogState.modified` records the mtime and the fast path requires it (`an_interior_edit_through_the_same_path_is_not_trusted`, which fails when the check is disabled). A writer that sets the mtime back is the authenticity residual ADR-0021 records; an OS lock is the only complete answer and stays recorded |
 | F2 | medium | a partial magic-prefixed lock (a crashed write) is unjudgeable, so it wedges the log; non-unix cleanup cannot remove it | **open for r16**: needs a "magic + partial" state that is still judgeable |
 | F3 | medium | `repair` refuses a tail whose 4-byte length is out of range, though no record survives there | **open for r16** |
 | F4 | low | the steal matches by text rather than by the judged inode, so the empty-nonce rule can delete a lock created in the create-to-write window | **open for r16** |

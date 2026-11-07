@@ -230,6 +230,14 @@ struct LogState {
     /// (R-13 round 14, F1). `None` means the walk did not come from a handle,
     /// and the fast path then re-walks.
     identity: Option<(u64, u64)>,
+    /// The file's modification time when the walk happened.
+    ///
+    /// The inode is invariant under an in-place write, so an interior edit
+    /// through the log's own path (or a hard link) kept length, header, tail
+    /// and identity intact and the append kept trusting the cache. The mtime
+    /// changes on that write; a writer who can set it back is the authenticity
+    /// residual ADR-0021 records (R-13 round 15, F1).
+    modified: Option<std::time::SystemTime>,
 }
 
 /// One read of a log: the records and the tail they end at.
@@ -1162,6 +1170,7 @@ impl ReceiptLog {
                 head: [0u8; 32],
                 last_ms: 0,
                 identity: None,
+                modified: None,
             })),
         };
         let mut header = Vec::with_capacity(LOG_HEADER_LEN);
@@ -1300,6 +1309,8 @@ impl ReceiptLog {
                 // is the one edited). The inode is what a copy cannot keep
                 // (R-13 round 14, F1).
                 && identity_matches(&self.path, cached.identity)
+                && cached.modified.is_some()
+                && cached.modified == path_modified(&self.path)
                 && read_header_start(&self.path) == Some(cached.start)
                 // A replacement of exactly the same length would pass the two
                 // checks above while its trailing head is another chain: the
@@ -1309,9 +1320,10 @@ impl ReceiptLog {
             if usable {
                 cached
             } else {
-                let (bytes, identity) = read_capped_with_identity(&self.path)?;
+                let (bytes, identity, modified) = read_capped_with_identity(&self.path)?;
                 let (_, mut walked) = walk_log(&bytes)?;
                 walked.identity = identity;
+                walked.modified = modified;
                 walked
             }
         };
@@ -1630,7 +1642,7 @@ fn read_tail_head(path: &std::path::Path) -> Option<[u8; 32]> {
 /// Read a log file under the size ceiling, refusing a larger one without
 /// allocating it.
 fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
-    read_capped_with_identity(path).map(|(bytes, _)| bytes)
+    read_capped_with_identity(path).map(|(bytes, _, _)| bytes)
 }
 
 /// The identity of an open file on unix: `(dev, ino)`.
@@ -1659,6 +1671,15 @@ fn path_identity(path: &std::path::Path) -> Option<(u64, u64)> {
 #[cfg_attr(not(unix), allow(dead_code))]
 fn path_identity(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
+}
+
+/// The path's modification time, without following a link.
+fn path_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    meta.modified().ok()
 }
 
 /// Whether the path still names the file the state was walked from.
@@ -1695,7 +1716,7 @@ fn same_identity(path: &std::path::Path, identity: Option<(u64, u64)>) -> bool {
 }
 
 /// The bytes read, and the identity of the handle that read them.
-type ReadLog = (Vec<u8>, Option<(u64, u64)>);
+type ReadLog = (Vec<u8>, Option<(u64, u64)>, Option<std::time::SystemTime>);
 
 /// Read the log and report the identity of the handle that was read.
 fn read_capped_with_identity(path: &std::path::Path) -> Result<ReadLog> {
@@ -1725,7 +1746,8 @@ fn read_capped_with_identity(path: &std::path::Path) -> Result<ReadLog> {
     if bytes.len() as u64 > MAX_LOG_BYTES {
         return Err(Error::receipt("the receipt log exceeds the size ceiling"));
     }
-    Ok((bytes, identity))
+    let modified = path_modified(path);
+    Ok((bytes, identity, modified))
 }
 
 /// True when a writer is, or very recently was, appending.
@@ -1761,7 +1783,7 @@ fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogStat
             std::thread::sleep(std::time::Duration::from_millis(20));
             continue;
         }
-        let (bytes, identity) = read_capped_with_identity(path)?;
+        let (bytes, identity, _) = read_capped_with_identity(path)?;
         let walked = walk_log(&bytes);
         let length_now = std::fs::metadata(path)
             .map(|metadata| metadata.len())
@@ -1788,7 +1810,7 @@ fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogStat
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (bytes, identity) = read_capped_with_identity(path)?;
+    let (bytes, identity, _) = read_capped_with_identity(path)?;
     let length_now = std::fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(u64::MAX);
@@ -2062,6 +2084,7 @@ fn walk_log(bytes: &[u8]) -> Result<(Vec<Receipt>, LogState)> {
         head: expected_previous,
         last_ms: last_time.unwrap_or(0),
         identity: None,
+        modified: None,
     };
     Ok((receipts, state))
 }
