@@ -131,6 +131,9 @@ impl Heartbeat {
 }
 
 /// How long a snapshot may keep the same uptime before the worker is stale.
+/// Open dashboard sockets this plane will serve.
+const MAX_WS_CLIENTS: u64 = 64;
+
 pub const STALE_WORKER_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
@@ -236,6 +239,24 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                     }
                 };
                 match rx.recv_timeout(Duration::from_secs(1)) {
+                    // After a sticky down the core's state is unverified, so a
+                    // mutating command must not run on it
+                    // (R-19 round 4, F18).
+                    Ok(Command::Scenario(_, reply)) if down.load(Ordering::SeqCst) => {
+                        let _ = reply.send(Err(CommandFailure::Internal(
+                            "the kernel worker is down; restart the plane".to_string(),
+                        )));
+                    }
+                    Ok(Command::Level(_, _, reply)) if down.load(Ordering::SeqCst) => {
+                        let _ = reply.send(Err(CommandFailure::Internal(
+                            "the kernel worker is down; restart the plane".to_string(),
+                        )));
+                    }
+                    Ok(Command::Benchmark(_, reply)) if down.load(Ordering::SeqCst) => {
+                        let _ = reply.send(Err(CommandFailure::Internal(
+                            "the kernel worker is down; restart the plane".to_string(),
+                        )));
+                    }
                     Ok(Command::Scenario(id, reply)) => {
                         let mut result = None;
                         let outcome = guarded(
@@ -888,6 +909,11 @@ async fn ws(ws: WebSocketUpgrade, headers: HeaderMap, State(state): State<AppSta
             return (StatusCode::FORBIDDEN, "cross-origin websocket refused").into_response();
         }
     }
+    // Every socket holds a full snapshot per tick; an unbounded set is a
+    // local memory amplifier (R-19 round 4, F11).
+    if state.observers.load(Ordering::Relaxed) >= MAX_WS_CLIENTS {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many dashboards").into_response();
+    }
     ws.on_upgrade(move |socket| stream_socket(socket, state))
 }
 
@@ -1036,11 +1062,12 @@ pub fn same_origin(origin: &str, host: Option<&str>) -> bool {
         return false;
     };
     let name = name.trim_matches(['[', ']']).to_ascii_lowercase();
-    let default_port = match parsed.scheme_str() {
-        Some("https") => 443,
-        Some("http") => 80,
-        _ => return false,
-    };
+    // The plane serves plain HTTP: an `https` origin is a different origin
+    // even on the same host and port (R-19 round 4, F14).
+    if parsed.scheme_str() != Some("http") {
+        return false;
+    }
+    let default_port = 80;
     let port = parsed.port_u16().unwrap_or(default_port);
     match host.and_then(host_parts) {
         // The dashboard's own origin: the browser sent both, and they must agree.
@@ -1128,9 +1155,9 @@ mod tests {
     #[test]
     fn the_origin_must_share_the_host_and_the_port() {
         assert!(same_origin("http://127.0.0.1:8787", Some("127.0.0.1:8787")));
-        // A `Host` with no port is port 80, so an HTTPS origin on 443 is a
-        // different origin from this (plain-HTTP) plane.
-        assert!(same_origin("https://localhost", Some("localhost:443")));
+        // The plane serves plain HTTP: an `https` origin is a different
+        // origin even on the same host (R-19 round 4, F14).
+        assert!(!same_origin("https://localhost", Some("localhost:443")));
         assert!(!same_origin("https://localhost:443", Some("localhost")));
         assert!(same_origin("http://[::1]:8787", Some("[::1]:8787")));
         // Another local program is another principal.

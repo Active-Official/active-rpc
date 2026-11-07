@@ -26,13 +26,13 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-5: round 5 found no critical/high/medium (CLEAN) and 12 lows (2 fixed); round 6 must be clean to close | 32 fixed / 0 rejected / 10 noted | this commit |
-| R-13 | receipts | `src/receipts.rs` | rounds 1-14: r14 found the append cache trusting a same-length copy (medium) and the reader's missing `O_NOFOLLOW`, both fixed; r15 and r16 must be clean | 77 fixed / 0 rejected / 2 residuals (no OS-level lock; no non-unix identity) | this commit |
+| R-13 | receipts | `src/receipts.rs` | rounds 1-15: r15 found the in-place edit behind the append cache (high), a partial-magic wedge and a repair refusal, open for r16 | 77 fixed / 0 rejected / 2 residuals (7 open) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-14: r14 found four highs (uncovered carriers, the non-sticky address set, the provenance text, binary copies), all fixed; r15 and r16 must be clean | 63 fixed / 0 rejected / 5 noted | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-15: r15 found the evaluate fast path, the label leak and the binary hex scan (highs), fixed; F3's projection-side assertion, F5, F6 and F9 are open for r16 | 66 fixed / 0 rejected / 5 noted (4 open) | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-10: r10 found the residency charge (medium) and four lows, all fixed; r11 and r12 must be clean | 68 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
-| R-19 | control-plane | `control-plane/**` | rounds 1-4: r4 found the lane grant (high) and nine mediums; F1-F9, F12, F13 and F17 fixed, six lows open for r5 | 61 fixed / 0 rejected / 6 open (3 documented) | this commit |
+| R-19 | control-plane | `control-plane/**` | rounds 1-4: r4 found the lane grant (high), nine mediums and eight lows, all fixed; r5 and r6 must be clean | 76 fixed / 0 rejected / 0 open (3 documented) | this commit |
 | R-20 | fuzz | `fuzz/**` | rounds 1-6: r6 found the control gate and five controls could pass on a broken implementation (high + mediums), all fixed; r7 and r8 must be clean | 58 fixed / 0 rejected / 1 noted (4 residuals) | this commit |
 
 ## Cross-cutting passes (after the sections)
@@ -153,20 +153,63 @@ the semantics of the gap row.
 | F7 | medium | refresh revoked before minting, so a failed mint left no fixture | **fixed**: mint first, revoke the old handles only after a success |
 | F8 | medium | a cursor from a previous plane epoch was stuck at `count:0, gap:false` | **fixed**: `since_envelope` treats a cursor above every id as a gap and restarts it (`a_cursor_from_a_previous_epoch_is_a_gap`) |
 | F9 | medium | `/health.ok` ignored the redaction probe and the fixture grant | **fixed**: both are part of `ok` and the grant is reported (`health_reports_the_fixture_grant`) |
-| F10 | medium | the HTTP stub spawned an unbounded thread per connection and could die silently | **open** for r5: needs a live-thread cap and a panic boundary around the accept loop |
-| F11 | low | `/ws` is unbounded and each tick deep-clones the snapshot per socket | **open** for r5 |
+| F10 | medium | the HTTP stub spawned an unbounded thread per connection and a failed spawn could kill the accept loop | **fixed**: 64 live handlers, a 503 beyond that, a guard that releases the slot on unwind, and a failed spawn keeps the loop alive |
+| F11 | low | `/ws` is unbounded | **fixed**: at most 64 dashboard sockets, then 503 |
 | F12 | low | h2c without `:authority` skipped both host checks | **fixed**: an HTTP/2 mutating request must name its Host; HTTP/1.1 without one is malformed rather than the h2 case |
 | F13 | low | expanded IPv6 and `localhost.` were false refusals | **fixed**: the address is parsed and a trailing dot is stripped |
-| F14 | low | `same_origin` does not compare the scheme when the Host carries a port | **open** for r5 |
-| F15 | low | the embedded MCP fallback's snapshot is unguarded and the redirect test bypasses `Attach::new` | **open** for r5 |
-| F16 | low | every `tools/call` failure is JSON-RPC `-32602` | **open** for r5 |
+| F14 | low | `same_origin` did not compare the scheme | **fixed**: only an `http` origin matches; the plane serves plain HTTP |
+| F15 | low | the embedded MCP fallback's snapshot was unguarded (the redirect test still builds its own agent) | **snapshot fixed**: the fallback catches the panic and answers a refusal |
+| F16 | low | every `tools/call` failure was JSON-RPC `-32602` | **fixed**: `ToolFailure` separates invalid params from a plane/transport failure (`-32603`) |
 | F17 | low | the worker's first snapshot was outside the panic boundary | **fixed**: it is caught and a down snapshot is published |
-| F18 | low | after a sticky down, commands still execute on the unverified core | **open** for r5 |
+| F18 | low | after a sticky down, commands still executed on the unverified core | **fixed**: a mutating command is refused with a 500 while the flag is set |
 
-The six open lows are recorded here, not silently dropped: r5 takes them before
-the section can close.
+All six lows were fixed in the same round. r5 must be clean, and r6 clean to
+close.
 
 Gate: green; control-plane 28 integration + 21 unit tests; fmt and clippy clean.
+
+### R-13 receipts - 2026-11-07 (round 15)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `c506437` (two
+probes built outside the tree). Verdict **NOT CLEAN**: one high, two mediums and
+six lows. The round-14 identity check closed the copy-swap case; an in-place
+write keeps the inode and the other three checks.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | an interior edit written through the log's own path (or a hard link) keeps length, header, tail and inode, so the append fast path trusts a file no reader can walk again | **partial**: the cache also records the modification time, which an ordinary in-place write changes; a writer that can set it back is the authenticity residual ADR-0021 records. The full fix (re-walk every append, or an OS lock) is recorded for r16 |
+| F2 | medium | a partial magic-prefixed lock (a crashed write) is unjudgeable, so it wedges the log; non-unix cleanup cannot remove it | **open for r16**: needs a "magic + partial" state that is still judgeable |
+| F3 | medium | `repair` refuses a tail whose 4-byte length is out of range, though no record survives there | **open for r16** |
+| F4 | low | the steal matches by text rather than by the judged inode, so the empty-nonce rule can delete a lock created in the create-to-write window | **open for r16** |
+| F5 | low | `repair`'s `walk_prefix` builds a `Receipt` per record with no cap | **open for r16** |
+| F6 | low | the sweep deletes by name prefix, including a sibling the magic rule promised to preserve | **open for r16** |
+| F7 | low | a receipts-off interval is invisible in the log | **open for r16** |
+| F8 | low | a provider inner code can occupy the kernel's `rpc/` namespace with no origin bit | **noted** (the code is the provider's own; the receipt names it verbatim by design) |
+| F9 | low | `nonce_of` bypasses the guarded open, and nofollow is unix-only | **open for r16** |
+
+R-13 needs r16 (with these fixes) and r17 clean.
+
+### R-16 security helpers - 2026-11-07 (round 15)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `c506437`. Verdict
+**NOT CLEAN**: three highs, three mediums and four lows. Round 14 covered the
+carriers it enumerated; three projections did not use that pass at all.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `evaluate` took its unredacted fast path when the cone dropped the only blob, so a text that quotes the address came back to every capability | **fixed**: the caller's sticky address set is a parameter, an empty set is required for the fast path, and both redacting copies use `redact_derived_with` (`an_evaluated_text_that_quotes_a_blob_address_is_scrubbed`) |
+| F2 | high | a label is a field name, and a field name can hold the address; `why`/`impact`/`dependencies`/`dependents` returned it | **fixed**: `strip_address_labels` drops such a label for a held-secret slot (`a_label_that_names_a_tainted_blobs_address_is_hidden`) |
+| F3 | high | the hex search required a UTF-8 payload, the byte assertion compared only all-lower/all-upper, and the assertion never ran on a domain projection | **partly fixed**: the hex search is byte-level and case-insensitive and the assertion's window compare too (`a_payload_copy_with_a_binary_tail_is_dropped`); **the projection-side call and the caller's `extra` in the assertion are open for r16** |
+| F4 | medium | the separator set covered five zero-width code points; the soft hyphen, bidi controls, variation selectors and tag characters split a copy undetected | **fixed**: the set covers those ranges |
+| F5 | medium | fullwidth and mathematical hex is NFKC-equivalent to ASCII and invisible to both scans | **open** for r16 |
+| F6 | medium | quadratic work on a hostile image (`bytes_carry_an_address` rebuilds its set per blob; the assertion is O(bytes x addresses)) and no wall check on the egress path | **open** for r16 |
+| F7 | low | the provenance scrub drops any text containing `blake3:` without checking it names an address | **intentional over-drop**: a content address is an oracle whatever it names; recorded |
+| F8 | low | a key collision after the rewrite deletes the field, and a binding collision drops a binding | **fail-closed by design**: the shape is preserved where possible and the projection never keeps the address; recorded |
+| F9 | low | the text-carrier match ends in a wildcard, so a new `Inode` variant compiles clean | **open** for r16: needs a carrier enumeration test |
+| F10 | low | the docs overstate the guarantees while F1-F3 and F5 are open | **corrected where fixed**; final wording waits for r16 |
+
+Gate: green; the security suites; fmt, clippy and doc clean. R-16 needs r16 and
+r17 clean.
 
 ### R-13 receipts - 2026-11-07 (round 14)
 

@@ -319,11 +319,28 @@ impl ModuleProvider {
                             }
                         }
                         let sub = restrict(&slot.module, node)?;
-                        evaluate_for_caller(&slot.module, &sub, budget, &slot.redactor)
+                        // The same sticky set `subgraph` builds: a cone can
+                        // drop the blob while a text still quotes its address
+                        // (R-16 round 15, F1).
+                        let mut addresses: Vec<[u8; 32]> =
+                            slot.secret_addresses.iter().copied().collect();
+                        addresses.extend(slot.hash);
+                        evaluate_for_caller(&slot.module, &sub, budget, &slot.redactor, &addresses)
                     }
                     // No path means the module root: evaluate in place rather
                     // than cloning the whole arena.
-                    None => evaluate_for_caller(&slot.module, &slot.module, budget, &slot.redactor),
+                    None => {
+                        let mut addresses: Vec<[u8; 32]> =
+                            slot.secret_addresses.iter().copied().collect();
+                        addresses.extend(slot.hash);
+                        evaluate_for_caller(
+                            &slot.module,
+                            &slot.module,
+                            budget,
+                            &slot.redactor,
+                            &addresses,
+                        )
+                    }
                 }
                 .map_err(|error| evaluator_fault(&error))?;
                 // The conversion recurses; a result deeper than the wire can
@@ -360,7 +377,8 @@ impl ModuleProvider {
                     started,
                     call,
                 )?;
-                let answer = redact_answer(&slot.module, node, labels, call.redact);
+                let mut answer = redact_answer(&slot.module, node, labels, call.redact);
+                strip_address_labels(&mut answer, slot);
                 // The redaction walk is the caller's work too: the ceiling is
                 // checked after the answer is built (round 32, #7).
                 check_wall_budget(started, call)?;
@@ -388,7 +406,8 @@ impl ModuleProvider {
                     started,
                     call,
                 )?;
-                let answer = redact_answer(&slot.module, node, labels, call.redact);
+                let mut answer = redact_answer(&slot.module, node, labels, call.redact);
+                strip_address_labels(&mut answer, slot);
                 // As in `dependencies`: after the redaction walk
                 // (round 32, #7).
                 check_wall_budget(started, call)?;
@@ -670,7 +689,8 @@ impl ModuleProvider {
                     started,
                     call,
                 )?;
-                let answer = redact_answer(&slot.module, node, labels, call.redact);
+                let mut answer = redact_answer(&slot.module, node, labels, call.redact);
+                strip_address_labels(&mut answer, slot);
                 // After the redaction walk (round 32, #7).
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(answer))
@@ -704,7 +724,8 @@ impl ModuleProvider {
                     started,
                     call,
                 )?;
-                let answer = redact_answer(&slot.module, node, labels, call.redact);
+                let mut answer = redact_answer(&slot.module, node, labels, call.redact);
+                strip_address_labels(&mut answer, slot);
                 // After the redaction walk (round 32, #7).
                 check_wall_budget(started, call)?;
                 Ok(Response::Labels(answer))
@@ -1732,6 +1753,22 @@ fn scoped_labels(
     Ok(labels_from(module, &paths, kept))
 }
 
+/// Drop labels that quote a secret-derived address.
+///
+/// A label is a dotted field name, and a field name can hold a blob's address.
+/// `subgraph` scrubs the same name, but a metadata answer is a *set of labels*:
+/// a rewritten label no longer resolves, so the answer drops it instead. Every
+/// capability, redacting or not, must not learn the address
+/// (R-16 round 15, F2).
+fn strip_address_labels(answer: &mut Vec<String>, slot: &ModuleSlot) {
+    if !slot.held_secret {
+        return;
+    }
+    let mut addresses: Vec<[u8; 32]> = slot.secret_addresses.iter().copied().collect();
+    addresses.extend(slot.hash);
+    answer.retain(|label| !security::text_names_any_address(label, &addresses));
+}
+
 /// Answer a metadata query under a redacting capability.
 ///
 /// A query about a node inside the secret cone learns one marker, not which
@@ -2004,6 +2041,7 @@ fn evaluate_for_caller(
     module: &InfinityModule,
     budget: active_core::Budget,
     redactor: &active_infinity::interop::Redactor,
+    extra: &[[u8; 32]],
 ) -> std::result::Result<(active_core::Value, Vec<active_core::Diagnostic>), active_infinity::Error>
 {
     // The `active-core` bridge refuses a module that holds secret material: it
@@ -2012,7 +2050,12 @@ fn evaluate_for_caller(
     // A redacting capability and a plain one therefore see the same structure;
     // the marker is content-free for both, and `VALUE_MARKER` maps it back to
     // `Value::Secret` so the caller can tell it from data.
-    if redactor.is_empty() && !security::module_holds_secret(module) {
+    // A module whose only secret material is a tainted blob has no redactor
+    // and, in a restricted cone, no blob either: the fast path returned text
+    // that quotes the address, unscrubbed (R-16 round 15, F1). The caller's
+    // sticky address set is the fact the cone cannot carry, so its presence
+    // forces the redacting path.
+    if redactor.is_empty() && !security::module_holds_secret(module) && extra.is_empty() {
         return active_infinity::interop::evaluate(module, budget);
     }
     // The placeholder is not always `***SECRET***`: when a secret is a
@@ -2020,7 +2063,7 @@ fn evaluate_for_caller(
     // mapping only the marker left `Text("")` (round 10, #5). Read what the
     // redactor actually wrote for a secret node.
     let mut redacted = module.clone();
-    security::redact_derived(&mut redacted, redactor)
+    security::redact_derived_with(&mut redacted, redactor, extra)
         .map_err(|_| active_infinity::Error::Encode("redaction"))?;
     // Every text the redactor wrote for a secret node: the marker for a normal
     // secret, the empty string when a secret is a substring of the marker. One
@@ -2029,7 +2072,7 @@ fn evaluate_for_caller(
     // A restricted cone no longer holds the secret node, so the placeholders are
     // read from a redacted copy of the source (round 15, #6).
     let mut redacted_source = source.clone();
-    security::redact_derived(&mut redacted_source, redactor)
+    security::redact_derived_with(&mut redacted_source, redactor, extra)
         .map_err(|_| active_infinity::Error::Encode("redaction"))?;
     let placeholders: BTreeSet<String> = (0..source.node_count())
         .map(|index| NodeId(index as u32))

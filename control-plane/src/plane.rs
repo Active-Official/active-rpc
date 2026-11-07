@@ -573,6 +573,18 @@ pub struct PlaneCore {
     panic_snapshot_once: bool,
 }
 
+/// Connections the HTTP stub serves at once.
+const MAX_STUB_CLIENTS: usize = 64;
+
+/// Releases one stub slot when its handler ends, including on unwind.
+struct StubGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for StubGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Drop for PlaneCore {
     fn drop(&mut self) {
         // Ask the stub to stop and wake its blocking `accept` with one
@@ -847,25 +859,46 @@ impl PlaneCore {
         std::thread::Builder::new()
             .name("http-stub".into())
             .spawn(move || {
+                // A stalled client must never block the ladder, but an
+                // unbounded thread per connection is a memory amplifier and a
+                // failed `spawn` panicked the accept loop while health stayed
+                // green (R-19 round 4, F10).
+                let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 for stream in listener.incoming() {
                     if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
                     let Ok(mut stream) = stream else { continue };
-                    // One short-lived handler per connection: a client that
-                    // stalls must never block the next ladder run.
-                    std::thread::spawn(move || {
-                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                        let mut buffer = [0u8; 2048];
-                        let _ = stream.read(&mut buffer);
-                        let body = r#"{"ok":true}"#;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
+                    if live.load(std::sync::atomic::Ordering::Relaxed) >= MAX_STUB_CLIENTS {
+                        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(200)));
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
                         );
-                        let _ = stream.write_all(response.as_bytes());
-                    });
+                        continue;
+                    }
+                    let counter = std::sync::Arc::clone(&live);
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let spawned = std::thread::Builder::new()
+                        .name("http-stub-client".into())
+                        .spawn(move || {
+                            let _guard = StubGuard(counter);
+                            let _ = stream
+                                .set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let mut buffer = [0u8; 2048];
+                            let _ = stream.read(&mut buffer);
+                            let body = r#"{"ok":true}"#;
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        });
+                    if spawned.is_err() {
+                        // No thread: the failed spawn drops the closure (and
+                        // the stream) itself; keep the loop alive.
+                        live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             })
             .expect("http stub thread");

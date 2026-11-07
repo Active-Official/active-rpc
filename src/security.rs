@@ -328,13 +328,13 @@ fn assert_no_address_bytes(bytes: &[u8], addresses: &BTreeSet<[u8; 32]>) -> Resu
     // form is searched as bytes, in both cases (R-16 round 14, F1).
     let mut text_carries = false;
     for key in address_keys_from_raw(addresses) {
-        let upper: Vec<u8> = key.iter().map(u8::to_ascii_uppercase).collect();
         let first = key[0];
-        let first_upper = first.to_ascii_uppercase();
         for (index, byte) in bytes.iter().enumerate() {
-            if (*byte == first || *byte == first_upper) && bytes.len() - index >= 64 {
+            // Case-insensitive per byte: an all-lower/all-upper pair missed a
+            // mixed-case copy (R-16 round 15, F3).
+            if byte.eq_ignore_ascii_case(&first) && bytes.len() - index >= 64 {
                 let window = &bytes[index..index + 64];
-                if window == key.as_slice() || window == upper.as_slice() {
+                if window.eq_ignore_ascii_case(key.as_slice()) {
                     text_carries = true;
                     break;
                 }
@@ -817,11 +817,22 @@ fn bytes_carry_an_address(bytes: &[u8], addresses: &BTreeSet<[u8; 64]>) -> bool 
         }
         windows.insert(raw);
     }
-    bytes.windows(32).any(|window| {
+    let raw_hit = bytes.windows(32).any(|window| {
         let mut raw = [0u8; 32];
         raw.copy_from_slice(window);
         windows.contains(&raw)
-    }) || std::str::from_utf8(bytes).is_ok_and(|text| text_names_an_address(text, addresses))
+    });
+    // The hex form is searched over the bytes, not over a UTF-8 view: a payload
+    // that ends in a non-UTF-8 byte carried the address past both this scan and
+    // the doom pass (R-16 round 15, F3). The comparison is case-insensitive per
+    // byte, so a mixed-case copy cannot slip through.
+    raw_hit
+        || addresses.iter().any(|address| {
+            let key = address.as_slice();
+            bytes
+                .windows(64)
+                .any(|window| window.eq_ignore_ascii_case(key))
+        })
 }
 
 /// Whether `text` contains one of the addresses, contiguous or separated.
@@ -866,10 +877,25 @@ pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) 
 }
 
 /// Characters a decoder ignores inside a hex address.
+///
+/// A reader that strips them can compare a split copy, so the scrub must too.
+/// The set covers the zero-width family, the soft hyphen, the bidi controls,
+/// the invisible operators and the variation selectors and tag characters a
+/// renderer hides (R-16 rounds 14-15).
 fn is_address_separator(character: char) -> bool {
     matches!(
         character,
-        '-' | ':' | '_' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
+        '-' | ':'
+            | '_'
+            | '\u{00ad}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{e0000}'..='\u{e007f}'
     )
 }
 

@@ -253,58 +253,87 @@ fn tools() -> Json {
     ])
 }
 
-fn call(attach: &Attach, params: &Json) -> Result<Json, String> {
+/// Why a tool call produced no answer.
+///
+/// The JSON-RPC code says whose fault it is: bad arguments are invalid params
+/// (-32602), a plane or transport failure is an internal error (-32603). Every
+/// failure used to be -32602, so a down plane looked like a bad request
+/// (R-19 round 4, F16).
+struct ToolFailure {
+    code: i64,
+    message: String,
+}
+
+impl ToolFailure {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: -32603,
+            message: message.into(),
+        }
+    }
+}
+
+fn call(attach: &Attach, params: &Json) -> Result<Json, ToolFailure> {
     let name = params
         .get("name")
         .and_then(Json::as_str)
-        .ok_or_else(|| "missing tool name".to_string())?;
+        .ok_or_else(|| ToolFailure::invalid("missing tool name"))?;
     let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
     let value = match name {
-        "cp_metrics" => attach.snapshot()?,
-        "cp_activity_state" => attach.activity()?,
-        "cp_engines" => attach.engines()?,
-        "cp_status_module" => attach.status_module()?,
-        "cp_scenario_results" => attach.scenario_results()?,
+        "cp_metrics" => attach.snapshot().map_err(ToolFailure::internal)?,
+        "cp_activity_state" => attach.activity().map_err(ToolFailure::internal)?,
+        "cp_engines" => attach.engines().map_err(ToolFailure::internal)?,
+        "cp_status_module" => attach.status_module().map_err(ToolFailure::internal)?,
+        "cp_scenario_results" => attach.scenario_results().map_err(ToolFailure::internal)?,
         "cp_events_tail" => {
             let limit = arguments
                 .get("limit")
                 .and_then(Json::as_u64)
                 .unwrap_or(40)
                 .clamp(1, 500) as usize;
-            attach.events_tail(limit)?
+            attach.events_tail(limit).map_err(ToolFailure::internal)?
         }
         "cp_events_since" => {
             let cursor = arguments
                 .get("cursor")
                 .and_then(Json::as_u64)
-                .ok_or_else(|| "missing cursor".to_string())?;
-            attach.events_since(cursor)?
+                .ok_or_else(|| ToolFailure::invalid("missing cursor"))?;
+            attach.events_since(cursor).map_err(ToolFailure::internal)?
         }
         "cp_run_scenario" => {
             let id = arguments
                 .get("id")
                 .and_then(Json::as_str)
-                .ok_or_else(|| "missing scenario id".to_string())?;
-            attach.scenario(id)?
+                .ok_or_else(|| ToolFailure::invalid("missing scenario id"))?;
+            attach.scenario(id).map_err(ToolFailure::internal)?
         }
         "cp_run_level" => {
             let level = arguments
                 .get("level")
                 .and_then(Json::as_u64)
-                .ok_or_else(|| "missing level".to_string())?;
+                .ok_or_else(|| ToolFailure::invalid("missing level"))?;
             if level > 6 {
-                return Err("level must be 0..=6".to_string());
+                return Err(ToolFailure::invalid("level must be 0..=6"));
             }
             let up_to = arguments
                 .get("up_to")
                 .and_then(Json::as_bool)
                 .unwrap_or(false);
-            attach.level(level as u8, up_to)?
+            attach
+                .level(level as u8, up_to)
+                .map_err(ToolFailure::internal)?
         }
-        other => return Err(format!("unknown tool {other}")),
+        other => return Err(ToolFailure::invalid(format!("unknown tool {other}"))),
     };
     Ok(json!({
         "content": [{"type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default()}],
@@ -328,22 +357,22 @@ fn respond(request: &Json, attach: &Attach) -> Option<Json> {
             let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
             call(attach, &params)
         }
-        other => Err(format!("method not found: {other}")),
+        other => Err(ToolFailure::invalid(format!("method not found: {other}"))),
     };
     Some(match result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err(message) => {
-            // A tool call with a bad name or argument is invalid params;
-            // an unknown JSON-RPC method is method-not-found.
+        Err(failure) => {
+            // An unknown JSON-RPC method is method-not-found; a tool call's
+            // code comes from the failure itself.
             let code = if method == "tools/call" {
-                -32602
+                failure.code
             } else {
                 -32601
             };
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "error": {"code": code, "message": message}
+                "error": {"code": code, "message": failure.message}
             })
         }
     })

@@ -327,3 +327,94 @@ fn a_separated_copy_of_an_address_is_scrubbed() {
         "the separated copy survived: {printed}"
     );
 }
+
+/// R-16 round 15, F1: `evaluate` has no redactor to consult when the cone
+/// drops the only blob, so it took its unredacted fast path and returned a
+/// text that quotes the address.
+#[test]
+fn an_evaluated_text_that_quotes_a_blob_address_is_scrubbed() {
+    let (mut module, blob) = blob_module();
+    let address = hash_hex(&BLOB_HASH);
+    let note = module.push(Inode::Str(address.clone()));
+    let root = module.push(Inode::Table {
+        fields: vec![("blob".to_string(), blob), ("note".to_string(), note)],
+    });
+    module.set_root(Some(root));
+    for redact in [false, true] {
+        let (agent, cap, lane) = install(module.clone(), &["evaluate"], redact);
+        let value = call(
+            &agent,
+            lane,
+            &cap,
+            "evaluate",
+            vec![Arg::Value(Value::path("note"))],
+        );
+        let printed = format!("{value:?}").to_lowercase();
+        assert!(
+            !printed.contains(&address),
+            "evaluate(note) returned the address (redact {redact}): {printed}"
+        );
+    }
+}
+
+/// R-16 round 15, F3: the hex search used to require a UTF-8 payload, so an
+/// address followed by a non-UTF-8 byte survived.
+#[test]
+fn a_payload_copy_with_a_binary_tail_is_dropped() {
+    let (mut module, blob) = blob_module();
+    let mut payload = hash_hex(&BLOB_HASH).into_bytes();
+    payload.push(0xff);
+    let carrier = module.push(Inode::Blob {
+        hash: *blake3::hash(&payload).as_bytes(),
+        size: payload.len() as u64,
+        tainted: false,
+        media_type: "application/octet-stream".to_string(),
+        payload: Some(payload),
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("blob".to_string(), blob), ("carrier".to_string(), carrier)],
+    });
+    module.set_root(Some(root));
+    let raw = encode(&module).expect("encode");
+    let redacted = active_rpc::security::redact_module(&raw).expect("redact");
+    let printed = String::from_utf8_lossy(&redacted).to_lowercase();
+    assert!(
+        !printed.contains(&hash_hex(&BLOB_HASH)),
+        "a binary-tailed payload copy survived"
+    );
+}
+
+/// R-16 round 15, F2: a field name can hold the address, and a metadata label
+/// is that name. Every capability must not learn it.
+#[test]
+fn a_label_that_names_a_tainted_blobs_address_is_hidden() {
+    let (mut module, blob) = blob_module();
+    let address = hash_hex(&BLOB_HASH);
+    let sibling = module.push(Inode::Str("x".to_string()));
+    let root = module.push(Inode::Table {
+        fields: vec![
+            ("blob".to_string(), blob),
+            (format!("addr{address}"), sibling),
+        ],
+    });
+    module.set_root(Some(root));
+    let methods = ["dependencies", "dependents", "why", "impact"];
+    for redact in [false, true] {
+        let (agent, cap, lane) = install(module.clone(), &methods, redact);
+        for method in methods {
+            // Each query takes the root path.
+            let value = call(
+                &agent,
+                lane,
+                &cap,
+                method,
+                vec![Arg::Value(Value::path(""))],
+            );
+            let printed = format!("{value:?}").to_lowercase();
+            assert!(
+                !printed.contains(&address),
+                "{method} (redact {redact}) returned the address: {printed}"
+            );
+        }
+    }
+}
