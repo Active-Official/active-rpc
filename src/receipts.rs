@@ -1374,6 +1374,10 @@ impl ReceiptLog {
         state.count = count;
         state.head = previous;
         state.last_ms = last_ms;
+        // Our own append moved the mtime the fast path compares: refresh it
+        // here, or every later append re-walks the whole log (the linearity
+        // test caught exactly that).
+        state.modified = path_modified(&self.path);
         if let Ok(mut cached) = self.state.lock() {
             *cached = state;
         }
