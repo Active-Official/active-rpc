@@ -101,8 +101,9 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   silently truncates it (`required_lane_wall_ms()` is the same number). The
   lane's cumulative `max_bytes` must cover `required_lane_bytes()`. A provider
   may bound the bytes it holds across objects with `with_max_live_bytes`, where
-  each open transfer reserves two body copies plus the retained plan hash
-  vector.
+  each open transfer reserves twice the bytes it has **stored** plus the retained
+  plan hash vector: an unpaid plan holds only its vector, and a `put` that would
+  pass the bound is refused before it stores (R-10 round 18).
 - Every `finish` that runs out of wall is counted, whatever its grant: an
   attempt that presents `assembly_wall_ms()` and still expires is evidence that
   the estimate is wrong for this host, not a payment to forget (R-10 round 16).

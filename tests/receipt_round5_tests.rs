@@ -467,20 +467,22 @@ fn a_future_dated_lock_is_not_immortal() {
 fn a_symlinked_log_path_is_refused() {
     let path = scratch("symlink");
     drop(ReceiptLog::create(&path).expect("create"));
+    // The handle is opened while the path is the real log; the link is planted
+    // afterwards, which is the shape an attacker can actually produce.
+    let log = ReceiptLog::open(&path).expect("open the real log");
     let target = scratch("symlink-target");
     std::fs::write(&target, b"").expect("target");
     let moved = path.with_extension("moved");
     std::fs::rename(&path, &moved).expect("move the real log");
     std::os::unix::fs::symlink(&target, &path).expect("symlink");
 
-    let log = ReceiptLog::open(&moved).expect("open the real log");
     let error = log
         .append(&receipt(1, "echo"))
         .expect_err("a symlinked log path is refused");
-    assert_eq!(error.code(), "rpc/receipt");
+    assert_eq!(error.code(), "rpc/receipt", "{error}");
     assert!(
-        error.to_string().contains("symlink"),
-        "the refusal names the link: {error}"
+        error.to_string().contains("symlink") || error.to_string().contains("regular file"),
+        "the refusal says the path is not our log: {error}"
     );
     assert_eq!(
         std::fs::metadata(&target).expect("stat").len(),

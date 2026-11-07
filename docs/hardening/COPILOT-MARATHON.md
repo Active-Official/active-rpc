@@ -3262,6 +3262,28 @@ tree; the rate test pins the numbers the fixes are derived from.
 Gate: `cargo test --all-features` 648 passed, 0 failed; clippy clean on both
 feature sets; fmt and doc clean.
 
+### R-13 receipts - 2026-11-06 (round 10)
+
+Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at
+`31b020e`. Claims F4, L1, L3 verified; F1, F2, F5 partly false. Verdict **NOT
+CLEAN**: one high, two mediums and five lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| A | high | ownership was verified only at acquire, never immediately before the mutation: a writer displaced during the state walk (or during `repair`'s 64 MiB read) still appended, renamed or truncated, so two chains could reach the log | **fixed**: `write_all` re-checks `still_holds()` itself, and so does `create_locked` before the rename and `repair` before `set_len`; `append_inner` touches the lock right after acquiring so the walk cannot age it. `a_displaced_lock_cannot_write` drives the shipped `write_all` with a displaced lock. The window is narrowed, not eliminated: only an OS lock on the log handle closes it, which is above the 1.88 MSRV |
+| B | medium | a future-dated lock naming a live pid was immortal: the future read as `LOCK_STALE_MS + 1`, which is inside the 20-minute grace | **fixed**: a future timestamp reads as past the grace, so the pid rule cannot keep it alive |
+| C | medium | the type checks are check-then-open, and `nonce_of`/`read_header_start`/`read_tail_head` had none at all, so a planted FIFO could still block a reader | **fixed**: all three type-check with `symlink_metadata` first. The check and the open are not atomic, which is recorded: it narrows the hang, it does not prove the absence of one |
+| D | low | a non-empty but unrenderable nonce was unstealable | **open** |
+| E | low | an ignored `writeln!` can leave an empty lock whose displacement is then reported misleadingly | **open** |
+| F | low | `record_receipt` ignores `receipted` | **open** |
+| G | low | the ADR's C14 wording over-claims what the type check guarantees | **open** |
+
+Gate: the full local gate green after the fixes; the receipt suites also run in
+the `rust:1.99` container, which is where the Linux-only tests (pid liveness,
+symlink) execute. CI on `31b020e` was red for the symlink test, which asserted the
+wrong handle; the test now plants the link *after* the handle is opened, which is
+the shape an attacker can produce.
+
 ### R-13 receipts - 2026-11-06 (round 9)
 
 Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at

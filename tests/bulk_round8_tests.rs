@@ -186,21 +186,23 @@ fn a_missing_frame_is_validated() {
     }
 }
 
-/// A provider can bound the bytes it holds across objects (round 8, L5).
+/// A provider can bound the bytes it holds across objects (round 8, L5), and a
+/// plan nobody has paid for reserves only its hash vector (round 18, #1).
 #[test]
 fn the_provider_can_bound_its_live_bytes() {
     let first = BulkTransfer::new(body(2_000, 83), 1_000).expect("first");
     let second = BulkTransfer::new(body(2_000, 84), 1_000).expect("second");
     let plan = first.plan().clone();
-    let reserved = 2 * plan.total() + 53 + 32 * plan.chunk_count() as u64;
-    let mut provider = BulkProvider::new().with_max_live_bytes(reserved);
+    let vector = 53 + 32 * plan.chunk_count() as u64;
+    // Room for one announced plan's vector, not for two.
+    let mut provider = BulkProvider::new().with_max_live_bytes(vector * 2 - 1);
     provider
         .invoke(0, &call("plan", first.plan_frame()))
         .expect("first fits");
     assert_eq!(
         provider.live_bytes(),
-        reserved,
-        "the plan, its assembly and its hash vector are reserved"
+        vector,
+        "an unpaid plan reserves its hash vector"
     );
     assert!(
         provider
@@ -230,8 +232,9 @@ fn the_lane_wall_is_named() {
 fn a_plan_retry_does_not_double_reserve() {
     let transfer = BulkTransfer::new(body(2_000, 86), 1_000).expect("transfer");
     let plan = transfer.plan().clone();
-    // Two body copies plus the retained plan hash vector (round 10, M-1).
-    let reserved = 2 * plan.total() + 53 + 32 * plan.chunk_count() as u64;
+    // The retained plan hash vector, which is what an unpaid plan reserves
+    // (round 10, M-1; round 18, #1).
+    let reserved = 53 + 32 * plan.chunk_count() as u64;
     let mut provider = BulkProvider::new().with_max_live_bytes(reserved);
     provider
         .invoke(0, &call("plan", plan.encode()))

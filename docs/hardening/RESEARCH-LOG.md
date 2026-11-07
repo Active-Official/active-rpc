@@ -138,8 +138,8 @@ Source: H1.17 fuzz target; a wrapped ring with a partially consumed frame.
 Attack class: SharedSegment::write compacted unread bytes starting at the
 head offset rather than the tail. When the head was near the end of the segment
 and a frame did not fit contiguously, the copy range ran past the buffer and
-panicked. A consumer that calls dvance with the wrong length can also leave
-	ail mid-frame; the next write then computes a nonsense range.
+panicked. A consumer that calls advance with the wrong length can also leave
+the tail mid-frame; the next write then computes a nonsense range.
 Mapped invariants: I-8 (hard capacity), I-10 (fail closed).
 Fix: compact from 	ail % capacity, copy the unread region in at most two
 pieces when it wraps, and reset with Error::Transport when the ring is

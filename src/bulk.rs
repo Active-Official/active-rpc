@@ -1545,13 +1545,13 @@ impl BulkProvider {
     /// An open transfer reserves its plan's total, so the bound holds before a
     /// chunk arrives (round 8, L5).
     pub fn live_bytes(&self) -> u64 {
-        // An open transfer reserves its plan's total, the assembly buffer a
-        // `finish` allocates and the plan's own hash vector
-        // (round 9, M5; round 10, M-1).
+        // An open transfer reserves the bytes it has stored, the assembly
+        // buffer a `finish` allocates and the plan's own hash vector
+        // (round 9, M5; round 10, M-1; round 18, #1).
         let pending: u64 = self
             .transfers
             .values()
-            .map(|active| reserved_bytes(&active.plan))
+            .map(|active| reserved_bytes(&active.plan, active.receiver.bytes_received()))
             .sum();
         let done: u64 = self
             .completed
@@ -1667,7 +1667,10 @@ impl BulkProvider {
         }
         if self.max_live_bytes != 0 {
             let held = self.live_bytes();
-            if held.saturating_add(reserved_bytes(&plan)) > self.max_live_bytes {
+            // A new transfer has stored nothing yet, so it reserves its plan
+            // vector; the chunks it receives reserve more as they arrive
+            // (R-10 round 18, #1).
+            if held.saturating_add(reserved_bytes(&plan, 0)) > self.max_live_bytes {
                 // A budget class, like every other ceiling (round 9, L3).
                 return Err(Error::BudgetExceeded("byte"));
             }
@@ -1699,7 +1702,10 @@ impl BulkProvider {
     /// be granted holds the object's slot, its reserved bytes in the provider's
     /// live ceiling and its chunks until the idle or absolute window expires
     /// (R-10 round 15, #2). An explicit `abort` is that party saying so, and it
-    /// is idempotent: an object with nothing to drop answers `dropped: false`.
+    /// is idempotent: an object with nothing to drop answers the same constant
+    /// shape as one that dropped a body (`aborted: true`), so a capability that
+    /// grants only `abort` learns nothing about another principal's state
+    /// (R-10 rounds 17-18).
     ///
     /// It drops a completed body the host has not taken as well: the caller paid
     /// for the transfer and the reply for it, and asking to abandon it is a
@@ -1721,6 +1727,19 @@ impl BulkProvider {
 
     fn put_method(&mut self, object: u64, call: &Call) -> Result<Response> {
         self.expire(object, call.now_ms);
+        if self.max_live_bytes != 0 {
+            // A chunk grows the reservation by twice its stored bytes; the
+            // ceiling is charged before the bytes are stored, like every other
+            // budget (R-10 round 18, #1).
+            // The stored bytes are the frame without its header, which is what
+            // live_bytes counts; a malformed short frame reserves nothing and
+            // accept refuses it below.
+            let stored = (call.payload.len() as u64).saturating_sub(CHUNK_OVERHEAD);
+            let growth = stored.saturating_mul(2);
+            if self.live_bytes().saturating_add(growth) > self.max_live_bytes {
+                return Err(Error::BudgetExceeded("byte"));
+            }
+        }
         let active = self
             .transfers
             .get_mut(&object)
@@ -2075,8 +2094,13 @@ impl BulkTransfer {
 /// The plan is retained for the whole transfer (32 bytes per chunk plus the
 /// header), so a bound that counts only the body under-reports a
 /// maximal-chunk-count plan by up to 16x (round 10, M-1).
-fn reserved_bytes(plan: &BulkPlan) -> u64 {
-    plan.total()
+fn reserved_bytes(plan: &BulkPlan, received: u64) -> u64 {
+    // The footprint is what is stored plus the assembly buffer a `finish`
+    // allocates, and the assembly can only ever hold a complete body: reserving
+    // `2 x received` is exact at the finish and never under-counts. Charging
+    // `2 x total` from the plan instead let an announced-but-unpaid plan hold the
+    // provider-wide bound for the whole idle window (R-10 round 18, #1).
+    received
         .saturating_mul(2)
         .saturating_add(PLAN_OVERHEAD)
         .saturating_add(32u64.saturating_mul(plan.chunk_count() as u64))

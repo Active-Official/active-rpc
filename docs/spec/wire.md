@@ -686,12 +686,15 @@ because the kernel meters a call against the narrower of the two
 body's own cost at the documented rate, a per-chunk term and 100 ms of slack —
 so a deployment that mints narrow grants can still finish a small body. The lane's cumulative
 `max_bytes` must cover `BulkPlan::required_lane_bytes()`. A provider built with
-`with_max_live_bytes` refuses with `rpc/budget-exceeded` a plan that would push
-the bytes it holds past that bound, where each open transfer reserves twice its
-announced total (the stored chunks and the assembly buffer) plus the plan's own
-hash vector (32 bytes per chunk and the 53-byte header), because the plan is
-retained for the whole transfer; a `finish` of an image adds a third, transient
-body copy for the redaction. A `finish` that runs out of wall is counted: **every**
+`with_max_live_bytes` refuses with `rpc/budget-exceeded` anything that would push
+the bytes it holds past that bound. Each open transfer reserves **twice the bytes
+it has stored** (the chunks and the assembly buffer the body will need, which can
+only ever be a complete body) plus the plan's own hash vector (32 bytes per chunk
+and the 53-byte header), because the plan is retained for the whole transfer. An
+announced plan that has received nothing therefore reserves only its vector, and
+a `put` that would pass the bound is refused before it stores the chunk, so an
+unpaid announcement cannot hold the provider-wide bound. A `finish` of an image
+adds a third, transient body copy for the redaction. A `finish` that runs out of wall is counted: **every**
 such failure increments the transfer's count, whatever the grant, because an
 attempt that presents the body's own wall and still expires is evidence that the
 estimate is wrong for this host. After three failures at a grant the transfer

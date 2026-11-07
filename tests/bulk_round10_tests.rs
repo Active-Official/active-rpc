@@ -36,27 +36,90 @@ fn drive(provider: &mut BulkProvider, transfer: &BulkTransfer, object: u64, now_
     }
 }
 
-/// The live bound counts the retained plan hash vector, so a one-byte-chunk plan
-/// cannot slip under a body-only limit (round 10, M-1).
+/// The live bound counts the retained plan hash vector but **not** the announced
+/// total of a plan nobody has paid for: an unpaid plan holds its vector, and the
+/// chunks reserve more as they arrive (round 10, M-1; round 18, #1).
 #[test]
-fn the_live_bound_counts_the_plan() {
+fn the_live_bound_counts_the_plan_and_not_an_unpaid_total() {
     let transfer = BulkTransfer::new(body(10, 90), 1).expect("transfer");
     let plan = transfer.plan().clone();
-    let body_only = 2 * plan.total();
-    let reserved = body_only + 53 + 32 * plan.chunk_count() as u64;
-    assert!(reserved > body_only);
-
-    let mut tight = BulkProvider::new().with_max_live_bytes(body_only);
+    // `PLAN_OVERHEAD` (53) plus one 32-byte hash per chunk.
+    let vector = 53 + 32 * plan.chunk_count() as u64;
     assert!(
-        tight.invoke(0, &call("plan", plan.encode())).is_err(),
-        "a body-only bound must not admit the plan hashes"
+        vector > 2 * plan.total(),
+        "the fixture must be vector-heavy"
     );
 
-    let mut exact = BulkProvider::new().with_max_live_bytes(reserved);
+    let mut tight = BulkProvider::new().with_max_live_bytes(vector - 1);
+    assert!(
+        tight.invoke(0, &call("plan", plan.encode())).is_err(),
+        "a bound one byte under the vector must refuse the plan"
+    );
+
+    let mut exact = BulkProvider::new().with_max_live_bytes(vector);
     exact
         .invoke(0, &call("plan", plan.encode()))
-        .expect("the exact reservation fits");
-    assert_eq!(exact.live_bytes(), reserved);
+        .expect("the vector fits");
+    assert_eq!(
+        exact.live_bytes(),
+        vector,
+        "an announced plan reserves its hash vector, not twice its total"
+    );
+
+    // Storing a chunk reserves twice its bytes on top of the vector, so a bound
+    // exactly at the vector has no room for even one chunk.
+    let chunk = transfer.chunk_frame(0).expect("chunk");
+    let stored = (chunk.len() - 53) as u64;
+    let error = exact
+        .invoke(0, &call("put", chunk.clone()))
+        .expect_err("no room for the first chunk");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+
+    let mut roomy = BulkProvider::new().with_max_live_bytes(vector + 2 * stored);
+    roomy.invoke(0, &call("plan", plan.encode())).expect("plan");
+    roomy
+        .invoke(0, &call("put", chunk))
+        .expect("the first chunk fits");
+    assert_eq!(roomy.live_bytes(), vector + 2 * stored);
+}
+
+/// A large announced body is admitted under a small live bound, and a chunk that
+/// would push the bound is refused before it is stored (round 18, #1).
+#[test]
+fn an_unpaid_plan_does_not_hold_the_provider_bound() {
+    let big = BulkTransfer::new(body(64 << 20, 0x21), 256 * 1024).expect("transfer");
+    let other = BulkTransfer::new(body(64 << 20, 0x22), 256 * 1024).expect("transfer");
+    let mut provider = BulkProvider::new().with_max_live_bytes(4 << 20);
+
+    // Two announced 64 MiB bodies fit: neither has stored anything yet.
+    provider
+        .invoke(0, &call("plan", big.plan_frame()))
+        .expect("an unpaid plan reserves its vector");
+    provider
+        .invoke(1, &call("plan", other.plan_frame()))
+        .expect("a second unpaid plan also fits");
+
+    // A chunk is 256 KiB, so twice it is 512 KiB: it fits, and enough chunks to
+    // pass the bound are refused at the ceiling.
+    provider
+        .invoke(0, &call("put", big.chunk_frame(0).expect("chunk")))
+        .expect("the first chunk fits");
+    let mut refused = false;
+    for index in 1..64u32 {
+        match provider.invoke(0, &call("put", big.chunk_frame(index).expect("chunk"))) {
+            Ok(_) => {}
+            Err(error) => {
+                assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused, "the bound refuses a chunk before it is stored");
+    assert!(
+        provider.live_bytes() <= 4 << 20,
+        "the reservation never passes the bound"
+    );
 }
 
 /// A frame is charged before it is decoded, so a wrong-hash frame is not free

@@ -485,9 +485,11 @@ fn lock_state(path: &std::path::Path) -> Option<(u64, String, Option<u32>)> {
     let age_ms = match modified.elapsed() {
         Ok(age) => age.as_millis() as u64,
         // A timestamp in the future is clock skew or a planted file. Reading the
-        // age as zero made such a lock immortal; the ceiling is the safe reading
-        // (R-13 round 9, F2).
-        Err(_) => LOCK_STALE_MS + 1,
+        // age as zero made such a lock immortal, and reading it as the ceiling
+        // kept it immortal while the pid it names is alive (the grace is longer
+        // than the ceiling). Past the grace is the honest reading: no writer
+        // writes its lock with a future timestamp (R-13 rounds 9-10, F2/B).
+        Err(_) => LOCK_LIVE_GRACE_MS + 1,
     };
     let (nonce, pid) = read_lock(&file)?;
     Some((age_ms, nonce, pid))
@@ -626,6 +628,9 @@ fn read_lock(file: &std::fs::File) -> Option<(String, Option<u32>)> {
 
 /// The nonce of the file at `path`, if it can be read.
 fn nonce_of(path: &std::path::Path) -> Option<String> {
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
     let file = std::fs::File::open(path).ok()?;
     read_lock(&file).map(|(nonce, _)| nonce)
 }
@@ -876,6 +881,10 @@ impl ReceiptLog {
             return Ok(());
         }
         let lock = LogLock::acquire(&self.path)?;
+        // The walk below can take a while (up to a full re-read); keep the lock
+        // fresh so a slow walk is not read as an abandoned writer
+        // (R-13 round 10, A).
+        lock.touch();
         if !lock.still_holds() {
             // The path no longer carries our nonce: another process displaced
             // this lock, and a second writer may hold the path. Refusing keeps
@@ -968,6 +977,16 @@ impl ReceiptLog {
 
     fn write_all(&self, bytes: &[u8], lock: &LogLock) -> Result<()> {
         use std::io::Write;
+        // Ownership is re-checked **here**, immediately before the write: the
+        // acquire-time check is followed by a state walk (and, on a repaired
+        // log, a full read), so a writer displaced in between must not append a
+        // second chain (R-13 round 10, A). Only an OS lock on the log handle
+        // would close the window completely.
+        if !lock.still_holds() {
+            return Err(Error::receipt(
+                "the receipt log lock was displaced by another process",
+            ));
+        }
         refuse_symlink(&self.path)?;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -1102,6 +1121,13 @@ impl ReceiptLog {
             .open(&path)
             .map_err(|_| Error::receipt("cannot open the receipt log to repair it"))?;
         refuse_symlink(&path)?;
+        // The same check as the append: a repair that lost its lock must not
+        // truncate a log another writer now owns (R-13 round 10, A).
+        if !lock.still_holds() {
+            return Err(Error::receipt(
+                "the receipt log lock was displaced by another process",
+            ));
+        }
         file.set_len(good_end as u64)
             .map_err(|_| Error::receipt("cannot truncate the damaged tail"))?;
         file.sync_all()
@@ -1145,6 +1171,12 @@ fn valid_correlation_id(id: &str) -> bool {
 /// length, which a size comparison cannot see.
 fn read_header_start(path: &std::path::Path) -> Option<u64> {
     use std::io::Read;
+    // A non-regular file at the path would block `open`; the type check is not
+    // atomic with the open, but it keeps a planted FIFO from hanging the writer
+    // (R-13 round 10, C).
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
     let mut header = [0u8; LOG_HEADER_LEN];
     let mut file = std::fs::File::open(path).ok()?;
     file.read_exact(&mut header).ok()?;
@@ -1162,6 +1194,9 @@ fn read_header_start(path: &std::path::Path) -> Option<u64> {
 /// the file are the head an append links to.
 fn read_tail_head(path: &std::path::Path) -> Option<[u8; 32]> {
     use std::io::{Read, Seek, SeekFrom};
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
     let mut file = std::fs::File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
     if length < (LOG_HEADER_LEN + 32) as u64 {
@@ -1662,6 +1697,33 @@ mod lock_tests {
             "the judged nonce is the one removed"
         );
         assert!(!lock_path.exists(), "the judged lock is gone");
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The write path checks ownership itself, not only the acquire path: a
+    /// writer displaced during the state walk must not append a second chain
+    /// (R-13 round 10, A). The check lives in `write_all`, so this drives the
+    /// shipped function with a displaced lock.
+    #[test]
+    fn a_displaced_lock_cannot_write() {
+        let path = scratch("displaced-write");
+        drop(super::ReceiptLog::create(&path).expect("create"));
+        let log = super::ReceiptLog::open(&path).expect("open");
+        let lock = LogLock::acquire(&path).expect("the lock is free");
+        let lock_path = lock_of(&path);
+
+        // Displace the lock while this writer holds it.
+        std::fs::remove_file(&lock_path).expect("remove");
+        std::fs::write(&lock_path, b"other-1 pid 4294967294 started 1").expect("replacement");
+
+        // The same `ReceiptLog::write_all` the append uses must refuse.
+        let err = log
+            .write_all(b"x", &lock)
+            .expect_err("a displaced lock cannot write");
+        assert_eq!(err.code(), "rpc/receipt", "{err}");
+        assert!(err.to_string().contains("displaced"), "{err}");
 
         let _ = std::fs::remove_file(&lock_path);
         let _ = std::fs::remove_file(&path);

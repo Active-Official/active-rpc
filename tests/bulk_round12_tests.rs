@@ -338,3 +338,112 @@ fn a_zero_grant_attempt_never_counts_against_the_budget() {
         .invoke(0, &with_wall("finish", transfer.finish_frame(), 60_000))
         .expect("a wider grant finishes");
 }
+
+/// An abort-only capability can abandon an object, and the reply is the same
+/// constant shape whether it dropped an open transfer, a completed body, or
+/// nothing at all — so the reply is not a view of another principal's state
+/// (R-10 rounds 17-18).
+#[test]
+fn an_abort_only_capability_cannot_read_the_objects_state() {
+    let transfer = BulkTransfer::new(body(4_000, 0x1b), 1_000).expect("transfer");
+    let agent = Agent::new();
+    let id = agent.register(Box::new(BulkProvider::new()));
+    let lane = agent
+        .create_lane("abort-only", Budget::default())
+        .expect("lane");
+    // The second capability grants only `abort`.
+    let writer = agent
+        .mint(id, 0, CapAttrs::new(&["plan", "put", "missing", "finish"]))
+        .expect("writer");
+    let aborter = agent
+        .mint(id, 0, CapAttrs::new(&["abort"]))
+        .expect("aborter");
+
+    let mut request = 1u64;
+    let mut send = |cap: &active_rpc::cap::CapHandle, method: &str, frame: Vec<u8>| {
+        let envelope = Envelope::request(request, method, Vec::new()).with_payload(frame);
+        request += 1;
+        let promise = agent
+            .call_from_envelope(None, lane, cap, &envelope)
+            .expect("queued");
+        agent.run();
+        promise.value()
+    };
+
+    let reply = |value: active_rpc::Result<Value>| match value.expect("abort answers") {
+        Value::Map(entries) => entries,
+        other => panic!("a map reply: {other:?}"),
+    };
+
+    // Nothing to drop.
+    let empty = reply(send(&aborter, "abort", Vec::new()));
+    // An open transfer.
+    send(&writer, "plan", transfer.plan_frame()).expect("plan");
+    send(&writer, "put", transfer.chunk_frame(0).expect("chunk")).expect("chunk");
+    let open = reply(send(&aborter, "abort", Vec::new()));
+    // A completed body the host has not taken.
+    send(&writer, "plan", transfer.plan_frame()).expect("plan");
+    send(&writer, "put", transfer.chunk_frame(0).expect("chunk")).expect("chunk");
+    send(&writer, "put", transfer.chunk_frame(1).expect("chunk")).expect("chunk");
+    send(&writer, "put", transfer.chunk_frame(2).expect("chunk")).expect("chunk");
+    send(&writer, "put", transfer.chunk_frame(3).expect("chunk")).expect("chunk");
+    send(&writer, "finish", transfer.finish_frame()).expect("finish");
+    let completed = reply(send(&aborter, "abort", Vec::new()));
+
+    assert_eq!(empty, open, "an empty object answers like an open one");
+    assert_eq!(
+        open, completed,
+        "a completed body answers like an empty one"
+    );
+    assert_eq!(
+        empty.keys().cloned().collect::<Vec<_>>(),
+        vec!["aborted".to_string()],
+        "the reply carries only the constant field"
+    );
+}
+
+/// A redacting capability's finish reply omits the raw digest: it is the offline
+/// equality oracle over the un-redacted bytes (R-10 round 18, #7).
+#[test]
+fn a_redacting_finish_omits_the_raw_digest() {
+    let transfer = BulkTransfer::new(body(4_000, 0x1c), 1_000).expect("transfer");
+    let agent = Agent::new();
+    let id = agent.register(Box::new(BulkProvider::new()));
+    let lane = agent
+        .create_lane("redact", Budget::default())
+        .expect("lane");
+    let cap = agent
+        .mint(
+            id,
+            0,
+            CapAttrs::new(&["plan", "put", "missing", "finish"]).redacted(),
+        )
+        .expect("cap");
+
+    let mut request = 1u64;
+    let mut send = |method: &str, frame: Vec<u8>| {
+        let envelope = Envelope::request(request, method, Vec::new()).with_payload(frame);
+        request += 1;
+        let promise = agent
+            .call_from_envelope(None, lane, &cap, &envelope)
+            .expect("queued");
+        agent.run();
+        promise.value()
+    };
+    send("plan", transfer.plan_frame()).expect("plan");
+    for index in 0..4u32 {
+        send("put", transfer.chunk_frame(index).expect("chunk")).expect("chunk");
+    }
+    let reply = send("finish", transfer.finish_frame()).expect("finish");
+    let Value::Map(entries) = reply else {
+        panic!("a map reply");
+    };
+    assert!(
+        !entries.contains_key("body_hash"),
+        "a redacting reply withholds the raw digest: {entries:?}"
+    );
+    assert!(
+        entries.contains_key("length"),
+        "the reply still says how much was stored: {entries:?}"
+    );
+}
