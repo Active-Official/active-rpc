@@ -420,6 +420,18 @@ guest's own `-1` stays `wasm/output`.
 
 ---
 
+### Control-plane codes
+
+The control plane (`control-plane/`) is a separate crate over the kernel, not
+another wire protocol, but two of its codes use the `rpc/` namespace and are
+refused to a client like any other. They are listed here so a client that
+branches on codes knows them (R-19 round 3, L9).
+
+| Code | Condition |
+|------|-----------|
+| `rpc/audit-gap` | the plane's 500-event ring evicted events a reader had not received; the marker frame (`{"kind":"event_gap","skipped":N}`) carries the count and the ring's `dropped_through` high-water mark answers the same question to a poller |
+| `scenario/failed` | a demo scenario could not complete: its fixture call was refused, its provider returned an error, or it panicked (the last case is contained and also marks the kernel `down`) |
+
 ### Channel and topic authority
 
 A channel carries messages in one process; it is not a wire format. The rules a
@@ -440,8 +452,11 @@ transport must preserve when it forwards one:
   a queued payload or a transferred capability id; the host that holds `&Agent`
   can see a channel's existence and counts for any id, and no envelope path can.
   Both the per-channel and the kernel-wide byte counters charge the stored
-  message record, and the add and the release paths measure it with the same
-  function, so those ceilings are memory ceilings.
+  message record at `SLOTS_PER_RECORD` slots, because the deque keeps `capacity`
+  records and the rebuild guard allows up to four times the live count; the add
+  and the release paths measure it with the same function, so those ceilings are
+  resident-memory ceilings rather than occupancy ceilings (R-17 round 10,
+  R10-1).
 - **A topic is bounded text.** 1..=128 bytes, no control characters, and none of
   the characters that reorder or hide rendered text (U+2028/U+2029, bidi
   controls, zero-width and tag characters), checked at the grant, at publish and

@@ -507,3 +507,50 @@ fn an_ambiguous_record_is_refused_before_the_grant_is_spent() {
     agent.run();
     promise.value().expect("the capability still works");
 }
+
+/// Capture stops at the introduction bound: a provider that advertises one
+/// method past it must not have `mutating()` called for the whole list before
+/// the refusal (R-17 round 10, R10-4).
+#[test]
+fn a_capture_stops_at_the_introduction_bound() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct Counting {
+        asked: Arc<AtomicUsize>,
+    }
+
+    impl Provider for Counting {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn methods(&self) -> Vec<String> {
+            (0..=active_rpc::intro::MAX_METHODS_PER_PROVIDER)
+                .map(|index| format!("m{index}"))
+                .collect()
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Ok(Response::Value(Value::text("ok")))
+        }
+    }
+
+    let asked = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new();
+    agent.register(Box::new(Counting {
+        asked: Arc::clone(&asked),
+    }));
+    let bytes = agent.intro().expect("an undescribable provider is skipped");
+    let module = active_infinity::decode(&bytes).expect("a valid module");
+    let json = active_infinity::interop::to_redacted_json(&module).expect("json");
+    assert!(!json.contains("counting"), "{json}");
+    let asked = asked.load(Ordering::SeqCst);
+    assert!(
+        asked <= active_rpc::intro::MAX_METHODS_PER_PROVIDER,
+        "capture asked mutating() {asked} times for {} names",
+        active_rpc::intro::MAX_METHODS_PER_PROVIDER + 1
+    );
+}

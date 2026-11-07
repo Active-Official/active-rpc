@@ -111,6 +111,8 @@ pub struct Health {
     pub kernel: String,
     pub mode: String,
     pub observers: u64,
+    /// Calls the shared echo fixture has left before it is re-minted.
+    pub fixture_calls_remaining: u64,
     pub last_event_ms_ago: u64,
     pub redaction_ok: bool,
     /// True once the audit trail lost events it will never show again.
@@ -509,6 +511,9 @@ pub struct PlaneCore {
     lane: LaneId,
     lanes: Vec<LaneId>,
     echo_provider: ProviderId,
+    /// Kept so `refresh_fixtures` can re-mint the module capability.
+    module_provider: ProviderId,
+    module_object: u64,
     echo_cap: CapHandle,
     module_cap: CapHandle,
     mcp_cap: CapHandle,
@@ -561,6 +566,11 @@ pub struct PlaneCore {
     http_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Sticky: the audit trail lost events.
     audit_gap: bool,
+    /// Re-mint a fixture capability below this many calls.
+    fixture_headroom: u64,
+    /// One-shot test hook: the next `snapshot()` panics. Proves the worker's
+    /// panic boundary covers snapshot construction (R-19 round 3, M2).
+    panic_snapshot_once: bool,
 }
 
 impl Drop for PlaneCore {
@@ -665,6 +675,28 @@ fn redacted_probe() -> bool {
     !json.contains(SECRET_CANARY) && !debug.contains(SECRET_CANARY)
 }
 
+/// Whether an MCP `tools/call` answer is the fixture's echo.
+///
+/// The adapter hands back the JSON result, so the exact `content[0].text` and
+/// the absence of an in-band `isError` are the whole claim. `Debug.contains`
+/// passed an error whose text mentioned "pong", and any payload containing the
+/// word (R-19 round 3, L7).
+fn mcp_echo_ok(value: &Value) -> bool {
+    let Value::Map(entries) = value else {
+        return false;
+    };
+    if matches!(entries.get("isError"), Some(Value::Bool(true))) {
+        return false;
+    }
+    let Some(Value::List(items)) = entries.get("content") else {
+        return false;
+    };
+    matches!(
+        items.first(),
+        Some(Value::Map(field)) if matches!(field.get("text"), Some(Value::Text(text)) if text == "pong")
+    )
+}
+
 fn category_for(kind: &str) -> &'static str {
     match kind {
         "call_queued" | "call_settled" | "job" => "calls",
@@ -677,6 +709,28 @@ fn category_for(kind: &str) -> &'static str {
         "tool" => "tool",
         "stream" => "stream",
         _ => "system",
+    }
+}
+
+/// Calls a fixture capability is minted with.
+///
+/// The demo shares one echo capability, one module capability and one
+/// lane across every scenario and benchmark run. `Budget::default()`
+/// gives 10 000 calls, which an ordinary ladder-plus-benchmark cycle
+/// spends in a few dozen runs; the meter is lifetime and never refills,
+/// so the plane then refused every fixture call and the ladder panicked
+/// while `/health` stayed green (R-19 round 3, M3). Sized for a long
+/// session and backed by `refresh_fixtures`.
+const FIXTURE_CALLS: u64 = 5_000_000;
+const FIXTURE_BYTES: u64 = 4 << 30;
+/// Re-mint once a fixture capability has less than this left.
+const FIXTURE_HEADROOM: u64 = 10_000;
+
+fn fixture_budget() -> Budget {
+    Budget {
+        max_calls: FIXTURE_CALLS,
+        max_bytes: FIXTURE_BYTES,
+        ..Budget::default()
     }
 }
 
@@ -693,33 +747,29 @@ impl PlaneCore {
             .expect("the fixture module installs");
         let module_provider = agent.register(Box::new(module_provider));
 
-        let lane = agent
-            .create_lane("lane-0", Budget::default())
-            .expect("lane");
+        let lane = agent.create_lane("lane-0", fixture_budget()).expect("lane");
         let lanes = vec![
             lane,
-            agent
-                .create_lane("lane-1", Budget::default())
-                .expect("lane"),
-            agent
-                .create_lane("lane-2", Budget::default())
-                .expect("lane"),
-            agent
-                .create_lane("lane-3", Budget::default())
-                .expect("lane"),
+            agent.create_lane("lane-1", fixture_budget()).expect("lane"),
+            agent.create_lane("lane-2", fixture_budget()).expect("lane"),
+            agent.create_lane("lane-3", fixture_budget()).expect("lane"),
         ];
 
         let echo_cap = agent
-            .mint(echo_provider, 0, CapAttrs::new(&["echo", "ping"]))
+            .mint(
+                echo_provider,
+                0,
+                CapAttrs::new(&["echo", "ping"]).with_budget(fixture_budget()),
+            )
             .expect("cap");
         let module_cap = agent
             .mint(
                 module_provider,
                 object,
-                CapAttrs::new(active_rpc::MODULE_METHODS),
+                CapAttrs::new(active_rpc::MODULE_METHODS).with_budget(fixture_budget()),
             )
             .expect("cap");
-        let mut audit_attrs = CapAttrs::new(&["stats", "evaluate"]);
+        let mut audit_attrs = CapAttrs::new(&["stats", "evaluate"]).with_budget(fixture_budget());
         audit_attrs.read_only = true;
         let audit_cap = agent
             .mint(module_provider, object, audit_attrs)
@@ -734,14 +784,18 @@ impl PlaneCore {
             .mint(
                 tool_provider,
                 0,
-                CapAttrs::new(&["echo"]).with_tool_policy(ToolPolicy::allow(&["echo"])),
+                CapAttrs::new(&["echo"])
+                    .with_budget(fixture_budget())
+                    .with_tool_policy(ToolPolicy::allow(&["echo"])),
             )
             .expect("cap");
         let mcp_restricted = agent
             .mint(
                 tool_provider,
                 0,
-                CapAttrs::new(&["echo"]).with_tool_policy(ToolPolicy::allow(&["other"])),
+                CapAttrs::new(&["echo"])
+                    .with_budget(fixture_budget())
+                    .with_tool_policy(ToolPolicy::allow(&["other"])),
             )
             .expect("restricted cap");
         let mut ceiling_policy = ToolPolicy::allow(&["echo"]);
@@ -750,7 +804,9 @@ impl PlaneCore {
             .mint(
                 tool_provider,
                 0,
-                CapAttrs::new(&["echo"]).with_tool_policy(ceiling_policy),
+                CapAttrs::new(&["echo"])
+                    .with_budget(fixture_budget())
+                    .with_tool_policy(ceiling_policy),
             )
             .expect("ceiling cap");
 
@@ -799,7 +855,9 @@ impl PlaneCore {
                 // The allow-list is what confines an HTTP path; the adapter
                 // refuses a path scope because the kernel compares dotted
                 // paths, which cannot confine a URL path.
-                CapAttrs::new(&["get"]).with_tool_policy(http_policy),
+                CapAttrs::new(&["get"])
+                    .with_budget(fixture_budget())
+                    .with_tool_policy(http_policy),
             )
             .expect("http cap");
 
@@ -823,7 +881,9 @@ impl PlaneCore {
             .mint(
                 process_provider,
                 0,
-                CapAttrs::new(&["run"]).with_tool_policy(process_policy),
+                CapAttrs::new(&["run"])
+                    .with_budget(fixture_budget())
+                    .with_tool_policy(process_policy),
             )
             .expect("process cap");
         let process_denied = agent
@@ -843,7 +903,7 @@ impl PlaneCore {
                 label: "echo/rw",
                 cap: echo_cap.clone(),
                 methods: vec!["echo".into(), "ping".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: false,
             },
@@ -854,7 +914,7 @@ impl PlaneCore {
                     .iter()
                     .map(|method| method.to_string())
                     .collect(),
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: false,
             },
@@ -862,7 +922,7 @@ impl PlaneCore {
                 label: "echo/attenuated",
                 cap: worker_cap.clone(),
                 methods: vec!["echo".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: true,
             },
@@ -870,7 +930,7 @@ impl PlaneCore {
                 label: "module/ro",
                 cap: audit_cap,
                 methods: vec!["stats".into(), "evaluate".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: true,
                 attenuated: true,
             },
@@ -878,7 +938,7 @@ impl PlaneCore {
                 label: "mcp/echo",
                 cap: mcp_cap.clone(),
                 methods: vec!["echo".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: false,
             },
@@ -886,7 +946,7 @@ impl PlaneCore {
                 label: "mcp/restricted",
                 cap: mcp_restricted.clone(),
                 methods: vec!["echo".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: true,
             },
@@ -894,7 +954,7 @@ impl PlaneCore {
                 label: "mcp/ceiling",
                 cap: mcp_ceiling.clone(),
                 methods: vec!["echo".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: true,
             },
@@ -902,7 +962,7 @@ impl PlaneCore {
                 label: "http/health",
                 cap: http_cap.clone(),
                 methods: vec!["get".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: false,
             },
@@ -910,7 +970,7 @@ impl PlaneCore {
                 label: "process/allowed",
                 cap: process_allowed.clone(),
                 methods: vec!["run".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: false,
             },
@@ -918,7 +978,7 @@ impl PlaneCore {
                 label: "process/denied",
                 cap: process_denied.clone(),
                 methods: vec!["run".into()],
-                max_calls: Budget::default().max_calls,
+                max_calls: FIXTURE_CALLS,
                 read_only: false,
                 attenuated: true,
             },
@@ -939,6 +999,8 @@ impl PlaneCore {
             lane,
             lanes,
             echo_provider,
+            module_provider,
+            module_object: object,
             echo_cap: echo_cap.clone(),
             module_cap: module_cap.clone(),
             mcp_cap: mcp_cap.clone(),
@@ -950,6 +1012,7 @@ impl PlaneCore {
             process_denied: process_denied.clone(),
             process_program,
             http_shutdown,
+            fixture_headroom: FIXTURE_HEADROOM,
             caps,
             channels,
             channel_messages,
@@ -985,6 +1048,7 @@ impl PlaneCore {
             gauge_samples: BTreeMap::new(),
             plane_mode: "demo".into(),
             audit_gap: false,
+            panic_snapshot_once: false,
         };
         core.redaction_ok = redacted_probe();
         core.capture_kernel_events();
@@ -1665,7 +1729,19 @@ impl PlaneCore {
         }
     }
 
+    /// Make the next [`PlaneCore::snapshot`] panic, once.
+    ///
+    /// Only for the worker's panic-containment test: a panic inside snapshot
+    /// construction is otherwise unreachable without corrupting the core.
+    #[doc(hidden)]
+    pub fn panic_next_snapshot(&mut self) {
+        self.panic_snapshot_once = true;
+    }
+
     pub fn snapshot(&mut self) -> Snapshot {
+        if std::mem::take(&mut self.panic_snapshot_once) {
+            panic!("test hook: the snapshot panicked");
+        }
         self.capture_kernel_events();
         self.refresh_status();
         let metrics = self.metrics_view();
@@ -1687,6 +1763,7 @@ impl PlaneCore {
                 kernel: "up".into(),
                 mode: self.plane_mode.clone(),
                 observers: 0,
+                fixture_calls_remaining: self.fixture_calls_remaining(),
                 last_event_ms_ago: now.saturating_sub(last_event),
                 redaction_ok: self.redaction_ok,
                 audit_gap: self.audit_gap,
@@ -1724,7 +1801,60 @@ impl PlaneCore {
             .collect()
     }
 
+    /// Re-mint a fixture capability before its lifetime meter runs out.
+    ///
+    /// Every scenario and benchmark shares the echo and module handles, and a
+    /// `BudgetMeter` is cumulative for the life of a capability: a plane left
+    /// running eventually refused every fixture call, and the ladder turned
+    /// the refusal into a panic while `/health` still said "up" (R-19 round 3,
+    /// M3). Re-minting keeps the ladder honest; the old handles are revoked so
+    /// the kernel's record set does not grow with time.
+    fn refresh_fixtures(&mut self) {
+        let headroom = self.fixture_headroom;
+        let low = |agent: &Agent, cap: &CapHandle| {
+            agent
+                .remaining_calls(cap)
+                .map(|left| left < headroom)
+                .unwrap_or(true)
+        };
+        if !low(&self.agent, &self.echo_cap) && !low(&self.agent, &self.module_cap) {
+            return;
+        }
+        for cap in [&self.echo_cap, &self.module_cap] {
+            let _ = self.agent.revoke(cap);
+        }
+        if let Ok(cap) = self.agent.mint(
+            self.echo_provider,
+            0,
+            CapAttrs::new(&["echo", "ping"]).with_budget(fixture_budget()),
+        ) {
+            self.echo_cap = cap;
+        }
+        if let Ok(cap) = self.agent.mint(
+            self.module_provider,
+            self.module_object,
+            CapAttrs::new(active_rpc::MODULE_METHODS).with_budget(fixture_budget()),
+        ) {
+            self.module_cap = cap;
+        }
+        // The display table holds clones minted at startup: point the live rows
+        // at the handles the scenarios now use.
+        for info in &mut self.caps {
+            match info.label {
+                "echo/rw" => info.cap = self.echo_cap.clone(),
+                "module/rw" => info.cap = self.module_cap.clone(),
+                _ => {}
+            }
+        }
+    }
+
+    /// Calls the shared echo fixture has left (reported by `/health`).
+    fn fixture_calls_remaining(&self) -> u64 {
+        self.agent.remaining_calls(&self.echo_cap).unwrap_or(0)
+    }
+
     pub fn run_scenario(&mut self, id: &str) -> Result<ScenarioResult, String> {
+        self.refresh_fixtures();
         let def = scenario_def(id).ok_or_else(|| format!("unknown scenario {id}"))?;
         self.begin_activity(def.mode, format!("{} · {} starting", def.code, def.title));
         let before = self.metrics_view();
@@ -2262,7 +2392,7 @@ impl PlaneCore {
         };
         let call_us = start.elapsed().as_secs_f64() * 1e6;
         self.counters.tool_calls += 1;
-        let ok = format!("{value:?}").contains("pong");
+        let ok = mcp_echo_ok(&value);
         self.stage("tools/call", brief(&value), call_us, ok);
         self.note(
             "tool",
@@ -2868,6 +2998,7 @@ impl PlaneCore {
     }
 
     pub fn run_benchmark(&mut self, iterations: usize) -> Result<BenchmarkReport, String> {
+        self.refresh_fixtures();
         let iterations = iterations.clamp(5, 5_000);
         self.begin_activity("Benchmark", format!("benchmark · {iterations} iterations"));
         let module = fixture_module();
@@ -3079,5 +3210,92 @@ mod ring_tests {
         assert!(core.audit_gap, "the audit trail lost events");
         assert!(pinned < core.dropped_through);
         assert_eq!(core.snapshot().dropped_through, core.dropped_through);
+    }
+
+    /// The fixture handles are lifetime meters. A plane that outlives the
+    /// grant used to refuse every call and then panic in the ladder while
+    /// `/health` stayed green; `refresh_fixtures` re-mints before that
+    /// (R-19 round 3, M3).
+    #[test]
+    fn the_fixture_refreshes_before_its_grant_runs_out() {
+        let mut core = PlaneCore::new();
+        let fresh = core.echo_cap.id();
+        let module = core.module_cap.id();
+        assert_eq!(core.fixture_calls_remaining(), FIXTURE_CALLS);
+        // A full budget does not need a re-mint.
+        core.refresh_fixtures();
+        assert_eq!(core.echo_cap.id(), fresh, "a fresh fixture was replaced");
+        // Force the low-water mark, which is what a long session reaches.
+        core.fixture_headroom = u64::MAX;
+        core.refresh_fixtures();
+        assert_ne!(
+            core.echo_cap.id(),
+            fresh,
+            "the echo fixture did not refresh"
+        );
+        assert_ne!(
+            core.module_cap.id(),
+            module,
+            "the module fixture did not refresh"
+        );
+        assert_eq!(core.fixture_calls_remaining(), FIXTURE_CALLS);
+        // The ladder runs on the refreshed handles.
+        let result = core.run_scenario("round-trip").expect("round-trip");
+        assert!(result.ok, "{}", result.detail);
+        assert_eq!(
+            core.snapshot().health.fixture_calls_remaining,
+            FIXTURE_CALLS
+        );
+    }
+
+    /// One full ladder plus a benchmark must fit in the fixture grant, or the
+    /// `.expect("bench value")` sites turn a budget refusal into a panic.
+    #[test]
+    fn one_ladder_and_benchmark_fit_in_the_fixture_grant() {
+        let mut core = PlaneCore::new();
+        let before = core.fixture_calls_remaining();
+        for result in core.run_level(6, true) {
+            assert!(result.ok, "{}: {}", result.code, result.detail);
+        }
+        assert!(core.run_benchmark(200).is_ok(), "benchmark");
+        let spent = before - core.fixture_calls_remaining();
+        assert!(
+            spent < FIXTURE_HEADROOM,
+            "one ladder and benchmark spent {spent} fixture calls, above the re-mint headroom"
+        );
+    }
+
+    /// The MCP memory step is an exact answer, not a substring: an in-band
+    /// `isError` or a text that merely contains "pong" is a failure
+    /// (R-19 round 3, L7).
+    #[test]
+    fn the_mcp_echo_answer_is_matched_exactly() {
+        let good = Value::map([(
+            "content",
+            Value::list([Value::map([
+                ("type", Value::text("text")),
+                ("text", Value::text("pong")),
+            ])]),
+        )]);
+        assert!(mcp_echo_ok(&good));
+        let errored = Value::map([
+            (
+                "content",
+                Value::list([Value::map([
+                    ("type", Value::text("text")),
+                    ("text", Value::text("pong")),
+                ])]),
+            ),
+            ("isError", Value::Bool(true)),
+        ]);
+        assert!(!mcp_echo_ok(&errored), "an in-band error passed");
+        let substring = Value::map([(
+            "content",
+            Value::list([Value::map([
+                ("type", Value::text("text")),
+                ("text", Value::text("pong but not the echo")),
+            ])]),
+        )]);
+        assert!(!mcp_echo_ok(&substring), "a substring passed");
     }
 }

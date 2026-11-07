@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,14 +27,48 @@ use crate::plane::{BenchmarkReport, PlaneCore, ScenarioResult, Snapshot};
 pub enum Command {
     Scenario(
         String,
-        tokio::sync::oneshot::Sender<Result<ScenarioResult, String>>,
+        tokio::sync::oneshot::Sender<Result<ScenarioResult, CommandFailure>>,
     ),
-    Level(u8, bool, tokio::sync::oneshot::Sender<Vec<ScenarioResult>>),
+    Level(
+        u8,
+        bool,
+        tokio::sync::oneshot::Sender<Result<Vec<ScenarioResult>, CommandFailure>>,
+    ),
     Benchmark(
         usize,
-        tokio::sync::oneshot::Sender<Result<BenchmarkReport, String>>,
+        tokio::sync::oneshot::Sender<Result<BenchmarkReport, CommandFailure>>,
     ),
-    Status(tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>),
+    Status(tokio::sync::oneshot::Sender<Result<serde_json::Value, CommandFailure>>),
+}
+
+/// Why a worker command produced no result.
+///
+/// The two cases need different HTTP statuses: a command the core refused
+/// (unknown scenario, read-only plane) is the caller's fault, while a caught
+/// panic is the plane's. Collapsing them into one string made a panic answer
+/// `400` (R-19 round 3, L2).
+#[derive(Debug, Clone)]
+pub enum CommandFailure {
+    Refused(String),
+    Panicked,
+}
+
+impl CommandFailure {
+    fn status(&self) -> StatusCode {
+        match self {
+            CommandFailure::Refused(_) => StatusCode::BAD_REQUEST,
+            CommandFailure::Panicked => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn into_response(self) -> Response {
+        let status = self.status();
+        let detail = match self {
+            CommandFailure::Refused(detail) => detail,
+            CommandFailure::Panicked => "the kernel worker panicked".to_string(),
+        };
+        (status, detail).into_response()
+    }
 }
 
 #[derive(Clone)]
@@ -49,6 +84,11 @@ pub struct AppState {
     /// compares the snapshot's uptime against the last one it saw, so a frozen
     /// worker reads as unhealthy instead of immortal.
     pub heartbeat: Arc<Mutex<Heartbeat>>,
+    /// Sticky: the worker caught a panic, so every snapshot reads `kernel:
+    /// "down"` until the process restarts (R-19 round 3, M2).
+    pub down: Arc<AtomicBool>,
+    /// Open dashboard sockets, reported by `/metrics` (round 3, L8).
+    pub observers: Arc<AtomicU64>,
 }
 
 /// When the last snapshot was taken, and the uptime it carried.
@@ -127,6 +167,9 @@ pub fn spawn_worker(read_only: bool) -> AppState {
     // (audit ARPC-003).
     let heartbeat: Arc<Mutex<Heartbeat>> = Arc::new(Mutex::new(Heartbeat::new(0)));
     let heartbeat_worker = Arc::clone(&heartbeat);
+    let observers: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let down: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let down_worker = Arc::clone(&down);
     std::thread::Builder::new()
         .name("active-kernel".into())
         .spawn(move || {
@@ -144,29 +187,15 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                 // serve.
                 return;
             }
-            let publish = |core: &mut PlaneCore,
-                           latest: &Arc<Mutex<Snapshot>>,
-                           broadcast: &broadcast::Sender<Snapshot>,
-                           heartbeat: &Arc<Mutex<Heartbeat>>| {
-                let snapshot = core.snapshot();
-                if let Ok(mut guard) = latest.lock() {
-                    *guard = snapshot.clone();
-                }
-                if let Ok(mut beat) = heartbeat.lock() {
-                    beat.observe(snapshot.uptime_ms);
-                }
-                let _ = broadcast.send(snapshot);
-            };
-            // A panic in provider or scenario code must not leave `/health`
-            // claiming a live kernel: the last snapshot is republished with
-            // `kernel: "down"` and every later read route sees it. The core is
-            // not touched afterwards, because a panic can leave a `RefCell`
-            // borrow held.
+            // A panic inside `snapshot()` used to happen outside `catch_unwind`,
+            // kill this thread, and leave `latest` frozen with `kernel: "up"`;
+            // the flag makes the failure sticky so a later tick cannot publish
+            // "up" over a core whose panic was never explained (R-19 r3, M2).
+            let down = down_worker;
             let publish_down =
                 |latest: &Arc<Mutex<Snapshot>>, broadcast: &broadcast::Sender<Snapshot>| {
-                    if let Some(snapshot) = mark_worker_down(latest) {
-                        let _ = broadcast.send(snapshot);
-                    }
+                    let snapshot = mark_worker_down(latest);
+                    let _ = broadcast.send(snapshot);
                 };
             loop {
                 // Everything that runs kernel or provider code goes through
@@ -177,15 +206,13 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                                broadcast: &broadcast::Sender<Snapshot>,
                                heartbeat: &Arc<Mutex<Heartbeat>>,
                                run: &mut dyn FnMut(&mut PlaneCore)|
-                 -> Result<(), String> {
+                 -> Result<(), CommandFailure> {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(core))) {
-                        Ok(()) => {
-                            publish(core, latest, broadcast, heartbeat);
-                            Ok(())
-                        }
+                        Ok(()) => publish_snapshot(core, latest, broadcast, heartbeat, &down),
                         Err(_) => {
+                            down.store(true, Ordering::SeqCst);
                             publish_down(latest, broadcast);
-                            Err("the kernel worker panicked".to_string())
+                            Err(CommandFailure::Panicked)
                         }
                     }
                 };
@@ -201,8 +228,8 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                         );
                         match outcome {
                             Ok(()) => {
-                                let _ =
-                                    reply.send(result.unwrap_or_else(|| Err("no result".into())));
+                                let result = result.unwrap_or_else(|| Err("no result".to_string()));
+                                let _ = reply.send(result.map_err(CommandFailure::Refused));
                             }
                             Err(error) => {
                                 let _ = reply.send(Err(error));
@@ -218,8 +245,16 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                             &heartbeat,
                             &mut |core| results = Some(core.run_level(level, up_to)),
                         );
-                        if outcome.is_ok() {
-                            let _ = reply.send(results.unwrap_or_default());
+                        // A caught panic used to answer nothing, so the HTTP
+                        // handler waited out its timeout and returned 504
+                        // (R-19 round 3, L2).
+                        match outcome {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(results.unwrap_or_default()));
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
                         }
                     }
                     Ok(Command::Benchmark(iterations, reply)) => {
@@ -233,8 +268,8 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                         );
                         match outcome {
                             Ok(()) => {
-                                let _ =
-                                    reply.send(report.unwrap_or_else(|| Err("no result".into())));
+                                let report = report.unwrap_or_else(|| Err("no result".to_string()));
+                                let _ = reply.send(report.map_err(CommandFailure::Refused));
                             }
                             Err(error) => {
                                 let _ = reply.send(Err(error));
@@ -250,12 +285,26 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                             &heartbeat,
                             &mut |core| status = Some(core.status_module_json()),
                         );
-                        if outcome.is_ok() {
-                            let _ = reply.send(status.unwrap_or_else(|| Ok(json!({}))));
+                        match outcome {
+                            Ok(()) => {
+                                let status = status.unwrap_or_else(|| Err("no result".to_string()));
+                                let _ = reply.send(status.map_err(CommandFailure::Refused));
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        publish(&mut core, &latest, &broadcast_thread, &heartbeat);
+                        // A panic here is contained: the flag is set and the
+                        // next tick serves `kernel: "down"`.
+                        let _ = publish_snapshot(
+                            &mut core,
+                            &latest,
+                            &broadcast_thread,
+                            &heartbeat,
+                            &down,
+                        );
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -273,6 +322,8 @@ pub fn spawn_worker(read_only: bool) -> AppState {
         broadcast,
         read_only,
         heartbeat,
+        down,
+        observers,
     }
 }
 
@@ -339,6 +390,14 @@ async fn guard(
     if let Some(host) = &host {
         if !is_loopback_host(host) {
             return (StatusCode::FORBIDDEN, "unexpected Host").into_response();
+        }
+        // `is_loopback_host` splits on the first colon, so
+        // `127.0.0.1:8787@evil.example` passed as loopback while `host_parts`
+        // refused its port; `same_origin` then took its "no Host" arm and any
+        // loopback port was accepted. A present-but-unparsable Host is refused
+        // (R-19 round 3, L4).
+        if host_parts(host).is_none() {
+            return (StatusCode::FORBIDDEN, "unparsable Host").into_response();
         }
     }
     if request.method() != axum::http::Method::GET {
@@ -410,7 +469,58 @@ pub fn is_loopback_host(host: &str) -> bool {
 }
 
 fn snapshot(state: &AppState) -> Snapshot {
-    state.latest.lock().expect("snapshot").clone()
+    // A panic inside a critical section poisons the cell, and a plain
+    // `Snapshot` has no invariant left to protect: recovering beats failing
+    // every read route for the life of the process (R-19 round 3, L5).
+    let guard = state
+        .latest
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut snapshot = guard.clone();
+    drop(guard);
+    if state.down.load(Ordering::SeqCst) {
+        snapshot.health.kernel = "down".to_string();
+    }
+    snapshot.health.observers = state.observers.load(Ordering::Relaxed);
+    snapshot
+}
+
+/// Take a snapshot and publish it, containing a panic inside `snapshot()`.
+///
+/// It used to run outside `catch_unwind`: a panic killed the worker thread,
+/// `mark_worker_down` was never reached, and `/metrics` kept serving a frozen
+/// snapshot with `kernel: "up"` (R-19 round 3, M2).
+fn publish_snapshot(
+    core: &mut PlaneCore,
+    latest: &Arc<Mutex<Snapshot>>,
+    broadcast: &broadcast::Sender<Snapshot>,
+    heartbeat: &Arc<Mutex<Heartbeat>>,
+    down: &AtomicBool,
+) -> Result<(), CommandFailure> {
+    let snapshot = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| core.snapshot()))
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            down.store(true, Ordering::SeqCst);
+            let snapshot = mark_worker_down(latest);
+            let _ = broadcast.send(snapshot);
+            return Err(CommandFailure::Panicked);
+        }
+    };
+    let mut snapshot = snapshot;
+    if down.load(Ordering::SeqCst) {
+        // Sticky: the core's post-panic state was never verified, so no later
+        // tick may claim it is healthy.
+        snapshot.health.kernel = "down".to_string();
+    }
+    if let Ok(mut guard) = latest.lock() {
+        *guard = snapshot.clone();
+    }
+    if let Ok(mut beat) = heartbeat.lock() {
+        beat.observe(snapshot.uptime_ms);
+    }
+    let _ = broadcast.send(snapshot);
+    Ok(())
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -462,13 +572,51 @@ async fn events(State(state): State<AppState>) -> impl IntoResponse {
 /// while later ids are evicted, so a cursor just below the pinned front was
 /// told "no gap" over a real hole. The highest evicted id can answer it
 /// (R-19 round 3, M1).
-fn ring_gap(cursor: u64, dropped_through: u64) -> bool {
+pub(crate) fn ring_gap(cursor: u64, dropped_through: u64) -> bool {
     cursor < dropped_through
 }
 
 /// Whether the ring has dropped any event at all.
-fn ring_truncated(dropped_through: u64) -> bool {
+pub(crate) fn ring_truncated(dropped_through: u64) -> bool {
     dropped_through > 0
+}
+
+/// The `/logs/tail` envelope.
+///
+/// One function for the HTTP route and the embedded MCP fallback: the fallback
+/// used to build `{count,cursor,events}` and omit `oldest`/`truncated`, so the
+/// same tool returned two shapes depending on one probe at startup, and the
+/// truncation signal disappeared in the degraded mode (R-19 round 3, L3).
+pub(crate) fn tail_envelope(
+    events: Vec<crate::plane::UiEvent>,
+    oldest: u64,
+    dropped_through: u64,
+) -> serde_json::Value {
+    let cursor = events.last().map(|event| event.id).unwrap_or(0);
+    json!({
+        "count": events.len(),
+        "cursor": cursor,
+        "oldest": oldest,
+        "truncated": ring_truncated(dropped_through),
+        "events": events,
+    })
+}
+
+/// The `/logs/since` envelope; same reason as [`tail_envelope`].
+pub(crate) fn since_envelope(
+    events: Vec<crate::plane::UiEvent>,
+    cursor: u64,
+    oldest: u64,
+    dropped_through: u64,
+) -> serde_json::Value {
+    let next = events.last().map(|event| event.id).unwrap_or(cursor);
+    json!({
+        "count": events.len(),
+        "cursor": next,
+        "oldest": oldest,
+        "gap": ring_gap(cursor, dropped_through),
+        "events": events,
+    })
 }
 
 async fn logs_tail(
@@ -479,20 +627,12 @@ async fn logs_tail(
     let limit = query.n.unwrap_or(200).clamp(1, 500);
     let start = snapshot.events.len().saturating_sub(limit);
     let events = snapshot.events[start..].to_vec();
-    let cursor = events.last().map(|event| event.id).unwrap_or(0);
     let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
     // `truncated` says the 500-event ring has already dropped history: a poller
     // that asks for a tail is looking at a window, not at the whole run. A
     // protected event can pin `oldest`, so the eviction counter decides
     // (R-19 round 3, M1).
-    let truncated = ring_truncated(snapshot.dropped_through);
-    Json(json!({
-        "count": events.len(),
-        "cursor": cursor,
-        "oldest": oldest,
-        "truncated": truncated,
-        "events": events,
-    }))
+    Json(tail_envelope(events, oldest, snapshot.dropped_through))
 }
 
 async fn logs_since(
@@ -508,19 +648,11 @@ async fn logs_since(
         .into_iter()
         .filter(|event| event.id > cursor)
         .collect();
-    let next = events.last().map(|event| event.id).unwrap_or(cursor);
     // Any id at or below `dropped_through` is gone for ever. Comparing with
     // `oldest` alone missed it: a protected event pins the front while later
     // ids are evicted, so the poller was told "no gap" over a real hole
     // (R-19 round 3, M1).
-    let gap = ring_gap(cursor, dropped_through);
-    Json(json!({
-        "count": events.len(),
-        "cursor": next,
-        "oldest": oldest,
-        "gap": gap,
-        "events": events,
-    }))
+    Json(since_envelope(events, cursor, oldest, dropped_through))
 }
 
 async fn logs_export(State(state): State<AppState>) -> Response {
@@ -578,7 +710,7 @@ async fn scenario(State(state): State<AppState>, Path(id): Path<String>) -> Resp
             let snapshot = snapshot(&state);
             Json(json!({"result": result, "metrics": snapshot.metrics})).into_response()
         }
-        Ok(Ok(Err(error))) => (StatusCode::BAD_REQUEST, error).into_response(),
+        Ok(Ok(Err(failure))) => failure.into_response(),
         Ok(Err(_)) => (StatusCode::INTERNAL_SERVER_ERROR, "scenario reply dropped").into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "scenario timed out").into_response(),
     }
@@ -608,7 +740,7 @@ async fn level(
         return (StatusCode::SERVICE_UNAVAILABLE, "kernel busy or stopped").into_response();
     }
     match tokio::time::timeout(Duration::from_secs(120), rx).await {
-        Ok(Ok(results)) => {
+        Ok(Ok(Ok(results))) => {
             let snapshot = snapshot(&state);
             Json(json!({
                 "level": level,
@@ -618,6 +750,7 @@ async fn level(
             }))
             .into_response()
         }
+        Ok(Ok(Err(failure))) => failure.into_response(),
         Ok(Err(_)) => (StatusCode::INTERNAL_SERVER_ERROR, "level reply dropped").into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "level timed out").into_response(),
     }
@@ -645,7 +778,7 @@ async fn benchmark_run(
     }
     match tokio::time::timeout(Duration::from_secs(120), rx).await {
         Ok(Ok(Ok(report))) => Json(report).into_response(),
-        Ok(Ok(Err(error))) => (StatusCode::BAD_REQUEST, error).into_response(),
+        Ok(Ok(Err(failure))) => failure.into_response(),
         Ok(Err(_)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "benchmark reply dropped").into_response()
         }
@@ -660,7 +793,7 @@ async fn status_module(State(state): State<AppState>) -> Response {
     }
     match tokio::time::timeout(Duration::from_secs(20), rx).await {
         Ok(Ok(Ok(value))) => Json(value).into_response(),
-        Ok(Ok(Err(error))) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        Ok(Ok(Err(failure))) => failure.into_response(),
         Ok(Err(_)) => (StatusCode::INTERNAL_SERVER_ERROR, "status reply dropped").into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "status timed out").into_response(),
     }
@@ -682,7 +815,25 @@ async fn ws(ws: WebSocketUpgrade, headers: HeaderMap, State(state): State<AppSta
     ws.on_upgrade(move |socket| stream_socket(socket, state))
 }
 
+/// Counts one open dashboard socket for `health.observers`.
+struct ObserverGuard(Arc<AtomicU64>);
+
+impl ObserverGuard {
+    fn open(counter: &Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for ObserverGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn stream_socket(mut socket: WebSocket, state: AppState) {
+    // `Health.observers` was a constant zero (R-19 round 3, L8).
+    let _observer = ObserverGuard::open(&state.observers);
     let mut receiver = state.broadcast.subscribe();
     let initial = snapshot(&state);
     if let Ok(text) = serde_json::to_string(&initial) {
@@ -746,10 +897,14 @@ pub fn gap_frame(skipped: u64, ts_ms: u64) -> String {
 ///
 /// Called when the worker panicked: the alternative is a process that keeps
 /// answering 200 with a frozen snapshot while `/health` says `ok`.
-fn mark_worker_down(latest: &Arc<Mutex<Snapshot>>) -> Option<Snapshot> {
-    let mut guard = latest.lock().ok()?;
+fn mark_worker_down(latest: &Arc<Mutex<Snapshot>>) -> Snapshot {
+    // A poisoned cell still holds the last snapshot; the down flag is the fact
+    // that matters, so recover it (R-19 round 3, L5).
+    let mut guard = latest
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.health.kernel = "down".to_string();
-    Some(guard.clone())
+    guard.clone()
 }
 
 pub async fn serve(port: u16, read_only: bool) -> std::io::Result<()> {
@@ -941,5 +1096,97 @@ mod ring_arithmetic_tests {
     fn truncation_is_any_eviction() {
         assert!(!ring_truncated(0));
         assert!(ring_truncated(1));
+    }
+}
+
+#[cfg(test)]
+mod worker_panic_tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::{publish_snapshot, snapshot, AppState, Command, CommandFailure, Heartbeat};
+    use crate::plane::PlaneCore;
+    use tokio::sync::broadcast;
+
+    /// The three cells `publish_snapshot` writes through, plus the down flag.
+    type PublishCells = (
+        Arc<Mutex<crate::plane::Snapshot>>,
+        broadcast::Sender<crate::plane::Snapshot>,
+        Arc<Mutex<Heartbeat>>,
+        AtomicBool,
+    );
+
+    fn cell(core: &mut PlaneCore) -> PublishCells {
+        let latest = Arc::new(Mutex::new(core.snapshot()));
+        let (broadcast, _) = broadcast::channel(8);
+        let heartbeat = Arc::new(Mutex::new(Heartbeat::new(0)));
+        (latest, broadcast, heartbeat, AtomicBool::new(false))
+    }
+
+    /// A panic inside `snapshot()` used to escape `catch_unwind`, kill the
+    /// worker thread and leave `latest` frozen with `kernel: "up"`. It must be
+    /// contained, and the down flag must survive later ticks (R-19 round 3, M2).
+    #[test]
+    fn a_panicking_snapshot_sticks_the_kernel_down() {
+        let mut core = PlaneCore::new();
+        let (latest, broadcast, heartbeat, down) = cell(&mut core);
+        core.panic_next_snapshot();
+        let outcome = publish_snapshot(&mut core, &latest, &broadcast, &heartbeat, &down);
+        assert!(
+            matches!(outcome, Err(CommandFailure::Panicked)),
+            "the panic must be reported as a worker failure"
+        );
+        assert!(down.load(Ordering::SeqCst));
+        assert_eq!(
+            latest.lock().expect("latest").health.kernel,
+            "down",
+            "the published snapshot must name the dead kernel"
+        );
+        // The next tick succeeds, but a sticky failure must not turn "up".
+        let outcome = publish_snapshot(&mut core, &latest, &broadcast, &heartbeat, &down);
+        assert!(outcome.is_ok());
+        assert_eq!(latest.lock().expect("latest").health.kernel, "down");
+    }
+
+    /// A reader must see the sticky flag even when the published snapshot is
+    /// older than the panic.
+    #[test]
+    fn a_reader_sees_down_after_the_flag_is_set() {
+        let mut core = PlaneCore::new();
+        let (latest, broadcast, heartbeat, down) = cell(&mut core);
+        let (tx, _rx) = crossbeam_channel::bounded::<Command>(1);
+        let state = AppState {
+            tx,
+            latest: Arc::clone(&latest),
+            broadcast,
+            read_only: false,
+            heartbeat,
+            down: Arc::new(down),
+            observers: Arc::new(AtomicU64::new(3)),
+        };
+        // The stored snapshot still says "up"; the flag from a caught panic is
+        // what every read route consults.
+        assert_eq!(latest.lock().expect("latest").health.kernel, "up");
+        state.down.store(true, Ordering::SeqCst);
+        let served = snapshot(&state);
+        assert_eq!(served.health.kernel, "down");
+        assert_eq!(
+            served.health.observers, 3,
+            "observers come from the live count"
+        );
+    }
+
+    /// A caught panic maps to 500; a command the core refused maps to 400.
+    #[test]
+    fn a_worker_panic_is_a_server_error() {
+        use axum::http::StatusCode;
+        assert_eq!(
+            CommandFailure::Panicked.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            CommandFailure::Refused("bad level".to_string()).status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 }

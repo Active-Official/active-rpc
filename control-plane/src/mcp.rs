@@ -16,13 +16,20 @@ const DEFAULT_ATTACH: &str = "http://127.0.0.1:8787";
 
 struct Attach {
     base: String,
+    /// Every attach request goes through one agent whose redirect policy is
+    /// `0`: `ureq` follows five by default, so a `302` from whatever owns the
+    /// port escaped the loopback check and its body was returned to the agent
+    /// (R-19 round 3, L6).
+    http: ureq::Agent,
     local: Option<Mutex<PlaneCore>>,
     read_only: bool,
 }
 
 impl Attach {
     fn new(base: String, read_only: bool) -> Self {
-        let reachable = ureq::get(&format!("{base}/health"))
+        let http = ureq::AgentBuilder::new().redirects(0).build();
+        let reachable = http
+            .get(&format!("{base}/health"))
             .timeout(std::time::Duration::from_millis(500))
             .call()
             .is_ok();
@@ -38,13 +45,15 @@ impl Attach {
         });
         Self {
             base,
+            http,
             local,
             read_only,
         }
     }
 
     fn get(&self, path: &str) -> Result<Json, String> {
-        ureq::get(&format!("{}{}", self.base, path))
+        self.http
+            .get(&format!("{}{}", self.base, path))
             .timeout(std::time::Duration::from_secs(5))
             .call()
             .map_err(|error| error.to_string())?
@@ -93,28 +102,33 @@ impl Attach {
             let snapshot = core.snapshot();
             let start = snapshot.events.len().saturating_sub(limit);
             let events = snapshot.events[start..].to_vec();
-            let cursor = events.last().map(|event| event.id).unwrap_or(0);
-            return serde_json::to_value(json!({
-                "count": events.len(),
-                "cursor": cursor,
-                "events": events,
-            }))
-            .map_err(|error| error.to_string());
+            let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
+            return Ok(crate::server::tail_envelope(
+                events,
+                oldest,
+                snapshot.dropped_through,
+            ));
         }
         self.get(&format!("/logs/tail?n={limit}"))
     }
 
     fn events_since(&self, cursor: u64) -> Result<Json, String> {
         if let Some(local) = &self.local {
-            let core = local.lock().map_err(|_| "plane poisoned".to_string())?;
-            let events = core.events_after(cursor);
-            let next = events.last().map(|event| event.id).unwrap_or(cursor);
-            return serde_json::to_value(json!({
-                "count": events.len(),
-                "cursor": next,
-                "events": events,
-            }))
-            .map_err(|error| error.to_string());
+            let mut core = local.lock().map_err(|_| "plane poisoned".to_string())?;
+            let snapshot = core.snapshot();
+            let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
+            let dropped_through = snapshot.dropped_through;
+            let events = snapshot
+                .events
+                .into_iter()
+                .filter(|event| event.id > cursor)
+                .collect();
+            return Ok(crate::server::since_envelope(
+                events,
+                cursor,
+                oldest,
+                dropped_through,
+            ));
         }
         self.get(&format!("/logs/since?id={cursor}"))
     }
@@ -145,7 +159,8 @@ impl Attach {
                     .map_err(|error| error.to_string())
             });
         }
-        ureq::post(&format!("{}/demo/scenario/{id}", self.base))
+        self.http
+            .post(&format!("{}/demo/scenario/{id}", self.base))
             .timeout(std::time::Duration::from_secs(60))
             .send_json(json!({}))
             .map_err(|error| error.to_string())?
@@ -172,7 +187,8 @@ impl Attach {
             }))
             .map_err(|error| error.to_string());
         }
-        ureq::post(&format!("{}/demo/level/{level}?up_to={up_to}", self.base))
+        self.http
+            .post(&format!("{}/demo/level/{level}?up_to={up_to}", self.base))
             .timeout(std::time::Duration::from_secs(120))
             .send_json(json!({}))
             .map_err(|error| error.to_string())?
@@ -464,5 +480,63 @@ mod tests {
             "http://127.0.0.1.evil.example",
             None
         ));
+    }
+
+    /// A `3xx` from whatever owns the attach port must not be followed: the
+    /// redirect target escapes the loopback check and its body would be handed
+    /// to the agent as `cp_metrics` (R-19 round 3, L6).
+    #[test]
+    fn an_attach_redirect_is_not_followed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("stub");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let response = "HTTP/1.1 302 Found\r\nlocation: http://169.254.169.254/latest\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let attach = super::Attach {
+            base: base.clone(),
+            http: ureq::AgentBuilder::new().redirects(0).build(),
+            local: None,
+            read_only: true,
+        };
+        let error = attach.get("/metrics").expect_err("a redirect is refused");
+        assert!(!error.is_empty(), "the refusal carries no detail");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the client followed the redirect"
+        );
+    }
+
+    /// The embedded fallback and the HTTP route share one envelope: the same
+    /// tool used to answer `{count,cursor,events}` without `oldest`,
+    /// `truncated` or `gap` (R-19 round 3, L3).
+    #[test]
+    fn both_event_tools_carry_the_full_envelope() {
+        let tail = crate::server::tail_envelope(Vec::new(), 7, 9);
+        for key in ["count", "cursor", "oldest", "truncated", "events"] {
+            assert!(tail.get(key).is_some(), "tail envelope is missing {key}");
+        }
+        assert_eq!(tail["truncated"], serde_json::Value::Bool(true));
+        let since = crate::server::since_envelope(Vec::new(), 3, 7, 9);
+        for key in ["count", "cursor", "oldest", "gap", "events"] {
+            assert!(since.get(key).is_some(), "since envelope is missing {key}");
+        }
+        assert_eq!(since["gap"], serde_json::Value::Bool(true));
+        assert_eq!(since["cursor"], serde_json::Value::from(3u64));
     }
 }

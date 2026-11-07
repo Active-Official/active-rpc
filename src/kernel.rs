@@ -128,9 +128,11 @@ pub const MAX_EVENTS: usize = 16_384;
 ///
 /// `name` and every entry of `methods` must be 1..=1024 bytes and free of
 /// control, invisible and reordering characters: [`Agent::intro`] carries them
-/// in a module, and a name it cannot carry makes the whole introduction fail.
-/// The kernel cannot refuse it at [`Agent::register`], so an adapter with an
-/// invalid name is a defect in that adapter (R-17 round 7, F-5).
+/// in a module. A provider whose name or methods the module cannot carry makes
+/// that provider *undescribable*: [`Agent::intro`] omits it and tapes
+/// `intro.skipped` once, and every other provider still crosses (R-17 rounds 8
+/// and 10). The kernel cannot refuse it at [`Agent::register`], so an adapter
+/// with an invalid name is a defect in that adapter (R-17 round 7, F-5).
 ///
 /// The kernel captures a provider's surface — its name, the methods it answers
 /// and which of those mutate — once, at [`Agent::register`], with no kernel
@@ -717,11 +719,27 @@ struct ProviderFacts {
     name: String,
     methods: BTreeSet<String>,
     mutating: BTreeSet<String>,
+    /// The provider's surface passed the introduction bound, so `methods` is a
+    /// prefix and the provider is undescribable (R-17 round 10, R10-4).
+    over_bound: bool,
 }
 
 impl ProviderFacts {
+    /// Capture the surface once, bounded.
+    ///
+    /// The returned list used to be materialised whole and only bounded later
+    /// in `intro()`, so a provider with a million method names pinned the
+    /// memory before the bound could refuse it. Capture stops one past the
+    /// bound and records the fact; dispatch admits the captured prefix, which
+    /// is a narrowing and fails closed.
     fn capture(provider: &dyn Provider) -> Self {
-        let methods = provider.methods();
+        let raw = provider.methods();
+        let over_bound = raw.len() > crate::intro::MAX_METHODS_PER_PROVIDER;
+        let methods: BTreeSet<String> = raw
+            .iter()
+            .take(crate::intro::MAX_METHODS_PER_PROVIDER)
+            .cloned()
+            .collect();
         let mutating = methods
             .iter()
             .filter(|method| provider.mutating(method.as_str()))
@@ -729,8 +747,9 @@ impl ProviderFacts {
             .collect();
         Self {
             name: provider.name().to_string(),
-            methods: methods.into_iter().collect(),
+            methods,
             mutating,
+            over_bound,
         }
     }
 
@@ -906,6 +925,12 @@ pub(crate) struct ParkedDrops {
     providers: Vec<(ProviderId, Box<dyn Provider>)>,
     /// Providers whose `delivering` marker the parked work owns.
     markers: Vec<ProviderId>,
+    /// A dispatch that could not take the kernel borrow on unwind: the
+    /// provider is parked above and `dispatching` must be cleared with it
+    /// (R-17 round 10, R10-3).
+    dispatch_release: bool,
+    /// Jobs a batch guard could not fail because the borrow was held.
+    fail_jobs: Vec<u64>,
 }
 
 pub(crate) type ParkedCell = Rc<std::cell::RefCell<ParkedDrops>>;
@@ -913,15 +938,22 @@ pub(crate) type ParkedCell = Rc<std::cell::RefCell<ParkedDrops>>;
 /// Write parked work back into the kernel. False when the borrow is still
 /// unavailable, in which case everything stays parked.
 fn drain_parked(cell: &KernelCell, parked: &ParkedCell) -> bool {
-    let (providers, markers, entries) = {
+    let (providers, markers, entries, dispatch_release, fail_jobs) = {
         let mut parked = parked.borrow_mut();
         (
             std::mem::take(&mut parked.providers),
             std::mem::take(&mut parked.markers),
             std::mem::take(&mut parked.entries),
+            std::mem::take(&mut parked.dispatch_release),
+            std::mem::take(&mut parked.fail_jobs),
         )
     };
-    if providers.is_empty() && markers.is_empty() && entries.is_empty() {
+    if providers.is_empty()
+        && markers.is_empty()
+        && entries.is_empty()
+        && !dispatch_release
+        && fail_jobs.is_empty()
+    {
         return true;
     }
     match cell.try_borrow_mut() {
@@ -932,6 +964,20 @@ fn drain_parked(cell: &KernelCell, parked: &ParkedCell) -> bool {
             for id in markers {
                 kernel.delivering.remove(&id);
             }
+            if dispatch_release {
+                kernel.dispatching = false;
+            }
+            for id in fail_jobs {
+                if kernel.jobs.contains_key(&id) {
+                    kernel.fail_job(
+                        id,
+                        Error::Provider {
+                            code: "rpc/provider".to_string(),
+                        },
+                        true,
+                    );
+                }
+            }
             kernel.deferred_drops.extend(entries);
             true
         }
@@ -940,6 +986,8 @@ fn drain_parked(cell: &KernelCell, parked: &ParkedCell) -> bool {
             parked.providers = providers;
             parked.markers = markers;
             parked.entries = entries;
+            parked.dispatch_release = dispatch_release;
+            parked.fail_jobs = fail_jobs;
             false
         }
     }
@@ -968,18 +1016,25 @@ impl Drop for BatchGuard<'_> {
             return;
         }
         let ids = std::mem::take(&mut self.pending);
-        let Ok(mut kernel) = self.agent.cell.try_borrow_mut() else {
-            return;
-        };
-        for id in ids {
-            if kernel.jobs.contains_key(&id) {
-                kernel.fail_job(
-                    id,
-                    Error::Provider {
-                        code: "rpc/provider".to_string(),
-                    },
-                    true,
-                );
+        match self.agent.cell.try_borrow_mut() {
+            Ok(mut kernel) => {
+                for id in ids {
+                    if kernel.jobs.contains_key(&id) {
+                        kernel.fail_job(
+                            id,
+                            Error::Provider {
+                                code: "rpc/provider".to_string(),
+                            },
+                            true,
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                // Park the ids: leaving them queued behind a borrow nobody
+                // will release is a promise that never settles (R-17 round 10,
+                // R10-3).
+                self.agent.parked.borrow_mut().fail_jobs.extend(ids);
             }
         }
     }
@@ -995,12 +1050,26 @@ impl DispatchGuard<'_> {
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
-        let Ok(mut kernel) = self.agent.cell.try_borrow_mut() else {
-            return;
-        };
-        kernel.dispatching = false;
-        if let Some(provider) = self.provider.take() {
-            kernel.providers.insert(self.provider_id, provider);
+        match self.agent.cell.try_borrow_mut() {
+            Ok(mut kernel) => {
+                kernel.dispatching = false;
+                if let Some(provider) = self.provider.take() {
+                    kernel.providers.insert(self.provider_id, provider);
+                }
+            }
+            Err(_) => {
+                // A leaked `Ref` held the cell on unwind. Destroying the
+                // provider here left `facts` advertising a provider that no
+                // longer existed and `dispatching` stuck, which made later
+                // batches return empty with every promise pending and nothing
+                // on the tape. Park both; `drain_parked` runs before the
+                // `dispatching` check (R-17 round 10, R10-3).
+                if let Some(provider) = self.provider.take() {
+                    let mut parked = self.agent.parked.borrow_mut();
+                    parked.providers.push((self.provider_id, provider));
+                    parked.dispatch_release = true;
+                }
+            }
         }
     }
 }
@@ -1128,8 +1197,10 @@ impl Agent {
             for (id, facts) in &kernel.facts {
                 // The count check before the copy: the whole point of the
                 // ceiling is not to materialise a million-name surface
-                // (R-17 round 9, F-3).
-                if facts.methods.len() > crate::intro::MAX_METHODS_PER_PROVIDER {
+                // (R-17 round 9, F-3). Capture already dropped everything past
+                // the bound, so the flag is the fact to read now
+                // (R-17 round 10, R10-4).
+                if facts.over_bound {
                     skipped.push((*id, "a provider advertises too many methods".to_string()));
                     continue;
                 }
@@ -5104,6 +5175,7 @@ impl Agent {
         /// Puts the checked-out provider back, on the normal path and on unwind.
         struct DrainGuard<'a> {
             cell: &'a KernelCell,
+            parked: &'a ParkedCell,
             provider: ProviderId,
             record: Option<Box<dyn Provider>>,
             /// This guard set `delivering` and must clear it.
@@ -5115,10 +5187,22 @@ impl Agent {
                 let Some(record) = self.record.take() else {
                     return;
                 };
-                if let Ok(mut kernel) = self.cell.try_borrow_mut() {
-                    kernel.providers.insert(self.provider, record);
-                    if self.marked {
-                        kernel.delivering.remove(&self.provider);
+                match self.cell.try_borrow_mut() {
+                    Ok(mut kernel) => {
+                        kernel.providers.insert(self.provider, record);
+                        if self.marked {
+                            kernel.delivering.remove(&self.provider);
+                        }
+                    }
+                    Err(_) => {
+                        // Park the provider and its marker instead of dropping
+                        // it: a lost record made `intro()` advertise a provider
+                        // that had been destroyed (R-17 round 10, R10-3).
+                        let mut parked = self.parked.borrow_mut();
+                        parked.providers.push((self.provider, record));
+                        if self.marked {
+                            parked.markers.push(self.provider);
+                        }
                     }
                 }
             }
@@ -5141,6 +5225,7 @@ impl Agent {
         };
         let mut guard = DrainGuard {
             cell: &self.cell,
+            parked: &self.parked,
             provider,
             record: Some(record),
             marked,
@@ -5256,6 +5341,25 @@ impl Agent {
             .get(&record.id)
             .map(|meter| meter.remaining_bytes())
             .unwrap_or(record.attrs.budget.max_bytes))
+    }
+
+    /// Calls this capability's own meter has left.
+    ///
+    /// Reported by an operator surface that re-mints a long-lived fixture
+    /// before its grant is spent: a lifetime meter that reaches zero refuses
+    /// every later call, and the refusal is indistinguishable from a policy
+    /// error on every other surface (R-19 round 3, M3).
+    pub fn remaining_calls(&self, cap: &CapHandle) -> Result<u64> {
+        let kernel = self.cell.borrow();
+        let record = kernel
+            .caps
+            .get(&cap.id())
+            .ok_or(Error::UnknownCapability(cap_token(cap.id())))?;
+        Ok(kernel
+            .meters
+            .get(&record.id)
+            .map(|meter| meter.remaining_calls())
+            .unwrap_or(record.attrs.budget.max_calls))
     }
 
     /// Point-in-time counters. Contains no capability ids or payloads.

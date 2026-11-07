@@ -7,7 +7,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use active_rpc::channel::{Channel, ChannelId, Direction, MESSAGE_OVERHEAD};
+use active_rpc::channel::{Channel, ChannelId, Direction, MESSAGE_OVERHEAD, SLOTS_PER_RECORD};
 use active_rpc::lane::LaneId;
 use active_rpc::value::Value;
 
@@ -121,34 +121,104 @@ fn a_list_is_not_charged_its_slots_twice() {
     let slot = std::mem::size_of::<Value>() as u64;
     let value = Value::List(vec![Value::Null; 100_000]);
     let charged = Channel::message_bytes(&value, &[], None);
+    // The record's four slots are charged for residency on top of the
+    // value's own slots (R-17 round 10, R10-1), so the bound is record slots
+    // plus the list's occupied slots plus a little slack.
+    let record = MESSAGE_OVERHEAD * SLOTS_PER_RECORD;
     assert!(
-        charged >= MESSAGE_OVERHEAD + 100_000 * slot,
+        charged >= record + 100_000 * slot,
         "the occupied slots are charged: {charged}"
     );
     assert!(
-        charged <= MESSAGE_OVERHEAD + 2 * slot + 100_000 * slot,
+        charged <= record + 2 * slot + 100_000 * slot,
         "the slots are charged twice: {charged}"
     );
     drop(value);
 }
 
-/// A standing queue must keep its capacity across message pairs: an exact
-/// rebuild at the 2x threshold fired on every take, copying the whole queue
-/// (R-17 round 9, F-1).
+/// A buffer keeps up to four times the live records; the byte charge must
+/// cover that residency, or a drained channel charges a quarter of what it
+/// holds (R-17 round 10, R10-1).
 #[test]
-fn a_steady_queue_keeps_its_capacity() {
+fn a_channel_is_charged_for_the_slots_its_buffer_keeps() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let mut channel = Channel::new(ChannelId(3), "steady", Direction::Both);
-    for _ in 0..2_048 {
+    let mut channel = Channel::new(ChannelId(5), "resident", Direction::Both);
+    for _ in 0..4_096 {
         channel
             .send_sequence(LaneId(1), Value::Null, Vec::new())
             .expect("send");
     }
-    for _ in 0..1_024 {
+    for _ in 0..3_096 {
         channel.recv().expect("recv").expect("message");
     }
-    let capacity = channel.capacity();
-    for _ in 0..1_000 {
+    let per_record = Channel::message_bytes(&Value::Null, &[], None);
+    assert_eq!(
+        channel.queued_bytes(),
+        1_000 * per_record,
+        "the counter and the per-record charge must agree"
+    );
+    assert!(
+        per_record >= MESSAGE_OVERHEAD * SLOTS_PER_RECORD,
+        "a record must be charged its share of the buffer: {per_record}"
+    );
+    // The buffer still holds about twice the live records at four slots each,
+    // which is the residency the counter used to miss.
+    assert!(
+        channel.queued_bytes() >= MESSAGE_OVERHEAD * channel.capacity() as u64,
+        "charged {} for a buffer of {} records",
+        channel.queued_bytes(),
+        channel.capacity()
+    );
+}
+
+/// A standing queue must keep its capacity across message pairs: an exact
+/// rebuild at the 2x threshold fired on every take, copying the whole queue
+/// (R-17 round 9, F-1).
+///
+/// The queue is drained past the quarter-occupancy guard so the rebuild really
+/// fires; filling 2 048 and draining 1 024 never crossed `4 * len < capacity`,
+/// so the earlier form passed against the pre-fix exact rebuild too
+/// (R-17 round 10, R10-2).
+#[test]
+fn a_steady_queue_keeps_its_capacity() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let mut channel = Channel::new(ChannelId(3), "steady", Direction::Both);
+    for _ in 0..4_096 {
+        channel
+            .send_sequence(LaneId(1), Value::Null, Vec::new())
+            .expect("send");
+    }
+    let full = channel.capacity();
+    assert!(full >= 4_096, "the queue grew to {full}");
+    // Exactly a quarter occupancy is still above the guard: a 2x threshold
+    // rebuilt here, and at every later take the buffer was already at its live
+    // count (R-17 round 10, R10-2).
+    for _ in 0..3_072 {
+        channel.recv().expect("recv").expect("message");
+    }
+    assert_eq!(channel.len(), 1_024, "the drain left the live count");
+    assert_eq!(
+        channel.capacity(),
+        full,
+        "the queue rebuilt at a quarter occupancy"
+    );
+    // One more take crosses `4 * len < capacity`, and the rebuild targets
+    // twice the live records so the next push cannot satisfy the guard again.
+    channel.recv().expect("recv").expect("message");
+    let rebuilt = channel.capacity();
+    // `VecDeque::with_capacity` rounds its request up, so the target is a
+    // range: twice the live records plus the ring's slack, well under the
+    // burst.
+    assert!(
+        (2_000..2_100).contains(&rebuilt),
+        "the rebuild must target twice the live records (got {rebuilt}, full {full})"
+    );
+    assert!(rebuilt < full, "the burst capacity was not released");
+    // Twice the live records leaves headroom for the next push, so a steady
+    // pair loop neither reallocates nor rebuilds. The capacity check is the
+    // assertion that binds: an exact rebuild at the guard leaves
+    // `capacity() == len`, which fails it on the next take.
+    for _ in 0..10_000 {
         channel
             .send_sequence(LaneId(1), Value::Null, Vec::new())
             .expect("send");
@@ -156,7 +226,7 @@ fn a_steady_queue_keeps_its_capacity() {
     }
     assert_eq!(
         channel.capacity(),
-        capacity,
+        rebuilt,
         "the queue rebuilt or grew while its occupancy was steady"
     );
 }

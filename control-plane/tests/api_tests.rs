@@ -196,6 +196,24 @@ async fn a_foreign_host_is_refused() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+/// `is_loopback_host` reads the name before the first colon, so a Host whose
+/// port does not parse (`127.0.0.1:8787@evil.example`) passed as loopback while
+/// `host_parts` refused it and `same_origin` fell into its no-Host arm. A
+/// present-but-unparsable Host is refused on its own (R-19 round 3, L4).
+#[tokio::test]
+async fn an_unparsable_host_is_refused() {
+    let app = app(spawn_worker(false));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/demo/scenario/round-trip")
+        .header("host", "127.0.0.1:8787@evil.example")
+        .header("origin", "http://127.0.0.1:9999")
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
 /// A mutating request from another origin is refused, and one from loopback is
 /// allowed.
 #[tokio::test]

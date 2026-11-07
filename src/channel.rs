@@ -40,14 +40,25 @@ pub const MAX_QUEUED_BYTES: u64 = 64 << 20;
 /// hundred times the memory the byte ceilings promise (R-17 round 3, L-1).
 pub const MESSAGE_OVERHEAD: u64 = std::mem::size_of::<Message>() as u64;
 
-/// Bytes one queued message is charged: its record, payload, transferred ids
-/// and topic name.
+/// Slots one queued record is charged for.
+///
+/// The deque keeps `capacity` records and the rebuild guard allows up to four
+/// times the live count, so counting one slot per live record made the byte
+/// ceiling an occupancy bound while up to four times that stayed resident
+/// (R-17 round 10, R10-1). Charging four slots per record bounds residency at
+/// the ceiling. Both the enqueue and the release path derive the charge from
+/// this one function, so they cannot disagree.
+pub const SLOTS_PER_RECORD: u64 = 4;
+
+/// Bytes one queued message is charged: its record slots, payload, transferred
+/// ids and topic name.
 fn queued_size(payload: &Value, caps: &[CapId], topic: Option<&str>) -> u64 {
     // The wire image is not the memory cost. `memory_bytes` charges every
     // inline value slot, the spare capacity a `String`/`Vec`/`Module` keeps and
     // a map entry's key and node share, so the ceilings bound what the queue
     // actually pins (R-17 rounds 6-7, N-1 and F-1).
     MESSAGE_OVERHEAD
+        .saturating_mul(SLOTS_PER_RECORD)
         .saturating_add(payload.memory_bytes())
         // The charge counts the ids, not the vector's spare capacity: the
         // release path sees a `&[CapId]` and must subtract exactly this, and a

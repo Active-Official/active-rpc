@@ -2,6 +2,10 @@
 	const $ = (id) => document.getElementById(id);
 	const state = {
 		snapshot: null,
+		// Events the server's 500-event ring dropped before this client saw
+		// them. Kept per connection and shown above the log: a gap frame is
+		// not a snapshot (R-19 round 3, L1).
+		eventGaps: 0,
 		status: null,
 		ws: null,
 		retry: 0,
@@ -681,8 +685,13 @@
 		setText("event-count", `${events.length} of ${total} events`);
 		const cursor = total ? snapshot.events[total - 1].id : 0;
 		setText("log-cursor", `cursor ${cursor}`);
-		$("event-log").innerHTML = events.length
-			? events
+		const gapRow = state.eventGaps
+			? `<li class="event-gap"><time>--:--:--</time><span class="cat cat-system">gap</span><b>audit gap</b><span class="detail">${state.eventGaps} events were dropped by the server ring; this log is not the whole run</span><span class="meta"></span></li>`
+			: "";
+		$("event-log").innerHTML =
+			gapRow +
+			(events.length
+				? events
 					.map((event) => {
 						const time = new Date(event.ts_ms).toLocaleTimeString([], {
 							hour12: false,
@@ -706,8 +715,8 @@
               <span class="meta">${escapeHtml(meta)}</span>
             </li>`;
 					})
-					.join("")
-			: '<li class="empty">No events match this filter.</li>';
+						.join("")
+				: '<li class="empty">No events match this filter.</li>');
 		$("event-log")
 			.querySelectorAll("li[data-event]")
 			.forEach((row) =>
@@ -1160,7 +1169,17 @@
 				status = "live";
 			}
 			try {
-				render(JSON.parse(event.data));
+				const frame = JSON.parse(event.data);
+				// The server sends a gap marker when its ring evicted events this
+				// socket had not received. It is not a snapshot: feeding it to
+				// `render` set `state.snapshot` to a frame without `metrics`,
+				// which threw in `renderKpis`, and the count was lost.
+				if (frame.kind === "event_gap") {
+					state.eventGaps += Number(frame.skipped) || 0;
+					if (state.snapshot) renderEvents(state.snapshot);
+					return;
+				}
+				render(frame);
 			} catch (error) {
 				console.error("snapshot parse", error);
 			}

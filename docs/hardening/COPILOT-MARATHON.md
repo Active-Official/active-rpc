@@ -30,9 +30,9 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-12: r12 found the media type of a tainted blob surviving every projection (high) and a quadratic address scan, both fixed; r13 and r14 must be clean | 52 fixed / 0 rejected / 5 noted | this commit |
-| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-8: r8 corrected the memory estimate (map nodes, list slots, deque guard) and the introduction's blast radius, all fixed; r9 and r10 must be clean | 63 fixed / 0 rejected / 0 open (9 residuals) | this commit |
+| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-10: r10 found the residency charge (medium) and four lows, all fixed; r11 and r12 must be clean | 68 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
-| R-19 | control-plane | `control-plane/**` | rounds 1-3: r3's M1 (the audit gap) is fixed with tests; M2/M3 and nine lows are open | 37 fixed / 0 rejected / 0 open (3 documented) | this commit |
+| R-19 | control-plane | `control-plane/**` | rounds 1-3: M1-M3 and all nine lows fixed (round 3's M2 panic boundary, M3 lifetime fixtures); r4 and r5 must be clean | 49 fixed / 0 rejected / 0 open (3 documented) | this commit |
 | R-20 | fuzz | `fuzz/**` | rounds 1-5: r5 found the local lane's missing `import os` (high) and the decoder controls' absence, all fixed; r6 and r7 must be clean | 46 fixed / 0 rejected / 1 noted (2 residuals) | this commit |
 
 ## Cross-cutting passes (after the sections)
@@ -134,6 +134,51 @@ Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. Verdict
 | F10 | low | an answer delivered while receipts were disabled suppressed the dispatch receipt for ever | **fixed**: dispatch seals through the `receipted` flag alone; `receipt_round3_tests::an_in_flight_resolve_while_receipts_were_disabled_still_yields_one_receipt` (negative control: zero receipts) |
 
 Gate: green; both feature sets; fmt and doc clean. R-13 needs r13 and r14 clean.
+
+### R-19 control plane - 2026-11-07 (round 3 fixes)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `bb476c8`. Round 3
+found three mediums and nine lows; M1 (the audit gap) was fixed in `81c2b61` and
+this round closes the rest.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M2 | medium | `publish`/`snapshot()` ran outside `catch_unwind`, so a panic there killed the worker with `latest` frozen at `kernel: "up"`, and a caught panic was republished as `up` one tick later | **fixed**: `publish_snapshot` catches snapshot construction, a sticky `AtomicBool` forces `kernel: "down"` in every later snapshot and in every read, and `a_panicking_snapshot_sticks_the_kernel_down` drives it through the test hook `panic_next_snapshot` |
+| M3 | medium | the shared fixture caps and lanes were lifetime meters (10 000 calls) that never refilled; a long session refused every fixture call and the ladder's `.expect(...)` turned it into a panic while health stayed green | **fixed**: `FIXTURE_CALLS`/`FIXTURE_BYTES` size the session, `refresh_fixtures` re-mints the echo and module caps below `FIXTURE_HEADROOM` and revokes the old handles, `Health.fixture_calls_remaining` surfaces the grant, and two tests pin the refresh and that a full ladder plus a 200-iteration benchmark fits |
+| L1 | low | the dashboard fed the `event_gap` frame to `render`, so `state.snapshot` became a non-snapshot, `renderKpis` threw, and the count was lost | **fixed**: the frame is recognised, counted in `state.eventGaps`, and shown as a persistent audit-gap row above the log |
+| L2 | low | a panicking `Level`/`Status` command never answered, so the handler waited out its timeout and returned 504 | **fixed**: `CommandFailure::{Refused,Panicked}` answers on both arms and maps a panic to 500 (`a_worker_panic_is_a_server_error`) |
+| L3 | low | the embedded MCP fallback returned `{count,cursor,events}` and dropped `oldest`/`truncated`/`gap` | **fixed**: one `tail_envelope`/`since_envelope` pair serves the HTTP routes and the fallback (`both_event_tools_carry_the_full_envelope`) |
+| L4 | low | `is_loopback_host` split on the first colon, so `Host: 127.0.0.1:8787@evil.example` passed as loopback while `host_parts` refused it, and `same_origin` fell into its no-Host arm | **fixed**: a present-but-unparsable Host is 403 (`an_unparsable_host_is_refused`) |
+| L5 | low | one poisoned `latest` made every read route panic for the life of the process | **fixed**: the read path and `mark_worker_down` recover `PoisonError::into_inner` |
+| L6 | low | `ureq` followed five redirects, so a 302 from whatever owned the attach port escaped the loopback check | **fixed**: one agent with `redirects(0)` (`an_attach_redirect_is_not_followed`, which counts the stub's hits) |
+| L7 | low | the `mcp-memory` step was `Debug.contains("pong")`, which passed an in-band `isError` and any substring | **fixed**: `mcp_echo_ok` reads `content[0].text` exactly and refuses `isError` (`the_mcp_echo_answer_is_matched_exactly`) |
+| L8 | low | `Health.observers` was a constant 0 | **fixed**: an `ObserverGuard` counts open dashboard sockets and `snapshot()` reports it |
+| L9 | low | `rpc/audit-gap` and `scenario/failed` used the `rpc/` namespace without appearing in the spec table | **fixed**: `docs/spec/wire.md` has a control-plane codes section |
+
+Residual (recorded, not fixed): a *leaked* `RefCell` borrow wedges every later
+borrow, so the guard parking in R-17 R10-3 cannot be reached from a sound
+program; the parking keeps the provider alive and clears the flag if the borrow
+ever becomes available.
+
+Gate: green; both feature sets; control plane 28 integration + 18 unit tests;
+fmt, clippy and doc clean.
+
+### R-17 introduction and topics - 2026-11-07 (round 10)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `81c2b61`. Verdict
+**NOT CLEAN**: one medium and four lows. Every round-9 fix was code-present; the
+F-1 test was vacuous.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| R10-1 | medium | the byte counters charged live records while the deque kept `capacity` of them, and the 4x rebuild guard allows four times the live count, so the "memory ceilings" bounded a quarter of the residency | **fixed**: `SLOTS_PER_RECORD = 4`; `queued_size` charges four record slots, so both the per-channel and the kernel-wide ceilings are resident bounds (`a_channel_is_charged_for_the_slots_its_buffer_keeps`) |
+| R10-2 | low | `a_steady_queue_keeps_its_capacity` filled 2 048 and drained 1 024, which never crosses `4 * len < capacity`, so it passed against the pre-fix exact rebuild | **fixed**: the test drains to exactly a quarter (no rebuild), then one more (rebuild to twice the live records), then pins the capacity across 10 000 pairs; a mutation back to the 2x threshold fails it |
+| R10-3 | low | `DispatchGuard`, `DrainGuard` and `BatchGuard` gave up silently when the cell was borrowed on unwind, destroying a provider that `facts` still advertised and leaving `dispatching`/`delivering` set | **fixed**: all three park their work in `ParkedDrops` (`dispatch_release`, `fail_jobs`) and `drain_parked`, which runs before the `dispatching` check, restores it |
+| R10-4 | low | `ProviderFacts::capture` materialised the whole surface and called `mutating()` once per name before `intro()` applied the 4 096 bound | **fixed**: capture takes at most `MAX_METHODS_PER_PROVIDER` names and records `over_bound`; `intro` reads the flag (`a_capture_stops_at_the_introduction_bound` fails on an unbounded capture) |
+| R10-5 | low | the `Provider` trait doc still said an uncarryable name "makes the whole introduction fail" | **fixed**: the doc states the omission contract (ADR-0017) |
+
+Gate: green; both feature sets; fmt, clippy and doc clean. Two more rounds
+(r11, r12) must be clean to close R-17.
 
 ### R-20 fuzz program - 2026-11-07 (round 5)
 
