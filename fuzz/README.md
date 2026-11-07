@@ -50,9 +50,12 @@ On a native Linux host:
 cargo +nightly fuzz run fuzz_arp1_frame -- -runs=200000 -max_len=65536
 ```
 
-`-max_len=65536` matches the largest input every parser accepts, so the campaign
-spends its budget on structure rather than on growing a buffer past the size
-that is refused before parsing.
+`-max_len=65536` is a campaign budget, not a parser ceiling: the wire, receipt
+and replay parsers accept frames up to 64 MiB, and the wasm module ceiling is
+1 MiB. Those limits are asserted in-target with buffers built there (an
+oversize module, a ceiling-sized filler), so a campaign never needs `-max_len`
+to reach them. The budget is spent on structure instead of on a buffer the
+parser refuses in its first few bytes (R-20 round 3, L5).
 
 ## Corpus
 

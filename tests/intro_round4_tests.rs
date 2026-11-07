@@ -185,6 +185,73 @@ fn a_panicking_drain_restores_the_provider_and_is_on_the_tape() {
     );
 }
 
+/// Leaks a `Ref` across `on_drop`, so the kernel cannot write its registry
+/// back in place.
+struct LeakyDrop {
+    agent: AgentSlot,
+    armed: Rc<Cell<bool>>,
+    delivered: Rc<Cell<u32>>,
+    dropped: Rc<Cell<u32>>,
+}
+
+impl Drop for LeakyDrop {
+    fn drop(&mut self) {
+        self.dropped.set(self.dropped.get() + 1);
+    }
+}
+
+impl Provider for LeakyDrop {
+    fn name(&self) -> &'static str {
+        "leaky"
+    }
+    fn methods(&self) -> Vec<String> {
+        vec!["noop".to_string()]
+    }
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::text("ok")))
+    }
+    fn on_drop(&mut self, _object: u64, _cap: CapId) {
+        self.delivered.set(self.delivered.get() + 1);
+        if self.armed.get() {
+            if let Some(agent) = self.agent.borrow().as_ref() {
+                // A provider that keeps a `Ref` past the callback: the kernel
+                // cannot write the registry back and must park the provider
+                // rather than drop it (R-17 round 7, F-2/F-3).
+                std::mem::forget(agent.cell().borrow());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_drop_that_keeps_a_borrow_parks_the_provider_instead_of_losing_it() {
+    let agent = Agent::new();
+    let slot: AgentSlot = Rc::new(RefCell::new(Some(agent.clone())));
+    let armed = Rc::new(Cell::new(false));
+    let delivered = Rc::new(Cell::new(0));
+    let dropped = Rc::new(Cell::new(0));
+    let id = agent.register(Box::new(LeakyDrop {
+        agent: Rc::clone(&slot),
+        armed: Rc::clone(&armed),
+        delivered: Rc::clone(&delivered),
+        dropped: Rc::clone(&dropped),
+    }));
+    let cap = agent.mint(id, 0, CapAttrs::new(&["noop"])).expect("cap");
+    armed.set(true);
+    // Releasing the last handle delivers the callback; the leak makes the
+    // write-back borrow fail.
+    drop(cap);
+    assert_eq!(delivered.get(), 1, "the callback ran once");
+    assert_eq!(
+        dropped.get(),
+        0,
+        "the provider is parked, not dropped while the registry still names it"
+    );
+}
+
 #[test]
 fn two_instances_of_one_adapter_describe_one_surface() {
     let agent = Agent::new();

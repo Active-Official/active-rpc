@@ -7,7 +7,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup toolchain install nightly --profile minimal
-RUN cargo +nightly install cargo-fuzz --locked
+RUN cargo +nightly install cargo-fuzz --version 0.13.2 --locked
 
 ENV PATH="/usr/local/cargo/bin:${PATH}"
 WORKDIR /work

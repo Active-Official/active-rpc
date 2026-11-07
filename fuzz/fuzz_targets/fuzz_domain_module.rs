@@ -39,6 +39,15 @@ const VALUE_METHODS: &[&str] = &[
 ];
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: a canonical image must install through the
+    // parser, or the success branch below is dead (R-20 round 3, M4).
+    let fixed = active_rpc::domain::module_from_source("[a]\nx = 1\n", "fixed")
+        .expect("the fixed module");
+    let fixed_image = active_infinity::encode(&fixed).expect("the fixed image encodes");
+    ModuleProvider::new()
+        .install_canonical_image(&fixed_image)
+        .expect("the canonical image installs");
+
     if data.is_empty() {
         return;
     }

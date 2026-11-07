@@ -37,8 +37,13 @@ unsafe impl GlobalAlloc for Live {
 #[global_allocator]
 static ALLOCATOR: Live = Live;
 
+/// The live counter is process-wide, so the tests take turns: a parallel test's
+/// allocation would land inside the window each one measures.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn a_drained_channel_releases_its_queue_allocation() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let mut channel = Channel::new(ChannelId(1), "shrink", Direction::Both);
     // Small messages, so the queued records (not the payloads) are the large
     // allocation: 1 024 records is about 98 KiB of deque.
@@ -54,5 +59,28 @@ fn a_drained_channel_releases_its_queue_allocation() {
     assert!(
         drained + 4_096 < filled,
         "the queue kept its allocation after draining: {filled} -> {drained}"
+    );
+}
+
+/// A channel that keeps one message must not pin the burst it once held
+/// (R-17 round 7, F-4).
+#[test]
+fn a_channel_that_keeps_one_message_releases_the_burst() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let mut channel = Channel::new(ChannelId(2), "burst", Direction::Both);
+    for _ in 0..4_096 {
+        channel
+            .send_sequence(LaneId(1), Value::text("x"), Vec::new())
+            .expect("send");
+    }
+    let filled = LIVE.load(Ordering::SeqCst);
+    for _ in 0..4_095 {
+        assert!(channel.recv().expect("recv").is_some());
+    }
+    assert_eq!(channel.len(), 1);
+    let held = LIVE.load(Ordering::SeqCst);
+    assert!(
+        held + 300_000 < filled,
+        "the deque kept the burst allocation: {filled} -> {held}"
     );
 }

@@ -44,9 +44,11 @@ fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
     }
-    let Ok(session) = McpSession::handshake(MemoryTransport::new(responses())) else {
-        return;
-    };
+    // A positive control: the fixed fixture must handshake. With `let Ok(..)
+    // else return` a handshake that refuses every input made this target exit
+    // 0 without exercising anything (R-20 round 3, H1).
+    let session = McpSession::handshake(MemoryTransport::new(responses()))
+        .expect("the fixed fixture handshakes");
     assert_eq!(session.tools().len(), 1, "the handshake discovers one tool");
     assert_eq!(session.tools()[0].name, "echo");
 
@@ -136,7 +138,7 @@ fuzz_target!(|data: &[u8]| {
                 // A body that parses must still be bounded: the tool list is a
                 // response an operator's policy is derived from.
                 assert!(
-                    session.tools().len() <= 256,
+                    session.tools().len() <= active_rpc::tool::MAX_MCP_TOOLS,
                     "a {method} response cannot invent an unbounded tool list"
                 );
             }

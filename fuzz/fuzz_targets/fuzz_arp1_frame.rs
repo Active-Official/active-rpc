@@ -19,6 +19,23 @@ use active_rpc::transport::connect::{grpc_frame, grpc_unframe};
 use active_rpc::wire::{decode_capability_table, Envelope, WireLimits};
 
 fuzz_target!(|data: &[u8]| {
+    // Positive controls: a codec that refuses every input must fail the target
+    // instead of making every assertion below dead (R-20 round 3, H1).
+    let probe = Envelope::request(1, "ping", Vec::new());
+    let probe_bytes = probe.encode().expect("the probe encodes");
+    let probe = Envelope::decode(&probe_bytes).expect("the probe decodes");
+    assert_eq!(probe.encode().expect("re-encode"), probe_bytes);
+    let descriptor = active_rpc::wire::CapDescriptor::from_attrs(
+        active_rpc::cap::CapId([0x11; 16]),
+        &active_rpc::cap::CapAttrs::new(&["ping"]),
+    );
+    let table = active_rpc::wire::encode_capability_table(std::slice::from_ref(&descriptor))
+        .expect("the probe table encodes");
+    assert_eq!(
+        decode_capability_table(&table).expect("the probe table decodes"),
+        vec![descriptor]
+    );
+
     // 1. Envelope decoding is total.
     if let Ok(envelope) = Envelope::decode(data) {
         assert!(envelope.args.len() <= WireLimits::default().max_args as usize);
@@ -67,7 +84,10 @@ fuzz_target!(|data: &[u8]| {
 
     // 2. Capability tables: independent entry point, same rules.
     if let Ok(caps) = decode_capability_table(data) {
-        assert!(caps.len() <= WireLimits::default().max_caps as usize);
+        // The standalone decoder's own profile is MAX_CAP_TABLE, not the
+        // envelope's WireLimits: a valid 300-cap table is legal input and must
+        // not panic the harness (R-20 round 3, M2).
+        assert!(caps.len() <= active_rpc::wire::MAX_CAP_TABLE);
         for cap in &caps {
             assert_ne!(cap.budget.max_calls, 0, "a decoded budget must be finite");
         }

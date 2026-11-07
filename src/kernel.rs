@@ -124,6 +124,14 @@ pub const MAX_EVENTS: usize = 16_384;
 
 /// A provider of capabilities: a module, a tool, a peer.
 ///
+/// # Introduction rule
+///
+/// `name` and every entry of `methods` must be 1..=1024 bytes and free of
+/// control, invisible and reordering characters: [`Agent::intro`] carries them
+/// in a module, and a name it cannot carry makes the whole introduction fail.
+/// The kernel cannot refuse it at [`Agent::register`], so an adapter with an
+/// invalid name is a defect in that adapter (R-17 round 7, F-5).
+///
 /// The kernel captures a provider's surface — its name, the methods it answers
 /// and which of those mutate — once, at [`Agent::register`], with no kernel
 /// borrow held. These three methods are never called again on the dispatch,
@@ -619,6 +627,8 @@ pub(crate) struct HandleControl {
     cell: KernelCell,
     /// Reference operations that could not take the kernel borrow.
     deferred_refops: Rc<std::cell::RefCell<VecDeque<(CapId, bool)>>>,
+    /// Drop work that could not be written back (see `ParkedDrops`).
+    parked: ParkedCell,
 }
 
 impl HandleControl {
@@ -663,7 +673,7 @@ impl HandleControl {
                 drop(kernel);
                 // A release may have queued a provider notification; deliver it
                 // now, with the borrow released.
-                deliver_pending_drops(&self.cell);
+                deliver_pending_drops(&self.cell, &self.parked);
             }
             Err(_) => self.deferred_refops.borrow_mut().push_back((id, retain)),
         }
@@ -727,17 +737,31 @@ impl ProviderFacts {
 /// A provider runs with no borrow held and may panic; without this guard a
 /// caught panic would leave `dispatching` set and the provider removed, so
 /// every later `run()` would be a no-op and queued work would never settle.
-fn deliver_pending_drops(cell: &KernelCell) {
-    /// Puts an entry and the entries after it back on the queue.
+fn deliver_pending_drops(cell: &KernelCell, parked: &ParkedCell) {
+    /// Puts an entry and the entries after it back on the queue, or parks them
+    /// when a provider still holds a `Ref` (R-17 round 7, F-3).
     fn requeue(
         cell: &KernelCell,
+        parked: &ParkedCell,
         entry: (ProviderId, u64, CapId),
         rest: std::collections::VecDeque<(ProviderId, u64, CapId)>,
     ) {
         if let Ok(mut kernel) = cell.try_borrow_mut() {
             kernel.deferred_drops.push(entry);
             kernel.deferred_drops.extend(rest);
+        } else {
+            let mut parked = parked.borrow_mut();
+            parked.entries.push_back(entry);
+            parked.entries.extend(rest);
         }
+    }
+
+    // Work an earlier attempt could not write back. The borrow may be free
+    // now; if it is not, this call leaves everything parked and returns, and
+    // the next delivery tries again. Losing it would skip a provider's
+    // `on_drop` with nothing on the tape (F-2/F-3).
+    if !drain_parked(cell, parked) {
+        return;
     }
 
     for _ in 0..65_536 {
@@ -772,7 +796,7 @@ fn deliver_pending_drops(cell: &KernelCell) {
                     }
                 }
                 Err(_) => {
-                    requeue(cell, entry, pending);
+                    requeue(cell, parked, entry, pending);
                     return;
                 }
             };
@@ -782,6 +806,8 @@ fn deliver_pending_drops(cell: &KernelCell) {
                 // the entry waits for the outer delivery to finish.
                 if let Ok(mut kernel) = cell.try_borrow_mut() {
                     kernel.deferred_drops.push(entry);
+                } else {
+                    parked.borrow_mut().entries.push_back(entry);
                 }
                 requeued += 1;
                 continue;
@@ -791,8 +817,10 @@ fn deliver_pending_drops(cell: &KernelCell) {
                 Err(_) => {
                     if let Ok(mut kernel) = cell.try_borrow_mut() {
                         kernel.delivering.remove(&provider_id);
+                    } else {
+                        parked.borrow_mut().markers.push(provider_id);
                     }
-                    requeue(cell, entry, pending);
+                    requeue(cell, parked, entry, pending);
                     return;
                 }
             };
@@ -800,6 +828,8 @@ fn deliver_pending_drops(cell: &KernelCell) {
                 // The provider is gone: there is nobody to notify.
                 if let Ok(mut kernel) = cell.try_borrow_mut() {
                     kernel.delivering.remove(&provider_id);
+                } else {
+                    parked.borrow_mut().markers.push(provider_id);
                 }
                 continue;
             };
@@ -807,8 +837,13 @@ fn deliver_pending_drops(cell: &KernelCell) {
                 provider.on_drop(object, cap);
             }))
             .is_err();
-            if let Ok(mut kernel) = cell.try_borrow_mut() {
-                kernel.providers.insert(provider_id, provider);
+            // Keep the provider owned here: the write-back may fail and park
+            // it instead (F-2/F-3).
+            let mut provider = Some(provider);
+            let restored = if let Ok(mut kernel) = cell.try_borrow_mut() {
+                if let Some(provider) = provider.take() {
+                    kernel.providers.insert(provider_id, provider);
+                }
                 kernel.delivering.remove(&provider_id);
                 if unwound {
                     // `on_drop` often runs from a `Drop`; letting this panic
@@ -821,10 +856,22 @@ fn deliver_pending_drops(cell: &KernelCell) {
                 }
                 // The callback may have dropped handles, which queue more work.
                 kernel.apply_deferred_refops();
+                true
             } else {
-                // A provider that kept a `Ref` alive across `on_drop` owns this
-                // borrow conflict; the registry cannot take the provider back
-                // until it releases, and there is no queue to wait on here.
+                false
+            };
+            if !restored {
+                // A provider kept a `Ref` across `on_drop`. Park the provider,
+                // its marker and the tail instead of dropping them; the next
+                // delivery writes them back (F-2/F-3).
+                {
+                    let mut parked = parked.borrow_mut();
+                    if let Some(provider) = provider.take() {
+                        parked.providers.push((provider_id, provider));
+                    }
+                    parked.markers.push(provider_id);
+                    parked.entries.extend(pending.drain(..));
+                }
                 return;
             }
         }
@@ -832,6 +879,56 @@ fn deliver_pending_drops(cell: &KernelCell) {
             // The outer delivery owns the rest; it runs again as soon as its
             // own callback returns.
             return;
+        }
+    }
+}
+
+/// Work a delivery could not write back because a provider held a `Ref`.
+///
+/// Owned by the agent, not a thread-local: a parked provider written into
+/// another kernel that later ran on the same thread would be a cross-kernel
+/// state leak (R-17 round 7, F-2/F-3).
+#[derive(Default)]
+pub(crate) struct ParkedDrops {
+    entries: std::collections::VecDeque<(ProviderId, u64, CapId)>,
+    providers: Vec<(ProviderId, Box<dyn Provider>)>,
+    /// Providers whose `delivering` marker the parked work owns.
+    markers: Vec<ProviderId>,
+}
+
+pub(crate) type ParkedCell = Rc<std::cell::RefCell<ParkedDrops>>;
+
+/// Write parked work back into the kernel. False when the borrow is still
+/// unavailable, in which case everything stays parked.
+fn drain_parked(cell: &KernelCell, parked: &ParkedCell) -> bool {
+    let (providers, markers, entries) = {
+        let mut parked = parked.borrow_mut();
+        (
+            std::mem::take(&mut parked.providers),
+            std::mem::take(&mut parked.markers),
+            std::mem::take(&mut parked.entries),
+        )
+    };
+    if providers.is_empty() && markers.is_empty() && entries.is_empty() {
+        return true;
+    }
+    match cell.try_borrow_mut() {
+        Ok(mut kernel) => {
+            for (id, provider) in providers {
+                kernel.providers.insert(id, provider);
+            }
+            for id in markers {
+                kernel.delivering.remove(&id);
+            }
+            kernel.deferred_drops.extend(entries);
+            true
+        }
+        Err(_) => {
+            let mut parked = parked.borrow_mut();
+            parked.providers = providers;
+            parked.markers = markers;
+            parked.entries = entries;
+            false
         }
     }
 }
@@ -901,6 +998,8 @@ impl Drop for DispatchGuard<'_> {
 pub struct Agent {
     cell: KernelCell,
     control: Rc<dyn CapControl>,
+    /// Drop work that could not be written back (see `ParkedDrops`).
+    parked: ParkedCell,
     /// Promise reference operations that could not take the kernel borrow.
     promise_ops: Rc<std::cell::RefCell<VecDeque<(PromiseId, bool)>>>,
 }
@@ -980,13 +1079,16 @@ impl Agent {
             deferred_refops: Rc::clone(&deferred_refops),
         };
         let cell: KernelCell = Rc::new(RefCell::new(kernel));
+        let parked: ParkedCell = Rc::new(std::cell::RefCell::new(ParkedDrops::default()));
         let control: Rc<dyn CapControl> = Rc::new(HandleControl {
             cell: Rc::clone(&cell),
             deferred_refops,
+            parked: Rc::clone(&parked),
         });
         Agent {
             cell,
             control,
+            parked,
             promise_ops: Rc::new(std::cell::RefCell::new(VecDeque::new())),
         }
     }
@@ -4074,12 +4176,16 @@ impl Agent {
                 kernel.metrics.promises_double_settled.saturating_add(1);
         }
         settled.0?;
-        // The answer is the decision: mark the job receipted before the
-        // queued-job cleanup, which would otherwise seal a refusal for a call
-        // that was answered (R-02 round 4 #1).
+        // The answer is the decision: mark a *queued* job receipted before the
+        // cleanup below, which would otherwise seal a refusal for a call that
+        // was answered (R-02 round 4 #1). An in-flight job keeps the flag clear
+        // so exactly one of resolve and dispatch seals the single admission
+        // (R-13 round 11, M-2).
         if let Some(job) = &job {
-            if let Some(stored) = kernel.jobs.get_mut(&job.id) {
-                stored.receipted = true;
+            if kernel.queue.contains(&job.id) {
+                if let Some(stored) = kernel.jobs.get_mut(&job.id) {
+                    stored.receipted = true;
+                }
             }
         }
         // A promise answered out of band must not still run its provider: the
@@ -5011,7 +5117,7 @@ impl Agent {
                 // A drop raised inside the drain was requeued while the
                 // provider was checked out; deliver it now instead of waiting
                 // for unrelated traffic (R-17 round 5, L-1).
-                deliver_pending_drops(&self.cell);
+                deliver_pending_drops(&self.cell, &self.parked);
                 drops
             }
             Err(_) => {
@@ -6098,7 +6204,7 @@ impl Agent {
     /// a borrow. Delivery therefore always goes through the queue: take the
     /// list under a short borrow, release it, then run provider code.
     fn flush_drops(&self) {
-        deliver_pending_drops(&self.cell);
+        deliver_pending_drops(&self.cell, &self.parked);
     }
 }
 

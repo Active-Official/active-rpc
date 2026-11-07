@@ -72,6 +72,10 @@ fn hash_hex(hash: &[u8; 32]) -> String {
     active_infinity::ir::hash_hex(hash)
 }
 
+fn contains(bytes: &[u8], needle: &[u8; 32]) -> bool {
+    bytes.windows(32).any(|window| window == needle)
+}
+
 /// The high: a tainted-blob-only module is secret material, so its raw content
 /// address and provenance must not leave a non-redacting capability.
 #[test]
@@ -154,7 +158,9 @@ fn a_patch_cannot_declassify_a_tainted_blob() {
     let provider = ModuleProvider::new();
     let module = module_with_blob(false);
     let (agent, cap, lane) = install(provider, module, &["patch", "provenance"], false);
-    let replacement = Value::text("public");
+    // A text replacement is refused on a secret-bearing module (it could copy
+    // a literal); a scalar replacement is what a public write looks like.
+    let replacement = Value::Int(1);
     call(
         &agent,
         lane,
@@ -206,4 +212,75 @@ fn a_streamed_secret_free_image_keeps_its_address() {
         Value::Text(format!("blake3:{}", hash_hex(&expected))),
         "a redacting caller gets the address of the installed bytes"
     );
+}
+
+/// A non-redacting capability must not receive a tainted blob's address from
+/// `annotations`, even though it may read the module's structure
+/// (R-16 round 11, Finding 1).
+#[test]
+fn a_non_redacting_annotation_cannot_name_a_tainted_blob() {
+    let provider = ModuleProvider::new();
+    let module = module_with_blob(true);
+    let (agent, cap, lane) = install(provider, module, &["annotations"], false);
+    let annotations = call(&agent, lane, &cap, "annotations", Vec::new());
+    let printed = format!("{annotations:?}");
+    assert!(
+        !printed.contains(&hash_hex(&BLOB_HASH)),
+        "a non-redacting caller received the blob address: {printed}"
+    );
+}
+
+/// A patch reply's cone carries no tainted blob address, and the blob itself
+/// is untainted in the projection (R-16 round 11, Finding 6b).
+#[test]
+fn a_patch_cone_never_carries_a_tainted_blob_address() {
+    let provider = ModuleProvider::new();
+    let module = module_with_blob(false);
+    let (agent, cap, lane) = install(provider, module, &["patch"], false);
+    let cone = call(
+        &agent,
+        lane,
+        &cap,
+        "patch",
+        vec![Arg::Value(Value::path("blob")), Arg::Value(Value::Int(1))],
+    );
+    let Value::Module(bytes) = cone else {
+        panic!("a cone: {cone:?}");
+    };
+    let printed = String::from_utf8_lossy(&bytes);
+    assert!(
+        !printed.contains(&hash_hex(&BLOB_HASH)),
+        "the cone leaked the address"
+    );
+}
+
+/// Two distinct tainted blobs both lose their address, and the projection is
+/// still a canonical image (R-16 round 11, Finding 6c).
+#[test]
+fn two_tainted_blobs_both_lose_their_address() {
+    let mut module = InfinityModule::new();
+    let first = module.push(Inode::Blob {
+        hash: [0x31; 32],
+        size: 8,
+        tainted: true,
+        media_type: "application/octet-stream".to_string(),
+        payload: None,
+    });
+    let second = module.push(Inode::Blob {
+        hash: [0x32; 32],
+        size: 8,
+        tainted: true,
+        media_type: "application/octet-stream".to_string(),
+        payload: None,
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("a".to_string(), first), ("b".to_string(), second)],
+    });
+    module.set_root(Some(root));
+    let redacted = active_rpc::security::redact_module(&encode(&module).expect("encode"))
+        .expect("a redacted image");
+    assert!(!contains(&redacted, &[0x31; 32]));
+    assert!(!contains(&redacted, &[0x32; 32]));
+    active_infinity::validate_canonical(&redacted, active_infinity::Limits::default())
+        .expect("the projection is canonical");
 }

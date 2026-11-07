@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use active_rpc::cap::CapAttrs;
-use active_rpc::channel::{Channel, Direction, MAX_QUEUED_BYTES, MESSAGE_OVERHEAD};
+use active_rpc::channel::{Channel, Direction, MAX_QUEUED_BYTES};
 use active_rpc::kernel::{Provider, MAX_OBJECT_NAME_BYTES};
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::{Agent, Budget, LaneId, PromiseHandle};
@@ -108,16 +108,19 @@ fn a_publish_refused_on_a_full_channel_charges_nothing() {
             },
         )
         .expect("lane");
-    // Fill the channel to its byte ceiling with one message.
-    // A text value costs its tag, a length prefix and its bytes; the queue
-    // charges the message record and the value's inline node too (R-17 rounds
-    // 3 and 6): the message fills the channel exactly.
-    let filler = Value::text("x".repeat(
-        MAX_QUEUED_BYTES as usize
-            - 5
-            - MESSAGE_OVERHEAD as usize
-            - std::mem::size_of::<Value>() as usize,
-    ));
+    // Fill the channel to its byte ceiling with one message. The queue charges
+    // the record, the inline value slot and the text's capacity, so the filler
+    // is sized against the shipped measurement rather than a hand-computed
+    // wire size.
+    let mut len = MAX_QUEUED_BYTES as usize;
+    let filler = loop {
+        let candidate = Value::text("x".repeat(len));
+        if Channel::message_bytes(&candidate, &[], None) <= MAX_QUEUED_BYTES {
+            break candidate;
+        }
+        len = len.saturating_sub(32);
+        assert!(len > 0, "no filler fits the ceiling");
+    };
     agent
         .send(lane, channel, filler, &[])
         .expect("the ceiling itself fits");

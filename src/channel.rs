@@ -43,18 +43,12 @@ pub const MESSAGE_OVERHEAD: u64 = std::mem::size_of::<Message>() as u64;
 /// Bytes one queued message is charged: its record, payload, transferred ids
 /// and topic name.
 fn queued_size(payload: &Value, caps: &[CapId], topic: Option<&str>) -> u64 {
-    // The wire size is not the memory size: the queue stores one `Value` per
-    // node, 32 bytes inline, while a null costs one wire byte. Charging only
-    // the wire image let a null-heavy message hold 32x what its ceiling said
-    // (R-17 round 6, N-1).
-    let shape = payload.shape();
+    // The wire image is not the memory cost. `memory_bytes` charges every
+    // inline value slot, the spare capacity a `String`/`Vec`/`Module` keeps and
+    // a map entry's key and node share, so the ceilings bound what the queue
+    // actually pins (R-17 rounds 6-7, N-1 and F-1).
     MESSAGE_OVERHEAD
-        .saturating_add(shape.size)
-        .saturating_add(
-            shape
-                .nodes
-                .saturating_mul(std::mem::size_of::<Value>() as u64),
-        )
+        .saturating_add(payload.memory_bytes())
         .saturating_add((caps.len() as u64).saturating_mul(16))
         .saturating_add(topic.map_or(0, |name| name.len() as u64))
 }
@@ -359,14 +353,23 @@ impl Channel {
                 self.received += 1;
                 let bytes = queued_size(&message.payload, &message.caps, message.topic.as_deref());
                 self.queued_bytes = self.queued_bytes.saturating_sub(bytes);
-                if self.queue.is_empty() && self.queue.capacity() > 64 {
-                    // A drained channel must not keep a large allocation: with
-                    // 4 096 channels that is ~1.6 GiB resident while both
-                    // counters read zero (R-17 round 5, L-4). A fresh small
-                    // buffer releases it without churning the allocator on a
-                    // request/response channel (round 6 residual; `shrink_to`
-                    // left the old allocation in place for this capacity).
-                    self.queue = std::collections::VecDeque::with_capacity(64);
+                // A channel must not keep a burst allocation it no longer
+                // uses: 4 096 channels holding one message each while their
+                // deques keep a 4 096-slot capacity is ~1.6 GiB resident with
+                // both counters near zero (R-17 rounds 5 and 7, L-4 and F-4).
+                // Rebuilding from the live records is exact; the 4x guard makes
+                // it amortised, so a request/response channel does not churn.
+                if self.queue.capacity() > 64
+                    && self.queue.len().saturating_mul(4) <= self.queue.capacity()
+                {
+                    // `VecDeque::from_iter` may reuse the consumed iterator's
+                    // buffer (observed: capacity stayed 1024 after a rebuild),
+                    // so build the replacement through a `Vec` and an exact
+                    // `with_capacity`.
+                    let live: Vec<Message> = std::mem::take(&mut self.queue).into_iter().collect();
+                    let mut fresh = std::collections::VecDeque::with_capacity(live.len());
+                    fresh.extend(live);
+                    self.queue = fresh;
                 }
                 Ok(Some(message))
             }

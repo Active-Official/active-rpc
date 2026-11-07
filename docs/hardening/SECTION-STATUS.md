@@ -24,14 +24,14 @@ Updated 2026-11-06 at `cf5f969`.
 | R-10 | bulk transfer | 17 | open | r16 fixed two mediums (wall-failure accounting, `abort` scope); r17 in flight |
 | R-11 | identity | 14 | open | r13 fixed two mediums (child-first rotation, event schema); r14 in flight |
 | R-12 | replay | 6 | **closed** | r5 and r6 CLEAN |
-| R-13 | receipts | 11 | open | r10's high and two mediums fixed at `68f29ab` (ownership re-checked before every mutation, future timestamps, type-checked readers); its five lows fixed in round 11; r11's audit must come back clean, then r12 |
+| R-13 | receipts | 11 | open | r11 found the header install unguarded (high) and an in-flight resolve sealing no receipt (medium), both fixed with negative controls; r12 and r13 must be clean |
 | R-14 | wasm tools | 5 | **closed** | r3's medium was refuted with a test; r4 and r5 CLEAN |
 | R-15 | observability | 5 | **closed** | r2's high and mediums fixed; r4 and r5 CLEAN |
-| R-16 | security helpers | 10 | open | r10 found one high (a tainted-blob-only module was secret-free to every domain projection) and the taint-set medium, all fixed with the sticky `held_secret` predicate; r11 and r12 must be clean |
-| R-17 | introduction / topics | 6 | open | r6 found one medium (the channel counters charged wire bytes, not the 32-byte inline values) and four lows, all fixed; r7 and r8 must be clean |
+| R-16 | security helpers | 11 | open | r11 found `annotations` still serving a tainted blob address to non-redacting callers plus five lows, all fixed; r12 and r13 must be clean |
+| R-17 | introduction / topics | 7 | open | r7 found the memory charge still incomplete (spare capacity and map nodes) and three lows, all fixed with `Value::memory_bytes` and the parked-delivery slot; r8 and r9 must be clean |
 | R-18 | CLI | 2 | open | r2 had one high and eight mediums, all fixed; r3 and r4 needed |
 | R-19 | control plane | 2 | open | r2 had two highs and six mediums, all fixed; r3 and r4 needed |
-| R-20 | fuzz program | 2 | open | r2 had three highs and three mediums, all fixed; r3 and r4 needed |
+| R-20 | fuzz program | 3 | open | r3 found vacuous targets (high), five mediums and seven lows, all fixed; the seven patched targets ran 2 000 Docker runs each without a crash; r4 and r5 must be clean |
 
 ## What "closed" means here
 

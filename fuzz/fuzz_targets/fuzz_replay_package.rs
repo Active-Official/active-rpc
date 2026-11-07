@@ -93,6 +93,16 @@ fn structured(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // The format checksums the body before parsing it, so a mutated seed fails
+    // before reaching the op/trace parser. Wrap arbitrary bytes as a body with
+    // its own valid trailer so the body parser is actually fuzzed (R-20 round
+    // 3, M5).
+    {
+        let mut wrapped = data.to_vec();
+        wrapped.extend_from_slice(blake3::hash(data).as_bytes());
+        let _ = std::panic::catch_unwind(|| ReplayPackage::decode(&wrapped));
+    }
+
     // Arbitrary bytes: the decoder is total and its own fixed point.
     match ReplayPackage::decode(data) {
         Ok(package) => {

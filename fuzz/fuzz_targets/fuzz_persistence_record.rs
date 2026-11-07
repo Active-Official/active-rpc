@@ -21,11 +21,48 @@
 use libfuzzer_sys::fuzz_target;
 
 use active_rpc::persistence::CapabilityRecord;
+use active_rpc::Budget;
 
 const KEY: [u8; 32] = [0x77; 32];
 const FOREIGN: [u8; 32] = [0x78; 32];
 
+/// A record the parser must accept. Without this the target passed when
+/// `from_json` refused every input (R-20 round 3, H1 and M3).
+fn probe() -> CapabilityRecord {
+    CapabilityRecord {
+        provider: "echo".to_string(),
+        object: 0,
+        methods: ["echo".to_string()].into_iter().collect(),
+        budget: Budget::default(),
+        read_only: false,
+        redact: false,
+        path_scope: None,
+        topics: None,
+        publish: false,
+        tool_policy: None,
+        bound_to: Some([0x22; 32]),
+        expires_at: Some(60_000),
+        wall_clock: false,
+        lease_ms: Some(60_000),
+        record_id: [0x33; 32],
+        seal: None,
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control before the fuzzed input.
+    let fixed = probe();
+    let fixed_text = fixed.to_json();
+    let parsed = CapabilityRecord::from_json(&fixed_text)
+        .expect("the fixed record parses");
+    let mut sealed = parsed.clone();
+    sealed.seal_with(&KEY);
+    assert!(sealed.seal_is_valid(&KEY), "a sealed record verifies");
+    assert!(
+        !sealed.seal_is_valid(&FOREIGN),
+        "a sealed record does not verify under another key"
+    );
+
     if data.is_empty() {
         return;
     }
@@ -42,10 +79,16 @@ fuzz_target!(|data: &[u8]| {
                 !record.seal_is_valid(&FOREIGN),
                 "a record verified under a key it was not sealed with"
             );
+            // A seal from one record pasted onto an edited one must not
+            // verify: that is the forgery this parser exists to refuse. The
+            // earlier form asserted a parsed record never verified under KEY,
+            // which made the legitimate seeded record a crash (round 3, M3).
             if record.seal.is_some() {
+                let mut edited = record.clone();
+                edited.methods.insert("appended".to_string());
                 assert!(
-                    !record.seal_is_valid(&KEY),
-                    "an arbitrary seal must not verify under the deployment key"
+                    !edited.seal_is_valid(&KEY),
+                    "an edited record with a foreign seal must not verify"
                 );
             }
 

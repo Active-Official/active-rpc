@@ -43,6 +43,19 @@ fn policy() -> WasmHostPolicy {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: a minimal module must be accepted, or the
+    // construction branch below is dead (R-20 round 3, H1).
+    let wat = r#"(module (func (export "run") (result i32) i32.const 7))"#;
+    WasmTool::from_bytes_with_policy(
+        wat.as_bytes(),
+        LIMITS,
+        WasmHostPolicy {
+            accept_wat: true,
+            ..policy()
+        },
+    )
+    .expect("the fixed wat module compiles");
+
     // A limit that asks for more than the ceiling allows is refused, so a
     // caller cannot buy an unbounded table or memory by widening the policy.
     for limits in [
@@ -89,7 +102,9 @@ fuzz_target!(|data: &[u8]| {
     }
     // A module over this size is refused by the ceiling before compiling, and a
     // bigger input would only slow the campaign down.
-    if data.is_empty() || data.len() > 64 * 1024 {
+    // The module ceiling, not an arbitrary 64 KiB: a 1 MiB module is legal
+    // input the parser must handle (R-20 round 3, L5).
+    if data.is_empty() || data.len() > MAX_MODULE_BYTES {
         return;
     }
     match WasmTool::from_bytes_with_policy(data, LIMITS, policy()) {

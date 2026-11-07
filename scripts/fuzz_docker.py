@@ -39,6 +39,10 @@ def targets() -> list[str]:
 
 
 TARGETS = targets()
+if not TARGETS:
+    # A regex that silently matched nothing printed "all 0 targets completed"
+    # and the lane looked green (R-20 round 3, L7).
+    raise SystemExit("no fuzz targets found in fuzz/Cargo.toml")
 
 
 def run(

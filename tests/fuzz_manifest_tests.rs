@@ -60,14 +60,25 @@ fn every_target_has_a_source_file_and_a_committed_corpus_directory() {
 }
 
 #[test]
-fn every_lane_names_every_target() {
+fn every_lane_covers_every_target() {
+    // The CI lanes derive their list from the manifest, so one entry point
+    // drives all of them; a lane that went back to a hand-copied list must name
+    // every target or fail here (R-20 round 3, L6/L7).
     for lane in [
         ".github/workflows/ci.yml",
         ".github/workflows/nightly.yml",
         ".github/workflows/fuzz-nightly.yml",
-        "fuzz/README.md",
-        "docs/hardening/CORPUS.md",
     ] {
+        let text = repo(lane);
+        if text.contains("fuzz/Cargo.toml") && text.contains("fuzz_") {
+            continue;
+        }
+        for target in manifest_targets() {
+            assert!(text.contains(&target), "{lane} does not name {target}");
+        }
+    }
+    // The prose documents name every target.
+    for lane in ["fuzz/README.md", "docs/hardening/CORPUS.md"] {
         let text = repo(lane);
         for target in manifest_targets() {
             assert!(text.contains(&target), "{lane} does not name {target}");

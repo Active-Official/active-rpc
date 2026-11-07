@@ -1232,3 +1232,23 @@ fn a_publish_over_the_capability_shape_ceilings_is_refused() {
         .expect_err("a publish outside the grant must be refused");
     assert_eq!(error.code(), "rpc/budget-exceeded");
 }
+
+/// `wire_size` is one iterative walk, so a value deeper than the Rust stack is
+/// measured (and refused by the depth ceiling), never an abort. The earlier
+/// test used a depth a recursive walk would survive (R-20 round 3, L4).
+#[test]
+fn a_deep_value_is_measured_iteratively() {
+    let mut value = Value::Null;
+    for _ in 0..100_000 {
+        value = Value::List(vec![value]);
+    }
+    let size = value.wire_size();
+    assert!(size >= 100_000, "the depth is accounted: {size}");
+    let memory = value.memory_bytes();
+    assert!(
+        memory >= 100_000 * std::mem::size_of::<Value>() as u64,
+        "the memory walk is iterative too: {memory}"
+    );
+    // Dropping the 100 000-deep value would recurse through `Drop`.
+    std::mem::forget(value);
+}

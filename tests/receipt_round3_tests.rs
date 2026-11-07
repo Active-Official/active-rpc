@@ -275,6 +275,64 @@ fn an_out_of_band_resolve_seals_an_admission() {
     assert_eq!(receipts[0].decision, Decision::Admitted);
 }
 
+/// A provider that answers its own promise from `invoke`, so the job is
+/// in flight when the resolve runs (R-13 round 11, M-2).
+struct Resolving {
+    agent: std::rc::Rc<std::cell::RefCell<Option<Agent>>>,
+    own: std::rc::Rc<std::cell::RefCell<Option<active_rpc::PromiseHandle>>>,
+}
+
+impl Provider for Resolving {
+    fn name(&self) -> &'static str {
+        "resolving"
+    }
+    fn methods(&self) -> Vec<String> {
+        vec!["go".to_string()]
+    }
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        let agent = self.agent.borrow();
+        let agent = agent.as_ref().expect("agent installed");
+        if let Some(handle) = self.own.borrow().as_ref() {
+            agent.resolve(handle, Value::Int(1)).expect("answer itself");
+        }
+        Ok(Response::Value(Value::Int(0)))
+    }
+}
+
+#[test]
+fn an_in_flight_out_of_band_resolve_seals_one_admission() {
+    let agent = Agent::with_secret([0x94; 32]);
+    agent.enable_receipts(true);
+    let slot: std::rc::Rc<std::cell::RefCell<Option<Agent>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let own: std::rc::Rc<std::cell::RefCell<Option<active_rpc::PromiseHandle>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let provider = agent.register(Box::new(Resolving {
+        agent: std::rc::Rc::clone(&slot),
+        own: std::rc::Rc::clone(&own),
+    }));
+    *slot.borrow_mut() = Some(agent.clone());
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["go"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("resolve", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "go", Vec::new()).expect("queued");
+    *own.borrow_mut() = Some(promise.clone());
+    agent.run();
+    assert_eq!(
+        promise.value().expect("the provider answered it"),
+        Value::Int(1)
+    );
+    let receipts = agent.receipts();
+    assert_eq!(receipts.len(), 1, "one call, one receipt: {receipts:?}");
+    assert_eq!(receipts[0].decision, Decision::Admitted);
+}
+
 // ---------------------------------------------------------------------------
 // N10: a replaced log of the same size is noticed
 // ---------------------------------------------------------------------------

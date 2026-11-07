@@ -402,23 +402,35 @@ pub(crate) fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
 /// secret-derived material, so a non-redacting caller can receive it
 /// (R-16 rounds 9-10).
 pub(crate) fn sanitize_tainted_blobs(module: &mut active_infinity::InfinityModule) {
-    let doomed: Vec<active_infinity::NodeId> = (0..module.node_count())
-        .filter(|index| {
-            module
-                .get(active_infinity::NodeId(*index as u32))
-                .is_some_and(is_tainted_blob)
-        })
-        .map(|index| active_infinity::NodeId(index as u32))
-        .collect();
+    let mut doomed: BTreeSet<active_infinity::NodeId> = BTreeSet::new();
+    let mut addresses: Vec<String> = Vec::new();
+    for index in 0..module.node_count() {
+        let id = active_infinity::NodeId(index as u32);
+        if module.get(id).is_some_and(is_tainted_blob) {
+            doomed.insert(id);
+            if let Some(active_infinity::Inode::Blob { hash, .. }) = module.get(id) {
+                addresses.push(active_infinity::ir::hash_hex(hash));
+            }
+        }
+    }
     if doomed.is_empty() {
         return;
     }
-    // An annotation is free text about its subject: one that names the blob may
-    // carry the address the fields no longer do (R-16 round 10, Finding 2).
+    // An annotation is free text about its subject: one attached to the blob,
+    // or one whose text quotes the address, carries what the fields no longer
+    // do (R-16 rounds 10-11).
     let kept: Vec<active_infinity::Annotation> = module
         .annotations()
         .iter()
         .filter(|annotation| !doomed.contains(&annotation.node))
+        .filter(|annotation| {
+            let text = match &annotation.kind {
+                active_infinity::AnnotationKind::Intent(text) => text.as_str(),
+                active_infinity::AnnotationKind::Constraint { source, .. } => source.as_str(),
+                active_infinity::AnnotationKind::AiImmutable(_) => "",
+            };
+            !addresses.iter().any(|address| text.contains(address))
+        })
         .cloned()
         .collect();
     module.clear_annotations();

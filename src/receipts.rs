@@ -372,7 +372,28 @@ impl LogLock {
     /// refuses rather than append a second chain into the file (R-13 round 8,
     /// M1). The check is one bounded read of the path.
     fn still_holds(&self) -> bool {
-        nonce_of(&self.path).as_deref() == Some(self.nonce.as_str())
+        // On unix the lock is a file identity: a local user with directory
+        // write can read a live nonce, unlink the lock and recreate the same
+        // text, so a text check alone let two writers append (R-13 round 11,
+        // L-3). Everywhere else the nonce is the best available check.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Some(held) = self.file.as_ref().and_then(|file| file.metadata().ok()) else {
+                return false;
+            };
+            let Ok(current) = std::fs::symlink_metadata(&self.path) else {
+                return false;
+            };
+            if current.file_type().is_symlink() {
+                return false;
+            }
+            return held.ino() != 0 && held.dev() == current.dev() && held.ino() == current.ino();
+        }
+        #[cfg(not(unix))]
+        {
+            nonce_of(&self.path).as_deref() == Some(self.nonce.as_str())
+        }
     }
 
     fn acquire(log: &std::path::Path) -> Result<Self> {
@@ -654,6 +675,20 @@ fn nonce_of(path: &std::path::Path) -> Option<String> {
 /// A link planted in the log's directory would make every append write through
 /// it (and `repair` truncate through it), so the type is checked without
 /// following it (R-13 round 9, L2).
+/// Refuse a log path that is not a regular file, before opening it for write.
+///
+/// A symlink check alone lets a FIFO or a device block the open; the type rule
+/// is the one `read_capped` uses (R-13 round 11, L-5).
+fn refuse_writable_regular(path: &std::path::Path) -> Result<()> {
+    refuse_symlink(path)?;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_file() {
+            return Err(Error::receipt("the receipt log is not a regular file"));
+        }
+    }
+    Ok(())
+}
+
 fn refuse_symlink(path: &std::path::Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -673,6 +708,41 @@ fn claim_name(nonce: &str) -> Option<String> {
 }
 
 /// The file name of `path`, as text, for deriving a sibling name.
+/// Move a written header onto the log path.
+///
+/// Ownership is re-checked immediately before the rename: a creator suspended
+/// past the grace can resume to find its lock stolen, and installing a fresh
+/// header over a log the new owner is appending to destroys every record
+/// (R-13 round 11, H-1). The parent directory is flushed so `create` does not
+/// return Ok for a name that a power loss forgets (L-6).
+fn install_staged(staging: &std::path::Path, path: &std::path::Path, lock: &LogLock) -> Result<()> {
+    if !lock.still_holds() {
+        let _ = std::fs::remove_file(staging);
+        return Err(Error::receipt(
+            "the receipt log lock was displaced by another process",
+        ));
+    }
+    std::fs::rename(staging, path).map_err(|_| {
+        let _ = std::fs::remove_file(staging);
+        Error::receipt("cannot install the receipt log header")
+    })?;
+    sync_parent(path);
+    Ok(())
+}
+
+fn sync_parent(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 fn file_name_text(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -681,14 +751,49 @@ fn file_name_text(path: &std::path::Path) -> String {
 
 impl Drop for LogLock {
     fn drop(&mut self) {
-        // Only the owner removes the lock: a stealer replaces the file, and
-        // deleting a stolen lock would free a writer that is still appending.
-        // Bounded: after the kernel created its lock, a local user with
-        // directory write can replace the path with a symlink to `/dev/zero`,
-        // and an unbounded read would allocate without limit (R-13 round 7, #3).
-        let owned = nonce_of(&self.path).as_deref() == Some(self.nonce.as_str());
-        if owned {
-            let _ = std::fs::remove_file(&self.path);
+        // Only the owner removes the lock. Moving it to a claim name first, then
+        // verifying the moved file, is one winner: a check-then-unlink let a
+        // stealer swap the path between the two and this holder delete the new
+        // owner's live lock (R-13 round 11, L-4).
+        if !self.still_holds() {
+            return;
+        }
+        let claim = self.path.with_file_name(format!(
+            "{}.done-{}-{}",
+            file_name_text(&self.path),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        if std::fs::rename(&self.path, &claim).is_err() {
+            return;
+        }
+        let ours = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                match (
+                    self.file.as_ref().and_then(|file| file.metadata().ok()),
+                    std::fs::symlink_metadata(&claim),
+                ) {
+                    (Some(held), Ok(moved)) => {
+                        held.dev() == moved.dev() && held.ino() == moved.ino()
+                    }
+                    _ => false,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                nonce_of(&claim).as_deref() == Some(self.nonce.as_str())
+            }
+        };
+        if ours {
+            let _ = std::fs::remove_file(&claim);
+        } else if !self.path.exists() {
+            // Not ours: never destroy it, put it back when the path is free.
+            let _ = std::fs::rename(&claim, &self.path);
         }
     }
 }
@@ -825,10 +930,7 @@ impl ReceiptLog {
                 return Err(Error::receipt("cannot write the receipt log header"));
             }
         }
-        std::fs::rename(&staging, &path).map_err(|_| {
-            let _ = std::fs::remove_file(&staging);
-            Error::receipt("cannot install the receipt log header")
-        })?;
+        install_staged(&staging, &path, &lock)?;
         Ok(log)
     }
 
@@ -997,7 +1099,7 @@ impl ReceiptLog {
                 "the receipt log lock was displaced by another process",
             ));
         }
-        refuse_symlink(&self.path)?;
+        refuse_writable_regular(&self.path)?;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&self.path)
@@ -1126,11 +1228,14 @@ impl ReceiptLog {
         let remaining = tail.len();
         // The prefix must itself be a valid log, or the cut would keep damage.
         let (_, state) = walk_log(&bytes[..good_end])?;
+        // Before the open: a FIFO at the path passes a symlink check and
+        // `open(O_WRONLY)` blocks for ever, in the one tool an operator runs
+        // after damage (R-13 round 11, L-5).
+        refuse_writable_regular(&path)?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .map_err(|_| Error::receipt("cannot open the receipt log to repair it"))?;
-        refuse_symlink(&path)?;
         // The same check as the append: a repair that lost its lock must not
         // truncate a log another writer now owns (R-13 round 10, A).
         if !lock.still_holds() {
@@ -1777,5 +1882,41 @@ mod lock_tests {
 
         let _ = std::fs::remove_file(&lock_path);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod round11_tests {
+    use super::*;
+
+    /// H-1: a creator whose lock was stolen while it wrote the header must not
+    /// install that header over the new owner's log.
+    #[test]
+    fn a_displaced_creator_does_not_install_a_header() {
+        let dir = std::env::temp_dir().join(format!(
+            "arrl-displaced-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("log.arrl");
+        let lock = LogLock::acquire(&path).expect("lock");
+        let staging = dir.join("staging");
+        std::fs::write(&staging, b"header").expect("staging");
+
+        // Displace the lock: another writer now owns the path.
+        std::fs::remove_file(lock_path(&path)).expect("remove");
+        std::fs::write(lock_path(&path), "other-nonce pid 1 started 1").expect("foreign lock");
+
+        let error = install_staged(&staging, &path, &lock).expect_err("displaced");
+        assert_eq!(error.code(), "rpc/receipt");
+        assert!(
+            !path.exists(),
+            "the header was installed over a lock the creator no longer held"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

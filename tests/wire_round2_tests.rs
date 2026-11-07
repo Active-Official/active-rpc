@@ -296,3 +296,14 @@ fn a_provider_code_cannot_carry_a_control_character() {
     );
     assert_eq!(envelope.method, "rpc/provider");
 }
+
+/// A table shorter than its own count is a table fault, the class every other
+/// limit in the decoder uses (R-20 round 3, L1).
+#[test]
+fn a_truncated_capability_table_is_a_table_fault() {
+    for len in 0..4 {
+        let error = active_rpc::wire::decode_capability_table(&vec![0u8; len])
+            .expect_err("a truncated count is not a table");
+        assert_eq!(error.code(), "rpc/capability-table", "len {len}: {error}");
+    }
+}

@@ -122,6 +122,34 @@ fn a_null_heavy_record_is_charged_the_memory_it_holds() {
     assert_eq!(agent.queued_channel_bytes(), 0, "nothing was queued");
 }
 
+/// A record is charged what it pins, not what the wire would carry: a text
+/// with spare capacity and a map's entry overhead are both part of the cost
+/// (R-17 round 7, F-1).
+#[test]
+fn a_message_is_charged_the_capacity_it_pins() {
+    let mut text = String::with_capacity(1 << 20);
+    text.push('x');
+    let value = Value::Text(text);
+    assert_eq!(value.wire_size(), 6, "the wire image is one small string");
+    let charged = Channel::message_bytes(&value, &[], None);
+    assert!(
+        charged >= (1 << 20),
+        "a megabyte of spare capacity was charged as {charged} bytes"
+    );
+
+    let map = Value::Map(
+        (0..11)
+            .map(|index| (format!("key{index}"), Value::Int(index)))
+            .collect(),
+    );
+    let charged = Channel::message_bytes(&map, &[], None);
+    let per_entry = std::mem::size_of::<Value>() + std::mem::size_of::<String>();
+    assert!(
+        charged >= 11 * per_entry as u64,
+        "a map's keys and nodes are undercharged: {charged}"
+    );
+}
+
 /// The kernel-wide counter adds and subtracts the same quantity, so a send,
 /// a receive and a destroy each close it exactly (R-17 round 4, #1).
 #[test]

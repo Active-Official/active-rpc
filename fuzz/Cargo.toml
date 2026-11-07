@@ -12,6 +12,10 @@ libfuzzer-sys = "0.4"
 # The wasm target needs the interpreter; the feature is crate-wide, which only
 # makes the other targets build a little slower.
 active-rpc = { path = "..", default-features = false, features = ["wasm-tools", "quic", "http2"] }
+# The positive controls build a canonical image (domain target) and wrap a
+# replay body in its checksum so mutations reach the body parser.
+active-infinity = "2.4.0"
+blake3 = "1.5"
 
 [[bin]]
 name = "fuzz_arp1_frame"

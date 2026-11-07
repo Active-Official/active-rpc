@@ -8,6 +8,25 @@ use libfuzzer_sys::fuzz_target;
 use active_rpc::bulk::{BulkChunk, BulkPlan, BulkReceiver, BulkRequest, BulkSender};
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: a plan and a body built here must decode, verify
+    // and assemble. Without it a decoder that refused everything made every
+    // branch below dead (R-20 round 3, H1).
+    {
+        let body = b"the fixed bulk body".to_vec();
+        let plan = BulkPlan::new(&body, 4).expect("the fixed plan");
+        let bytes = plan.encode();
+        let decoded = BulkPlan::decode(&bytes).expect("the fixed plan decodes");
+        assert_eq!(decoded.root(), plan.root());
+        decoded.verify(&body).expect("the fixed plan verifies its body");
+        let sender = BulkSender::new(body.clone(), plan.chunk_size()).expect("sender");
+        let frames = sender.frames().expect("frames");
+        let mut receiver = BulkReceiver::new(decoded).expect("receiver");
+        for frame in &frames {
+            receiver.accept(frame).expect("a sender frame is accepted");
+        }
+        assert!(receiver.is_complete());
+        assert_eq!(receiver.finish().expect("finish"), body);
+    }
     if let Ok(plan) = BulkPlan::decode(data) {
         let _ = plan.chunk_count();
         let _ = plan.chunk_size();

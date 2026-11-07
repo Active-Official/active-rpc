@@ -118,6 +118,57 @@ impl Value {
         self.shape().size
     }
 
+    /// Bytes this value pins in memory, including spare capacity.
+    ///
+    /// The wire image is not the memory cost: a `Text` with a 1 GiB capacity
+    /// and one byte is 6 bytes on the wire and 1 GiB resident. A queue that
+    /// charges `wire_size` alone therefore cannot bound what it holds, and a
+    /// `Vec::with_capacity` or a `String` built by a provider is exactly the
+    /// shape an adversary sends (R-17 round 7, F-1). The walk is iterative for
+    /// the same reason as [`Value::shape`].
+    ///
+    /// The estimate is a lower bound on what the allocator holds: a container's
+    /// header, each key's spare capacity and a per-entry tree-node share are
+    /// charged, so a decoded map is not 10x under its ceiling.
+    pub fn memory_bytes(&self) -> u64 {
+        let mut work = vec![self];
+        let mut total = 0u64;
+        while let Some(value) = work.pop() {
+            let value_slot = std::mem::size_of::<Value>() as u64;
+            let charged = match value {
+                Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Secret => {
+                    value_slot
+                }
+                Value::Text(text) | Value::Path(text) => {
+                    value_slot.saturating_add(text.capacity() as u64)
+                }
+                Value::Module(bytes) => value_slot.saturating_add(bytes.capacity() as u64),
+                Value::List(items) => {
+                    // The vector itself, every slot (occupied or spare), then
+                    // the children.
+                    work.extend(items.iter());
+                    value_slot.saturating_add((items.capacity() as u64).saturating_mul(value_slot))
+                }
+                Value::Map(entries) => {
+                    // A tree entry is a key and a value plus node bookkeeping;
+                    // the value slot is charged per child, the key and the
+                    // node share here.
+                    let mut entry_cost = 0u64;
+                    for (key, item) in entries {
+                        entry_cost = entry_cost
+                            .saturating_add(std::mem::size_of::<String>() as u64)
+                            .saturating_add(key.capacity() as u64)
+                            .saturating_add(2 * std::mem::size_of::<usize>() as u64);
+                        work.push(item);
+                    }
+                    value_slot.saturating_add(entry_cost)
+                }
+            };
+            total = total.saturating_add(charged);
+        }
+        total
+    }
+
     /// True when this value or any descendant is a secret marker.
     ///
     /// Iterative like [`Value::shape`]: a caller can build a value deeper than

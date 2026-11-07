@@ -162,6 +162,26 @@ fn the_diagnostic_path_refuses_a_package_without_its_header_latency() {
     assert!(error.to_string().contains("header latency"), "{error}");
 }
 
+/// The parser applies the rule `encode` and `replay_trace` apply: a package
+/// whose first operation is not its header latency is not a package, even with
+/// a valid checksum (R-20 round 3, M5).
+#[test]
+fn a_checksum_valid_package_without_its_header_latency_is_refused() {
+    let mut body = Vec::new();
+    body.extend_from_slice(b"ARRP");
+    body.push(1);
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&7u64.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // no operations
+    body.extend_from_slice(&0u32.to_le_bytes()); // no trace
+    let mut bytes = body.clone();
+    bytes.extend_from_slice(blake3::hash(&body).as_bytes());
+
+    let error = ReplayPackage::decode(&bytes).expect_err("no header latency");
+    assert_eq!(error.code(), "rpc/replay");
+    assert!(error.to_string().contains("header latency"), "{error}");
+}
+
 /// A record-time ceiling that the decoder also enforces: a package that cannot
 /// be read back is not a package, and the recorder must not allocate the
 /// argument that proves it.

@@ -1278,7 +1278,11 @@ pub fn decode_capability_table_with(
         return Err(Error::CapabilityTable("table exceeds the byte ceiling"));
     }
     let mut cursor = 0usize;
-    let count = read_u32(bytes, &mut cursor)?;
+    // A table shorter than its own count is a table fault, the class every
+    // other limit in this decoder uses: `rpc/wire` is the envelope's class
+    // (R-20 round 3, L1).
+    let count = read_u32(bytes, &mut cursor)
+        .map_err(|_| Error::CapabilityTable("truncated descriptor count"))?;
     if count as usize > MAX_CAP_TABLE {
         return Err(Error::CapabilityTable("too many descriptors"));
     }

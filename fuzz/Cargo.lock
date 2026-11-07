@@ -59,7 +59,9 @@ dependencies = [
 name = "active-rpc-fuzz"
 version = "0.0.0"
 dependencies = [
+ "active-infinity",
  "active-rpc",
+ "blake3",
  "libfuzzer-sys",
 ]
 

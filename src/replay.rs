@@ -304,6 +304,15 @@ impl ReplayPackage {
         if !reader.is_empty() {
             return Err(Error::Replay("trailing bytes after the package".into()));
         }
+        // The format's first operation carries the header rate, and both
+        // `encode` and `replay_trace` refuse a package that disagrees. A
+        // parser that accepted one handed the caller a package this crate
+        // could never re-encode or run (R-20 round 3, M5).
+        if ops.first() != Some(&Op::SetLatency(latency_ms)) {
+            return Err(Error::Replay(
+                "the package does not begin with its header latency".into(),
+            ));
+        }
         Ok(ReplayPackage {
             latency_ms,
             ops,

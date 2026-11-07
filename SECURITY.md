@@ -85,6 +85,11 @@ capability id at rest (it is a bearer token).
   redacted secret-bearing image also drops its whole provenance: the parent
   content address in it is an offline equality oracle over the secret heap
   (R-16 round 7), and the `content_hash` projection does the same (round 8).
+  A **tainted blob** is secret material too: its bytes are secret-derived and
+  its `hash` is `blake3` over them, so a projection drops the address, the size,
+  the payload and every annotation that names it, and the domain treats a
+  module that holds one as secret-bearing for hashing, provenance, patching and
+  metadata (R-16 rounds 9-11).
   Bytes that do not claim to be an image are opaque by declaration (a WASM
   guest's binary output,
   a provider's blob): the value model cannot tell them from arbitrary data, so a

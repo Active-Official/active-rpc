@@ -488,7 +488,7 @@ impl ModuleProvider {
                             _ => None,
                         })
                         .ok_or(Error::InvalidArgument("patch needs a literal value"))?;
-                    if !slot.redactor.is_empty() && matches!(replacement, Inode::Str(_)) {
+                    if slot.held_secret && matches!(replacement, Inode::Str(_)) {
                         // The reply is the caller's own literal through the
                         // install-time redactor, and that redaction is
                         // unconditional: a candidate containing the secret
@@ -835,11 +835,27 @@ impl ModuleProvider {
                 check_node_budget(slot, call)?;
                 let module = &slot.module;
                 // The taint walk is only needed when the capability redacts.
-                let tainted_ids = if call.redact {
-                    tainted_nodes(module)
-                } else {
-                    BTreeSet::new()
-                };
+                // A tainted blob's content address is secret material, so an
+                // annotation that names it -- as its subject, or with the hex
+                // address in its text -- is hidden from every capability, not
+                // only a redacting one (R-16 round 11, Findings 1 and 4).
+                let mut tainted_ids: BTreeSet<NodeId> = BTreeSet::new();
+                let mut hidden_addresses: Vec<String> = Vec::new();
+                if slot.held_secret {
+                    for index in 0..module.node_count() {
+                        let id = NodeId(index as u32);
+                        if module.get(id).is_some_and(security::is_tainted_blob) {
+                            tainted_ids.insert(id);
+                            if let Some(active_infinity::Inode::Blob { hash, .. }) = module.get(id)
+                            {
+                                hidden_addresses.push(active_infinity::ir::hash_hex(hash));
+                            }
+                        }
+                    }
+                }
+                if call.redact {
+                    tainted_ids.extend(tainted_nodes(module));
+                }
                 let mut out = Vec::new();
                 let mut hidden_seen = false;
                 for annotation in module.annotations() {
@@ -851,8 +867,11 @@ impl ModuleProvider {
                     // A redacting capability hides anything attached to the
                     // secret cone; a non-redacting one still only sees text that
                     // canonicalization already redacted.
-                    let hidden = (call.redact && tainted_ids.contains(&annotation.node))
-                        || text.contains(security::SECRET_MARKER);
+                    let hidden = tainted_ids.contains(&annotation.node)
+                        || text.contains(security::SECRET_MARKER)
+                        || hidden_addresses
+                            .iter()
+                            .any(|address| text.contains(address));
                     if hidden {
                         // One marker for the whole hidden set: a marker per
                         // annotation would count the rules on the secret cone

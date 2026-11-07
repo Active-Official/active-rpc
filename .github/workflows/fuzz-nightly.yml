@@ -7,6 +7,9 @@ on:
     - cron: "27 3 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -20,29 +23,25 @@ jobs:
       - name: Install clang (libFuzzer runtime)
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Pinned: an unpinned third-party install runs arbitrary new code with
+        # the job token (R-20 round 3, L2).
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Campaign (seven minutes per target)
         env:
           FUZZ_SECONDS: "420"
         run: |
+          targets=$(python3 - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("fuzz/Cargo.toml").read_text()
+          print("\n".join(re.findall(r'^name = "(fuzz_[a-z0-9_]+)"$', text, re.MULTILINE)))
+          PY
+          )
+          if [ -z "$targets" ]; then
+            echo "no fuzz targets found in fuzz/Cargo.toml"
+            exit 1
+          fi
           status=0
-          for target in \
-            fuzz_arp1_frame \
-            fuzz_capability_lifecycle \
-            fuzz_promise_graph \
-            fuzz_budget_matrix \
-            fuzz_tool_mcp \
-            fuzz_tool_http \
-            fuzz_tool_process \
-            fuzz_channel_cap_transfer \
-            fuzz_transport_framing \
-            fuzz_bulk_plan \
-            fuzz_replay_package \
-            fuzz_topic_policy \
-            fuzz_receipt_log \
-            fuzz_wasm_module \
-            fuzz_domain_module \
-            fuzz_persistence_record; do
+          for target in $targets; do
             echo "== $target =="
             cargo fuzz run "$target" -- \
               -max_total_time="$FUZZ_SECONDS" -max_len=65536 -print_final_stats=1 || status=1
