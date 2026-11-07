@@ -41,14 +41,15 @@ fn responses() -> BTreeMap<String, String> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // A positive control: the fixed fixture must handshake. With `let Ok(..)
+    // else return` a handshake that refuses every input made this target exit
+    // 0 without exercising anything (R-20 round 3, H1). It runs before the
+    // empty-input guard so no input can skip it (round 4, #5).
+    let session = McpSession::handshake(MemoryTransport::new(responses()))
+        .expect("the fixed fixture handshakes");
     if data.is_empty() {
         return;
     }
-    // A positive control: the fixed fixture must handshake. With `let Ok(..)
-    // else return` a handshake that refuses every input made this target exit
-    // 0 without exercising anything (R-20 round 3, H1).
-    let session = McpSession::handshake(MemoryTransport::new(responses()))
-        .expect("the fixed fixture handshakes");
     assert_eq!(session.tools().len(), 1, "the handshake discovers one tool");
     assert_eq!(session.tools()[0].name, "echo");
 

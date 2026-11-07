@@ -93,6 +93,19 @@ fn structured(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Fixed positive control: a package the shipped recorder produced must
+    // encode, decode and replay. Without it a decoder that refuses every input
+    // passed the lane (R-20 rounds 3-4).
+    {
+        let mut recorder = Recorder::new(1).expect("recorder");
+        let cap = recorder.mint(&["echo"], None).expect("mint");
+        recorder.call(cap, "echo", 0).expect("call");
+        let package = recorder.package().expect("package");
+        let bytes = package.encode().expect("encode");
+        let decoded = ReplayPackage::decode(&bytes).expect("the fixed package decodes");
+        decoded.replay().expect("the fixed package replays");
+    }
+
     // The format checksums the body before parsing it, so a mutated seed fails
     // before reaching the op/trace parser. Wrap arbitrary bytes as a body with
     // its own valid trailer so the body parser is actually fuzzed (R-20 round
@@ -100,7 +113,13 @@ fuzz_target!(|data: &[u8]| {
     {
         let mut wrapped = data.to_vec();
         wrapped.extend_from_slice(blake3::hash(data).as_bytes());
-        let _ = std::panic::catch_unwind(|| ReplayPackage::decode(&wrapped));
+        // No `catch_unwind`: this is the only path on which a mutated body
+        // reaches the op/trace parser, so a panic must fail the target
+        // (R-20 round 4, #1). A refusal is the replay class.
+        match ReplayPackage::decode(&wrapped) {
+            Ok(_) => {}
+            Err(error) => assert_eq!(error.code(), "rpc/replay", "{error}"),
+        }
     }
 
     // Arbitrary bytes: the decoder is total and its own fixed point.

@@ -94,8 +94,12 @@ fuzz_target!(|data: &[u8]| {
                             let last = tampered.len() - 1;
                             tampered[last] ^= 0xFF;
                         }
-                        if let Err(error) = receiver.accept(&tampered) {
-                            assert_eq!(error.code(), "rpc/bulk");
+                        // A wrong-hash frame must be refused; the old form
+                        // only checked the code *if* it was refused (R-20
+                        // round 4, #3).
+                        match receiver.accept(&tampered) {
+                            Ok(_) => panic!("a tampered frame was accepted"),
+                            Err(error) => assert_eq!(error.code(), "rpc/bulk"),
                         }
                     }
                 }

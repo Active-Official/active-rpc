@@ -284,3 +284,68 @@ fn two_tainted_blobs_both_lose_their_address() {
     active_infinity::validate_canonical(&redacted, active_infinity::Limits::default())
         .expect("the projection is canonical");
 }
+
+/// A tainted blob's `media_type` is an operator-facing label that can be
+/// secret-derived, and a text that quotes the address must go even when the
+/// annotation names another node (R-16 round 12, F1 and F4). An `AiImmutable`
+/// flag carries no text, so it survives (F3).
+#[test]
+fn a_tainted_blobs_media_type_and_quoted_address_do_not_survive() {
+    let mut module = InfinityModule::new();
+    let blob = module.push(Inode::Blob {
+        hash: BLOB_HASH,
+        size: 64,
+        tainted: true,
+        media_type: "application/x-canary-secret".to_string(),
+        payload: None,
+    });
+    let root = module.push(Inode::Table {
+        fields: vec![("blob".to_string(), blob)],
+    });
+    module.set_root(Some(root));
+    module.annotate(
+        root,
+        active_infinity::AnnotationKind::Intent(format!("see blake3:{}", hash_hex(&BLOB_HASH))),
+    );
+    module.annotate(blob, active_infinity::AnnotationKind::AiImmutable(true));
+
+    let raw = encode(&module).expect("encode");
+    assert!(String::from_utf8_lossy(&raw).contains("canary-secret"));
+    let redacted = active_rpc::security::redact_module(&raw).expect("redact");
+    let printed = String::from_utf8_lossy(&redacted);
+    assert!(
+        !printed.contains("canary-secret"),
+        "the media type survived the projection"
+    );
+    assert!(
+        !printed.contains(&hash_hex(&BLOB_HASH)),
+        "a text that quotes the address survived"
+    );
+
+    let decoded = active_infinity::decode(&redacted).expect("decode");
+    // Canonical numbering reorders nodes; find the blob by shape.
+    let (media_type, tainted) = decoded
+        .nodes()
+        .iter()
+        .find_map(|node| match node {
+            active_infinity::Inode::Blob {
+                media_type,
+                tainted,
+                ..
+            } => Some((media_type.clone(), *tainted)),
+            _ => None,
+        })
+        .expect("the projection still carries the blob");
+    assert_eq!(media_type, "application/octet-stream");
+    assert!(!tainted, "the sanitized projection is not tainted");
+    assert_eq!(
+        decoded.annotations().len(),
+        1,
+        "only the text annotation was dropped: {:?}",
+        decoded.annotations()
+    );
+    assert!(matches!(
+        decoded.annotations()[0].kind,
+        active_infinity::AnnotationKind::AiImmutable(true)
+    ));
+}

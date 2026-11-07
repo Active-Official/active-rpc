@@ -45,7 +45,7 @@ omits a target the manifest declares.
 | `fuzz_replay_package` | `fuzz_targets/fuzz_replay_package.rs` | real package plus four variants | total decode, canonical re-encode, replay matches or refuses |
 | `fuzz_topic_policy` | `fuzz_targets/fuzz_topic_policy.rs` | topic masks | publish exactly inside the grant, attenuation never widens |
 | `fuzz_receipt_log` | `fuzz_targets/fuzz_receipt_log.rs` | real log plus three variants | reader total and canonical, writer/reader agreement |
-| `fuzz_wasm_module` | `fuzz_targets/fuzz_wasm_module.rs` | four module classes | construction total, huge table refused, bounded run with clock and entropy disabled |
+| `fuzz_wasm_module` | `fuzz_targets/fuzz_wasm_module.rs` | four module classes | construction total, oversize module and huge table refused, bounded run with an embedder-seeded clock and entropy disabled |
 | `fuzz_domain_module` | `fuzz_targets/fuzz_domain_module.rs` | module images and paths | the image parser is total; every domain method answers or refuses |
 | `fuzz_persistence_record` | `fuzz_targets/fuzz_persistence_record.rs` | sealed and edited records | parser total and canonical, seal only under its own key |
 
@@ -107,4 +107,6 @@ Interpretation:
 4. The corpus is hostile input: it runs under the same `WireLimits` and
    sanitizers as external bytes.
 5. Short campaign on pull requests and `main`, longer on the nightly lanes;
-   `-max_len=65536` matches the largest input every parser accepts.
+   `-max_len=65536` is a campaign budget, not a parser ceiling (the wire,
+   receipt and replay frames run to 64 MiB and the wasm module ceiling is
+   1 MiB, each asserted by a control in its target).

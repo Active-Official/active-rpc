@@ -279,6 +279,12 @@ impl Channel {
         if self.closed {
             return Err(Error::InvalidArgument("channel is closed"));
         }
+        // The kernel gates depth before it queues, but the type is public: a
+        // host-built value deeper than the wire ceiling cannot round-trip and
+        // aborts on the recursive `Drop` (R-17 round 8, residual).
+        if crate::kernel::value_too_deep(&payload, crate::wire::MAX_VALUE_DEPTH) {
+            return Err(Error::BudgetExceeded("depth"));
+        }
         if !self.direction.can_send() {
             return Err(Error::InvalidArgument("channel is receive-only"));
         }
@@ -359,8 +365,11 @@ impl Channel {
                 // both counters near zero (R-17 rounds 5 and 7, L-4 and F-4).
                 // Rebuilding from the live records is exact; the 4x guard makes
                 // it amortised, so a request/response channel does not churn.
+                // 2x, not 4x: a deque at len 1025 in a 4096-slot buffer is
+                // about four times its live records, and the charge is per
+                // message (R-17 round 8, #3).
                 if self.queue.capacity() > 64
-                    && self.queue.len().saturating_mul(4) <= self.queue.capacity()
+                    && self.queue.len().saturating_mul(2) <= self.queue.capacity()
                 {
                     // `VecDeque::from_iter` may reuse the consumed iterator's
                     // buffer (observed: capacity stayed 1024 after a rebuild),

@@ -214,6 +214,16 @@ pub enum Event {
         /// Which callback: `invoke` or `on_drop`.
         phase: String,
     },
+    /// A provider's captured surface cannot go into an introduction module
+    /// (a name or a method the module cannot carry, or too many methods), so
+    /// `intro` leaves it out instead of failing for the whole kernel
+    /// (R-17 round 8, #4).
+    IntroSkipped {
+        /// Provider left out of the description.
+        provider: ProviderId,
+        /// Why the surface cannot be described.
+        reason: String,
+    },
     /// A capability's lifetime elapsed; it is refused exactly like a revocation.
     CapExpired(CapId),
     /// A capability was exported as a sealed, durable record.
@@ -1104,13 +1114,28 @@ impl Agent {
     /// and it lists every registered provider even while one is checked out for
     /// a dispatch (R-17 round 3, M-1 and M-2).
     pub fn intro(&self) -> Result<Vec<u8>> {
-        let surface: Vec<(String, Vec<String>)> = self
-            .cell
-            .borrow()
-            .facts
-            .values()
-            .map(|facts| (facts.name.clone(), facts.methods.iter().cloned().collect()))
-            .collect();
+        // A provider whose name or methods the module cannot carry is left out
+        // and taped, not allowed to deny every peer the description
+        // (R-17 round 8, #4). A surface that does not fit is the adapter's
+        // defect; the healthy surface still crosses.
+        let mut surface: Vec<(String, Vec<String>)> = Vec::new();
+        let mut skipped: Vec<(ProviderId, String)> = Vec::new();
+        {
+            let kernel = self.cell.borrow();
+            for (id, facts) in &kernel.facts {
+                let methods: Vec<String> = facts.methods.iter().cloned().collect();
+                match crate::intro::surface_error(&facts.name, &methods) {
+                    None => surface.push((facts.name.clone(), methods)),
+                    Some(reason) => skipped.push((*id, reason.to_string())),
+                }
+            }
+        }
+        if !skipped.is_empty() {
+            let mut kernel = self.cell.borrow_mut();
+            for (provider, reason) in skipped {
+                kernel.push_event(Event::IntroSkipped { provider, reason });
+            }
+        }
         crate::intro::build(
             &format!("active-rpc/{}", crate::VERSION),
             &surface,
@@ -6033,12 +6058,16 @@ impl Agent {
             // audit artifact disagreed with the metric and the caller. When the
             // provider ran and only the reply was withheld, the effect stands
             // and the receipt records the admission.
-            if !resolved_out_of_band {
-                if effect_withheld {
-                    self.record_receipt(&job, None);
-                } else {
-                    self.record_receipt(&job, outcome.as_ref().err());
-                }
+            // Seal through the `receipted` flag alone. The old guard skipped
+            // this call whenever the promise had been answered out of band, so
+            // an in-flight resolve that did not seal (receipts disabled at that
+            // moment) left a call whose provider ran with no receipt at all
+            // (R-13 round 12, F10). `record_receipt` is idempotent through the
+            // flag.
+            if effect_withheld {
+                self.record_receipt(&job, None);
+            } else {
+                self.record_receipt(&job, outcome.as_ref().err());
             }
 
             // Phase 3: settle under a write borrow.

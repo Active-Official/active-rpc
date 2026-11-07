@@ -280,6 +280,8 @@ fn an_out_of_band_resolve_seals_an_admission() {
 struct Resolving {
     agent: std::rc::Rc<std::cell::RefCell<Option<Agent>>>,
     own: std::rc::Rc<std::cell::RefCell<Option<active_rpc::PromiseHandle>>>,
+    /// Turn receipts off around the answer, then back on.
+    toggle: bool,
 }
 
 impl Provider for Resolving {
@@ -296,7 +298,13 @@ impl Provider for Resolving {
         let agent = self.agent.borrow();
         let agent = agent.as_ref().expect("agent installed");
         if let Some(handle) = self.own.borrow().as_ref() {
+            if self.toggle {
+                agent.enable_receipts(false);
+            }
             agent.resolve(handle, Value::Int(1)).expect("answer itself");
+            if self.toggle {
+                agent.enable_receipts(true);
+            }
         }
         Ok(Response::Value(Value::Int(0)))
     }
@@ -313,6 +321,7 @@ fn an_in_flight_out_of_band_resolve_seals_one_admission() {
     let provider = agent.register(Box::new(Resolving {
         agent: std::rc::Rc::clone(&slot),
         own: std::rc::Rc::clone(&own),
+        toggle: false,
     }));
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
@@ -328,6 +337,38 @@ fn an_in_flight_out_of_band_resolve_seals_one_admission() {
         promise.value().expect("the provider answered it"),
         Value::Int(1)
     );
+    let receipts = agent.receipts();
+    assert_eq!(receipts.len(), 1, "one call, one receipt: {receipts:?}");
+    assert_eq!(receipts[0].decision, Decision::Admitted);
+}
+
+/// An answer delivered while receipts were off must not suppress the dispatch
+/// receipt once they are back on: a decision taken while the feature was off is
+/// unrecorded, but the call still reaches dispatch (R-13 round 12, F10).
+#[test]
+fn an_in_flight_resolve_while_receipts_were_disabled_still_yields_one_receipt() {
+    let agent = Agent::with_secret([0x95; 32]);
+    agent.enable_receipts(true);
+    let slot: std::rc::Rc<std::cell::RefCell<Option<Agent>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let own: std::rc::Rc<std::cell::RefCell<Option<active_rpc::PromiseHandle>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let provider = agent.register(Box::new(Resolving {
+        agent: std::rc::Rc::clone(&slot),
+        own: std::rc::Rc::clone(&own),
+        toggle: true,
+    }));
+    *slot.borrow_mut() = Some(agent.clone());
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["go"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("toggle", Budget::default())
+        .expect("lane");
+    let promise = agent.call(lane, &cap, "go", Vec::new()).expect("queued");
+    *own.borrow_mut() = Some(promise.clone());
+    agent.run();
+    assert_eq!(promise.value().expect("answered"), Value::Int(1));
     let receipts = agent.receipts();
     assert_eq!(receipts.len(), 1, "one call, one receipt: {receipts:?}");
     assert_eq!(receipts[0].decision, Decision::Admitted);

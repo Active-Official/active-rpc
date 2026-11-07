@@ -29,8 +29,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-13 | receipts | `src/receipts.rs` | rounds 1-11: round 10's high and two mediums fixed at `68f29ab`, its five lows fixed in round 11; r11's re-audit is owed | 59 fixed / 0 rejected / 1 residual (the check-then-open race needs a unix `O_NOFOLLOW`) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-11: r11 found that `annotations` still served a blob address to non-redacting callers, plus five lows, all fixed; r12 and r13 must be clean | 48 fixed / 0 rejected / 4 noted | this commit |
-| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-7: r7 found the memory charge still incomplete (capacity) and three lows, all fixed; r8 and r9 must be clean | 56 fixed / 0 rejected / 0 open (8 residuals recorded) | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-12: r12 found the media type of a tainted blob surviving every projection (high) and a quadratic address scan, both fixed; r13 and r14 must be clean | 52 fixed / 0 rejected / 5 noted | this commit |
+| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-8: r8 corrected the memory estimate (map nodes, list slots, deque guard) and the introduction's blast radius, all fixed; r9 and r10 must be clean | 63 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
 | R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
@@ -49,6 +49,85 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-17 introduction and topics - 2026-11-06 (round 8)
+
+Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. Round-7
+F-2/F-3/F-4/F-5 held; F-1 was right about capacity and wrong about the map node
+and the list slots. Verdict **NOT CLEAN**: one medium and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | `memory_bytes` charged a `BTreeMap` per entry while the container allocates an eleven-slot leaf node on the first insert (one entry pinned 545 B, charged 105) | **fixed**: the node header and its spare slots are charged per eleven entries; `channel_shrink_tests::a_map_heavy_record_is_charged_what_it_pins` measures a list of one-entry maps against the live allocator and requires 4/5 coverage. Negative control: the per-entry charge fails it |
+| 2 | low | a list charged its occupied slots twice (capacity times the slot size plus each child) | **fixed**: only the spare slots are charged as capacity; `a_list_is_not_charged_its_slots_twice` bounds it from both sides |
+| 3 | low | a deque at 1 025 records kept a 4 096-slot buffer (the 4x guard did not fire) | **fixed**: the rebuild guard is 2x; the burst test covers the case |
+| 4 | low | one adapter whose name or method list the introduction cannot carry denied `intro()` to the whole kernel | **fixed**: `intro()` leaves the provider out, tapes `intro.skipped` with the reason, and lists the healthy surface; `intro::surface_error` also bounds the method list at 4 096; `intro_round4_tests::a_provider_the_introduction_cannot_name_is_skipped_not_fatal` |
+| 5 | low | the "at the introduction bound" test used 200 bytes | **fixed**: it uses `MAX_NAME_BYTES` for the round trip and asserts 1 025 is refused |
+| - | residual | a provider that keeps a `Ref` for ever leaves its parked work parked, and a directly driven `Channel` had no depth gate | **fixed the depth gate** (`Channel::enqueue` refuses at `MAX_VALUE_DEPTH`); the permanent leak is contained (jobs stay queued, no cap) and recorded |
+
+Gate: green; both feature sets; fmt and doc clean. R-17 needs r9 and r10 clean.
+
+### R-16 security helpers - 2026-11-06 (round 12)
+
+Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. The
+annotation fix held; the sanitizer still left a secret-derived field and scanned
+quadratically. Verdict **NOT CLEAN**: one high, one medium and three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | a tainted blob's `media_type` (an operator-facing label the codec replaces in its own projections) survived every projection | **fixed**: the sanitizer sets a fixed media type; `security_round10_tests::a_tainted_blobs_media_type_and_quoted_address_do_not_survive` also covers a text that quotes the address on another node. Negative control: keeping the field fails it |
+| F2 | medium | address matching was annotations x blobs x text, charged to no budget | **fixed**: a set of 64-byte keys and one sliding window per text (`security::text_names_an_address`), used by the sanitizer and the domain |
+| F3 | low | an `@ai_immutable` flag on a tainted blob was dropped with the text annotations | **fixed**: only text-bearing annotations are filtered; the test asserts the flag survives |
+| F4 | low | a provider-produced non-canonical image was reported as the caller's `rpc/payload` | **recorded**: the egress class is the payload class by contract; the provider's refusal is `provider/reply-withheld` upstream |
+| F5 | low | the "every capability" guarantee rests on the cached `held_secret` flag | **accepted**: the flag is sticky and set at install from the module itself; a test proves a patch cannot clear it |
+
+Gate: green; both feature sets; fmt and doc clean. R-16 needs r13 and r14 clean.
+
+### R-13 receipts - 2026-11-06 (round 12)
+
+Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. Verdict
+**NOT CLEAN**: one high, three mediums and six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | the header install was a *replacing* rename: a creator descheduled in the check-then-rename gap installed its header over a log the new owner had appended to | **fixed**: the install is an exclusive hard link (spawn `link`), so a log created meanwhile is refused, never replaced; `replacing` removes the old name first. `receipts::round11_tests::a_competing_log_is_never_replaced_by_the_install`; negative control (rename) overwrites and fails |
+| F2 | medium | ownership was checked once per batch, not per 1 MiB chunk | **fixed**: re-checked before each chunk and before the final flush (`write_all`) |
+| F3 | medium | the log path was checked and then re-opened; `repair` truncated through whatever the path named | **fixed**: `open_log_write` opens with `O_NOFOLLOW` on unix, verifies the handle is a regular file, and the read/write/`set_len` act on that handle (`libc` added for the flag) |
+| F4 | medium | the reader could accept bytes read before its liveness probe | **fixed**: the probe runs before and after the read, and the length must equal the bytes walked; the refusal names the writer |
+| F5 | low | a planted fresh lock suppressed verification with an unhelpful message | **fixed**: the refusal names the lock's age, owner (escaped) and pid; `a_live_lock_refusal_names_the_lock` |
+| F6 | low | the directory flush was unix-only and best-effort, described unconditionally | **fixed in the doc**; the ADR says the guarantee is unix-only |
+| F7 | low | claim/quarantine/orphan/staging leftovers were never swept | **fixed**: `acquire` removes aged leftovers (32 per call, best effort); `acquisition_sweeps_aged_leftovers` |
+| F8 | low | the unauthenticated writer was the ordinary entry point | **documented**: `append`/`append_all` warn and name `append_verified` as the deployment path |
+| F9 | low | the ADR stopped at round 7 and promised a CLI surface in this crate | **fixed**: a rounds 8-12 table with dispositions and residuals, and the CLI sentence is scoped to the CLI crate |
+| F10 | low | an answer delivered while receipts were disabled suppressed the dispatch receipt for ever | **fixed**: dispatch seals through the `receipted` flag alone; `receipt_round3_tests::an_in_flight_resolve_while_receipts_were_disabled_still_yields_one_receipt` (negative control: zero receipts) |
+
+Gate: green; both feature sets; fmt and doc clean. R-13 needs r13 and r14 clean.
+
+### R-20 fuzz program - 2026-11-06 (round 4)
+
+Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. Verdict
+**NOT CLEAN**: one high, three mediums and nine lows; the round-3 controls mostly
+held and three gaps remained.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the replay target wrapped arbitrary bodies in a checksum but swallowed the decode panic with `catch_unwind`, on the only path that reaches the body parser | **fixed**: no `catch_unwind`; the result must be `Ok` or `rpc/replay` |
+| 2 | medium | the persistence target's "edited record" assertion was vacuous and the edit could be a no-op | **fixed**: the seal is produced in-target, `object ^= 1` changes the record, and `assert_ne!` precedes the check |
+| 3 | medium | the bulk target checked the code only when a tampered frame was refused | **fixed**: `Ok` is a panic; `Err` must be `rpc/bulk` |
+| 4 | medium | `nightly.yml` installed unpinned tools with the default token and a hand-copied matrix | **fixed**: `cargo-fuzz 0.13.2`, `cargo-llvm-cov 0.6.19`, `permissions: contents: read`, and a `plan` job derives the matrix from `fuzz/Cargo.toml` |
+| 5 | low | the MCP control ran after the empty-input guard | **fixed**: the control is first |
+| 6 | low | the "derived list" test could be satisfied by a comment; nothing pinned the tools | **fixed**: it requires the heredoc and `fuzz/Cargo.toml`, and a new test pins both tool versions and the token scope |
+| 7 | low | no gate for the control convention | **fixed**: `every_decoder_target_asserts_its_control_first` parses each decoder target and fails if the control follows an early return |
+| 8 | low | the wasm module ceiling was asserted only for one-byte inputs | **fixed**: a `Once` runs the oversize refusal once per process |
+| 9 | low | the receipt target used a predictable pid-named scratch path | **fixed**: a per-execution unique name per half |
+| 10 | low | duplicate seeds and no seed for the header-latency rule | **fixed**: duplicates removed (a test keeps them unique), a crafted seed added and pinned by `tests/fuzz_regression_tests.rs` |
+| 11 | low | docs claimed a disabled clock and that `-max_len` was a parser ceiling | **fixed** in `fuzz/README.md` and `CORPUS.md` |
+| 12 | low | the local lane ran as root with a mutable base tag | **partly fixed**: `--user` for the invoking uid/gid; the base tag pins the Rust minor and a digest pin is recorded as a deployment choice |
+
+Docker campaign: the seven patched targets ran 2 000 runs each with no crash,
+and the corpus grew to 123 valid seeds (committed).
+
+Gate: green; both feature sets; fmt and doc clean. R-20 needs r5 and r6 clean.
 
 ### R-17 introduction and topics - 2026-11-06 (round 7)
 

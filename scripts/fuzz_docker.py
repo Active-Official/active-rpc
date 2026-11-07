@@ -22,6 +22,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The image tag pins the Rust minor; a digest pin is a deployment choice (the
+# tag is rebuilt from `docker/fuzz.Dockerfile`, which pins the base image's
+# minor too).
 IMAGE = "active-fuzz:1.88"
 
 
@@ -114,6 +117,14 @@ def main() -> int:
         # A killed client leaves a `docker run` container behind even with
         # `--rm`, so the container is named and removed on a timeout.
         run(["docker", "rm", "-f", name], root)
+        # Run as the invoking user: the repository is mounted read-write so the
+        # campaign can grow the committed corpus, and a root-owned seed in a
+        # developer's tree is not something they can remove (R-20 round 4, #12).
+        user = (
+            []
+            if os.name == "nt"
+            else ["--user", f"{os.getuid()}:{os.getgid()}"]
+        )
         try:
             result = run(
                 [
@@ -122,6 +133,7 @@ def main() -> int:
                     "--rm",
                     "--name",
                     name,
+                    *user,
                     "-v",
                     f"{root}:/work",
                     "-w",

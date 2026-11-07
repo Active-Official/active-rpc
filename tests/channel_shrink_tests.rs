@@ -7,7 +7,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use active_rpc::channel::{Channel, ChannelId, Direction};
+use active_rpc::channel::{Channel, ChannelId, Direction, MESSAGE_OVERHEAD};
 use active_rpc::lane::LaneId;
 use active_rpc::value::Value;
 
@@ -83,4 +83,49 @@ fn a_channel_that_keeps_one_message_releases_the_burst() {
         held + 300_000 < filled,
         "the deque kept the burst allocation: {filled} -> {held}"
     );
+}
+
+/// A `BTreeMap` reserves an eleven-slot leaf node on its first insert, so a
+/// map-heavy record must be charged the node, not a per-entry share
+/// (R-17 round 8, #1).
+#[test]
+fn a_map_heavy_record_is_charged_what_it_pins() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let before = LIVE.load(Ordering::SeqCst);
+    let value = Value::List(
+        (0..1_000)
+            .map(|index| {
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(format!("k{index}"), Value::Int(index));
+                Value::Map(map)
+            })
+            .collect(),
+    );
+    let pinned = (LIVE.load(Ordering::SeqCst) - before) as u64;
+    let charged = Channel::message_bytes(&value, &[], None);
+    assert!(
+        charged.saturating_mul(5) >= pinned.saturating_mul(4),
+        "charged {charged} for {pinned} pinned"
+    );
+    // The value's recursive drop is shallow here; a plain drop is fine.
+    drop(value);
+}
+
+/// A list's occupied slots are charged as children and its spare slots as
+/// capacity, not both (R-17 round 8, #2).
+#[test]
+fn a_list_is_not_charged_its_slots_twice() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let slot = std::mem::size_of::<Value>() as u64;
+    let value = Value::List(vec![Value::Null; 100_000]);
+    let charged = Channel::message_bytes(&value, &[], None);
+    assert!(
+        charged >= MESSAGE_OVERHEAD + 100_000 * slot,
+        "the occupied slots are charged: {charged}"
+    );
+    assert!(
+        charged <= MESSAGE_OVERHEAD + 2 * slot + 100_000 * slot,
+        "the slots are charged twice: {charged}"
+    );
+    drop(value);
 }

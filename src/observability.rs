@@ -26,6 +26,7 @@ pub const METRICS_SCHEMA: &str = "active-rpc/metrics/1";
 
 /// Every event name this schema can emit.
 pub const EVENT_NAMES: &[&str] = &[
+    "intro.skipped",
     "cap.minted",
     "cap.retained",
     "cap.released",
@@ -233,6 +234,11 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.event = "provider.panicked";
             trace.provider = Some(provider.0);
             trace.detail = Some(label(phase));
+        }
+        Event::IntroSkipped { provider, reason } => {
+            trace.event = "intro.skipped";
+            trace.provider = Some(provider.0);
+            trace.detail = Some(label(reason));
         }
         Event::LaneCreated(lane) => {
             trace.event = "lane.created";

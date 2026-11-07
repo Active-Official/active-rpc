@@ -52,6 +52,12 @@ wasmi = { version = "2", optional = true }
 # ceiling bounds what the engine actually compiles (R-14 round 3, L-5).
 wat = { version = "1", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW` for the receipt log's write and read opens: the path is checked
+# and then opened, and the open is the only step that can be made atomic
+# (R-13 round 12, F3).
+libc = "0.2"
+
 [dev-dependencies]
 proptest = "1"
 sha2 = "0.10"

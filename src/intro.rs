@@ -16,6 +16,34 @@ use crate::error::{Error, Result};
 /// Longest name an introduction accepts for a peer, a provider or a method.
 pub const MAX_NAME_BYTES: usize = 1024;
 
+/// Most methods one provider may advertise in an introduction.
+///
+/// The module carries every method name, so an unbounded list is an
+/// unbounded description: one adapter with millions of methods made the
+/// introduction fail for the whole kernel (R-17 round 8, #4).
+pub const MAX_METHODS_PER_PROVIDER: usize = 4_096;
+
+/// Why a captured provider surface cannot go into an introduction, if it
+/// cannot.
+///
+/// `Agent::intro` uses this to leave the provider out and tape the reason
+/// instead of failing for every peer.
+pub(crate) fn surface_error(name: &str, methods: &[String]) -> Option<&'static str> {
+    if methods.len() > MAX_METHODS_PER_PROVIDER {
+        return Some("a provider advertises too many methods");
+    }
+    if check_name("provider", name).is_err() {
+        return Some("a provider name the introduction cannot carry");
+    }
+    if methods
+        .iter()
+        .any(|method| check_name("method", method).is_err())
+    {
+        return Some("a method name the introduction cannot carry");
+    }
+    None
+}
+
 /// Build the canonical introduction module for a peer.
 ///
 /// The encoding is canonical regardless of how the caller ordered anything: the
@@ -29,6 +57,11 @@ pub fn build(peer: &str, providers: &[(String, Vec<String>)], budget: &Budget) -
     let mut providers: Vec<(String, Vec<String>)> = providers.to_vec();
     for (provider, methods) in &mut providers {
         check_name("provider", provider)?;
+        if methods.len() > MAX_METHODS_PER_PROVIDER {
+            return Err(Error::InvalidArgument(
+                "a provider advertises too many methods",
+            ));
+        }
         methods.sort();
         methods.dedup();
         for method in methods.iter() {

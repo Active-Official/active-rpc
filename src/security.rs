@@ -403,13 +403,17 @@ pub(crate) fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
 /// (R-16 rounds 9-10).
 pub(crate) fn sanitize_tainted_blobs(module: &mut active_infinity::InfinityModule) {
     let mut doomed: BTreeSet<active_infinity::NodeId> = BTreeSet::new();
-    let mut addresses: Vec<String> = Vec::new();
+    let mut addresses: BTreeSet<[u8; 64]> = BTreeSet::new();
     for index in 0..module.node_count() {
         let id = active_infinity::NodeId(index as u32);
         if module.get(id).is_some_and(is_tainted_blob) {
             doomed.insert(id);
             if let Some(active_infinity::Inode::Blob { hash, .. }) = module.get(id) {
-                addresses.push(active_infinity::ir::hash_hex(hash));
+                if let Ok(key) =
+                    <[u8; 64]>::try_from(active_infinity::ir::hash_hex(hash).as_bytes())
+                {
+                    addresses.insert(key);
+                }
             }
         }
     }
@@ -418,18 +422,18 @@ pub(crate) fn sanitize_tainted_blobs(module: &mut active_infinity::InfinityModul
     }
     // An annotation is free text about its subject: one attached to the blob,
     // or one whose text quotes the address, carries what the fields no longer
-    // do (R-16 rounds 10-11).
+    // do. An `AiImmutable` flag carries no text, so it stays (R-16 rounds 10-12).
     let kept: Vec<active_infinity::Annotation> = module
         .annotations()
         .iter()
-        .filter(|annotation| !doomed.contains(&annotation.node))
         .filter(|annotation| {
-            let text = match &annotation.kind {
-                active_infinity::AnnotationKind::Intent(text) => text.as_str(),
-                active_infinity::AnnotationKind::Constraint { source, .. } => source.as_str(),
-                active_infinity::AnnotationKind::AiImmutable(_) => "",
-            };
-            !addresses.iter().any(|address| text.contains(address))
+            if doomed.contains(&annotation.node) {
+                return annotation_text(&annotation.kind).is_none();
+            }
+            match annotation_text(&annotation.kind) {
+                Some(text) => !text_names_an_address(text, &addresses),
+                None => true,
+            }
         })
         .cloned()
         .collect();
@@ -445,6 +449,7 @@ pub(crate) fn sanitize_tainted_blobs(module: &mut active_infinity::InfinityModul
             hash,
             size,
             tainted,
+            media_type,
             payload,
             ..
         } = node
@@ -453,8 +458,44 @@ pub(crate) fn sanitize_tainted_blobs(module: &mut active_infinity::InfinityModul
             *size = 0;
             *payload = None;
             *tainted = false;
+            // The media type is an operator-facing label the codec replaces in
+            // its own projections because it can be secret-derived; a
+            // projection here uses a fixed one too (R-16 round 12, F1).
+            *media_type = "application/octet-stream".to_string();
         }
     }
+}
+
+/// The free text an annotation carries, if it carries any.
+pub(crate) fn annotation_text(kind: &active_infinity::AnnotationKind) -> Option<&str> {
+    match kind {
+        active_infinity::AnnotationKind::Intent(text) => Some(text),
+        active_infinity::AnnotationKind::Constraint { source, .. } => Some(source),
+        active_infinity::AnnotationKind::AiImmutable(_) => None,
+    }
+}
+
+/// Whether `text` contains one of the addresses, in one linear pass.
+///
+/// A 64-character hex address is matched by sliding a 64-byte window against a
+/// set, so the cost is the text length rather than the number of blobs times
+/// the text length (R-16 round 12, F2).
+pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) -> bool {
+    if addresses.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() < 64 {
+        return false;
+    }
+    let mut key = [0u8; 64];
+    for window in bytes.windows(64) {
+        key.copy_from_slice(window);
+        if addresses.contains(&key) {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when a module image carries a structural secret.

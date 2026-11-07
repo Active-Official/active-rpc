@@ -89,8 +89,10 @@ fuzz_target!(|data: &[u8]| {
 
     // The declared ceiling itself: an oversize module is refused as a module
     // error, not handed to the compiler. Built here because libFuzzer cannot
-    // reach it within `-max_len`.
-    if data.len() == 1 {
+    // reach it within `-max_len`, once per process so no input can skip it
+    // (R-20 round 4, #8).
+    static OVERSIZE: std::sync::Once = std::sync::Once::new();
+    OVERSIZE.call_once(|| {
         let oversized = vec![0u8; MAX_MODULE_BYTES + 1];
         let error = WasmTool::from_bytes_with_policy(&oversized, LIMITS, policy())
             .expect_err("a module over the ceiling must be refused");
@@ -99,7 +101,7 @@ fuzz_target!(|data: &[u8]| {
             Some("wasm/module"),
             "an oversize module must be a module refusal: {error}"
         );
-    }
+    });
     // A module over this size is refused by the ceiling before compiling, and a
     // bigger input would only slow the campaign down.
     // The module ceiling, not an arbitrary 64 KiB: a 1 MiB module is legal

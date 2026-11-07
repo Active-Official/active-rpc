@@ -20,7 +20,7 @@ kernel or adapter and asserts an invariant, not only "did not crash".
 | `fuzz_replay_package` | `ARRP` decode, re-encode, replay | decode is total; re-encode is canonical; a replayed trace matches or is refused |
 | `fuzz_topic_policy` | capability-filtered topics | publish succeeds exactly inside the grant; attenuation never widens |
 | `fuzz_receipt_log` | `ARRL` reader and writer | the reader is total and canonical; the writer never accepts a record its own reader rejects |
-| `fuzz_wasm_module` | module bytes, fuel, imports | construction is total; the sandbox refuses a huge table; a run is bounded (the clock and entropy are disabled, so a failure reproduces from the input) |
+| `fuzz_wasm_module` | module bytes, fuel, imports | construction is total; the sandbox refuses a huge table; a run is bounded (the clock is embedder-seeded, so a failure reproduces from the input; entropy is disabled) |
 | `fuzz_domain_module` | `ModuleProvider` install and path lookup | the image parser is total; a fuzzed path answers or refuses, never panics |
 | `fuzz_persistence_record` | `CapabilityRecord` JSON and seal | the parser is total and canonical; a seal never verifies under a key it did not use; an edited record breaks it |
 

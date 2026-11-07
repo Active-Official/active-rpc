@@ -50,12 +50,20 @@ impl Provider for Echo {
 
 const SECRET: [u8; 32] = [0x5a; 32];
 
-/// One scratch path per fuzz process; each execution removes it first.
-fn scratch() -> PathBuf {
+/// A scratch path unique to the caller and this execution.
+///
+/// A fixed pid-named path in the shared temp directory is a file another local
+/// user can pre-plant (a symlink, an empty log) and the writer truncates
+/// through it (R-20 round 4, #9). The caller removes it when done.
+fn scratch(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "active-rpc-fuzz-receipt-log-{}",
-        std::process::id()
+        "active-rpc-fuzz-receipt-log-{}-{tag}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
     ));
     path
 }
@@ -122,7 +130,7 @@ fn structured(data: &[u8]) {
 
     let receipts = agent.receipts();
     let key = agent.receipt_key();
-    let path = scratch();
+    let path = scratch("log");
     let _ = std::fs::remove_file(&path);
     let start = receipts.first().map_or(1, |receipt| receipt.sequence);
     let log = ReceiptLog::create_starting_at(&path, start).expect("create");
@@ -172,7 +180,7 @@ fn structured(data: &[u8]) {
 /// reader rejects would make the log permanently unreadable, so this is the
 /// invariant the reader fuzz cannot see.
 fn writer(data: &[u8]) {
-    let path = scratch();
+    let path = scratch("writer");
     let _ = std::fs::remove_file(&path);
     let log = match ReceiptLog::create(&path) {
         Ok(log) => log,

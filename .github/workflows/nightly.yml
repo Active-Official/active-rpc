@@ -5,8 +5,34 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Read the target list from the manifest
+        id: list
+        run: |
+          targets=$(python3 - <<'PY'
+          import json, pathlib, re
+          text = pathlib.Path("fuzz/Cargo.toml").read_text()
+          names = re.findall(r'^name = "(fuzz_[a-z0-9_]+)"$', text, re.MULTILINE)
+          print(json.dumps(names))
+          PY
+          )
+          if [ -z "$targets" ] || [ "$targets" = "[]" ]; then
+            echo "no fuzz targets found in fuzz/Cargo.toml"
+            exit 1
+          fi
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
   fuzz:
+    needs: plan
     runs-on: ubuntu-latest
     # A slow target must not eat the six-hour default: the campaign is bounded
     # per target and the job is bounded overall.
@@ -14,30 +40,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - fuzz_arp1_frame
-          - fuzz_capability_lifecycle
-          - fuzz_promise_graph
-          - fuzz_budget_matrix
-          - fuzz_tool_mcp
-          - fuzz_tool_http
-          - fuzz_tool_process
-          - fuzz_channel_cap_transfer
-          - fuzz_transport_framing
-          - fuzz_bulk_plan
-          - fuzz_replay_package
-          - fuzz_topic_policy
-          - fuzz_receipt_log
-          - fuzz_wasm_module
-          - fuzz_domain_module
-          - fuzz_persistence_record
+        # Derived from the manifest: a hand-copied list drifts (R-20 L6/L7).
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install clang (libFuzzer runtime)
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Pinned: an unpinned third-party install runs arbitrary new code every
+        # night with the job token (R-20 round 4, #4).
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Long campaign
         run: cargo fuzz run "${{ matrix.target }}" -- -runs=200000 -max_len=65536 -print_final_stats=1
       # A crash input is the only thing that makes a nightly failure
@@ -59,7 +72,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
+        # Pinned for the same reason as cargo-fuzz.
+        run: cargo install cargo-llvm-cov --version 0.6.19 --locked
       - name: Coverage floor
         run: |
           cargo llvm-cov --locked --all-features --json --summary-only --output-path coverage.json

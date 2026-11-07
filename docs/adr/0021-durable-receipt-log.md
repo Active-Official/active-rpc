@@ -165,3 +165,31 @@ a retryable condition, not damage. **A reader does not take the writer's lock**:
 `ReceiptLog::open`/`snapshot` read and walk without it, so `receipts verify` exits
 non-zero with "being written" while an append is in progress and an operator
 retries. The lock is the writer's alone.
+
+## Rounds 8-12 (hostile review, R-13)
+
+Each row is a finding the audit loop closed after the C-table; the code comment
+names the round where the rule lives.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| R8 | high | the steal could move a lock it had not judged, and a displaced writer still appended | ownership is re-checked before every mutation; a steal renames, verifies the moved nonce and preserves what it did not judge |
+| R9 | medium | a future-dated lock was immortal; an empty lock was unstealable; a FIFO blocked an open | a future timestamp reads past the grace; an empty or unrenderable nonce is quarantined; both paths are type-checked before an open |
+| R10 | high | the writer held no ownership check between acquiring and writing | `write_all`, `create_locked` and `repair` re-check `still_holds` immediately before their mutation |
+| R11 | high | a suspended creator could install its header over the new owner's log | `install_staged` re-checks, and the install is an exclusive hard link: a log created meanwhile is refused, never replaced |
+| R11 | medium | an in-flight out-of-band resolve marked the job receipted without sealing | the pre-mark applies only while the job is queued; dispatch seals through the flag |
+| R11 | low | text ownership could be copied by a local user; `Drop` checked then unlinked; a FIFO blocked the write opens; the parent directory was not flushed | ownership is the held handle's `(dev, ino)` on unix; `Drop` renames to a claim before verifying; `open_log_write` uses `O_NOFOLLOW` and the handle's type; the parent is flushed on unix |
+| R12 | high | the header install was a *replacing* rename | the exclusive hard link above |
+| R12 | medium | ownership was checked once per batch, not per 1 MiB chunk | re-checked before each chunk and before the final flush |
+| R12 | medium | the log path was checked, then re-opened; `repair` truncated through the new object | one verified handle per operation: `O_NOFOLLOW`, `fstat` regular-file, then read/write/`set_len` on that handle |
+| R12 | medium | a reader could accept bytes read before its liveness probe | the probe runs before and after the read, and the length must equal the bytes walked |
+| R12 | low | a planted fresh lock suppressed verification with an unhelpful message; leftovers were never swept; the unauthenticated writer was the ordinary one | the refusal names the lock's age, owner and pid (escaped); `acquire` sweeps aged claim/stale/orphan/staging files; the unauthenticated writers are documented and `append_verified` is the deployment path |
+
+Accepted residuals: the check-then-open race on the lock path (a local user with
+directory write can deny the log; an `O_NOFOLLOW` on the log path narrows the
+same class for the log itself), orphan files left by a killed process until their
+age passes the ceiling, and the chain not being authenticity (the receipt MAC is).
+
+`receipts verify` and the `--receipt-key-file` / `--expect-head` flags live in
+the CLI crate that consumes this library; this ADR describes the library
+contract, not a command-line surface (R-13 round 12, F9).

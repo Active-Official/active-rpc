@@ -840,7 +840,7 @@ impl ModuleProvider {
                 // address in its text -- is hidden from every capability, not
                 // only a redacting one (R-16 round 11, Findings 1 and 4).
                 let mut tainted_ids: BTreeSet<NodeId> = BTreeSet::new();
-                let mut hidden_addresses: Vec<String> = Vec::new();
+                let mut hidden_addresses: BTreeSet<[u8; 64]> = BTreeSet::new();
                 if slot.held_secret {
                     for index in 0..module.node_count() {
                         let id = NodeId(index as u32);
@@ -848,7 +848,11 @@ impl ModuleProvider {
                             tainted_ids.insert(id);
                             if let Some(active_infinity::Inode::Blob { hash, .. }) = module.get(id)
                             {
-                                hidden_addresses.push(active_infinity::ir::hash_hex(hash));
+                                if let Ok(key) = <[u8; 64]>::try_from(
+                                    active_infinity::ir::hash_hex(hash).as_bytes(),
+                                ) {
+                                    hidden_addresses.insert(key);
+                                }
                             }
                         }
                     }
@@ -867,11 +871,10 @@ impl ModuleProvider {
                     // A redacting capability hides anything attached to the
                     // secret cone; a non-redacting one still only sees text that
                     // canonicalization already redacted.
-                    let hidden = tainted_ids.contains(&annotation.node)
-                        || text.contains(security::SECRET_MARKER)
-                        || hidden_addresses
-                            .iter()
-                            .any(|address| text.contains(address));
+                    let carries_text = security::annotation_text(&annotation.kind).is_some();
+                    let hidden = (carries_text && tainted_ids.contains(&annotation.node))
+                        || security::text_names_an_address(&text, &hidden_addresses)
+                        || text.contains(security::SECRET_MARKER);
                     if hidden {
                         // One marker for the whole hidden set: a marker per
                         // annotation would count the rules on the secret cone

@@ -79,18 +79,19 @@ fuzz_target!(|data: &[u8]| {
                 !record.seal_is_valid(&FOREIGN),
                 "a record verified under a key it was not sealed with"
             );
-            // A seal from one record pasted onto an edited one must not
-            // verify: that is the forgery this parser exists to refuse. The
-            // earlier form asserted a parsed record never verified under KEY,
-            // which made the legitimate seeded record a crash (round 3, M3).
-            if record.seal.is_some() {
-                let mut edited = record.clone();
-                edited.methods.insert("appended".to_string());
-                assert!(
-                    !edited.seal_is_valid(&KEY),
-                    "an edited record with a foreign seal must not verify"
-                );
-            }
+            // Seal the parsed record ourselves, then edit a field that always
+            // changes: the earlier edit inserted a method name, which is a
+            // no-op when the record already grants it (R-20 round 4, #2).
+            let mut sealed_here = record.clone();
+            sealed_here.seal_with(&KEY);
+            assert!(sealed_here.seal_is_valid(&KEY));
+            let mut edited = sealed_here.clone();
+            edited.object ^= 1;
+            assert_ne!(edited, sealed_here, "the edit must change the record");
+            assert!(
+                !edited.seal_is_valid(&KEY),
+                "an edited record must not verify"
+            );
 
             // 3. Canonical round trip: a record that parses re-parses to itself
             //    and re-encodes to the same bytes.
@@ -105,19 +106,9 @@ fuzz_target!(|data: &[u8]| {
             );
 
             // A record we seal ourselves verifies under our key and only ours.
-            let mut sealed = record.clone();
-            sealed.seal_with(&KEY);
-            assert!(sealed.seal_is_valid(&KEY), "a sealed record must verify");
             assert!(
-                !sealed.seal_is_valid(&FOREIGN),
+                !sealed_here.seal_is_valid(&FOREIGN),
                 "a sealed record must not verify under another key"
-            );
-            // Editing any field breaks the seal.
-            let mut edited = sealed.clone();
-            edited.methods.insert("appended".to_string());
-            assert!(
-                !edited.seal_is_valid(&KEY),
-                "an edited record must not verify"
             );
         }
         Err(error) => assert_eq!(

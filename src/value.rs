@@ -127,9 +127,11 @@ impl Value {
     /// shape an adversary sends (R-17 round 7, F-1). The walk is iterative for
     /// the same reason as [`Value::shape`].
     ///
-    /// The estimate is a lower bound on what the allocator holds: a container's
-    /// header, each key's spare capacity and a per-entry tree-node share are
-    /// charged, so a decoded map is not 10x under its ceiling.
+    /// The estimate tracks what the allocator holds: every inline slot, a
+    /// container's header and spare slots, each key's capacity and the
+    /// `BTreeMap` leaf node a map's first entry allocates. It is deliberately
+    /// conservative on a small map (a node reserves eleven slots), never an
+    /// order of magnitude under.
     pub fn memory_bytes(&self) -> u64 {
         let mut work = vec![self];
         let mut total = 0u64;
@@ -144,24 +146,37 @@ impl Value {
                 }
                 Value::Module(bytes) => value_slot.saturating_add(bytes.capacity() as u64),
                 Value::List(items) => {
-                    // The vector itself, every slot (occupied or spare), then
-                    // the children.
+                    // The vector header, its spare slots (the occupied ones are
+                    // charged as children) and then the children (R-17 round 8,
+                    // #2: the old form charged both).
                     work.extend(items.iter());
-                    value_slot.saturating_add((items.capacity() as u64).saturating_mul(value_slot))
+                    let spare = (items.capacity() as u64).saturating_sub(items.len() as u64);
+                    value_slot.saturating_add(spare.saturating_mul(value_slot))
                 }
                 Value::Map(entries) => {
-                    // A tree entry is a key and a value plus node bookkeeping;
-                    // the value slot is charged per child, the key and the
-                    // node share here.
-                    let mut entry_cost = 0u64;
+                    // A `BTreeMap` allocates an 11-slot leaf node on the first
+                    // insert, so a one-entry map pins a whole node; charging a
+                    // per-entry share undercharged it ~5x (R-17 round 8, #1).
+                    // Occupied slots are charged through their key and child;
+                    // the node header and the spare slots are charged here.
+                    let mut keys = 0u64;
                     for (key, item) in entries {
-                        entry_cost = entry_cost
+                        keys = keys
                             .saturating_add(std::mem::size_of::<String>() as u64)
-                            .saturating_add(key.capacity() as u64)
-                            .saturating_add(2 * std::mem::size_of::<usize>() as u64);
+                            .saturating_add(key.capacity() as u64);
                         work.push(item);
                     }
-                    value_slot.saturating_add(entry_cost)
+                    let occupied = entries.len() as u64;
+                    let nodes = occupied.saturating_add(10) / 11;
+                    let spare = nodes.saturating_mul(11).saturating_sub(occupied);
+                    let node_overhead = nodes
+                        .saturating_mul(3 * std::mem::size_of::<usize>() as u64)
+                        .saturating_add(
+                            spare.saturating_mul(std::mem::size_of::<String>() as u64 + value_slot),
+                        );
+                    value_slot
+                        .saturating_add(keys)
+                        .saturating_add(node_overhead)
                 }
             };
             total = total.saturating_add(charged);

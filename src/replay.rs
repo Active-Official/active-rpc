@@ -960,6 +960,12 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             event: format!("provider.panicked:{phase:?}"),
             cap: None,
         },
+        Event::IntroSkipped { .. } => Trace {
+            // Kernel-local bookkeeping: the reason names a surface, not a
+            // capability, and a replay does not depend on it.
+            event: "intro.skipped".into(),
+            cap: None,
+        },
         Event::LaneCreated(_) => Trace {
             event: "lane.created".into(),
             cap: None,

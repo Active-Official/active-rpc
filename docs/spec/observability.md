@@ -81,6 +81,7 @@ authority.
 | `budget.exhausted` | `cap`, `dimension` | a budget ceiling refused work |
 | `receipts.dropped` | `detail` | the receipt ring dropped records; `detail` carries the running total (evicted or cleared) |
 | `provider.panicked` | `provider`, `detail` | a provider panicked; `detail` names the phase, and the panic message never enters a trace |
+| `intro.skipped` | `provider`, `detail` | a provider's captured surface cannot go into an introduction module (a name or a method the module cannot carry, or more than 4 096 methods), so `intro` leaves it out; `detail` is the reason |
 | `tool.refused` | `cap`, `detail` | a tool policy refused work |
 
 `tests/observability_tests.rs` fails if the code emits a name that is absent

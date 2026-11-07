@@ -331,7 +331,10 @@ fn a_provider_may_mint_for_itself_while_it_is_dispatching() {
 /// (R-17 round 5, L-5).
 #[test]
 fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
-    let name: &'static str = Box::leak("p".repeat(200).into_boxed_str());
+    let name: &'static str = Box::leak(
+        "p".repeat(active_rpc::intro::MAX_NAME_BYTES)
+            .into_boxed_str(),
+    );
     let agent = Agent::with_secret([0x55; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x98; 32]);
@@ -348,6 +351,15 @@ fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
     let mut attrs = CapAttrs::new(&["noop"]);
     attrs.persistence = CapPersistence::Durable;
     let cap = agent.mint_bound(&owner, provider, 0, attrs).expect("cap");
+    // One byte over the bound is refused by the description and, through the
+    // same rule, by the record parser (R-17 round 8, #5).
+    let over = "p".repeat(active_rpc::intro::MAX_NAME_BYTES + 1);
+    assert!(active_rpc::intro::build(
+        "peer",
+        &[(over.clone(), vec!["noop".to_string()])],
+        &Budget::default()
+    )
+    .is_err());
     let record = agent
         .export_capability(&cap)
         .expect("a name the introduction accepts is persistable");
@@ -359,6 +371,35 @@ fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
 }
 
 /// A refused receive is a refusal like any other (R-17 round 5, L-6).
+/// One adapter whose surface the module cannot carry must not deny the
+/// kernel's description to every peer (R-17 round 8, #4).
+#[test]
+fn a_provider_the_introduction_cannot_name_is_skipped_not_fatal() {
+    let agent = Agent::new();
+    agent.register(Box::new(Adapter {
+        name: "bad\u{200B}name",
+        methods: vec!["x".to_string()],
+    }));
+    agent.register(Box::new(Adapter {
+        name: "good",
+        methods: vec!["y".to_string()],
+    }));
+    let bytes = agent
+        .intro()
+        .expect("one bad surface does not deny the description");
+    let module = active_infinity::decode(&bytes).expect("a valid module");
+    let json = active_infinity::interop::to_redacted_json(&module).expect("json");
+    assert!(json.contains("\"good\""), "{json}");
+    assert!(!json.contains('\u{200B}'), "the bad name crossed: {json}");
+    assert!(
+        agent
+            .trace()
+            .iter()
+            .any(|event| event.event() == "intro.skipped"),
+        "the skip is on the tape"
+    );
+}
+
 #[test]
 fn a_refused_receive_is_recorded() {
     let agent = Agent::new();

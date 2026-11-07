@@ -46,6 +46,10 @@ fn every_event(cap: CapId) -> Vec<Event> {
             cap,
             provider: ProviderId(1),
         },
+        Event::IntroSkipped {
+            provider: ProviderId(1),
+            reason: "test".to_string(),
+        },
         Event::CapRetained(cap),
         Event::CapReleased(cap),
         Event::CapDropped(cap),

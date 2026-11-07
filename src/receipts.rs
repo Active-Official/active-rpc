@@ -293,7 +293,10 @@ impl Snapshot {
 /// Exclusive access to one log file, held for the length of an append.
 struct LogLock {
     path: std::path::PathBuf,
-    /// Written into the lock file: the only proof that this holder may remove it.
+    /// Written into the lock file: the proof a non-unix host checks, and what an
+    /// operator reads. On unix the held handle's `(dev, ino)` decides ownership
+    /// (a copied text is not a file identity), so the field is write-only there.
+    #[cfg_attr(unix, allow(dead_code))]
     nonce: String,
     /// The handle `create_new` returned.
     ///
@@ -388,7 +391,7 @@ impl LogLock {
             if current.file_type().is_symlink() {
                 return false;
             }
-            return held.ino() != 0 && held.dev() == current.dev() && held.ino() == current.ino();
+            held.ino() != 0 && held.dev() == current.dev() && held.ino() == current.ino()
         }
         #[cfg(not(unix))]
         {
@@ -398,6 +401,7 @@ impl LogLock {
 
     fn acquire(log: &std::path::Path) -> Result<Self> {
         let path = lock_path(log);
+        sweep_leftovers(&path);
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -597,6 +601,22 @@ fn take_stale(path: &std::path::Path, judged: &str) -> bool {
     false
 }
 
+/// A refusal message that lets an operator tell a stale lock from damage.
+///
+/// The nonce is file text, so it is escaped and bounded like any other label
+/// (R-13 round 12, F5).
+fn writer_description(path: &std::path::Path) -> String {
+    match lock_state(&lock_path(path)) {
+        Some((age_ms, nonce, pid)) => format!(
+            "the receipt log is being written by another process (lock {} ms old, owner {}, pid {})",
+            age_ms,
+            crate::observability::label(&nonce),
+            pid.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+        ),
+        None => "the receipt log is being written by another process".to_string(),
+    }
+}
+
 /// Whether a lock of that age, naming that pid, still belongs to a live writer.
 ///
 /// The one rule the stealer and the reader share: a lock is live while it is
@@ -713,21 +733,48 @@ fn claim_name(nonce: &str) -> Option<String> {
 /// Ownership is re-checked immediately before the rename: a creator suspended
 /// past the grace can resume to find its lock stolen, and installing a fresh
 /// header over a log the new owner is appending to destroys every record
-/// (R-13 round 11, H-1). The parent directory is flushed so `create` does not
-/// return Ok for a name that a power loss forgets (L-6).
-fn install_staged(staging: &std::path::Path, path: &std::path::Path, lock: &LogLock) -> Result<()> {
+/// (R-13 round 11, H-1). On unix the parent directory is flushed so `create`
+/// does not return Ok for a name that a power loss forgets; that flush is
+/// best-effort and has no Windows equivalent here, so the durability guarantee
+/// is a unix one (L-6; round 12, F6).
+fn install_staged(
+    staging: &std::path::Path,
+    path: &std::path::Path,
+    lock: &LogLock,
+    replacing: bool,
+) -> Result<()> {
     if !lock.still_holds() {
         let _ = std::fs::remove_file(staging);
         return Err(Error::receipt(
             "the receipt log lock was displaced by another process",
         ));
     }
-    std::fs::rename(staging, path).map_err(|_| {
-        let _ = std::fs::remove_file(staging);
-        Error::receipt("cannot install the receipt log header")
-    })?;
-    sync_parent(path);
-    Ok(())
+    if replacing {
+        // `truncate` asks to replace the log, so the old name goes first; the
+        // link below then refuses to clobber anything created in between.
+        let _ = std::fs::remove_file(path);
+    }
+    // A `rename` *replaces* its destination: a creator that passes the check
+    // and is descheduled before the rename installs a bare header over a log
+    // another writer has created and appended to (R-13 round 12, F1). A hard
+    // link is exclusive, so the two names can never both be the log.
+    match std::fs::hard_link(staging, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(staging);
+            sync_parent(path);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(staging);
+            Err(Error::receipt(
+                "the receipt log was created by another writer",
+            ))
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(staging);
+            Err(Error::receipt("cannot install the receipt log header"))
+        }
+    }
 }
 
 fn sync_parent(path: &std::path::Path) {
@@ -741,6 +788,56 @@ fn sync_parent(path: &std::path::Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+/// Remove aged claim, quarantine, orphan and staging files beside the lock.
+///
+/// A displaced drop, a crashed steal or a crash mid-header leaves one of each;
+/// without a sweep the directory grows one file per attempt, and a local user
+/// can make the writer add one per steal (R-13 round 12, F7). Best effort: an
+/// entry that cannot be read or removed is left alone, and a live creator's
+/// staging file is younger than the ceiling.
+fn sweep_leftovers(lock: &std::path::Path) {
+    let Some(parent) = lock.parent() else {
+        return;
+    };
+    let Some(name) = lock
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let mut budget = 32usize;
+    for entry in entries.flatten() {
+        if budget == 0 {
+            break;
+        }
+        let file = entry.file_name();
+        let file = file.to_string_lossy();
+        let Some(rest) = file.strip_prefix(name.as_str()) else {
+            continue;
+        };
+        if !(rest.starts_with(".done-")
+            || rest.starts_with(".stale-")
+            || rest.starts_with(".orphan-")
+            || rest.starts_with(".writing-"))
+        {
+            continue;
+        }
+        let aged = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_millis() as u64 >= LOCK_STALE_MS);
+        if aged && std::fs::remove_file(entry.path()).is_ok() {
+            budget -= 1;
+        }
+    }
 }
 
 fn file_name_text(path: &std::path::Path) -> String {
@@ -930,7 +1027,7 @@ impl ReceiptLog {
                 return Err(Error::receipt("cannot write the receipt log header"));
             }
         }
-        install_staged(&staging, &path, &lock)?;
+        install_staged(&staging, &path, &lock, replacing)?;
         Ok(log)
     }
 
@@ -957,12 +1054,21 @@ impl ReceiptLog {
         walk_log(bytes).map(|(receipts, _)| receipts)
     }
 
-    /// Append one receipt.
+    /// Append one receipt **without** checking its MAC.
+    ///
+    /// The chain is integrity, not authenticity: a local writer can extend it.
+    /// A deployment that needs the artifact to be evidence calls
+    /// [`ReceiptLog::append_verified`], which refuses a record whose MAC is not
+    /// the one this kernel's receipt key produces (R-13 round 12, F8).
     pub fn append(&self, receipt: &Receipt) -> Result<()> {
         self.append_all(std::slice::from_ref(receipt))
     }
 
     /// Append a batch of receipts without checking their `mac`.
+    ///
+    /// The unverified writer: see [`ReceiptLog::append`]. The tests use it to
+    /// build logs with chosen fields; a deployment should use
+    /// [`ReceiptLog::append_verified`].
     ///
     /// The sequence must continue the log exactly, every method must be
     /// representable, and the batch is refused before anything is written when
@@ -1369,42 +1475,57 @@ fn writer_active(path: &std::path::Path) -> bool {
 /// The wait is bounded, and a reader only waits while the lock is fresh: a
 /// damaged file with a stale lock still fails.
 fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogState)> {
-    let mut bytes = read_capped(path)?;
     let mut last_error: Option<Error> = None;
-    let mut previous_len = 0usize;
+    let mut previous_len = usize::MAX;
     for attempt in 0..11u32 {
+        // Probe *before* the read as well as after: a writer that finished
+        // between the read and the probe used to leave a boundary-aligned
+        // prefix final (R-13 round 12, F4).
+        if writer_active(path) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        let bytes = read_capped(path)?;
         let walked = walk_log(&bytes);
+        let length_now = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(u64::MAX);
         let active = writer_active(path);
         match walked {
-            // A complete walk is final only when no writer is appending: while
-            // one is, the next record may already be on its way.
-            Ok((receipts, state)) if !active => return Ok((bytes, receipts, state)),
+            // A complete walk is final only when no writer is appending and the
+            // path still holds exactly the bytes that were walked.
+            Ok((receipts, state)) if !active && length_now == bytes.len() as u64 => {
+                return Ok((bytes, receipts, state));
+            }
             Ok(_) => {}
             Err(error) => last_error = Some(error),
         }
         let grew = bytes.len() != previous_len;
         previous_len = bytes.len();
-        if attempt > 0 && !active && !grew {
+        if attempt > 0 && !active && !grew && length_now == bytes.len() as u64 {
             // Nothing is being written and the bytes stopped changing: the file
             // is what it is.
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-        bytes = read_capped(path)?;
     }
+    let bytes = read_capped(path)?;
+    let length_now = std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(u64::MAX);
+    let active = writer_active(path);
     match walk_log(&bytes) {
-        // The bound ran out while a writer was still working: a complete walk is
-        // then a prefix of its batch, and returning it would publish a head the
-        // file has already moved past (R-13 round 7, #5).
-        Ok(_) if writer_active(path) => Err(Error::receipt(
-            "the receipt log is being written by another process",
-        )),
+        // The bound ran out while a writer was still working, or the file moved
+        // under the read: a complete walk of the old bytes is a prefix of its
+        // batch, and returning it would publish a head the file has already
+        // moved past (R-13 round 7, #5; round 12, F4).
+        Ok(_) if active || length_now != bytes.len() as u64 => {
+            Err(Error::receipt(writer_description(path)))
+        }
         Ok((receipts, state)) => Ok((bytes, receipts, state)),
         Err(error) => {
-            if writer_active(path) {
-                Err(Error::receipt(
-                    "the receipt log is being written by another process",
-                ))
+            if active {
+                Err(Error::receipt(writer_description(path)))
             } else {
                 Err(last_error.unwrap_or(error))
             }
@@ -1911,12 +2032,103 @@ mod round11_tests {
         std::fs::remove_file(lock_path(&path)).expect("remove");
         std::fs::write(lock_path(&path), "other-nonce pid 1 started 1").expect("foreign lock");
 
-        let error = install_staged(&staging, &path, &lock).expect_err("displaced");
+        let error = install_staged(&staging, &path, &lock, false).expect_err("displaced");
         assert_eq!(error.code(), "rpc/receipt");
         assert!(
             !path.exists(),
             "the header was installed over a lock the creator no longer held"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A competing log created between the ownership check and the install must
+    /// survive: a hard link is exclusive, a rename would replace it (F1).
+    #[test]
+    fn a_competing_log_is_never_replaced_by_the_install() {
+        let dir = scratch_dir("competing");
+        let path = dir.join("log.arrl");
+        let lock = LogLock::acquire(&path).expect("lock");
+        let staging = dir.join("staging");
+        std::fs::write(&staging, b"our header").expect("staging");
+        // Another writer created the log after the check.
+        std::fs::write(&path, b"their log").expect("competitor");
+
+        let error = install_staged(&staging, &path, &lock, false).expect_err("refused");
+        assert_eq!(error.code(), "rpc/receipt");
+        assert_eq!(std::fs::read(&path).expect("read"), b"their log");
+        assert!(!staging.exists(), "the staging file is removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh lock is reported with its age and owner, so an operator can tell
+    /// a stuck retry from damage (F5).
+    #[test]
+    fn a_live_lock_refusal_names_the_lock() {
+        let dir = scratch_dir("live");
+        let path = dir.join("log.arrl");
+        drop(ReceiptLog::create(&path).expect("create"));
+        let lock = LogLock::acquire(&path).expect("lock");
+        let error = read_stable(&path).expect_err("a live writer is refused");
+        let text = error.to_string();
+        assert!(text.contains("ms old"), "{text}");
+        assert!(
+            text.contains(&format!("pid {}", std::process::id())),
+            "{text}"
+        );
+        assert!(text.contains(&lock.nonce), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Aged claim, quarantine and staging files are swept on the next acquire;
+    /// a live one is left alone (F7).
+    #[test]
+    fn acquisition_sweeps_aged_leftovers() {
+        let dir = scratch_dir("sweep");
+        let path = dir.join("log.arrl");
+        let lock = lock_path(&path);
+        let name = file_name_text(&lock);
+        let aged = [
+            dir.join(format!("{name}.done-1-2")),
+            dir.join(format!("{name}.stale-x")),
+            dir.join(format!("{name}.orphan-y")),
+            dir.join(format!("{name}.writing-1-2")),
+        ];
+        for file in &aged {
+            std::fs::write(file, b"leftover").expect("leftover");
+            age(file, 600);
+        }
+        let fresh = dir.join(format!("{name}.writing-9-9"));
+        std::fs::write(&fresh, b"live").expect("fresh");
+        drop(LogLock::acquire(&path).expect("lock"));
+        for file in &aged {
+            assert!(!file.exists(), "{} survived the sweep", file.display());
+        }
+        assert!(fresh.exists(), "a live staging file is not swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn age(file: &std::path::Path, seconds: u64) {
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file)
+            .expect("open the leftover");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(seconds),
+            ))
+            .expect("set the mtime");
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arrl-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
     }
 }
