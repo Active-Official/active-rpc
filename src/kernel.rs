@@ -4591,14 +4591,12 @@ impl Agent {
             // provider never ran (R-13 round 7, #4).
             kernel.record_settled(promise.id);
             if kernel.receipts_enabled {
-                // A read-only capability cannot have applied an effect, so its
-                // cancel is a refusal; a mutating one reached the provider and
-                // may have landed, so it is admitted (R-13 rounds 7-8, L4).
-                let refused = job
-                    .call
-                    .read_only
-                    .then_some(Error::PromiseCancelled(promise.id.0));
-                kernel.seal_receipt(&job, refused.as_ref());
+                // The receipt records the decision dispatch took, and the call
+                // reached the provider: no answer is delivered, but nothing was
+                // refused either, so the decision is `Admitted` for a read-only
+                // call as much as for a mutating one. A `Refused` here would deny
+                // an admission the tape already made (R-13 round 9, F4).
+                kernel.seal_receipt(&job, None);
             }
             if let Some(stored) = kernel.jobs.get_mut(&job.id) {
                 stored.receipted = true;
@@ -4719,10 +4717,9 @@ impl Agent {
                 // withheld (R-13 round 7, #4).
                 if let Some(job) = kernel.jobs.values().find(|job| job.promise == *id).cloned() {
                     if !job.receipted && kernel.receipts_enabled {
-                        // The same split as `cancel`: a read-only call had no
-                        // effect to stand (R-13 round 8, L4).
-                        let refused = job.call.read_only.then_some(Error::PromiseCancelled(id.0));
-                        kernel.seal_receipt(&job, refused.as_ref());
+                        // The same rule as `cancel`: dispatch admitted the call
+                        // and the provider ran (R-13 round 9, F4).
+                        kernel.seal_receipt(&job, None);
                     }
                     if let Some(stored) = kernel.jobs.get_mut(&job.id) {
                         stored.receipted = true;

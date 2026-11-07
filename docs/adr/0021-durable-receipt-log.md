@@ -155,6 +155,10 @@ authority, and a crash costs at most one record.
 | C10 | low | `touch` followed the lock path, so a planted symlink made the writer refresh another file | `touch` acts on the handle the writer created |
 | C11 | low | the steal's check-then-remove was not atomic, and an expired claim let two live stealers through | The steal quarantines the lock by `rename` (atomic; one winner) and deletes the quarantined file; a displaced writer fails `still_holds` |
 | C12 | low | a lock with a non-UTF-8 byte in its first bytes was unidentifiable, so it could never be stolen | The lock is parsed as lossy text |
+| C13 | high | the quarantine moved whatever was at the lock path, and `create`/`truncate`/`repair` wrote without re-checking ownership | `take_stale` re-reads the moved file's nonce and preserves anything it did not judge (put back when the path is free, else kept as an orphan); every writer path calls `still_holds()` right after acquiring |
+| C14 | medium | a future-dated lock was immortal, an empty lock unstealable, and a FIFO at the lock or log path blocked `open` for ever | A future timestamp reads as past the ceiling; an empty lock is quarantined like any other; both paths are type-checked with `symlink_metadata` before an open |
+| C15 | medium | a pre-planted quarantine name blocked the rename | A failed first rename retries with a unique suffix the file's author cannot choose |
+| C16 | medium | an in-flight read-only cancel was receipted as a refusal | A call that reached the provider is `Admitted`, read-only or not: the receipt records the dispatch decision, and the withheld answer is visible in the promise state |
 
 The reader's refusal code is `rpc/receipt` with a message naming the writer; it is
 a retryable condition, not damage. **A reader does not take the writer's lock**:

@@ -473,12 +473,22 @@ fn judged_stale(path: &std::path::Path) -> Option<String> {
 /// #1). Lossy text, so a lock with a stray non-UTF-8 byte is still identifiable
 /// and can still be stolen (R-13 round 8, L5).
 fn lock_state(path: &std::path::Path) -> Option<(u64, String, Option<u32>)> {
+    // A FIFO or a device at the lock path would block `open` for ever, so the
+    // type is checked without following a link and without blocking
+    // (R-13 round 9, F5).
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
     let file = std::fs::File::open(path).ok()?;
     let modified = file.metadata().ok()?.modified().ok()?;
-    let age_ms = modified
-        .elapsed()
-        .map(|age| age.as_millis() as u64)
-        .unwrap_or(0);
+    let age_ms = match modified.elapsed() {
+        Ok(age) => age.as_millis() as u64,
+        // A timestamp in the future is clock skew or a planted file. Reading the
+        // age as zero made such a lock immortal; the ceiling is the safe reading
+        // (R-13 round 9, F2).
+        Err(_) => LOCK_STALE_MS + 1,
+    };
     let (nonce, pid) = read_lock(&file)?;
     Some((age_ms, nonce, pid))
 }
@@ -495,14 +505,45 @@ fn lock_state(path: &std::path::Path) -> Option<(u64, String, Option<u32>)> {
 ///
 /// Returns true when the lock that was judged was removed.
 fn take_stale(path: &std::path::Path, judged: &str) -> bool {
-    let Some(safe) = claim_name(judged) else {
-        return false;
+    let safe = if judged.is_empty() {
+        // No nonce: an interrupted creator. A fixed, valid name keeps the
+        // quarantine path derivable without letting the file choose it.
+        "unidentified".to_string()
+    } else {
+        match claim_name(judged) {
+            Some(safe) => safe,
+            None => return false,
+        }
     };
     let quarantine = path.with_file_name(format!("{}.stale-{safe}", file_name_text(path)));
-    if std::fs::rename(path, &quarantine).is_err() {
-        return false;
-    }
-    if nonce_of(&quarantine).as_deref() == Some(judged) {
+    // A name a local user pre-planted (as a directory, or a file the rename
+    // cannot replace) must not block the steal: the second attempt carries a
+    // unique suffix the file's author cannot choose (R-13 round 9, L1).
+    let quarantine = if std::fs::rename(path, &quarantine).is_ok() {
+        quarantine
+    } else {
+        let unique = path.with_file_name(format!(
+            "{}.stale-{safe}-{}",
+            file_name_text(path),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        if std::fs::rename(path, &unique).is_err() {
+            return false;
+        }
+        unique
+    };
+    let moved_nonce = nonce_of(&quarantine).unwrap_or_else(|| "missing".to_string());
+    let matched = if judged.is_empty() {
+        // The file that was judged had no nonce; it still has none, so it is the
+        // same lock (R-13 round 9, F2).
+        moved_nonce.is_empty()
+    } else {
+        moved_nonce == judged
+    };
+    if matched {
         let _ = std::fs::remove_file(&quarantine);
         return true;
     }
@@ -557,6 +598,9 @@ fn process_is_alive(_pid: u32) -> bool {
 /// allocate megabytes to discover that. The format is
 /// `{nonce} pid {pid} started {ms}`; a lock without a pid is still usable.
 fn read_lock(file: &std::fs::File) -> Option<(String, Option<u32>)> {
+    // (An empty lock yields an empty nonce: it is identifiable as "no owner",
+    // which is a state a lock can be left in when a writer dies between
+    // `create_new` and its write, and one that must not be unstealable.)
     use std::io::Read;
     let mut bytes = Vec::new();
     file.try_clone()
@@ -569,7 +613,7 @@ fn read_lock(file: &std::fs::File) -> Option<(String, Option<u32>)> {
     // (R-13 round 8, L5).
     let text = String::from_utf8_lossy(&bytes);
     let mut words = text.split_whitespace();
-    let nonce = words.next()?.to_string();
+    let nonce = words.next().unwrap_or_default().to_string();
     let mut pid = None;
     while let Some(word) = words.next() {
         if word == "pid" {
@@ -1117,6 +1161,13 @@ fn read_tail_head(path: &std::path::Path) -> Option<[u8; 32]> {
 /// allocating it.
 fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
     use std::io::Read;
+    // Opening a FIFO or a device here would block for ever: refuse anything that
+    // is not a regular file, without following a link (R-13 round 9, F5).
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_file() {
+            return Err(Error::receipt("the receipt log is not a regular file"));
+        }
+    }
     let file =
         std::fs::File::open(path).map_err(|_| Error::receipt("cannot read the receipt log"))?;
     let mut bytes = Vec::new();

@@ -309,36 +309,38 @@ fn a_reader_refuses_instead_of_returning_a_prefix() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A steal claim left behind by a dead stealer expires, so it cannot make one
-/// stale lock unstealable for ever (R-13 round 7, #6).
+/// A quarantine name a local user pre-planted cannot block the steal: the second
+/// attempt carries a unique suffix the author cannot choose (R-13 round 9, L1).
 #[test]
-fn a_leftover_claim_does_not_make_a_stale_lock_permanently_unstealable() {
-    let path = scratch("claim");
+fn a_planted_quarantine_name_does_not_block_the_steal() {
+    let path = scratch("planted-quarantine");
     drop(ReceiptLog::create(&path).expect("create"));
     let lock = lock_of(&path);
     std::fs::write(&lock, b"555-1 pid 4294967294 started 1").expect("lock");
-    // The claim a killed stealer would leave behind: the exact name the steal
-    // derives from the judged nonce.
-    let claim = lock.with_file_name(format!(
-        "{}.steal-555-1",
+    // The exact quarantine name the steal derives from the judged nonce, planted
+    // as a directory: a rename onto it fails on every platform.
+    let planted = lock.with_file_name(format!(
+        "{}.stale-555-1",
         lock.file_name().unwrap().to_string_lossy()
     ));
-    std::fs::write(&claim, b"").expect("claim");
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
-    filetime_set(&lock, old);
-    filetime_set(&claim, old);
+    std::fs::create_dir_all(&planted).expect("planted");
+    filetime_set(
+        &lock,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+    );
 
     let log = ReceiptLog::open(&path).expect("open");
     log.append(&receipt(1, "echo"))
-        .expect("the expired claim is cleared and the stale lock is stolen");
+        .expect("the unique fallback steals the lock the planted name would block");
     assert_eq!(
         ReceiptLog::verify_bytes(&std::fs::read(&path).expect("read"))
             .expect("walk")
             .len(),
         1
     );
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&planted);
     let _ = std::fs::remove_file(&lock);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// A lock that names a live writer keeps being honoured inside the grace.
@@ -419,6 +421,33 @@ fn a_lock_with_a_non_utf8_prefix_is_still_stolen() {
     let log = ReceiptLog::open(&path).expect("open");
     log.append(&receipt(1, "echo"))
         .expect("the lossy nonce is still a nonce, so the lock is stolen");
+    assert_eq!(
+        ReceiptLog::verify_bytes(&std::fs::read(&path).expect("read"))
+            .expect("walk")
+            .len(),
+        1
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock);
+}
+
+/// A lock whose timestamp is in the future is clock skew or a planted file: it
+/// must not become immortal, because a negative age read as zero never passes the
+/// stale ceiling (R-13 round 9, F2).
+#[test]
+fn a_future_dated_lock_is_not_immortal() {
+    let path = scratch("future");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let lock = lock_of(&path);
+    std::fs::write(&lock, b"77-1 pid 4294967294 started 1").expect("lock");
+    filetime_set(
+        &lock,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3_600),
+    );
+
+    let log = ReceiptLog::open(&path).expect("open");
+    log.append(&receipt(1, "echo"))
+        .expect("a future timestamp is not a live writer");
     assert_eq!(
         ReceiptLog::verify_bytes(&std::fs::read(&path).expect("read"))
             .expect("walk")

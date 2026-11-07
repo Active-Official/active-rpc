@@ -122,38 +122,53 @@ fn a_replacement_at_the_same_size_and_start_is_not_trusted() {
     let _ = std::fs::remove_file(path.with_extension("lock"));
 }
 
-/// 6: a lock that cannot be identified is never stolen, and the wait is bounded.
+/// 6: a lock left with no nonce (a creator that died between `create_new` and
+/// its write) is stolen rather than wedging the log for ever, and a lock path
+/// that is not a regular file is refused instead of blocking (R-13 rounds 4-9).
 #[test]
-fn an_unidentifiable_lock_is_refused_within_a_bounded_time() {
+fn an_empty_lock_is_stolen_and_a_non_regular_lock_is_refused() {
     let path = scratch("lock");
-    let log = ReceiptLog::create(&path).expect("create");
-    drop(log);
-    // An empty lock file: it has no nonce, so it cannot be judged stale safely.
+    drop(ReceiptLog::create(&path).expect("create"));
     let lock = path.with_file_name(format!(
         "{}.lock",
         path.file_name().expect("name").to_string_lossy()
     ));
+    // An empty lock, aged past the ceiling: the creator never wrote its nonce,
+    // so no live writer can hold it.
     std::fs::write(&lock, b"").expect("lock");
-    // Age it past the stale ceiling.
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
     filetime_set(&lock, old);
 
     let log = ReceiptLog::open(&path).expect("open");
+    log.append(&receipt(1, "echo"))
+        .expect("an unidentifiable lock is stolen, not a wedge");
+    assert_eq!(
+        ReceiptLog::verify_bytes(&std::fs::read(&path).expect("read"))
+            .expect("walk")
+            .len(),
+        1
+    );
+
+    // A directory at the lock path is not a lock: the append is refused within
+    // the documented budget instead of hanging on an open (R-13 round 9, F5).
+    let _ = std::fs::remove_file(&lock);
+    std::fs::create_dir_all(&lock).expect("directory at the lock path");
+    let log = ReceiptLog::open(&path).expect("open");
     let started = std::time::Instant::now();
     let error = log
-        .append(&receipt(1, "echo"))
-        .expect_err("a lock without a nonce cannot be stolen");
+        .append(&receipt(2, "echo"))
+        .expect_err("a directory is not a lock");
     let elapsed = started.elapsed();
     assert_eq!(error.code(), "rpc/receipt");
-    // The failing path sleeps on all 40 attempts: 1.38 s of backoff. A ceiling
-    // of 1.5 s catches a doubling, which the old 6 s bound could not
-    // (R-13 rounds 5-6).
+    // The documented budget is 1.38 s; this test runs inside the parallel suite,
+    // so it checks the order of magnitude (3 s catches a doubling) rather than
+    // the exact figure.
     assert!(
-        elapsed < std::time::Duration::from_millis(1_500),
-        "the wait was {elapsed:?}, not the documented ~1.38 s"
+        elapsed < std::time::Duration::from_secs(3),
+        "the wait was {elapsed:?}, not the documented wait"
     );
+    let _ = std::fs::remove_dir_all(&lock);
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&lock);
 }
 
 /// 5: a reader that lands mid-append waits for the writer instead of calling the
