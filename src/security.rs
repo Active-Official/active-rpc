@@ -25,24 +25,33 @@ pub const SECRET_MARKER: &str = "***SECRET***";
 /// that can never leave the kernel (R-07 round 7, #4).
 pub fn active_value_too_deep(value: &active_core::Value, limit: usize) -> bool {
     use active_core::Value as ActiveValue;
-    let mut work = vec![(value, 1usize)];
+    // The root sits at depth 0, the depth the conversion gives it: rooting at
+    // 1 refused a wire-legal 64-container value (R-16 round 7, L-3).
+    let mut work = vec![(value, 0usize)];
     while let Some((value, depth)) = work.pop() {
-        if depth > limit {
-            return true;
-        }
         match value {
+            // The conversion replaces a container at the cap with `Null`, so a
+            // value that would reach that point is refused here instead of
+            // being silently truncated.
             ActiveValue::Array(items) => {
+                if depth >= limit {
+                    return true;
+                }
                 work.extend(items.iter().map(|item| (item, depth.saturating_add(1))));
             }
             ActiveValue::Table(entries) => {
+                if depth >= limit {
+                    return true;
+                }
                 work.extend(
                     entries
                         .iter()
                         .map(|(_, item)| (item, depth.saturating_add(1))),
                 );
             }
-            // These two convert into a synthetic map, one level deeper than
-            // the Active node itself (round 17, F5).
+            // These two convert into a synthetic map at the Active node's own
+            // depth, and the map's entries are one level below it (round 17,
+            // F5): a duration at the cap would need a child past the wire's.
             ActiveValue::DurationMs(_) | ActiveValue::Quantity(..)
                 if depth.saturating_add(1) > limit =>
             {
@@ -81,13 +90,13 @@ pub fn from_active_value(value: &active_core::Value) -> Value {
     let mut out: Vec<Value> = Vec::new();
     while let Some(frame) = work.pop() {
         match frame {
-            Frame::Value(ActiveValue::Array(items), depth) if depth > LIMIT => {
+            Frame::Value(ActiveValue::Array(items), depth) if depth >= LIMIT => {
                 // Past the ceiling the shape is truncated to the cap rather
                 // than carried deeper: the wire cannot express it either.
                 out.push(Value::Null);
                 let _ = items;
             }
-            Frame::Value(ActiveValue::Table(entries), depth) if depth > LIMIT => {
+            Frame::Value(ActiveValue::Table(entries), depth) if depth >= LIMIT => {
                 out.push(Value::Null);
                 let _ = entries;
             }
@@ -259,6 +268,15 @@ pub fn redact_value(value: Value) -> Value {
 /// One implementation for [`redact_value`] and the domain provider: two would
 /// drift, and the one that drifted would be the leak.
 pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
+    let module =
+        active_infinity::decode(bytes).map_err(|error| Error::Payload(error.code().to_string()))?;
+    if !module_holds_secret(&module) {
+        // Nothing to rewrite. The bytes go back untouched, so a non-secret
+        // streamed module keeps its flag and its identity (R-16 round 7, L-4),
+        // after the canonical proof the egress owes the caller (L-2).
+        check_module_payload(bytes)?;
+        return Ok(bytes.to_vec());
+    }
     // One implementation, in the library that holds the secret heap: it
     // canonicalizes first (so the codec can refuse free text or a binary copy
     // that carries a secret literal, and can redact the metadata while the
@@ -267,6 +285,17 @@ pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
     // Active RPC cannot see an `Inode::Secret`'s bytes, so a local pass would
     // miss every copy the library itself redacts in its projections.
     let redacted = active_infinity::interop::redact_image(bytes)
+        .map_err(|error| Error::Payload(error.code().to_string()))?;
+    // Provenance names the pre-redaction image: `parent` is its content
+    // address and a `Hash` entry is another one. The library drops an entry
+    // that *is* a secret literal, not the address of the secret-bearing
+    // image, and either address is an offline equality oracle over the secret
+    // heap. The whole provenance goes, exactly as the domain provider does on
+    // every secret-bearing reply (R-16 round 7, M-1; R-07 round 13, H2).
+    let mut module = active_infinity::decode(&redacted)
+        .map_err(|error| Error::Payload(error.code().to_string()))?;
+    module.set_provenance(None);
+    let redacted = active_infinity::encode(&module)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     check_module_payload(&redacted)?;
     Ok(redacted)
@@ -317,13 +346,18 @@ fn module_has_secret(bytes: &[u8]) -> Result<bool> {
         // closed (R-16 round 5, #1).
         return Ok(claims_infinity_image(bytes));
     };
-    Ok((0..module.node_count()).any(|index| {
+    Ok(module_holds_secret(&module))
+}
+
+/// True when a decoded module holds a node marked secret.
+fn module_holds_secret(module: &active_infinity::InfinityModule) -> bool {
+    (0..module.node_count()).any(|index| {
         module
             .get(active_infinity::NodeId(index as u32))
             // A node the decoder counts but cannot materialise cannot be
             // proven secret-free, so it fails closed (round 3, F-1).
             .is_none_or(|node| node.is_secret())
-    }))
+    })
 }
 
 /// True when a module image carries a structural secret.
@@ -345,10 +379,16 @@ pub fn is_infinity_image(bytes: &[u8]) -> bool {
     active_infinity::decode(bytes).is_ok()
 }
 
-/// Validate an outgoing module payload before it is handed to a transport or a
-/// tool.
+/// Prove an outgoing module payload is a canonical image before it is handed
+/// to a transport or a tool.
+///
+/// `validate` alone proves structure and the stored hash, not the canonical
+/// form: the decoder drops an unreferenced string, blob or type entry, so two
+/// byte strings can name one module, and a receiver's install gate
+/// (`ModuleProvider::install_canonical_image`) refuses what the weaker check
+/// passed. The proof here is the one the receiver applies (R-16 round 7, L-2).
 pub fn check_module_payload(bytes: &[u8]) -> Result<()> {
-    active_infinity::validate(bytes)
+    active_infinity::validate_canonical(bytes, active_infinity::Limits::default())
         .map(|_| ())
         .map_err(|error| Error::Payload(error.code().to_string()))
 }

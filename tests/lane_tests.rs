@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use active_rpc::cap::CapAttrs;
-use active_rpc::channel::{Direction, MAX_QUEUED_BYTES};
+use active_rpc::channel::{Channel, Direction, MAX_QUEUED_BYTES, MESSAGE_OVERHEAD};
 use active_rpc::kernel::{Provider, MAX_OBJECT_NAME_BYTES};
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::{Agent, Budget, LaneId, PromiseHandle};
@@ -109,9 +109,10 @@ fn a_publish_refused_on_a_full_channel_charges_nothing() {
         )
         .expect("lane");
     // Fill the channel to its byte ceiling with one message.
-    // A text value costs its tag, a length prefix and its bytes: the message
-    // fills the channel exactly.
-    let filler = Value::text("x".repeat(MAX_QUEUED_BYTES as usize - 5));
+    // A text value costs its tag, a length prefix and its bytes, and the queue
+    // charges the message record too (R-17 round 3): the message fills the
+    // channel exactly.
+    let filler = Value::text("x".repeat(MAX_QUEUED_BYTES as usize - 5 - MESSAGE_OVERHEAD as usize));
     agent
         .send(lane, channel, filler, &[])
         .expect("the ceiling itself fits");
@@ -685,7 +686,8 @@ fn channel_bytes_are_exact() {
         .expect("channel");
     agent.subscribe(lane, channel).expect("subscribe");
     let value = Value::text("payload");
-    let size = value.wire_size();
+    // The counter charges the queued record, not only its payload (R-17 round 3).
+    let size = Channel::message_bytes(&value, &[], None);
     agent.send(lane, channel, value, &[]).expect("send");
     assert_eq!(agent.channel(channel).expect("channel").queued_bytes, size);
     agent.recv(lane, channel).expect("recv").expect("message");

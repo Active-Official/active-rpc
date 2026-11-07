@@ -288,17 +288,19 @@ impl Provider for Reentrant {
 #[test]
 fn a_provider_may_call_the_agent_from_methods() {
     let agent = Agent::with_secret([0x42; 32]);
-    let slot = Rc::new(RefCell::new(None));
+    // The surface is described at registration, with no kernel borrow held, so
+    // a provider may consult the agent there (R-17 round 3, M-2).
+    let slot = Rc::new(RefCell::new(Some(agent.clone())));
     let lanes = Rc::new(Cell::new(0));
     let provider = agent.register(Box::new(Reentrant {
         agent: Rc::clone(&slot),
         lanes: Rc::clone(&lanes),
     }));
-    *slot.borrow_mut() = Some(agent.clone());
+    assert_eq!(lanes.get(), 1, "the provider ran with no borrow held");
     let bytes = agent.intro().expect("intro with a re-entrant provider");
     assert!(!bytes.is_empty());
-    assert_eq!(lanes.get(), 1, "the provider ran with no borrow held");
-    // The provider is still registered: the table was put back.
+    assert_eq!(lanes.get(), 1, "intro reads the captured surface");
+    // The provider is still registered.
     assert!(agent.mint(provider, 0, CapAttrs::new(&["ping"])).is_ok());
 }
 

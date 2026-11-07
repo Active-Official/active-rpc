@@ -437,7 +437,10 @@ transport must preserve when it forwards one:
   `recv_topic(lane, channel, topic)` require the lane to be in the channel's
   subscriber set; a lane that is not gets `rpc/unknown-channel`, the same answer
   as a missing channel. `Agent::channel(id)` returns counts and names only, never
-  a queued payload or a transferred capability id.
+  a queued payload or a transferred capability id; the host that holds `&Agent`
+  can see a channel's existence and counts for any id, and no envelope path can.
+  The queue's byte counters charge the stored message record, so the payload
+  ceilings are also memory ceilings.
 - **A topic is bounded text.** 1..=128 bytes, no control characters, and none of
   the characters that reorder or hide rendered text (U+2028/U+2029, bidi
   controls, zero-width and tag characters), checked at the grant, at publish and

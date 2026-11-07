@@ -123,16 +123,36 @@ pub const MAX_SETTLED_BYTES: usize = 64 << 20;
 pub const MAX_EVENTS: usize = 16_384;
 
 /// A provider of capabilities: a module, a tool, a peer.
+///
+/// The kernel captures a provider's surface — its name, the methods it answers
+/// and which of those mutate — once, at [`Agent::register`], with no kernel
+/// borrow held. These three methods are never called again on the dispatch,
+/// export, restore or introspection paths. A provider that consults the agent
+/// while it describes itself therefore cannot panic the kernel with a
+/// re-borrow, and the advertised surface cannot disagree with the surface
+/// dispatch enforces (R-17 round 3, M-1 and M-2). A provider whose surface
+/// changes after registration must be registered again.
 pub trait Provider {
-    /// Stable adapter name.
+    /// Stable adapter name. Captured once, at registration.
     fn name(&self) -> &'static str;
-    /// Methods this provider answers (introspection).
+    /// Methods this provider answers.
+    ///
+    /// Captured once, at registration: this set is the surface dispatch,
+    /// [`Agent::export_capability`], [`Agent::restore_capability`] and
+    /// [`Agent::intro`] read afterwards, so the list must be final here.
     fn methods(&self) -> Vec<String>;
-    /// Whether this provider answers `method`.
+    /// Whether this provider answers `method`, for adapters that query a
+    /// provider directly.
+    ///
+    /// The kernel reads the surface captured at registration instead of calling
+    /// this on a hot path, so an override can answer more cheaply but cannot
+    /// widen what dispatch admits.
     fn has_method(&self, method: &str) -> bool {
         self.methods().iter().any(|name| name == method)
     }
     /// Whether `method` mutates provider state (refused on read-only caps).
+    ///
+    /// Captured once, at registration, for every method in [`Self::methods`].
     fn mutating(&self, method: &str) -> bool;
     /// Invoke a method on `object`.
     fn invoke(&mut self, object: u64, call: &Call) -> Result<Response>;
@@ -481,6 +501,12 @@ pub struct Kernel {
     /// the receipt key without being handed the authority that mints ids.
     receipt_key: [u8; 32],
     providers: BTreeMap<ProviderId, Box<dyn Provider>>,
+    /// The surface each provider declared at registration.
+    ///
+    /// Kept apart from `providers`, which is temporarily emptied for a
+    /// dispatch: the facts are stable for the life of the kernel and are what
+    /// the call, export, restore and introspection paths read.
+    facts: BTreeMap<ProviderId, ProviderFacts>,
     caps: BTreeMap<CapId, CapRecord>,
     meters: BTreeMap<CapId, BudgetMeter>,
     promises: BTreeMap<PromiseId, PromiseRecord>,
@@ -654,24 +680,41 @@ impl CapControl for HandleControl {
 /// Shared kernel cell.
 pub type KernelCell = Rc<RefCell<Kernel>>;
 
-/// Puts the provider table back when it is dropped, on the normal path and on
-/// unwind.
+/// The provider surface the kernel enforces, captured once at registration.
 ///
-/// `Agent::intro` takes the table out so provider code runs with no kernel
-/// borrow held; a panic inside that code must not leave the kernel with no
-/// providers.
-struct ProviderTableGuard {
-    cell: KernelCell,
-    table: Option<BTreeMap<ProviderId, Box<dyn Provider>>>,
+/// Dispatch, export, restore and introspection read this snapshot instead of
+/// calling back into the provider, so provider code never runs while a kernel
+/// borrow is held (R-17 round 3, M-2). It also makes `intro()` independent of
+/// which providers are checked out for a dispatch at that moment, and cheaper:
+/// one capture per provider instead of a method-table walk per admitted call.
+#[derive(Debug)]
+struct ProviderFacts {
+    name: String,
+    methods: BTreeSet<String>,
+    mutating: BTreeSet<String>,
 }
 
-impl Drop for ProviderTableGuard {
-    fn drop(&mut self) {
-        if let Some(table) = self.table.take() {
-            if let Ok(mut kernel) = self.cell.try_borrow_mut() {
-                kernel.providers = table;
-            }
+impl ProviderFacts {
+    fn capture(provider: &dyn Provider) -> Self {
+        let methods = provider.methods();
+        let mutating = methods
+            .iter()
+            .filter(|method| provider.mutating(method.as_str()))
+            .cloned()
+            .collect();
+        Self {
+            name: provider.name().to_string(),
+            methods: methods.into_iter().collect(),
+            mutating,
         }
+    }
+
+    fn has_method(&self, method: &str) -> bool {
+        self.methods.contains(method)
+    }
+
+    fn mutates(&self, method: &str) -> bool {
+        self.mutating.contains(method)
     }
 }
 
@@ -867,6 +910,7 @@ impl Agent {
             secret,
             receipt_key: crate::receipts::derive_receipt_key(&secret),
             providers: BTreeMap::new(),
+            facts: BTreeMap::new(),
             caps: BTreeMap::new(),
             meters: BTreeMap::new(),
             promises: BTreeMap::new(),
@@ -932,29 +976,19 @@ impl Agent {
     /// The module lists provider names, granted methods and the default budget
     /// ceilings. It carries no capability ids, arguments or secrets, and its
     /// bytes are deterministic for a given provider table.
+    ///
+    /// It reads the surface captured at registration, so no provider code runs
+    /// here: an introspection cannot re-enter the kernel or destroy queued work,
+    /// and it lists every registered provider even while one is checked out for
+    /// a dispatch (R-17 round 3, M-1 and M-2).
     pub fn intro(&self) -> Result<Vec<u8>> {
-        // Provider code runs with no kernel borrow held, exactly as dispatch
-        // arranges it: a provider that holds an `Agent` clone and calls back into
-        // the kernel would otherwise panic on a re-borrow, and one that calls
-        // `intro()` again would recurse to a stack overflow.
-        let table = std::mem::take(&mut self.cell.borrow_mut().providers);
-        let guard = ProviderTableGuard {
-            cell: Rc::clone(&self.cell),
-            table: Some(table),
-        };
-        let surface: Vec<(String, Vec<String>)> = guard
-            .table
-            .as_ref()
-            .map(|table| {
-                table
-                    .values()
-                    .map(|provider| (provider.name().to_string(), provider.methods()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // The guard puts the table back before the module is built, so an error
-        // from `intro::build` never leaves the kernel without providers.
-        drop(guard);
+        let surface: Vec<(String, Vec<String>)> = self
+            .cell
+            .borrow()
+            .facts
+            .values()
+            .map(|facts| (facts.name.clone(), facts.methods.iter().cloned().collect()))
+            .collect();
         crate::intro::build(
             &format!("active-rpc/{}", crate::VERSION),
             &surface,
@@ -1074,10 +1108,17 @@ impl Agent {
     }
 
     /// Register a provider and return its id.
+    ///
+    /// The provider's surface is captured here, before the kernel is borrowed:
+    /// `name`, `methods` and `mutating` run with no borrow held, so a provider
+    /// that consults the agent while it describes itself is safe (R-17 round 3,
+    /// M-2).
     pub fn register(&self, provider: Box<dyn Provider>) -> ProviderId {
+        let facts = ProviderFacts::capture(provider.as_ref());
         let mut kernel = self.cell.borrow_mut();
         let id = ProviderId(kernel.next_provider);
         kernel.next_provider += 1;
+        kernel.facts.insert(id, facts);
         kernel.providers.insert(id, provider);
         id
     }
@@ -1177,9 +1218,9 @@ impl Agent {
             return Err(Error::Revoked(cap_token(cap.id())));
         }
         let provider_name = kernel
-            .providers
+            .facts
             .get(&record.provider)
-            .map(|provider| provider.name().to_string())
+            .map(|facts| facts.name.clone())
             .ok_or_else(|| Error::persistence("the provider is no longer registered"))?;
         let key = kernel
             .record_key
@@ -1463,9 +1504,9 @@ impl Agent {
         let provider = {
             let kernel = self.cell.borrow();
             let mut matches = kernel
-                .providers
+                .facts
                 .iter()
-                .filter(|(_, provider)| provider.name() == record.provider)
+                .filter(|(_, facts)| facts.name == record.provider)
                 .map(|(id, _)| *id);
             let first = matches
                 .next()
@@ -1799,8 +1840,11 @@ impl Agent {
     ///
     /// Binds the capability to that peer's authenticated fingerprint and returns
     /// the descriptor to send over the transport. A capability already bound to
-    /// a different peer is refused rather than rebound, so introduction can
-    /// never move authority between principals.
+    /// a different peer is refused rather than rebound, so a peer can never move
+    /// authority between principals. The *owning* handle may later rotate the
+    /// binding with [`Agent::reintroduce_to`]; that is the granting principal
+    /// withdrawing and re-placing its own grant, not a second introduction
+    /// (ADR-0017, R-17 round 3, L-2).
     pub fn introduce_to(
         &self,
         cap: &CapHandle,
@@ -2636,12 +2680,17 @@ impl Agent {
         // The same classes the inline recorder in `call_with_origin_payload`
         // counts: a refusal routed through here must not be invisible in the
         // metrics an operator reads (R-15 round 3, #3).
-        if let (Error::ToolPolicy(reason), Some(cap_id)) = (error, cap) {
+        // The tool class is counted whether or not the refusal names a
+        // capability; the event carries the capability, so it is pushed only when
+        // there is one (R-15 round 5, #5).
+        if let Error::ToolPolicy(reason) = error {
             kernel.metrics.tool_refusals = kernel.metrics.tool_refusals.saturating_add(1);
-            kernel.push_event(Event::ToolRefused {
-                cap: cap_id,
-                reason: (*reason).to_string(),
-            });
+            if let Some(cap_id) = cap {
+                kernel.push_event(Event::ToolRefused {
+                    cap: cap_id,
+                    reason: (*reason).to_string(),
+                });
+            }
         }
         // Backpressure is *not* counted here: `send_inner`/`publish_inner` count
         // it where the window is found, and both are wrapped by `note_refusal`,
@@ -2834,7 +2883,7 @@ impl Agent {
         }
         kernel.push_event(Event::ChannelSend { channel, sequence });
         for id in cap_ids {
-            kernel.metrics.transfers += 1;
+            kernel.metrics.transfers = kernel.metrics.transfers.saturating_add(1);
             kernel.push_event(Event::CapTransferred { cap: id, channel });
         }
         Ok(sequence)
@@ -3377,18 +3426,18 @@ impl Agent {
                 method: method.to_string(),
             });
         }
-        let provider = kernel
-            .providers
-            .get(&record.provider)
-            .ok_or(Error::Provider {
-                code: "rpc/provider".to_string(),
-            })?;
-        if !provider.has_method(method) {
+        // The captured surface, not the provider: this runs under the kernel
+        // borrow, and a provider whose `methods()` consults the agent must not
+        // see `RefCell already borrowed` (R-17 round 3, M-2).
+        let facts = kernel.facts.get(&record.provider).ok_or(Error::Provider {
+            code: "rpc/provider".to_string(),
+        })?;
+        if !facts.has_method(method) {
             return Err(Error::MethodNotGranted {
                 method: method.to_string(),
             });
         }
-        if record.attrs.read_only && provider.mutating(method) {
+        if record.attrs.read_only && facts.mutates(method) {
             return Err(Error::ReadOnly);
         }
         let effective = record.attrs.budget.intersect(&lane_budget);
@@ -3800,7 +3849,14 @@ impl Agent {
                     record.wall_clock,
                     record.attrs.bound_to,
                 ),
-                None => return Err(Error::UnknownCapability(cap_token(job.cap))),
+                None => {
+                    // The capability a queued promise names is gone (its last
+                    // handle was dropped): a peer answering it must see the
+                    // refusal on the tape too (R-15 round 5, #1).
+                    let error = Error::UnknownCapability(cap_token(job.cap));
+                    Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                    return Err(error);
+                }
             };
             if revoked {
                 Self::record_refusal_in(
@@ -4810,13 +4866,22 @@ impl Agent {
     }
 
     /// Drain drop notifications recorded by one provider.
+    ///
+    /// The provider is taken out of the registry for the duration, so an
+    /// implementation that consults the agent does not re-borrow the kernel
+    /// (R-17 round 3, M-2). While a dispatch has it checked out there is
+    /// nothing to drain and the answer is empty.
     pub fn take_drops(&self, provider: ProviderId) -> Vec<(u64, CapId)> {
+        let Some(mut provider_record) = self.cell.borrow_mut().providers.remove(&provider) else {
+            return Vec::new();
+        };
+        let drops = provider_record.take_drop_notifications();
         self.cell
             .borrow_mut()
             .providers
-            .get_mut(&provider)
-            .map(|provider| provider.take_drop_notifications())
-            .unwrap_or_default()
+            .entry(provider)
+            .or_insert(provider_record);
+        drops
     }
 
     /// Live dependents of a promise, for operators and tests.
@@ -5176,7 +5241,7 @@ impl Agent {
             // to advance the counter and emit `BatchDispatched` before failing
             // every job (round 4, #6).
             if kernel.providers.contains_key(&provider_id) {
-                kernel.metrics.round_trips += 1;
+                kernel.metrics.round_trips = kernel.metrics.round_trips.saturating_add(1);
                 kernel.now_ms = if kernel.wall_clock {
                     kernel.now_ms.max(wall_now_ms())
                 } else {
@@ -5523,7 +5588,12 @@ impl Agent {
             // method mutates decides how a post-provider refusal is reported:
             // a provider that ran may already have changed its state
             // (round 31, F1).
-            let mutating = guard.provider_mut().mutating(&job.call.method);
+            let mutating = self
+                .cell
+                .borrow()
+                .facts
+                .get(&provider_id)
+                .is_some_and(|facts| facts.mutates(&job.call.method));
             let mut provider_succeeded = false;
             let outcome = match failure {
                 Some(error) => Err(error),

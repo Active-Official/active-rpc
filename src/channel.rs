@@ -32,10 +32,19 @@ pub const MAX_QUEUED_PER_CHANNEL: usize = 4_096;
 /// actually has to pay for.
 pub const MAX_QUEUED_BYTES: u64 = 64 << 20;
 
-/// Wire size of one queued message: payload, transferred ids and topic name.
+/// Bytes one queued [`Message`] costs before its payload.
+///
+/// The record stores the payload inline and carries a capability vector, an
+/// optional topic and a sequence number, so even an empty message occupies one
+/// whole record. Charging payload bytes alone let a 1-byte flood hold roughly a
+/// hundred times the memory the byte ceilings promise (R-17 round 3, L-1).
+pub const MESSAGE_OVERHEAD: u64 = std::mem::size_of::<Message>() as u64;
+
+/// Bytes one queued message is charged: its record, payload, transferred ids
+/// and topic name.
 fn queued_size(payload: &Value, caps: &[CapId], topic: Option<&str>) -> u64 {
-    payload
-        .wire_size()
+    MESSAGE_OVERHEAD
+        .saturating_add(payload.wire_size())
         .saturating_add((caps.len() as u64).saturating_mul(16))
         .saturating_add(topic.map_or(0, |name| name.len() as u64))
 }

@@ -29,8 +29,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-3: round 3 found 3 mediums and 4 lows; all fixed except the opaque-module residual, accepted in `SECURITY.md` | 21 fixed / 0 rejected / 2 noted (no store wired by default; virtual-epoch deadline; opaque module bytes) | this commit |
-| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs` | rounds 1-2: 11 + 14 findings fixed (2 design-level documented) | 25 fixed / 0 rejected / 0 open (2 recorded: publisher identity, host authority) | `190e9c9` |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-7: round 7 found 1 medium and 5 lows, all fixed or documented; r8 and r9 must be clean to close | 27 fixed / 0 rejected / 2 noted (no store wired by default; virtual-epoch deadline; opaque module bytes) | this commit |
+| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs` | rounds 1-3: round 3 found 2 mediums and 3 lows, all fixed; r4 and r5 must be clean to close | 30 fixed / 0 rejected / 0 open (2 recorded: publisher identity, host authority) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
 | R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
@@ -49,6 +49,45 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-16 security helpers - 2026-11-06 (round 7)
+
+Reviewer: DeepSeek (`deepseek-flash`) through the direct API, `xhigh`, read-only
+at `b6c8295`. Round-6 claims 1, 4 and 5 held; claims 2 and 3 did not.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M-1 | medium | `redact_value` returned the raw provenance content address of a secret-bearing image: `redact_image` drops a metadata entry that *is* a secret literal, not the address of the image that holds the secret, and a hostile provider's module reply handed a redacting caller an offline equality oracle | **fixed**: `redact_module` decodes the redacted image, `set_provenance(None)`, re-encodes and re-checks, exactly as the domain provider does on every secret-bearing reply; `security_round7_tests::redaction_drops_the_provenance_of_a_secret_bearing_image`. Negative control: without the drop, the test fails on "the parent content address survived redaction" |
+| L-1 | low | the conversion stopped one level short: the round-6 test accepted 64 or 65 containers, so an off-by-one that emitted a value the wire refuses passed | **fixed**: `depth >= LIMIT` restored; `security_round5_tests::a_deep_active_value_converts_without_recursing` pins `depth == MAX_VALUE_DEPTH` and encodes the result |
+| L-2 | low | the wired egress proved `decode`, not canonical form, so a decodable non-canonical image crossed a boundary whose receiver's install gate refuses it; the round-6 branch was dead code | **fixed**: `check_module_payload` is `validate_canonical` with the default limits, the proof `ModuleProvider::install_canonical_image` applies; `a_non_canonical_image_is_refused_by_the_egress` builds `mark_canonical: false` bytes that `validate` accepts and the egress refuses |
+| L-3 | low | `active_value_too_deep` rooted at depth 1, so a wire-legal 64-container evaluator value was refused | **fixed**: the walk roots at 0, refuses a container at the cap, and keeps the synthetic-map rule (`depth + 1 > limit`); `the_depth_walk_agrees_with_the_conversion` and `domain_round10_tests::the_synthetic_level_counts_against_the_ceiling` (now 63 tables succeed and 64 are refused) |
+| L-4 | low | redaction re-encoded a secret-free module, dropping `FLAG_STREAMED` and changing an identity nothing had to change | **fixed**: a secret-free image is returned byte-identical after the canonical proof; `a_secret_free_image_keeps_its_bytes_under_redaction` |
+| L-5 | low | the egress decoded the same module up to three times | **partly fixed**: the secret-free early return removes one pass; the canonical proof and the secret walk remain two decodes by design |
+
+Gate: `scripts/local_gate.sh --no-msrv` green; `cargo test --all-features` green
+on both feature sets; fmt and doc clean.
+
+### R-17 introduction and topics - 2026-11-06 (round 3)
+
+Reviewer: DeepSeek (`deepseek-flash`) through the direct API, `xhigh`, read-only
+at `b6c8295`. Verdict **NOT CLEAN**: two mediums, both in the provider
+re-entrancy story, plus three lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M-1 | medium | `intro()` emptied the provider table while running `methods()` on every provider: a re-entrant `run()` failed every queued call (`rpc/provider`), a `register()` from `methods()` was overwritten and the caller kept a dangling id, and a nested `intro()` from `invoke()` returned a partial surface | **fixed at the root**: the surface is captured once at registration (`ProviderFacts`), so `intro()` runs no provider code and never takes the table out; `ProviderTableGuard` and the dispatch flag it saved are gone. `intro_round3_tests::{an_intro_runs_no_provider_code_and_keeps_queued_work, an_intro_from_a_provider_lists_the_whole_surface}`. Negative control: restoring `dispatching = false` for the introspection fails the queued-call assertion with `Provider { code: "rpc/provider" }` |
+| M-2 | medium | `call_inner` called `provider.has_method`/`mutating()` while holding `borrow_mut`, so a provider that consults the agent from `methods()` panicked an ordinary `call()` (`RefCell already borrowed`) — the contract the round-2 test blessed was false on the call path; `export`/`restore` called `name()` under a borrow too | **fixed**: the same facts cache serves dispatch, export, restore and introspection, and `Provider::name/methods/mutating` are documented as captured at registration, with no kernel borrow held. `a_call_does_not_panic_when_the_provider_methods_consults_the_agent`, `the_declared_surface_is_the_one_enforced`, `the_mutating_facts_are_the_ones_enforced`. `take_drops` takes the provider out for the drain (`a_drop_drain_does_not_reborrow_the_kernel`). Negative control: re-adding the under-borrow `has_method` reproduces the panic |
+| L-1 | low | the channel byte ceiling charged a 1-byte message as 1 byte, so the "64 MiB"/"256 MiB" ceilings were ~100x optimistic in records | **fixed**: `channel::MESSAGE_OVERHEAD` (`size_of::<Message>()`) is part of `queued_size`, which every charge and release path already uses. `channel_round3_tests::{a_queued_message_is_charged_its_record, the_kernel_byte_ceiling_binds_before_the_structural_worst_case}`; `lane_tests::channel_bytes_are_exact` pins `Channel::message_bytes` |
+| L-2 | low | ADR-0017 said the introduction binding has no `unbind`, while `reintroduce_to` is an owner-side rotation of the same binding | **fixed in the docs**: ADR-0017 and `introduce_to`'s rustdoc say the binding is permanent for the recipient and revocable by the owning handle, which is the principal that granted it |
+| L-3 | low | "not a membership oracle" covered `recv` only; `channel(id)` and `publish` tell the host more | **fixed in the docs**: ADR-0024, ADR-0020 and `wire.md` scope the claim to a lane's receive path and state that the host that holds `&Agent` sees existence and counts; `the_host_sees_a_channel_a_lane_may_not_read` |
+
+API note: `Provider`'s surface (name, methods, mutating) is now read once, at
+`register`; a provider whose surface changes afterwards must be registered again.
+`has_method` stays for adapters that query a provider directly and can no longer
+widen what dispatch admits.
+
+Gate: `scripts/local_gate.sh --no-msrv` green; `cargo test --all-features` green
+on both feature sets; fmt and doc clean.
 
 ### Fuzz nightly red - 2026-11-02 (run 41437025560, `fuzz_arp1_frame`)
 

@@ -59,13 +59,24 @@ fn a_deep_active_value_converts_without_recursing() {
             break;
         }
     }
-    // The wire rule refuses a container deeper than the cap, so a value at
-    // exactly the cap survives (R-16 round 6, #3).
-    assert!(
-        depth <= active_rpc::wire::MAX_VALUE_DEPTH + 1,
-        "the conversion is bounded by the wire cap: {depth}"
+    // The wire refuses a container at the cap's depth, so the conversion stops
+    // exactly at `MAX_VALUE_DEPTH` (R-16 round 7, L-1: an off-by-one here emits
+    // a value the wire cannot encode).
+    assert_eq!(
+        depth,
+        active_rpc::wire::MAX_VALUE_DEPTH,
+        "the conversion stops exactly at the wire cap"
     );
-    assert!(depth > 10, "the conversion kept the nesting: {depth}");
+    // And the result encodes: the point of the exact bound.
+    let envelope = active_rpc::wire::Envelope::request(
+        1,
+        "value",
+        vec![active_rpc::value::Arg::Value(converted)],
+    );
+    assert!(
+        envelope.encode().is_ok(),
+        "the converted value is within what the wire accepts"
+    );
 }
 
 /// A `Response::Module` prints its length, never its bytes (R-16 round 5, #2).

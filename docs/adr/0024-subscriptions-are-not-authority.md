@@ -35,9 +35,14 @@ a refusal rather than a leak. It does not claim more than that.
    a "receive from an arbitrary channel" message.
 3. **The advisory gate stays.** `recv` from an unsubscribed lane answers
    `rpc/unknown-channel`, the same answer as an id that does not exist, so the
-   check is not an oracle either. `unsubscribe` exists so a lane can withdraw
-   read access from a channel it no longer needs, and `destroy_lane` and
-   `destroy_channel` clear the relevant halves.
+   receive path is not a membership oracle for a lane. The host is a different
+   principal: it already holds `&Agent`, and `Agent::channel(id)` returns a
+   channel's existence, name, counts and subscriber total for any id, while
+   `publish` distinguishes a missing channel from a closed one. That is inside
+   the `&Agent` trust boundary (point 1) and no envelope path reaches it.
+   `unsubscribe` exists so a lane can withdraw read access from a channel it no
+   longer needs, and `destroy_lane` and `destroy_channel` clear the relevant
+   halves.
 4. **A capability-mediated receive would be a new feature, not a fix.** It would
    need: a receive capability naming (channel, filter), a changed wire surface so
    a remote peer can be granted one, and a story for what a capability means

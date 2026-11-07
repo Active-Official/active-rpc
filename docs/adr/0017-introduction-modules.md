@@ -50,10 +50,18 @@ Table {
 - **Names are validated.** A peer, provider or method name is 1..=1024 bytes and
   free of control characters, at the same boundary as a capability method name:
   every one of them reaches a module, a fingerprint and a log line.
-- **The binding is one-way, by design.** `introduce_to` writes `bound_to` into
-  the live records of the subtree, including the root, so after an introduction
-  the local kernel can no longer use the capability it handed over. That is the
-  intent — the capability now belongs to that peer — but it is irreversible and
-  there is no `unbind`, so an embedder that wants to keep its own authority
+- **The binding is one-way for the recipient, and revocable by the owner.**
+  `introduce_to` writes `bound_to` into the live records of the subtree,
+  including the root, so after an introduction the local kernel can no longer
+  use the capability it handed over. That is the intent — the capability now
+  belongs to that peer — and the recipient can never rebind it: a second
+  `introduce_to` to a different peer is refused. The owning handle can end the
+  binding: `reintroduce_to` rotates the capability to a peer the owner names,
+  tombstones the old peer's unrestored records and carries its queued work to
+  the new peer. That is a rotation, not a second introduction, and it needs the
+  owner's handle plus knowledge of the old fingerprint. `introduce_to`'s
+  "authority never moves between principals" is therefore about peers acting
+  on each other; the owner remains the principal that may withdraw and
+  re-place its own grant. An embedder that wants to keep its own authority
   should attenuate a child and introduce that. A future revision may return a
   bound child instead; it is a breaking change to the call's semantics.

@@ -1096,12 +1096,30 @@ fn evaluator_limit_dimensions_are_preserved() {
 }
 
 /// The synthetic level of a duration counts against the wire ceiling
-/// (round 18, #7).
+/// (round 18, #7; the walk roots at 0, R-16 round 7, L-3).
 #[test]
 fn the_synthetic_level_counts_against_the_ceiling() {
+    // A duration at depth 63 becomes a map there whose entries sit at 64: the
+    // wire accepts it, so the evaluation must succeed.
+    let mut shallow = InfinityModule::new();
+    let mut current = shallow.push(Inode::DurationMs(7));
+    for index in 0..63 {
+        current = shallow.push(Inode::Table {
+            fields: vec![(format!("f{index}"), current)],
+        });
+    }
+    shallow.set_root(Some(current));
+    let (agent, cap, lane) = install(shallow, &["evaluate"], None, false);
+    let promise = agent
+        .call(lane, &cap, "evaluate", Vec::new())
+        .expect("queued");
+    agent.run();
+    promise.value().expect("a duration at 63 is wire-encodable");
+
+    // One level deeper the map's entries would sit past the ceiling.
     let mut module = InfinityModule::new();
     let mut current = module.push(Inode::DurationMs(7));
-    for index in 0..63 {
+    for index in 0..64 {
         current = module.push(Inode::Table {
             fields: vec![(format!("f{index}"), current)],
         });

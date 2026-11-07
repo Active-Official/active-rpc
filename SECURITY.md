@@ -78,7 +78,11 @@ capability id at rest (it is a bearer token).
 - Secret material is represented by `Value::Secret`, never by bytes. The egress
   gates (`assert_no_secret_material`, `assert_no_structural_secrets`) inspect a
   `Value::Module` when it decodes as an Active Infinity image: a secret node is
-  refused, and a decodable image must also pass the codec's `validate`. Bytes
+  refused, and a decodable image must also pass the codec's canonical proof
+  (`validate_canonical`), the same proof a receiver's install gate applies. A
+  redacted secret-bearing image also drops its whole provenance: the parent
+  content address in it is an offline equality oracle over the secret heap
+  (R-16 round 7). Bytes
   that are not an image are opaque by declaration (a WASM guest's binary output,
   a provider's blob): the value model cannot tell them from arbitrary data, so a
   provider that puts *its own* secret bytes in opaque output is a provider

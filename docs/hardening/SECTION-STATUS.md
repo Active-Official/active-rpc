@@ -27,8 +27,8 @@ Updated 2026-11-06 at `cf5f969`.
 | R-13 | receipts | 8 | open | r7 fixed four mediums; r8 fixed two mediums and five lows (lock ownership, one liveness predicate, quarantine steal, lossy lock parse); r9 needed for a first clean round |
 | R-14 | wasm tools | 5 | **closed** | r3's medium was refuted with a test; r4 and r5 CLEAN |
 | R-15 | observability | 5 | **closed** | r2's high and mediums fixed; r4 and r5 CLEAN |
-| R-16 | security helpers | 6 | open | r4 CLEAN, r5 two mediums fixed, r6 one medium fixed; r7 needed |
-| R-17 | introduction / topics | 2 | open | r2 had two highs and mediums, all fixed; r3 and r4 needed |
+| R-16 | security helpers | 7 | open | r7 one medium (the redaction helper returned a secret image's provenance address) and five lows, all fixed; a clean round means r8 and r9 both clean |
+| R-17 | introduction / topics | 3 | open | r3's two mediums were the intro/call provider re-entrancy path, fixed at the root by capturing the provider surface at registration; three lows fixed; r4 and r5 must be clean |
 | R-18 | CLI | 2 | open | r2 had one high and eight mediums, all fixed; r3 and r4 needed |
 | R-19 | control plane | 2 | open | r2 had two highs and six mediums, all fixed; r3 and r4 needed |
 | R-20 | fuzz program | 2 | open | r2 had three highs and three mediums, all fixed; r3 and r4 needed |
