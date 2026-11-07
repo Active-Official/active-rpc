@@ -560,7 +560,7 @@ impl Call {
 }
 
 /// What a provider returns.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Response {
     /// A plain value.
     Value(Value),
@@ -574,6 +574,19 @@ pub enum Response {
     Module(Vec<u8>),
     /// An ordered list of labels (why/impact answers).
     Labels(Vec<String>),
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Module` may be a secret-bearing image or a guest's opaque output, so
+        // it is printed by shape only, like `Value`'s own formatter
+        // (R-16 round 5, #2).
+        match self {
+            Response::Value(value) => f.debug_tuple("Value").field(value).finish(),
+            Response::Module(bytes) => f.debug_struct("Module").field("len", &bytes.len()).finish(),
+            Response::Labels(labels) => f.debug_tuple("Labels").field(labels).finish(),
+        }
+    }
 }
 
 impl Response {

@@ -3416,6 +3416,24 @@ Gate: full `gate-rpc.sh` green — all-features and no-default suites, clippy on
 both sets, fmt, doc, the fuzz and control-plane and CLI manifests, and
 `python scripts/negative_controls.py --check` 9/9.
 
+### R-16 security helpers - 2026-11-06 (round 5)
+
+Reviewer: DeepSeek through the direct API (`deepseek-flash`, `max`), read-only at
+`7c38cef`. The round-4 CLEAN was re-checked and two of its dispositions did not
+hold at HEAD. Verdict **NOT CLEAN**: two mediums and four lows; no critical/high.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | an image-looking payload that fails `decode` was classified **opaque**, so a corrupted secret-bearing image bypassed every secret gate and the wasm argument guard | **fixed**: bytes that start with the image magic and do not decode are classified secret-carrying (fail closed); opaque bytes without the magic keep the accepted residual. `a_corrupted_image_is_not_treated_as_opaque` (flips a byte of a real image and asserts the guard still refuses it) |
+| 2 | medium | `Response` derived `Debug`, so `Response::Module` printed its bytes (the round-3 claim covered `Value` and `Arg`, not `Response`) | **fixed**: a hand-written `Debug` prints the shape (`len`) only; `a_module_response_prints_no_bytes` |
+| 3 | low | `check_module_payload` is coextensive with `decode`, so the non-redacting egress still admits a decodable non-canonical image the receiver's install gate refuses | **open** — the honest statement is that the egress proves decodability, not canonicity |
+| 4 | low | public in-process accessors hand out raw secret material (`DomainProvider::module`, `cached_hash`) | **open** — `Agent` is the host's authority object, but a raw content address of a secret-bearing module is the oracle `content_hash` refuses; the accessor needs to return the redacted address |
+| 5 | low | `redact_module`/`redact_value` re-encode through default options, dropping `FLAG_STREAMED`, so a non-secret module's bytes can change under redaction | **open** |
+| 6 | low | public `from_active_value` recursed without a depth guard, so a deep `active_core::Value` aborted the process | **fixed**: the conversion is an explicit stack bounded by `MAX_VALUE_DEPTH`, so neither the walk nor the resulting drop can overflow; `a_deep_active_value_converts_without_recursing` builds 100 000 levels |
+
+Gate: the full local gate green after the fixes (both clippy sets, both test sets,
+doc, benches, fuzz, control plane, CLI, hardening status, 9/9 negative controls).
+
 ### R-16 security helpers - 2026-11-04 (round 3)
 
 Reviewer: DeepSeek through Token Harbor, `xhigh`, read-only at `6fb5ca4`. Verdict

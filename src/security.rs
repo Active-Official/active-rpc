@@ -60,6 +60,70 @@ pub fn active_value_too_deep(value: &active_core::Value, limit: usize) -> bool {
 /// carries secret material, only the fact that something is secret.
 pub fn from_active_value(value: &active_core::Value) -> Value {
     use active_core::Value as ActiveValue;
+
+    /// One unit of work: convert a value at a depth, or assemble the children
+    /// already on the output stack.
+    enum Frame<'a> {
+        Value(&'a ActiveValue, usize),
+        Array(usize),
+        Table(Vec<String>, usize),
+    }
+
+    /// The same ceiling the wire applies: a deeper value cannot be represented,
+    /// and a value deeper than this would also overflow the stack when it is
+    /// dropped (R-16 round 5, #6).
+    const LIMIT: usize = crate::wire::MAX_VALUE_DEPTH;
+
+    // An explicit stack: this used to recurse, and a value deeper than the wire
+    // cap overflowed the Rust stack, which aborts the process where no
+    // `catch_unwind` reaches (R-16 round 5, #6).
+    let mut work = vec![Frame::Value(value, 0)];
+    let mut out: Vec<Value> = Vec::new();
+    while let Some(frame) = work.pop() {
+        match frame {
+            Frame::Value(ActiveValue::Array(items), depth) if depth >= LIMIT => {
+                // Past the ceiling the shape is truncated to the cap rather
+                // than carried deeper: the wire cannot express it either.
+                out.push(Value::Null);
+                let _ = items;
+            }
+            Frame::Value(ActiveValue::Table(entries), depth) if depth >= LIMIT => {
+                out.push(Value::Null);
+                let _ = entries;
+            }
+            Frame::Value(ActiveValue::Array(items), depth) => {
+                work.push(Frame::Array(items.len()));
+                for item in items.iter().rev() {
+                    work.push(Frame::Value(item, depth + 1));
+                }
+            }
+            Frame::Value(ActiveValue::Table(entries), depth) => {
+                let keys: Vec<String> = entries.iter().map(|(key, _)| key.clone()).collect();
+                work.push(Frame::Table(keys, entries.len()));
+                for (_key, item) in entries.iter().rev() {
+                    work.push(Frame::Value(item, depth + 1));
+                }
+            }
+            Frame::Value(scalar, _) => out.push(scalar_value(scalar)),
+            Frame::Array(count) => {
+                let items = out.split_off(out.len() - count);
+                out.push(Value::List(items));
+            }
+            Frame::Table(keys, count) => {
+                let values = out.split_off(out.len() - count);
+                out.push(Value::Map(keys.into_iter().zip(values).collect()));
+            }
+        }
+    }
+    out.pop().unwrap_or(Value::Null)
+}
+
+/// One non-container Active value as an RPC value.
+///
+/// Secrets and tainted blobs collapse to [`Value::Secret`]: the RPC layer never
+/// carries secret material, only the fact that something is secret.
+fn scalar_value(value: &active_core::Value) -> Value {
+    use active_core::Value as ActiveValue;
     match value {
         ActiveValue::Null => Value::Null,
         ActiveValue::Bool(flag) => Value::Bool(*flag),
@@ -67,8 +131,8 @@ pub fn from_active_value(value: &active_core::Value) -> Value {
         ActiveValue::Float(number) => Value::Float(*number),
         ActiveValue::String(text) => Value::Text(text.clone()),
         ActiveValue::DurationMs(ms) => Value::Map(
-            // A duration past `i64::MAX` saturates: a cast wraps negative
-            // and a consumer that reads `ms` as a deadline misbehaves.
+            // A duration past `i64::MAX` saturates: a cast wraps negative and a
+            // consumer that reads `ms` as a deadline misbehaves.
             [(
                 "ms".to_string(),
                 Value::Int(i64::try_from(*ms).unwrap_or(i64::MAX)),
@@ -84,13 +148,10 @@ pub fn from_active_value(value: &active_core::Value) -> Value {
             .into_iter()
             .collect(),
         ),
-        ActiveValue::Array(items) => Value::List(items.iter().map(from_active_value).collect()),
-        ActiveValue::Table(entries) => Value::Map(
-            entries
-                .iter()
-                .map(|(key, value)| (key.clone(), from_active_value(value)))
-                .collect(),
-        ),
+        // Containers never reach here: `from_active_value` handles them with the
+        // explicit stack. A nested container in this position would be a bug in
+        // that walk, and `Null` is the safe answer for it.
+        ActiveValue::Array(_) | ActiveValue::Table(_) => Value::Null,
         ActiveValue::Secret(_) => Value::Secret,
     }
 }
@@ -237,7 +298,11 @@ pub fn redact_derived(
 fn module_has_secret(bytes: &[u8]) -> Result<bool> {
     // Opaque bytes are not an Infinity image and carry no secret structure.
     let Ok(module) = active_infinity::decode(bytes) else {
-        return Ok(false);
+        // Except when they claim to be one. A payload that starts with the
+        // image magic and fails to decode cannot be proven secret-free: a
+        // corrupted secret-bearing image would otherwise be classified opaque
+        // and pass every gate (R-16 round 5, #1).
+        return Ok(bytes.starts_with(&active_infinity::MAGIC));
     };
     Ok((0..module.node_count()).any(|index| {
         module
