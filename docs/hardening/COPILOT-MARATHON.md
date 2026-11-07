@@ -29,8 +29,8 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-13 | receipts | `src/receipts.rs` | rounds 1-4: 13 + 16 + 19 + 7 findings | 55 fixed / 0 rejected / 0 open | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-7: round 7 found 1 medium and 5 lows, all fixed or documented; r8 and r9 must be clean to close | 27 fixed / 0 rejected / 2 noted (no store wired by default; virtual-epoch deadline; opaque module bytes) | this commit |
-| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs` | rounds 1-3: round 3 found 2 mediums and 3 lows, all fixed; r4 and r5 must be clean to close | 30 fixed / 0 rejected / 0 open (2 recorded: publisher identity, host authority) | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs` | rounds 1-8: round 8 found one high (the `content_hash` provenance oracle) and five lows, all fixed; r9 and r10 must be clean to close | 33 fixed / 0 rejected / 2 noted (no store wired by default; virtual-epoch deadline; opaque module bytes) | this commit |
+| R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs` | rounds 1-4: round 4 found a round-3 regression (the kernel channel counter) and four mediums, all fixed; r5 and r6 must be clean to close | 40 fixed / 0 rejected / 0 open (6 residuals recorded) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-2: 16 + 20 findings fixed (1 partly a false positive) | 36 fixed / 0 rejected / 0 open (3 documented) | `4c127c4`, `d2ee809` |
 | R-20 | fuzz | `fuzz/**` | rounds 1-2: 21 + 12 findings fixed (1 noted); found 3 kernel defects | 33 fixed / 0 rejected / 1 noted | `09b1c82`, `1c4cb37` |
@@ -49,6 +49,55 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-16 security helpers - 2026-11-06 (round 8)
+
+Reviewer: DeepSeek (`deepseek-flash`) through the direct API, `xhigh`, read-only
+at `5fd5256`. Round-7 L-1 to L-5 held; M-1 held on the module-bytes path but
+**not** on the domain's `content_hash` projection. Verdict **NOT CLEAN**: one
+high and five lows; `persistence.rs` was CLEAN.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `ModuleProvider::content_hash` hashed a redacted image that still carried its provenance, so the digest was a function of the raw image's `parent` and `Hash` addresses — the same offline oracle R-07 H2 and R-16 round 7 closed on the bytes path, on the one projection that bypasses `redact_module` | **fixed**: the hash branch calls `redacted.set_provenance(None)` before encoding; `domain_round10_tests::a_secret_bearing_content_hash_ignores_provenance` installs a secret module with lineage, proves two images differing only in provenance share one digest, and compares the answer to `content_hash(security::redact_module(raw))`. Negative control: without the drop the test fails on the first assertion |
+| 2 | low | `SECRET_MARKER` was a hard-coded copy of the library's marker, with no guard | **fixed**: it aliases `active_infinity::interop::SECRET_MARKER`; `security_round8_tests::the_secret_marker_is_the_librarys` |
+| 3 | low | `docs/spec/security.md` I-2 claimed a secret never equals itself and that a test asserted it; `Value::Secret` compares equal and no such test exists | **fixed**: I-2 is scoped to secret *content*, the section states that the marker's structural equality is what keeps replay bit-exact, and it names the three tests that back the invariant |
+| 4 | low | the module egress decoded provider-controlled bytes three or four times | **fixed**: one `inspect_module` tri-state (opaque, image, corrupt) decides it once, and both gates match on it; `module_carries_a_secret` is derived from the same value |
+| 5 | low | `parse_hex32` accepted `+`-prefixed and uppercase hex through `from_str_radix`, leaving only the later canonical-text comparison to refuse a record | **fixed**: the parser applies the lowercase-hex rule itself; `a_signed_or_uppercase_fingerprint_is_refused` asserts the local "not hex" reason |
+| 6 | low | `module_carries_a_secret`'s doc said "false for bytes that are not an image" while a magic-prefixed undecodable payload is `true`, and its `Result` had no `Err` arm | **fixed**: the doc states the fail-closed rule, and the tri-state returns `bool` |
+
+Gate: `scripts/local_gate.sh --no-msrv` green; `cargo test --all-features` green
+on both feature sets; fmt and doc clean.
+
+### R-17 introduction and topics - 2026-11-06 (round 4)
+
+Reviewer: DeepSeek (`deepseek-flash`) through the direct API, `xhigh`, read-only
+at `5fd5256`. One round-3 disposition was **falsified**: `Channel::message_bytes`
+changed, but the kernel's own `queued_channel_bytes` still added payload-only
+bytes. The add and the subtract side disagreed and the kernel-wide ceiling
+under-counted records by about 100x. Verdict **NOT CLEAN**: one high, four
+mediums, four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | `send_inner`/`publish_inner` added payload bytes to `queued_channel_bytes`; `recv`/`recv_topic`/`destroy_channel` subtracted the record, so the counter drifted down and the "256 MiB" kernel ceiling held up to ~1.6 GiB of records | **fixed**: two quantities, each with one owner. The caller's grant pays the payload it moves (`Budget::max_bytes`' documented meaning); the channel and the kernel pay `Channel::message_bytes`. `Agent::queued_channel_bytes()` exposes the counter; `channel_round3_tests::the_kernel_counter_closes_on_send_recv_and_destroy` pins send, receive, publish and destroy to the exact same quantity |
+| 2 | medium | `publish` charged the capability chain before an `enqueue` that measured the record, so a publish in the 96-byte-per-message window was charged and then refused (retryable, so a retry charged again) | **fixed** by 1: the pre-check and the enqueue now call the same function, so the pre-check is conclusive |
+| 3 | medium | `take_drops` removed the provider without marking it: a re-entrant `run()` failed its queued jobs, and a drop raised during the drain was discarded by `deliver_pending_drops` | **fixed**: the drain sets `delivering` (which `next_batch` skips and the drop pass requeues) and a `DrainGuard` puts the provider back. `intro_round4_tests::{a_drain_leaves_the_providers_queued_work_alone, a_drop_raised_during_a_drain_is_delivered_later}`. Negative control: without the marker both fail |
+| 4 | medium | two providers with one name made `intro()` fail for the whole kernel and made durable restore impossible for that provider, although multi-instance adapters are a documented configuration | **fixed**: `intro::build` orders by name and then by the method list, and lists both instances; restore still refuses a name that identifies two providers. `two_instances_of_one_adapter_describe_one_surface`, `an_introduction_is_order_independent_and_lists_each_instance` |
+| 5 | medium | `export_capability` reserved the whole grant, consumed the record id and pinned the object for a record restore would refuse as ambiguous | **fixed**: the ambiguity check runs with the other "this record cannot be built" refusals, before the reserve; `an_ambiguous_record_is_refused_before_the_grant_is_spent` (negative control: without it the export succeeds and the bytes are reserved) |
+| 6 | low | `take_drops` had no unwind guard: a panicking drain destroyed the provider while `facts` still advertised it | **fixed** by 3's guard |
+| 7 | low | `mint`/`mint_bound`/`attenuate` gated on `providers`, which a dispatch empties, so a provider minting for itself from `invoke` was told it was unknown | **fixed**: they consult `facts`, the registry that survives a check-out; `a_provider_may_mint_for_itself_while_it_is_dispatching` |
+| 8 | low | stale spec text: ADR-0017's provider order, its duplicates sentence, `security.md`'s "reports as mutating", `wire.md`'s kernel-wide claim | **fixed**: all four amended, and `Provider::mutating` documents that the captured answer must be a pure function of the method |
+| 9 | low | the round-3 constants test asserted a property the kernel did not implement | **fixed** by 1's counter test; the constants test now documents the record charge it depends on |
+
+Residuals recorded, not fixed: `mutating` is frozen at registration (documented
+on the trait); there is no provider-count ceiling; `next_provider`/`next_channel`
+increments are unchecked; `deliver_pending_drops`'s push-back can lose an entry
+if its second `try_borrow_mut` also fails; `intro()` advertises `Budget::default`
+rather than the deployment's ceilings.
+
+Gate: `scripts/local_gate.sh --no-msrv` green; `cargo test --all-features` green
+on both feature sets; fmt and doc clean.
 
 ### R-16 security helpers - 2026-11-06 (round 7)
 

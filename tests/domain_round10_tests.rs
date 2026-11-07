@@ -1137,6 +1137,64 @@ fn the_synthetic_level_counts_against_the_ceiling() {
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
 }
 
+/// The redacted content hash must not depend on the raw image's provenance:
+/// `parent` and `Hash` entries are content addresses over the secret heap, so
+/// hashing them rebuilt the oracle the redacted form exists to close
+/// (R-16 round 8, #1).
+#[test]
+fn a_secret_bearing_content_hash_ignores_provenance() {
+    use active_infinity::{ProvEntry, ProvValue, Provenance};
+
+    let build = |parent: [u8; 32], entry: [u8; 32]| {
+        let mut module = InfinityModule::new();
+        let secret = module.push(Inode::Secret(CANARY.into()));
+        let root = module.push(Inode::Table {
+            fields: vec![("s".to_string(), secret)],
+        });
+        module.set_root(Some(root));
+        module.set_provenance(Some(Provenance {
+            producer: Some("test".to_string()),
+            timestamp_ms: 1,
+            model: None,
+            tool: None,
+            parent: Some(parent),
+            entries: vec![ProvEntry {
+                key: "lineage".to_string(),
+                value: ProvValue::Hash(entry),
+            }],
+        }));
+        module
+    };
+    let digest = |module: InfinityModule| -> String {
+        let (agent, cap, lane) = install(module, &["content_hash"], None, false);
+        let promise = agent
+            .call(lane, &cap, "content_hash", Vec::new())
+            .expect("queued");
+        agent.run();
+        match promise.value().expect("hash") {
+            Value::Text(text) => text,
+            other => panic!("a text digest: {other:?}"),
+        }
+    };
+
+    let first_module = build([0x61; 32], [0x62; 32]);
+    let raw = active_infinity::encode(&first_module).expect("encode");
+    let first = digest(first_module);
+    let second = digest(build([0x63; 32], [0x64; 32]));
+    assert_eq!(
+        first, second,
+        "two images differing only in provenance share one redacted digest"
+    );
+    let expected =
+        active_infinity::content_hash(&active_rpc::security::redact_module(&raw).expect("redact"))
+            .expect("hash");
+    assert_eq!(
+        first,
+        format!("blake3:{}", active_infinity::ir::hash_hex(&expected)),
+        "the digest is the provenance-free projection the helper produces"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Round 19
 // ---------------------------------------------------------------------------

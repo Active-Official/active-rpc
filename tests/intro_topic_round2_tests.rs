@@ -218,10 +218,10 @@ fn invisible_and_reordering_characters_are_refused() {
     );
 }
 
-/// 2.7 - the same surface encodes to the same bytes, and two names for one
-/// provider are refused rather than ordered by the caller.
+/// 2.7 - the same surface encodes to the same bytes, including two instances of
+/// one adapter, whose method lists break the tie (R-17 round 4).
 #[test]
-fn an_introduction_is_order_independent_and_refuses_duplicates() {
+fn an_introduction_is_order_independent_and_lists_each_instance() {
     let forward = vec![
         ("b".to_string(), vec!["x".to_string()]),
         ("a".to_string(), vec!["y".to_string(), "x".to_string()]),
@@ -232,15 +232,18 @@ fn an_introduction_is_order_independent_and_refuses_duplicates() {
     let second = active_rpc::intro::build("peer", &reverse, &Budget::default()).expect("second");
     assert_eq!(first, second, "an introduction is canonical");
 
-    let duplicates = vec![
+    let instances = vec![
         ("dup".to_string(), vec!["a".to_string()]),
         ("dup".to_string(), vec!["b".to_string()]),
     ];
+    let mut swapped = instances.clone();
+    swapped.reverse();
+    let bytes = active_rpc::intro::build("peer", &instances, &Budget::default())
+        .expect("two instances of one adapter are a documented configuration");
     assert_eq!(
-        active_rpc::intro::build("peer", &duplicates, &Budget::default())
-            .expect_err("two entries for one provider name are ambiguous")
-            .code(),
-        "rpc/invalid-argument"
+        bytes,
+        active_rpc::intro::build("peer", &swapped, &Budget::default()).expect("the other order"),
+        "the method list orders two instances deterministically"
     );
 }
 

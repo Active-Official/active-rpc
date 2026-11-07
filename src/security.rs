@@ -15,7 +15,11 @@ use crate::error::{Error, Result};
 use crate::value::Value;
 
 /// Marker used wherever a secret would otherwise appear.
-pub const SECRET_MARKER: &str = "***SECRET***";
+///
+/// The library's constant, not a copy: a copy that drifted would make the
+/// map-key gates miss the marker the library itself writes
+/// (R-16 round 8, #2).
+pub const SECRET_MARKER: &str = active_infinity::interop::SECRET_MARKER;
 
 /// True when an evaluator value is deeper than `limit`.
 ///
@@ -338,15 +342,29 @@ pub(crate) fn claims_infinity_image(bytes: &[u8]) -> bool {
     is_infinity_image(bytes) || bytes.starts_with(&active_infinity::MAGIC)
 }
 
-/// True when a module holds a node marked secret.
-fn module_has_secret(bytes: &[u8]) -> Result<bool> {
-    // Opaque bytes are not an Infinity image and carry no secret structure.
-    let Ok(module) = active_infinity::decode(bytes) else {
-        // A payload that claims to be an image and cannot be decoded fails
-        // closed (R-16 round 5, #1).
-        return Ok(claims_infinity_image(bytes));
-    };
-    Ok(module_holds_secret(&module))
+/// What a `Value::Module` payload is, decided by one decode.
+///
+/// The egress gates ask this once instead of walking the same bytes three
+/// times: every pass is O(bytes) over provider- or guest-controlled output
+/// (R-16 round 8, #4).
+enum ModuleKind {
+    /// Not an image, and does not claim to be one: a provider's opaque blob.
+    Opaque,
+    /// A decodable image, with whether it holds a secret node.
+    Image { secret: bool },
+    /// Starts with the image magic but does not decode. It cannot be proven
+    /// secret-free, so every gate fails closed on it (R-16 round 5).
+    Corrupt,
+}
+
+fn inspect_module(bytes: &[u8]) -> ModuleKind {
+    match active_infinity::decode(bytes) {
+        Ok(module) => ModuleKind::Image {
+            secret: module_holds_secret(&module),
+        },
+        Err(_) if bytes.starts_with(&active_infinity::MAGIC) => ModuleKind::Corrupt,
+        Err(_) => ModuleKind::Opaque,
+    }
 }
 
 /// True when a decoded module holds a node marked secret.
@@ -362,13 +380,22 @@ fn module_holds_secret(module: &active_infinity::InfinityModule) -> bool {
 
 /// True when a module image carries a structural secret.
 ///
-/// `false` for bytes that are not an image: opaque data has no secret structure
-/// this walk can see. An adapter that must not hand secrets to third-party code
+/// `false` only for bytes that neither decode nor claim to be an image: opaque
+/// data has no secret structure this walk can see. A payload that starts with
+/// the image magic and does not decode is `true`, because it cannot be proven
+/// secret-free (R-16 round 5). An adapter that must not hand secrets to
+/// third-party code
 /// asks this first — the wasm sandbox writes its input into guest memory, and a
 /// guest can return it mangled into an opaque blob the egress check passes
 /// through by design (R-14 round 3, L-3).
 pub fn module_carries_a_secret(bytes: &[u8]) -> bool {
-    module_has_secret(bytes).unwrap_or(true)
+    match inspect_module(bytes) {
+        ModuleKind::Opaque => false,
+        ModuleKind::Image { secret } => secret,
+        // A magic-prefixed payload that does not decode cannot be proven
+        // secret-free (R-16 round 5).
+        ModuleKind::Corrupt => true,
+    }
 }
 
 /// True when the bytes are an Active Infinity image.
@@ -418,19 +445,25 @@ pub fn assert_no_structural_secrets(value: &Value) -> Result<()> {
                 }
                 stack.extend(entries.values());
             }
-            Value::Module(bytes) => {
-                if module_has_secret(bytes)? {
+            Value::Module(bytes) => match inspect_module(bytes) {
+                ModuleKind::Opaque => {}
+                ModuleKind::Corrupt => {
+                    // An image that cannot be read cannot be proven
+                    // secret-free.
                     return Err(Error::Provider {
                         code: "provider/secret-material".to_string(),
                     });
                 }
-                // A decodable image must also be *valid*: `decode` tolerates a
-                // trailing tail, and a receiver's install gate refuses what this
-                // gate would otherwise pass (R-16 round 6, #2).
-                if is_infinity_image(bytes) {
-                    check_module_payload(bytes)?;
+                ModuleKind::Image { secret: true } => {
+                    return Err(Error::Provider {
+                        code: "provider/secret-material".to_string(),
+                    });
                 }
-            }
+                // A decodable image must also be canonical: a receiver's
+                // install gate refuses what `decode` alone would pass
+                // (R-16 round 6, #2; round 7, L-2).
+                ModuleKind::Image { secret: false } => check_module_payload(bytes)?,
+            },
             Value::Null
             | Value::Bool(_)
             | Value::Int(_)
@@ -465,21 +498,24 @@ pub fn assert_no_secret_material(value: &Value) -> Result<()> {
             }
             // A module is bytes: it is the one variant that can carry a secret
             // without the value model noticing, so it is decoded and inspected.
-            Value::Module(bytes) => {
-                if module_has_secret(bytes)? {
+            Value::Module(bytes) => match inspect_module(bytes) {
+                ModuleKind::Opaque => {}
+                ModuleKind::Corrupt => {
+                    // An image that cannot be read cannot be proven
+                    // secret-free.
                     return Err(Error::Provider {
                         code: "provider/secret-material".to_string(),
                     });
                 }
-                // A decodable image must also pass the codec's `validate`: a
-                // decoder that tolerates a trailing byte would otherwise emit
-                // an image a peer's install gate refuses, so two byte strings
-                // would name one module for a peer that hashes the payload
-                // (round 3, F-2). Opaque non-image bytes stay untouched.
-                if is_infinity_image(bytes) {
-                    check_module_payload(bytes)?;
+                ModuleKind::Image { secret: true } => {
+                    return Err(Error::Provider {
+                        code: "provider/secret-material".to_string(),
+                    });
                 }
-            }
+                // A decodable image must also be canonical, the proof a peer's
+                // install gate applies (round 3, F-2; R-16 round 7, L-2).
+                ModuleKind::Image { secret: false } => check_module_payload(bytes)?,
+            },
             // Every other variant is a scalar or a label with no room for
             // secret bytes, and a new variant has to be considered here rather
             // than inheriting this arm silently.

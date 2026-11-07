@@ -152,7 +152,10 @@ pub trait Provider {
     }
     /// Whether `method` mutates provider state (refused on read-only caps).
     ///
-    /// Captured once, at registration, for every method in [`Self::methods`].
+    /// Captured once, at registration, for every method in [`Self::methods`],
+    /// so this must be a pure function of the method: the kernel never asks
+    /// again, and a provider whose answer depends on runtime state keeps the
+    /// answer it gave at registration (R-17 round 4, residual R-1).
     fn mutating(&self, method: &str) -> bool;
     /// Invoke a method on `object`.
     fn invoke(&mut self, object: u64, call: &Call) -> Result<Response>;
@@ -1222,6 +1225,26 @@ impl Agent {
             .get(&record.provider)
             .map(|facts| facts.name.clone())
             .ok_or_else(|| Error::persistence("the provider is no longer registered"))?;
+        // Restore resolves a provider by name, so a record naming one of two
+        // providers is a credential no kernel can spend. Refuse before the
+        // reserve, like every other record that cannot be built (R-17 round 4,
+        // #5).
+
+        // Restore resolves a provider by name, so a record naming one of two
+        // providers is a credential no kernel can spend. Refuse before the
+        // reserve, like every other record that cannot be built (R-17 round 4,
+        // #5).
+        if kernel
+            .facts
+            .values()
+            .filter(|facts| facts.name == provider_name)
+            .count()
+            > 1
+        {
+            return Err(Error::persistence(
+                "the record's provider name is ambiguous",
+            ));
+        }
         let key = kernel
             .record_key
             .ok_or_else(|| Error::persistence("no record seal key is configured"))?;
@@ -1574,7 +1597,10 @@ impl Agent {
         check_method_names(&attrs)?;
         {
             let kernel = self.cell.borrow();
-            if !kernel.providers.contains_key(&provider) {
+            // `facts` is the registry: it survives a dispatch checking the
+            // provider out, so a provider that mints for itself from `invoke`
+            // is registered (R-17 round 4, #7).
+            if !kernel.facts.contains_key(&provider) {
                 return Err(Error::InvalidArgument("unknown provider"));
             }
             if kernel.caps.len() >= MAX_CAPS {
@@ -1703,7 +1729,8 @@ impl Agent {
         }
         check_method_names(&attrs)?;
         let mut kernel = self.cell.borrow_mut();
-        if !kernel.providers.contains_key(&provider) {
+        // `facts` is the registry, exactly as in `mint` (R-17 round 4, #7).
+        if !kernel.facts.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
         }
         if kernel.caps.len() >= MAX_CAPS {
@@ -1788,7 +1815,8 @@ impl Agent {
             return Err(Error::Escalation("capability chain is too deep"));
         }
         let mut kernel = self.cell.borrow_mut();
-        if !kernel.providers.contains_key(&provider) {
+        // `facts` is the registry, exactly as in `mint` (R-17 round 4, #7).
+        if !kernel.facts.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
         }
         if kernel.caps.len() >= MAX_CAPS {
@@ -2842,15 +2870,22 @@ impl Agent {
         if value_too_deep(&payload, crate::wire::MAX_VALUE_DEPTH) {
             return Err(Error::BudgetExceeded("depth"));
         }
-        let bytes = payload
+        // Two quantities, each with one owner. The caller's grant pays for the
+        // payload it moves, which is what `Budget::max_bytes` documents. The
+        // channel and the kernel pay for the whole stored record, which is what
+        // their memory ceilings must bound: charging only the payload let a
+        // 1-byte flood hold about 100x the records the ceiling promised, and it
+        // made the add side disagree with the subtract side (R-17 round 4, #1).
+        let payload_bytes = payload
             .wire_size()
             .checked_add((cap_ids.len() as u64).saturating_mul(16))
             .ok_or(Error::BudgetExceeded("byte"))?;
-        if bytes > lane_budget.max_bytes {
+        let stored_bytes = crate::channel::Channel::message_bytes(&payload, &cap_ids, None);
+        if payload_bytes > lane_budget.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
         if lane_bytes
-            .checked_add(bytes)
+            .checked_add(payload_bytes)
             .ok_or(Error::BudgetExceeded("lane byte"))?
             > lane_budget.max_bytes
         {
@@ -2858,12 +2893,12 @@ impl Agent {
         }
         // Channel capacity is checked before the lane and the meters are
         // charged: a refused send must not spend the sender's grant.
-        if !channel_record.has_room_for(bytes) {
+        if !channel_record.has_room_for(stored_bytes) {
             kernel.metrics.backpressure_refusals =
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("channel byte ceiling reached"));
         }
-        if kernel.queued_channel_bytes.saturating_add(bytes) > MAX_QUEUED_CHANNEL_BYTES {
+        if kernel.queued_channel_bytes.saturating_add(stored_bytes) > MAX_QUEUED_CHANNEL_BYTES {
             kernel.metrics.backpressure_refusals =
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("the kernel's channel byte ceiling"));
@@ -2873,11 +2908,11 @@ impl Agent {
             .get_mut(&channel)
             .ok_or(Error::UnknownChannel(channel.0))?;
         let sequence = record.send_sequence(lane, payload, cap_ids.clone())?;
-        kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(bytes);
+        kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(stored_bytes);
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
             lane_record.bytes = lane_record
                 .bytes
-                .checked_add(bytes)
+                .checked_add(payload_bytes)
                 .ok_or(Error::BudgetExceeded("lane byte"))?;
             lane_record.completed = lane_record.completed.saturating_add(1);
         }
@@ -3030,10 +3065,15 @@ impl Agent {
         // The topic name is metadata the channel stores and forwards, so it is
         // payload as far as the grant is concerned: charging only the value let
         // a 1 KiB topic ride through a 32-byte budget.
-        let bytes = payload
+        let payload_bytes = payload
             .wire_size()
             .checked_add(topic.len() as u64)
             .ok_or(Error::BudgetExceeded("byte"))?;
+        // The stored record, not the payload, is what the channel and the
+        // kernel hold. It is measured with the same function `enqueue` uses, so
+        // this pre-check is conclusive and a publish it passes cannot be
+        // refused after the grant was spent (R-17 round 4, #1-#2).
+        let stored_bytes = crate::channel::Channel::message_bytes(&payload, &[], Some(topic));
         // Channel capacity comes before the charge: a publish the channel would
         // refuse must not spend the grant or queue nothing silently.
         {
@@ -3041,22 +3081,22 @@ impl Agent {
                 .channels
                 .get(&channel)
                 .ok_or(Error::UnknownChannel(channel.0))?;
-            if !channel_record.has_room_for(bytes) {
+            if !channel_record.has_room_for(stored_bytes) {
                 kernel.metrics.backpressure_refusals =
                     kernel.metrics.backpressure_refusals.saturating_add(1);
                 return Err(Error::Backpressure("channel byte ceiling reached"));
             }
         }
-        if kernel.queued_channel_bytes.saturating_add(bytes) > MAX_QUEUED_CHANNEL_BYTES {
+        if kernel.queued_channel_bytes.saturating_add(stored_bytes) > MAX_QUEUED_CHANNEL_BYTES {
             kernel.metrics.backpressure_refusals =
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("the kernel's channel byte ceiling"));
         }
-        if bytes > effective.max_bytes {
+        if payload_bytes > effective.max_bytes {
             return Err(Error::BudgetExceeded("byte"));
         }
         if lane_bytes
-            .checked_add(bytes)
+            .checked_add(payload_bytes)
             .ok_or(Error::BudgetExceeded("lane byte"))?
             > lane_budget.max_bytes
         {
@@ -3068,12 +3108,12 @@ impl Agent {
         chain.push(cap.id());
         for id in &chain {
             if let Some(meter) = meter_for(&kernel, *id)? {
-                meter.check(bytes)?;
+                meter.check(payload_bytes)?;
             }
         }
         for id in &chain {
             if let Some(meter) = meter_mut_for(&mut kernel, *id)? {
-                meter.charge(bytes)?;
+                meter.charge(payload_bytes)?;
             }
         }
         let record = kernel
@@ -3083,11 +3123,11 @@ impl Agent {
         // A publish needs the sequence, not the message: `send_topic` would
         // copy the whole payload for a value this path discards (round 2, #1).
         let sequence = record.send_topic_sequence(lane, topic, payload, Vec::new())?;
-        kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(bytes);
+        kernel.queued_channel_bytes = kernel.queued_channel_bytes.saturating_add(stored_bytes);
         if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
             lane_record.bytes = lane_record
                 .bytes
-                .checked_add(bytes)
+                .checked_add(payload_bytes)
                 .ok_or(Error::BudgetExceeded("lane byte"))?;
             lane_record.completed = lane_record.completed.saturating_add(1);
         }
@@ -4869,19 +4909,72 @@ impl Agent {
     ///
     /// The provider is taken out of the registry for the duration, so an
     /// implementation that consults the agent does not re-borrow the kernel
-    /// (R-17 round 3, M-2). While a dispatch has it checked out there is
-    /// nothing to drain and the answer is empty.
+    /// (R-17 round 3, M-2). It is marked `delivering` while out, so a re-entrant
+    /// `run()` leaves its jobs queued instead of failing them against an absent
+    /// provider, and a drop raised during the drain waits for the next delivery
+    /// instead of being discarded (R-17 round 4, #3). A guard puts the provider
+    /// back on the normal path and on unwind (R-17 round 4, #6). While a
+    /// dispatch has it checked out, there is nothing to drain and the answer is
+    /// empty.
     pub fn take_drops(&self, provider: ProviderId) -> Vec<(u64, CapId)> {
-        let Some(mut provider_record) = self.cell.borrow_mut().providers.remove(&provider) else {
+        /// Puts the checked-out provider back, on the normal path and on unwind.
+        struct DrainGuard<'a> {
+            cell: &'a KernelCell,
+            provider: ProviderId,
+            record: Option<Box<dyn Provider>>,
+            /// This guard set `delivering` and must clear it.
+            marked: bool,
+        }
+
+        impl Drop for DrainGuard<'_> {
+            fn drop(&mut self) {
+                let Some(record) = self.record.take() else {
+                    return;
+                };
+                if let Ok(mut kernel) = self.cell.try_borrow_mut() {
+                    kernel.providers.insert(self.provider, record);
+                    if self.marked {
+                        kernel.delivering.remove(&self.provider);
+                    }
+                }
+            }
+        }
+
+        let (record, marked) = {
+            let Ok(mut kernel) = self.cell.try_borrow_mut() else {
+                return Vec::new();
+            };
+            let marked = kernel.delivering.insert(provider);
+            let record = kernel.providers.remove(&provider);
+            if record.is_none() && marked {
+                // A dispatch (or a drop delivery) owns it: leave no marker.
+                kernel.delivering.remove(&provider);
+            }
+            (record, marked)
+        };
+        let Some(record) = record else {
             return Vec::new();
         };
-        let drops = provider_record.take_drop_notifications();
-        self.cell
-            .borrow_mut()
-            .providers
-            .entry(provider)
-            .or_insert(provider_record);
-        drops
+        let mut guard = DrainGuard {
+            cell: &self.cell,
+            provider,
+            record: Some(record),
+            marked,
+        };
+        guard
+            .record
+            .as_mut()
+            .expect("just set")
+            .take_drop_notifications()
+    }
+
+    /// Payload bytes queued across every channel in this kernel.
+    ///
+    /// This is the counter the kernel-wide channel ceiling compares against,
+    /// and it charges each message's whole record, exactly like the per-channel
+    /// counter (see [`crate::channel::Channel::message_bytes`]).
+    pub fn queued_channel_bytes(&self) -> u64 {
+        self.cell.borrow().queued_channel_bytes
     }
 
     /// Live dependents of a promise, for operators and tests.

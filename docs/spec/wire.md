@@ -439,8 +439,9 @@ transport must preserve when it forwards one:
   as a missing channel. `Agent::channel(id)` returns counts and names only, never
   a queued payload or a transferred capability id; the host that holds `&Agent`
   can see a channel's existence and counts for any id, and no envelope path can.
-  The queue's byte counters charge the stored message record, so the payload
-  ceilings are also memory ceilings.
+  Both the per-channel and the kernel-wide byte counters charge the stored
+  message record, and the add and the release paths measure it with the same
+  function, so those ceilings are memory ceilings.
 - **A topic is bounded text.** 1..=128 bytes, no control characters, and none of
   the characters that reorder or hide rendered text (U+2028/U+2029, bidi
   controls, zero-width and tag characters), checked at the grant, at publish and

@@ -718,6 +718,17 @@ impl ModuleProvider {
                             let mut redacted = slot.module.clone();
                             crate::security::redact_derived(&mut redacted, &slot.redactor)
                                 .map_err(redaction_fault)?;
+                            // Provenance names the pre-redaction image: its
+                            // `parent` and `Hash` entries are content
+                            // addresses over the secret heap, so hashing them
+                            // rebuilt exactly the oracle this branch exists to
+                            // close (R-16 round 8, #1).
+                            // Provenance names the pre-redaction image: its
+                            // `parent` and `Hash` entries are content
+                            // addresses over the secret heap, so hashing them
+                            // rebuilt exactly the oracle this branch exists to
+                            // close (R-16 round 8, #1).
+                            redacted.set_provenance(None);
                             let redacted_bytes = encode(&redacted).map_err(|error| {
                                 redaction_fault(Error::Payload(error.code().to_string()))
                             })?;

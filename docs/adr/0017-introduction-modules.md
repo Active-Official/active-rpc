@@ -22,8 +22,9 @@ Table {
 }
 ```
 
-- Provider order is the kernel's provider-table order, so the bytes are
-  deterministic and hashable.
+- Provider order is the introduction's own: providers are sorted by name and
+  then by their method lists, so the bytes are deterministic and hashable
+  whatever order the caller registered them in.
 - The module carries names, methods and default ceilings only. Capability ids,
   arguments, values and secrets never enter it.
 - It is plain AINF: any language binding validates, hashes and decodes it with
@@ -46,7 +47,11 @@ Table {
   deduplicates each method list, so the same surface produces the same bytes
   whatever order the caller used. A peer's fingerprint is derived from those
   bytes, and a `HashSet`-ordered plugin used to change the digest without
-  changing the surface. Duplicates are dropped for the same reason.
+  changing the surface. A method list is deduplicated for the same reason.
+  Two providers with the same name are two instances of one adapter (a
+  documented configuration); each is listed once, their method lists break the
+  tie, and a durable record that names that provider stays unrestorable because
+  a name no longer identifies one instance (R-17 round 4).
 - **Names are validated.** A peer, provider or method name is 1..=1024 bytes and
   free of control characters, at the same boundary as a capability method name:
   every one of them reaches a module, a fingerprint and a log line.

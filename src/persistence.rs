@@ -714,6 +714,16 @@ fn parse_hex32(text: &str) -> Result<[u8; 32]> {
     if text.len() != 64 || !text.is_ascii() {
         return Err(Error::persistence("fingerprint must be 64 hex characters"));
     }
+    // `from_str_radix` accepts a leading `+` and uppercase digits; a
+    // fingerprint is lowercase hex, so the parser applies that rule itself
+    // instead of leaving it to the later canonical-text comparison
+    // (R-16 round 8, #5).
+    if !text
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::persistence("fingerprint is not hex"));
+    }
     let mut out = [0u8; 32];
     for (index, slot) in out.iter_mut().enumerate() {
         *slot = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)

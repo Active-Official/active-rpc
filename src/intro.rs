@@ -19,23 +19,14 @@ pub const MAX_NAME_BYTES: usize = 1024;
 /// Build the canonical introduction module for a peer.
 ///
 /// The encoding is canonical regardless of how the caller ordered anything: the
-/// providers are sorted by name, and each method list is sorted and deduplicated,
-/// so the same surface always produces the same bytes. That matters because a
-/// peer's fingerprint is derived from these bytes — a `HashSet`-ordered plugin
-/// must not change the digest without changing the surface.
+/// providers are sorted by name and then by their method lists, and each method
+/// list is sorted and deduplicated, so the same surface always produces the same
+/// bytes. That matters because a peer's fingerprint is derived from these bytes
+/// — a `HashSet`-ordered plugin must not change the digest without changing the
+/// surface.
 pub fn build(peer: &str, providers: &[(String, Vec<String>)], budget: &Budget) -> Result<Vec<u8>> {
     check_name("peer", peer)?;
     let mut providers: Vec<(String, Vec<String>)> = providers.to_vec();
-    // One surface per provider name. Two entries for `"dup"` would tie on the
-    // name and keep the caller's order, so the same surface would encode to
-    // different bytes (and a different fingerprint) depending on how the caller
-    // built the list.
-    providers.sort_by(|left, right| left.0.cmp(&right.0));
-    if providers.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(Error::InvalidArgument(
-            "a provider name appears more than once in the introduction",
-        ));
-    }
     for (provider, methods) in &mut providers {
         check_name("provider", provider)?;
         methods.sort();
@@ -44,6 +35,12 @@ pub fn build(peer: &str, providers: &[(String, Vec<String>)], budget: &Budget) -
             check_name("method", method)?;
         }
     }
+    // Two instances of one adapter are a documented configuration (a provider
+    // per exchange context), so a duplicate name is not an error: the method
+    // list breaks the tie, and two entries that tie are byte-identical, so
+    // their order cannot change the output. Refusing duplicates made `intro()`
+    // fail for the whole kernel (R-17 round 4, #4).
+    providers.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
     let mut module = InfinityModule::new();
     let peer_node = module.push(Inode::Str(peer.to_string()));

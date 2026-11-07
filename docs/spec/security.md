@@ -11,7 +11,7 @@ that would violate one stops and needs an ADR.
 | ID | Invariant |
 |---|---|
 | I-1 | Structural secret taint: a secret is a kind, not a removable flag. |
-| I-2 | Anti-oracle equality: a secret never equals anything, including itself. |
+| I-2 | Anti-oracle equality: secret *content* is never compared, ordered or hashed for equality. `Value::Secret` is a content-free marker, and its structural equality is what keeps replay bit-exact. |
 | I-3 | Secret non-leakage: secrets never appear in Debug, Display, JSON, Protobuf, diagnostics, logs, errors, annotations, provenance or wire tags. |
 | I-4 | Capability unforgeability: capability ids are unguessable and possession is authority. |
 | I-5 | Attenuation only narrows: no operation may widen methods, budgets, paths or tool policy. |
@@ -145,8 +145,8 @@ kernel. Three patterns are supported and tested:
 - **Writer** — a capability granting mutating methods plus a finite budget. It
   can change one object and nothing else.
 - **Auditor** — a read-only capability (`read_only = true`) over the same
-  object. `call` refuses any method the provider reports as mutating, so an
-  auditor cannot write even if the method list is wide.
+  object. `call` refuses any method the surface captured at registration marks
+  as mutating, so an auditor cannot write even if the method list is wide.
 - **Orchestrator** — a capability whose methods are the narrow query surface
   plus channel send/receive; it hands attenuated child capabilities to workers
   instead of widening its own.
@@ -184,9 +184,14 @@ timing differences that remain are:
   They are outside the secret boundary; a deployment that needs constant-time
   behaviour at that edge must supply its own padding or fixed-size frames.
 
-No secret value is compared, ordered, hashed for equality, or branched on inside
-the kernel. `Value::Secret` has no equality; the anti-oracle test asserts that
-comparing a secret with itself, or with another secret, never yields `true`.
+No secret *content* is compared, ordered, hashed for equality, or branched on
+inside the kernel. `Value::Secret` is a marker with no content: its structural
+equality is what makes a recorded value replay bit-exact, and it reveals nothing.
+The tests that back I-2 are `security_round5_tests::a_module_response_prints_no_bytes`
+(no bytes reach a diagnostic), `security_round7_tests::redaction_drops_the_provenance_of_a_secret_bearing_image`
+(the addresses that would act as an oracle are gone) and
+`domain_round10_tests::a_secret_bearing_content_hash_ignores_provenance` (the
+redacted digest does not depend on them).
 
 ## 8. Capability maximum (absolute-max baseline)
 

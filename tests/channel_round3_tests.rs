@@ -7,13 +7,31 @@
 //! that holds `&Agent` also sees a channel's existence and counts regardless of
 //! subscription, which is what the ADRs now say (L-3).
 
+use active_rpc::cap::CapAttrs;
 use active_rpc::channel::{
     Channel, ChannelId, Direction, Message, MAX_QUEUED_PER_CHANNEL, MESSAGE_OVERHEAD,
 };
-use active_rpc::kernel::{MAX_CHANNELS, MAX_QUEUED_CHANNEL_BYTES};
+use active_rpc::kernel::{Provider, MAX_CHANNELS, MAX_QUEUED_CHANNEL_BYTES};
 use active_rpc::lane::LaneId;
-use active_rpc::value::Value;
+use active_rpc::value::{Call, Response, Value};
 use active_rpc::{Agent, Budget};
+
+struct Sink;
+
+impl Provider for Sink {
+    fn name(&self) -> &'static str {
+        "sink"
+    }
+    fn methods(&self) -> Vec<String> {
+        vec!["noop".to_string()]
+    }
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::text("ok")))
+    }
+}
 
 #[test]
 fn a_queued_message_is_charged_its_record() {
@@ -50,6 +68,66 @@ fn the_kernel_byte_ceiling_binds_before_the_structural_worst_case() {
         MAX_QUEUED_CHANNEL_BYTES < worst_case,
         "the global channel ceiling ({MAX_QUEUED_CHANNEL_BYTES} bytes) must bind \
          before {worst_case} record bytes"
+    );
+}
+
+/// The kernel-wide counter adds and subtracts the same quantity, so a send,
+/// a receive and a destroy each close it exactly (R-17 round 4, #1).
+#[test]
+fn the_kernel_counter_closes_on_send_recv_and_destroy() {
+    let agent = Agent::with_secret([0x52; 32]);
+    let channel = agent
+        .create_channel("counter", Direction::Both)
+        .expect("channel");
+    let lane = agent
+        .create_lane("counter", Budget::default())
+        .expect("lane");
+    agent.subscribe(lane, channel).expect("subscribe");
+
+    let value = Value::text("x");
+    let stored = Channel::message_bytes(&value, &[], None);
+    agent.send(lane, channel, value.clone(), &[]).expect("send");
+    assert_eq!(
+        agent.queued_channel_bytes(),
+        stored,
+        "the kernel counter charges the record, like the channel does"
+    );
+    assert_eq!(
+        agent.queued_channel_bytes(),
+        agent.channel(channel).expect("channel").queued_bytes,
+        "the two counters agree"
+    );
+
+    agent.recv(lane, channel).expect("recv").expect("message");
+    assert_eq!(
+        agent.queued_channel_bytes(),
+        0,
+        "a receive releases exactly what the send charged"
+    );
+
+    // The publish path charges the topic with the record, and destroy releases
+    // the backlog.
+    let provider = agent.register(Box::new(Sink));
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["noop"])
+                .allow_publish()
+                .restrict_topics(&["t"]),
+        )
+        .expect("cap");
+    agent
+        .publish(lane, channel, &cap, "t", Value::text("y"))
+        .expect("publish");
+    let published = agent.channel(channel).expect("channel").queued_bytes;
+    assert_eq!(agent.queued_channel_bytes(), published);
+    assert!(published >= MESSAGE_OVERHEAD);
+    agent.destroy_channel(channel).expect("destroy");
+    assert_eq!(
+        agent.queued_channel_bytes(),
+        0,
+        "a destroy releases exactly the backlog it removed"
     );
 }
 
