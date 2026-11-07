@@ -404,3 +404,48 @@ async fn a_wrapped_ring_reports_a_gap_and_truncation() {
     let body = body_json(tail).await;
     assert_eq!(body["truncated"], serde_json::json!(true), "{body}");
 }
+
+/// `/status-module` is the one read route that used to contradict the sticky
+/// down flag: it answered `plane: "ok"` after a caught panic (R-19 round 4,
+/// F2).
+#[tokio::test]
+async fn a_down_plane_says_so_in_the_status_module() {
+    use std::sync::atomic::Ordering;
+
+    let state = spawn_worker(false);
+    state.down.store(true, Ordering::SeqCst);
+    let app = app(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/status-module")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["plane"], Json::from("down"), "{body}");
+}
+
+/// `/health` names the fixture grant it depends on, so an operator sees a
+/// spent grant without reading `/metrics` (R-19 round 4, F9).
+#[tokio::test]
+async fn health_reports_the_fixture_grant() {
+    let app = app(spawn_worker(false));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("response");
+    let body = body_json(response).await;
+    assert!(
+        body["fixture_calls_remaining"].as_u64().unwrap_or(0) > 0,
+        "{body}"
+    );
+}

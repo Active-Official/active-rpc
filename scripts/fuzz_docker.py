@@ -109,7 +109,11 @@ def main() -> int:
     failures: list[str] = []
     for target in selected:
         print(f"== {target} ({args.runs} runs) ==")
+        # `--locked` on the fuzz crate: a stale manifest must not be resolved
+        # and rewritten at campaign time (R-20 round 6, finding 9).
         command = (
+            "cargo +nightly metadata --locked --manifest-path Cargo.toml "
+            "--format-version 1 > /dev/null && "
             f"cargo +nightly fuzz build {target} && "
             f"cargo +nightly fuzz run {target} -- -runs={args.runs} "
             f"-max_len={args.max_len} -print_final_stats=1"

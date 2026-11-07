@@ -77,3 +77,113 @@ fn a_framed_grpc_message_unframes_to_itself() {
     assert_eq!(message, b"hello");
     assert!(tail.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The adapter controls the campaign asserts, driven here as well.
+// ---------------------------------------------------------------------------
+
+/// The process control runs a real child and reads its output: a canned `Ok`
+/// or a policy that refuses every argument fails here (R-20 round 6, finding 5).
+#[cfg(unix)]
+#[test]
+fn a_process_control_runs_the_child() {
+    use active_rpc::tool::LocalProcess;
+    use active_rpc::{Arg, Budget, CapAttrs, ToolPolicy, Value};
+
+    let policy = ToolPolicy {
+        allowed: ["run"].iter().map(|name| name.to_string()).collect(),
+        max_arg_bytes: 64,
+        allow_process: true,
+    };
+    let tool = LocalProcess::new("/bin/echo", &["ok"]).expect("an absolute program");
+    let agent = active_rpc::Agent::new();
+    let provider = agent.register(Box::new(tool));
+    let lane = agent
+        .create_lane("control", Budget::default())
+        .expect("lane");
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["run"])
+                .with_budget(Budget::default())
+                .with_tool_policy(policy),
+        )
+        .expect("cap");
+    let promise = agent
+        .call(lane, &cap, "run", vec![Arg::text("ok")])
+        .expect("queued");
+    agent.run();
+    let value = promise.value().expect("the child ran");
+    let Value::Map(fields) = value else {
+        panic!("the process reply is a map: {value:?}");
+    };
+    assert!(
+        matches!(fields.get("status"), Some(Value::Int(0))),
+        "{fields:?}"
+    );
+    assert!(
+        matches!(fields.get("stdout"), Some(Value::Text(text)) if text == "ok\n"),
+        "{fields:?}"
+    );
+}
+
+/// The HTTP control reaches a real loopback endpoint and reads its body: a
+/// pre-network provider error fails here (R-20 round 6, finding 6).
+#[test]
+fn an_http_control_reaches_the_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    use active_rpc::tool::HttpTool;
+    use active_rpc::{Arg, Budget, CapAttrs, ToolPolicy, Value};
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let address = listener.local_addr().expect("address");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer);
+            let body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    let tool = HttpTool::new(format!("http://{address}"), &[("GET", "/safe")]);
+    let policy = tool.policy();
+    let agent = active_rpc::Agent::new();
+    let provider = agent.register(Box::new(tool));
+    let lane = agent
+        .create_lane("control", Budget::default())
+        .expect("lane");
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["get"])
+                .with_budget(Budget::default())
+                .with_tool_policy(ToolPolicy {
+                    allowed: policy.allowed.clone(),
+                    max_arg_bytes: 1024,
+                    allow_process: false,
+                }),
+        )
+        .expect("cap");
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "get",
+            vec![Arg::Value(Value::path("/safe".to_string()))],
+        )
+        .expect("queued");
+    agent.run();
+    assert_eq!(
+        promise.value().expect("the endpoint answered"),
+        Value::map([("ok", Value::Bool(true))])
+    );
+}

@@ -212,12 +212,15 @@ a message.
 
 A provider failure is `rpc/provider` with an inner code in the provider's own
 namespace. The kernel itself reports `rpc/provider` (a provider panicked or
-vanished), `wasm/trap` (a panic inside the kernel's own egress policy) and
-`provider/reply-withheld`; the domain provider reports `provider/redaction`
-and `provider/object`; `provider/egress-panic` is the kernel's own code for a
-panic inside the egress policy walk, which any provider can trigger. An error envelope carries the inner code when it is
+vanished) and `provider/reply-withheld`; the domain provider reports
+`provider/redaction` and `provider/object`; `provider/egress-panic` is the
+kernel's own code for a panic inside the egress policy walk, which any provider
+can trigger. An error envelope carries the inner code when it is
 ASCII and at most 64 bytes (`Envelope::error`), and falls back to `rpc/provider`
 otherwise, so the destination field stays decodable under the strict profile.
+A receipt is a local audit record and records the inner code itself when the
+receipt character set accepts it, falling back to the envelope class otherwise
+(R-13 round 14).
 
 | Code | Condition |
 |------|-----------|
@@ -430,7 +433,7 @@ branches on codes knows them (R-19 round 3, L9).
 | Code | Condition |
 |------|-----------|
 | `rpc/audit-gap` | the plane's 500-event ring evicted events a reader had not received; the marker frame (`{"kind":"event_gap","skipped":N}`) carries the count and the ring's `dropped_through` high-water mark answers the same question to a poller |
-| `scenario/failed` | a demo scenario could not complete: its fixture call was refused, its provider returned an error, or it panicked (the last case is contained and also marks the kernel `down`) |
+| `scenario/failed` | a demo scenario could not complete: its fixture call was refused, its provider returned an error, or it panicked. A scenario panic is contained per scenario and reported here; it does **not** mark the kernel `down` (that flag is for a panic in the worker or in snapshot construction, where the core's state is unknown) |
 
 ### Channel and topic authority
 

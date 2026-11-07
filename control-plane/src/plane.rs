@@ -734,6 +734,22 @@ fn fixture_budget() -> Budget {
     }
 }
 
+/// The fixture lane's grant.
+///
+/// A lane is a queue, not authority, and every scenario and benchmark charges
+/// the same one. A lifetime 10 000-call lane was the *first* fixture to run
+/// out: a benchmark then panicked on the refusal and the sticky down flag
+/// latched while `/health` reported a healthy echo grant (R-19 round 4, F1).
+/// The lane is sized for the process; its calls are charged to the capability
+/// and the byte budget still bounds a payload.
+fn fixture_lane_budget() -> Budget {
+    Budget {
+        max_calls: u64::MAX / 2,
+        max_bytes: u64::MAX / 2,
+        ..Budget::default()
+    }
+}
+
 impl PlaneCore {
     pub fn new() -> Self {
         // A fresh secret per process: a constant one made every deployment
@@ -747,12 +763,20 @@ impl PlaneCore {
             .expect("the fixture module installs");
         let module_provider = agent.register(Box::new(module_provider));
 
-        let lane = agent.create_lane("lane-0", fixture_budget()).expect("lane");
+        let lane = agent
+            .create_lane("lane-0", fixture_lane_budget())
+            .expect("lane");
         let lanes = vec![
             lane,
-            agent.create_lane("lane-1", fixture_budget()).expect("lane"),
-            agent.create_lane("lane-2", fixture_budget()).expect("lane"),
-            agent.create_lane("lane-3", fixture_budget()).expect("lane"),
+            agent
+                .create_lane("lane-1", fixture_lane_budget())
+                .expect("lane"),
+            agent
+                .create_lane("lane-2", fixture_lane_budget())
+                .expect("lane"),
+            agent
+                .create_lane("lane-3", fixture_lane_budget())
+                .expect("lane"),
         ];
 
         let echo_cap = agent
@@ -890,11 +914,13 @@ impl PlaneCore {
             .mint(
                 process_provider,
                 0,
-                CapAttrs::new(&["run"]).with_tool_policy(ToolPolicy {
-                    allowed: ["run"].iter().map(|name| name.to_string()).collect(),
-                    max_arg_bytes: 4 << 10,
-                    allow_process: false,
-                }),
+                CapAttrs::new(&["run"])
+                    .with_budget(fixture_budget())
+                    .with_tool_policy(ToolPolicy {
+                        allowed: ["run"].iter().map(|name| name.to_string()).collect(),
+                        max_arg_bytes: 4 << 10,
+                        allow_process: false,
+                    }),
             )
             .expect("denied process cap");
 
@@ -932,7 +958,9 @@ impl PlaneCore {
                 methods: vec!["stats".into(), "evaluate".into()],
                 max_calls: FIXTURE_CALLS,
                 read_only: true,
-                attenuated: true,
+                // A first-generation mint with read-only attrs, not an
+                // attenuation (R-19 round 4, F6).
+                attenuated: false,
             },
             CapInfo {
                 label: "mcp/echo",
@@ -948,7 +976,7 @@ impl PlaneCore {
                 methods: vec!["echo".into()],
                 max_calls: FIXTURE_CALLS,
                 read_only: false,
-                attenuated: true,
+                attenuated: false,
             },
             CapInfo {
                 label: "mcp/ceiling",
@@ -956,7 +984,7 @@ impl PlaneCore {
                 methods: vec!["echo".into()],
                 max_calls: FIXTURE_CALLS,
                 read_only: false,
-                attenuated: true,
+                attenuated: false,
             },
             CapInfo {
                 label: "http/health",
@@ -980,7 +1008,7 @@ impl PlaneCore {
                 methods: vec!["run".into()],
                 max_calls: FIXTURE_CALLS,
                 read_only: false,
-                attenuated: true,
+                attenuated: false,
             },
         ];
         let mut channels = Vec::new();
@@ -1466,7 +1494,13 @@ impl PlaneCore {
             budget_pressure: pressure,
             active_lanes,
             active_channels: self.channels.len(),
-            caps_live: self.caps.len(),
+            // A revoked row is not a live capability: the table used to report
+            // its own vector length (R-19 round 4, F6).
+            caps_live: self
+                .caps
+                .iter()
+                .filter(|info| self.agent.remaining_calls(&info.cap).is_ok())
+                .count(),
             queue_depth: metrics.calls_queued,
             wire_in_per_s: self.wire_in_per_s,
             wire_out_per_s: self.wire_out_per_s,
@@ -3041,11 +3075,21 @@ impl PlaneCore {
         let mut sequential = Vec::with_capacity(calls);
         for _ in 0..calls {
             let started = Instant::now();
+            // A refused fixture call is a report, not a panic: a panic here
+            // latched the sticky down flag for a spent budget (R-19 round 4,
+            // F1).
             let promise = self
                 .agent
                 .call(self.lane, &self.echo_cap, "echo", vec![Arg::text("bench")])
-                .expect("bench call");
-            self.await_value(&promise).expect("bench value");
+                .map_err(|error| {
+                    format!("the benchmark's fixture call was refused: {}", error.code())
+                })?;
+            self.await_value(&promise).map_err(|error| {
+                format!(
+                    "the benchmark's fixture reply was refused: {}",
+                    error.code()
+                )
+            })?;
             sequential.push(started.elapsed().as_secs_f64() * 1e6);
         }
         let sequential_us = start.elapsed().as_secs_f64() * 1e6;
@@ -3063,7 +3107,9 @@ impl PlaneCore {
             let mut promise = self
                 .agent
                 .call(self.lane, &self.echo_cap, "echo", vec![Arg::text("head")])
-                .expect("bench head");
+                .map_err(|error| {
+                    format!("the benchmark's fixture call was refused: {}", error.code())
+                })?;
             for _ in 0..9 {
                 promise = self
                     .agent
@@ -3073,9 +3119,19 @@ impl PlaneCore {
                         "echo",
                         vec![Arg::Promise(promise.id())],
                     )
-                    .expect("bench pipelined");
+                    .map_err(|error| {
+                        format!(
+                            "the benchmark's pipelined call was refused: {}",
+                            error.code()
+                        )
+                    })?;
             }
-            self.await_value(&promise).expect("bench value");
+            self.await_value(&promise).map_err(|error| {
+                format!(
+                    "the benchmark's fixture reply was refused: {}",
+                    error.code()
+                )
+            })?;
             // Ten dependent calls per sample; divide so sequential and
             // pipelined p50 values are both per call.
             pipelined.push(started.elapsed().as_secs_f64() * 1e6 / 10.0);
@@ -3137,6 +3193,7 @@ impl PlaneCore {
             .map_err(|error| error.to_string())?;
         self.refresh_status();
         Ok(json!({
+            "plane": "ok",
             "hash": hex(&hash),
             "image_bytes": bytes.len(),
             "bytes_base64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
@@ -3262,6 +3319,47 @@ mod ring_tests {
         assert!(
             spent < FIXTURE_HEADROOM,
             "one ladder and benchmark spent {spent} fixture calls, above the re-mint headroom"
+        );
+    }
+
+    /// A spent fixture grant must reach the caller as a report, not a panic: a
+    /// panic here latched the sticky down flag while `/health` still showed a
+    /// healthy grant (R-19 round 4, F1).
+    #[test]
+    fn a_spent_fixture_grant_is_a_report_not_a_panic() {
+        let mut core = PlaneCore::new();
+        // Disable the re-mint so the refusal is reachable in one call.
+        core.fixture_headroom = 0;
+        let provider = core.echo_provider;
+        let spent = Budget {
+            max_calls: 1,
+            ..fixture_budget()
+        };
+        core.echo_cap = core
+            .agent
+            .mint(
+                provider,
+                0,
+                CapAttrs::new(&["echo", "ping"]).with_budget(spent),
+            )
+            .expect("a one-call grant is valid");
+        let lane = core.lane;
+        let promise = core
+            .agent
+            .call(lane, &core.echo_cap, "ping", Vec::new())
+            .expect("the one call is admitted");
+        let _ = core.await_value(&promise);
+        assert_eq!(core.fixture_calls_remaining(), 0);
+        let outcome = core.run_benchmark(50);
+        assert!(
+            outcome.is_err(),
+            "a refused fixture call must be an Err, not a panic"
+        );
+        // The lane itself is sized for the process, so the refusal is the
+        // capability's.
+        assert!(
+            fixture_lane_budget().max_calls > FIXTURE_CALLS,
+            "the fixture lane is the first grant to run out"
         );
     }
 

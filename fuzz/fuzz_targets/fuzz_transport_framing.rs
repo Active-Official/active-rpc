@@ -29,6 +29,10 @@ fuzz_target!(|data: &[u8]| {
         ring.write(b"frame").expect("the fixed frame fits");
         let read = ring.read().expect("read").expect("a frame");
         assert_eq!(read, b"frame");
+        // `read` consumes the frame; `advance` is the call that releases the
+        // bytes when a reader only peeked, so the claim to pin here is that a
+        // consumed frame is released (R-20 round 6, finding 13).
+        assert_eq!(ring.consumed(), ring.produced());
         ring.advance().expect("advance");
         assert_eq!(ring.consumed(), ring.produced());
         let framed = grpc_frame(b"hello").expect("frame");

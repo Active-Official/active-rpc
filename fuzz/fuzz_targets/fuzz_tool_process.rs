@@ -17,7 +17,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use active_rpc::tool::LocalProcess;
-use active_rpc::{Arg, Budget, CapAttrs, ToolPolicy};
+use active_rpc::{Arg, Budget, CapAttrs, ToolPolicy, Value};
 
 #[path = "common.rs"]
 mod common;
@@ -35,7 +35,11 @@ fuzz_target!(|data: &[u8]| {
     // comes back. A policy that refused every argument used to pass
     // (R-20 round 5, F7).
     {
-        let tool = LocalProcess::new("/bin/sh", &["ok"]).expect("an absolute program");
+        // `/bin/echo` with the allowed argument: the response proves the child
+        // ran and its output came back, not only that the policy accepted the
+        // call. `/bin/sh ok` would have run a file named `ok` and a canned `Ok`
+        // would have passed the old check (R-20 round 6, finding 5).
+        let tool = LocalProcess::new("/bin/echo", &["ok"]).expect("an absolute program");
         let control = common::agent(&[0x05]);
         let provider = control.register(Box::new(tool));
         let lane = control
@@ -53,9 +57,17 @@ fuzz_target!(|data: &[u8]| {
         let promise = control
             .call(lane, &cap, "run", vec![Arg::text("ok")])
             .expect("the control call is queued");
+        let value = promise.value().expect("the allow-listed argument ran");
+        let Value::Map(fields) = value else {
+            panic!("the process reply is a map: {value:?}");
+        };
         assert!(
-            promise.value().is_ok(),
-            "the allow-listed argument was refused"
+            matches!(fields.get("status"), Some(Value::Int(0))),
+            "the child did not exit cleanly: {fields:?}"
+        );
+        assert!(
+            matches!(fields.get("stdout"), Some(Value::Text(text)) if text == "ok\n"),
+            "the child's output did not come back: {fields:?}"
         );
     }
     if data.is_empty() {

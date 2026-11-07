@@ -55,7 +55,14 @@ jobs:
         # `-max_total_time` bounds the campaign in-process: a cancelled job
         # skips its `always()` upload, so a job-timeout could lose the
         # crashing input the step exists to keep (R-20 round 5, F12).
-        run: cargo fuzz run "${{ matrix.target }}" -- -runs=200000 -max_total_time=900 -max_len=65536 -print_final_stats=1
+        run: |
+          # The lock must describe the graph the campaign builds (R-20 round 6,
+          # finding 9).
+          cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null
+          # `-runs` counts the seed corpus, so the budget is the corpus plus the
+          # mutation allowance (finding 2).
+          seeds=$(find "fuzz/corpus/${{ matrix.target }}" -type f | wc -l)
+          cargo fuzz run "${{ matrix.target }}" -- -runs=$((200000 + seeds)) -max_total_time=900 -max_len=65536 -print_final_stats=1
       # A crash input is the only thing that makes a nightly failure
       # reproducible: `fuzz/artifacts` is gitignored, so without this step the
       # artifact dies with the runner.

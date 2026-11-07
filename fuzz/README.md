@@ -87,7 +87,7 @@ capability the first kernel had minted itself.
 
 | Lane | Bound | Artifacts |
 |---|---|---|
-| Pull request and `main` | 2 000 runs per target | uploaded on failure |
+| Pull request and `main` | 2 000 runs per target plus the seed count | the crash input and the corpus, always |
 | Nightly (`fuzz-nightly.yml`) | 7 minutes per target (`FUZZ_SECONDS: 420`) | `fuzz/artifacts` and the grown corpus, always |
 | Nightly matrix (`nightly.yml`) | 200 000 runs or 15 minutes per target, 120-minute job timeout | the crash input always; the grown corpus only on failure |
 

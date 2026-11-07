@@ -49,7 +49,13 @@ pub enum Command {
 /// `400` (R-19 round 3, L2).
 #[derive(Debug, Clone)]
 pub enum CommandFailure {
+    /// The caller asked for something the plane does not do (an unknown
+    /// scenario id, a read-only plane).
     Refused(String),
+    /// The plane itself failed while producing the answer (a codec, hash or
+    /// projection fault). Not the caller's fault, so not a 400 (R-19 round 4,
+    /// F4).
+    Internal(String),
     Panicked,
 }
 
@@ -57,14 +63,16 @@ impl CommandFailure {
     fn status(&self) -> StatusCode {
         match self {
             CommandFailure::Refused(_) => StatusCode::BAD_REQUEST,
-            CommandFailure::Panicked => StatusCode::INTERNAL_SERVER_ERROR,
+            CommandFailure::Internal(_) | CommandFailure::Panicked => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 
     fn into_response(self) -> Response {
         let status = self.status();
         let detail = match self {
-            CommandFailure::Refused(detail) => detail,
+            CommandFailure::Refused(detail) | CommandFailure::Internal(detail) => detail,
             CommandFailure::Panicked => "the kernel worker panicked".to_string(),
         };
         (status, detail).into_response()
@@ -175,7 +183,18 @@ pub fn spawn_worker(read_only: bool) -> AppState {
         .spawn(move || {
             let mut core = PlaneCore::new();
             core.set_mode(if read_only { "read-only" } else { "demo" });
-            let first = core.snapshot();
+            // The first snapshot is worker code like any other: a panic here
+            // used to block startup for 30 s and then panic the spawner
+            // (R-19 round 4, F17).
+            let first =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| core.snapshot())) {
+                    Ok(first) => first,
+                    Err(_) => {
+                        let mut fallback = PlaneCore::new().snapshot();
+                        fallback.health.kernel = "down".to_string();
+                        fallback
+                    }
+                };
             let latest: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(first.clone()));
             let heartbeat = heartbeat_worker;
             if let Ok(mut beat) = heartbeat.lock() {
@@ -269,7 +288,7 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                         match outcome {
                             Ok(()) => {
                                 let report = report.unwrap_or_else(|| Err("no result".to_string()));
-                                let _ = reply.send(report.map_err(CommandFailure::Refused));
+                                let _ = reply.send(report.map_err(CommandFailure::Internal));
                             }
                             Err(error) => {
                                 let _ = reply.send(Err(error));
@@ -288,7 +307,7 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                         match outcome {
                             Ok(()) => {
                                 let status = status.unwrap_or_else(|| Err("no result".to_string()));
-                                let _ = reply.send(status.map_err(CommandFailure::Refused));
+                                let _ = reply.send(status.map_err(CommandFailure::Internal));
                             }
                             Err(error) => {
                                 let _ = reply.send(Err(error));
@@ -387,6 +406,22 @@ async fn guard(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    // HTTP/2 carries `:authority`; axum does not copy it into `host`, so a
+    // mutating h2c request with no `Host` used to skip both checks
+    // (R-19 round 4, F12). HTTP/1.1 clients that omit Host are malformed but
+    // are not the h2 case this closes.
+    let authority = request.uri().authority().map(|value| value.to_string());
+    let host = host.or(authority);
+    if request.method() != axum::http::Method::GET
+        && host.is_none()
+        && request.version() == axum::http::Version::HTTP_2
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "a mutating request must name its Host",
+        )
+            .into_response();
+    }
     if let Some(host) = &host {
         if !is_loopback_host(host) {
             return (StatusCode::FORBIDDEN, "unexpected Host").into_response();
@@ -458,13 +493,19 @@ pub fn is_loopback_host(host: &str) -> bool {
         if !tail.is_empty() && !tail.starts_with(':') {
             return false;
         }
-        return name.eq_ignore_ascii_case("::1");
+        // `[0:0:0:0:0:0:0:1]` is the same address as `[::1]`: parse it rather
+        // than compare text (R-19 round 4, F13).
+        return name
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|address| address.is_loopback());
     }
     if host.matches(':').count() > 1 {
         // A bare IPv6 address: ambiguous without brackets, so refused.
         return false;
     }
     let name = host.split_once(':').map(|(name, _)| name).unwrap_or(host);
+    // A trailing dot is the same name in DNS (`localhost.`).
+    let name = name.strip_suffix('.').unwrap_or(name);
     name.eq_ignore_ascii_case("127.0.0.1") || name.eq_ignore_ascii_case("localhost")
 }
 
@@ -532,12 +573,19 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         .map(|mut beat| beat.observe(snapshot.uptime_ms))
         .unwrap_or(false);
     Json(json!({
-        "ok": snapshot.health.kernel == "up" && ticking,
+        // A failed redaction probe and a spent fixture grant are unhealthy
+        // states an operator must see here, not only on `/metrics`
+        // (R-19 round 4, F9).
+        "ok": snapshot.health.kernel == "up"
+            && ticking
+            && snapshot.health.redaction_ok
+            && snapshot.health.fixture_calls_remaining > 0,
         "worker": if ticking { "live" } else { "stale" },
         "mode": snapshot.health.mode,
         "read_only": state.read_only,
         "redaction_ok": snapshot.health.redaction_ok,
         "audit_gap": snapshot.health.audit_gap,
+        "fixture_calls_remaining": snapshot.health.fixture_calls_remaining,
         "uptime_ms": snapshot.uptime_ms,
     }))
 }
@@ -608,13 +656,24 @@ pub(crate) fn since_envelope(
     cursor: u64,
     oldest: u64,
     dropped_through: u64,
+    newest: u64,
 ) -> serde_json::Value {
-    let next = events.last().map(|event| event.id).unwrap_or(cursor);
+    // A cursor above every id names another plane process: ids start at 1 and
+    // never go back, so a poller from a previous epoch is stuck at
+    // `count:0, gap:false` while the audit restarted under it (R-19 round 4,
+    // F8). It is a gap, and the cursor restarts so the next poll sees the
+    // whole window.
+    let stale = cursor > 0 && newest > 0 && cursor > newest;
+    let next = if stale {
+        0
+    } else {
+        events.last().map(|event| event.id).unwrap_or(cursor)
+    };
     json!({
         "count": events.len(),
         "cursor": next,
         "oldest": oldest,
-        "gap": ring_gap(cursor, dropped_through),
+        "gap": ring_gap(cursor, dropped_through) || stale,
         "events": events,
     })
 }
@@ -643,6 +702,7 @@ async fn logs_since(
     let cursor = query.id.unwrap_or(0);
     let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
     let dropped_through = snapshot.dropped_through;
+    let newest = snapshot.events.last().map(|event| event.id).unwrap_or(0);
     let events: Vec<_> = snapshot
         .events
         .into_iter()
@@ -652,7 +712,13 @@ async fn logs_since(
     // `oldest` alone missed it: a protected event pins the front while later
     // ids are evicted, so the poller was told "no gap" over a real hole
     // (R-19 round 3, M1).
-    Json(since_envelope(events, cursor, oldest, dropped_through))
+    Json(since_envelope(
+        events,
+        cursor,
+        oldest,
+        dropped_through,
+        newest,
+    ))
 }
 
 async fn logs_export(State(state): State<AppState>) -> Response {
@@ -792,7 +858,17 @@ async fn status_module(State(state): State<AppState>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "kernel busy or stopped").into_response();
     }
     match tokio::time::timeout(Duration::from_secs(20), rx).await {
-        Ok(Ok(Ok(value))) => Json(value).into_response(),
+        Ok(Ok(Ok(mut value))) => {
+            // `/status-module` used to answer `plane: "ok"` after a caught
+            // panic, contradicting every other read route
+            // (R-19 round 4, F2).
+            if state.down.load(Ordering::SeqCst) {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("plane".to_string(), serde_json::json!("down"));
+                }
+            }
+            Json(value).into_response()
+        }
         Ok(Ok(Err(failure))) => failure.into_response(),
         Ok(Err(_)) => (StatusCode::INTERNAL_SERVER_ERROR, "status reply dropped").into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "status timed out").into_response(),
@@ -1186,6 +1262,40 @@ mod worker_panic_tests {
         );
         assert_eq!(
             CommandFailure::Refused("bad level".to_string()).status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[cfg(test)]
+mod round4_tests {
+    use super::{since_envelope, CommandFailure};
+
+    /// A cursor above every id names another plane process: it is a gap, and
+    /// the cursor restarts so the next poll sees the window
+    /// (R-19 round 4, F8).
+    #[test]
+    fn a_cursor_from_a_previous_epoch_is_a_gap() {
+        let stale = since_envelope(Vec::new(), 9_000, 1, 0, 12);
+        assert_eq!(stale["gap"], serde_json::Value::Bool(true));
+        assert_eq!(stale["cursor"], serde_json::Value::from(0u64));
+        // A current cursor with nothing new is not a gap.
+        let current = since_envelope(Vec::new(), 12, 1, 0, 12);
+        assert_eq!(current["gap"], serde_json::Value::Bool(false));
+        assert_eq!(current["cursor"], serde_json::Value::from(12u64));
+    }
+
+    /// A plane-side failure is a 500; the caller's mistake stays a 400
+    /// (R-19 round 4, F4).
+    #[test]
+    fn a_plane_side_failure_is_a_server_error() {
+        use axum::http::StatusCode;
+        assert_eq!(
+            CommandFailure::Internal("encode".to_string()).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            CommandFailure::Refused("unknown scenario".to_string()).status(),
             StatusCode::BAD_REQUEST
         );
     }

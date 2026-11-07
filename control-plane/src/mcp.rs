@@ -117,6 +117,7 @@ impl Attach {
             let mut core = local.lock().map_err(|_| "plane poisoned".to_string())?;
             let snapshot = core.snapshot();
             let oldest = snapshot.events.first().map(|event| event.id).unwrap_or(0);
+            let newest = snapshot.events.last().map(|event| event.id).unwrap_or(0);
             let dropped_through = snapshot.dropped_through;
             let events = snapshot
                 .events
@@ -128,6 +129,7 @@ impl Attach {
                 cursor,
                 oldest,
                 dropped_through,
+                newest,
             ));
         }
         self.get(&format!("/logs/since?id={cursor}"))
@@ -532,7 +534,7 @@ mod tests {
             assert!(tail.get(key).is_some(), "tail envelope is missing {key}");
         }
         assert_eq!(tail["truncated"], serde_json::Value::Bool(true));
-        let since = crate::server::since_envelope(Vec::new(), 3, 7, 9);
+        let since = crate::server::since_envelope(Vec::new(), 3, 7, 9, 12);
         for key in ["count", "cursor", "oldest", "gap", "events"] {
             assert!(since.get(key).is_some(), "since envelope is missing {key}");
         }

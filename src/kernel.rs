@@ -6763,7 +6763,13 @@ impl Kernel {
         };
         self.next_receipt = next;
         let decision = match refusal {
-            Some(error) => crate::receipts::Decision::Refused(error.code().to_string()),
+            // The envelope collapses a provider failure to `rpc/provider`, but
+            // a receipt is a local audit record: it keeps the provider's own
+            // code when the format can carry it, so a `wasm/trap` in a receipt
+            // is attributable (R-13 round 14, F5). A code the receipt format
+            // refuses falls back to the envelope class, because a hostile
+            // provider string must not make the ring unexportable.
+            Some(error) => crate::receipts::Decision::Refused(receipt_refusal_code(error)),
             None => crate::receipts::Decision::Admitted,
         };
         let receipt = crate::receipts::Receipt::seal(
@@ -7051,6 +7057,19 @@ fn method_event_label(method: &str) -> String {
 /// one the receipt format cannot hold: that name is escaped and bounded like an
 /// event label, so the refusal is still exportable and still distinguishes
 /// names that share a prefix.
+/// The code a receipt records for a refusal.
+///
+/// A provider's inner code when the receipt format can carry it, otherwise the
+/// envelope class. Total by construction: [`crate::receipts::valid_method`]'s
+/// sibling rule (`valid_code`) is the only gate, so a hostile provider string
+/// cannot make the ring unexportable (R-13 round 14, F5).
+fn receipt_refusal_code(error: &Error) -> String {
+    match error {
+        Error::Provider { code } if crate::receipts::valid_code(code) => code.clone(),
+        other => other.code().to_string(),
+    }
+}
+
 fn receipt_method(method: &str) -> String {
     if crate::receipts::valid_method(method) {
         return method.to_string();

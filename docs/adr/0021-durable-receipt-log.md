@@ -191,8 +191,15 @@ names the round where the rule lives.
 
 Accepted residuals: the check-then-open race on the lock path (a local user with
 directory write can deny the log; an `O_NOFOLLOW` on the log path narrows the
-same class for the log itself), orphan files left by a killed process until their
-age passes the ceiling, and the chain not being authenticity (the receipt MAC is).
+same class for the lock and for the log itself), orphan files left by a killed
+process until their age passes the ceiling, and the chain not being authenticity
+(the receipt MAC is). **Off unix** there is no stable file identity at the MSRV,
+so `(dev, ino)` comparisons are skipped there: the reader and the append fast
+path keep the length, header and trailing-head checks, and a local writer who
+can replace the file with a same-length copy is not detected. A deployment that
+needs assurance on a non-unix host should read through a pinned head
+(`--expect-head`) and the MAC, which do not depend on identity
+(R-13 round 14, F2).
 
 `receipts verify` and the `--receipt-key-file` / `--expect-head` flags live in
 the CLI crate that consumes this library; this ADR describes the library

@@ -26,14 +26,14 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs` | rounds 1-5: round 5 found no critical/high/medium (CLEAN) and 12 lows (2 fixed); round 6 must be clean to close | 32 fixed / 0 rejected / 10 noted | this commit |
-| R-13 | receipts | `src/receipts.rs` | rounds 1-13: r13 found two highs (the per-chunk check and the verified handle were claimed but absent) and three mediums, all fixed; r14 and r15 must be clean | 73 fixed / 0 rejected / 1 residual (no OS-level lock) | this commit |
+| R-13 | receipts | `src/receipts.rs` | rounds 1-14: r14 found the append cache trusting a same-length copy (medium) and the reader's missing `O_NOFOLLOW`, both fixed; r15 and r16 must be clean | 77 fixed / 0 rejected / 2 residuals (no OS-level lock; no non-unix identity) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-14: r14 found four highs (uncovered carriers, the non-sticky address set, the provenance text, binary copies), all fixed; r15 and r16 must be clean | 63 fixed / 0 rejected / 5 noted | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-10: r10 found the residency charge (medium) and four lows, all fixed; r11 and r12 must be clean | 68 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
-| R-19 | control-plane | `control-plane/**` | rounds 1-3: M1-M3 and all nine lows fixed (round 3's M2 panic boundary, M3 lifetime fixtures); r4 and r5 must be clean | 49 fixed / 0 rejected / 0 open (3 documented) | this commit |
-| R-20 | fuzz | `fuzz/**` | rounds 1-5: r5 found the local lane's missing `import os` (high) and the decoder controls' absence, all fixed; r6 and r7 must be clean | 46 fixed / 0 rejected / 1 noted (2 residuals) | this commit |
+| R-19 | control-plane | `control-plane/**` | rounds 1-4: r4 found the lane grant (high) and nine mediums; F1-F9, F12, F13 and F17 fixed, six lows open for r5 | 61 fixed / 0 rejected / 6 open (3 documented) | this commit |
+| R-20 | fuzz | `fuzz/**` | rounds 1-6: r6 found the control gate and five controls could pass on a broken implementation (high + mediums), all fixed; r7 and r8 must be clean | 58 fixed / 0 rejected / 1 noted (4 residuals) | this commit |
 
 ## Cross-cutting passes (after the sections)
 
@@ -134,6 +134,88 @@ Reviewer: DeepSeek through Token Harbor, `max`, read-only at `6de1973`. Verdict
 | F10 | low | an answer delivered while receipts were disabled suppressed the dispatch receipt for ever | **fixed**: dispatch seals through the `receipted` flag alone; `receipt_round3_tests::an_in_flight_resolve_while_receipts_were_disabled_still_yields_one_receipt` (negative control: zero receipts) |
 
 Gate: green; both feature sets; fmt and doc clean. R-13 needs r13 and r14 clean.
+
+### R-19 control plane - 2026-11-07 (round 4)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `f849b06`. Verdict
+**NOT CLEAN**: one high, nine mediums and eight lows. The round-3 fixes held but
+were incomplete in the places they mattered: the lane, the status document and
+the semantics of the gap row.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | the fixture **lane** is charged before the capability and was never refreshed: a benchmark crossing it panicked into the sticky down flag while `/health` showed a healthy grant | **fixed**: `fixture_lane_budget` sizes the lanes for the process, the benchmark's fixture calls map a refusal to `Err` instead of panicking, and `a_spent_fixture_grant_is_a_report_not_a_panic` drives it |
+| F2 | medium | `/status-module` returned `plane: "ok"` after a caught panic | **fixed**: the handler stamps `plane: "down"` when the flag is set (`a_down_plane_says_so_in_the_status_module`) |
+| F3 | medium | a scenario panic was contained but the spec said it marked the kernel down | **fixed in the contract**: `scenario/failed` is documented as contained per scenario; the down flag is for a worker or snapshot panic, where the core's state is unknown |
+| F4 | medium | a plane-side status/benchmark failure answered 400 | **fixed**: `CommandFailure::Internal` maps to 500 (`a_plane_side_failure_is_a_server_error`) |
+| F5 | medium | the dashboard row called skipped snapshots "events dropped by the ring" and ignored the ring's own loss bit | **fixed**: the frame row is labelled "missed updates", a separate row follows `health.audit_gap`, and the count resets per connection |
+| F6 | medium | the capability table misstated grants and attenuation, and `caps_live` was the table's length | **fixed**: the four first-generation mints are no longer labelled attenuated, the denied process cap carries the grant its row claims, and `caps_live` counts handles the kernel still knows |
+| F7 | medium | refresh revoked before minting, so a failed mint left no fixture | **fixed**: mint first, revoke the old handles only after a success |
+| F8 | medium | a cursor from a previous plane epoch was stuck at `count:0, gap:false` | **fixed**: `since_envelope` treats a cursor above every id as a gap and restarts it (`a_cursor_from_a_previous_epoch_is_a_gap`) |
+| F9 | medium | `/health.ok` ignored the redaction probe and the fixture grant | **fixed**: both are part of `ok` and the grant is reported (`health_reports_the_fixture_grant`) |
+| F10 | medium | the HTTP stub spawned an unbounded thread per connection and could die silently | **open** for r5: needs a live-thread cap and a panic boundary around the accept loop |
+| F11 | low | `/ws` is unbounded and each tick deep-clones the snapshot per socket | **open** for r5 |
+| F12 | low | h2c without `:authority` skipped both host checks | **fixed**: an HTTP/2 mutating request must name its Host; HTTP/1.1 without one is malformed rather than the h2 case |
+| F13 | low | expanded IPv6 and `localhost.` were false refusals | **fixed**: the address is parsed and a trailing dot is stripped |
+| F14 | low | `same_origin` does not compare the scheme when the Host carries a port | **open** for r5 |
+| F15 | low | the embedded MCP fallback's snapshot is unguarded and the redirect test bypasses `Attach::new` | **open** for r5 |
+| F16 | low | every `tools/call` failure is JSON-RPC `-32602` | **open** for r5 |
+| F17 | low | the worker's first snapshot was outside the panic boundary | **fixed**: it is caught and a down snapshot is published |
+| F18 | low | after a sticky down, commands still execute on the unverified core | **open** for r5 |
+
+The six open lows are recorded here, not silently dropped: r5 takes them before
+the section can close.
+
+Gate: green; control-plane 28 integration + 21 unit tests; fmt and clippy clean.
+
+### R-13 receipts - 2026-11-07 (round 14)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `58b0a4e`. Verdict
+**NOT CLEAN**: two mediums and four lows. The round-13 write path held; the
+append cache and the non-unix identity did not.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | medium | the append fast path trusted length + header + trailing head, so a same-length copy with one edited middle record was appended to | **fixed**: `LogState` carries the file identity the walk came from, the fast path requires it to match, and `read_header_start` validates the whole 16-byte header (version and reserved flags); `an_interior_edit_behind_a_same_length_copy_is_not_trusted` (unix) fails on a mutation that trusts the cache |
+| F2 | medium | the reader's open had no `O_NOFOLLOW`; `same_identity` is a no-op off unix; `Cargo.toml` and the ADR claimed guarantees that did not exist | **fixed**: `open_log_read` (O_NOFOLLOW, handle type) is used by the reader, the header and tail probes and the lock state; ADR-0021 states the non-unix residual (no stable identity at the MSRV: use the pinned head and the MAC) |
+| F3 | low | `repair`'s truncate and `install_staged`'s rename were separated from the ownership check | **no change**: both already re-check `still_holds` immediately before the syscall (the reviewer read the first check); the OS-lock residual stands |
+| F4 | low | `<log>.lock` is a legal log name, so a sibling log was judged as a lock and deleted by the steal | **fixed**: lock content is magic-prefixed and a file without the magic is unjudgeable and preserved; `a_foreign_file_at_the_lock_path_is_not_stolen` |
+| F5 | low | a receipt collapsed every provider failure to `rpc/provider`, so the spec's `wasm/trap` attribution was unreachable | **fixed**: `receipt_refusal_code` seals the inner code when `valid_code` accepts it; `a_receipt_records_the_providers_own_code`; the wire spec and ADR-0019 agree |
+| F6 | low | a failed lock write unlinked the path without an ownership check | **fixed**: the unlink requires the handle's identity (unix) or the nonce (else) |
+
+Gate: green; both feature sets; the unix-only tests and Linux clippy ran in
+`rust:1.99`; fmt, clippy and doc clean. R-13 needs r15 and r16 clean.
+
+### R-20 fuzz program - 2026-11-07 (round 6)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `58b0a4e` (the r5
+tree). Verdict **NOT CLEAN**: one high, nine mediums and four lows. The fuzz
+program's controls could pass on a broken implementation, and the lanes'
+budgets were not what they claimed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the control gate matched the word "assert" in the control's own comment and a guard-less target's whole tail | **fixed**: comments and literals are stripped, the region ends at the first use of `data`, and each control now asserts a real outcome (`strip_non_code`); deleting a control block fails the test (proved by mutation) |
+| 2 | medium | `-runs` counts the seed corpus, so a corpus at the budget fuzzed zero times | **fixed**: both count-bounded lanes compute `runs = allowance + seeds` |
+| 3 | medium | the derivation was executed but not connected to the loop | **fixed**: the test requires `for target in $targets` + `cargo fuzz run "$target"` (or the nightly `fromJSON` matrix), and a commented here-doc is skipped |
+| 4 | medium | `fuzz_persistence_record` asserted every parsed record fails under the public `FOREIGN` key, so a legitimate seed panicked | **fixed**: the assertion is gone; the fixed probe still proves key separation |
+| 5 | medium | the process control accepted a canned `Ok` | **fixed**: `/bin/echo ok`, and the reply's `status` and `stdout` are asserted, in the target and in `fuzz_controls_tests` |
+| 6 | medium | the HTTP control accepted any `rpc/provider`, so a pre-network refusal passed | **fixed**: a loopback stub answers `{"ok":true}` and the body is asserted |
+| 7 | medium | the MCP control only handshook; the echo call's value was ignored | **fixed**: the control asserts `content[0].text == "ok"` |
+| 8 | medium | the wasm and domain controls proved construction/installation only | **fixed**: the wasm control runs a guest that writes a byte at the output offset and asserts it; the domain control calls `stats` and asserts a map |
+| 9 | medium | no lane checked the committed `fuzz/Cargo.lock` | **fixed**: every lane and `scripts/fuzz_docker.py` run `cargo metadata --locked` on the fuzz crate, and the lane test requires it |
+| 10 | medium | the manifest was parsed by a line prefix, so `name="fuzz_new"` and a mismatched `path` were invisible | **fixed**: `manifest_targets` parses TOML with `tomllib` and requires the canonical name and `path` |
+| 11 | low | `--all` was untested | **not fixed**: the harness drives `--target`; `--all` selects `TARGETS`, which `--list` proves |
+| 12 | low | the fixed container name lets one campaign kill another | **not fixed**: distinct targets have distinct names; the same target twice is a deliberate replace |
+| 13 | low | the ring control called `read` (which consumes) before `advance` | **fixed**: the control asserts the consumed/produced invariant after `read` |
+| 14 | low | the docs said 9 negative controls (11), artifacts "on failure" (always), R-20 at round 4 | **fixed** |
+
+Recorded note: the fixed controls run per input, which costs campaign
+throughput; the receipt, process, HTTP and wasm controls are the expensive ones
+and are candidates for `Once` wrapping if a target's exec/s becomes a limit.
+
+Gate: green; both feature sets; fuzz crate clippy clean. R-20 needs r7 and r8
+clean.
 
 ### R-16 security helpers - 2026-11-07 (round 14)
 

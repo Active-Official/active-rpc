@@ -20,26 +20,36 @@ fn repo(relative: &str) -> String {
 }
 
 /// Target names declared by `[[bin]]` in the fuzz manifest.
+///
+/// Parsed as TOML, not by a line prefix: `name="fuzz_new"` and a `path` that
+/// points elsewhere both built a target no lane derived (R-20 round 6, finding
+/// 10). The parser also proves each entry's `path` is the conventional file.
 fn manifest_targets() -> BTreeSet<String> {
+    let script = r#"
+import pathlib, tomllib
+data = tomllib.loads(pathlib.Path("fuzz/Cargo.toml").read_text())
+for entry in data.get("bin", []):
+    print(f"{entry.get('name', '')}\t{entry.get('path', '')}")
+"#;
+    let listed = run_python(script);
     let mut targets = BTreeSet::new();
-    for line in repo("fuzz/Cargo.toml").lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("name = \"") else {
-            continue;
-        };
-        let Some(name) = rest.strip_suffix('"') else {
-            continue;
-        };
-        // The same pattern every lane derives with: a mixed-case name passed
-        // the old check and was then run by no lane (R-20 round 5, F6).
-        if name.strip_prefix("fuzz_").is_some_and(|rest| {
-            !rest.is_empty()
-                && rest
-                    .chars()
-                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-        }) {
-            targets.insert(name.to_string());
-        }
+    for line in listed.lines().filter(|line| !line.trim().is_empty()) {
+        let (name, path) = line.split_once('\t').unwrap_or((line, ""));
+        assert!(
+            name.strip_prefix("fuzz_").is_some_and(|rest| {
+                !rest.is_empty()
+                    && rest
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+            }),
+            "a fuzz bin has a noncanonical name: {name:?}"
+        );
+        assert_eq!(
+            path,
+            format!("fuzz_targets/{name}.rs"),
+            "{name} points at {path:?}, not its conventional source"
+        );
+        targets.insert(name.to_string());
     }
     targets
 }
@@ -102,9 +112,21 @@ fn parse_names(output: &str) -> BTreeSet<String> {
 /// way the YAML block scalar dedents it.
 fn lane_derivation(lane: &str) -> String {
     let text = repo(lane);
-    let start = text
-        .find("<<'PY'")
-        .unwrap_or_else(|| panic!("{lane} no longer derives its targets with a here-doc"));
+    // A commented here-doc earlier in the file must not stand in for the one
+    // the lane runs (R-20 round 6, finding 3).
+    let mut start = None;
+    let mut search = 0;
+    while let Some(found) = text[search..].find("<<'PY'") {
+        let at = search + found;
+        let line_start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+        if !text[line_start..at].trim_start().starts_with('#') {
+            start = Some(at);
+            break;
+        }
+        search = at + 6;
+    }
+    let start =
+        start.unwrap_or_else(|| panic!("{lane} no longer derives its targets with a here-doc"));
     let rest = &text[start + "<<'PY'".len()..];
     let mut lines: Vec<&str> = Vec::new();
     for line in rest.lines().skip(1) {
@@ -171,6 +193,29 @@ fn every_lane_derives_exactly_the_manifest_targets() {
             "{lane}'s derivation does not match fuzz/Cargo.toml"
         );
     }
+    // The derivation is only half the lane: the loop has to consume it. A lane
+    // with the right here-doc and a hand-copied list passed the earlier form
+    // (R-20 round 6, finding 3).
+    for lane in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/fuzz-nightly.yml",
+    ] {
+        let text = repo(lane);
+        assert!(
+            text.contains("for target in $targets"),
+            "{lane} does not loop over the derived list"
+        );
+        assert!(
+            text.contains("cargo fuzz run \"$target\"")
+                || text.contains("cargo fuzz run \"$target\" --"),
+            "{lane} does not run the loop variable"
+        );
+    }
+    let nightly = repo(".github/workflows/nightly.yml");
+    assert!(
+        nightly.contains("target: ${{ fromJSON(needs.plan.outputs.targets) }}"),
+        "nightly.yml does not take its matrix from the derived list"
+    );
     // The prose documents name every target.
     for lane in ["fuzz/README.md", "docs/hardening/CORPUS.md"] {
         let text = repo(lane);
@@ -186,6 +231,10 @@ fn the_local_lane_reads_the_manifest() {
     // exists to prevent.
     let script = repo("scripts/fuzz_docker.py");
     assert!(script.contains("fuzz/Cargo.toml") || script.contains("Cargo.toml"));
+    assert!(
+        script.contains("metadata --locked"),
+        "scripts/fuzz_docker.py does not check the committed fuzz lock"
+    );
     assert!(
         !script.contains("\"fuzz_arp1_frame\""),
         "scripts/fuzz_docker.py hard-codes a target list"
@@ -304,6 +353,13 @@ fn every_fuzz_lane_pins_its_tools_and_its_token() {
             !text.contains("contents: write") && !text.contains("write-all"),
             "{lane} grants a write scope"
         );
+        // The committed lock is the graph the campaign builds; a lane that does
+        // not check it resolves and rewrites a stale one silently (R-20 round 6,
+        // finding 9).
+        assert!(
+            text.contains("cargo metadata --locked"),
+            "{lane} does not check the fuzz crate's committed lock"
+        );
         // A pinned string in a comment while a second, unpinned `cargo install`
         // does the work passed the earlier `contains` check (F8).
         let installs: Vec<&str> = text
@@ -353,15 +409,74 @@ fn every_target_asserts_a_fixed_control_before_its_input() {
             .to_lowercase()
             .find("positive control")
             .unwrap_or_else(|| panic!("{target} has no fixed positive control"));
-        let guard = source.find("if data.is_empty()").unwrap_or(source.len());
-        assert!(
-            marker < guard,
-            "{target} runs its positive control after the empty-input guard"
-        );
-        let region = &source[marker..guard];
+        // The region ends at the first use of the fuzzed input, not at the
+        // guard: four targets have no guard, so the old window was the whole
+        // rest of the file and any later assertion satisfied it (R-20 round 6,
+        // finding 1). Comments and string literals are stripped before the
+        // token check, so the marker comment itself cannot count.
+        let rest = &source[marker..];
+        let end = rest.find("data").unwrap_or(rest.len());
+        let region = strip_non_code(&rest[..end]);
         assert!(
             region.contains("assert") || region.contains("expect("),
-            "{target}'s control does not assert an outcome"
+            "{target}'s control does not assert an outcome before touching the input"
         );
     }
+}
+
+/// Rust source with comments and literal bodies blanked.
+///
+/// A token check on raw text matched the word "assert" inside the control's own
+/// comment (R-20 round 6, finding 1).
+fn strip_non_code(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"//") {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            while index < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[index] == b'"' {
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index += 2;
+                } else if bytes[index] == b'"' {
+                    index += 1;
+                    break;
+                } else {
+                    index += 1;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        if bytes[index] == b'\'' {
+            // A char literal closes within a few bytes; a lifetime does not, so
+            // a quote with no nearby partner is copied as code.
+            let close = bytes[index + 1..]
+                .iter()
+                .take(4)
+                .position(|byte| *byte == b'\'');
+            if let Some(offset) = close {
+                index += offset + 2;
+                out.push(' ');
+                continue;
+            }
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
 }

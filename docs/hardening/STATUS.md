@@ -156,7 +156,7 @@ Run: `python scripts/negative_controls.py --check`. CI job `negative-controls`.
 | `cargo package --locked` | pass | local run 2026-10-27 |
 | `cargo audit` / `cargo deny check` | pass (1 allowed warning) | local run + CI `supply-chain` |
 | Fuzz campaigns (16 targets) | pass | CI 2k/target; nightly 200k/target, artifacts uploaded |
-| Negative controls (9) | pass | local run + CI `negative-controls` |
+| Negative controls (11) | pass | local run + CI `negative-controls` |
 | 32-bit i686 lane | pass | `scripts/check_32bit.sh`, Docker |
 | Benchmark matrix | checked in | `benches/transport.rs`, `docs/spec/performance.md` |
 | Perf budgets | pass | `cargo test --test perf_budget` |

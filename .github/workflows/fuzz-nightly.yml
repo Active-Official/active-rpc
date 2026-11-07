@@ -30,6 +30,9 @@ jobs:
         env:
           FUZZ_SECONDS: "420"
         run: |
+          # The lock must describe the graph the campaign builds (R-20 round 6,
+          # finding 9).
+          cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null
           targets=$(python3 - <<'PY'
           import pathlib, re
           text = pathlib.Path("fuzz/Cargo.toml").read_text()

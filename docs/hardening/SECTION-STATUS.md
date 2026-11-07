@@ -31,7 +31,7 @@ Updated 2026-11-06 at `cf5f969`.
 | R-17 | introduction / topics | 8 | open | r8 corrected the memory estimate (map leaf nodes, double-charged list slots, deque guard) and made `intro()` skip an undescribable provider instead of failing; r9 and r10 must be clean |
 | R-18 | CLI | 2 | open | r2 had one high and eight mediums, all fixed; r3 and r4 needed |
 | R-19 | control plane | 3 | open | r3's M1 (the audit-gap signal was wrong when a protected event pinned `oldest`) is fixed and tested; M2, M3 and nine lows are open |
-| R-20 | fuzz program | 4 | open | r4 found a swallowed panic on the replay wrapper (high), three target/CI mediums and nine lows, all fixed; the corpus is deduplicated and carries the header-latency seed; r5 and r6 must be clean |
+| R-20 | fuzz program | 6 | open | r5 found the local lane's missing `import os` (high) and the decoder controls' absence; r6 found that the static control gate and five controls could pass on a broken implementation, that `-runs` counted the corpus, and that the fuzz lock was unchecked, all fixed; r7 and r8 must be clean |
 
 ## What "closed" means here
 

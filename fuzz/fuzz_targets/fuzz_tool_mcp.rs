@@ -47,6 +47,42 @@ fuzz_target!(|data: &[u8]| {
     // empty-input guard so no input can skip it (round 4, #5).
     let session = McpSession::handshake(MemoryTransport::new(responses()))
         .expect("the fixed fixture handshakes");
+    // And the data path must work: a handshake that succeeds while `invoke`
+    // refuses every call passed the old control (R-20 round 6, finding 7).
+    {
+        let control = common::agent(&[0x07]);
+        let policy = session.policy();
+        let provider = control.register(Box::new(session));
+        let lane = control
+            .create_lane("control", Budget::default())
+            .expect("the control lane");
+        let cap = control
+            .mint(
+                provider,
+                0,
+                CapAttrs::new(&["echo"])
+                    .with_budget(Budget::default())
+                    .with_tool_policy(policy),
+            )
+            .expect("the control method is granted");
+        let promise = control
+            .call(lane, &cap, "echo", vec![Arg::text("hi")])
+            .expect("the control call is queued");
+        let value = promise.value().expect("the fixed echo answers");
+        let Value::Map(fields) = &value else {
+            panic!("the MCP reply is a map: {value:?}");
+        };
+        let text = match fields.get("content") {
+            Some(Value::List(items)) => items.first(),
+            _ => None,
+        };
+        assert!(
+            matches!(text, Some(Value::Map(item)) if matches!(item.get("text"), Some(Value::Text(body)) if body == "ok")),
+            "the fixed tools/call answer did not come back: {value:?}"
+        );
+    }
+    let session = McpSession::handshake(MemoryTransport::new(responses()))
+        .expect("the fixed fixture handshakes a second time");
     if data.is_empty() {
         return;
     }

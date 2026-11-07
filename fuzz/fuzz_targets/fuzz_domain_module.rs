@@ -44,9 +44,30 @@ fuzz_target!(|data: &[u8]| {
     let fixed = active_rpc::domain::module_from_source("[a]\nx = 1\n", "fixed")
         .expect("the fixed module");
     let fixed_image = active_infinity::encode(&fixed).expect("the fixed image encodes");
-    ModuleProvider::new()
-        .install_canonical_image(&fixed_image)
-        .expect("the canonical image installs");
+    // Installation is half the path: a provider that answers every call with
+    // `rpc/provider` passed a control that only installed (R-20 round 6,
+    // finding 8). The fixed module answers `stats`.
+    {
+        let mut provider = ModuleProvider::new();
+        provider
+            .install_canonical_image(&fixed_image)
+            .expect("the canonical image installs");
+        let agent = Agent::with_secret([0x32; 32]);
+        let id = agent.register(Box::new(provider));
+        let cap = agent
+            .mint(id, 0, CapAttrs::new(&["stats"]))
+            .expect("the fixed capability");
+        let lane = agent
+            .create_lane("fixed", Budget::default())
+            .expect("the fixed lane");
+        let promise = agent.call(lane, &cap, "stats", Vec::new()).expect("queued");
+        agent.run();
+        let value = promise.value().expect("the fixed module answers stats");
+        assert!(
+            matches!(value, Value::Map(_)),
+            "the fixed stats answer is a map: {value:?}"
+        );
+    }
 
     if data.is_empty() {
         return;

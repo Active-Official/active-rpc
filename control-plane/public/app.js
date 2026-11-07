@@ -685,9 +685,17 @@
 		setText("event-count", `${events.length} of ${total} events`);
 		const cursor = total ? snapshot.events[total - 1].id : 0;
 		setText("log-cursor", `cursor ${cursor}`);
-		const gapRow = state.eventGaps
-			? `<li class="event-gap"><time>--:--:--</time><span class="cat cat-system">gap</span><b>audit gap</b><span class="detail">${state.eventGaps} events were dropped by the server ring; this log is not the whole run</span><span class="meta"></span></li>`
+		// Two different losses: frames this socket missed (a count of
+		// updates, not events) and events the server's ring dropped for
+		// good (its own sticky `audit_gap` bit). Labelling the first as
+		// event loss cried wolf; ignoring the second hid a real hole
+		// (R-19 round 4, F5).
+		const ringGap = snapshot?.health?.audit_gap
+			? `<li class="event-gap"><time>--:--:--</time><span class="cat cat-system">gap</span><b>audit gap</b><span class="detail">the server ring has dropped events; /logs/since reports the hole</span><span class="meta"></span></li>`
 			: "";
+		const gapRow = state.eventGaps
+			? `${ringGap}<li class="event-gap"><time>--:--:--</time><span class="cat cat-system">gap</span><b>missed updates</b><span class="detail">${state.eventGaps} snapshots were skipped by this socket; the log may be behind</span><span class="meta"></span></li>`
+			: ringGap;
 		$("event-log").innerHTML =
 			gapRow +
 			(events.length
@@ -1185,6 +1193,9 @@
 			}
 		});
 		ws.addEventListener("close", () => {
+			// Per connection: a reconnect starts a fresh socket and a fresh count
+			// (R-19 round 4, F5).
+			state.eventGaps = 0;
 			setStatus("reconnecting", "error");
 			const delay = Math.min(10_000, 500 * 2 ** state.retry++);
 			setTimeout(connect, delay);

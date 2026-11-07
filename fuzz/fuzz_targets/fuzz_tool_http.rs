@@ -40,7 +40,27 @@ fuzz_target!(|data: &[u8]| {
     // refusal is a transport class and never a policy one. A tool that refused
     // every path used to pass (R-20 round 5, F7).
     {
-        let tool = HttpTool::new("http://127.0.0.1:1", &[("GET", "/safe")]);
+        // A real loopback stub: the allowed path must reach it and its body must
+        // come back. Accepting a provider error proved only that the call was
+        // not refused by policy (R-20 round 6, finding 6).
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("the control stub binds");
+        let address = listener.local_addr().expect("the control stub address");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let body = r#"{"ok":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let tool = HttpTool::new(format!("http://{address}"), &[("GET", "/safe")]);
         let control = common::agent(&[0x04]);
         let provider = control.register(Box::new(tool));
         let lane = control
@@ -63,16 +83,13 @@ fuzz_target!(|data: &[u8]| {
                 vec![Arg::Value(Value::path("/safe".to_string()))],
             )
             .expect("the control call is queued");
-        let error = promise
+        let value = promise
             .value()
-            .expect_err("port 1 is closed, so the allowed path must fail at the transport");
-        assert!(
-            matches!(
-                error.code(),
-                "rpc/provider" | "rpc/transport" | "rpc/timeout" | "rpc/transport-unavailable"
-            ),
-            "the allowed path was refused by policy: {}",
-            error.code()
+            .expect("the allowed path reached the control stub");
+        assert_eq!(
+            value,
+            Value::map([("ok", Value::Bool(true))]),
+            "the allowed path's body did not come back"
         );
     }
     if data.is_empty() {

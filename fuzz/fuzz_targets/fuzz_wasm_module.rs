@@ -44,17 +44,28 @@ fn policy() -> WasmHostPolicy {
 
 fuzz_target!(|data: &[u8]| {
     // Fixed positive control: a minimal module must be accepted, or the
-    // construction branch below is dead (R-20 round 3, H1).
-    let wat = r#"(module (func (export "run") (result i32) i32.const 7))"#;
-    WasmTool::from_bytes_with_policy(
-        wat.as_bytes(),
-        LIMITS,
-        WasmHostPolicy {
-            accept_wat: true,
-            ..policy()
-        },
-    )
-    .expect("the fixed wat module compiles");
+    // construction branch below is dead (R-20 round 3, H1). It must also *run*:
+    // a sandbox that refuses every call passed a construction-only control
+    // (R-20 round 6, finding 8).
+    {
+        // The guest writes one byte at the output offset and returns its
+        // length, so the control proves the ABI end to end.
+        let wat = r#"(module (memory (export "memory") 2)
+  (func (export "run") (param i32) (result i32)
+    i32.const 65536 i32.const 65 i32.store8
+    i32.const 1))"#;
+        let mut tool = WasmTool::from_bytes_with_policy(
+            wat.as_bytes(),
+            LIMITS,
+            WasmHostPolicy {
+                accept_wat: true,
+                ..policy()
+            },
+        )
+        .expect("the fixed wat module compiles");
+        let output = tool.call(&[]).expect("the fixed module runs");
+        assert_eq!(output, vec![65], "the guest's output did not come back");
+    }
 
     // A limit that asks for more than the ceiling allows is refused, so a
     // caller cannot buy an unbounded table or memory by widening the policy.

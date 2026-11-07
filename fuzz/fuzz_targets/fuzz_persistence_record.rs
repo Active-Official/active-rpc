@@ -72,13 +72,12 @@ fuzz_target!(|data: &[u8]| {
 
     match CapabilityRecord::from_json(text) {
         Ok(record) => {
-            // 2. The parser is not a verifier: a record with a seal must not
-            //    verify under a key it was not sealed with, and one without a
-            //    seal never verifies at all.
-            assert!(
-                !record.seal_is_valid(&FOREIGN),
-                "a record verified under a key it was not sealed with"
-            );
+            // The parser is not a verifier, but `FOREIGN` is a public key and a
+            // record sealed under it is legitimate: asserting that *every*
+            // parsed record fails under `FOREIGN` panicked on such a seed
+            // (R-20 round 6, finding 4). The fixed probe above proves the key
+            // separation; here a record verifies only under the key that
+            // sealed it.
             // Seal the parsed record ourselves, then edit a field that always
             // changes: the earlier edit inserted a method name, which is a
             // no-op when the record already grants it (R-20 round 4, #2).

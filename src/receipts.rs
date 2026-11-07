@@ -222,6 +222,14 @@ struct LogState {
     /// `at_ms` of the last record, so a writer refuses a record the reader
     /// would reject for running backwards in time.
     last_ms: u64,
+    /// The file identity the state was walked from.
+    ///
+    /// The append fast path trusted the length, the header and the trailing
+    /// head, and a same-length copy with an edited middle record keeps all
+    /// three: only the inode tells the copy from the log that was walked
+    /// (R-13 round 14, F1). `None` means the walk did not come from a handle,
+    /// and the fast path then re-walks.
+    identity: Option<(u64, u64)>,
 }
 
 /// One read of a log: the records and the tail they end at.
@@ -422,7 +430,7 @@ impl LogLock {
                     // time are diagnostics for an operator who finds a lock.
                     let written = writeln!(
                         file,
-                        "{nonce} pid {} started {}",
+                        "{LOCK_MAGIC}{nonce} pid {} started {}",
                         std::process::id(),
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -434,8 +442,34 @@ impl LogLock {
                         // the log for the grace, and the writer's own
                         // `still_holds` would report a misleading "displaced"
                         // (R-13 round 10, E).
+                        // Only the lock this call created may be removed:
+                        // an unchecked unlink deleted whatever held the path
+                        // after a displacement (R-13 round 14, F6).
+                        let held = file.metadata().ok();
                         drop(file);
-                        let _ = std::fs::remove_file(&path);
+                        let ours = match &held {
+                            Some(held) => {
+                                #[cfg(not(unix))]
+                                let _ = held;
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::MetadataExt;
+                                    std::fs::symlink_metadata(&path).is_ok_and(|current| {
+                                        !current.file_type().is_symlink()
+                                            && current.dev() == held.dev()
+                                            && current.ino() == held.ino()
+                                    })
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    nonce_of(&path).as_deref() == Some(nonce.as_str())
+                                }
+                            }
+                            None => false,
+                        };
+                        if ours {
+                            let _ = std::fs::remove_file(&path);
+                        }
                         return Err(Error::receipt("cannot write the receipt lock"));
                     }
                     return Ok(Self {
@@ -471,6 +505,14 @@ impl LogLock {
         ))
     }
 }
+
+/// The first token of a lock file's content.
+///
+/// A lock path is `<log>.lock`, which is also a legal log name, so a sibling
+/// log was judged by reading its binary header as a nonce and then deleted by
+/// the steal. A magic prefix makes a file that is not ours unjudgeable and
+/// therefore preserved (R-13 round 14, F4).
+const LOCK_MAGIC: &str = "active-rpc-lock v1 ";
 
 /// Path of the lock that guards `log`.
 ///
@@ -514,7 +556,7 @@ fn lock_state(path: &std::path::Path) -> Option<(u64, String, Option<u32>)> {
     if !meta.file_type().is_file() {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
+    let file = open_log_read(path).ok()?;
     let modified = file.metadata().ok()?.modified().ok()?;
     let age_ms = match modified.elapsed() {
         Ok(age) => age.as_millis() as u64,
@@ -665,7 +707,17 @@ fn read_lock(file: &std::fs::File) -> Option<(String, Option<u32>)> {
     // identifiable, so it can still be stolen instead of blocking for ever
     // (R-13 round 8, L5).
     let text = String::from_utf8_lossy(&bytes);
-    let mut words = text.split_whitespace();
+    let body = text.strip_prefix(LOCK_MAGIC).unwrap_or(&text);
+    // A file that is neither magic-prefixed nor lock-shaped is not a lock this
+    // build wrote or a build before it wrote: refuse to judge it, so a sibling
+    // log at the lock path is never stolen and deleted (R-13 round 14, F4). An
+    // empty file stays identifiable as "interrupted creator", and a legacy
+    // `<nonce> pid <pid> started <ms>` line stays stealable, so a crashed writer
+    // from an older build does not wedge the log for ever.
+    if !body.trim().is_empty() && !looks_like_a_lock(body) {
+        return None;
+    }
+    let mut words = body.split_whitespace();
     let nonce = words.next().unwrap_or_default().to_string();
     let mut pid = None;
     while let Some(word) = words.next() {
@@ -684,6 +736,22 @@ fn nonce_of(path: &std::path::Path) -> Option<String> {
     }
     let file = std::fs::File::open(path).ok()?;
     read_lock(&file).map(|(nonce, _)| nonce)
+}
+
+/// Whether a line is the shape every writer since the first build has written.
+///
+/// `<nonce> pid <pid> started <ms>`; the magic prefix is optional. Anything
+/// else at the lock path is somebody else's file.
+fn looks_like_a_lock(body: &str) -> bool {
+    let mut words = body.split_whitespace();
+    let Some(_nonce) = words.next() else {
+        return false;
+    };
+    matches!(
+        (words.next(), words.next(), words.next(), words.next()),
+        (Some("pid"), Some(pid), Some("started"), Some(start))
+            if pid.parse::<u32>().is_ok() && start.parse::<u64>().is_ok()
+    )
 }
 
 /// A nonce rendered safe to use in a file name.
@@ -719,6 +787,32 @@ fn open_log_write(path: &std::path::Path, append: bool, read: bool) -> Result<st
     let file = options
         .open(path)
         .map_err(|_| Error::receipt("cannot open the receipt log for writing"))?;
+    let meta = file
+        .metadata()
+        .map_err(|_| Error::receipt("cannot inspect the receipt log"))?;
+    if !meta.file_type().is_file() {
+        return Err(Error::receipt("the receipt log is not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Open a log for reading, refusing a symlink at the open.
+///
+/// The reader used a plain `File::open` and relied on a post-hoc identity
+/// check, so a reparse point swapped in between the type check and the open
+/// redirected it on every platform, and on unix the `O_NOFOLLOW` the manifest
+/// claimed for "write and read opens" was missing (R-13 round 14, F2).
+fn open_log_read(path: &std::path::Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| Error::receipt("cannot read the receipt log"))?;
     let meta = file
         .metadata()
         .map_err(|_| Error::receipt("cannot inspect the receipt log"))?;
@@ -1067,6 +1161,7 @@ impl ReceiptLog {
                 start: start_sequence,
                 head: [0u8; 32],
                 last_ms: 0,
+                identity: None,
             })),
         };
         let mut header = Vec::with_capacity(LOG_HEADER_LEN);
@@ -1200,6 +1295,11 @@ impl ReceiptLog {
             // instance) would let the append write a sequence the header does
             // not number, producing a log nothing can walk.
             let usable = cached.bytes == observed
+                // A copy swapped over the path keeps every other check: same
+                // length, same header, same trailing head (its middle record
+                // is the one edited). The inode is what a copy cannot keep
+                // (R-13 round 14, F1).
+                && identity_matches(&self.path, cached.identity)
                 && read_header_start(&self.path) == Some(cached.start)
                 // A replacement of exactly the same length would pass the two
                 // checks above while its trailing head is another chain: the
@@ -1209,8 +1309,9 @@ impl ReceiptLog {
             if usable {
                 cached
             } else {
-                let bytes = read_capped(&self.path)?;
-                let (_, walked) = walk_log(&bytes)?;
+                let (bytes, identity) = read_capped_with_identity(&self.path)?;
+                let (_, mut walked) = walk_log(&bytes)?;
+                walked.identity = identity;
                 walked
             }
         };
@@ -1490,9 +1591,15 @@ fn read_header_start(path: &std::path::Path) -> Option<u64> {
         return None;
     }
     let mut header = [0u8; LOG_HEADER_LEN];
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = open_log_read(path).ok()?;
     file.read_exact(&mut header).ok()?;
     if &header[..4] != LOG_MAGIC {
+        return None;
+    }
+    // The whole header decides which log this is: a version flip or a set
+    // reserved flag is a different format that a cached state must not be
+    // trusted against (R-13 round 14, F1).
+    if header[4] != LOG_VERSION || header[5..8] != [0, 0, 0] {
         return None;
     }
     Some(u64::from_le_bytes(
@@ -1509,7 +1616,7 @@ fn read_tail_head(path: &std::path::Path) -> Option<[u8; 32]> {
     if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
         return None;
     }
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = open_log_read(path).ok()?;
     let length = file.metadata().ok()?.len();
     if length < (LOG_HEADER_LEN + 32) as u64 {
         return None;
@@ -1545,6 +1652,32 @@ fn path_identity(path: &std::path::Path) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
+/// Off unix there is no stable inode at the MSRV: the fast path and the reader
+/// fall back to the length and header checks, and the residual is stated in
+/// ADR-0021 (R-13 round 14, F2).
+#[cfg(not(unix))]
+#[cfg_attr(not(unix), allow(dead_code))]
+fn path_identity(_path: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Whether the path still names the file the state was walked from.
+///
+/// On unix a state with no recorded identity cannot be trusted, so the fast
+/// path re-walks. Off unix there is nothing to compare, and the documented
+/// residual applies (R-13 round 14, F1/F2).
+fn identity_matches(path: &std::path::Path, identity: Option<(u64, u64)>) -> bool {
+    #[cfg(unix)]
+    {
+        identity.is_some() && identity == path_identity(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, identity);
+        true
+    }
+}
+
 /// Whether the path still names the file that was read.
 ///
 /// On unix `(dev, ino)` decides; elsewhere the read and the length check are
@@ -1574,8 +1707,7 @@ fn read_capped_with_identity(path: &std::path::Path) -> Result<ReadLog> {
             return Err(Error::receipt("the receipt log is not a regular file"));
         }
     }
-    let file =
-        std::fs::File::open(path).map_err(|_| Error::receipt("cannot read the receipt log"))?;
+    let file = open_log_read(path)?;
     let identity = {
         #[cfg(unix)]
         {
@@ -1929,6 +2061,7 @@ fn walk_log(bytes: &[u8]) -> Result<(Vec<Receipt>, LogState)> {
         start,
         head: expected_previous,
         last_ms: last_time.unwrap_or(0),
+        identity: None,
     };
     Ok((receipts, state))
 }
@@ -2062,7 +2195,11 @@ mod lock_tests {
     fn the_steal_never_removes_a_lock_it_did_not_judge() {
         let path = scratch("judged");
         let lock_path = lock_of(&path);
-        std::fs::write(&lock_path, b"fresh-1 pid 4294967294 started 1").expect("lock");
+        std::fs::write(
+            &lock_path,
+            format!("{}fresh-1 pid 4294967294 started 1", super::LOCK_MAGIC),
+        )
+        .expect("lock");
 
         // `take_stale` takes the **lock** path, as `acquire` passes it.
         assert!(
@@ -2070,10 +2207,7 @@ mod lock_tests {
             "a lock with another nonce is not the one judged"
         );
         let kept = std::fs::read_to_string(&lock_path).expect("the unjudged lock survives");
-        assert!(
-            kept.starts_with("fresh-1"),
-            "the live lock is intact: {kept}"
-        );
+        assert!(kept.contains("fresh-1"), "the live lock is intact: {kept}");
 
         // The lock that *was* judged is removed, so a real stale lock still goes.
         assert!(
