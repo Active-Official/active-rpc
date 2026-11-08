@@ -225,6 +225,25 @@ it.
 
 Verdict after the fix pass: every r13 finding is closed; r14 must be clean.
 
+### R-12 replay - 2026-11-07 (round 11)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `0e1a3ed` (it also
+audited the uncommitted worktree, which is where the medium lived). Verdict
+**NOT CLEAN**: one medium (worktree), six lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | dropping `into_parts` also dropped the `poisoned` check: a replay that lost events returned a truncated trace as `Ok`, and a crafted package matching that truncation verified | **fixed**: `replay_trace_inner` refuses with `rpc/replay` when the recorder is poisoned; `a_replay_that_loses_events_refuses_instead_of_truncating` builds the 17 000-attenuation package and fails when the check is removed |
+| 2 | low | at HEAD `replay_trace()` returned an empty op list | **fixed**: the public path returns the package's own ops (`the_diagnostic_path_reports_the_package_operations`) |
+| 3 | low | `note` appended an `op.*` trace entry without charging `decoded`, so `package()` could accept a session `encode`/`decode` refuse | **fixed**: `note` charges its entry (and poisons on the ceiling) |
+| 4 | low | neither pin test can see the O(pins) scan: the first revoke releases the 2 000 pins, and the unit test has none | **recorded**: the cfg(test) `pin_scans` counter test is the guard (it fails when the counter moves above the skip); the timed table test is kept for the walk. A fixture whose pins survive needs a restore cycle and is recorded for r12 |
+| 5 | low | `live_durable_caps` exactness was untested | **fixed**: `the_live_durable_counter_matches_the_registry` compares the counter with a fresh registry count after mint, attenuate, ephemeral drop, export, drop and revoke |
+| 6 | low | ADR-0018 and the wire spec disagreed with the code (1 MiB method names, no 128 MiB decode ceiling) | **fixed**: both state the 65 535-byte `u16` method bound and `MAX_DECODE_BYTES` |
+| 7 | low | `reserve_op`'s `MAX_OPS` check was dead for a replaying recorder | **fixed**: the check runs only when the recorder keeps ops |
+
+Gate: green on both feature sets, fmt, clippy, doc, fuzz and the negative
+controls. R-12 needs r12 and r13 clean.
+
 ### R-12 replay - 2026-11-07 (round 10 fixes)
 
 Round 8's three remaining items are closed.

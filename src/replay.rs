@@ -422,7 +422,7 @@ impl ReplayPackage {
     /// list would prove nothing, because `replay_trace` builds that list from
     /// the very operations it reads.
     pub fn replay(&self) -> Result<()> {
-        let (trace, _) = self.replay_trace()?;
+        let trace = self.replay_trace_inner()?;
         if self.trace.len() != trace.len() {
             return Err(Error::Replay(format!(
                 "trace length differs: recorded {}, replayed {}",
@@ -456,6 +456,16 @@ impl ReplayPackage {
     /// first operation is not its header latency would otherwise run every
     /// operation except the one the header describes.
     pub fn replay_trace(&self) -> Result<(Vec<Trace>, Vec<Op>)> {
+        // The operations this replay ran are the package's own, in order: the
+        // recorder no longer keeps a second list, so the diagnostic path
+        // returns the package's (R-12 round 10, F3). `replay()` takes the
+        // trace directly and avoids this copy.
+        let trace = self.replay_trace_inner()?;
+        Ok((trace, self.ops.clone()))
+    }
+
+    /// The trace a replay produces, without the diagnostic operation list.
+    fn replay_trace_inner(&self) -> Result<Vec<Trace>> {
         // The header latency is the *initial* rate; the recording always emits
         // it as the first operation, and a package that does not is using the
         // field for something else.
@@ -504,10 +514,15 @@ impl ReplayPackage {
                 }
             }?;
         }
-        // Move the trace and the operations out: cloning them through
-        // `package()` doubled a ceiling-sized session in memory
-        // (round 4, L-3).
-        recorder.into_parts()
+        // A capture that lost events leaves a truncated trace; returning it
+        // as `Ok` would verify a package crafted to match that truncation
+        // (R-12 round 11, F1).
+        if recorder.poisoned {
+            return Err(Error::Replay(
+                "the replay lost events; the trace is incomplete".into(),
+            ));
+        }
+        Ok(recorder.trace)
     }
 }
 
@@ -682,7 +697,7 @@ impl Recorder {
                 "the recorder lost events; the session cannot be packaged".into(),
             ));
         }
-        if self.ops.len() >= MAX_OPS {
+        if self.record_ops && self.ops.len() >= MAX_OPS {
             return Err(Error::Replay(
                 "the session exceeds the operation ceiling".into(),
             ));
@@ -751,6 +766,18 @@ impl Recorder {
     /// The entry carries a digest rather than the text: a method name is
     /// caller-chosen and may be a megabyte long.
     fn note(&mut self, op: &Op) -> Result<()> {
+        // `note` appends the `op.*` input entry outside `capture`, so it must
+        // charge that entry itself; otherwise `package()` could succeed while
+        // `encode`/`decode` at the same ceiling refuse the same package
+        // (R-12 round 11, F3).
+        let entry = input_event(op);
+        self.decoded = self.decoded.saturating_add(trace_decoded_bytes(&entry));
+        if self.decoded > self.decode_ceiling {
+            self.poisoned = true;
+            return Err(Error::Replay(
+                "the session expands beyond the decode ceiling".into(),
+            ));
+        }
         let event = input_event(op);
         // The operation's own bytes plus its input entry: the same sum
         // `reserve_op` predicted, and `encode` writes exactly this.
@@ -987,20 +1014,6 @@ impl Recorder {
         // events: `package()` is where that loss is refused.
         self.capture_acted();
         outcome
-    }
-
-    /// The trace and the operations, moved out after the same checks
-    /// `package()` makes.
-    fn into_parts(self) -> Result<(Vec<Trace>, Vec<Op>)> {
-        if self.poisoned {
-            return Err(Error::Replay(
-                "the recorder lost events; the session cannot be packaged".into(),
-            ));
-        }
-        if self.body.saturating_add(32) > MAX_PACKAGE_BYTES {
-            return Err(Error::Replay("package exceeds the size ceiling".into()));
-        }
-        Ok((self.trace, self.ops))
     }
 
     /// The recorded package.

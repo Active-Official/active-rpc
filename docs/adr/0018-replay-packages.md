@@ -39,9 +39,11 @@ Operation tags:
 Trace entries: `flags u8` (0 = no capability, 1 = capability), `event (len u32,
 bytes)`, and `cap u32` when the flag is set.
 
-Limits: `op_count ≤ 100,000`, `trace_count ≤ 1,000,000`, method and event names
-≤ 1 MiB, methods per capability ≤ 64, `arg_bytes ≤ 1 MiB`, 16 MiB of declared
-argument bytes per package, and a 64 MiB body. The recorder, the encoder and the
+Limits: `op_count ≤ 100,000`, `trace_count ≤ 1,000,000`, trace event names
+≤ 1 MiB, a method name ≤ 65 535 bytes (its `u16` length), methods per capability
+≤ 64, `arg_bytes ≤ 1 MiB`, 16 MiB of declared
+argument bytes per package, a 64 MiB body and a 128 MiB decoded-heap ceiling
+(`MAX_DECODE_BYTES`). The recorder, the encoder and the
 decoder enforce the same set, so a package that is written is a package that
 reads. A package with an unknown tag, a reserved flag set, trailing bytes, a bad
 checksum or an out-of-range ordinal is refused with `rpc/replay`.

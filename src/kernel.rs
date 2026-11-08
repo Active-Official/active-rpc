@@ -7868,3 +7868,79 @@ mod pin_scan_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod durable_counter_tests {
+    use super::*;
+    use crate::cap::CapPersistence;
+    use crate::identity::{IdentityPolicy, PeerIdentity};
+
+    struct Echo;
+
+    impl Provider for Echo {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["echo".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> Result<Response> {
+            Ok(Response::Value(Value::Int(1)))
+        }
+    }
+
+    fn durable() -> CapAttrs {
+        let mut attrs = CapAttrs::new(&["echo"]);
+        attrs.persistence = CapPersistence::Durable;
+        attrs
+    }
+
+    /// The counter `durable_ceiling_reached` reads must match a fresh count of
+    /// the registry at every lifecycle step, or a drift silently raises or
+    /// lowers the tombstone ceiling (R-12 round 11, F5).
+    #[test]
+    fn the_live_durable_counter_matches_the_registry() {
+        let agent = Agent::new();
+        agent.set_durable_capabilities(true);
+        agent.set_record_seal_key([0x64; 32]);
+        let provider = agent.register(Box::new(Echo));
+        let owner = IdentityPolicy::default()
+            .admit(Some(&PeerIdentity::from_certificate(b"owner")), false)
+            .expect("admitted");
+        let manual = |agent: &Agent| {
+            let kernel = agent.cell.borrow();
+            let counted = kernel
+                .caps
+                .values()
+                .filter(|record| {
+                    record.attrs.persistence == CapPersistence::Durable && !record.revoked
+                })
+                .count();
+            assert_eq!(
+                counted, kernel.live_durable_caps,
+                "the counter drifted from the registry"
+            );
+        };
+        let root = agent
+            .mint_bound(&owner, provider, 0, durable())
+            .expect("durable root");
+        manual(&agent);
+        let child = agent.attenuate(&root, durable()).expect("durable child");
+        manual(&agent);
+        let ephemeral = agent
+            .mint(provider, 0, CapAttrs::new(&["echo"]))
+            .expect("ephemeral");
+        manual(&agent);
+        drop(ephemeral);
+        manual(&agent);
+        agent.export_capability(&child).expect("export");
+        manual(&agent);
+        drop(child);
+        manual(&agent);
+        agent.revoke(&root).expect("revoke the tree");
+        manual(&agent);
+    }
+}

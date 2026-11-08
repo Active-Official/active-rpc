@@ -781,7 +781,8 @@ the `call.queued` trace entry. The trace is
 the decision stream plus one `op.*` input entry per operation, so an edit to a
 grant, a TTL, a latency or a refused call's method does not match a replayed
 trace. The recorder, the encoder and the decoder share one set of limits
-(100 000 operations, 1 000 000 trace entries, 64 methods per grant, 1 MiB per
-argument and 16 MiB per package, 64 MiB body), so an artifact that is written is
-an artifact that reads. The checksum detects corruption, not forgery: a party
+(100 000 operations, 1 000 000 trace entries, 64 methods per grant, a 65 535-byte
+method name, 1 MiB per argument and 16 MiB of declared argument bytes per
+package, a 64 MiB body and a 128 MiB decoded-heap ceiling), so an artifact that is
+written is an artifact that reads. The checksum detects corruption, not forgery: a party
 that can rewrite the file can recompute it.

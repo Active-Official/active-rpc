@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use active_rpc::cap::{CapAttrs, CapPersistence};
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
+use active_rpc::replay::ReplayPackage;
 use active_rpc::{AdmittedIdentity, Agent, Budget};
 
 fn admitted(name: &[u8]) -> AdmittedIdentity {
@@ -114,4 +115,57 @@ impl active_rpc::kernel::Provider for Echo {
             "ok",
         )))
     }
+}
+
+/// The diagnostic path still reports the operations the replay ran: the
+/// recorder no longer keeps a second list, so it returns the package own ops
+/// (R-12 round 10, F3).
+#[test]
+fn the_diagnostic_path_reports_the_package_operations() {
+    use active_rpc::replay::Recorder;
+
+    let mut recorder = Recorder::new(1).expect("recorder");
+    let cap = recorder.mint(&["echo"], None).expect("mint");
+    recorder.call(cap, "echo", 0).expect("call");
+    let package = recorder.package().expect("package");
+    let (trace, ops) = package.replay_trace().expect("replay trace");
+    assert_eq!(
+        ops, package.ops,
+        "the diagnostic op list is the package own"
+    );
+    assert_eq!(trace.len(), package.trace.len(), "the trace is complete");
+}
+
+/// A replay that loses events must refuse rather than return the truncated
+/// trace: a package crafted to match that truncation would otherwise verify
+/// (R-12 round 11, F1).
+#[test]
+fn a_replay_that_loses_events_refuses_instead_of_truncating() {
+    use active_rpc::replay::Op;
+
+    let mut ops = vec![Op::SetLatency(0)];
+    ops.push(Op::Mint {
+        methods: vec!["echo".to_string()],
+        ttl_ms: None,
+    });
+    for _ in 0..17_000 {
+        ops.push(Op::Attenuate {
+            parent: 0,
+            methods: vec!["echo".to_string()],
+            ttl_ms: None,
+        });
+    }
+    ops.push(Op::Revoke { cap: 0 });
+    let package = ReplayPackage {
+        latency_ms: 0,
+        ops,
+        trace: Vec::new(),
+    };
+    let error = package
+        .replay_trace()
+        .expect_err("the revoke overflows the event tape");
+    assert_eq!(error.code(), "rpc/replay", "{error}");
+    assert!(error.to_string().contains("lost events"), "{error}");
+    let error = package.replay().expect_err("replay must refuse too");
+    assert_eq!(error.code(), "rpc/replay", "{error}");
 }
