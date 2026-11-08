@@ -1,5 +1,6 @@
-//! R-12 replay rounds 6-10: a repeated revoke of an already-revoked subtree must
-//! not re-walk it, and must not scan the export pin table either.
+//! R-12 replay rounds 6-12: a repeated revoke of an already-revoked subtree must
+//! not re-walk it, must not scan the export pin table, and must not trust a
+//! truncated replay trace.
 
 use std::time::Instant;
 
@@ -12,6 +13,16 @@ fn admitted(name: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::default()
         .admit(Some(&PeerIdentity::from_certificate(name)), false)
         .expect("admitted")
+}
+
+fn durable() -> CapAttrs {
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    // A tiny grant: `export` reserves it from the parent, so thousands of
+    // one-call reservations must fit the parent budget.
+    attrs.budget.max_calls = 1;
+    attrs.budget.max_bytes = 1;
+    attrs
 }
 
 /// The first revoke walks the subtree; every later revoke of the same node must
@@ -52,88 +63,52 @@ fn repeated_revokes_of_a_revoked_subtree_are_linear() {
     let _ = (lane, children);
 }
 
-/// A repeated revoke must not scan the export pin table either. The round-6
-/// test has no `record_pins`, so it cannot see that scan; this one exports
-/// 2 000 durable capabilities, drops their handles (so the pins survive the
-/// root's revocation), and then revokes the same root 20 000 times (~40M pin
-/// visits on the buggy path).
+/// A repeated revoke must not scan the export pin table either. A pin outlives
+/// its exporting handle (the record stays restorable until its provider object
+/// is reclaimed), so an unrelated revoke still has to look at the table once;
+/// every later revoke of an already-revoked capability must not (R-12 round 12).
 #[test]
-fn repeated_revokes_with_a_pinned_export_table_stay_linear() {
+fn repeated_revokes_with_a_surviving_pin_table_stay_linear() {
+    const PINS: usize = 300;
+    const REPEATS: usize = 100_000;
+
     let agent = Agent::new();
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x63; 32]);
+    let owner = admitted(b"owner");
     let provider = agent.register(Box::new(Echo));
-    let mut root_attrs = CapAttrs::new(&["echo"]);
-    root_attrs.persistence = CapPersistence::Durable;
+    let mut root_attrs = durable();
+    root_attrs.budget.max_calls = u64::from(PINS as u32) + 1;
+    root_attrs.budget.max_bytes = 1 << 20;
     let root = agent
-        .mint_bound(&admitted(b"owner"), provider, 0, root_attrs)
+        .mint_bound(&owner, provider, 0, root_attrs)
         .expect("root");
-    for _ in 0..2_000 {
-        let mut attrs = CapAttrs::new(&["echo"]);
-        attrs.persistence = CapPersistence::Durable;
-        // A tiny grant: xport reserves it from the parent, and 2 000
-        // one-call reservations must fit the parent budget.
-        attrs.budget.max_calls = 1;
-        attrs.budget.max_bytes = 1;
-        let child = agent.attenuate(&root, attrs).expect("child");
+    for _ in 0..PINS {
+        let child = agent.attenuate(&root, durable()).expect("child");
         agent.export_capability(&child).expect("export");
-        // The exported capability is dropped before the revocation, so the
-        // record has no live capability and only the pin names it: the orphan
-        // scan is the path under test.
+        // The exporting handle is dropped; the pin keeps the record's object
+        // resident, so the table stays populated.
         drop(child);
     }
-    agent.revoke(&root).expect("the first revoke");
+    let pins = agent.export_pin_count();
+    assert_eq!(pins, PINS, "the fixture keeps one pin per exported record");
+
+    // A separate capability whose repeated revocation is timed. Its first
+    // revoke is allowed to run the orphan scan; the repeats are not.
+    let victim = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("victim");
+    agent.revoke(&victim).expect("the first revoke");
     let started = Instant::now();
-    for _ in 0..20_000 {
-        let _ = agent.revoke(&root);
+    for _ in 0..REPEATS {
+        let _ = agent.revoke(&victim);
     }
     let elapsed = started.elapsed();
+    assert_eq!(agent.export_pin_count(), pins, "the pins survived");
     assert!(
         elapsed < std::time::Duration::from_secs(5),
-        "20 000 repeated revokes with 2 000 pins took {elapsed:?}: the pin scan runs"
+        "{REPEATS} repeated revokes with {pins} pins took {elapsed:?}: the pin scan runs"
     );
-}
-
-struct Echo;
-
-impl active_rpc::kernel::Provider for Echo {
-    fn name(&self) -> &'static str {
-        "echo"
-    }
-    fn methods(&self) -> Vec<String> {
-        vec!["echo".to_string()]
-    }
-    fn mutating(&self, _method: &str) -> bool {
-        false
-    }
-    fn invoke(
-        &mut self,
-        _object: u64,
-        _call: &active_rpc::value::Call,
-    ) -> active_rpc::Result<active_rpc::value::Response> {
-        Ok(active_rpc::value::Response::Value(active_rpc::Value::text(
-            "ok",
-        )))
-    }
-}
-
-/// The diagnostic path still reports the operations the replay ran: the
-/// recorder no longer keeps a second list, so it returns the package own ops
-/// (R-12 round 10, F3).
-#[test]
-fn the_diagnostic_path_reports_the_package_operations() {
-    use active_rpc::replay::Recorder;
-
-    let mut recorder = Recorder::new(1).expect("recorder");
-    let cap = recorder.mint(&["echo"], None).expect("mint");
-    recorder.call(cap, "echo", 0).expect("call");
-    let package = recorder.package().expect("package");
-    let (trace, ops) = package.replay_trace().expect("replay trace");
-    assert_eq!(
-        ops, package.ops,
-        "the diagnostic op list is the package own"
-    );
-    assert_eq!(trace.len(), package.trace.len(), "the trace is complete");
 }
 
 /// A replay that loses events must refuse rather than return the truncated
@@ -168,4 +143,46 @@ fn a_replay_that_loses_events_refuses_instead_of_truncating() {
     assert!(error.to_string().contains("lost events"), "{error}");
     let error = package.replay().expect_err("replay must refuse too");
     assert_eq!(error.code(), "rpc/replay", "{error}");
+}
+
+/// The diagnostic path still reports the operations the replay ran: the
+/// recorder no longer keeps a second list, so it returns the package own ops
+/// (R-12 round 10, F3).
+#[test]
+fn the_diagnostic_path_reports_the_package_operations() {
+    use active_rpc::replay::Recorder;
+
+    let mut recorder = Recorder::new(1).expect("recorder");
+    let cap = recorder.mint(&["echo"], None).expect("mint");
+    recorder.call(cap, "echo", 0).expect("call");
+    let package = recorder.package().expect("package");
+    let (trace, ops) = package.replay_trace().expect("replay trace");
+    assert_eq!(
+        ops, package.ops,
+        "the diagnostic op list is the package own"
+    );
+    assert_eq!(trace.len(), package.trace.len(), "the trace is complete");
+}
+
+struct Echo;
+
+impl active_rpc::kernel::Provider for Echo {
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+    fn methods(&self) -> Vec<String> {
+        vec!["echo".to_string()]
+    }
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+    fn invoke(
+        &mut self,
+        _object: u64,
+        _call: &active_rpc::value::Call,
+    ) -> active_rpc::Result<active_rpc::value::Response> {
+        Ok(active_rpc::value::Response::Value(active_rpc::Value::text(
+            "ok",
+        )))
+    }
 }

@@ -2719,6 +2719,16 @@ impl Agent {
         self.cell.borrow().restored_records.len()
     }
 
+    /// Live export pins.
+    ///
+    /// A pin keeps an exported record's object resident until the record is
+    /// tombstoned or the provider object is reclaimed; an operator surface and
+    /// the cost the revocation walk must not scan per call
+    /// (R-12 round 12).
+    pub fn export_pin_count(&self) -> usize {
+        self.cell.borrow().record_pins.len()
+    }
+
     /// Create a lane.
     pub fn create_lane(&self, name: impl Into<String>, budget: Budget) -> Result<LaneId> {
         budget.check()?;
