@@ -542,12 +542,25 @@ fn lock_path(log: &std::path::Path) -> std::path::PathBuf {
 /// that cannot be identified cannot be stolen safely. `metadata()` and the bytes
 /// describe one file here, which is what makes the judgement trustworthy
 /// (R-13 round 5, #1).
-fn judged_stale(path: &std::path::Path) -> Option<(String, Option<(u64, u64)>)> {
+fn judged_stale(path: &std::path::Path) -> Option<(String, Option<FileIdentity>)> {
     let facts = lock_state(path)?;
     if lock_is_live(facts.age_ms, facts.pid) {
         return None;
     }
     Some((facts.nonce, facts.identity))
+}
+
+/// Identity of the lock file a judgement read (unix).
+///
+/// The inode alone is not enough: a filesystem may hand a removed file's inode
+/// to its immediate replacement (the Linux CI does). The modification time
+/// changes with the replacement and survives the rename that quarantines the
+/// judged file (R-13 round 16, F4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    modified: Option<std::time::SystemTime>,
 }
 
 /// The facts one open read gives: the lock's age, its nonce, the pid it names
@@ -560,10 +573,10 @@ struct LockFacts {
     age_ms: u64,
     nonce: String,
     pid: Option<u32>,
-    /// `(dev, ino)` of the file the judgement read (unix), so the steal can
-    /// prove it moved the same file and not a replacement with the same text
+    /// The file the judgement read (unix), so the steal can prove it moved the
+    /// same file and not a replacement with the same text
     /// (R-13 round 16, F4).
-    identity: Option<(u64, u64)>,
+    identity: Option<FileIdentity>,
 }
 
 fn lock_state(path: &std::path::Path) -> Option<LockFacts> {
@@ -575,7 +588,8 @@ fn lock_state(path: &std::path::Path) -> Option<LockFacts> {
         return None;
     }
     let file = open_log_read(path).ok()?;
-    let modified = file.metadata().ok()?.modified().ok()?;
+    let metadata = file.metadata().ok()?;
+    let modified = metadata.modified().ok()?;
     let age_ms = match modified.elapsed() {
         Ok(age) => age.as_millis() as u64,
         // A timestamp in the future is clock skew or a planted file. Reading the
@@ -589,10 +603,11 @@ fn lock_state(path: &std::path::Path) -> Option<LockFacts> {
     #[cfg(unix)]
     let identity = {
         use std::os::unix::fs::MetadataExt;
-        // The identity of the file this judgement read, so the steal can prove
-        // it moved the same file and not a replacement with the same text
-        // (R-13 round 16, F4).
-        Some((file.metadata().ok()?.dev(), file.metadata().ok()?.ino()))
+        Some(FileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            modified: metadata.modified().ok(),
+        })
     };
     #[cfg(not(unix))]
     let identity = None;
@@ -615,7 +630,7 @@ fn lock_state(path: &std::path::Path) -> Option<LockFacts> {
 /// `still_holds` and refuses to write, so two writers never append.
 ///
 /// Returns true when the lock that was judged was removed.
-fn take_stale(path: &std::path::Path, judged: &str, identity: Option<(u64, u64)>) -> bool {
+fn take_stale(path: &std::path::Path, judged: &str, identity: Option<FileIdentity>) -> bool {
     let safe = if judged.is_empty() {
         // No nonce: an interrupted creator. A fixed, valid name keeps the
         // quarantine path derivable without letting the file choose it.
@@ -653,10 +668,16 @@ fn take_stale(path: &std::path::Path, judged: &str, identity: Option<(u64, u64)>
     // compare the text, which is the best identity their open gives.
     #[cfg(unix)]
     let matched = match identity {
-        Some((dev, ino)) => {
+        Some(judged) => {
             use std::os::unix::fs::MetadataExt;
             std::fs::symlink_metadata(&quarantine).is_ok_and(|meta| {
-                !meta.file_type().is_symlink() && meta.dev() == dev && meta.ino() == ino
+                // The inode alone is reusable (the Linux CI reuses it for an
+                // immediate replacement), so the mtime is part of the identity
+                // and it survives the rename (R-13 round 16, F4).
+                !meta.file_type().is_symlink()
+                    && meta.dev() == judged.dev
+                    && meta.ino() == judged.ino
+                    && meta.modified().ok() == judged.modified
             })
         }
         None => lock_text_matches(&moved_nonce, judged),
