@@ -25,7 +25,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
-| R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | rounds 1-12: r12 verified r11 and found the surviving-pin fixture vacuous (medium) plus four lows, all fixed; r13 must be clean to close | 47 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018) | this commit |
+| R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | rounds 1-13: r13 verified r12 and closed a high kill-switch gap plus four lows; r14 and r15 must be clean to close | 52 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-15: r15 found the in-place edit behind the append cache (high), a partial-magic wedge and a repair refusal, open for r16 | 77 fixed / 0 rejected / 2 residuals (7 open) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
@@ -49,6 +49,24 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-12 replay - 2026-11-07 (round 13)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `40dfd73`. Every r12 fix was verified with an out-of-tree mutation control
+(including the 64-pin test failing at 201 vs 1 scans when the early return is
+weakened). Verdict **NOT CLEAN**: one high and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | `tombstone_record` could not reach a record exported through a *dropped* restored copy: `remove_cap_record` pruned the record-id index entry, so the kill switch had no seed for the revoke walk and a descendant record stayed restorable (an authority resurrection) | **fixed**: a restored credential's index entry survives its handle drop (bounded by the restored-record set, which the record-id ceiling bounds). `capability_record_tests::a_tombstone_reaches_a_record_exported_through_a_dropped_restored_copy` fails before the fix and passes after; the control (restoring the unconditional prune) fails it |
+| F2 | low | every newly-doomed revoke scanned the whole pin table: N distinct revokes were O(N·P) | **fixed**: `pin_roots` counts each pin against its exporter and every lineage ancestor, maintained in export and `release_pin`; the orphan scan runs only when a doomed id names a pin. `pin_scan_tests::a_distinct_revoke_does_not_visit_a_foreign_pin_table` keeps `pin_visits` at zero across 32 distinct revokes and requires 32 visits for the matching root; the control (always scan) reports 1 024 visits |
+| F3 | low | the r12 header `SetLatency` charge had no discriminating test (removing it left all replay tests green) | **fixed**: `decode_ceiling_contract_tests::the_header_operation_is_charged_like_the_codec_charges_it` encodes and decodes at exactly `recorder.decoded` and refuses one byte less on both paths; the control (`decoded: 0`) fails only it |
+| F4 | low | ADR-0018 still called the op digest 64 bits while the code and the same amendment say 128 | **fixed**: 128 bits |
+| F5 | low | `docs/spec/observability.md` said the object stays pinned "until the record is restored", omitting the tombstone and rotation release | **fixed**: names restore, tombstone (revoke, kill switch, rotation) and provider reclaim |
+
+Gate: `scripts/local_gate.sh --no-msrv` green on the fixed tree. R-12 needs r14
+and r15 clean.
 
 ### R-12 replay - 2026-11-07 (round 12)
 

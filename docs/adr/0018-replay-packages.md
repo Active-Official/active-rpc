@@ -103,7 +103,7 @@ following replace the earlier claim.
 - **Every operation has an input entry in the trace.** `op.latency:<ms>`,
   `op.mint:<digest>:<ttl>`, `op.attenuate:<parent>:<digest>:<ttl>`,
   `op.call:<cap>:<digest>:<bytes>` and `op.revoke:<cap>`, appended before that
-  operation's kernel events. The digest is 64 bits over length-prefixed method
+  operation's kernel events. The digest is 128 bits over length-prefixed method
   names, so the text of a caller-chosen name is never recorded. The entry is
   computed from the package's fields at replay time and from the live arguments
   at record time: an edit that is not followed by re-running the replay no longer

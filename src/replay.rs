@@ -1707,6 +1707,36 @@ mod decode_ceiling_contract_tests {
         );
     }
 
+    /// The recorder's `decoded` is the encoder's and decoder's charge, header
+    /// operation included: a package accepted at exactly that ceiling must
+    /// encode and decode, and one byte less must be refused by both
+    /// (R-12 round 13, F3; the r12 header charge had no discriminating test).
+    #[test]
+    fn the_header_operation_is_charged_like_the_codec_charges_it() {
+        let mut recorder = Recorder::new(1).expect("recorder");
+        let methods: Vec<String> = (0..64).map(|index| format!("m{index}")).collect();
+        let names: Vec<&str> = methods.iter().map(String::as_str).collect();
+        let cap = recorder.mint(&names, Some(5)).expect("a 64-method mint");
+        recorder.call(cap, "m0", 7).expect("call");
+        recorder.revoke(cap).expect("revoke");
+        let package = recorder.package().expect("package");
+        let ceiling = recorder.decoded;
+        let bytes = package
+            .encode_with_ceiling(ceiling)
+            .expect("the recorder's exact charge encodes");
+        ReplayPackage::decode_with_ceiling(&bytes, ceiling)
+            .expect("the recorder's exact charge decodes");
+        let error = package
+            .encode_with_ceiling(ceiling - 1)
+            .expect_err("one byte short is refused by the encoder");
+        assert!(
+            error.to_string().contains("decode ceiling"),
+            "the refusal names the ceiling: {error}"
+        );
+        ReplayPackage::decode_with_ceiling(&bytes, ceiling - 1)
+            .expect_err("one byte short is refused by the decoder");
+    }
+
     /// The running body estimate is exact, not conservative: the comment on the
     /// phantom-byte fix cited a test that did not exist (R-12 round 6, F6).
     #[test]

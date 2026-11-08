@@ -1599,3 +1599,44 @@ fn sequential_narrow_revocations_are_linear() {
     );
     let _ = agent.take_drops(provider);
 }
+
+/// A record exported through a restored copy that has since been dropped must
+/// still be reachable by the kill switch: the tombstone seeds the revoke walk
+/// from the record-id index, and pruning the dropped copy's entry left the
+/// descendant record restorable after `tombstone_record` claimed to kill it
+/// (R-12 round 13, F1).
+#[test]
+fn a_tombstone_reaches_a_record_exported_through_a_dropped_restored_copy() {
+    let (agent, _provider, root) = durable_agent();
+    let durable = || {
+        let mut attrs = CapAttrs::new(&["echo"]);
+        attrs.persistence = CapPersistence::Durable;
+        attrs
+    };
+    let child = agent.attenuate(&root, durable()).expect("child");
+    let grandchild = agent.attenuate(&child, durable()).expect("grandchild");
+    let parent_record = agent.export_capability(&grandchild).expect("export");
+    drop(grandchild);
+    let restored = agent
+        .restore_capability(&parent_record, &admitted(b"durable-owner"))
+        .expect("restore the exported record");
+    let descendant = agent.attenuate(&restored, durable()).expect("descendant");
+    let descendant_record = agent
+        .export_capability(&descendant)
+        .expect("export the descendant");
+    // The documented orphan workflow drops both handles before the tombstone.
+    drop(descendant);
+    drop(restored);
+
+    agent
+        .tombstone_record(parent_record.record_id)
+        .expect("kill switch");
+    assert!(
+        agent.record_is_tombstoned(&descendant_record.record_id),
+        "the tombstone must reach the record exported through the dropped restored copy"
+    );
+    let error = agent
+        .restore_capability(&descendant_record, &admitted(b"durable-owner"))
+        .expect_err("a tombstoned descendant record is dead");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}

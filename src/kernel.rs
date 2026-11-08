@@ -592,12 +592,24 @@ pub struct Kernel {
     /// authority the rotation must withdraw even when no capability record can
     /// be matched to it (round 40, R-07-2).
     record_pins: BTreeMap<[u8; 32], RecordPin>,
+    /// How many pins name each capability as their exporter or an ancestor.
+    ///
+    /// The orphan scan must run only when a doomed capability can match a pin;
+    /// the counts answer that in O(doomed) lookups instead of walking every
+    /// pin on every distinct revoke (R-12 round 13, F2).
+    pin_roots: BTreeMap<CapId, usize>,
     /// How many times `revoke_subtree` ran the export-pin orphan scan.
     ///
     /// A test-only counter: the scan is O(pins), and a repeated revoke must
     /// return before it (R-12 round 10).
     #[cfg(test)]
     pin_scans: std::cell::Cell<usize>,
+    /// Pins the orphan scan actually visited.
+    ///
+    /// A test-only counter for the distinct-revoke shape: the root-count guard
+    /// must keep it at zero when no doomed id names a pin (R-12 round 13, F2).
+    #[cfg(test)]
+    pin_visits: std::cell::Cell<usize>,
     /// Live durable capabilities, maintained on every insert, revoke and drop.
     ///
     /// `durable_ceiling_reached` used to scan the whole registry per durable
@@ -1169,8 +1181,11 @@ impl Agent {
             record_index: BTreeMap::new(),
             object_records: BTreeMap::new(),
             record_pins: BTreeMap::new(),
+            pin_roots: BTreeMap::new(),
             #[cfg(test)]
             pin_scans: std::cell::Cell::new(0),
+            #[cfg(test)]
+            pin_visits: std::cell::Cell::new(0),
             live_durable_caps: 0,
             pin_counts: BTreeMap::new(),
             deferred_refops: Rc::clone(&deferred_refops),
@@ -1648,16 +1663,15 @@ impl Agent {
                 .map_err(|_| Error::persistence("the grant is already committed"))?;
         }
         kernel.consumed_records.insert(record.record_id);
-        kernel.record_pins.insert(
-            record.record_id,
-            RecordPin {
-                provider: pinned.0,
-                object: pinned.1,
-                cap: cap.id(),
-                binding: record.bound_to,
-                lineage: pin_lineage,
-            },
-        );
+        let pin = RecordPin {
+            provider: pinned.0,
+            object: pinned.1,
+            cap: cap.id(),
+            binding: record.bound_to,
+            lineage: pin_lineage,
+        };
+        pin_root_add(&mut kernel, &pin);
+        kernel.record_pins.insert(record.record_id, pin);
         *kernel.pin_counts.entry(pinned).or_insert(0) += 1;
         kernel.push_event(Event::CapExported(cap.id()));
         Ok(record)
@@ -6484,10 +6498,18 @@ impl Kernel {
         if record.attrs.persistence == CapPersistence::Durable && !record.revoked {
             self.live_durable_caps = self.live_durable_caps.saturating_sub(1);
         }
-        if let Some(ids) = self.record_index.get_mut(&record.record_id) {
-            ids.remove(&id);
-            if ids.is_empty() {
-                self.record_index.remove(&record.record_id);
+        // A restored credential's record id must keep an index entry after its
+        // handle drops: `tombstone_record` seeds the revoke walk from this map,
+        // and a descendant record exported through this copy would otherwise be
+        // unreachable once the copy is gone, so the kill switch would miss it
+        // (R-12 round 13, F1). The entries are bounded by the restored-record
+        // set, which the record-id ceiling already bounds.
+        if !self.restored_records.contains(&record.record_id) {
+            if let Some(ids) = self.record_index.get_mut(&record.record_id) {
+                ids.remove(&id);
+                if ids.is_empty() {
+                    self.record_index.remove(&record.record_id);
+                }
             }
         }
         let key = (record.provider, record.object);
@@ -7313,16 +7335,25 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
     // selector uses them (round 40, R-07-2), and a dropped durable cap already
     // left the `live` term of `durable_ceiling_reached`, so this adds no
     // ceiling pressure (round 43, F1).
-    let orphans: Vec<[u8; 32]> = kernel
-        .record_pins
-        .iter()
-        .filter(|(record_id, pin)| {
-            !kernel.revoked_records.contains(*record_id)
-                && (doomed.contains(&pin.cap)
-                    || pin.lineage.iter().any(|ancestor| doomed.contains(ancestor)))
-        })
-        .map(|(record_id, _)| *record_id)
-        .collect();
+    // The root counts answer "can any pin match this revocation?" without
+    // walking the table: a distinct revoke that names no pinned capability
+    // must not scan every pin (R-12 round 13, F2).
+    let orphans: Vec<[u8; 32]> = if doomed.iter().any(|id| kernel.pin_roots.contains_key(id)) {
+        kernel
+            .record_pins
+            .iter()
+            .filter(|(record_id, pin)| {
+                #[cfg(test)]
+                kernel.pin_visits.set(kernel.pin_visits.get() + 1);
+                !kernel.revoked_records.contains(*record_id)
+                    && (doomed.contains(&pin.cap)
+                        || pin.lineage.iter().any(|ancestor| doomed.contains(ancestor)))
+            })
+            .map(|(record_id, _)| *record_id)
+            .collect()
+    } else {
+        Vec::new()
+    };
     for record_id in orphans {
         mark_tombstoned(kernel, record_id);
     }
@@ -7377,10 +7408,30 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
 ///
 /// A restore calls this because the restored capability now holds the object; a
 /// tombstone because the record can never be restored (round 38, F3).
+/// Count a pin against its exporter and every ancestor in its lineage.
+fn pin_root_add(kernel: &mut Kernel, pin: &RecordPin) {
+    for id in std::iter::once(pin.cap).chain(pin.lineage.iter().copied()) {
+        *kernel.pin_roots.entry(id).or_insert(0) += 1;
+    }
+}
+
+/// Undo [`pin_root_add`].
+fn pin_root_remove(kernel: &mut Kernel, pin: &RecordPin) {
+    for id in std::iter::once(pin.cap).chain(pin.lineage.iter().copied()) {
+        if let Some(count) = kernel.pin_roots.get_mut(&id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                kernel.pin_roots.remove(&id);
+            }
+        }
+    }
+}
+
 fn release_pin(kernel: &mut Kernel, record_id: [u8; 32]) {
     let Some(pin) = kernel.record_pins.remove(&record_id) else {
         return;
     };
+    pin_root_remove(kernel, &pin);
     let (provider, object, cap) = (pin.provider, pin.object, pin.cap);
     let key = (provider, object);
     if let Some(count) = kernel.pin_counts.get_mut(&key) {
@@ -7948,6 +7999,68 @@ mod pin_scan_tests {
             agent.export_pin_count(),
             64,
             "the repeats must not disturb the pins"
+        );
+    }
+
+    /// A *distinct* revoke must not visit a pin table it cannot match: the
+    /// root counts are maintained at export and release, so the scan is
+    /// skipped unless a doomed id names a pin (R-12 round 13, F2).
+    #[test]
+    fn a_distinct_revoke_does_not_visit_a_foreign_pin_table() {
+        let agent = Agent::new();
+        agent.set_durable_capabilities(true);
+        agent.set_record_seal_key([0x67; 32]);
+        let provider = agent.register(Box::new(Echo));
+        let victim = agent
+            .mint(provider, 0, CapAttrs::new(&["echo"]))
+            .expect("victim root");
+        let mut pinned_attrs = CapAttrs::new(&["echo"]);
+        pinned_attrs.persistence = CapPersistence::Durable;
+        let owner = crate::identity::IdentityPolicy::default()
+            .admit(
+                Some(&crate::identity::PeerIdentity::from_certificate(b"pins")),
+                false,
+            )
+            .expect("admitted");
+        let pinned_root = agent
+            .mint_bound(&owner, provider, 1, pinned_attrs)
+            .expect("pinned root");
+        let mut pinned_children = Vec::new();
+        for _ in 0..32 {
+            let mut attrs = CapAttrs::new(&["echo"]);
+            attrs.persistence = CapPersistence::Durable;
+            attrs.budget.max_calls = 1;
+            attrs.budget.max_bytes = 1;
+            let child = agent.attenuate(&pinned_root, attrs).expect("durable child");
+            agent.export_capability(&child).expect("export");
+            pinned_children.push(child);
+        }
+        drop(pinned_children);
+        assert_eq!(agent.export_pin_count(), 32, "32 pins are live");
+
+        let victims: Vec<_> = (0..32)
+            .map(|_| {
+                agent
+                    .attenuate(&victim, CapAttrs::new(&["echo"]))
+                    .expect("victim leaf")
+            })
+            .collect();
+        let visits = agent.cell.borrow().pin_visits.get();
+        for child in &victims {
+            agent.revoke(child).expect("distinct revoke");
+        }
+        assert_eq!(
+            agent.cell.borrow().pin_visits.get(),
+            visits,
+            "a distinct revoke visited a pin table it cannot match"
+        );
+        assert_eq!(agent.export_pin_count(), 32, "the pins are untouched");
+        // The guard is not a blanket skip: revoking the pinned root must visit
+        // the table and release the pins.
+        agent.revoke(&pinned_root).expect("revoke the pinned root");
+        assert!(
+            agent.cell.borrow().pin_visits.get() >= visits + 32,
+            "the matching revoke must visit every pin"
         );
     }
 }
