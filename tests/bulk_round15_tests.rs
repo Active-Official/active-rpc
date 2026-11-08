@@ -5,7 +5,7 @@
 use active_rpc::bulk::{BulkProvider, BulkReceiver, BulkSender, BulkTransfer, CHUNK_OVERHEAD};
 use active_rpc::cap::CapAttrs;
 use active_rpc::kernel::Provider;
-use active_rpc::value::{Call, Value};
+use active_rpc::value::{Call, Response, Value};
 use active_rpc::wire::Envelope;
 use active_rpc::{Agent, Budget, Error};
 
@@ -388,6 +388,70 @@ fn the_throttle_freezes_and_a_paid_grant_still_finishes() {
     provider
         .invoke(0, &with_wall("finish", transfer.finish_frame(), 60_000))
         .expect("a paid grant still finishes after the freeze");
+}
+
+/// A sender and a provider can share a transfer context, and the default
+/// constructor is refused by a bound provider (R-10 round 16, L10).
+#[test]
+fn a_context_bound_provider_accepts_a_context_bound_sender() {
+    let transfer =
+        BulkTransfer::new_with_context(body(2_000, 0x29), 700, b"exchange-1").expect("transfer");
+    let mut provider = BulkProvider::new().with_context(b"exchange-1".to_vec());
+    provider
+        .invoke(0, &call("plan", transfer.plan_frame()))
+        .expect("the bound plan is accepted");
+    for index in 0..transfer.plan().chunk_count() {
+        provider
+            .invoke(0, &call("put", transfer.chunk_frame(index).expect("chunk")))
+            .expect("chunk");
+    }
+    provider
+        .invoke(0, &with_wall("finish", transfer.finish_frame(), 60_000))
+        .expect("finish");
+    // The context-free constructor produces a plan the bound provider refuses.
+    let plain = BulkTransfer::new(body(10, 1), 1_024).expect("plain");
+    let mut bound = BulkProvider::new().with_context(b"exchange-1".to_vec());
+    bound
+        .invoke(0, &call("plan", plain.plan_frame()))
+        .expect_err("a context-free plan is refused");
+}
+
+/// A provider bound that covers the assembly but not the classification
+/// degrades the reply instead of allocating past its own bound
+/// (R-10 round 16, M4).
+#[test]
+fn a_bound_that_cannot_cover_the_classification_degrades_the_reply() {
+    let module =
+        active_rpc::domain::module_from_source("[app]\nname = \"bulk-r16m4\"\n", "r16m4.active")
+            .expect("module");
+    let image = active_infinity::encode(&module).expect("encode");
+    let transfer = BulkTransfer::new(image, 1 << 20).expect("transfer");
+    let required = transfer.plan().required_live_bytes();
+    let mut provider = BulkProvider::new().with_max_live_bytes(required);
+    provider
+        .invoke(0, &call("plan", transfer.plan_frame()))
+        .expect("plan");
+    for index in 0..transfer.plan().chunk_count() {
+        provider
+            .invoke(0, &call("put", transfer.chunk_frame(index).expect("chunk")))
+            .expect("chunk fits the exact bound");
+    }
+    let reply = provider
+        .invoke(0, &with_wall("finish", transfer.finish_frame(), 60_000))
+        .expect("the finish still answers");
+    let Response::Value(Value::Map(entries)) = &reply else {
+        panic!("a map reply");
+    };
+    assert_eq!(
+        entries.get("content_error"),
+        Some(&Value::text("memory")),
+        "the classification is skipped when the bound cannot cover it: {entries:?}"
+    );
+    assert_eq!(entries.get("canonical"), Some(&Value::Bool(false)));
+    assert!(
+        entries.contains_key("body_hash"),
+        "the record is still usable"
+    );
 }
 
 /// A transfer opened at the documented minimal bound

@@ -152,9 +152,9 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
   the plan; `frames_from` refuses a resume point past the plan; `decode` refuses
   a declared total above the ceiling or more than 32 700 chunks before
   allocating the hash list; `BulkChunk::try_new` refuses an oversized chunk.
-- **Peak memory and CPU.** `finish` moves chunks out of the map instead of holding
-  two copies, and a chunk frame carries the hash it was built with, so a
-  retransmission does not re-hash the body.
+- **Peak memory and CPU.** `finish` assembles the body while the stored chunks
+  are still resident (peak: the body plus the chunks), and a chunk frame carries
+  the hash it was built with, so a retransmission does not re-hash the body.
 - **No body bytes in `Debug`.** `BulkPlan`, `BulkChunk`, `BulkSender`,
   `BulkReceiver` and `BulkProvider` print shape only. `BulkBody` does not print
   its raw digest either: that digest is the offline equality oracle a redacting
@@ -163,10 +163,11 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
   the deadline before the first chunk, between chunks and after the last, and
   `finish_within` uses it, so an expired grant cannot buy a full-body hash.
 - **A refusal never destroys a paid body, and the caller has its own way out.**
-  Every `finish` that runs out of wall is counted, and once three have failed at
-  the same grant the transfer is frozen with `rpc/bulk` before any work: a
-  same-root `plan` frame does not clear the freeze, so a 53-byte frame cannot
-  re-assemble the body, and only a strictly wider grant does. `abort` is the
+  Every `finish` that runs out of wall is counted: a grant at the body's estimate
+  is funded, the allowance is two funded assemblies, and one transfer runs at
+  most five assemblies, after which it is frozen with `rpc/bulk` before any work
+  and the freeze is monotone. A same-root `plan` frame does not clear it, and
+  `abort` is the
   mutating method that discards the object's transfer, untaken body and digest
   reply, answering one constant shape so it reveals nothing about another
   capability's state. `assembly_wall_ms()` (bytes, a per-chunk term and slack) is

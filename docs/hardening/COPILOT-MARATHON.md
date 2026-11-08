@@ -23,7 +23,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-15: r15 found two mediums (the documented grant was six bytes short of the plan-plus-finish replies; the funded cap was mutation-blind) and eight lows, all fixed; r16 and r17 must be clean | 113 fixed / 0 rejected / 0 open (limits documented) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-16: r16 found no critical/high but four mediums (non-monotone freeze, long-finish windows, O(chunks) missing page, unbounded classification) and sixteen lows, all fixed or documented; r17 and r18 must be clean | 130 fixed / 0 rejected / 0 open (limits documented) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | `CLEAN` (rounds 1-15; rounds 14 and 15 clean) | 60 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018/0010) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-16: r16 fixed the r15 mediums (a partial magic lock wedged the log; a zeroed tail could not be repaired) and the r15 lows; r17 and r18 must be clean | 85 fixed / 0 rejected / 2 residuals (documented) | this commit |
@@ -49,6 +49,39 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-10 bulk - 2026-11-07 (round 16 audit pass)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `e64a347` (bulk identical to `bdf954a`). All six round-15 fixes verified by
+mutation. No critical or high; four mediums and sixteen lows, all closed or
+documented.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M1 | medium | the freeze was non-monotone: after the funded allowance was spent an estimate grant was refused while `estimate - 1` still ran, and a funded success reset the cheap counter, allowing ~7 cheap assemblies | **fixed**: `throttle` takes an `attempts` counter and freezes when the funded allowance is spent or five assemblies have run; counters move only when work starts. `a_spent_funded_allowance_refuses_a_cheaper_grant_too`; the control drops the funded branch and fails it. wire.md/ADR-0013 now say the freeze is monotone and `abort` is the only way out |
+| M2 | medium | a finish longer than the idle window destroyed the paid chunks on the next call, and a successful long finish recorded its body as already old | **fixed**: `finish` uses `expire_for_finish` (absolute lifetime only) and stamps the completed body with the call's start plus the work duration. `a_long_finish_does_not_destroy_the_chunks_it_paid_for`; the control restores `expire` and fails it |
+| M3 | medium | `missing_page` scanned every chunk, so a zero-length `missing` on a complete plan was O(32 700) per call | **fixed**: the receiver keeps a `BTreeSet` of missing indexes and pages over it (O(page)); `a_page_over_a_complete_plan_does_not_scan_every_chunk` (control: 17.5 s vs 0.13 s for 1 000 pages) |
+| M4 | medium | `required_live_bytes` covers the assembly, but an image classification allocates several body-sized projections without a bound and without fallible allocation | **fixed**: the provider answers `content_error: memory` instead of classifying when its bound cannot cover three body lengths; `a_bound_that_cannot_cover_the_classification_degrades_the_reply`; the control classifies and fails. The accessor and both docs state the exclusion |
+| L1 | low | `BulkFinish` Debug printed the full root | custom Debug with an eight-byte prefix |
+| L2 | low | `plan` creates the transfer before the reply-shape check | wire.md says the reply is withheld and the transfer stays open until `abort`/expiry |
+| L3 | low | a `missing`-only capability below four map entries cannot page | wire.md states the four-entry floor and the `max_array_len` page cap |
+| L4 | low | `required_calls` has no `abort` slot | the doc says to mint one more call |
+| L5 | low | the reply-allowance comment swapped the measured shapes and overclaimed | rewritten with the measured sizes and the aggregate sum |
+| L6 | low | the bound context was not charged; map nodes and the missing set are estimates | `reserved_bytes` charges `2 x context`; the estimate is documented |
+| L7 | low | `with_budget` does not say the frame overhead is extra | the doc points at `required_grant()` |
+| L8 | low | a capability too narrow for the finish reply strands the body | wire.md states the 205-byte/four-entry floor and the consequence |
+| L9 | low | `required_grant` did not name the resume request frames | the doc names `ARBM` (9 + 4 per index) |
+| L10 | low | no sender convenience for a context-bound transfer | `BulkSender::new_with_context` and `BulkTransfer::new_with_context`; `a_context_bound_provider_accepts_a_context_bound_sender` |
+| L11 | low | the Debug comment said 65 536 chunks | corrected to a maximal plan (~1 MB) |
+| L12 | low | the changelog described the old freeze and the old `finish` peak | corrected |
+| L13 | low | `BulkRequest::new` is unbounded and truncates in the count | documented; `frames_for` is the bounded path |
+| L14 | low | `missing` did not apply the completed/digest windows | `expire_completed` runs in `missing` (the active idle rule still does not) |
+| L15 | low | `live_bytes` is O(objects) per `put` | documented |
+| L16 | low | the page cap cast a `u64` to `usize` and could truncate on 32-bit | `usize::try_from(...).unwrap_or(usize::MAX)` |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-10 needs r17 and r18 clean
+(r15 and r16 were each not clean).
 
 ### R-13 receipts - 2026-11-07 (round 16 fix pass)
 

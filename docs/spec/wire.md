@@ -193,7 +193,7 @@ a message.
 | `rpc/promise-resolved` | the promise was already resolved or rejected |
 | `rpc/backpressure` | the local call queue or channel window is full |
 | `rpc/identity` | the peer's authenticated identity is missing, does not match the capability's binding, or cannot be a binding at all (a zero or loopback digest); a capability's deadline belongs to the other clock domain; an out-of-band answer comes from a peer that did not queue the promise, or from one whose certificate has since rotated away; an *in-process* pipelined argument names a promise another principal queued; also an *in-process* misuse of a borrowed imported handle (it cannot introduce, rebind, attenuate or revoke the owner's authority; exporting one is `rpc/persistence`) |
-| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, a completed body has not been taken, or a `finish` is frozen because three under-resourced attempts are spent. A state refusal is recoverable by planning again for the slot, by granting the body's wall (`assembly_wall_ms`) or by `abort` for a frozen finish; a re-plan does not clear the freeze itself, and the chunks survive either way. A hash or framing fault is not |
+| `rpc/bulk` | a bulk plan or chunk is malformed, truncated or fails its hash; also a provider state refusal — no transfer is active, a different transfer is already active, a body is incomplete, a completed body has not been taken, or a `finish` is frozen because its five-assembly allowance is spent. A state refusal is recoverable by planning again for the slot, or by `abort` for a frozen finish; the freeze is monotone and a re-plan does not clear it, and the chunks survive either way. A hash or framing fault is not |
 | `rpc/replay` | a replay package is malformed, tampered with, or disagrees with the decisions it recorded |
 | `rpc/persistence` | a durable capability record is unsealed, already restored, or names a provider this kernel does not have; a record restored by a different peer is `rpc/identity` |
 | `rpc/unresolvable-promise` | the promise can never settle |
@@ -684,10 +684,13 @@ it inherits the object model's rule that an object has one principal: a host
 that mints a second capability on the same object gives that party the right to
 discard the object's state. It is idempotent and needs no plan.
 A `plan` reply is a five-entry map, so a capability whose `max_array_len` is
-below five cannot open a transfer (the provider withholds the reply).
+below five gets `provider/reply-withheld`; the transfer stays open until `abort`
+or expiry, so the shape must be checked before the call is minted.
 `missing` answers the indexes the request frame names (page-capped at 1 024 or the
 caller's `max_array_len`, whichever is smaller, with `more` and `remaining`; an
-empty payload asks for the lowest window), refreshes
+empty payload asks for the lowest window). A `missing` reply is a four-entry map
+plus the list, so `max_array_len` must be at least four for any page to arrive.
+It refreshes
 the idle window, and never expires a transfer by idleness: a read-only
 capability can poll but cannot destroy another capability's chunks. The absolute
 lifetime below still applies to a poll, so polling cannot hold a transfer
@@ -703,11 +706,18 @@ canonical content address of the **redacted** image, the same value the domain
 provider serves. When the address could have been computed but was not,
 `canonical` is false and `content_error` says why (`wall`: the grant was spent
 before classification, so the reply does not say whether the body is an image;
-`parser`: an image that cannot be redacted). The reply is recorded and replayed, so a degraded reply says so
+`parser`: an image that cannot be redacted; `memory`: the provider-wide bound
+cannot cover the classification's extra body-sized projections, so it was
+skipped). The finish reply is up to 205 bytes and four entries: a capability
+whose `max_value_size` cannot carry it completes the body but has every finish
+reply withheld, and `plan` then refuses the untaken body, so mint at least that
+much. The reply is recorded and replayed, so a degraded reply says so
 rather than looking like a body that is not an image. A grant must cover `BulkPlan::required_grant()` bytes (plan
-frame, chunk frames, finish marker and a per-call reply allowance) and
-`BulkPlan::required_calls()` calls (one pass plus a gaps-only resume's `missing`
-pages): `total + 53 × chunk_count` pays for the chunk frames only. A caller that
+frame, chunk frames, request frames, finish marker and a reply allowance sized by
+the reply shapes) and
+`BulkPlan::required_calls()` calls (one pass, a gaps-only resume's `missing`
+pages; add one call if the caller may need `abort` after the freeze):
+`total + 53 × chunk_count` pays for the chunk frames only. A caller that
 may reconnect and re-send every frame instead reserves
 `BulkPlan::required_grant_with_resume()` bytes and
 `BulkPlan::required_calls_with_resume()` calls, which is roughly two passes.
@@ -727,7 +737,11 @@ only ever be a complete body) plus **twice** the 32-byte-per-chunk hash vector
 and the 53-byte header once: the transfer holds its plan and the receiver holds
 its own copy of the per-chunk hashes, while the shared header is counted once. A complete body therefore needs `BulkPlan::required_live_bytes()` of
 the provider-wide bound; compare it before opening a transfer, because a bound
-below it refuses the last `put` after the earlier chunks have been paid for. An
+below it refuses the last `put` after the earlier chunks have been paid for.
+That figure covers the assembly, not an image classification: the provider
+answers `content_error: memory` rather than classify when its bound cannot cover
+three body lengths, and the receiver's missing-index set and map nodes are a
+committed-state estimate rather than allocator-exact. An
 announced plan that has received nothing reserves only its vector; a `put` whose
 validated chunk would pass the bound is refused before it stores the chunk (and
 before any state changes), while an identical retransmission is free. A `finish`
@@ -742,8 +756,11 @@ funded assemblies (`FUNDED_ASSEMBLY_LIMIT`), after which the transfer freezes.
 Both rules are why the sizing to mint is `required_wall_ms()`. The stored chunks are
 **never** destroyed by a refusal (a body the caller paid to transfer survives
 every refusal), and a refusal that did no work (the deadline was already spent
-when the assembly was due to start) does not count. A frozen transfer has two
-ways out: the host mints a wider grant, or the caller abandons it with `abort`.
+when the assembly was due to start) does not count. The freeze is monotone:
+after the funded allowance is spent no grant runs, including a smaller one, and
+one transfer gets at most five assemblies (`WALL_REFUSAL_LIMIT` +
+`FUNDED_ASSEMBLY_LIMIT`). A frozen transfer has one way out: the caller abandons
+it with `abort` (or lets it expire).
 A same-root `plan` frame does **not** clear the freeze, which is what stops a
 53-byte frame from re-assembling a paid body. The verification pass is inside
 the wall grant, chunk by chunk; the redaction pass of a valid image runs once it

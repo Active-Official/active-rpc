@@ -108,22 +108,30 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   an unpaid plan holds only its vector, a `put` whose validated chunk would pass
   the bound is refused before it stores (an identical retransmission is free),
   and `BulkPlan::required_live_bytes()` is the bound a complete body needs
-  (R-10 rounds 18 and 15).
+  (R-10 rounds 18 and 15). It covers the assembly, not an image
+  **classification**: the redaction path holds two more body-sized projections,
+  and the provider answers `content_error: memory` instead of classifying when
+  its bound cannot cover three body lengths. Both plan copies retain the
+  transfer context (charged twice); the receiver's missing-index set and the
+  per-chunk map nodes are not charged, so the figure is a committed-state
+  estimate (R-10 round 16, M4/L6).
 - Every `finish` that runs out of wall is counted, whatever its grant: an
   attempt that presents `assembly_wall_ms()` and still expires is evidence that
   the estimate is wrong for this host, not a payment to forget (R-10 round 16).
   After three such failures the provider **freezes** the transfer and refuses it
   with `rpc/bulk` before any work. A grant at the body's estimate is *funded*:
   it clears the count and runs, capped at two funded assemblies
-  (`FUNDED_ASSEMBLY_LIMIT`), after which the transfer freezes even for a grant
-  that could pay; a same-root `plan` frame does not clear the freeze. Both rules
+  (`FUNDED_ASSEMBLY_LIMIT`). Once that allowance is spent the freeze is
+  monotone — no grant runs, including a smaller one, and one transfer runs at
+  most `WALL_REFUSAL_LIMIT + FUNDED_ASSEMBLY_LIMIT` assemblies — so a funded
+  reset cannot renew the cheap attempts (R-10 round 16, M1). A same-root `plan`
+  frame does not clear the freeze. Both rules
   are why the sizing to mint is `required_wall_ms()`: the body's own cost with a
   per-chunk term and slack, never below the default grant. The stored chunks are
   never destroyed by a refusal: the non-destructiveness rule outranks the
   throttle, and `abort` is the caller's own way to discard what it no longer
   wants.
-- A frozen transfer has exactly two ways out: a wider grant, which the host mints
-  (the peer cannot widen its own cap ∩ lane), or `abort`. Closing the second is
+- A frozen transfer has exactly one way out: `abort` (or expiry). Closing it is
   what makes the freeze safe to hold: without it the only release is the idle or
   absolute window, and the object's slot and its reserved bytes stay held until
   then. `abort` acts on the object, so a host that mints a second capability on a
