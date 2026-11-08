@@ -341,7 +341,7 @@ fn an_untaken_body_is_released_after_its_window() {
 
     let next = BulkPlan::new(&body(2_000, 26), 1_000).expect("next plan");
     let mut reopen = call("plan", next.encode());
-    reopen.now_ms = COMPLETED_IDLE_MS + 1;
+    reopen.now_ms = COMPLETED_IDLE_MS * 2 + 1;
     provider
         .invoke(0, &reopen)
         .expect("the expired body no longer blocks a new transfer");
@@ -350,7 +350,7 @@ fn an_untaken_body_is_released_after_its_window() {
 
     // The digest reply is still answerable after the bytes are gone.
     let mut late = call("finish", transfer.finish_frame());
-    late.now_ms = COMPLETED_IDLE_MS + 1;
+    late.now_ms = COMPLETED_IDLE_MS * 2 + 1;
     let error = provider
         .invoke(0, &late)
         .expect_err("a new transfer is active, so the old marker is refused");

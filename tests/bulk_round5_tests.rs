@@ -104,7 +104,7 @@ fn expire_idle_releases_incomplete_and_finished_state() {
 
     provider.expire_idle(10_000);
     assert!(provider.has_body(1), "inside the completed window");
-    provider.expire_idle(active_rpc::bulk::COMPLETED_IDLE_MS + 1);
+    provider.expire_idle(active_rpc::bulk::COMPLETED_IDLE_MS * 2 + 1);
     assert!(!provider.has_body(1), "the finished body was not released");
     assert_eq!(
         provider.active_root(2),

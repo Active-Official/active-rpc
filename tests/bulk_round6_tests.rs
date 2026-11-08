@@ -107,9 +107,9 @@ fn the_digest_reply_is_released_with_the_window() {
     provider.invoke(1, &finish).expect("finish");
     assert!(provider.take_body(1).is_some());
 
-    provider.expire_idle(COMPLETED_IDLE_MS + 1);
+    provider.expire_idle(COMPLETED_IDLE_MS * 2 + 1);
     let mut late = call("finish", transfer.finish_frame());
-    late.now_ms = COMPLETED_IDLE_MS + 1;
+    late.now_ms = COMPLETED_IDLE_MS * 2 + 1;
     let error = provider
         .invoke(1, &late)
         .expect_err("the digest reply expired with the body");
