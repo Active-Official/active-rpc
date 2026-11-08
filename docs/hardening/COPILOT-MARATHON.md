@@ -237,6 +237,7 @@ the byte estimate) and F10 (a truncating cast on a hand-built op) are closed.
 | F4 | low | method vectors were charged 32 + len where the heap is about 48 + len | **fixed**: `METHOD_HEAP = 48`, one helper for every charge |
 | F6 | low | the running body estimate had no test and its comment cited a missing one | **fixed**: `the_size_estimate_matches_the_encoder` asserts `body + 32 == encoded.len()` (a reintroduced four-byte phantom fails it) |
 | F10 | low | `*arg_bytes as usize` truncated a hand-built op on 32-bit targets | **fixed**: `usize::try_from` with the ceiling code |
+| F5 | low | `tombstone_record`, `restore_capability_with` and `durable_ceiling_reached` scanned every capability | **partly fixed**: the tombstone's live set and the restore's already-live check use the maintained `record_index`; the durable ceiling's live-count scan is open for r10 (it needs a maintained counter) |
 
 Still open for r10: F3 (the replay-side peak: a second kernel, a second op list
 and a second trace, ~391 MB for a 15.8 MB package), F5 (the three per-cap scans),

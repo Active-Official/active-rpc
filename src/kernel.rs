@@ -1726,10 +1726,17 @@ impl Agent {
             let kernel = self.cell.borrow();
             // Restoring is a re-mint, so N restores of one credential would be N
             // independent grants that a single revocation cannot reach.
+            // The registry's record id -> capabilities index answers this in
+            // one lookup; a scan of every capability made a restore set
+            // quadratic at the ceiling (R-12 round 8, F5).
             if kernel
-                .caps
-                .values()
-                .any(|live| live.record_id == record.record_id && !live.revoked)
+                .record_index
+                .get(&record.record_id)
+                .is_some_and(|sharing| {
+                    sharing
+                        .iter()
+                        .any(|id| kernel.caps.get(id).is_some_and(|live| !live.revoked))
+                })
             {
                 return Err(Error::persistence("the record is already live"));
             }
@@ -2649,12 +2656,14 @@ impl Agent {
         // when nothing else names the object, lets the provider reclaim it
         // (round 38, F3).
         mark_tombstoned(&mut kernel, record_id);
+        // The registry keeps record id -> capabilities, so the caps a
+        // tombstone must revoke come from one lookup instead of a scan of
+        // every capability (R-12 round 8, F5).
         let live: Vec<CapId> = kernel
-            .caps
-            .iter()
-            .filter(|(_, record)| record.record_id == record_id)
-            .map(|(id, _)| *id)
-            .collect();
+            .record_index
+            .get(&record_id)
+            .map(|sharing| sharing.iter().copied().collect())
+            .unwrap_or_default();
         if !live.is_empty() {
             revoke_subtree(&mut kernel, live);
         }
