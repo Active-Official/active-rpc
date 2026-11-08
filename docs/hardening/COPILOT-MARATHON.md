@@ -23,7 +23,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-15: r15 found two mediums (the documented grant was six bytes short of the plan-plus-finish replies; the funded cap was mutation-blind) and eight lows, all fixed; r16 and r17 must be clean | 113 fixed / 0 rejected / 0 open (limits documented) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | `CLEAN` (rounds 1-15; rounds 14 and 15 clean) | 60 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018/0010) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-15: r15 found the in-place edit behind the append cache (high), a partial-magic wedge and a repair refusal, open for r16 | 77 fixed / 0 rejected / 2 residuals (7 open) | this commit |
@@ -49,6 +49,28 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-10 bulk - 2026-11-07 (round 15 audit pass)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `aa99f0f`. The round-15 fix pass was verified with mutation controls (all six
+claims held). No critical or high; two mediums and eight lows, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M1 | medium | `required_grant()` was six bytes short for a one-chunk image when the advertised resume asks `missing` before `put`: the reply allowance (128) under-counted the plan (162) and finish (205) replies, so the finish effect landed while egress was refused | **fixed**: `REPLY_ALLOWANCE = 192` with the measured shapes written down. `a_one_chunk_image_with_an_early_missing_page_fits_required_grant` drives plan, missing, put, finish through a kernel at exactly `required_grant()`/`required_calls()`; the control (128) fails at the finish reply |
+| M2 | medium | the funded-assembly cap was mutation-blind: `FUNDED_ASSEMBLY_LIMIT = 100` passed the whole suite | **fixed**: `the_funded_assembly_cap_is_two_literal_attempts` pins the literal; the throttle and provider tests already drive two runs to `Frozen` |
+| L1 | low | `accept_charged` charged the receiver's internal meter as well as the callback, so a host combining `with_budget` and the external charge paid twice | **fixed**: `accept_inner(frame, charge_internal, reserve)`; `accept_charged` passes false. `an_externally_charged_receiver_does_not_charge_its_own_meter`; the control charges the meter and fails it |
+| L2 | low | `missing` always paged to 1 024, ignoring the caller's `max_array_len`, so a narrowed capability could not use the resume door | **fixed**: the page is `min(MISSING_PAGE, max_array_len)`; `a_narrow_array_budget_can_still_page_the_missing_indexes`; the control caps it at 1 024 and fails. wire.md also states the five-entry `plan` floor |
+| L3 | low | docs said the 53-byte header is reserved twice; the code charges it once | **fixed**: wire.md, ADR-0013, `required_live_bytes` and `reserved_bytes` say twice the per-chunk vector and the header once |
+| L4 | low | wire.md called `finish` idempotent "until a new plan is accepted", omitting the completed-window expiry | **fixed**: the marker is `rpc/bulk` once the 10-minute body window releases the reply |
+| L5 | low | the `frames_from` byte-equality test could not see a re-hash regression (the old code produced the same bytes) | **fixed**: a `#[cfg(test)]` build counter on `BulkSender::frame_at` and `bulk::sender_tests::frames_from_reuses_the_streaming_builder`; the control restores the old loop and fails it |
+| L6 | low | `live_bytes` omits the per-chunk map node and `Vec` header, so many one-byte chunks can hold more than the bound | **documented** as a committed-state estimate in `live_bytes`; the payload dominates for realistic chunk sizes |
+| L7 | low | `BulkPlan::Debug` printed the full root, a body-committing equality oracle | **fixed**: only an eight-byte `root_prefix`; `a_plan_debug_never_prints_the_full_root`; the control prints the full root and fails |
+| L8 | low | wire.md implied idle state is released on a timer; it is released on the next call, a sweep, `plan`, `abort` or drop | **fixed**: the sentence names the triggers and tells hosts of long-lived capabilities to sweep |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-10 now needs r16 and r17 clean
+(r14 and r15 were each not clean).
 
 ### R-10 bulk - 2026-11-07 (round 15 fix pass)
 

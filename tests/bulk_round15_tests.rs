@@ -2,10 +2,12 @@
 //! live-byte ceiling, a refused frame reports its own defect rather than the
 //! provider's occupancy, and the documented minimal bound can complete.
 
-use active_rpc::bulk::{BulkProvider, BulkSender, BulkTransfer, CHUNK_OVERHEAD};
+use active_rpc::bulk::{BulkProvider, BulkReceiver, BulkSender, BulkTransfer, CHUNK_OVERHEAD};
+use active_rpc::cap::CapAttrs;
 use active_rpc::kernel::Provider;
-use active_rpc::value::Call;
-use active_rpc::Budget;
+use active_rpc::value::{Call, Value};
+use active_rpc::wire::Envelope;
+use active_rpc::{Agent, Budget, Error};
 
 fn body(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
@@ -173,6 +175,190 @@ fn a_resume_batch_is_the_streaming_frames() {
         .frames_from(plan.chunk_count() + 1)
         .expect_err("a resume point past the plan is refused");
     assert_eq!(error.code(), "rpc/bulk", "{error}");
+}
+
+/// The documented `required_grant`/`required_calls` carry a one-chunk image
+/// through the resume order the module advertises (plan, missing, put, finish).
+/// The reply allowance used to be six bytes short of the plan-plus-finish
+/// replies, so the effect landed while egress was refused
+/// (R-10 round 15, M1).
+#[test]
+fn a_one_chunk_image_with_an_early_missing_page_fits_required_grant() {
+    let module =
+        active_rpc::domain::module_from_source("[app]\nname = \"bulk-r15\"\n", "bulk-r15.active")
+            .expect("module");
+    let image = active_infinity::encode(&module).expect("encode");
+    let transfer = BulkTransfer::new(image, 1 << 20).expect("one-chunk transfer");
+    assert_eq!(transfer.plan().chunk_count(), 1);
+    run_kernel_flow(
+        &transfer,
+        transfer.plan().required_grant(),
+        transfer.plan().required_calls(),
+    )
+    .expect("the documented grant carries plan, missing, put and finish");
+}
+
+fn run_kernel_flow(transfer: &BulkTransfer, grant: u64, calls: u64) -> Result<(), Error> {
+    let agent = Agent::new();
+    let id = agent.register(Box::new(BulkProvider::new()));
+    let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
+    let mut attrs = CapAttrs::new(&["plan", "put", "missing", "finish"]);
+    attrs.budget.max_bytes = grant;
+    attrs.budget.max_calls = calls;
+    let cap = agent.mint(id, 0, attrs).expect("cap");
+
+    let mut request = 1u64;
+    let plan = agent.call_from_envelope(
+        None,
+        lane,
+        &cap,
+        &Envelope::request(request, "plan", Vec::new()).with_payload(transfer.plan_frame()),
+    )?;
+    agent.run();
+    plan.value()?;
+    request += 1;
+    let missing = agent.call_from_envelope(
+        None,
+        lane,
+        &cap,
+        &Envelope::request(request, "missing", Vec::new()),
+    )?;
+    agent.run();
+    missing.value()?;
+    for index in 0..transfer.plan().chunk_count() {
+        request += 1;
+        let promise = agent.call_from_envelope(
+            None,
+            lane,
+            &cap,
+            &Envelope::request(request, "put", Vec::new())
+                .with_payload(transfer.chunk_frame(index)?),
+        )?;
+        agent.run();
+        promise.value()?;
+    }
+    request += 1;
+    let finish = agent.call_from_envelope(
+        None,
+        lane,
+        &cap,
+        &Envelope::request(request, "finish", Vec::new()).with_payload(transfer.finish_frame()),
+    )?;
+    agent.run();
+    finish.value()?;
+    Ok(())
+}
+
+/// `accept_charged` charges the callback only: a receiver built with its own
+/// meter used to charge the same frame twice, so a host combining the two
+/// documented APIs refused a transfer at half its true grant
+/// (R-10 round 15, L1).
+#[test]
+fn an_externally_charged_receiver_does_not_charge_its_own_meter() {
+    let sender = BulkSender::new(body(2_000, 0x26), 700).expect("sender");
+    let mut receiver =
+        BulkReceiver::with_budget(sender.plan().clone(), Budget::default()).expect("receiver");
+    let frame = sender.frame_at(0).expect("chunk");
+    let mut external = 0u64;
+    receiver
+        .accept_charged(&frame, &mut |bytes| {
+            external += bytes;
+            Ok(())
+        })
+        .expect("the frame is accepted");
+    assert_eq!(external, frame.len() as u64, "the callback sees the frame");
+    assert_eq!(
+        receiver.charged_bytes(),
+        0,
+        "the callback is the only meter on this path"
+    );
+}
+
+/// The advertised resume door works under a narrowed array budget: the page is
+/// capped by `max_array_len` instead of always asking for 1 024
+/// (R-10 round 15, L2).
+#[test]
+fn a_narrow_array_budget_can_still_page_the_missing_indexes() {
+    let transfer = BulkTransfer::new(body(64 * 1024, 0x27), 1_024).expect("transfer");
+    assert!(transfer.plan().chunk_count() > 10);
+    let agent = Agent::new();
+    let id = agent.register(Box::new(BulkProvider::new()));
+    let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
+    let mut attrs = CapAttrs::new(&["plan", "missing"]);
+    attrs.budget.max_array_len = 10;
+    attrs.budget.max_bytes = 1 << 20;
+    let cap = agent.mint(id, 0, attrs).expect("cap");
+    let plan = agent
+        .call_from_envelope(
+            None,
+            lane,
+            &cap,
+            &Envelope::request(1, "plan", Vec::new()).with_payload(transfer.plan_frame()),
+        )
+        .expect("plan queued");
+    agent.run();
+    plan.value().expect("plan settles");
+    let missing = agent
+        .call_from_envelope(
+            None,
+            lane,
+            &cap,
+            &Envelope::request(2, "missing", Vec::new()),
+        )
+        .expect("missing queued");
+    agent.run();
+    let value = missing.value().expect("missing settles");
+    let Value::Map(entries) = value else {
+        panic!("a map reply");
+    };
+    let Some(Value::List(items)) = entries.get("missing") else {
+        panic!("a missing list: {entries:?}");
+    };
+    assert!(
+        items.len() <= 10,
+        "the page is capped by the caller's array budget: {}",
+        items.len()
+    );
+    assert_eq!(
+        entries.get("more"),
+        Some(&Value::Bool(true)),
+        "the capped page reports that more remain"
+    );
+}
+
+/// A plan's `Debug` does not print the full root: the root is a commitment to
+/// the body, so a log line would be an offline equality oracle
+/// (R-10 round 15, L7).
+#[test]
+fn a_plan_debug_never_prints_the_full_root() {
+    let sender = BulkSender::new(body(2_000, 0x28), 700).expect("sender");
+    let plan = sender.plan();
+    let rendered = format!("{plan:?}");
+    let full: String = plan
+        .root()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert!(
+        !rendered.contains(&full),
+        "the full root is in the debug form: {rendered}"
+    );
+    assert!(
+        rendered.contains("root_prefix"),
+        "the prefix names what it prints: {rendered}"
+    );
+}
+
+/// The funded-assembly cap is two attempts: the literal value and the frozen
+/// state are pinned, so raising the constant to 100 cannot pass the suite
+/// silently (R-10 round 15, M2).
+#[test]
+fn the_funded_assembly_cap_is_two_literal_attempts() {
+    assert_eq!(
+        active_rpc::bulk::FUNDED_ASSEMBLY_LIMIT,
+        2,
+        "the shipped cap is part of the throttle contract"
+    );
 }
 
 /// The throttle's counted and frozen branches, and the paid way out: the same

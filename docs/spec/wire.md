@@ -667,7 +667,10 @@ principal, and a delegated capability observes and settles its parent's
 transfer. `Provider::on_drop` releases the object's transfer and any untaken
 body. An incomplete transfer is released after 60 s of inactivity and never later
 than 1 hour after it opened, a finished, untaken body after 10 minutes, and its
-digest reply with it, all measured against the kernel-stamped `Call::now_ms`. `plan`
+digest reply with it, all measured against the kernel-stamped `Call::now_ms`
+and applied on the next call for that object, a host `expire_idle` sweep, a
+`plan` for the object, `abort`, or the capability's drop: a provider never
+reclaims on a timer of its own, so a host serving long-lived capabilities sweeps. `plan`
 refuses to open a new transfer for an object whose completed body has not been
 taken (`rpc/bulk`), so a body is never silently dropped inside its window.
 `abort` drops whatever the object holds — an open transfer, an untaken body
@@ -680,14 +683,19 @@ be able to say so. It acts on the **object**, like every other bulk method, so
 it inherits the object model's rule that an object has one principal: a host
 that mints a second capability on the same object gives that party the right to
 discard the object's state. It is idempotent and needs no plan.
-`missing` answers the indexes the request frame names (page-capped at 1 024, with
-`more` and `remaining`; an empty payload asks for the lowest window), refreshes
+A `plan` reply is a five-entry map, so a capability whose `max_array_len` is
+below five cannot open a transfer (the provider withholds the reply).
+`missing` answers the indexes the request frame names (page-capped at 1 024 or the
+caller's `max_array_len`, whichever is smaller, with `more` and `remaining`; an
+empty payload asks for the lowest window), refreshes
 the idle window, and never expires a transfer by idleness: a read-only
 capability can poll but cannot destroy another capability's chunks. The absolute
 lifetime below still applies to a poll, so polling cannot hold a transfer
-forever. `finish` is idempotent per object until a new plan is accepted for it: a
+forever. `finish` is idempotent per object until a new plan is accepted for it
+or the completed window expires: a
 repeated marker returns the same reply, even after the host takes the body,
-because the effect already landed. The reply is `length`, `canonical` (whether
+because the effect already landed; after the untaken body is released (10
+minutes) the marker is `rpc/bulk`. The reply is `length`, `canonical` (whether
 the body has a content address), `body_hash` (the raw Blake3 digest
 of the body: a transfer-integrity value, **never** a content address; omitted for
 a redacting call) and, when the body is an Active Infinity image, `content`: the
@@ -715,9 +723,9 @@ so a deployment that mints narrow grants can still finish a small body. The lane
 `with_max_live_bytes` refuses with `rpc/budget-exceeded` anything that would push
 the bytes it holds past that bound. Each open transfer reserves **twice the bytes
 it has stored** (the chunks and the assembly buffer the body will need, which can
-only ever be a complete body) plus **twice** the plan's hash vector (32 bytes per
-chunk and the 53-byte header): the transfer holds its plan and the receiver holds
-its own copy. A complete body therefore needs `BulkPlan::required_live_bytes()` of
+only ever be a complete body) plus **twice** the 32-byte-per-chunk hash vector
+and the 53-byte header once: the transfer holds its plan and the receiver holds
+its own copy of the per-chunk hashes, while the shared header is counted once. A complete body therefore needs `BulkPlan::required_live_bytes()` of
 the provider-wide bound; compare it before opening a transfer, because a bound
 below it refuses the last `put` after the earlier chunks have been paid for. An
 announced plan that has received nothing reserves only its vector; a `put` whose

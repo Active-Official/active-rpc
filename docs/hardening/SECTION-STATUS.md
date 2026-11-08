@@ -21,7 +21,7 @@ Updated 2026-11-06 at `cf5f969`.
 | R-07 | domain providers | 47 | clean | r47 CLEAN (six claims held, four lows fixed) |
 | R-08 | tools / MCP | 60 | **closed** | r59 and r60 CLEAN |
 | R-09 | transports | 23 | **closed** | r22 and r23 CLEAN |
-| R-10 | bulk transfer | 14 | open | r14 found the funded-assembly allowance (medium, fixed) and the put charge on an unvalidated or duplicate frame (medium, open); r15 fixes F2-F8 and r16 must be clean |
+| R-10 | bulk transfer | 15 | open | r15 verified the round-15 fixes and found two mediums: `required_grant()` was six bytes short of the plan-plus-finish replies (a one-chunk image resume was refused at finish), and the funded-assembly cap was mutation-blind. Both fixed, plus eight lows (external-charge double count, page cap by `max_array_len`, docs, a deterministic `frames_from` build counter, `Debug` root, idle triggers). r16 and r17 must be clean |
 | R-11 | identity | 14 | open | r13 fixed two mediums (child-first rotation, event schema); r14 in flight |
 | R-12 | replay | 15 | **closed** | r14 and r15 **CLEAN** back to back (no critical/high/medium in either). r15's four lows are non-behavioral: the restore-release test and three ADR corrections. Residuals are count-bounded operator memory and the disclosed replay peak |
 | R-13 | receipts | 13 | open | r13 found two round-12 claims absent from the tree (the per-chunk check and the `O_NOFOLLOW` handle) plus three mediums, all fixed with tests; r14 and r15 must be clean |

@@ -102,7 +102,9 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   lane's cumulative `max_bytes` must cover `required_lane_bytes()`. A provider
   may bound the bytes it holds across objects with `with_max_live_bytes`, where
   each open transfer reserves twice the bytes it has **stored** plus **twice**
-  the retained plan hash vector (the transfer's plan and the receiver's copy):
+  the retained 32-byte-per-chunk hash vector and the 53-byte header once (the
+  transfer's plan and the receiver's copy hold the per-chunk hashes; the header
+  is shared):
   an unpaid plan holds only its vector, a `put` whose validated chunk would pass
   the bound is refused before it stores (an identical retransmission is free),
   and `BulkPlan::required_live_bytes()` is the bound a complete body needs

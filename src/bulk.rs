@@ -97,11 +97,14 @@ pub const FINISH_LEN: u64 = 4 + 1 + 8 + 32;
 
 /// Per-call allowance for the provider's replies when a caller sizes a grant.
 ///
-/// A place, put, missing or finish reply is a small map; 128 bytes covers every
-/// fixed shape with room to spare (a missing page is larger, but a caller that
-/// pages a [`MAX_CHUNKS`]-chunk plan also needs the grant for those replies and
-/// [`BulkPlan::required_grant`] is the conservative bound).
-pub const REPLY_ALLOWANCE: u64 = 128;
+/// A place, put, missing or finish reply is a small map. The measured fixed
+/// shapes are 162 bytes (plan), 84 (put), 67 (missing, one index) and 205
+/// (finish, an image with an address), so 192 covers each with room to spare;
+/// 128 under-counted a plan-plus-finish flow by six bytes (R-10 round 15, M1).
+/// A missing page is larger: a caller that pages a [`MAX_CHUNKS`]-chunk plan
+/// needs the grant for those replies, and [`BulkPlan::required_grant`] sizes a
+/// whole chunk per allowance.
+pub const REPLY_ALLOWANCE: u64 = 192;
 
 /// Throughput the wall-sizing formula assumes for one `finish` pass.
 ///
@@ -230,12 +233,14 @@ pub struct BulkPlan {
 
 impl std::fmt::Debug for BulkPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never the hashes: a 65 536-chunk plan would print two megabytes.
+        // Never the hashes: a 65 536-chunk plan would print two megabytes. The
+        // root commits the body, so a full root in a log is an offline equality
+        // oracle; only a prefix is printed (R-10 round 15, L7).
         f.debug_struct("BulkPlan")
             .field("chunk", &self.chunk)
             .field("total", &self.total)
             .field("chunks", &self.chunks)
-            .field("root", &hex(&self.root))
+            .field("root_prefix", &hex8(&self.root[..8]))
             .field("context_bytes", &self.context.len())
             .finish()
     }
@@ -443,7 +448,8 @@ impl BulkPlan {
     /// Provider-wide footprint a complete transfer reserves.
     ///
     /// The provider counts each stored byte twice (the chunks and the assembly
-    /// buffer) plus the plan's hash vector twice, so a host that wants a body
+    /// buffer) plus the 32-byte-per-chunk hash vector twice and the 53-byte
+    /// header once, so a host that wants a body
     /// of [`BulkPlan::total`] bytes to complete must give
     /// [`BulkProvider::with_max_live_bytes`] at least this value. Comparing it
     /// at open turns the mid-transfer refusal into an up-front answer
@@ -905,6 +911,10 @@ impl BulkFinish {
 pub struct BulkSender {
     plan: BulkPlan,
     bytes: Vec<u8>,
+    /// Frames built through [`BulkSender::frame_at`], for the test that pins
+    /// the resume batch to the streaming builder (R-10 round 15, L5).
+    #[cfg(test)]
+    frame_builds: std::cell::Cell<usize>,
 }
 
 impl std::fmt::Debug for BulkSender {
@@ -921,7 +931,12 @@ impl BulkSender {
     /// Plan and retain a body for sending.
     pub fn new(bytes: Vec<u8>, chunk: usize) -> Result<Self> {
         let plan = BulkPlan::new(&bytes, chunk)?;
-        Ok(Self { plan, bytes })
+        Ok(Self {
+            plan,
+            bytes,
+            #[cfg(test)]
+            frame_builds: std::cell::Cell::new(0),
+        })
     }
 
     /// The plan to send before any chunk.
@@ -964,7 +979,15 @@ impl BulkSender {
         let start = index as usize * self.plan.chunk;
         let end = (start + self.plan.chunk).min(self.bytes.len());
         let planned = self.plan.hashes[index as usize];
+        #[cfg(test)]
+        self.frame_builds.set(self.frame_builds.get() + 1);
         Ok(BulkChunk::with_hash(index, self.plan.chunk, &self.bytes[start..end], planned).encode())
+    }
+
+    /// Frames built through the streaming path, for tests only.
+    #[cfg(test)]
+    fn frames_built(&self) -> usize {
+        self.frame_builds.get()
     }
 
     /// Frames for exactly the indexes a receiver reports as missing.
@@ -1095,8 +1118,23 @@ impl BulkReceiver {
     where
         F: FnOnce(u64) -> Result<()>,
     {
-        if let Some(meter) = self.meter.as_mut() {
-            meter.charge_bytes(frame.len() as u64)?;
+        self.accept_inner(frame, true, reserve)
+    }
+
+    /// Validate, reserve and store one chunk.
+    ///
+    /// `charge_internal` is false only for [`BulkReceiver::accept_charged`]:
+    /// the caller's callback already paid for the frame, and charging the
+    /// receiver's own meter as well made the same frame cost twice
+    /// (R-10 round 15, L1).
+    fn accept_inner<F>(&mut self, frame: &[u8], charge_internal: bool, reserve: F) -> Result<u32>
+    where
+        F: FnOnce(u64) -> Result<()>,
+    {
+        if charge_internal {
+            if let Some(meter) = self.meter.as_mut() {
+                meter.charge_bytes(frame.len() as u64)?;
+            }
         }
         let (index, data, duplicate) = validate_chunk(&self.plan, &self.received, frame)?;
         if duplicate {
@@ -1113,14 +1151,15 @@ impl BulkReceiver {
     /// The callback is the integration point for a caller that meters bytes
     /// somewhere else (a kernel lane, a capability). It runs before validation,
     /// because decoding and hashing the frame is the work it pays for; a
-    /// refused charge still leaves no state (round 10, M-2).
+    /// refused charge still leaves no state (round 10, M-2). The receiver's own
+    /// meter is **not** charged on this path: the callback is the meter.
     pub fn accept_charged(
         &mut self,
         frame: &[u8],
         charge: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<u32> {
         charge(frame.len() as u64)?;
-        self.accept_metered(frame, |_| Ok(()))
+        self.accept_inner(frame, false, |_| Ok(()))
     }
 
     /// Indexes not yet received, in order.
@@ -1590,6 +1629,12 @@ impl BulkProvider {
     /// its own copy), which is why a complete body needs
     /// `2 x body + plan vector` of the provider-wide bound
     /// (R-10 round 15, F4).
+    ///
+    /// It is a committed-state estimate, not an allocator-exact bound: the
+    /// per-chunk map node and its `Vec` header (tens of bytes per stored chunk)
+    /// are not charged, so a plan of many one-byte chunks can hold somewhat more
+    /// than the bound. The payload the caller paid for dominates that gap for
+    /// any realistic chunk size (R-10 round 15, L6).
     pub fn live_bytes(&self) -> u64 {
         // An open transfer reserves the bytes it has stored, the assembly
         // buffer a `finish` allocates and the plan's own hash vector
@@ -1831,22 +1876,25 @@ impl BulkProvider {
         // A resume request names the gaps the sender wants; the reply is that
         // set (page-capped), or the authoritative window when the frame is
         // empty. An index outside the plan is refused (round 8, L1;
-        // round 9, M3).
+        // round 9, M3). The page is also capped by the caller's array budget:
+        // a narrowed capability must be able to use the advertised resume door
+        // (R-10 round 15, L2).
         let requested = if call.payload.is_empty() {
             None
         } else {
             Some(BulkRequest::decode(&call.payload, &active.plan)?)
         };
         active.last_ms = call.now_ms;
+        let page_limit = MISSING_PAGE.min(call.budget.max_array_len.max(1) as usize);
         let page: Vec<u32> = match requested {
             Some(request) => request
                 .missing()
                 .iter()
                 .copied()
                 .filter(|index| active.receiver.missing_contains(*index))
-                .take(MISSING_PAGE)
+                .take(page_limit)
                 .collect(),
-            None => active.receiver.missing_page(MISSING_PAGE),
+            None => active.receiver.missing_page(page_limit),
         };
         let more = active.receiver.missing_count() > page.len() as u64;
         let missing: Vec<Value> = page
@@ -2176,11 +2224,12 @@ fn reserved_bytes(plan: &BulkPlan, received: u64) -> u64 {
     // `2 x received` is exact at the finish and never under-counts. Charging
     // `2 x total` from the plan instead let an announced-but-unpaid plan hold the
     // provider-wide bound for the whole idle window (R-10 round 18, #1).
-    // Two plan vectors are retained per transfer (`ActiveTransfer.plan` and
-    // the receiver's own `BulkPlan`), and the `plan` call itself builds a third
-    // from the frame before either is stored. Charging the vector twice bounds
-    // the resident footprint of an open transfer instead of under-counting it
-    // (R-10 round 13, F3; round 15, F4).
+    // Two copies of the per-chunk hash vector are retained per transfer
+    // (`ActiveTransfer.plan` and the receiver's own `BulkPlan`), and the `plan`
+    // call itself builds a third from the frame before either is stored.
+    // Charging the per-chunk vector twice (and the shared 53-byte header once)
+    // bounds the resident footprint of an open transfer instead of
+    // under-counting it (R-10 round 13, F3; round 15, F4/L3).
     received
         .saturating_mul(2)
         .saturating_add(PLAN_OVERHEAD)
@@ -2211,6 +2260,14 @@ fn expected_chunks(total: u64, chunk: usize) -> Result<u32> {
 
 fn hex(bytes: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn hex8(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(16);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));
     }
@@ -2398,6 +2455,33 @@ mod throttle_tests {
         assert!(
             provider.completed.get(&0).expect("record").recomputed,
             "the paying replay recomputes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sender_tests {
+    use super::*;
+
+    /// A resume batch must go through `frame_at`, which carries the plan's
+    /// hash. The old implementation re-hashed each chunk and produced the same
+    /// bytes, so output equality could not see the regression; the build
+    /// counter can (R-10 round 15, L5).
+    #[test]
+    fn frames_from_reuses_the_streaming_builder() {
+        let sender =
+            BulkSender::new((0..200u8).cycle().take(2_000).collect(), 700).expect("sender");
+        let before = sender.frames_built();
+        let batch = sender.frames_from(1).expect("resume batch");
+        assert_eq!(
+            batch.len() as u32,
+            sender.plan().chunk_count() - 1,
+            "the batch covers the remaining chunks"
+        );
+        assert_eq!(
+            sender.frames_built() - before,
+            batch.len(),
+            "every batch frame came from the streaming builder"
         );
     }
 }
