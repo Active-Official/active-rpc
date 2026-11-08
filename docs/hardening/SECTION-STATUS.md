@@ -23,7 +23,7 @@ Updated 2026-11-06 at `cf5f969`.
 | R-09 | transports | 23 | **closed** | r22 and r23 CLEAN |
 | R-10 | bulk transfer | 14 | open | r14 found the funded-assembly allowance (medium, fixed) and the put charge on an unvalidated or duplicate frame (medium, open); r15 fixes F2-F8 and r16 must be clean |
 | R-11 | identity | 14 | open | r13 fixed two mediums (child-first rotation, event schema); r14 in flight |
-| R-12 | replay | 9 | open | r9 fixes: the encode/record decode ceiling (F2), the method-vector charge (F4-low), the byte-estimate test (F6) and the 32-bit cast (F10); F3 (replay peak), F5 (cap scans) and the pinned revoke timing test are open for r10 |
+| R-12 | replay | 10 | open | r10 fixes: the replay-side op-list copy (F3), the durable-ceiling counter (F5) and a pin-scan counter test; r11 and r12 must be clean |
 | R-13 | receipts | 13 | open | r13 found two round-12 claims absent from the tree (the per-chunk check and the `O_NOFOLLOW` handle) plus three mediums, all fixed with tests; r14 and r15 must be clean |
 | R-14 | wasm tools | 5 | **closed** | r3's medium was refuted with a test; r4 and r5 CLEAN |
 | R-15 | observability | 5 | **closed** | r2's high and mediums fixed; r4 and r5 CLEAN |

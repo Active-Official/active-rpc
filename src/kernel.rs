@@ -592,6 +592,18 @@ pub struct Kernel {
     /// authority the rotation must withdraw even when no capability record can
     /// be matched to it (round 40, R-07-2).
     record_pins: BTreeMap<[u8; 32], RecordPin>,
+    /// How many times `revoke_subtree` ran the export-pin orphan scan.
+    ///
+    /// A test-only counter: the scan is O(pins), and a repeated revoke must
+    /// return before it (R-12 round 10).
+    #[cfg(test)]
+    pin_scans: std::cell::Cell<usize>,
+    /// Live durable capabilities, maintained on every insert, revoke and drop.
+    ///
+    /// `durable_ceiling_reached` used to scan the whole registry per durable
+    /// mint and per restore, so a 65k-cap kill list or restore set was
+    /// quadratic at startup (R-12 round 8, F5).
+    live_durable_caps: usize,
     /// How many pins name each object: `drop_record` must not scan the map on
     /// the unbudgeted drop path (round 39, L-3).
     pin_counts: BTreeMap<(ProviderId, u64), usize>,
@@ -1157,6 +1169,9 @@ impl Agent {
             record_index: BTreeMap::new(),
             object_records: BTreeMap::new(),
             record_pins: BTreeMap::new(),
+            #[cfg(test)]
+            pin_scans: std::cell::Cell::new(0),
+            live_durable_caps: 0,
             pin_counts: BTreeMap::new(),
             deferred_refops: Rc::clone(&deferred_refops),
         };
@@ -6447,12 +6462,18 @@ impl Kernel {
             .entry(record.record_id)
             .or_default()
             .insert(record.id);
+        if record.attrs.persistence == CapPersistence::Durable {
+            self.live_durable_caps = self.live_durable_caps.saturating_add(1);
+        }
         self.caps.insert(record.id, record);
     }
 
     /// Remove a capability and decrement its object's count.
     fn remove_cap_record(&mut self, id: CapId) -> Option<CapRecord> {
         let record = self.caps.remove(&id)?;
+        if record.attrs.persistence == CapPersistence::Durable && !record.revoked {
+            self.live_durable_caps = self.live_durable_caps.saturating_sub(1);
+        }
         if let Some(ids) = self.record_index.get_mut(&record.record_id) {
             ids.remove(&id);
             if ids.is_empty() {
@@ -7039,12 +7060,11 @@ fn is_expired(kernel: &Kernel, record: &CapRecord) -> bool {
 /// never add a second one. Counting it made a mint/revoke cycle grow the sum by
 /// two per pair and let the set pass its ceiling (round 40, residual R-3).
 fn durable_ceiling_reached(kernel: &Kernel) -> bool {
-    let live = kernel
-        .caps
-        .values()
-        .filter(|record| record.attrs.persistence == CapPersistence::Durable && !record.revoked)
-        .count();
-    kernel.revoked_records.len().saturating_add(live) >= MAX_TOMBSTONES
+    kernel
+        .revoked_records
+        .len()
+        .saturating_add(kernel.live_durable_caps)
+        >= MAX_TOMBSTONES
 }
 
 /// Longest method label a queued-call event carries.
@@ -7268,6 +7288,8 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         // ids was emitted by the call that revoked them.
         return;
     }
+    #[cfg(test)]
+    kernel.pin_scans.set(kernel.pin_scans.get() + 1);
     // An exported record whose exporting capability was dropped before this
     // revocation has no live record to match, so the subtree walk cannot see
     // it. The pin carries its exporter and lineage, exactly as the rotation
@@ -7293,6 +7315,9 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
             Some(record) => {
                 was_revoked = record.revoked;
                 record.revoked = true;
+                if record.attrs.persistence == CapPersistence::Durable && !was_revoked {
+                    kernel.live_durable_caps = kernel.live_durable_caps.saturating_sub(1);
+                }
                 // Only a durable record can ever be restored, so only its id
                 // needs a tombstone; an ephemeral one would leak an entry per
                 // mint/revoke cycle forever.
@@ -7791,6 +7816,55 @@ mod fail_closed_tests {
         assert!(
             error.to_string().ends_with("has no meter"),
             "unexpected refusal: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pin_scan_tests {
+    use super::*;
+
+    struct Echo;
+
+    impl Provider for Echo {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["echo".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> Result<Response> {
+            Ok(Response::Value(Value::Int(1)))
+        }
+    }
+
+    /// A repeated revoke must return before the export-pin orphan scan: the
+    /// round-6 timing test had no pins and the round-8 report showed the
+    /// counter's first fix was dead, so this asserts the scan count directly
+    /// (R-12 round 10).
+    #[test]
+    fn a_repeated_revoke_does_not_scan_the_pin_table() {
+        let agent = Agent::new();
+        let provider = agent.register(Box::new(Echo));
+        let root = agent
+            .mint(provider, 0, CapAttrs::new(&["echo"]))
+            .expect("root");
+        let _child = agent
+            .attenuate(&root, CapAttrs::new(&["echo"]))
+            .expect("child");
+        agent.revoke(&root).expect("the first revoke scans once");
+        let before = agent.cell.borrow().pin_scans.get();
+        assert!(before >= 1, "the first revoke must run the scan");
+        for _ in 0..10 {
+            let _ = agent.revoke(&root);
+        }
+        let after = agent.cell.borrow().pin_scans.get();
+        assert_eq!(
+            after, before,
+            "a repeated revoke of an already-revoked capability scanned the pin table"
         );
     }
 }

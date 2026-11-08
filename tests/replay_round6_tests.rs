@@ -1,9 +1,17 @@
-//! R-12 replay round 6: a repeated revoke of an already-revoked subtree must not
-//! re-walk it.
+//! R-12 replay rounds 6-10: a repeated revoke of an already-revoked subtree must
+//! not re-walk it, and must not scan the export pin table either.
 
 use std::time::Instant;
 
-use active_rpc::{Agent, Budget, CapAttrs};
+use active_rpc::cap::{CapAttrs, CapPersistence};
+use active_rpc::identity::{IdentityPolicy, PeerIdentity};
+use active_rpc::{AdmittedIdentity, Agent, Budget};
+
+fn admitted(name: &[u8]) -> AdmittedIdentity {
+    IdentityPolicy::default()
+        .admit(Some(&PeerIdentity::from_certificate(name)), false)
+        .expect("admitted")
+}
 
 /// The first revoke walks the subtree; every later revoke of the same node must
 /// be constant work. The reviewer's package used 16 000 children and 84 000
@@ -41,6 +49,48 @@ fn repeated_revokes_of_a_revoked_subtree_are_linear() {
         "2 000 repeated revokes of an 8 001-node subtree took {elapsed:?}: the walk is quadratic"
     );
     let _ = (lane, children);
+}
+
+/// A repeated revoke must not scan the export pin table either. The round-6
+/// test has no `record_pins`, so it cannot see that scan; this one exports
+/// 2 000 durable capabilities, drops their handles (so the pins survive the
+/// root's revocation), and then revokes the same root 20 000 times (~40M pin
+/// visits on the buggy path).
+#[test]
+fn repeated_revokes_with_a_pinned_export_table_stay_linear() {
+    let agent = Agent::new();
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x63; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let mut root_attrs = CapAttrs::new(&["echo"]);
+    root_attrs.persistence = CapPersistence::Durable;
+    let root = agent
+        .mint_bound(&admitted(b"owner"), provider, 0, root_attrs)
+        .expect("root");
+    for _ in 0..2_000 {
+        let mut attrs = CapAttrs::new(&["echo"]);
+        attrs.persistence = CapPersistence::Durable;
+        // A tiny grant: xport reserves it from the parent, and 2 000
+        // one-call reservations must fit the parent budget.
+        attrs.budget.max_calls = 1;
+        attrs.budget.max_bytes = 1;
+        let child = agent.attenuate(&root, attrs).expect("child");
+        agent.export_capability(&child).expect("export");
+        // The exported capability is dropped before the revocation, so the
+        // record has no live capability and only the pin names it: the orphan
+        // scan is the path under test.
+        drop(child);
+    }
+    agent.revoke(&root).expect("the first revoke");
+    let started = Instant::now();
+    for _ in 0..20_000 {
+        let _ = agent.revoke(&root);
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "20 000 repeated revokes with 2 000 pins took {elapsed:?}: the pin scan runs"
+    );
 }
 
 struct Echo;

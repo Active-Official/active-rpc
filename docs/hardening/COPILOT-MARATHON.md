@@ -225,6 +225,23 @@ it.
 
 Verdict after the fix pass: every r13 finding is closed; r14 must be clean.
 
+### R-12 replay - 2026-11-07 (round 10 fixes)
+
+Round 8's three remaining items are closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F3 | medium | a replay built a second op list (with a second copy of every method string), a second trace and a second kernel, peaking near 391 MB for a 15.8 MB package | **fixed (the op list)**: `Recorder::replaying` sets `record_ops = false`, so `ReplayTrace` drives the recorder for handle lifetimes and the trace only; `package()` refuses a replaying recorder. The kernel's own `CapAttrs` copy is what the kernel must hold, and the trace is the comparison output |
+| F5 | low | `durable_ceiling_reached` scanned every capability per durable mint and per restore | **fixed**: `Kernel::live_durable_caps` is maintained on insert, revoke and drop, and the ceiling reads it |
+| — | test gap | the round-6 timing test had no `record_pins`, so it could not see the pin scan (the r8 report showed the first fix's early return was dead) | **fixed**: a test-only `pin_scans` counter plus `a_repeated_revoke_does_not_scan_the_pin_table` asserts the first revoke scans once and ten repeats scan zero more (moving the counter above the revoked skip fails it); a durable export table (2 000 exports, 20 000 revokes) is also timed as a second shape |
+
+Measured: the pinned-table test (2 000 durable exports, 20 000 repeated
+revokes) completes in about 1.2 s including setup; the 8 001-node walk test in
+about 0.3 s. No number here is an estimate.
+
+Gate: green on both feature sets, fmt, clippy, doc, fuzz and the negative
+controls. R-12 needs r11 and r12 clean.
+
 ### R-12 replay - 2026-11-07 (round 9 fixes)
 
 Round 8's findings F2 (the encoder could write an artifact the decoder

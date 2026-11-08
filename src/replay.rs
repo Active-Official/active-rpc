@@ -467,7 +467,7 @@ impl ReplayPackage {
         // Replay through the same recorder code path the original session used,
         // so handle lifetimes (retain/release events) are identical by
         // construction.
-        let mut recorder = Recorder::new(self.latency_ms)?;
+        let mut recorder = Recorder::replaying(self.latency_ms)?;
         // The first op is the header latency, which `Recorder::new` already
         // applied and recorded; replaying it would duplicate the entry.
         for op in self.ops.iter().skip(1) {
@@ -558,6 +558,13 @@ pub struct Recorder {
     /// so the recorder refuses to produce a package rather than emit one that
     /// cannot replay.
     poisoned: bool,
+    /// Whether this recorder keeps its own op list.
+    ///
+    /// A replay drives the recorder to reproduce handle lifetimes and the
+    /// trace, but it never packages: keeping a second op list (with a second
+    /// copy of every method string) doubled the peak for no consumer
+    /// (R-12 round 10, F3).
+    record_ops: bool,
     /// The decoded heap this session describes: every operation plus every
     /// trace entry, charged with the same helpers the decoder uses.
     ///
@@ -585,6 +592,19 @@ pub struct Recorder {
 impl Recorder {
     /// Start a recorded session with the given simulated latency.
     pub fn new(latency_ms: u64) -> Result<Recorder> {
+        Self::with_record_ops(latency_ms, true)
+    }
+
+    /// A recorder that reproduces a session without keeping its own op list.
+    ///
+    /// [`ReplayPackage::replay_trace`] drives this path: it already owns the
+    /// operations it executes, and a second op list (with a second copy of
+    /// every method string) only raised the peak (R-12 round 10, F3).
+    pub(crate) fn replaying(latency_ms: u64) -> Result<Self> {
+        Self::with_record_ops(latency_ms, false)
+    }
+
+    fn with_record_ops(latency_ms: u64, record_ops: bool) -> Result<Self> {
         let agent = Agent::with_secret(DEMO_SECRET);
         let provider = agent.register(Box::new(Demo));
         agent.set_latency(latency_ms);
@@ -595,12 +615,17 @@ impl Recorder {
             lane,
             caps: Vec::new(),
             ordinals: BTreeMap::new(),
-            ops: vec![Op::SetLatency(latency_ms)],
+            ops: if record_ops {
+                vec![Op::SetLatency(latency_ms)]
+            } else {
+                Vec::new()
+            },
             trace: Vec::new(),
             seen_total: 0,
             latency_ms,
             initial_latency_ms: latency_ms,
             poisoned: false,
+            record_ops,
             decoded: 0,
             decode_ceiling: MAX_DECODE_BYTES,
             arg_total: 0,
@@ -629,7 +654,9 @@ impl Recorder {
         self.reserve_op(&op)?;
         self.latency_ms = latency_ms;
         self.agent.set_latency(latency_ms);
-        self.ops.push(op.clone());
+        if self.record_ops {
+            self.ops.push(op.clone());
+        }
         self.note(&op)?;
         // The kernel does not emit an event for a clock change today, so this
         // usually captures nothing; a future clock that does emit one must not
@@ -802,7 +829,9 @@ impl Recorder {
             ttl_ms,
         };
         self.reserve_op(&op)?;
-        self.ops.push(op.clone());
+        if self.record_ops {
+            self.ops.push(op.clone());
+        }
         self.note(&op)?;
         let cap = match self.agent.mint(self.provider, 0, attrs) {
             Ok(cap) => cap,
@@ -853,7 +882,9 @@ impl Recorder {
             ttl_ms,
         };
         self.reserve_op(&op)?;
-        self.ops.push(op.clone());
+        if self.record_ops {
+            self.ops.push(op.clone());
+        }
         self.note(&op)?;
         // Nothing below can fail before the handle is dropped, so its
         // retain/release events are captured with this operation.
@@ -909,7 +940,9 @@ impl Recorder {
             arg_bytes,
         };
         self.reserve_op(&op)?;
-        self.ops.push(op.clone());
+        if self.record_ops {
+            self.ops.push(op.clone());
+        }
         self.note(&op)?;
         self.arg_total = arg_total;
         // Cloned after the fallible steps, so a refusal above cannot leave a
@@ -941,7 +974,9 @@ impl Recorder {
         }
         let op = Op::Revoke { cap };
         self.reserve_op(&op)?;
-        self.ops.push(op.clone());
+        if self.record_ops {
+            self.ops.push(op.clone());
+        }
         self.note(&op)?;
         // Cloned after the fallible steps (R-12 round 7, F1).
         let handle = self.caps[cap as usize].clone();
@@ -973,6 +1008,11 @@ impl Recorder {
     /// A recorder that lost events refuses: the op list and the trace no longer
     /// line up, so the artifact could not replay.
     pub fn package(&self) -> Result<ReplayPackage> {
+        if !self.record_ops {
+            return Err(Error::Replay(
+                "a replay recorder has no op list to package".into(),
+            ));
+        }
         if self.poisoned {
             return Err(Error::Replay(
                 "the recorder lost events; the session cannot be packaged".into(),
