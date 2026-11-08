@@ -87,12 +87,14 @@ struct ModuleSlot {
     /// the install-time redactor stays, so a module cannot declassify itself by
     /// removing the node that made it secret.
     held_secret: bool,
-    /// Every tainted blob address the slot has ever held.
+    /// Every address the slot has ever held as secret material: tainted blob
+    /// hashes, the provenance parent and `Hash` entries, and the pre-patch
+    /// image hashes.
     ///
     /// Sticky with `held_secret`: a patch can replace the blob with an integer,
     /// and a projection that rebuilt the address set from the post-write module
     /// would then declassify a hash the reply may still quote
-    /// (R-16 round 14, F2).
+    /// (R-16 rounds 14-18).
     secret_addresses: BTreeSet<[u8; 32]>,
 }
 
@@ -668,11 +670,15 @@ impl ModuleProvider {
                 slot.secret_addresses
                     .extend(security::tainted_blob_addresses(&decoded));
                 if slot.held_secret {
-                    // The new provenance names the pre-patch image and any
-                    // carried Hash entries: both are sticky oracles
-                    // (R-16 round 17, F1).
-                    slot.secret_addresses
-                        .extend(security::provenance_addresses(&decoded));
+                    // The pre-patch image and its provenance are the addresses
+                    // a lineage text can quote; the new provenance drops them,
+                    // so the sticky set must learn them here
+                    // (R-16 round 18, F3).
+                    if let Some(old_hash) = slot.hash {
+                        slot.secret_addresses.insert(old_hash);
+                    }
+                    let old_provenance = security::provenance_addresses(&slot.module);
+                    slot.secret_addresses.extend(old_provenance);
                 }
                 slot.module = decoded;
                 slot.hash = Some(hash);
@@ -926,8 +932,9 @@ impl ModuleProvider {
                 let mut hidden_addresses: BTreeSet<[u8; 64]> = BTreeSet::new();
                 if slot.held_secret {
                     // Sticky: a patch may have removed the blob whose address
-                    // an annotation still quotes (R-16 round 14, F2).
-                    for address in &slot.secret_addresses {
+                    // an annotation still quotes (R-16 round 14, F2). The slot's
+                    // own hash is the same oracle (R-16 round 18, F5).
+                    for address in slot.secret_addresses.iter().chain(slot.hash.iter()) {
                         if let Ok(key) =
                             <[u8; 64]>::try_from(active_infinity::ir::hash_hex(address).as_bytes())
                         {
@@ -952,6 +959,15 @@ impl ModuleProvider {
                 if call.redact {
                     tainted_ids.extend(tainted_nodes(module));
                 }
+                // A raw 32-byte copy of a secret address is the same oracle as
+                // its hex form (R-16 round 18, F2/F5).
+                let hidden_raw = if slot.held_secret {
+                    let mut raw: Vec<[u8; 32]> = slot.secret_addresses.iter().copied().collect();
+                    raw.extend(slot.hash);
+                    security::raw_address_set(&raw)
+                } else {
+                    std::collections::BTreeSet::new()
+                };
                 let mut out = Vec::new();
                 let mut hidden_seen = false;
                 for annotation in module.annotations() {
@@ -966,6 +982,7 @@ impl ModuleProvider {
                     let carries_text = security::annotation_text(&annotation.kind).is_some();
                     let hidden = (carries_text && tainted_ids.contains(&annotation.node))
                         || security::text_names_an_address(&text, &hidden_addresses)
+                        || security::text_carries_raw_address(&text, &hidden_raw)
                         || text.contains(security::SECRET_MARKER);
                     if hidden {
                         // One marker for the whole hidden set: a marker per
@@ -1030,8 +1047,9 @@ impl ModuleProvider {
                             // whole answer: rebuilding both per key/value made
                             // a large provenance quadratic (R-16 round 17, F7).
                             let hex = security::hex_addresses(&addresses);
+                            let raw = security::raw_address_set(&addresses);
                             let carries =
-                                |text: &str| security::text_carries_raw_address(text, &addresses);
+                                |text: &str| security::text_carries_raw_address(text, &raw);
                             let names = |text: &str| {
                                 carries(text) || security::text_names_an_address(text, &hex)
                             };
@@ -1042,6 +1060,9 @@ impl ModuleProvider {
                                     security::scrub_addresses(text, &hex)
                                 }
                             };
+                            // A spent grant refuses before the text walk, not
+                            // after it (R-16 round 18, F1).
+                            check_wall_budget(started, call)?;
                             let mut scrubbed = std::collections::BTreeMap::new();
                             for (key, value) in map {
                                 if names(&key) {
@@ -1066,7 +1087,13 @@ impl ModuleProvider {
                                     Value::Text(text) => Value::Text(scrub(&text)),
                                     other => other,
                                 };
-                                scrubbed.insert(key, value);
+                                if scrubbed.insert(key, value).is_some() {
+                                    // Two keys that scrub to one name would
+                                    // silently drop a field (R-16 round 18, F4).
+                                    return Err(Error::Provider {
+                                        code: "provider/redaction".to_string(),
+                                    });
+                                }
                             }
                             map = scrubbed;
                         }
@@ -1822,8 +1849,9 @@ fn strip_address_labels(answer: &mut Vec<String>, slot: &ModuleSlot) {
     addresses.extend(slot.hash);
     // One set for every label in the answer (R-16 round 17, F7).
     let hex = security::hex_addresses(&addresses);
+    let raw = security::raw_address_set(&addresses);
     answer.retain(|label| {
-        !security::text_carries_raw_address(label, &addresses)
+        !security::text_carries_raw_address(label, &raw)
             && !security::text_names_an_address(label, &hex)
     });
 }
@@ -2471,11 +2499,12 @@ pub fn cone_ids(module: &InfinityModule, path: &str) -> Result<Vec<NodeId>> {
     Ok(subgraph(module, &[node]))
 }
 
-/// Whether a text carries a `blake3:` prefix followed by a 64-digit hex run.
+/// Whether a text carries a `blake3:` prefix followed by 64 hex digits.
 ///
-/// A producer string that merely mentions the prefix is audit text; one that
-/// carries a run is a content address and may be secret-derived
-/// (R-16 round 16, F7).
+/// The digits may be scattered through the rest of the text (`blake3:0011 for
+/// the lineage` still matches), so this is an over-drop in the safe direction;
+/// a producer string that merely mentions the prefix has too few digits and
+/// survives (R-16 round 16 F7; round 18, F5).
 fn carries_blake3_hex(text: &str) -> bool {
     let Some(index) = text.find("blake3:") else {
         return false;

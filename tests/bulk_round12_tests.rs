@@ -88,7 +88,7 @@ fn the_body_wall_is_the_bodys_own() {
     // 2 KB is one chunk at the documented rate, two chunks of per-chunk term and
     // the 100 ms slack.
     assert_eq!(small.chunk_count(), 2);
-    assert_eq!(small.assembly_wall_ms(), 102);
+    assert_eq!(small.assembly_wall_ms(), 103);
     // The recommendation never asks for less than the default grant.
     assert_eq!(small.required_wall_ms(), 5_000);
 
@@ -98,8 +98,8 @@ fn the_body_wall_is_the_bodys_own() {
     hashes[0] = [1u8; 32];
     let large = BulkPlan::from_hashes(256 * 1024, 1 << 30, hashes).expect("1 GiB plan");
     assert_eq!(large.chunk_count(), 4_096);
-    assert_eq!(large.assembly_wall_ms(), 8_118);
-    assert_eq!(large.required_wall_ms(), 8_118);
+    assert_eq!(large.assembly_wall_ms(), 209_445);
+    assert_eq!(large.required_wall_ms(), 209_445);
 
     // The per-chunk term is a real term, not a constant: a body with the same
     // bytes in more chunks needs strictly more wall, which is the shape the

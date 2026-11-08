@@ -76,6 +76,40 @@ fn a_provenance_parent_does_not_leave_any_projection() {
     }
 }
 
+/// Every folded compatibility separator splits a copy (R-16 round 18, F5).
+#[test]
+fn every_folded_separator_splits_a_copy() {
+    let separators = [
+        '\u{ff1a}', '\u{fe13}', '\u{2236}', '\u{ff0d}', '\u{fe63}', '\u{ff3f}', '\u{fe33}',
+        '\u{fe4d}', '\u{fe4e}', '\u{fe4f}',
+    ];
+    for (index, separator) in separators.into_iter().enumerate() {
+        let hash = [(index as u8) + 0x60; 32];
+        let address = hash_hex(&hash);
+        let split = format!("{}{}{}", &address[..32], separator, &address[32..]);
+        let mut module = InfinityModule::new();
+        let blob = module.push(Inode::Blob {
+            hash,
+            size: 8,
+            tainted: true,
+            media_type: "application/octet-stream".to_string(),
+            payload: None,
+        });
+        let copy = module.push(Inode::Str(split.clone()));
+        let root = module.push(Inode::Table {
+            fields: vec![("blob".to_string(), blob), ("copy".to_string(), copy)],
+        });
+        module.set_root(Some(root));
+        let raw = encode(&module).expect("encode");
+        let redacted = active_rpc::security::redact_module(&raw).expect("redact");
+        assert!(
+            !String::from_utf8_lossy(&redacted).contains(&split),
+            "a copy split by U+{:04X} survived",
+            separator as u32
+        );
+    }
+}
+
 /// A raw (non-hex) 32-byte address quoted in a text is hidden on the Value
 /// paths (R-16 round 17, F9).
 #[test]
@@ -90,9 +124,14 @@ fn a_raw_address_copy_in_a_text_is_hidden() {
         media_type: "application/octet-stream".to_string(),
         payload: None,
     });
+    let secret = module.push(Inode::Secret(CANARY.into()));
     let copy = module.push(Inode::Str(text.clone()));
     let root = module.push(Inode::Table {
-        fields: vec![("blob".to_string(), blob), ("copy".to_string(), copy)],
+        fields: vec![
+            ("blob".to_string(), blob),
+            ("s".to_string(), secret),
+            ("copy".to_string(), copy),
+        ],
     });
     module.set_root(Some(root));
     module.annotate(root, AnnotationKind::Intent(text.clone()));
@@ -112,6 +151,28 @@ fn a_raw_address_copy_in_a_text_is_hidden() {
             "{method} served the raw address: {answer:?}"
         );
     }
+
+    // A non-redacting capability still must not receive the annotation text.
+    let mut module = InfinityModule::new();
+    let blob = module.push(Inode::Blob {
+        hash: raw,
+        size: 8,
+        tainted: true,
+        media_type: "application/octet-stream".to_string(),
+        payload: None,
+    });
+    let leaf = module.push(Inode::Str("x".to_string()));
+    let root = module.push(Inode::Table {
+        fields: vec![("blob".to_string(), blob), ("leaf".to_string(), leaf)],
+    });
+    module.set_root(Some(root));
+    module.annotate(leaf, AnnotationKind::Intent(text.clone()));
+    let (agent, cap, lane) = install(module, &["annotations"], false);
+    let answer = call(&agent, lane, &cap, "annotations", vec![]);
+    assert!(
+        !text_contains(&answer, &text),
+        "a non-redacting read served the raw annotation: {answer:?}"
+    );
 }
 
 /// A fullwidth-colon split copy is a separators split to a consumer that

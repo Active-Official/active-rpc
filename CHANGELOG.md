@@ -153,7 +153,9 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
   a declared total above the ceiling or more than 32 700 chunks before
   allocating the hash list; `BulkChunk::try_new` refuses an oversized chunk.
 - **Peak memory and CPU.** `finish` assembles the body while the stored chunks
-  are still resident (peak: the body plus the chunks), and a chunk frame carries
+  are still resident (peak: the body plus the chunks; an image classification
+  retains up to `CLASSIFY_BODY_COPIES` body lengths, measured 7x without
+  secrets and 17-18x dense), and a chunk frame carries
   the hash it was built with, so a retransmission does not re-hash the body.
 - **No body bytes in `Debug`.** `BulkPlan`, `BulkChunk`, `BulkSender`,
   `BulkReceiver` and `BulkProvider` print shape only. `BulkBody` does not print

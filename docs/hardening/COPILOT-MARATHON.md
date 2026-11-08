@@ -23,13 +23,13 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-18: r18 verified r17 and found one high (classification peak 12x, not 3x) and one medium (terminal memory reply), plus five lows, all fixed; r19 and r20 must be clean | 165 fixed / 0 rejected / 0 open (limits documented) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-19: r19 found the classification peak model too low (critical), the wall estimate not node-aware (high), and medium/low test/doc gaps, all fixed; r20 and r21 must be clean | 180 fixed / 0 rejected / 0 open (limits documented) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | `CLEAN` (rounds 1-15; rounds 14 and 15 clean) | 60 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018/0010) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-16: r16 fixed the r15 mediums (a partial magic lock wedged the log; a zeroed tail could not be repaired) and the r15 lows; r17 and r18 must be clean | 85 fixed / 0 rejected / 2 residuals (documented) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-17: r17 found two highs (provenance parents not sticky; a quadratic byte assertion), seven mediums and eleven lows, all fixed or documented; r18 and r19 must be clean | 100 fixed / 0 rejected / 5 noted | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-18: r18 found the raw scan quadratic (high), raw Value-path leaks and dead patch seeding (mediums), and three lows, all fixed or documented; r19 and r20 must be clean | 110 fixed / 0 rejected / 5 noted | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-10: r10 found the residency charge (medium) and four lows, all fixed; r11 and r12 must be clean | 68 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-5: r5 found two round-4 fixes missing and three partial (F1 fixed now); F2/F6/F8/F15 and the r5 test gaps are open for r6 | 77 fixed / 0 rejected / 7 open (3 documented) | this commit |
@@ -49,6 +49,40 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-10 bulk - 2026-11-07 (round 19 audit pass)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `3d2540d`. One critical, one high, three mediums and five lows; all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | critical | the 12x classification model was below a dense-secret image's measured 17-18x peak: a host sized with the accessor could be OOM-killed | **fixed**: `CLASSIFY_BODY_COPIES = 24` (measured 7x public, 17-18x dense, plus margin) drives the fresh gate, the replay gate (`live + 23L`) and the accessor (`+22L`). The literal is pinned and a dense-secret boundary test checks both sides |
+| 2 | high | the wall estimate was byte-based while the redaction is node-bound (measured ~21-25x `needed_ms`, ~9-11x `assembly_wall_ms`) | **fixed**: `assembly_wall_ms` and the replay `needed_ms` add `total / 64 x 12 us` (`classification_wall_ms`); the docs state the term |
+| 3 | medium | the r18 fix had no literal pin, its boundary tests were tautological, and both fixtures were public | **fixed**: `the_classification_model_is_pinned` and `a_dense_secret_image_respects_the_classification_bound` |
+| 4 | medium | wire.md/ADR/CHANGELOG still promised three body lengths and the old peak | all three state `CLASSIFY_BODY_COPIES` and the measured peak |
+| 5 | medium | the default provider has no live bound, so the classification gate was opt-in and undocumented | documented on `BulkProvider::new` with the accessor to call |
+| 6 | low | the freeze message composition was inaccurate | it names the attempt cap |
+| 7 | low | a decoded `missing` request was scanned in full | the scan is capped by the page before the membership filter |
+| 8 | low | the decoder refused a duplicate-heavy request by raw count | it accepts it and dedups; `a_duplicate_heavy_request_decodes` |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-10 needs r20 and r21 clean.
+
+### R-16 security helpers - 2026-11-07 (round 18 audit pass)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `3d2540d`. One high, two mediums and three lows; all closed or documented.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | the raw-address text scan was O(addresses x text) and ran twice per provenance value before the wall check | **fixed**: `raw_address_set` + one window pass against the set, built once in `provenance` and `strip_address_labels`, and `check_wall_budget` now runs before the provenance scrub loop |
+| F2 | medium | raw 32-byte copies still left by `evaluate` and `annotations`: `scrub_text_copies` scrubbed hex only | **fixed**: the carrier pass replaces a raw-bearing text with the marker (module paths), and `annotations` hides a raw-bearing text. The raw test covers the redacting and non-redacting annotation reads |
+| F3 | medium | the patch sticky seeding was dead code: the new provenance drops the parent, so `provenance_addresses(&decoded)` is always empty | **fixed**: the commit seeds the pre-patch hash and the pre-patch provenance addresses directly |
+| F4 | low | two provenance keys that scrub to one silently merged | **fixed**: a duplicate is refused. The check is defensive: `provenance_lines` does not render arbitrary entries today, so no test can reach it |
+| F5 | low | docs overpromised; five NFKC separator codepoints (U+FE13, U+2236, U+FE4D-FE4F) were missing; `annotations` omitted `slot.hash`; "full hex run" was inaccurate | all four corrected; `every_folded_separator_splits_a_copy` |
+| F6 | low | the byte assertion allocates two full-size copies per payload/image | documented as the bounded cost the "one pass" comment hid |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-16 needs r19 and r20 clean.
 
 ### R-10 bulk - 2026-11-07 (round 18 audit pass)
 

@@ -108,12 +108,13 @@ pub const REPLY_ALLOWANCE: u64 = 192;
 
 /// Body copies the image classifier may retain at its peak.
 ///
-/// Measured with a tracking allocator over 1/4/8 MiB images: 7.00x for a
-/// non-secret image and 12.00x for a secret-bearing one (the worst case a peer
-/// can choose), linear in the body (R-10 round 18, F1). The provider gate and
-/// [`BulkPlan::required_classification_bytes`] use this one number, so a host
-/// that sizes with the accessor cannot be surprised by a larger peak.
-pub const CLASSIFY_BODY_COPIES: u64 = 12;
+/// Measured with a tracking allocator: 7x for a body with no secret nodes, 12x
+/// for an image with one secret node, and **17-18x** for a dense image of
+/// one-byte secret nodes (the worst shape a peer can choose), linear in the
+/// body. The constant carries a margin over the measured worst case, and the
+/// provider gate and [`BulkPlan::required_classification_bytes`] use this one
+/// number (R-10 rounds 18-19).
+pub const CLASSIFY_BODY_COPIES: u64 = 24;
 
 /// Throughput the wall-sizing formula assumes for one `finish` pass.
 ///
@@ -450,7 +451,23 @@ impl BulkPlan {
         self.total
             .div_ceil(FINISH_BYTES_PER_MS)
             .saturating_add(per_chunk)
+            .saturating_add(Self::classification_wall_ms_for(self.total))
             .saturating_add(100)
+    }
+
+    /// Milliseconds the redaction path can need over a body of `total` bytes.
+    ///
+    /// The redaction is node-bound, not byte-bound: a dense image of one-byte
+    /// secret nodes measured ~11.9 us per node, and a body has at most one node
+    /// per 64 bytes. The term is `total / 64 x 12 us`, rounded up
+    /// (R-10 round 19, F2).
+    fn classification_wall_ms_for(total: u64) -> u64 {
+        total.div_ceil(64).saturating_mul(12).div_ceil(1_000)
+    }
+
+    /// Milliseconds the classification of this body can need.
+    pub fn classification_wall_ms(&self) -> u64 {
+        Self::classification_wall_ms_for(self.total)
     }
 
     /// The wall grant a `finish` should be sized for, in milliseconds.
@@ -878,9 +895,8 @@ impl BulkRequest {
         if bytes.len() != expected {
             return Err(Error::Bulk("request length does not match its count"));
         }
-        if count > plan.chunk_count() as usize {
-            return Err(Error::Bulk("request asks for more chunks than the plan"));
-        }
+        // The bound is on distinct indexes: a duplicate-heavy request is legal,
+        // and `new` deduplicates. The frame length bounds the allocation.
         let mut missing = Vec::with_capacity(count);
         for slot in 0..count {
             let start = HEADER + slot * 4;
@@ -1660,6 +1676,12 @@ impl BulkProvider {
     /// corruption only: any peer that can reach `plan` chooses the body. Pin a
     /// root with [`BulkProvider::with_expected_root`] or bind the plan to the
     /// opening exchange with [`BulkProvider::with_context`].
+    ///
+    /// The default has **no provider-wide live bound** (`max_live_bytes == 0`),
+    /// so the image-classification gate is inactive. A host that accepts images
+    /// should call [`BulkProvider::with_max_live_bytes`] with the plan's
+    /// [`BulkPlan::required_classification_bytes`]: the classification peak is
+    /// up to [`CLASSIFY_BODY_COPIES`] body lengths (R-10 round 19, F5).
     pub fn new() -> Self {
         Self {
             expected_root: None,
@@ -2056,8 +2078,8 @@ impl BulkProvider {
                 .missing()
                 .iter()
                 .copied()
-                .filter(|index| active.receiver.missing_contains(*index))
                 .take(page_limit)
+                .filter(|index| active.receiver.missing_contains(*index))
                 .collect(),
             None => active.receiver.missing_page(page_limit),
         };
@@ -2103,6 +2125,9 @@ impl BulkProvider {
             // grant that can pay.
             let needed_ms = (done.body.body().len() as u64)
                 .div_ceil(FINISH_BYTES_PER_MS)
+                .saturating_add(BulkPlan::classification_wall_ms_for(
+                    done.body.body().len() as u64
+                ))
                 .max(1);
             if !done.recomputed
                 && done.body.content_hash().is_none()
@@ -2212,22 +2237,23 @@ impl BulkProvider {
                     active.attempts,
                 )
             });
-        let funded =
-            match throttle(
-                call.budget.max_wall_ms,
-                estimate,
-                refusals,
-                funded_runs,
-                attempts,
-            ) {
-                // A state refusal, not a budget class: the transfer has spent its
-                // assemblies, and the same frame is refused identically however it
-                // is priced. `abort` is the way out.
-                Throttle::Frozen => return Err(Error::Bulk(
-                    "finish is frozen: five assemblies used (three below-estimate and/or two funded): abort",
-                )),
-                Throttle::Run { funded } => funded,
-            };
+        let funded = match throttle(
+            call.budget.max_wall_ms,
+            estimate,
+            refusals,
+            funded_runs,
+            attempts,
+        ) {
+            // A state refusal, not a budget class: the transfer has spent its
+            // assemblies, and the same frame is refused identically however it
+            // is priced. `abort` is the way out.
+            Throttle::Frozen => {
+                return Err(Error::Bulk(
+                    "finish is frozen: five assemblies used (attempt cap): abort",
+                ))
+            }
+            Throttle::Run { funded } => funded,
+        };
         // The attempt counters are updated once work is known to start, below.
         // The instant the assembly starts, not the instant the deadline was
         // built: `entered < deadline` held for every positive grant and turned
@@ -2688,6 +2714,7 @@ mod throttle_tests {
         let needed_ms = plan
             .total()
             .div_ceil(crate::bulk::FINISH_BYTES_PER_MS)
+            .saturating_add(plan.classification_wall_ms())
             .max(1);
         let bound = CLASSIFY_BODY_COPIES
             .saturating_mul(plan.total())
@@ -2744,7 +2771,11 @@ mod throttle_tests {
         let body = vec![0u8; 200_000];
         let transfer = BulkTransfer::new(body.clone(), 1 << 20).expect("transfer");
         let plan = transfer.plan();
-        let needed_ms = plan.total().div_ceil(FINISH_BYTES_PER_MS).max(1);
+        let needed_ms = plan
+            .total()
+            .div_ceil(FINISH_BYTES_PER_MS)
+            .saturating_add(plan.classification_wall_ms())
+            .max(1);
         let seed = |provider: &mut BulkProvider| {
             provider.completed.insert(
                 0,
@@ -2854,6 +2885,10 @@ mod throttle_tests {
             .invoke(0, &finish)
             .expect_err("the attempt cap freezes a funded grant too");
         assert_eq!(error.code(), "rpc/bulk", "{error}");
+        assert!(
+            error.to_string().contains("attempt cap"),
+            "the refusal names the attempt cap: {error}"
+        );
     }
 
     /// A `wall`-degraded reply is not final while the body is resident: one
@@ -2946,6 +2981,7 @@ mod throttle_tests {
         let needed_ms = plan
             .total()
             .div_ceil(crate::bulk::FINISH_BYTES_PER_MS)
+            .saturating_add(plan.classification_wall_ms())
             .max(1);
         let mut provider = BulkProvider::new();
         provider.completed.insert(

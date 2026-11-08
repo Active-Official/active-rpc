@@ -732,7 +732,8 @@ content address, linear in the body) **on both the capability and the lane**,
 because the kernel meters a call against the narrower of the two
 (`required_lane_wall_ms()` is the same number). That is the recommended sizing;
 `BulkPlan::assembly_wall_ms()` is the estimate the freeze is judged against — the
-body's own cost at the documented rate, a per-chunk term and 100 ms of slack —
+body's own cost at the documented rate, a per-chunk term, the node-bound
+redaction term (`total / 64 x 12 us`) and 100 ms of slack —
 so a deployment that mints narrow grants can still finish a small body. The lane's cumulative
 `max_bytes` must cover `BulkPlan::required_lane_bytes()`. A provider built with
 `with_max_live_bytes` refuses with `rpc/budget-exceeded` anything that would push
@@ -743,16 +744,20 @@ and the 53-byte header once: the transfer holds its plan and the receiver holds
 its own copy of the per-chunk hashes, while the shared header is counted once. A complete body therefore needs `BulkPlan::required_live_bytes()` of
 the provider-wide bound; compare it before opening a transfer, because a bound
 below it refuses the last `put` after the earlier chunks have been paid for.
-That figure covers the assembly, not an image classification: the provider
-answers `content_error: memory` rather than classify when its bound cannot cover
-three body lengths plus the plan vector, so a host that wants an image address
-sizes the bound with `BulkPlan::required_classification_bytes()`
-(`required_live_bytes() + total`). The receiver's missing-index set and map nodes
+That figure covers the assembly, not an image classification: the redaction
+retains up to `CLASSIFY_BODY_COPIES` (24) body lengths at its peak — 7x for a
+body with no secret nodes, 17-18x for a dense one, measured with a tracking
+allocator — and the provider answers `content_error: memory` rather than
+classify when its bound cannot cover that, so a host that wants an image
+address sizes the bound with `BulkPlan::required_classification_bytes()`
+(`required_live_bytes() + (CLASSIFY_BODY_COPIES - 2) x total`). The receiver's
+missing-index set and map nodes
 are a committed-state estimate rather than allocator-exact. An
 announced plan that has received nothing reserves only its vector; a `put` whose
 validated chunk would pass the bound is refused before it stores the chunk (and
 before any state changes), while an identical retransmission is free. A `finish`
-of an image adds a third, transient body copy for the redaction. A `finish` that
+of an image adds up to `CLASSIFY_BODY_COPIES` body lengths at the classification
+peak (the redaction is node-bound). A `finish` that
 runs out of wall is counted: **every** such failure increments the transfer's
 count, whatever the grant, because an attempt that presents the body's own wall
 and still expires is evidence that the estimate is wrong for this host. After

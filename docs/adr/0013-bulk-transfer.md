@@ -113,7 +113,8 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   (R-10 rounds 18 and 15). It covers the assembly, not an image
   **classification**: the redaction path holds two more body-sized projections,
   and the provider answers `content_error: memory` instead of classifying when
-  its bound cannot cover three body lengths plus the plan vector (use
+  its bound cannot cover up to `CLASSIFY_BODY_COPIES` (24) body lengths at the
+  classification peak (7x measured with no secret nodes, 17-18x dense; use
   `BulkPlan::required_classification_bytes()` for the bound). Both plan copies
   retain the
   transfer context (charged twice); the receiver's missing-index set and the

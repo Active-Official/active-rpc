@@ -102,12 +102,13 @@ capability id at rest (it is a bearer token).
   keeps a producer string that merely mentions the prefix and drops a full hex
   run (a redacting answer serves no content address).
   The encoded projection is then re-read and refused (`provider/redaction`) if
-  any address survives in raw or hex form — including the caller's sticky and
-  parent addresses on every projection path — and a scrubbed-key collision is
+  any address survives in raw or hex form, and a text carrier that embeds a raw
+  32-byte address becomes the marker on every value path — the caller's sticky
+  and provenance addresses included. A scrubbed-key collision is
   refused rather than silently changing the shape. The field pass is a list,
   the byte check is not. The domain treats a module that holds one as
   secret-bearing for hashing, provenance, patching and metadata
-  (R-16 rounds 9-16).
+  (R-16 rounds 9-18).
   Bytes that do not claim to be an image are opaque by declaration (a WASM
   guest's binary output,
   a provider's blob): the value model cannot tell them from arbitrary data, so a

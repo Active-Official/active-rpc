@@ -141,6 +141,84 @@ fn the_classification_bound_is_exact() {
     }
 }
 
+/// The classification multiplier is the measured worst case plus margin, and
+/// the wall estimate carries the node-bound redaction term
+/// (R-10 round 19, F1/F2/F3).
+#[test]
+fn the_classification_model_is_pinned() {
+    assert_eq!(
+        active_rpc::bulk::CLASSIFY_BODY_COPIES,
+        24,
+        "the measured dense-secret peak is 17-18x; the constant carries margin"
+    );
+    let plan = BulkPlan::new(&vec![0u8; 1 << 20], 1 << 18).expect("plan");
+    assert!(
+        plan.classification_wall_ms() > 0,
+        "the redaction is node-bound and has a wall term"
+    );
+    assert!(
+        plan.assembly_wall_ms() >= plan.classification_wall_ms(),
+        "the funded estimate covers the classification term"
+    );
+    // The exact completion bound is 24 body lengths plus the plan vector.
+    assert_eq!(
+        plan.required_classification_bytes(),
+        plan.required_live_bytes() + (active_rpc::bulk::CLASSIFY_BODY_COPIES - 2) * plan.total()
+    );
+}
+
+/// A dense-secret image is classified at the measured bound and degraded one
+/// byte below (R-10 round 19, F1).
+#[test]
+fn a_dense_secret_image_respects_the_classification_bound() {
+    use active_infinity::{encode, InfinityModule, Inode};
+    let mut module = InfinityModule::new();
+    let mut fields = Vec::new();
+    for index in 0..2_000 {
+        let secret = module.push(Inode::Secret(format!("s{index}").as_str().into()));
+        fields.push((format!("f{index}"), secret));
+    }
+    let root = module.push(Inode::Table { fields });
+    module.set_root(Some(root));
+    let image = encode(&module).expect("encode");
+    for (slack, expect_content) in [(0u64, true), (1u64, false)] {
+        let transfer = BulkTransfer::new(image.clone(), 1 << 20).expect("transfer");
+        let bound = transfer
+            .plan()
+            .required_classification_bytes()
+            .saturating_sub(slack);
+        let mut provider = BulkProvider::new().with_max_live_bytes(bound);
+        provider
+            .invoke(0, &call("plan", transfer.plan_frame()))
+            .expect("plan");
+        for index in 0..transfer.plan().chunk_count() {
+            provider
+                .invoke(0, &call("put", transfer.chunk_frame(index).expect("chunk")))
+                .expect("chunk");
+        }
+        let reply = provider
+            .invoke(0, &with_wall("finish", transfer.finish_frame(), 60_000))
+            .expect("finish");
+        let Response::Value(Value::Map(entries)) = &reply else {
+            panic!("a map reply");
+        };
+        assert_eq!(
+            entries.get("canonical"),
+            Some(&Value::Bool(expect_content)),
+            "bound {bound}: {entries:?}"
+        );
+    }
+}
+
+/// A hand-built duplicate-heavy request decodes and dedups (R-10 round 19, F8).
+#[test]
+fn a_duplicate_heavy_request_decodes() {
+    let plan = BulkPlan::new(&body(2_000, 0x35), 1_500).expect("plan");
+    let request = BulkRequest::new(&[0, 0, 0]);
+    let decoded = BulkRequest::decode(&request.encode(), &plan).expect("duplicate count is legal");
+    assert_eq!(decoded.missing().len(), 1);
+}
+
 /// The plan's exact completion bound does not cover the classification
 /// (R-10 round 16, M4 kept here as the accessor boundary).
 #[test]

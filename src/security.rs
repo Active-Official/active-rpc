@@ -680,10 +680,20 @@ fn scrub_text_copies(
         return Ok(());
     }
     let bindings: Vec<(String, active_infinity::NodeId)> = module.bindings().to_vec();
+    // A raw 32-byte copy of a secret address is the same oracle as its hex
+    // form, and the codec cannot rewrite it in place: the carrier becomes
+    // the marker whole (R-16 round 18, F2).
+    let scrub = |value: &str| {
+        if text_carries_raw_address(value, raw) {
+            SECRET_MARKER.to_string()
+        } else {
+            scrub_addresses(value, addresses)
+        }
+    };
     let mut renamed: Vec<(String, active_infinity::NodeId)> = Vec::with_capacity(bindings.len());
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for (name, id) in bindings {
-        let name = scrub_addresses(&name, addresses);
+        let name = scrub(&name);
         if !seen.insert(name.clone()) {
             // Two names that scrub to one would silently drop a binding: the
             // projection's shape changed. Fail closed instead
@@ -703,19 +713,19 @@ fn scrub_text_copies(
         };
         match node {
             active_infinity::Inode::Str(text) | active_infinity::Inode::Ident(text) => {
-                *text = scrub_addresses(text, addresses);
+                *text = scrub(text);
             }
             active_infinity::Inode::Env { name, .. } => {
-                *name = scrub_addresses(name, addresses);
+                *name = scrub(name);
             }
             active_infinity::Inode::Table { fields }
             | active_infinity::Inode::SchemaTable { fields, .. } => {
-                scrub_field_keys(fields, addresses)?;
+                scrub_field_keys(fields, addresses, raw)?;
             }
             active_infinity::Inode::Interpolate { parts } => {
                 for part in parts.iter_mut() {
                     if let active_infinity::InterpPart::Literal(text) = part {
-                        *text = scrub_addresses(text, addresses);
+                        *text = scrub(text);
                     }
                 }
             }
@@ -723,7 +733,7 @@ fn scrub_text_copies(
                 active_infinity::Constraint::Enum(members) => {
                     let mut seen = BTreeSet::new();
                     for member in members.iter_mut() {
-                        *member = scrub_addresses(member, addresses);
+                        *member = scrub(member);
                         if !seen.insert(member.clone()) {
                             // Two members that scrub to one change the
                             // projection's meaning (R-16 round 17, F11).
@@ -733,39 +743,39 @@ fn scrub_text_copies(
                 }
                 active_infinity::Constraint::Pattern(text)
                 | active_infinity::Constraint::Custom(text) => {
-                    *text = scrub_addresses(text, addresses);
+                    *text = scrub(text);
                 }
                 active_infinity::Constraint::MinMax { .. } | active_infinity::Constraint::Odd => {}
             },
             active_infinity::Inode::Patch(operation) => match operation {
                 active_infinity::PatchOp::Set { path, .. }
                 | active_infinity::PatchOp::Remove { path } => {
-                    *path = scrub_addresses(path, addresses);
+                    *path = scrub(path);
                 }
                 active_infinity::PatchOp::Rename { from, to } => {
-                    *from = scrub_addresses(from, addresses);
-                    *to = scrub_addresses(to, addresses);
+                    *from = scrub(from);
+                    *to = scrub(to);
                 }
             },
             active_infinity::Inode::SchemaField(spec) => {
                 if let active_infinity::TypeSpec::Enum(members) = &mut spec.typ {
                     let mut seen = BTreeSet::new();
                     for member in members.iter_mut() {
-                        *member = scrub_addresses(member, addresses);
+                        *member = scrub(member);
                         if !seen.insert(member.clone()) {
                             return Err(redaction_failure());
                         }
                     }
                 }
                 if let Some(text) = spec.deprecated.as_mut() {
-                    *text = scrub_addresses(text, addresses);
+                    *text = scrub(text);
                 }
             }
             active_infinity::Inode::Quantity {
                 unit: active_infinity::UnitTag::Named(name),
                 ..
             } => {
-                *name = scrub_addresses(name, addresses);
+                *name = scrub(name);
             }
             active_infinity::Inode::Quantity { .. } => {}
             active_infinity::Inode::Blob {
@@ -773,7 +783,7 @@ fn scrub_text_copies(
                 payload,
                 ..
             } => {
-                *media_type = scrub_addresses(media_type, addresses);
+                *media_type = scrub(media_type);
                 if let Some(bytes) = payload.as_mut() {
                     // A payload that carries the address is a binary copy of it;
                     // the payload is dropped rather than edited, because its
@@ -810,9 +820,14 @@ fn scrub_text_copies(
 fn scrub_field_keys(
     fields: &mut [(String, active_infinity::NodeId)],
     addresses: &BTreeSet<[u8; 64]>,
+    raw: &BTreeSet<[u8; 32]>,
 ) -> Result<()> {
     for (name, _) in fields.iter_mut() {
-        *name = scrub_addresses(name, addresses);
+        *name = if text_carries_raw_address(name, raw) {
+            SECRET_MARKER.to_string()
+        } else {
+            scrub_addresses(name, addresses)
+        };
     }
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for (name, _) in fields.iter() {
@@ -958,9 +973,11 @@ pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) 
 /// Fullwidth digits and A-F/a-f, the mathematical alphanumeric letters and
 /// digits, and the compatibility punctuation NFKC folds to `-`, `:` or `_`.
 ///
-/// Only these compatibility forms are folded; circled, superscript and
-/// parenthesized forms are not, and the security docs name the covered set
-/// (R-16 round 16, F5; round 17, F6).
+/// The folded punctuation set is U+FF1A/U+FE55/U+FE13/U+2236 to `:`,
+/// U+FF0D/U+FE63 to `-`, and U+FF3F/U+FE33/U+FE4D-U+FE4F to `_`. Only these
+/// compatibility forms are folded; circled, superscript and parenthesized
+/// forms are not, and the security docs name the covered set
+/// (R-16 rounds 16-18).
 fn fold_compat_hex(character: char) -> char {
     let code = character as u32;
     let from = |start: u32, ascii: u8| char::from(ascii + (code - start) as u8);
@@ -971,9 +988,9 @@ fn fold_compat_hex(character: char) -> char {
         // Compatibility punctuation that NFKC folds to a separator: a copy
         // split by a fullwidth colon, hyphen or underscore is a split copy
         // (R-16 round 17, F3).
-        0xFF1A | 0xFE55 => ':',
+        0xFF1A | 0xFE55 | 0xFE13 | 0x2236 => ':',
         0xFF0D | 0xFE63 => '-',
-        0xFF3F | 0xFE33 => '_',
+        0xFF3F | 0xFE33 | 0xFE4D..=0xFE4F => '_',
         // The mathematical alphanumeric symbols: thirteen alphabets of 52
         // letters (A-Z then a-z), then five digit sets of ten.
         0x1D400..=0x1D6A3 => {
@@ -1011,11 +1028,28 @@ pub(crate) fn hex_addresses(addresses: &[[u8; 32]]) -> BTreeSet<[u8; 64]> {
     addresses.iter().map(hex_key).collect()
 }
 
-/// Whether a text carries one of the raw 32-byte addresses.
-pub(crate) fn text_carries_raw_address(text: &str, addresses: &[[u8; 32]]) -> bool {
+/// The raw address set, with the redaction sentinel removed.
+pub(crate) fn raw_address_set(addresses: &[[u8; 32]]) -> BTreeSet<[u8; 32]> {
     addresses
         .iter()
-        .any(|address| text.as_bytes().windows(32).any(|window| window == address))
+        .copied()
+        .filter(|address| *address != [0u8; 32])
+        .collect()
+}
+
+/// Whether a text carries one of the raw 32-byte addresses.
+///
+/// One window pass against a set, not one scan per address: the per-address
+/// shape was O(addresses x text) on a charged call (R-16 round 18, F1).
+pub(crate) fn text_carries_raw_address(text: &str, raw: &BTreeSet<[u8; 32]>) -> bool {
+    if raw.is_empty() || text.len() < 32 {
+        return false;
+    }
+    text.as_bytes().windows(32).any(|window| {
+        let mut candidate = [0u8; 32];
+        candidate.copy_from_slice(window);
+        raw.contains(&candidate)
+    })
 }
 
 /// The free text an annotation carries, if it carries any.
