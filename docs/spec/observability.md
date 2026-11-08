@@ -80,6 +80,8 @@ authority.
 | `channel.recv` | `channel`, `channel_sequence` | a message was received |
 | `budget.exhausted` | `cap`, `dimension` | a budget ceiling refused work |
 | `receipts.dropped` | `detail` | the receipt ring dropped records; `detail` carries the running total (evicted or cleared) |
+| `receipts.disabled` | `detail` | receipt recording was turned off; `detail` carries the running dropped total, so a log exported across the interval shows that decisions were not recorded |
+| `receipts.enabled` | — | receipt recording was turned on again after a disabled interval; a repeated call is not a transition and emits nothing |
 | `provider.panicked` | `provider`, `detail` | a provider panicked; `detail` names the phase, and the panic message never enters a trace |
 | `intro.skipped` | `provider`, `detail` | a provider's captured surface cannot go into an introduction module (a name or a method the module cannot carry, or more than 4 096 methods), so `intro` leaves it out; `detail` is the reason |
 | `tool.refused` | `cap`, `detail` | a tool policy refused work |

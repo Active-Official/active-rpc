@@ -102,6 +102,33 @@ fn a_corrupted_length_field_is_not_cut_away() {
 }
 
 #[test]
+fn a_zeroed_or_flooded_tail_length_is_cut() {
+    for pattern in [[0u8; 4], [0xFFu8; 4]] {
+        let dir = sandbox(if pattern[0] == 0 {
+            "zero-tail"
+        } else {
+            "flood-tail"
+        });
+        let path = dir.join("receipts.arrl");
+        let log = ReceiptLog::create(&path).expect("create");
+        for sequence in 1..=3 {
+            log.append(&receipt(sequence, sequence)).expect("append");
+        }
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes.extend_from_slice(&pattern);
+        std::fs::write(&path, &bytes).expect("damage");
+
+        let discarded = ReceiptLog::repair(&path)
+            .unwrap_or_else(|error| panic!("a {pattern:?} tail is a torn write: {error}"));
+        assert_eq!(discarded, 4, "only the four-byte tail is cut");
+        let repaired = ReceiptLog::open(&path).expect("the repaired log opens");
+        assert_eq!(repaired.records().expect("records").len(), 3);
+        repaired.verify_chain().expect("chain");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn a_torn_tail_repair_reports_the_bytes_it_discarded() {
     let dir = sandbox("torn-exact");
     let path = dir.join("receipts.arrl");

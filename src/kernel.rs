@@ -350,6 +350,16 @@ pub enum Event {
         /// Total receipts dropped so far.
         count: u64,
     },
+    /// Receipt recording was disabled; `count` is the total dropped so far.
+    ///
+    /// Emitted even when the ring was empty, so an exported log shows the
+    /// interval in which decisions were not recorded (R-13 round 16, F7).
+    ReceiptsDisabled {
+        /// Total receipts dropped so far.
+        count: u64,
+    },
+    /// Receipt recording was enabled again after a disabled interval.
+    ReceiptsEnabled,
     /// A promise was rejected.
     PromiseRejected {
         /// Promise id.
@@ -1271,15 +1281,21 @@ impl Agent {
     /// exported window never pretends to be the whole history.
     pub fn enable_receipts(&self, enabled: bool) {
         let mut kernel = self.cell.borrow_mut();
+        if kernel.receipts_enabled == enabled {
+            // A no-op call is not a transition and must not tape a marker.
+            return;
+        }
         kernel.receipts_enabled = enabled;
-        if !enabled {
+        if enabled {
+            kernel.push_event(Event::ReceiptsEnabled);
+        } else {
             let cleared = kernel.receipts.len() as u64;
             kernel.receipts.clear();
-            if cleared > 0 {
-                kernel.receipts_dropped = kernel.receipts_dropped.saturating_add(cleared);
-                let total = kernel.receipts_dropped;
-                kernel.push_event(Event::ReceiptsDropped { count: total });
-            }
+            kernel.receipts_dropped = kernel.receipts_dropped.saturating_add(cleared);
+            let total = kernel.receipts_dropped;
+            // Always a marker, even with an empty ring: the log must show that
+            // decisions taken from here were not recorded (R-13 round 16, F7).
+            kernel.push_event(Event::ReceiptsDisabled { count: total });
         }
     }
 
@@ -7168,9 +7184,18 @@ fn method_event_label(method: &str) -> String {
 /// envelope class. Total by construction: [`crate::receipts::valid_method`]'s
 /// sibling rule (`valid_code`) is the only gate, so a hostile provider string
 /// cannot make the ring unexportable (R-13 round 14, F5).
+///
+/// The kernel's own `rpc/` namespace is reserved: a provider code there would
+/// make a refusal look like a kernel decision, and a receipt has no origin bit.
+/// Such a code is recorded as `rpc/provider` (R-13 round 16, F8).
 fn receipt_refusal_code(error: &Error) -> String {
     match error {
-        Error::Provider { code } if crate::receipts::valid_code(code) => code.clone(),
+        Error::Provider { code }
+            if crate::receipts::valid_code(code) && !code.starts_with("rpc/") =>
+        {
+            code.clone()
+        }
+        Error::Provider { .. } => "rpc/provider".to_string(),
         other => other.code().to_string(),
     }
 }

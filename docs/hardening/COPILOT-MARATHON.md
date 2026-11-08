@@ -26,7 +26,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-10 | bulk | `src/bulk.rs` | rounds 1-15: r15 found two mediums (the documented grant was six bytes short of the plan-plus-finish replies; the funded cap was mutation-blind) and eight lows, all fixed; r16 and r17 must be clean | 113 fixed / 0 rejected / 0 open (limits documented) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | `CLEAN` (rounds 1-15; rounds 14 and 15 clean) | 60 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018/0010) | this commit |
-| R-13 | receipts | `src/receipts.rs` | rounds 1-15: r15 found the in-place edit behind the append cache (high), a partial-magic wedge and a repair refusal, open for r16 | 77 fixed / 0 rejected / 2 residuals (7 open) | this commit |
+| R-13 | receipts | `src/receipts.rs` | rounds 1-16: r16 fixed the r15 mediums (a partial magic lock wedged the log; a zeroed tail could not be repaired) and the r15 lows; r17 and r18 must be clean | 85 fixed / 0 rejected / 2 residuals (documented) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
 | R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-15: r15 found the evaluate fast path, the label leak and the binary hex scan (highs), fixed; F3's projection-side assertion, F5, F6 and F9 are open for r16 | 66 fixed / 0 rejected / 5 noted (4 open) | this commit |
@@ -49,6 +49,25 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-13 receipts - 2026-11-07 (round 16 fix pass)
+
+Round-15 findings F2-F9, fixed with failing-first tests and mutation controls
+(the round-15 F1 high was fixed at `ac8bdcd`).
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F2 | medium | a partial magic-prefixed lock (a crash mid-write) was unjudgeable: `read_lock` applied the shape gate to a line that started with our magic, so `lock_state` was `None` and every append failed for ever | **fixed**: the magic is proof of origin, so the shape gate applies only to files without it; a partial magic line is judged, aged and stolen. `a_partial_magic_lock_is_still_stealable` (three partial shapes); the control restores the gate and fails it. A partial *legacy* line (no magic) is still refused: it is indistinguishable from a foreign sibling, and only a pre-magic build could write one |
+| F3 | medium | `repair` refused a zeroed or 0xFF tail length as "damaged inside", though no record survives there | **fixed**: an out-of-range length is a torn tail; it is cut only when `tail_holds_a_record` is false. `a_zeroed_or_flooded_tail_length_is_cut`; the control restores the old predicate and fails it, while `a_corrupted_length_field_is_not_cut_away` stays green |
+| F4 | low | the steal decided identity from text, so a replacement with the judged nonce was deleted | **fixed**: `LockFacts` carries the judged `(dev, ino)` on unix and `take_stale` compares the moved file's inode; `the_steal_uses_the_judged_inode_not_its_text` (unix) |
+| F5 | low | `walk_prefix` materialised every record it walked (~100 MB on a crafted log) and had no record cap | **fixed**: it returns only the cut offset and stops at `MAX_LOG_RECORDS`; `a_walk_stops_at_the_record_ceiling` builds `MAX + 1` records and the control (no cap) fails it |
+| F6 | low | the sweep deleted a sibling receipt log whose name matched a leftover suffix | **fixed**: the sweep reads the log magic and spares it; `the_sweep_spares_a_sibling_receipt_log`; the control deletes it and fails |
+| F7 | low | a receipts-off interval was invisible, and re-enabling emitted nothing | **fixed**: `Event::ReceiptsDisabled { count }` fires on every disable (even with an empty ring) and `Event::ReceiptsEnabled` on re-enable; a repeated call is not a transition. `an_empty_ring_still_marks_the_receipts_interval`; the control removes the disable marker and fails. `receipts.dropped` keeps its eviction/clear meaning |
+| F8 | low | a provider code could occupy the kernel's `rpc/` namespace in a receipt, which has no origin bit | **fixed**: such a code (and an unrepresentable one) records as `rpc/provider`; `a_provider_cannot_occupy_the_kernel_code_namespace`; the control records `rpc/revoked` and fails |
+| F9 | low | `nonce_of` bypassed the guarded reader; `O_NOFOLLOW` is unix-only | **fixed**: `nonce_of` uses `open_log_read`; `a_lock_symlink_is_not_read_through` (unix) and ADR-0021 states the non-unix window and the directory-permission mitigation |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-13 needs r16 and r17 clean
+(r15 and the r16 fix pass were each not clean).
 
 ### R-10 bulk - 2026-11-07 (round 15 audit pass)
 

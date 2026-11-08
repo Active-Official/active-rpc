@@ -3,6 +3,7 @@
 ## Unreleased - 2.3.0
 
 Additive API (minor bump per ADR-0006): `Event::ReceiptsDropped`,
+`Event::ReceiptsDisabled`, `Event::ReceiptsEnabled`,
 `Event::IntroSkipped`, `Value::memory_bytes`, `Channel::capacity`,
 `Agent::remaining_calls`/`export_pin_count`, `Shape::nodes`,
 `BulkPlan::required_live_bytes`

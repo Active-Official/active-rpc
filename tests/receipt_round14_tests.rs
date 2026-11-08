@@ -109,6 +109,74 @@ impl Provider for Trap {
     }
 }
 
+/// A provider cannot put its code in the kernel's `rpc/` namespace: the
+/// receipt has no origin bit, so a refusal there would read as a kernel
+/// decision. A code the format cannot carry is also `rpc/provider`
+/// (R-13 round 16, F8).
+#[test]
+fn a_provider_cannot_occupy_the_kernel_code_namespace() {
+    struct KernelLooking;
+    impl Provider for KernelLooking {
+        fn name(&self) -> &'static str {
+            "kernel-looking"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["trap".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            true
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Err(Error::Provider {
+                code: "rpc/revoked".to_string(),
+            })
+        }
+    }
+    struct Unrepresentable;
+    impl Provider for Unrepresentable {
+        fn name(&self) -> &'static str {
+            "unrepresentable"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec!["trap".to_string()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            true
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            Err(Error::Provider {
+                code: "WASM\ntrap".to_string(),
+            })
+        }
+    }
+    let agent = Agent::new();
+    agent.enable_receipts(true);
+    let lane = agent.create_lane("codes", Budget::default()).expect("lane");
+    for provider in [
+        agent.register(Box::new(KernelLooking)),
+        agent.register(Box::new(Unrepresentable)),
+    ] {
+        let cap = agent
+            .mint(provider, 0, CapAttrs::new(&["trap"]))
+            .expect("cap");
+        let promise = agent.call(lane, &cap, "trap", Vec::new()).expect("queued");
+        let _ = promise.value();
+    }
+    let decisions: Vec<Decision> = agent
+        .receipts()
+        .into_iter()
+        .map(|receipt| receipt.decision)
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![
+            Decision::Refused("rpc/provider".to_string()),
+            Decision::Refused("rpc/provider".to_string()),
+        ],
+        "a kernel-looking or unrepresentable provider code is the envelope class"
+    );
+}
+
 /// A receipt is a local audit record: it keeps the provider's own code when the
 /// format can carry it, so a trap in the log is attributable
 /// (R-13 round 14, F5).

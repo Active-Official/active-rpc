@@ -188,6 +188,9 @@ names the round where the rule lives.
 | R13 | medium | a cancel that ran while receipts were off marked the job receipted without sealing, so dispatch skipped it later | the flag is set only when a receipt was actually sealed, on every path (resolve, cancel, fail, dispatch) |
 | R13 | low | the sweep read a future mtime as fresh | it reads as aged, like `lock_state`; an undeletable entry does not spend the budget |
 | R12 | low | a planted fresh lock suppressed verification with an unhelpful message; leftovers were never swept; the unauthenticated writer was the ordinary one | the refusal names the lock's age, owner and pid (escaped); `acquire` sweeps aged claim/stale/orphan/staging files; the unauthenticated writers are documented and `append_verified` is the deployment path |
+| R13r16 | medium | a partial magic-prefixed lock (a crashed write) was unjudgeable and wedged the log; `repair` refused a zeroed or flooded tail length | the magic is proof of origin, so a partial magic line is judged and stolen; an out-of-range tail length is cut only when no record survives there |
+| R13r16 | low | the steal decided identity from text; the sweep deleted a sibling receipt log by name; the prefix walk materialised every record | unix compares the judged inode after the move; the sweep reads the log magic first and spares a receipt log; the walk returns only the offset and stops at `MAX_LOG_RECORDS` |
+| R13r16 | low | a receipts-off interval was invisible, and a provider code could occupy the kernel's `rpc/` namespace | `receipts.disabled`/`receipts.enabled` events on every transition (a repeated call is not one); a provider code in `rpc/` or an unrepresentable one records as `rpc/provider` |
 
 Accepted residuals: the check-then-open race on the lock path (a local user with
 directory write can deny the log; an `O_NOFOLLOW` on the log path narrows the
@@ -199,7 +202,13 @@ path keep the length, header and trailing-head checks, and a local writer who
 can replace the file with a same-length copy is not detected. A deployment that
 needs assurance on a non-unix host should read through a pinned head
 (`--expect-head`) and the MAC, which do not depend on identity
-(R-13 round 14, F2).
+(R-13 round 14, F2). `O_NOFOLLOW` is a unix flag: off unix the guarded opens
+check the type of the object they actually opened, so a reparse point swapped in
+between the type check and the open is followed. For the lock the window is a
+bounded metadata read (`nonce_of` now uses the guarded reader, and the steal
+unlinks the link, never a target), and a log open still refuses a device or FIFO
+after the open. A host that cannot accept the window should keep the receipt
+directory writable only by the service (R-13 round 16, F9/F4).
 
 `receipts verify` and the `--receipt-key-file` / `--expect-head` flags live in
 the CLI crate that consumes this library; this ADR describes the library

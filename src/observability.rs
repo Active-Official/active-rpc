@@ -338,6 +338,13 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.event = "receipts.dropped";
             trace.detail = Some(format!("{count} dropped in total"));
         }
+        Event::ReceiptsDisabled { count } => {
+            trace.event = "receipts.disabled";
+            trace.detail = Some(format!("{count} dropped in total"));
+        }
+        Event::ReceiptsEnabled => {
+            trace.event = "receipts.enabled";
+        }
     }
     trace
 }

@@ -368,7 +368,7 @@ fn the_drop_event_reports_the_running_total() {
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            active_rpc::Event::ReceiptsDropped { count } => Some(count),
+            active_rpc::Event::ReceiptsDisabled { count } => Some(count),
             _ => None,
         })
         .next_back()

@@ -404,11 +404,44 @@ fn disabling_receipts_counts_what_it_clears() {
         .events()
         .into_iter()
         .find_map(|event| match event {
-            active_rpc::Event::ReceiptsDropped { count } => Some(count),
+            active_rpc::Event::ReceiptsDisabled { count } => Some(count),
             _ => None,
         })
         .expect("a marker for the cleared window");
     assert_eq!(marker, 2);
+}
+
+/// Disabling is visible even when the ring is empty, and enabling is visible
+/// again: a log exported across the interval cannot look contiguous
+/// (R-13 round 16, F7).
+#[test]
+fn an_empty_ring_still_marks_the_receipts_interval() {
+    let agent = Agent::new();
+    // Receipts are off by default, so enabling is already a transition.
+    agent.enable_receipts(true);
+    let count = |agent: &Agent, enabled: bool| {
+        agent
+            .events()
+            .into_iter()
+            .filter(|event| match event {
+                active_rpc::Event::ReceiptsEnabled => enabled,
+                active_rpc::Event::ReceiptsDisabled { .. } => !enabled,
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(count(&agent, true), 1, "enabling is marked");
+    agent.enable_receipts(false);
+    assert_eq!(
+        count(&agent, false),
+        1,
+        "an empty ring still marks the disable"
+    );
+    agent.enable_receipts(true);
+    assert_eq!(count(&agent, true), 2, "enabling again is marked");
+    // A repeated call is not a transition and adds no marker.
+    agent.enable_receipts(true);
+    assert_eq!(count(&agent, true), 2, "a no-op call is not a transition");
 }
 
 // ---------------------------------------------------------------------------

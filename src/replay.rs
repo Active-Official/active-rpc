@@ -1218,6 +1218,14 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             event: "receipts.dropped".into(),
             cap: None,
         },
+        Event::ReceiptsDisabled { .. } => Trace {
+            event: "receipts.disabled".into(),
+            cap: None,
+        },
+        Event::ReceiptsEnabled => Trace {
+            event: "receipts.enabled".into(),
+            cap: None,
+        },
         Event::PromiseRejected { code, .. } => Trace {
             event: format!("promise.rejected:{code}"),
             cap: None,
