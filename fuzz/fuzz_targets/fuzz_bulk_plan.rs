@@ -17,7 +17,9 @@ fuzz_target!(|data: &[u8]| {
         let bytes = plan.encode();
         let decoded = BulkPlan::decode(&bytes).expect("the fixed plan decodes");
         assert_eq!(decoded.root(), plan.root());
-        decoded.verify(&body).expect("the fixed plan verifies its body");
+        decoded
+            .verify(&body)
+            .expect("the fixed plan verifies its body");
         let sender = BulkSender::new(body.clone(), plan.chunk_size()).expect("sender");
         let frames = sender.frames().expect("frames");
         let mut receiver = BulkReceiver::new(decoded).expect("receiver");
@@ -33,11 +35,13 @@ fuzz_target!(|data: &[u8]| {
             use active_rpc::bulk::{BulkProvider, BulkTransfer};
             use active_rpc::kernel::Provider;
             use active_rpc::value::Call;
-            let transfer =
-                BulkTransfer::new(body.clone(), 4).expect("the control transfer");
+            let transfer = BulkTransfer::new(body.clone(), 4).expect("the control transfer");
             let mut provider = BulkProvider::new();
             provider
-                .invoke(0, &Call::new("plan", Vec::new()).with_payload(transfer.plan_frame()))
+                .invoke(
+                    0,
+                    &Call::new("plan", Vec::new()).with_payload(transfer.plan_frame()),
+                )
                 .expect("the control plan");
             for index in 0..transfer.plan().chunk_count() {
                 provider
@@ -49,9 +53,64 @@ fuzz_target!(|data: &[u8]| {
                     .expect("the control chunk");
             }
             let finished = provider
-                .invoke(0, &Call::new("finish", Vec::new()).with_payload(transfer.finish_frame()))
+                .invoke(
+                    0,
+                    &Call::new("finish", Vec::new()).with_payload(transfer.finish_frame()),
+                )
                 .expect("the control finish");
             assert!(matches!(finished, active_rpc::value::Response::Value(_)));
+        }
+        // The throttle's counted and frozen branches: a 19-byte control body is
+        // always funded, so the fuzz target never reached them (R-10 round 15,
+        // F7). One 8 MiB transfer per process is enough to prove the branches;
+        // a 1 ms finish cannot re-hash it, three of them freeze the transfer,
+        // and a paid grant still succeeds.
+        {
+            use active_rpc::bulk::{BulkProvider, BulkTransfer};
+            use active_rpc::kernel::Provider;
+            use active_rpc::value::Call;
+            use std::sync::OnceLock;
+            static THROTTLE: OnceLock<()> = OnceLock::new();
+            THROTTLE.get_or_init(|| {
+                let body = vec![0u8; 8 << 20];
+                let transfer = BulkTransfer::new(body, 256 * 1024).expect("the throttle body");
+                let mut provider = BulkProvider::new();
+                provider
+                    .invoke(
+                        0,
+                        &Call::new("plan", Vec::new()).with_payload(transfer.plan_frame()),
+                    )
+                    .expect("the throttle plan");
+                for index in 0..transfer.plan().chunk_count() {
+                    provider
+                        .invoke(
+                            0,
+                            &Call::new("put", Vec::new())
+                                .with_payload(transfer.chunk_frame(index).expect("frame")),
+                        )
+                        .expect("the throttle chunk");
+                }
+                let finish = transfer.finish_frame();
+                for _ in 0..3 {
+                    let mut request = Call::new("finish", Vec::new()).with_payload(finish.clone());
+                    request.budget.max_wall_ms = 1;
+                    let error = provider
+                        .invoke(0, &request)
+                        .expect_err("1 ms cannot assemble 8 MiB");
+                    assert_eq!(error.code(), "rpc/budget-exceeded");
+                }
+                let mut frozen = Call::new("finish", Vec::new()).with_payload(finish.clone());
+                frozen.budget.max_wall_ms = 1;
+                let error = provider
+                    .invoke(0, &frozen)
+                    .expect_err("three failures freeze the transfer");
+                assert_eq!(error.code(), "rpc/bulk");
+                let mut paid = Call::new("finish", Vec::new()).with_payload(finish);
+                paid.budget.max_wall_ms = 60_000;
+                provider
+                    .invoke(0, &paid)
+                    .expect("a paid grant still finishes after the freeze");
+            });
         }
     }
     if let Ok(plan) = BulkPlan::decode(data) {

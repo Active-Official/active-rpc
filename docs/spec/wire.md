@@ -715,20 +715,23 @@ so a deployment that mints narrow grants can still finish a small body. The lane
 `with_max_live_bytes` refuses with `rpc/budget-exceeded` anything that would push
 the bytes it holds past that bound. Each open transfer reserves **twice the bytes
 it has stored** (the chunks and the assembly buffer the body will need, which can
-only ever be a complete body) plus the plan's own hash vector (32 bytes per chunk
-and the 53-byte header), because the plan is retained for the whole transfer. An
-announced plan that has received nothing therefore reserves only its vector, and
-a `put` that would pass the bound is refused before it stores the chunk, so an
-unpaid announcement cannot hold the provider-wide bound. A `finish` of an image
-adds a third, transient body copy for the redaction. A `finish` that runs out of wall is counted: **every**
-such failure increments the transfer's count, whatever the grant, because an
-attempt that presents the body's own wall and still expires is evidence that the
-estimate is wrong for this host. After three failures at a grant the transfer
-refuses with `rpc/bulk` before any work, so three cheap frames cannot buy
-repeated copies, and repeating the same refused grant does not get a fresh
-allowance. The only thing that clears the count is a grant **strictly wider**
-than one that has already failed — a price the transfer has not refused — which
-is why the sizing to mint is `required_wall_ms()`. The stored chunks are
+only ever be a complete body) plus **twice** the plan's hash vector (32 bytes per
+chunk and the 53-byte header): the transfer holds its plan and the receiver holds
+its own copy. A complete body therefore needs `BulkPlan::required_live_bytes()` of
+the provider-wide bound; compare it before opening a transfer, because a bound
+below it refuses the last `put` after the earlier chunks have been paid for. An
+announced plan that has received nothing reserves only its vector; a `put` whose
+validated chunk would pass the bound is refused before it stores the chunk (and
+before any state changes), while an identical retransmission is free. A `finish`
+of an image adds a third, transient body copy for the redaction. A `finish` that
+runs out of wall is counted: **every** such failure increments the transfer's
+count, whatever the grant, because an attempt that presents the body's own wall
+and still expires is evidence that the estimate is wrong for this host. After
+three such failures the transfer refuses with `rpc/bulk` before any work, so three
+cheap frames cannot buy repeated copies. A grant at the body's estimate
+(`assembly_wall_ms()`) is **funded**: it clears the count and runs, up to two
+funded assemblies (`FUNDED_ASSEMBLY_LIMIT`), after which the transfer freezes.
+Both rules are why the sizing to mint is `required_wall_ms()`. The stored chunks are
 **never** destroyed by a refusal (a body the caller paid to transfer survives
 every refusal), and a refusal that did no work (the deadline was already spent
 when the assembly was due to start) does not count. A frozen transfer has two

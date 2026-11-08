@@ -129,9 +129,10 @@ pub const FUNDED_ASSEMBLY_LIMIT: u8 = 2;
 /// What the wall throttle decides for one `finish` attempt.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Throttle {
-    /// The attempt may run. `funded` says its grant is wider than any grant that
-    /// has already run out of wall, so it is a price this transfer has not
-    /// refused and it clears the failure count.
+    /// The attempt may run. `funded` says its grant can pay the body's own wall
+    /// estimate, so it is a price this transfer has not refused; a funded run
+    /// clears the failure count and is itself capped by
+    /// [`FUNDED_ASSEMBLY_LIMIT`] (R-10 round 15, F4).
     Run { funded: bool },
     /// The wall attempts are spent: refuse before any work.
     Frozen,
@@ -142,10 +143,11 @@ enum Throttle {
 ///
 /// Only a grant that can pay [`BulkPlan::assembly_wall_ms`] is *funded*: it
 /// runs and clears the count, because the host has paid the price the transfer
-/// asked for. Every grant below the estimate is counted and clears nothing.
-/// The earlier rule ("wider than any grant that already failed") let a caller
-/// walk the throttle one millisecond at a time — 1 ms, 2 ms, 3 ms, ... — and
-/// each step bought a full assembly, because `grant > failed_at` held every
+/// asked for, and [`FUNDED_ASSEMBLY_LIMIT`] caps how many funded runs one
+/// transfer may make. Every grant below the estimate is counted and clears
+/// nothing. The earlier rule ("wider than any grant that already failed") let a
+/// caller walk the throttle one millisecond at a time — 1 ms, 2 ms, 3 ms, ... —
+/// and each step bought a full assembly, because `grant > failed_at` held every
 /// time, so the freeze never engaged (R-10 round 13, F1). The transfer freezes
 /// after [`WALL_REFUSAL_LIMIT`] sub-estimate failures and has the two
 /// documented ways out: a grant at the estimate, or `abort`.
@@ -436,6 +438,18 @@ impl BulkPlan {
     /// Total body length.
     pub fn total(&self) -> u64 {
         self.total
+    }
+
+    /// Provider-wide footprint a complete transfer reserves.
+    ///
+    /// The provider counts each stored byte twice (the chunks and the assembly
+    /// buffer) plus the plan's hash vector twice, so a host that wants a body
+    /// of [`BulkPlan::total`] bytes to complete must give
+    /// [`BulkProvider::with_max_live_bytes`] at least this value. Comparing it
+    /// at open turns the mid-transfer refusal into an up-front answer
+    /// (R-10 round 15, F5).
+    pub fn required_live_bytes(&self) -> u64 {
+        reserved_bytes(self, self.total)
     }
 
     /// Number of chunks.
@@ -927,17 +941,16 @@ impl BulkSender {
     }
 
     /// Frames for the chunks at or after `from`.
+    ///
+    /// Each frame carries the hash the plan already holds, so a resume batch
+    /// does not re-hash the remaining body (R-10 round 15, F8).
     pub fn frames_from(&self, from: u32) -> Result<Vec<Vec<u8>>> {
         if from > self.plan.chunks {
             return Err(Error::Bulk("resume point is outside the plan"));
         }
-        let mut out = Vec::new();
-        for (index, part) in self.bytes.chunks(self.plan.chunk).enumerate() {
-            if index as u32 >= from {
-                out.push(BulkChunk::new(index as u32, self.plan.chunk, part).encode());
-            }
-        }
-        Ok(out)
+        (from..self.plan.chunks)
+            .map(|index| self.frame_at(index))
+            .collect()
     }
 
     /// One frame, for a streaming sender.
@@ -1067,6 +1080,21 @@ impl BulkReceiver {
     /// the charge pays for, so a wrong-hash frame is not free
     /// (round 7, L6; round 10, M-2).
     pub fn accept(&mut self, frame: &[u8]) -> Result<u32> {
+        self.accept_metered(frame, |_| Ok(()))
+    }
+
+    /// Accept one chunk, calling `reserve` with its stored size after the
+    /// frame validates and before it is stored.
+    ///
+    /// Validation comes first, so a malformed or wrong-hash frame pays for the
+    /// work its meter already charged but cannot learn the provider's occupancy
+    /// from the reservation (R-10 round 15, F3). A duplicate is stored once, so
+    /// `reserve` is not called for it and the provider-wide ceiling is not
+    /// charged twice (F2). A refused reservation leaves the receiver unchanged.
+    fn accept_metered<F>(&mut self, frame: &[u8], reserve: F) -> Result<u32>
+    where
+        F: FnOnce(u64) -> Result<()>,
+    {
         if let Some(meter) = self.meter.as_mut() {
             meter.charge_bytes(frame.len() as u64)?;
         }
@@ -1074,6 +1102,7 @@ impl BulkReceiver {
         if duplicate {
             return Ok(index);
         }
+        reserve(data.len() as u64)?;
         self.stored = self.stored.saturating_add(data.len() as u64);
         self.received.insert(index, data);
         Ok(index)
@@ -1091,13 +1120,7 @@ impl BulkReceiver {
         charge: &mut dyn FnMut(u64) -> Result<()>,
     ) -> Result<u32> {
         charge(frame.len() as u64)?;
-        let (index, data, duplicate) = validate_chunk(&self.plan, &self.received, frame)?;
-        if duplicate {
-            return Ok(index);
-        }
-        self.stored = self.stored.saturating_add(data.len() as u64);
-        self.received.insert(index, data);
-        Ok(index)
+        self.accept_metered(frame, |_| Ok(()))
     }
 
     /// Indexes not yet received, in order.
@@ -1549,8 +1572,9 @@ impl BulkProvider {
     ///
     /// N objects each hold up to the protocol ceiling; a host that mints per
     /// upload wants a provider-wide limit rather than one per object
-    /// (round 8, L5). The check runs when a transfer opens, so a transfer that
-    /// fits is never evicted mid-flight.
+    /// (round 8, L5). The check runs when a transfer opens and on every `put`,
+    /// so a plan that fits can still run out of room as chunks are stored;
+    /// `BulkPlan::required_live_bytes` is the footprint a complete body needs.
     pub fn with_max_live_bytes(mut self, limit: u64) -> Self {
         self.max_live_bytes = limit;
         self
@@ -1561,8 +1585,11 @@ impl BulkProvider {
     ///
     /// An open transfer does **not** reserve its announced total; it reserves
     /// what it holds plus the assembly buffer a `finish` needs (round 9, M5;
-    /// round 18, #1; R-10 round 13, F5). The plan vector is counted once per
-    /// transfer.
+    /// round 18, #1; R-10 round 13, F5). The plan's hash vector is counted
+    /// twice per transfer (the transfer holds its plan and the receiver holds
+    /// its own copy), which is why a complete body needs
+    /// `2 x body + plan vector` of the provider-wide bound
+    /// (R-10 round 15, F4).
     pub fn live_bytes(&self) -> u64 {
         // An open transfer reserves the bytes it has stored, the assembly
         // buffer a `finish` allocates and the plan's own hash vector
@@ -1754,24 +1781,28 @@ impl BulkProvider {
         if !self.transfers.contains_key(&object) {
             return Err(Error::Bulk("no transfer is active"));
         }
-        if self.max_live_bytes != 0 {
-            // A chunk grows the reservation by twice its stored bytes; the
-            // ceiling is charged before the bytes are stored, like every other
-            // budget (R-10 round 18, #1).
-            // The stored bytes are the frame without its header, which is what
-            // live_bytes counts; a malformed short frame reserves nothing and
-            // accept refuses it below.
-            let stored = (call.payload.len() as u64).saturating_sub(CHUNK_OVERHEAD);
-            let growth = stored.saturating_mul(2);
-            if self.live_bytes().saturating_add(growth) > self.max_live_bytes {
-                return Err(Error::BudgetExceeded("byte"));
-            }
-        }
+        // The live-byte reservation is settled after the frame validates and
+        // only for a chunk that is actually stored: charging the announced
+        // length first was a one-byte occupancy oracle over every object, and
+        // charging an idempotent duplicate again refused every retransmission
+        // at the documented minimal bound (R-10 round 15, F2 and F3). The
+        // receiver's own meter still pays for the decode and hash before
+        // validation, so a refused frame is not free.
+        let held = self.live_bytes();
+        let limit = self.max_live_bytes;
         let active = self
             .transfers
             .get_mut(&object)
             .ok_or(Error::Bulk("no transfer is active"))?;
-        let index = active.receiver.accept(&call.payload)?;
+        let index = active.receiver.accept_metered(&call.payload, |stored| {
+            if limit != 0 {
+                let growth = stored.saturating_mul(2);
+                if held.saturating_add(growth) > limit {
+                    return Err(Error::BudgetExceeded("byte"));
+                }
+            }
+            Ok(())
+        })?;
         active.last_ms = call.now_ms;
         let received = active.receiver.bytes_received();
         let missing = active.receiver.missing_count();
@@ -1932,15 +1963,14 @@ impl BulkProvider {
             // A None deadline would mean no bound at all: an already-passed
             // deadline fails closed instead (round 11, L-5).
             .unwrap_or_else(std::time::Instant::now);
-        // A transfer that keeps running out of wall gets three assemblies and
-        // then only refusals: a cheap frame must not buy repeated CPU. Every
-        // failure counts, whatever its grant — an attempt that presents the
-        // body's own wall and still expires is evidence that the estimate is
-        // wrong for this host, not a payment to forget — and the only way to
-        // clear the count is a grant strictly wider than one that has already
-        // failed (R-10 round 13/15/16). The chunks are never released by a
-        // refusal: a refusal must not destroy a body the caller paid to
-        // transfer.
+        // A transfer that keeps running out of wall gets three sub-estimate
+        // assemblies and then only refusals: a cheap frame must not buy
+        // repeated CPU. Every sub-estimate failure counts, whatever its grant,
+        // and only a funded attempt (a grant at the body's estimate) clears the
+        // count — capped at `FUNDED_ASSEMBLY_LIMIT` runs, after which the
+        // transfer freezes (R-10 rounds 13/14/15). The chunks are never
+        // released by a refusal: a refusal must not destroy a body the caller
+        // paid to transfer.
         let (refusals, estimate, funded_runs) =
             self.transfers.get(&object).map_or((0, 0, 0), |active| {
                 (
@@ -2147,9 +2177,10 @@ fn reserved_bytes(plan: &BulkPlan, received: u64) -> u64 {
     // `2 x total` from the plan instead let an announced-but-unpaid plan hold the
     // provider-wide bound for the whole idle window (R-10 round 18, #1).
     // Two plan vectors are retained per transfer (`ActiveTransfer.plan` and
-    // the receiver's own `BulkPlan`), and a finish clone can hold a third for
-    // the duration of the call; charging the vector twice bounds the resident
-    // footprint instead of under-counting it (R-10 round 13, F3).
+    // the receiver's own `BulkPlan`), and the `plan` call itself builds a third
+    // from the frame before either is stored. Charging the vector twice bounds
+    // the resident footprint of an open transfer instead of under-counting it
+    // (R-10 round 13, F3; round 15, F4).
     received
         .saturating_mul(2)
         .saturating_add(PLAN_OVERHEAD)
@@ -2303,6 +2334,70 @@ mod throttle_tests {
             entries.get("content_error"),
             Some(&Value::text("wall")),
             "one recomputation per transfer, not one per replay"
+        );
+    }
+
+    /// The recompute gate must refuse a replay that cannot pay for the
+    /// body-sized classification: a 45-byte frame with a 1 ms grant used to
+    /// start an unbounded pass (R-10 round 15, F6).
+    #[test]
+    fn a_replay_that_cannot_pay_does_not_start_the_classification() {
+        let image = vec![0u8; 200_000];
+        let plan = BulkPlan::new(&image, 4_096).expect("plan");
+        assert!(
+            plan.total()
+                .div_ceil(crate::bulk::FINISH_BYTES_PER_MS)
+                .max(1)
+                > 1,
+            "the fixture needs more than one millisecond"
+        );
+        let needed_ms = plan
+            .total()
+            .div_ceil(crate::bulk::FINISH_BYTES_PER_MS)
+            .max(1);
+        let mut provider = BulkProvider::new();
+        provider.completed.insert(
+            0,
+            CompletedTransfer {
+                body: BulkBody {
+                    body_hash: *blake3::hash(&image).as_bytes(),
+                    body: image,
+                    content: None,
+                    content_error: Some("wall"),
+                },
+                root: plan.root(),
+                total: plan.total(),
+                at_ms: 0,
+                recomputed: false,
+            },
+        );
+        let marker = BulkFinish::new(&plan).encode();
+        let mut tight = Call::new("finish", Vec::new()).with_payload(marker.clone());
+        tight.now_ms = 1;
+        tight.budget.max_wall_ms = 1;
+
+        let reply = provider.invoke(0, &tight).expect("the replay answers");
+        let Response::Value(Value::Map(entries)) = reply else {
+            panic!("a map reply");
+        };
+        assert_eq!(
+            entries.get("content_error"),
+            Some(&Value::text("wall")),
+            "a grant that cannot pay leaves the reply degraded: {entries:?}"
+        );
+        assert!(
+            !provider.completed.get(&0).expect("record").recomputed,
+            "the classification did not start"
+        );
+
+        // A grant that can pay runs the pass once and records it.
+        let mut paid = Call::new("finish", Vec::new()).with_payload(marker);
+        paid.now_ms = 1;
+        paid.budget.max_wall_ms = needed_ms;
+        provider.invoke(0, &paid).expect("the paying replay");
+        assert!(
+            provider.completed.get(&0).expect("record").recomputed,
+            "the paying replay recomputes"
         );
     }
 }

@@ -101,18 +101,21 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   silently truncates it (`required_lane_wall_ms()` is the same number). The
   lane's cumulative `max_bytes` must cover `required_lane_bytes()`. A provider
   may bound the bytes it holds across objects with `with_max_live_bytes`, where
-  each open transfer reserves twice the bytes it has **stored** plus the retained
-  plan hash vector: an unpaid plan holds only its vector, and a `put` that would
-  pass the bound is refused before it stores (R-10 round 18).
+  each open transfer reserves twice the bytes it has **stored** plus **twice**
+  the retained plan hash vector (the transfer's plan and the receiver's copy):
+  an unpaid plan holds only its vector, a `put` whose validated chunk would pass
+  the bound is refused before it stores (an identical retransmission is free),
+  and `BulkPlan::required_live_bytes()` is the bound a complete body needs
+  (R-10 rounds 18 and 15).
 - Every `finish` that runs out of wall is counted, whatever its grant: an
   attempt that presents `assembly_wall_ms()` and still expires is evidence that
   the estimate is wrong for this host, not a payment to forget (R-10 round 16).
-  After three failures at a grant the provider **freezes** the transfer and
-  refuses it with `rpc/bulk` before any work, and a same-root `plan` frame does
-  not clear the freeze, so a 53-byte frame cannot buy another batch of
-  assemblies. The only thing that clears the count is a grant **strictly wider**
-  than one that has already failed — a price the transfer has not refused — so
-  the sizing to mint is `required_wall_ms()`: the body's own cost with a
+  After three such failures the provider **freezes** the transfer and refuses it
+  with `rpc/bulk` before any work. A grant at the body's estimate is *funded*:
+  it clears the count and runs, capped at two funded assemblies
+  (`FUNDED_ASSEMBLY_LIMIT`), after which the transfer freezes even for a grant
+  that could pay; a same-root `plan` frame does not clear the freeze. Both rules
+  are why the sizing to mint is `required_wall_ms()`: the body's own cost with a
   per-chunk term and slack, never below the default grant. The stored chunks are
   never destroyed by a refusal: the non-destructiveness rule outranks the
   throttle, and `abort` is the caller's own way to discard what it no longer

@@ -50,6 +50,22 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 
 Entries are appended per section: date, reviewer path, findings, disposition.
 
+### R-10 bulk - 2026-11-07 (round 15 fix pass)
+
+Round-14 findings F2-F8, fixed with failing-first tests and mutation controls.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F2 | medium | `put` charged live-byte growth from the unvalidated payload length and charged it again for an identical duplicate, so every retransmission was refused at the documented minimal bound | **fixed**: `BulkReceiver::accept_metered` validates first and calls the reservation with the stored size only for a new chunk (a duplicate returns before it). `bulk_round15_tests::a_duplicate_chunk_does_not_charge_the_live_ceiling_again` and `the_documented_minimal_bound_completes_and_retransmits` fail before; the control (charging duplicates) fails both while the oracle test stays green |
+| F3 | low | the same pre-validation growth was a one-byte occupancy oracle over every object's bytes | **fixed**: validation precedes the reservation, so a corrupted frame reports `rpc/bulk` at a full ceiling. `a_refused_frame_reports_its_defect_at_a_full_ceiling`; control reintroduces the pre-check and fails it |
+| F4 | low | docs still described one plan vector, "strictly wider" grants and a finish clone | **fixed**: `live_bytes`/`reserved_bytes`, `Throttle::Run`, the finish comment, `docs/spec/wire.md` and ADR-0013 state twice the vector, the funded allowance (`FUNDED_ASSEMBLY_LIMIT`) and the real `put` order |
+| F5 | low | `with_max_live_bytes(L)` cannot complete a body above about `L/2`, and nothing let a host size it | **fixed**: `BulkPlan::required_live_bytes()` (the completion footprint) plus the documented requirement. `required_live_bytes_is_the_bound_a_complete_body_needs` asserts the value is exact and one byte less refuses only the last chunk |
+| F6 | low | the degraded-reply wall gate had no negative test (the fixture needed 1 ms, the call carried 5 000) | **fixed**: `a_replay_that_cannot_pay_does_not_start_the_classification` uses a 200 kB body (needed 2 ms), asserts a 1 ms replay leaves `content_error: wall` without recomputing, and a 2 ms replay recomputes once; control deletes the gate and fails it |
+| F7 | low | the fuzz control only reached the funded throttle branch | **fixed**: the target's once-per-process control runs an 8 MiB transfer through three 1 ms refusals, a frozen fourth and a paid finish; `the_throttle_freezes_and_a_paid_grant_still_finishes` drives the same shape on the shipped provider |
+| F8 | low | `frames_from` re-hashed every chunk with `BulkChunk::new`, contradicting ADR-0013's "hashed once per chunk" | **fixed**: it delegates to `frame_at`, which carries the plan's hash; `a_resume_batch_is_the_streaming_frames` pins byte equality for every resume point and the out-of-plan refusal |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-10 needs r15 and r16 clean.
+
 ### R-12 replay - 2026-11-07 (round 15) - CLEAN, section closed
 
 Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
