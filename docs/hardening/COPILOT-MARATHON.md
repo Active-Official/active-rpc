@@ -23,13 +23,13 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-16: r16 found no critical/high but four mediums (non-monotone freeze, long-finish windows, O(chunks) missing page, unbounded classification) and sixteen lows, all fixed or documented; r17 and r18 must be clean | 130 fixed / 0 rejected / 0 open (limits documented) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-17: r17 verified the round-16 mediums, found one medium (the `wall` replay bypassed the bound) and sixteen lows, all fixed; r18 and r19 must be clean | 147 fixed / 0 rejected / 0 open (limits documented) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | `CLEAN` (rounds 1-15; rounds 14 and 15 clean) | 60 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018/0010) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-16: r16 fixed the r15 mediums (a partial magic lock wedged the log; a zeroed tail could not be repaired) and the r15 lows; r17 and r18 must be clean | 85 fixed / 0 rejected / 2 residuals (documented) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-15: r15 found the evaluate fast path, the label leak and the binary hex scan (highs), fixed; F3's projection-side assertion, F5, F6 and F9 are open for r16 | 66 fixed / 0 rejected / 5 noted (4 open) | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-16: r16 fixed the r15 opens (binary payloads, the caller's extra on projections, separator and compatibility folds, the quadratic scrub, provenance precision, key collisions, the exhaustive carrier list); r17 and r18 must be clean | 80 fixed / 0 rejected / 5 noted | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-10: r10 found the residency charge (medium) and four lows, all fixed; r11 and r12 must be clean | 68 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-5: r5 found two round-4 fixes missing and three partial (F1 fixed now); F2/F6/F8/F15 and the r5 test gaps are open for r6 | 77 fixed / 0 rejected / 7 open (3 documented) | this commit |
@@ -49,6 +49,52 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-10 bulk - 2026-11-07 (round 17 audit pass)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `72512f4`. The round-16 mediums held under mutation except one replay path;
+one medium and sixteen lows, all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| M1 | medium | the one-shot `wall` recompute called `classify_body` with no `max_live_bytes` check, so a replay could allocate two more body-sized projections past the operator's bound | **fixed**: the replay checks `live + 2L <= bound` and answers `content_error: memory` without spending `recomputed`, so a later grant with room can compute it. `a_wall_replay_respects_the_provider_bound`; the control removes the gate and fails |
+| F2 | low | `finish_within` cleared the stored map but not the missing set, so `is_complete()` was true over an empty receiver | **fixed**: `is_complete` requires both views and the receiver reseeds its missing set; `a_finished_receiver_is_not_complete`; the control reverts both and fails |
+| F3 | low | the completed-window stamp mixes a real duration into the kernel stamp; docs said every window is kernel-time | documented as the conservative direction (a late start, never an early release) in the code, wire.md and ADR-0013 |
+| F4 | low | the classification needs `3L + vector`; the docs said three body lengths, and `required_live_bytes` can never yield an address | **fixed**: `BulkPlan::required_classification_bytes()`; `the_classification_bound_is_exact` (exact bound → address, one byte less → `memory`) |
+| F5 | low | the `put` reply's three-entry floor was undocumented | wire.md states it |
+| F6 | low | a zero-count `ARBM` returned an empty page with `more: true` | **fixed**: it means "nothing missing" and returns the window; `a_zero_count_request_returns_the_window` |
+| F7 | low | `BulkRequest::new` claimed a `MAX_CHUNKS` bound it does not apply | the doc now says the provider checks and points at `frames_for` |
+| F8 | low | `frames_for` refused a duplicate-heavy list by raw length | **fixed**: dedup first, bound the distinct set; `a_duplicate_heavy_resume_list_is_legal` |
+| F9 | low | the per-chunk multiplier said 16x (it is 64x for one-byte chunks) and the missing set was unnamed | corrected in `reserved_bytes`/`live_bytes` |
+| F10 | low | the frozen message and ADR said "five attempts" when the common freeze is the third cheap refusal, and the ADR contradicted itself | the message names both causes; the ADR separates sub-estimate freezes from the funded allowance |
+| F11 | low | the no-work exemption samples the clock just before the call, so a preemption can spend an attempt | documented as fail-closed and caller-only |
+| F12 | low | the global live bound is a cost-proportional cross-object occupancy signal | documented, with the per-tenant-provider mitigation |
+| F13 | low | `with_expected_root` is provider-wide with no note | documented |
+| F14 | low | the end-of-work stamp had no control | `a_completed_body_is_stamped_after_the_work` (a 16 MiB finish at `now_ms = 0` stamps > 0) |
+| F15 | low | the five-attempt cap had no call-site control | `a_seeded_attempt_cap_freezes_a_funded_grant` |
+| F16 | low | the classification gate boundary was untested | `the_classification_bound_is_exact` |
+| F17 | low | ADR-0013's `content_error` list omitted `memory` | corrected |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-10 needs r18 and r19 clean
+(r16 and r17 were each not clean).
+
+### R-16 security helpers - 2026-11-07 (round 16 fix pass)
+
+Round-15 open items F3-F10, fixed with tests and mutation controls.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F3 | high | a hex copy in a non-UTF-8 payload escaped the doom/scrub pass, the byte assertion was skipped by `redact_module`'s early return, and its set excluded the caller's `extra` | **fixed**: `bytes_carry_an_address` scans the payload as bytes (raw windows, one lowercased 64-byte pass, plus a compat scan); `assert_module_bytes` runs on the cone, subtree and content-hash projections with the caller's sticky/parent set. `a_binary_payload_and_a_parent_hash_copy_do_not_leave` |
+| F4 | medium | the separator set missed the soft hyphen, the invisible operators, variation selectors and the bidi/tag controls | **fixed**: `is_address_separator` reuses `is_invisible_or_reordering`, so the scrub and the metadata pass share one set. `a_soft_hyphen_separated_copy_is_scrubbed`; the control restores the old set and fails |
+| F5 | medium | fullwidth and mathematical hex (NFKC-equal to ASCII) were invisible to the text scan | **fixed**: `fold_compat_hex` folds the fullwidth and mathematical alphanumeric blocks before the run scan; `a_fullwidth_copy_of_an_address_is_scrubbed`; the control removes the fold and fails |
+| F6 | medium | the scrub rebuilt the raw address set per blob and scanned once per address (quadratic on provider-controlled images) | **fixed**: the receiver's raw set is already the caller's `raw`, and the hex scan is one lowercased pass per blob against a set. Structural; the old loop is gone |
+| F7 | low | any `blake3:` value was dropped, even a public audit string and even when the address set was empty | **fixed**: a secret-bearing module drops every `blake3:` text; a public one drops only a full hex run, so "built with blake3: manifests" survives. `a_public_provenance_mention_of_blake3_survives`; the control restores the broad drop and fails |
+| F8 | low | two field keys that scrub to one name silently dropped a field; a binding collision overwrote | **fixed**: a scrubbed-key collision is refused (`provider/redaction`), bindings included. `two_field_keys_that_scrub_to_one_name_are_refused`; the control keeps `retain` and fails |
+| F9 | low | the carrier match ended in `_ => {}` | **fixed**: the arm list is exhaustive over `Inode`, so a new text-bearing variant breaks the build |
+| F10 | low | docs claimed more than the passes did | **fixed**: SECURITY.md and `docs/spec/security.md` describe the compatibility folds, the caller-extra assertion and the collision refusal |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-16 needs r16 and r17 clean.
 
 ### R-10 bulk - 2026-11-07 (round 16 audit pass)
 

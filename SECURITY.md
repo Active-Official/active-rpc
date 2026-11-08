@@ -92,15 +92,20 @@ capability id at rest (it is a bearer token).
   string, identifier, env name, table or schema field key, interpolated literal,
   binding name, constraint or enum member, unit name, patch path, schema type
   list or blob media type that quotes the address is rewritten in place, in
-  either case and with `-`, `:` or zero-width separators. A second blob with the
-  same identity, a payload that embeds the address and an extension payload that
-  copies it are dropped as well. The address set is sticky on the slot, so a
+  either case and with `-`, `:` or any invisible/reordering separator, and a
+  fullwidth or mathematical compatibility form of a hex address is folded before
+  the scan. A second blob with the same identity, a payload that embeds the
+  address and an extension payload that copies it are dropped as well. The address set is sticky on the slot, so a
   patch that removes the blob cannot declassify a hash an annotation or the
-  provenance still quotes, and the provenance's own text fields are scrubbed.
+  provenance still quotes, and the provenance's own text fields are scrubbed
+  where they name a secret address (a public producer string survives).
   The encoded projection is then re-read and refused (`provider/redaction`) if
-  any address survives in raw or hex form: the field pass is a list, the byte
-  check is not. The domain treats a module that holds one as secret-bearing for
-  hashing, provenance, patching and metadata (R-16 rounds 9-14).
+  any address survives in raw or hex form — including the caller's sticky and
+  parent addresses on every projection path — and a scrubbed-key collision is
+  refused rather than silently changing the shape. The field pass is a list,
+  the byte check is not. The domain treats a module that holds one as
+  secret-bearing for hashing, provenance, patching and metadata
+  (R-16 rounds 9-16).
   Bytes that do not claim to be an image are opaque by declaration (a WASM
   guest's binary output,
   a provider's blob): the value model cannot tell them from arbitrary data, so a

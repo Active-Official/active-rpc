@@ -304,7 +304,7 @@ pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
         .map_err(|error| Error::Payload(error.code().to_string()))?;
     module.set_provenance(None);
     let extra: &[[u8; 32]] = own.as_slice();
-    let addresses = sanitize_tainted_blobs(&mut module, extra);
+    let addresses = sanitize_tainted_blobs(&mut module, extra)?;
 
     let redacted = active_infinity::encode(&module)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
@@ -370,6 +370,20 @@ fn assert_no_address_bytes(bytes: &[u8], addresses: &BTreeSet<[u8; 32]>) -> Resu
     Ok(())
 }
 
+/// Refuse encoded projection bytes that carry one of `extra`'s addresses.
+///
+/// The field passes and `redact_module`'s own assertion know the blobs they
+/// sanitized; a domain projection also has to answer for the caller's set (the
+/// sticky secret addresses and the parent hash) and for payloads and extensions,
+/// which the field walk does not read (R-16 round 16, F3).
+pub(crate) fn assert_module_bytes(bytes: &[u8], extra: &[[u8; 32]]) -> Result<()> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let addresses: BTreeSet<[u8; 32]> = extra.iter().copied().collect();
+    assert_no_address_bytes(bytes, &addresses)
+}
+
 /// The hex keys of a raw address set.
 fn address_keys_from_raw(raw: &BTreeSet<[u8; 32]>) -> BTreeSet<[u8; 64]> {
     raw.iter().map(hex_key).collect()
@@ -413,7 +427,7 @@ pub fn redact_derived_with(
     // The library redacts a tainted blob's media type, not its content
     // address; a cone or a patched reply is still a projection that leaves the
     // kernel (R-16 round 9, F-2).
-    sanitize_tainted_blobs(module, extra);
+    sanitize_tainted_blobs(module, extra)?;
     Ok(())
 }
 
@@ -506,7 +520,7 @@ pub(crate) fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
 pub(crate) fn sanitize_tainted_blobs(
     module: &mut active_infinity::InfinityModule,
     extra: &[[u8; 32]],
-) -> BTreeSet<[u8; 32]> {
+) -> Result<BTreeSet<[u8; 32]>> {
     let mut doomed: BTreeSet<active_infinity::NodeId> = BTreeSet::new();
     let mut raw: BTreeSet<[u8; 32]> = extra.iter().copied().collect();
     let mut addresses = address_keys(extra);
@@ -538,7 +552,7 @@ pub(crate) fn sanitize_tainted_blobs(
         let media = text_names_an_address(media_type, &addresses);
         let binary = payload
             .as_deref()
-            .is_some_and(|bytes| bytes_carry_an_address(bytes, &addresses));
+            .is_some_and(|bytes| bytes_carry_an_address(bytes, &addresses, &raw));
         if duplicate || media || binary {
             addresses.insert(hex_key(hash));
             raw.insert(*hash);
@@ -546,13 +560,13 @@ pub(crate) fn sanitize_tainted_blobs(
         }
     }
     if doomed.is_empty() && addresses.is_empty() {
-        return raw;
+        return Ok(raw);
     }
     // A text copy of an address carries what the blob fields no longer do. The
     // library's redactor rewrites secret literals, not an address the provider
     // copied into a string, an identifier, an env name, a field key or a
     // literal interpolation (R-16 round 13, F1).
-    scrub_text_copies(module, &addresses);
+    scrub_text_copies(module, &addresses, &raw)?;
     // An annotation is free text about its subject: one attached to the blob,
     // or one whose text quotes the address, carries what the fields no longer
     // do. An `AiImmutable` flag carries no text, so it stays (R-16 rounds 10-13).
@@ -602,15 +616,15 @@ pub(crate) fn sanitize_tainted_blobs(
     let extensions = module.extensions().to_vec();
     if extensions
         .iter()
-        .any(|(_, bytes)| bytes_carry_an_address(bytes, &addresses))
+        .any(|(_, bytes)| bytes_carry_an_address(bytes, &addresses, &raw))
     {
         let kept: Vec<(u64, Vec<u8>)> = extensions
             .into_iter()
-            .filter(|(_, bytes)| !bytes_carry_an_address(bytes, &addresses))
+            .filter(|(_, bytes)| !bytes_carry_an_address(bytes, &addresses, &raw))
             .collect();
         module.set_extensions(kept);
     }
-    raw
+    Ok(raw)
 }
 
 /// The 64-byte lowercase hex key of a hash.
@@ -641,19 +655,30 @@ fn address_keys(extra: &[[u8; 32]]) -> BTreeSet<[u8; 64]> {
 /// carried the same address untouched (R-16 round 14, F1). The text is rewritten
 /// rather than the node replaced, so a `SchemaField` keeps its constraints and a
 /// table keeps its shape (F6).
-fn scrub_text_copies(module: &mut active_infinity::InfinityModule, addresses: &BTreeSet<[u8; 64]>) {
+fn scrub_text_copies(
+    module: &mut active_infinity::InfinityModule,
+    addresses: &BTreeSet<[u8; 64]>,
+    raw: &BTreeSet<[u8; 32]>,
+) -> Result<()> {
     if addresses.is_empty() {
-        return;
+        return Ok(());
     }
     let bindings: Vec<(String, active_infinity::NodeId)> = module.bindings().to_vec();
-    if bindings
-        .iter()
-        .any(|(name, _)| text_names_an_address(name, addresses))
-    {
-        module.clear_bindings();
-        for (name, id) in bindings {
-            module.bind(scrub_addresses(&name, addresses), id);
+    let mut renamed: Vec<(String, active_infinity::NodeId)> = Vec::with_capacity(bindings.len());
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for (name, id) in bindings {
+        let name = scrub_addresses(&name, addresses);
+        if !seen.insert(name.clone()) {
+            // Two names that scrub to one would silently drop a binding: the
+            // projection's shape changed. Fail closed instead
+            // (R-16 round 16, F8).
+            return Err(redaction_failure());
         }
+        renamed.push((name, id));
+    }
+    module.clear_bindings();
+    for (name, id) in renamed {
+        module.bind(name, id);
     }
     for index in 0..module.node_count() {
         let id = active_infinity::NodeId(index as u32);
@@ -669,7 +694,7 @@ fn scrub_text_copies(module: &mut active_infinity::InfinityModule, addresses: &B
             }
             active_infinity::Inode::Table { fields }
             | active_infinity::Inode::SchemaTable { fields, .. } => {
-                scrub_field_keys(fields, addresses);
+                scrub_field_keys(fields, addresses)?;
             }
             active_infinity::Inode::Interpolate { parts } => {
                 for part in parts.iter_mut() {
@@ -727,27 +752,59 @@ fn scrub_text_copies(module: &mut active_infinity::InfinityModule, addresses: &B
                     // A payload that carries the address is a binary copy of it;
                     // the payload is dropped rather than edited, because its
                     // length defines the blob identity (R-16 round 14, F4).
-                    if bytes_carry_an_address(bytes, addresses) {
+                    if bytes_carry_an_address(bytes, addresses, raw) {
                         *payload = None;
                     }
                 }
             }
-            _ => {}
+            // Exhaustive on purpose: a new `Inode` variant that carries text
+            // must fail the build here rather than be silently un-scrubbed
+            // (R-16 round 16, F9; contrast `remap_node`).
+            active_infinity::Inode::Null
+            | active_infinity::Inode::Bool(_)
+            | active_infinity::Inode::Int(_)
+            | active_infinity::Inode::Float(_)
+            | active_infinity::Inode::DurationMs(_)
+            | active_infinity::Inode::Array { .. }
+            | active_infinity::Inode::Secret(_)
+            | active_infinity::Inode::SecretRef { .. }
+            | active_infinity::Inode::Ref(_)
+            | active_infinity::Inode::Binary { .. }
+            | active_infinity::Inode::Unary { .. }
+            | active_infinity::Inode::SchemaArray { .. }
+            | active_infinity::Inode::Semantic { .. }
+            | active_infinity::Inode::ContentAddressed { .. } => {}
         }
     }
+    Ok(())
 }
 
-/// Rewrite table keys that name an address and drop a collision the rewrite
+/// Rewrite table keys that name an address, refusing a collision the rewrite
 /// introduces.
 fn scrub_field_keys(
-    fields: &mut Vec<(String, active_infinity::NodeId)>,
+    fields: &mut [(String, active_infinity::NodeId)],
     addresses: &BTreeSet<[u8; 64]>,
-) {
+) -> Result<()> {
     for (name, _) in fields.iter_mut() {
         *name = scrub_addresses(name, addresses);
     }
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    fields.retain(|(name, _)| seen.insert(name.clone()));
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (name, _) in fields.iter() {
+        if !seen.insert(name.as_str()) {
+            // Silently dropping one field changed the projection's shape;
+            // a scrubbed name must stay unique or the reply is refused
+            // (R-16 round 16, F8).
+            return Err(redaction_failure());
+        }
+    }
+    Ok(())
+}
+
+/// The projection refused to keep its shape.
+fn redaction_failure() -> Error {
+    Error::Provider {
+        code: "provider/redaction".to_string(),
+    }
 }
 
 /// Replace every occurrence of an address in `text` with the marker.
@@ -792,47 +849,39 @@ fn scrub_contiguous(text: &str, addresses: &BTreeSet<[u8; 64]>) -> String {
     out
 }
 
-/// One hex digit's value; a non-digit reads as zero, which cannot match.
-fn hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => 0,
-    }
-}
-
 /// Whether `bytes` contains an address, raw or in hex.
-fn bytes_carry_an_address(bytes: &[u8], addresses: &BTreeSet<[u8; 64]>) -> bool {
+///
+/// `raw` is the same set as `addresses` in binary form, maintained by the
+/// caller: rebuilding it per blob made a many-blob image quadratic
+/// (R-16 round 16, F6). The hex scan is one pass over the bytes against a set,
+/// not a window scan per address, and a UTF-8 payload is also checked for
+/// compatibility-form copies (fullwidth or mathematical hex)
+/// (R-16 round 16, F5).
+fn bytes_carry_an_address(
+    bytes: &[u8],
+    addresses: &BTreeSet<[u8; 64]>,
+    raw: &BTreeSet<[u8; 32]>,
+) -> bool {
     if bytes.len() < 32 {
         return false;
     }
-    let mut windows = BTreeSet::new();
-    for address in addresses {
-        let mut raw = [0u8; 32];
-        for (slot, pair) in raw.iter_mut().zip(address.chunks(2)) {
-            if let [high, low] = pair {
-                *slot = (hex_nibble(*high) << 4) | hex_nibble(*low);
-            }
-        }
-        windows.insert(raw);
-    }
     let raw_hit = bytes.windows(32).any(|window| {
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(window);
-        windows.contains(&raw)
+        let mut candidate = [0u8; 32];
+        candidate.copy_from_slice(window);
+        raw.contains(&candidate)
     });
-    // The hex form is searched over the bytes, not over a UTF-8 view: a payload
-    // that ends in a non-UTF-8 byte carried the address past both this scan and
-    // the doom pass (R-16 round 15, F3). The comparison is case-insensitive per
-    // byte, so a mixed-case copy cannot slip through.
-    raw_hit
-        || addresses.iter().any(|address| {
-            let key = address.as_slice();
-            bytes
-                .windows(64)
-                .any(|window| window.eq_ignore_ascii_case(key))
+    let hex_hit = !addresses.is_empty() && bytes.len() >= 64 && {
+        let mut key = [0u8; 64];
+        bytes.windows(64).any(|window| {
+            for (slot, byte) in key.iter_mut().zip(window) {
+                *slot = byte.to_ascii_lowercase();
+            }
+            addresses.contains(&key)
         })
+    };
+    let compat_hit = !hex_hit
+        && std::str::from_utf8(bytes).is_ok_and(|text| text_names_an_address(text, addresses));
+    raw_hit || hex_hit || compat_hit
 }
 
 /// Whether `text` contains one of the addresses, contiguous or separated.
@@ -854,10 +903,13 @@ pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) 
             return true;
         }
     }
-    // Separated copies: collect hex digits across `-`, `:` and the zero-width
-    // family, and check every 64-digit window of the collected run.
+    // Separated and compatibility-form copies: collect hex digits across the
+    // separators, folding fullwidth and mathematical alphanumerics to ASCII
+    // first (NFKC-equivalent copies of a hex string are the same oracle,
+    // R-16 round 16, F5), and check every 64-digit window of the collected run.
     let mut run: Vec<u8> = Vec::with_capacity(64);
     for character in text.chars() {
+        let character = fold_compat_hex(character);
         if character.is_ascii_hexdigit() {
             run.push(character.to_ascii_lowercase() as u8);
             if run.len() > 64 {
@@ -876,6 +928,34 @@ pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) 
     false
 }
 
+/// Fold a compatibility-form hex character to ASCII.
+///
+/// Fullwidth digits and A-F/a-f, and the mathematical alphanumeric letters and
+/// digits, are NFKC-equal to ASCII hex: a consumer that normalizes identifiers
+/// recovers the address, so the scrub must see the same character
+/// (R-16 round 16, F5).
+fn fold_compat_hex(character: char) -> char {
+    let code = character as u32;
+    let from = |start: u32, ascii: u8| char::from(ascii + (code - start) as u8);
+    match code {
+        0xFF10..=0xFF19 => from(0xFF10, b'0'),
+        0xFF21..=0xFF26 => from(0xFF21, b'A'),
+        0xFF41..=0xFF46 => from(0xFF41, b'a'),
+        // The mathematical alphanumeric symbols: thirteen alphabets of 52
+        // letters (A-Z then a-z), then five digit sets of ten.
+        0x1D400..=0x1D6A3 => {
+            let offset = (code - 0x1D400) % 52;
+            if offset < 26 {
+                char::from(b'A' + offset as u8)
+            } else {
+                char::from(b'a' + (offset - 26) as u8)
+            }
+        }
+        0x1D7CE..=0x1D7FF => char::from(b'0' + (code - 0x1D7CE) as u8 % 10),
+        _ => character,
+    }
+}
+
 /// Characters a decoder ignores inside a hex address.
 ///
 /// A reader that strips them can compare a split copy, so the scrub must too.
@@ -883,20 +963,11 @@ pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) 
 /// the invisible operators and the variation selectors and tag characters a
 /// renderer hides (R-16 rounds 14-15).
 fn is_address_separator(character: char) -> bool {
-    matches!(
-        character,
-        '-' | ':'
-            | '_'
-            | '\u{00ad}'
-            | '\u{180e}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{fe00}'..='\u{fe0f}'
-            | '\u{feff}'
-            | '\u{e0000}'..='\u{e007f}'
-    )
+    // One source for the invisible set: the same predicate the metadata
+    // sanitizer uses, so a character the renderer hides cannot be a separator
+    // for one pass and opaque for the other (R-16 round 16, F4).
+    matches!(character, '-' | ':' | '_')
+        || (is_invisible_or_reordering(character) && !character.is_whitespace())
 }
 
 /// [text_names_an_address] for a raw address set.

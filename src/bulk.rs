@@ -483,6 +483,18 @@ impl BulkPlan {
         reserved_bytes(self, self.total)
     }
 
+    /// Provider-wide bound that also covers an image classification.
+    ///
+    /// An image `finish` decodes the body and builds two more body-sized
+    /// projections while the image itself is resident, so a bound sized with
+    /// [`BulkPlan::required_live_bytes`] answers `content_error: memory`. This
+    /// value (`required_live_bytes + total`) covers the body, its assembly and
+    /// the two classification projections, plus the plan vector and the
+    /// receiver's missing set (R-10 round 17, F4).
+    pub fn required_classification_bytes(&self) -> u64 {
+        self.required_live_bytes().saturating_add(self.total)
+    }
+
     /// Number of chunks.
     pub fn chunk_count(&self) -> u32 {
         self.chunks
@@ -799,11 +811,13 @@ pub struct BulkRequest {
 }
 
 impl BulkRequest {
-    /// Build a request from a missing list. Duplicates are removed and the
-    /// list is bounded by [`MAX_CHUNKS`]: a longer one is truncated in the
-    /// `u32` count by the wire format, so callers building a hand-made resume
-    /// should use [`BulkSender::frames_for`] or clamp to the plan
-    /// (R-10 round 16, L13).
+    /// Build a request from a missing list. Duplicates are removed.
+    ///
+    /// The list is not bounded here: the provider refuses an index outside its
+    /// plan, and a caller building a hand-made resume keeps the list within
+    /// [`MAX_CHUNKS`] (the count is a `u32` on the wire). Use
+    /// [`BulkSender::frames_for`], which checks the plan
+    /// (R-10 round 16, L13; round 17, F7).
     pub fn new(missing: &[u32]) -> Self {
         let mut unique: BTreeSet<u32> = BTreeSet::new();
         unique.extend(missing.iter().copied());
@@ -1046,15 +1060,17 @@ impl BulkSender {
     /// allocation. An index outside the plan is an error rather than a silently
     /// dropped frame.
     pub fn frames_for(&self, missing: &[u32]) -> Result<Vec<Vec<u8>>> {
-        if missing.len() > self.plan.chunks as usize {
-            return Err(Error::Bulk("request asks for more chunks than the plan"));
-        }
         let mut unique: BTreeSet<u32> = BTreeSet::new();
         for index in missing {
             if *index >= self.plan.chunks {
                 return Err(Error::Bulk("requested chunk is outside the plan"));
             }
             unique.insert(*index);
+        }
+        // The bound is on the distinct indexes: a duplicate-heavy list is a
+        // legal request (R-10 round 17, F8).
+        if unique.len() > self.plan.chunks as usize {
+            return Err(Error::Bulk("request asks for more chunks than the plan"));
         }
         unique
             .into_iter()
@@ -1135,6 +1151,9 @@ impl BulkReceiver {
     ///
     /// This is the binding to the transfer the caller authorized: a substituted
     /// plan has a different root and is refused before a chunk is accepted.
+    /// The root is **provider-wide**: one provider serves one body, so a host
+    /// that needs several pinned bodies uses several providers
+    /// (R-10 round 17, F13).
     pub fn with_expected_root(plan: BulkPlan, expected: [u8; 32]) -> Result<Self> {
         plan.require_root(expected)?;
         let mut receiver = Self::with_ceiling(plan, MAX_TOTAL)?;
@@ -1254,8 +1273,12 @@ impl BulkReceiver {
     }
 
     /// True when every chunk is present.
+    ///
+    /// Both views must agree: a receiver that just finished has an empty stored
+    /// map, and reading only the missing set reported a finished receiver as
+    /// complete with nothing to resume (R-10 round 17, F2).
     pub fn is_complete(&self) -> bool {
-        self.missing.is_empty()
+        self.missing.is_empty() && self.received.len() as u32 == self.plan.chunks
     }
 
     /// Assemble and verify the body.
@@ -1326,6 +1349,10 @@ impl BulkReceiver {
         self.plan.verify_within(&out, deadline)?;
         self.received.clear();
         self.stored = 0;
+        // A reusable receiver resumes from the start; an empty `missing` set
+        // over an empty map reported a finished transfer as complete
+        // (R-10 round 17, F2).
+        self.missing = (0..self.plan.chunks).collect();
         Ok((out, *hasher.finalize().as_bytes()))
     }
 }
@@ -1671,6 +1698,12 @@ impl BulkProvider {
     /// (round 8, L5). The check runs when a transfer opens and on every `put`,
     /// so a plan that fits can still run out of room as chunks are stored;
     /// `BulkPlan::required_live_bytes` is the footprint a complete body needs.
+    ///
+    /// The bound is a **global** sum over every object: a refusal therefore
+    /// reveals one bit about other objects' committed bytes. The cost of the
+    /// probe scales with the threshold, so it is a cost-proportional disclosure
+    /// rather than an amplification; a host that cannot accept it gives each
+    /// tenant its own provider (R-10 round 17, F12).
     pub fn with_max_live_bytes(mut self, limit: u64) -> Self {
         self.max_live_bytes = limit;
         self
@@ -1984,7 +2017,15 @@ impl BulkProvider {
         let requested = if call.payload.is_empty() {
             None
         } else {
-            Some(BulkRequest::decode(&call.payload, &active.plan)?)
+            let request = BulkRequest::decode(&call.payload, &active.plan)?;
+            // A zero-count request is the natural "nothing missing" frame; it
+            // must return the authoritative window, not an empty page that
+            // reports `more` for ever (R-10 round 17, F6).
+            if request.missing().is_empty() {
+                None
+            } else {
+                Some(request)
+            }
         };
         active.last_ms = call.now_ms;
         let page_limit = MISSING_PAGE
@@ -2028,6 +2069,8 @@ impl BulkProvider {
         // not be receipted as a refusal (round 3, F3). The digest summary
         // outlives the bytes, so the answer survives `take_body` and the
         // completed window (round 4, L-4, L-5).
+        let live = self.live_bytes();
+        let limit = self.max_live_bytes;
         if let Some(done) = self.completed.get_mut(&object) {
             BulkFinish::decode_for(&call.payload, done.total, done.root)?;
             // A reply degraded by a spent grant is not final while the body is
@@ -2046,13 +2089,26 @@ impl BulkProvider {
                 && done.body.content_error() == Some("wall")
                 && call.budget.max_wall_ms >= needed_ms
             {
-                let (content, content_error) = classify_body(done.body.body());
-                done.recomputed = true;
-                done.body.content = content;
-                done.body.content_error = content_error;
-                if let Some(last) = self.last_finished.get_mut(&object) {
-                    last.content = content;
-                    last.content_error = content_error;
+                // The replay allocates the same body-sized projections as the
+                // first classification, and the completed body is resident: a
+                // bound that cannot cover them degrades to `memory` without
+                // spending the one-shot recompute, so a later grant with room
+                // can still compute it (R-10 round 17, M1).
+                let extra = (done.body.body().len() as u64).saturating_mul(2);
+                if limit != 0 && live.saturating_add(extra) > limit {
+                    done.body.content_error = Some("memory");
+                    if let Some(last) = self.last_finished.get_mut(&object) {
+                        last.content_error = Some("memory");
+                    }
+                } else {
+                    let (content, content_error) = classify_body(done.body.body());
+                    done.recomputed = true;
+                    done.body.content = content;
+                    done.body.content_error = content_error;
+                    if let Some(last) = self.last_finished.get_mut(&object) {
+                        last.content = content;
+                        last.content_error = content_error;
+                    }
                 }
             }
             let reply = finished_reply(
@@ -2134,23 +2190,22 @@ impl BulkProvider {
                     active.attempts,
                 )
             });
-        let funded = match throttle(
-            call.budget.max_wall_ms,
-            estimate,
-            refusals,
-            funded_runs,
-            attempts,
-        ) {
-            // A state refusal, not a budget class: the transfer has spent its
-            // assemblies, and the same frame is refused identically however it
-            // is priced. `abort` is the way out.
-            Throttle::Frozen => {
-                return Err(Error::Bulk(
-                    "finish is frozen after five attempts (three below the body's wall estimate and two funded): abort",
-                ))
-            }
-            Throttle::Run { funded } => funded,
-        };
+        let funded =
+            match throttle(
+                call.budget.max_wall_ms,
+                estimate,
+                refusals,
+                funded_runs,
+                attempts,
+            ) {
+                // A state refusal, not a budget class: the transfer has spent its
+                // assemblies, and the same frame is refused identically however it
+                // is priced. `abort` is the way out.
+                Throttle::Frozen => return Err(Error::Bulk(
+                    "finish is frozen (three below-estimate or two funded assemblies used): abort",
+                )),
+                Throttle::Run { funded } => funded,
+            };
         // The attempt counters are updated once work is known to start, below.
         // The instant the assembly starts, not the instant the deadline was
         // built: `entered < deadline` held for every positive grant and turned
@@ -2160,7 +2215,10 @@ impl BulkProvider {
         // Attempts are counted only when work actually starts: a grant whose
         // deadline had already passed did no work and must not spend the
         // transfer's five-assembly allowance (R-10 round 11 M-2 preserved
-        // under the round-16 cap).
+        // under the round-16 cap). The sample is taken just before the call, so
+        // a preemption in that gap can still count one attempt with no work
+        // read; that direction is fail-closed and harms only the caller
+        // (R-10 round 17, F11).
         if started < deadline {
             if let Some(active) = self.transfers.get_mut(&object) {
                 active.attempts = active.attempts.saturating_add(1);
@@ -2223,6 +2281,10 @@ impl BulkProvider {
         // The window starts when the work ended, not when the call was stamped
         // before the assembly: a slow finish used to record a fresh body as
         // already old and release it on the next call (R-10 round 16, M2).
+        // The kernel stamp is virtual while the work duration is real, so in
+        // virtual mode the stamp is ahead of `now_ms`: the completed window
+        // starts late (never early), which is the safe direction
+        // (R-10 round 17, F3).
         let finished_ms = call
             .now_ms
             .saturating_add(entered.elapsed().as_millis() as u64);
@@ -2357,8 +2419,9 @@ impl BulkTransfer {
 /// plan's hash vector.
 ///
 /// The plan is retained for the whole transfer (32 bytes per chunk plus the
-/// header), so a bound that counts only the body under-reports a
-/// maximal-chunk-count plan by up to 16x (round 10, M-1).
+/// header), so a bound that counts only the body under-reports a maximal
+/// one-byte-chunk plan by up to 64x (48 charged bytes against 1 stored byte;
+/// round 10, M-1; R-10 round 17, F9).
 fn reserved_bytes(plan: &BulkPlan, received: u64) -> u64 {
     // The footprint is what is stored plus the assembly buffer a `finish`
     // allocates, and the assembly can only ever hold a complete body: reserving
@@ -2372,7 +2435,8 @@ fn reserved_bytes(plan: &BulkPlan, received: u64) -> u64 {
     // bounds the resident footprint of an open transfer instead of
     // under-counting it (R-10 round 13, F3; round 15, F4/L3), and the bound
     // context is retained by both copies, so it is charged twice as well
-    // (R-10 round 16, L6).
+    // (R-10 round 16, L6). The receiver's missing-index `BTreeSet` is **not**
+    // charged; it is part of the documented estimate (R-10 round 17, F9).
     received
         .saturating_mul(2)
         .saturating_add(PLAN_OVERHEAD)
@@ -2571,6 +2635,128 @@ mod throttle_tests {
             provider.transfers.contains_key(&0),
             "a freeze keeps the body the caller paid for"
         );
+    }
+
+    /// A `wall`-degraded reply is recomputed only when the provider bound can
+    /// cover the replay's extra projections: the replay must not allocate past
+    /// the operator's bound, and must not spend the one-shot recompute
+    /// (R-10 round 17, M1).
+    #[test]
+    fn a_wall_replay_respects_the_provider_bound() {
+        use crate::bulk::{BulkTransfer, COMPLETED_IDLE_MS, FINISH_BYTES_PER_MS};
+        let body = vec![0u8; 200_000];
+        let transfer = BulkTransfer::new(body.clone(), 1 << 20).expect("transfer");
+        let plan = transfer.plan();
+        let needed_ms = plan.total().div_ceil(FINISH_BYTES_PER_MS).max(1);
+        let seed = |provider: &mut BulkProvider| {
+            provider.completed.insert(
+                0,
+                CompletedTransfer {
+                    body: BulkBody {
+                        body_hash: *blake3::hash(&body).as_bytes(),
+                        body: body.clone(),
+                        content: None,
+                        content_error: Some("wall"),
+                    },
+                    root: plan.root(),
+                    total: plan.total(),
+                    at_ms: COMPLETED_IDLE_MS,
+                    recomputed: false,
+                },
+            );
+        };
+        // The completion bound cannot cover the replay's two extra copies.
+        let mut tight = BulkProvider::new().with_max_live_bytes(plan.required_live_bytes());
+        seed(&mut tight);
+        let mut request = Call::new("finish", Vec::new()).with_payload(transfer.finish_frame());
+        request.now_ms = COMPLETED_IDLE_MS;
+        request.budget.max_wall_ms = needed_ms;
+        let reply = tight.invoke(0, &request).expect("the replay answers");
+        let Response::Value(Value::Map(entries)) = reply else {
+            panic!("a map reply");
+        };
+        assert_eq!(
+            entries.get("content_error"),
+            Some(&Value::text("memory")),
+            "the replay respected the bound: {entries:?}"
+        );
+        assert!(
+            !tight.completed.get(&0).expect("record").recomputed,
+            "a bounded replay does not spend the one-shot recompute"
+        );
+
+        // A bound that covers the classification runs it.
+        let mut roomy =
+            BulkProvider::new().with_max_live_bytes(plan.required_classification_bytes());
+        seed(&mut roomy);
+        roomy.invoke(0, &request).expect("the replay answers");
+        assert!(
+            roomy.completed.get(&0).expect("record").recomputed,
+            "a replay with room recomputes"
+        );
+    }
+
+    /// The completed window starts at the end of the work, so a finish whose
+    /// assembly took real time is not recorded as already old
+    /// (R-10 round 17, F14).
+    #[test]
+    fn a_completed_body_is_stamped_after_the_work() {
+        use crate::bulk::BulkTransfer;
+        let transfer = BulkTransfer::new(vec![0u8; 16 << 20], 1 << 20).expect("transfer");
+        let mut provider = BulkProvider::new();
+        provider
+            .invoke(
+                0,
+                &Call::new("plan", Vec::new()).with_payload(transfer.plan_frame()),
+            )
+            .expect("plan");
+        for index in 0..transfer.plan().chunk_count() {
+            provider
+                .invoke(
+                    0,
+                    &Call::new("put", Vec::new())
+                        .with_payload(transfer.chunk_frame(index).expect("chunk")),
+                )
+                .expect("chunk");
+        }
+        let mut finish = Call::new("finish", Vec::new()).with_payload(transfer.finish_frame());
+        finish.now_ms = 0;
+        finish.budget.max_wall_ms = 60_000;
+        provider.invoke(0, &finish).expect("finish");
+        let at_ms = provider.completed.get(&0).expect("record").at_ms;
+        assert!(
+            at_ms > 0,
+            "the stamp includes the real assembly duration, got {at_ms}"
+        );
+    }
+
+    /// The five-assembly cap is enforced at the call site, not only in the
+    /// throttle function (R-10 round 17, F15).
+    #[test]
+    fn a_seeded_attempt_cap_freezes_a_funded_grant() {
+        use crate::bulk::{BulkTransfer, FUNDED_ASSEMBLY_LIMIT, WALL_REFUSAL_LIMIT};
+        let transfer = BulkTransfer::new(vec![1u8], 1_024).expect("transfer");
+        let mut provider = BulkProvider::new();
+        provider
+            .invoke(
+                0,
+                &Call::new("plan", Vec::new()).with_payload(transfer.plan_frame()),
+            )
+            .expect("plan");
+        provider
+            .invoke(
+                0,
+                &Call::new("put", Vec::new()).with_payload(transfer.chunk_frame(0).expect("chunk")),
+            )
+            .expect("chunk");
+        provider.transfers.get_mut(&0).expect("transfer").attempts =
+            WALL_REFUSAL_LIMIT.saturating_add(FUNDED_ASSEMBLY_LIMIT);
+        let mut finish = Call::new("finish", Vec::new()).with_payload(transfer.finish_frame());
+        finish.budget.max_wall_ms = 60_000;
+        let error = provider
+            .invoke(0, &finish)
+            .expect_err("the attempt cap freezes a funded grant too");
+        assert_eq!(error.code(), "rpc/bulk", "{error}");
     }
 
     /// A `wall`-degraded reply is not final while the body is resident: one

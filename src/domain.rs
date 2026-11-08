@@ -470,6 +470,7 @@ impl ModuleProvider {
                     keep_scoped_bindings(&mut sub, scope);
                 }
                 let bytes = redacted_module_bytes(&sub)?;
+                security::assert_module_bytes(&bytes, &own).map_err(redaction_fault)?;
                 check_wall_budget(started, call)?;
                 Ok(Response::Module(bytes))
             }
@@ -618,6 +619,7 @@ impl ModuleProvider {
                         keep_scoped_bindings(&mut cone, scope);
                     }
                     let bytes = redacted_module_bytes(&cone)?;
+                    security::assert_module_bytes(&bytes, &own).map_err(redaction_fault)?;
                     (patched, bytes)
                 };
                 // A patch advances the object in place: every holder of a
@@ -808,10 +810,13 @@ impl ModuleProvider {
                             let mut extra: Vec<[u8; 32]> =
                                 slot.secret_addresses.iter().copied().collect();
                             extra.extend(slot.hash);
-                            crate::security::sanitize_tainted_blobs(&mut redacted, &extra);
+                            crate::security::sanitize_tainted_blobs(&mut redacted, &extra)
+                                .map_err(redaction_fault)?;
                             let redacted_bytes = encode(&redacted).map_err(|error| {
                                 redaction_fault(Error::Payload(error.code().to_string()))
                             })?;
+                            crate::security::assert_module_bytes(&redacted_bytes, &extra)
+                                .map_err(redaction_fault)?;
                             let hash = active_infinity::content_hash(&redacted_bytes)
                                 .map_err(|error| Error::Payload(error.code().to_string()))?;
                             slot.redacted_hash = Some(hash);
@@ -1006,7 +1011,20 @@ impl ModuleProvider {
                                 }
                                 let key = security::scrub_any_addresses(&key, &addresses);
                                 let value = match value {
-                                    Value::Text(text) if text.contains("blake3:") => continue,
+                                    // In a secret-bearing module any
+                                    // `blake3:` text is dropped; in a public
+                                    // one only a full hex run is (a producer
+                                    // string that merely mentions the prefix
+                                    // survives). Both rules keep a redacting
+                                    // answer free of content addresses
+                                    // (R-16 round 14 L1; round 16, F7).
+                                    Value::Text(text)
+                                        if text.contains("blake3:")
+                                            && (!addresses.is_empty()
+                                                || carries_blake3_hex(&text)) =>
+                                    {
+                                        continue
+                                    }
                                     Value::Text(text) => Value::Text(
                                         security::scrub_any_addresses(&text, &addresses),
                                     ),
@@ -2410,6 +2428,23 @@ pub fn cone_ids(module: &InfinityModule, path: &str) -> Result<Vec<NodeId>> {
     let node = active_infinity::interop::resolve_path(module, path)
         .ok_or(Error::InvalidArgument("path does not resolve"))?;
     Ok(subgraph(module, &[node]))
+}
+
+/// Whether a text carries a `blake3:` prefix followed by a 64-digit hex run.
+///
+/// A producer string that merely mentions the prefix is audit text; one that
+/// carries a run is a content address and may be secret-derived
+/// (R-16 round 16, F7).
+fn carries_blake3_hex(text: &str) -> bool {
+    let Some(index) = text.find("blake3:") else {
+        return false;
+    };
+    text[index + "blake3:".len()..]
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(64)
+        .count()
+        == 64
 }
 
 #[cfg(test)]

@@ -107,8 +107,12 @@ fn a_resume_request_is_deduplicated_and_bounded() {
     assert_eq!(duplicate.len(), 2);
 
     let over = vec![0u32; sender.plan().chunk_count() as usize + 1];
-    let error = sender.frames_for(&over).expect_err("bounded by the plan");
-    assert_eq!(error.code(), "rpc/bulk");
+    // The bound is on distinct indexes: duplicates collapse instead of being
+    // refused by raw length (R-10 round 17, F8).
+    assert_eq!(
+        sender.frames_for(&over).expect("duplicates collapse").len(),
+        1
+    );
 
     let outside = sender
         .frames_for(&[sender.plan().chunk_count()])

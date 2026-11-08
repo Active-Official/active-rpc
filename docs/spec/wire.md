@@ -668,6 +668,9 @@ transfer. `Provider::on_drop` releases the object's transfer and any untaken
 body. An incomplete transfer is released after 60 s of inactivity and never later
 than 1 hour after it opened, a finished, untaken body after 10 minutes, and its
 digest reply with it, all measured against the kernel-stamped `Call::now_ms`
+except a completed body, whose window starts at the end of the `finish` work
+(the kernel stamp plus the real assembly duration, so a slow finish is not
+recorded as already old)
 and applied on the next call for that object, a host `expire_idle` sweep, a
 `plan` for the object, `abort`, or the capability's drop: a provider never
 reclaims on a timer of its own, so a host serving long-lived capabilities sweeps. `plan`
@@ -688,7 +691,8 @@ below five gets `provider/reply-withheld`; the transfer stays open until `abort`
 or expiry, so the shape must be checked before the call is minted.
 `missing` answers the indexes the request frame names (page-capped at 1 024 or the
 caller's `max_array_len`, whichever is smaller, with `more` and `remaining`; an
-empty payload asks for the lowest window). A `missing` reply is a four-entry map
+empty payload asks for the lowest window; a decoded request with a zero count
+does too). A `missing` reply is a four-entry map
 plus the list, so `max_array_len` must be at least four for any page to arrive.
 It refreshes
 the idle window, and never expires a transfer by idleness: a read-only
@@ -708,10 +712,11 @@ provider serves. When the address could have been computed but was not,
 before classification, so the reply does not say whether the body is an image;
 `parser`: an image that cannot be redacted; `memory`: the provider-wide bound
 cannot cover the classification's extra body-sized projections, so it was
-skipped). The finish reply is up to 205 bytes and four entries: a capability
-whose `max_value_size` cannot carry it completes the body but has every finish
-reply withheld, and `plan` then refuses the untaken body, so mint at least that
-much. The reply is recorded and replayed, so a degraded reply says so
+skipped). The finish reply is up to 205 bytes and four entries, and a `put`
+reply is a three-entry map: a capability
+whose `max_value_size`/`max_array_len` cannot carry one completes the body but
+has that reply withheld, and `plan` then refuses the untaken body, so mint at
+least that much. The reply is recorded and replayed, so a degraded reply says so
 rather than looking like a body that is not an image. A grant must cover `BulkPlan::required_grant()` bytes (plan
 frame, chunk frames, request frames, finish marker and a reply allowance sized by
 the reply shapes) and
@@ -740,8 +745,10 @@ the provider-wide bound; compare it before opening a transfer, because a bound
 below it refuses the last `put` after the earlier chunks have been paid for.
 That figure covers the assembly, not an image classification: the provider
 answers `content_error: memory` rather than classify when its bound cannot cover
-three body lengths, and the receiver's missing-index set and map nodes are a
-committed-state estimate rather than allocator-exact. An
+three body lengths plus the plan vector, so a host that wants an image address
+sizes the bound with `BulkPlan::required_classification_bytes()`
+(`required_live_bytes() + total`). The receiver's missing-index set and map nodes
+are a committed-state estimate rather than allocator-exact. An
 announced plan that has received nothing reserves only its vector; a `put` whose
 validated chunk would pass the bound is refused before it stores the chunk (and
 before any state changes), while an identical retransmission is free. A `finish`

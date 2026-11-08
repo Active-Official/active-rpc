@@ -57,7 +57,9 @@ hash matches the bytes *and* the plan's announced hash.
   principal and a delegated capability shares its slot. `Provider::on_drop`
   releases both the in-progress transfer and an untaken completed body; an
   incomplete transfer expires after 60 s of inactivity and an untaken body after
-  10 minutes, both against the kernel clock, and the digest reply outlives the
+  10 minutes, both against the kernel clock except a completed body, whose
+  window starts at the end of the finish work (the stamp plus the real assembly
+  duration, R-10 round 17), and the digest reply outlives the
   bytes. `plan` refuses to start a new transfer for an object whose completed
   body has not been taken, and `finish` is idempotent per object until a new
   plan is accepted for it, so a lost answer can be retried even after
@@ -111,20 +113,22 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   (R-10 rounds 18 and 15). It covers the assembly, not an image
   **classification**: the redaction path holds two more body-sized projections,
   and the provider answers `content_error: memory` instead of classifying when
-  its bound cannot cover three body lengths. Both plan copies retain the
+  its bound cannot cover three body lengths plus the plan vector (use
+  `BulkPlan::required_classification_bytes()` for the bound). Both plan copies
+  retain the
   transfer context (charged twice); the receiver's missing-index set and the
   per-chunk map nodes are not charged, so the figure is a committed-state
   estimate (R-10 round 16, M4/L6).
 - Every `finish` that runs out of wall is counted, whatever its grant: an
   attempt that presents `assembly_wall_ms()` and still expires is evidence that
   the estimate is wrong for this host, not a payment to forget (R-10 round 16).
-  After three such failures the provider **freezes** the transfer and refuses it
-  with `rpc/bulk` before any work. A grant at the body's estimate is *funded*:
-  it clears the count and runs, capped at two funded assemblies
-  (`FUNDED_ASSEMBLY_LIMIT`). Once that allowance is spent the freeze is
-  monotone — no grant runs, including a smaller one, and one transfer runs at
-  most `WALL_REFUSAL_LIMIT + FUNDED_ASSEMBLY_LIMIT` assemblies — so a funded
-  reset cannot renew the cheap attempts (R-10 round 16, M1). A same-root `plan`
+  Three **sub-estimate** failures freeze the transfer for sub-estimate grants;
+  a grant at the body's estimate is *funded*: it clears the count and runs, up
+  to two funded assemblies (`FUNDED_ASSEMBLY_LIMIT`). Once that allowance is
+  spent the freeze is monotone — no grant runs, including a smaller one, and one
+  transfer runs at most `WALL_REFUSAL_LIMIT + FUNDED_ASSEMBLY_LIMIT` assemblies
+  — so a funded reset cannot renew the cheap attempts (R-10 round 16, M1). A
+  same-root `plan`
   frame does not clear the freeze. Both rules
   are why the sizing to mint is `required_wall_ms()`: the body's own cost with a
   per-chunk term and slack, never below the default grant. The stored chunks are
@@ -142,13 +146,16 @@ carries the hash it was built with, so a retransmission does not re-hash it.
   recomputed once on a later `finish` that still has wall left, and the record
   then says it did, so a replay loop cannot buy repeated redactions (round 16).
 - The finish reply carries `canonical`, and `content_error` when an image's
-  address could not be computed (`wall` or `parser`); a degraded reply is
+  address could not be computed (`wall`, `parser` or `memory` when the provider
+  bound cannot cover the classification); a degraded reply is
   recorded as degraded instead of looking like a body without an address.
 - `finish` is the one bulk path that reads the wall clock: the grant is a
   *duration* (`max_wall_ms`), which `Call::now_ms` cannot express, so the
   deadline is anchored at `Instant::now()` and checked between chunks, inside
   the verification pass (chunk by chunk, via `BulkPlan::verify_within`) and
-  before the redaction. Every other lifetime is measured from the kernel clock.
+  before the redaction. Every other lifetime is measured from the kernel clock;
+  the completed window is the exception above because the work that produces it
+  is real-time (R-10 round 17).
   The redaction pass itself is not interruptible, which is why the grant is
   sized for it and the reply degrades to `content_error: "wall"` when the grant
   is spent before it starts.
