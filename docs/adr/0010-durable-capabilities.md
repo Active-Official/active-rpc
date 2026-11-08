@@ -13,9 +13,9 @@ Durable minting is refused unless the agent explicitly enables it with
 `Agent::set_durable_capabilities(true)`. The policy is local authority metadata;
 it is not a wire descriptor field and never travels in `CapDescriptor`.
 
-Attenuation never promotes persistence. A durable child of an ephemeral parent
-is safely downgraded to ephemeral; a durable parent may produce durable
-children. The kernel does not write raw capability ids to disk. A durable store
+Attenuation never promotes persistence: a durable child of an ephemeral parent
+is refused with `rpc/attenuation-escalation`, while a durable parent may produce
+durable children. The kernel does not write raw capability ids to disk. A durable store
 must be supplied by the deployment, must protect the bearer token like a private
 key, and must re-import through the normal registry/attenuation checks.
 
@@ -159,17 +159,26 @@ list with `Agent::tombstone_record` at startup and can read the set back with
 `record_is_tombstoned` and `record_tombstone_count`. Only a durable record is
 tombstoned (an ephemeral one can never be restored) and the set has a ceiling: a
 new durable mint is refused rather than evicting a tombstone, because eviction
-is fail-open. A record whose deadline
-has passed is refused, and so is one whose clock mode differs from the restoring
-kernel's (ADR-0015).
+is fail-open. The bound is `MAX_TOMBSTONES` **plus** the live durable
+capabilities a revocation may add: `revoke` cannot refuse, so it does not
+consult the gate, and a kernel at the tombstone ceiling can still exceed the set
+by revoking. A deployment replaying a kill list must treat a
+`rpc/budget-exceeded` from `tombstone_record` as fatal for the replay and refuse
+to restore anything it could not replay (R-12 round 15, L3). A record whose
+deadline has passed is refused, and so is one whose clock mode differs from the
+restoring kernel's (ADR-0015).
 
-A rotation (`reintroduce_to`) retires the records exported from the rotated
-subtree by tombstoning their ids in memory; the ids are discoverable with
-`record_is_tombstoned`. Because an `Event` cannot carry a record id, a
-deployment that keeps a persistent kill list must re-check its stored records
-against `record_is_tombstoned` after a successful rotation (or replay the
-rotation's ids from its own copy) before it restores anything: otherwise a
-restart forgets a kill that the rotation only recorded in memory.
+A rotation (`reintroduce_to`) retires the **unrestored** records exported from
+the rotated subtree by tombstoning their ids in memory; the ids are discoverable
+with `record_is_tombstoned`. A record already restored has no pin, carries the
+same id and survives the rotation as a minted capability; it can only be
+retired through the deployment's restore ledger or `RecordStore`
+(ADR-0017), which the rotation does not rewrite. Because an `Event` cannot carry
+a record id, a deployment that keeps a persistent kill list must re-check its
+stored records against `record_is_tombstoned` after a successful rotation (or
+replay the rotation's ids from its own copy) before it restores anything:
+otherwise a restart forgets a kill that the rotation only recorded in memory
+(R-12 round 15, L2).
 
 Restores have the same cross-process limit. In one process a tombstone reaches a
 record exported through a restored copy by walking the retained record-id index

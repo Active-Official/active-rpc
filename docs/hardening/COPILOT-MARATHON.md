@@ -25,7 +25,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
-| R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | rounds 1-14: r14 **CLEAN**; r12-r13 findings verified and the four r14 lows fixed; r15 must also be clean to close | 56 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018) | this commit |
+| R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | `CLEAN` (rounds 1-15; rounds 14 and 15 clean) | 60 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018/0010) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-15: r15 found the in-place edit behind the append cache (high), a partial-magic wedge and a repair refusal, open for r16 | 77 fixed / 0 rejected / 2 residuals (7 open) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
@@ -49,6 +49,29 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-12 replay - 2026-11-07 (round 15) - CLEAN, section closed
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `10e6b72`. Every round-14 low verified with its own mutation control (the
+decrement no-op fails the tracker test; skipping `release_pin` in
+`mark_tombstoned` fails the release assertion). No critical, high or medium
+defect in the codec, charge accounting, trace comparison, recorder poisoning,
+handle lifetimes, `pin_roots` arithmetic or the revoke/export-pin walk: 200 000
+random-byte decodes and 20 000 mutated packages produced no panic. Four lows,
+all test or documentation, closed here.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| L1 | low | the restore-time `release_pin` was correct but untested; deleting it passed every suite | **fixed**: `pin_roots_tracks_export_release_and_rotation` now restores the record after the handle drop, asserts `export_pin_count() == 0` and the root counts match, then drops the restored copy; the control (deleting the release) fails it |
+| L2 | low | ADR-0010 said a rotation retires "the records exported from the rotated subtree", but a record already restored has no pin and survives as a second-kernel credential | **fixed**: the ADR says **unrestored** records, and names the restore ledger/`RecordStore` as the only way to retire a restored one |
+| L3 | low | ADR-0010 said the tombstone set "has a ceiling"; `revoke` cannot refuse and bypasses the gate, so the real bound is `MAX_TOMBSTONES + live durable` | **fixed**: the ADR states the bound and requires a kill-list replay to treat `rpc/budget-exceeded` as fatal; `durable_ceiling_reached` says the same |
+| L4 | low | ADR-0010 said a durable child of an ephemeral parent is "downgraded"; the code refuses with `rpc/attenuation-escalation` | **fixed**: the ADR says refused |
+
+R-12 is **CLEAN** on two consecutive rounds (r14 and r15). The remaining
+residuals are count-bounded memory (`record_pins`/`pin_roots` lineage ids, a
+trusted-`Agent` exposure) and the replay/package peak RSS factor; both are
+disclosed in ADR-0018 and ADR-0010.
 
 ### R-12 replay - 2026-11-07 (round 14)
 

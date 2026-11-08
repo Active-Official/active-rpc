@@ -7100,6 +7100,11 @@ fn is_expired(kernel: &Kernel, record: &CapRecord) -> bool {
 /// rather than special-cased: subtracting it would need a reverse index from a
 /// tombstone to a still-live capability, which is the scan the counter exists
 /// to avoid (R-12 round 12, F4).
+///
+/// `revoke` cannot refuse, so it bypasses this gate and can take the set past
+/// it by the durable capabilities it kills. A deployment replaying a kill list
+/// must treat a `tombstone_record` refusal as fatal and restore nothing it
+/// could not replay (ADR-0010; R-12 round 15, L3).
 fn durable_ceiling_reached(kernel: &Kernel) -> bool {
     kernel
         .revoked_records
@@ -8134,6 +8139,16 @@ mod pin_scan_tests {
         let record = agent.export_capability(&child).expect("export");
         assert_pin_roots_match(&agent);
         drop(child);
+        assert_pin_roots_match(&agent);
+        // A restore releases the pin too: the restored copy now holds the
+        // object, so the pin and its root counts must be gone
+        // (R-12 round 15, L1).
+        let restored = agent
+            .restore_capability(&record, &old)
+            .expect("restore the record");
+        assert_eq!(agent.export_pin_count(), 0, "the restore releases the pin");
+        assert_pin_roots_match(&agent);
+        drop(restored);
         assert_pin_roots_match(&agent);
         agent
             .tombstone_record(record.record_id)
