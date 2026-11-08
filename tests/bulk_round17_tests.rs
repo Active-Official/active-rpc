@@ -152,7 +152,7 @@ fn the_completion_bound_is_below_the_classification_bound() {
     );
     assert_eq!(
         plan.required_classification_bytes() - plan.required_live_bytes(),
-        plan.total()
+        (active_rpc::bulk::CLASSIFY_BODY_COPIES - 2) * plan.total()
     );
     assert!(plan.required_live_bytes() >= 2 * plan.total() + CHUNK_OVERHEAD);
 }

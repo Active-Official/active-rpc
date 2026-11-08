@@ -150,7 +150,12 @@ impl ModuleProvider {
         let redactor = security::redactor_for(&module);
         let held_secret = !redactor.is_empty() || security::module_holds_secret(&module);
         let walk_weight = walk_weight(&module);
-        let secret_addresses = security::tainted_blob_addresses(&module);
+        let mut secret_addresses = security::tainted_blob_addresses(&module);
+        if held_secret {
+            // A provenance parent or Hash entry is the pre-redaction image's
+            // address: sticky, like a tainted blob's hash (R-16 round 17, F1).
+            secret_addresses.extend(security::provenance_addresses(&module));
+        }
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
@@ -179,7 +184,10 @@ impl ModuleProvider {
         let redactor = security::redactor_for(&module);
         let held_secret = !redactor.is_empty() || security::module_holds_secret(&module);
         let walk_weight = walk_weight(&module);
-        let secret_addresses = security::tainted_blob_addresses(&module);
+        let mut secret_addresses = security::tainted_blob_addresses(&module);
+        if held_secret {
+            secret_addresses.extend(security::provenance_addresses(&module));
+        }
         Ok(self.install_slot(ModuleSlot {
             module,
             hash: Some(hash),
@@ -324,7 +332,12 @@ impl ModuleProvider {
                         // (R-16 round 15, F1).
                         let mut addresses: Vec<[u8; 32]> =
                             slot.secret_addresses.iter().copied().collect();
-                        addresses.extend(slot.hash);
+                        // A public module's own hash is not an oracle; adding
+                        // it unconditionally made the fast path dead for every
+                        // installed module (R-16 round 17, F13).
+                        if slot.held_secret {
+                            addresses.extend(slot.hash);
+                        }
                         evaluate_for_caller(&slot.module, &sub, budget, &slot.redactor, &addresses)
                     }
                     // No path means the module root: evaluate in place rather
@@ -332,7 +345,9 @@ impl ModuleProvider {
                     None => {
                         let mut addresses: Vec<[u8; 32]> =
                             slot.secret_addresses.iter().copied().collect();
-                        addresses.extend(slot.hash);
+                        if slot.held_secret {
+                            addresses.extend(slot.hash);
+                        }
                         evaluate_for_caller(
                             &slot.module,
                             &slot.module,
@@ -652,6 +667,13 @@ impl ModuleProvider {
                 slot.held_secret |= security::module_holds_secret(&decoded);
                 slot.secret_addresses
                     .extend(security::tainted_blob_addresses(&decoded));
+                if slot.held_secret {
+                    // The new provenance names the pre-patch image and any
+                    // carried Hash entries: both are sticky oracles
+                    // (R-16 round 17, F1).
+                    slot.secret_addresses
+                        .extend(security::provenance_addresses(&decoded));
+                }
                 slot.module = decoded;
                 slot.hash = Some(hash);
                 slot.walk_weight = weight;
@@ -1004,12 +1026,28 @@ impl ModuleProvider {
                             if holds_secret {
                                 addresses.extend(slot.hash);
                             }
+                            // One hex set and one raw-window predicate for the
+                            // whole answer: rebuilding both per key/value made
+                            // a large provenance quadratic (R-16 round 17, F7).
+                            let hex = security::hex_addresses(&addresses);
+                            let carries =
+                                |text: &str| security::text_carries_raw_address(text, &addresses);
+                            let names = |text: &str| {
+                                carries(text) || security::text_names_an_address(text, &hex)
+                            };
+                            let scrub = |text: &str| {
+                                if carries(text) {
+                                    security::SECRET_MARKER.to_string()
+                                } else {
+                                    security::scrub_addresses(text, &hex)
+                                }
+                            };
                             let mut scrubbed = std::collections::BTreeMap::new();
                             for (key, value) in map {
-                                if security::text_names_any_address(&key, &addresses) {
+                                if names(&key) {
                                     continue;
                                 }
-                                let key = security::scrub_any_addresses(&key, &addresses);
+                                let key = scrub(&key);
                                 let value = match value {
                                     // In a secret-bearing module any
                                     // `blake3:` text is dropped; in a public
@@ -1025,9 +1063,7 @@ impl ModuleProvider {
                                     {
                                         continue
                                     }
-                                    Value::Text(text) => Value::Text(
-                                        security::scrub_any_addresses(&text, &addresses),
-                                    ),
+                                    Value::Text(text) => Value::Text(scrub(&text)),
                                     other => other,
                                 };
                                 scrubbed.insert(key, value);
@@ -1784,7 +1820,12 @@ fn strip_address_labels(answer: &mut Vec<String>, slot: &ModuleSlot) {
     }
     let mut addresses: Vec<[u8; 32]> = slot.secret_addresses.iter().copied().collect();
     addresses.extend(slot.hash);
-    answer.retain(|label| !security::text_names_any_address(label, &addresses));
+    // One set for every label in the answer (R-16 round 17, F7).
+    let hex = security::hex_addresses(&addresses);
+    answer.retain(|label| {
+        !security::text_carries_raw_address(label, &addresses)
+            && !security::text_names_an_address(label, &hex)
+    });
 }
 
 /// Answer a metadata query under a redacting capability.

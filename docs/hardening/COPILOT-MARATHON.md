@@ -23,13 +23,13 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-07 | domain ops | `src/domain.rs` | `CLEAN` (rounds 1-47; round 47 re-audited read-only: six HOLD, verdict CLEAN, four lows fixed) | 281 fixed / 1 noted / 0 open (residuals documented) | this commit |
 | R-08 | tools / MCP | `src/tool.rs` | `CLEAN` (rounds 1-60; rounds 59 and 60 clean; round 60's four lows fixed except one recorded) | 386 fixed / 5 rejected / 1 noted (5 residuals documented) | this commit |
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
-| R-10 | bulk | `src/bulk.rs` | rounds 1-17: r17 verified the round-16 mediums, found one medium (the `wall` replay bypassed the bound) and sixteen lows, all fixed; r18 and r19 must be clean | 147 fixed / 0 rejected / 0 open (limits documented) | this commit |
+| R-10 | bulk | `src/bulk.rs` | rounds 1-18: r18 verified r17 and found one high (classification peak 12x, not 3x) and one medium (terminal memory reply), plus five lows, all fixed; r19 and r20 must be clean | 165 fixed / 0 rejected / 0 open (limits documented) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
 | R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | `CLEAN` (rounds 1-15; rounds 14 and 15 clean) | 60 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018/0010) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-16: r16 fixed the r15 mediums (a partial magic lock wedged the log; a zeroed tail could not be repaired) and the r15 lows; r17 and r18 must be clean | 85 fixed / 0 rejected / 2 residuals (documented) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
-| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-16: r16 fixed the r15 opens (binary payloads, the caller's extra on projections, separator and compatibility folds, the quadratic scrub, provenance precision, key collisions, the exhaustive carrier list); r17 and r18 must be clean | 80 fixed / 0 rejected / 5 noted | this commit |
+| R-16 | security helpers | `src/security.rs`, `src/persistence.rs`, `src/domain.rs` | rounds 1-17: r17 found two highs (provenance parents not sticky; a quadratic byte assertion), seven mediums and eleven lows, all fixed or documented; r18 and r19 must be clean | 100 fixed / 0 rejected / 5 noted | this commit |
 | R-17 | intro / topics | `src/intro.rs`, `src/channel.rs`, `src/kernel.rs`, `src/value.rs` | rounds 1-10: r10 found the residency charge (medium) and four lows, all fixed; r11 and r12 must be clean | 68 fixed / 0 rejected / 0 open (9 residuals) | this commit |
 | R-18 | CLI | `cli/active-rpc-cli/**` | rounds 1-2: 19 + 19 findings fixed | 38 fixed / 0 rejected / 0 open | `af12e3a` |
 | R-19 | control-plane | `control-plane/**` | rounds 1-5: r5 found two round-4 fixes missing and three partial (F1 fixed now); F2/F6/F8/F15 and the r5 test gaps are open for r6 | 77 fixed / 0 rejected / 7 open (3 documented) | this commit |
@@ -49,6 +49,49 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-10 bulk - 2026-11-07 (round 18 audit pass)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `1add7c6`. One high, one medium and five lows; all closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | high | the classification gate reserved 3 body lengths, but a tracking-allocator probe measured a 7x peak for a public image and 12x for a secret-bearing one: a host sized with the accessor held ~4x its advertised bound and could be OOM-killed | **fixed**: `CLASSIFY_BODY_COPIES = 12` (the measured worst case) drives both the original and the replay gate, and `required_classification_bytes = required_live_bytes + (12-2) x total`. The literal is pinned and `the_classification_bound_is_exact` checks both sides |
+| 2 | medium | a `memory`-degraded reply was terminal: the replay accepted only `wall`, so a later replay with room never computed the address | **fixed**: the replay accepts `wall` or `memory`; `recomputed` still caps the pass. `a_memory_reply_recovers_when_the_provider_has_room` (a second object is taken to free the bound) |
+| 3 | low | the `is_complete` conjunction had no control | **fixed**: `is_complete_requires_both_the_missing_set_and_the_map` builds the inconsistent state and fails without the conjunction |
+| 4 | low | the per-chunk multiplier text said 64x/48 bytes; the formula charges 66 bytes per stored byte | corrected to 66x |
+| 5 | low | the freeze message omitted the five-assembly cause | it names three below-estimate and/or two funded |
+| 6 | low | the classification accessor claimed to cover the uncharged missing set | the claim is gone |
+| 7 | low | `plan` swept every object before a same-root retry, and `put`/`finish` scanned every object even with no bound set | the sweep moved after the same-root return; the scans are skipped when `max_live_bytes == 0` |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-10 needs r19 and r20 clean.
+
+### R-16 security helpers - 2026-11-07 (round 17 audit pass)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `1add7c6`. Two highs, seven mediums and eleven lows; all closed or documented.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | high | a secret-bearing image's provenance parent (and `Hash` entries) were not sticky, so a text, key, binding or annotation quoting them left through `evaluate`, `annotations`, `provenance` and `subgraph` | **fixed**: `provenance_addresses` seeds the sticky set at both install paths and on every patch while the slot holds a secret, and `redact_module` adds them to its extra set. `a_provenance_parent_does_not_leave_any_projection`; the control removes both seeds and fails |
+| F2 | high | `assert_no_address_bytes` rescanned the whole image per address (O(A x N), minutes on a crafted image, before any wall check) | **fixed**: it builds the hex set once and uses the one-pass `bytes_carry_an_address` (raw + lowercased hex + compat). Structural; the per-address loop is gone |
+| F3 | medium | fullwidth colons/hyphens/underscores did not fold, so a fullwidth-separated copy survived | **fixed**: those compatibility punctuation forms fold to `- : _`; `a_fullwidth_separator_split_copy_is_scrubbed`; control fails |
+| F4 | medium | U+2028/U+2029 are in the invisible set but excluded as whitespace, so a copy split there survived | **fixed**: only ASCII whitespace is excluded; `a_line_separator_split_copy_is_scrubbed`; control fails |
+| F5 | medium | a non-UTF-8 payload carrying a fullwidth address skipped the compat scan | **fixed**: the compat scan uses `from_utf8_lossy`; `a_non_utf8_fullwidth_payload_is_dropped`; control fails |
+| F7 | medium | provenance and label scrubbing rebuilt the hex set per entry (quadratic on a large provenance) | **fixed**: one hex set and one raw predicate per answer in `provenance` and `strip_address_labels` |
+| F8 | medium | every `redact_derived_with` scanned a public module's payloads before the empty-set return | **fixed**: an address-free module returns before the blob loop |
+| F9 | medium | only hex was matched in text; a detached tainted blob with printable-ASCII bytes in a text leaked on Value paths | **fixed**: `text_carries_raw_address` checks raw 32-byte windows and a raw hit becomes the marker; `a_raw_address_copy_in_a_text_is_hidden`; control fails |
+| F10 | low | a tainted blob whose hash is the all-zero sentinel made every projection fail | **fixed**: the assertion skips the sentinel; `a_zero_hash_tainted_blob_redacts`; control fails |
+| F11 | low | two enum members that scrub to one were deduplicated by the encoder | **fixed**: enum member lists (constraint and schema type) refuse a collision; `two_enum_members_that_scrub_to_one_are_refused` |
+| F12 | low | docs said a public mention survives but a secret module drops every `blake3:` text | both rules are stated in SECURITY.md and the spec |
+| F13 | low | `evaluate` always added the slot hash, so the public fast path was dead | the hash is added only for a secret-bearing slot |
+| F14 | low | `redact_module` does not re-check field names | documented: the domain install gate is the name authority |
+| F15 | low | `redact_module` maps a mid-redaction failure to a payload code | documented; the domain provider maps it to `provider/redaction` |
+| F16 | low | `redact_derived_with` does not drop provenance | documented as the caller's obligation (the domain drops it) |
+| F6 | low | the fold comment overclaimed NFKC coverage | narrowed to the folded set |
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-16 needs r18 and r19 clean.
 
 ### R-10 bulk - 2026-11-07 (round 17 audit pass)
 

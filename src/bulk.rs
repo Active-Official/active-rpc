@@ -106,6 +106,15 @@ pub const FINISH_LEN: u64 = 4 + 1 + 8 + 32;
 /// caller that pages a [`MAX_CHUNKS`]-chunk plan has one allowance per chunk.
 pub const REPLY_ALLOWANCE: u64 = 192;
 
+/// Body copies the image classifier may retain at its peak.
+///
+/// Measured with a tracking allocator over 1/4/8 MiB images: 7.00x for a
+/// non-secret image and 12.00x for a secret-bearing one (the worst case a peer
+/// can choose), linear in the body (R-10 round 18, F1). The provider gate and
+/// [`BulkPlan::required_classification_bytes`] use this one number, so a host
+/// that sizes with the accessor cannot be surprised by a larger peak.
+pub const CLASSIFY_BODY_COPIES: u64 = 12;
+
 /// Throughput the wall-sizing formula assumes for one `finish` pass.
 ///
 /// Measured at about 700 MiB/s on the reference host (256 MiB finishes in 372 ms,
@@ -476,23 +485,26 @@ impl BulkPlan {
     /// (R-10 round 15, F5).
     ///
     /// It covers the assembly, not an image **classification**: the redaction
-    /// path retains two more body-sized projections, and the provider degrades
-    /// such a reply (`content_error: memory`) when its bound cannot cover three
-    /// body lengths (R-10 round 16, M4).
+    /// path retains [`CLASSIFY_BODY_COPIES`] body-sized buffers at its peak
+    /// (7x measured without secrets, 12x with), and the provider degrades such
+    /// a reply (`content_error: memory`) when its bound cannot cover that
+    /// (R-10 rounds 16-18).
     pub fn required_live_bytes(&self) -> u64 {
         reserved_bytes(self, self.total)
     }
 
     /// Provider-wide bound that also covers an image classification.
     ///
-    /// An image `finish` decodes the body and builds two more body-sized
-    /// projections while the image itself is resident, so a bound sized with
-    /// [`BulkPlan::required_live_bytes`] answers `content_error: memory`. This
-    /// value (`required_live_bytes + total`) covers the body, its assembly and
-    /// the two classification projections, plus the plan vector and the
-    /// receiver's missing set (R-10 round 17, F4).
+    /// The classification peak is [`CLASSIFY_BODY_COPIES`] body lengths while
+    /// the image is resident; the completion reservation already counts two of
+    /// them, so this adds the rest to [`BulkPlan::required_live_bytes`]
+    /// (R-10 round 17, F4; round 18, F1).
     pub fn required_classification_bytes(&self) -> u64 {
-        self.required_live_bytes().saturating_add(self.total)
+        self.required_live_bytes().saturating_add(
+            CLASSIFY_BODY_COPIES
+                .saturating_sub(2)
+                .saturating_mul(self.total),
+        )
     }
 
     /// Number of chunks.
@@ -1865,13 +1877,12 @@ impl BulkProvider {
         if let Some(expected) = self.expected_root {
             plan.require_root(expected)?;
         }
-        // A new transfer is the moment to sweep every object: an abandoned
-        // transfer on another object would otherwise wait for its own call.
-        self.expire_idle(call.now_ms);
         // The state refusals come before the byte ceiling: the same plan must
         // not answer "not taken" or "another transfer" as a budget fault just
-        // because other objects hold bytes (round 10, L-1).
-        self.require_taken(object)?;
+        // because other objects hold bytes (round 10, L-1). This object's own
+        // stale state is released first (O(1)); the provider-wide sweep below
+        // only runs when a new transfer is actually created.
+        self.expire(object, call.now_ms);
         if let Some(active) = self.transfers.get_mut(&object) {
             // A second plan mid-transfer is either a retry of the same transfer
             // or a substitution, which is refused. A retry must not reset the
@@ -1887,6 +1898,15 @@ impl BulkProvider {
             active.last_ms = call.now_ms;
             return Ok(plan_reply(&active.plan, active.receiver.missing_count()));
         }
+        // A new transfer is the moment to sweep every object: an abandoned
+        // transfer on another object would otherwise wait for its own call.
+        // A same-root retry returned above, so a cheap retry does not pay for
+        // a provider-wide scan (R-10 round 18, F7).
+        self.expire_idle(call.now_ms);
+        // Expiry runs before the "not taken" refusal, or a body past its window
+        // would block the object for ever (R-10 round 4; the sweep moved here
+        // in round 18 and must stay above this check).
+        self.require_taken(object)?;
         if self.max_live_bytes != 0 {
             let held = self.live_bytes();
             // A new transfer has stored nothing yet, so it reserves its plan
@@ -1964,8 +1984,8 @@ impl BulkProvider {
         // at the documented minimal bound (R-10 round 15, F2 and F3). The
         // receiver's own meter still pays for the decode and hash before
         // validation, so a refused frame is not free.
-        let held = self.live_bytes();
         let limit = self.max_live_bytes;
+        let held = if limit == 0 { 0 } else { self.live_bytes() };
         let active = self
             .transfers
             .get_mut(&object)
@@ -2069,8 +2089,8 @@ impl BulkProvider {
         // not be receipted as a refusal (round 3, F3). The digest summary
         // outlives the bytes, so the answer survives `take_body` and the
         // completed window (round 4, L-4, L-5).
-        let live = self.live_bytes();
         let limit = self.max_live_bytes;
+        let live = if limit == 0 { 0 } else { self.live_bytes() };
         if let Some(done) = self.completed.get_mut(&object) {
             BulkFinish::decode_for(&call.payload, done.total, done.root)?;
             // A reply degraded by a spent grant is not final while the body is
@@ -2086,15 +2106,17 @@ impl BulkProvider {
                 .max(1);
             if !done.recomputed
                 && done.body.content_hash().is_none()
-                && done.body.content_error() == Some("wall")
+                && matches!(done.body.content_error(), Some("wall") | Some("memory"))
                 && call.budget.max_wall_ms >= needed_ms
             {
                 // The replay allocates the same body-sized projections as the
                 // first classification, and the completed body is resident: a
                 // bound that cannot cover them degrades to `memory` without
-                // spending the one-shot recompute, so a later grant with room
-                // can still compute it (R-10 round 17, M1).
-                let extra = (done.body.body().len() as u64).saturating_mul(2);
+                // spending the one-shot recompute, so a later replay whose
+                // provider has room (another object released) can still
+                // compute it (R-10 rounds 17-18).
+                let extra = (done.body.body().len() as u64)
+                    .saturating_mul(CLASSIFY_BODY_COPIES.saturating_sub(1));
                 if limit != 0 && live.saturating_add(extra) > limit {
                     done.body.content_error = Some("memory");
                     if let Some(last) = self.last_finished.get_mut(&object) {
@@ -2202,7 +2224,7 @@ impl BulkProvider {
                 // assemblies, and the same frame is refused identically however it
                 // is priced. `abort` is the way out.
                 Throttle::Frozen => return Err(Error::Bulk(
-                    "finish is frozen (three below-estimate or two funded assemblies used): abort",
+                    "finish is frozen: five assemblies used (three below-estimate and/or two funded): abort",
                 )),
                 Throttle::Run { funded } => funded,
             };
@@ -2265,11 +2287,14 @@ impl BulkProvider {
         // fallible in the Infinity API, so a host bound that cannot cover them
         // must degrade the reply rather than allocate past its own bound
         // (R-10 round 16, M4). The assembled body is already resident and the
-        // redaction path retains two more body-sized projections, so the check
-        // is three body lengths against the provider bound (the transfer's own
-        // reservation was released by a successful assembly).
+        // redaction path retains up to `CLASSIFY_BODY_COPIES` body-sized
+        // buffers at its peak (measured), so the check uses that one number
+        // (R-10 round 18, F1).
         let classify_room = self.max_live_bytes == 0
-            || self.live_bytes().saturating_add(length.saturating_mul(3)) <= self.max_live_bytes;
+            || self
+                .live_bytes()
+                .saturating_add(CLASSIFY_BODY_COPIES.saturating_mul(length))
+                <= self.max_live_bytes;
         let (content, content_error) = if spent {
             (None, Some("wall"))
         } else if !classify_room {
@@ -2420,8 +2445,8 @@ impl BulkTransfer {
 ///
 /// The plan is retained for the whole transfer (32 bytes per chunk plus the
 /// header), so a bound that counts only the body under-reports a maximal
-/// one-byte-chunk plan by up to 64x (48 charged bytes against 1 stored byte;
-/// round 10, M-1; R-10 round 17, F9).
+/// one-byte-chunk plan by up to 66x (66 charged bytes per stored byte:
+/// 2 x body + two 32-byte hash copies; round 10, M-1; R-10 rounds 17-18).
 fn reserved_bytes(plan: &BulkPlan, received: u64) -> u64 {
     // The footprint is what is stored plus the assembly buffer a `finish`
     // allocates, and the assembly can only ever hold a complete body: reserving
@@ -2513,8 +2538,8 @@ mod receiver_tests {
 #[cfg(test)]
 mod throttle_tests {
     use super::{
-        throttle, BulkBody, BulkFinish, BulkPlan, BulkProvider, CompletedTransfer, Throttle,
-        FUNDED_ASSEMBLY_LIMIT, WALL_REFUSAL_LIMIT,
+        throttle, BulkBody, BulkFinish, BulkPlan, BulkProvider, BulkReceiver, CompletedTransfer,
+        Throttle, FUNDED_ASSEMBLY_LIMIT, WALL_REFUSAL_LIMIT,
     };
     use crate::kernel::Provider;
     use crate::value::{Call, Response, Value};
@@ -2634,6 +2659,78 @@ mod throttle_tests {
         assert!(
             provider.transfers.contains_key(&0),
             "a freeze keeps the body the caller paid for"
+        );
+    }
+
+    /// The two views must agree: an empty missing set over an empty map is
+    /// not a complete transfer (R-10 round 18, F3).
+    #[test]
+    fn is_complete_requires_both_the_missing_set_and_the_map() {
+        let plan = BulkPlan::new(&[0u8; 16], 4).expect("plan");
+        let mut receiver = BulkReceiver::new(plan).expect("receiver");
+        receiver.missing.clear();
+        assert!(
+            !receiver.is_complete(),
+            "an empty missing set over an empty map is not complete"
+        );
+    }
+
+    /// A `memory`-degraded reply is not terminal: once the provider has room
+    /// again (another object released), a replay recomputes the address
+    /// (R-10 round 18, F2).
+    #[test]
+    fn a_memory_reply_recovers_when_the_provider_has_room() {
+        use crate::bulk::{BulkTransfer, CLASSIFY_BODY_COPIES, COMPLETED_IDLE_MS};
+        let y = vec![0u8; 200_000];
+        let x = vec![0u8; 10_000];
+        let transfer = BulkTransfer::new(y.clone(), 1 << 20).expect("transfer");
+        let plan = transfer.plan();
+        let needed_ms = plan
+            .total()
+            .div_ceil(crate::bulk::FINISH_BYTES_PER_MS)
+            .max(1);
+        let bound = CLASSIFY_BODY_COPIES
+            .saturating_mul(plan.total())
+            .saturating_add(x.len() as u64)
+            .saturating_sub(1);
+        let mut provider = BulkProvider::new().with_max_live_bytes(bound);
+        for (object, body) in [(0u64, y.clone()), (1u64, x.clone())] {
+            provider.completed.insert(
+                object,
+                CompletedTransfer {
+                    body: BulkBody {
+                        body_hash: *blake3::hash(&body).as_bytes(),
+                        body,
+                        content: None,
+                        content_error: Some("wall"),
+                    },
+                    root: plan.root(),
+                    total: if object == 0 {
+                        plan.total()
+                    } else {
+                        x.len() as u64
+                    },
+                    at_ms: COMPLETED_IDLE_MS,
+                    recomputed: false,
+                },
+            );
+        }
+        let mut request = Call::new("finish", Vec::new()).with_payload(transfer.finish_frame());
+        request.now_ms = COMPLETED_IDLE_MS;
+        request.budget.max_wall_ms = needed_ms;
+        provider.invoke(0, &request).expect("the replay answers");
+        assert!(
+            !provider.completed.get(&0).expect("record").recomputed,
+            "the first replay has no room"
+        );
+        // Another object releases its body: the provider now has room.
+        provider.take_body(1).expect("the other body is taken");
+        provider
+            .invoke(0, &request)
+            .expect("the second replay answers");
+        assert!(
+            provider.completed.get(&0).expect("record").recomputed,
+            "a replay with room recomputes after a memory degradation"
         );
     }
 

@@ -271,6 +271,12 @@ pub fn redact_value(value: Value) -> Value {
 ///
 /// One implementation for [`redact_value`] and the domain provider: two would
 /// drift, and the one that drifted would be the leak.
+///
+/// Field, binding and unit *names* are not re-validated here: the domain
+/// provider is the name authority and refuses an unrepresentable name at
+/// install, and this helper's callers hand it a module the provider accepted
+/// (R-16 round 17, F14). A mid-redaction failure is reported as a payload error;
+/// the domain provider maps it to `provider/redaction` (F15).
 pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
     let module =
         active_infinity::decode(bytes).map_err(|error| Error::Payload(error.code().to_string()))?;
@@ -302,9 +308,13 @@ pub fn redact_module(bytes: &[u8]) -> Result<Vec<u8>> {
     // every secret-bearing reply (R-16 round 7, M-1; R-07 round 13, H2).
     let mut module = active_infinity::decode(&redacted)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
+    // The decoded provenance names its parent and Hash entries; both are
+    // sticky oracles even though the provenance is about to be dropped
+    // (R-16 round 17, F1).
+    let mut extra_vec: Vec<[u8; 32]> = own.into_iter().collect();
+    extra_vec.extend(provenance_addresses(&module));
     module.set_provenance(None);
-    let extra: &[[u8; 32]] = own.as_slice();
-    let addresses = sanitize_tainted_blobs(&mut module, extra)?;
+    let addresses = sanitize_tainted_blobs(&mut module, &extra_vec)?;
 
     let redacted = active_infinity::encode(&module)
         .map_err(|error| Error::Payload(error.code().to_string()))?;
@@ -324,45 +334,21 @@ fn assert_no_address_bytes(bytes: &[u8], addresses: &BTreeSet<[u8; 32]>) -> Resu
     if addresses.is_empty() {
         return Ok(());
     }
-    // The encoded image is binary, so a UTF-8 view is not available: the hex
-    // form is searched as bytes, in both cases (R-16 round 14, F1).
-    let mut text_carries = false;
-    for key in address_keys_from_raw(addresses) {
-        let first = key[0];
-        for (index, byte) in bytes.iter().enumerate() {
-            // Case-insensitive per byte: an all-lower/all-upper pair missed a
-            // mixed-case copy (R-16 round 15, F3).
-            if byte.eq_ignore_ascii_case(&first) && bytes.len() - index >= 64 {
-                let window = &bytes[index..index + 64];
-                if window.eq_ignore_ascii_case(key.as_slice()) {
-                    text_carries = true;
-                    break;
-                }
-            }
-        }
-        if text_carries {
-            break;
-        }
+    // One pass, not one scan per address: O(bytes) per form instead of
+    // O(addresses x bytes), which was minutes on a crafted image and ran
+    // before any wall check (R-16 round 17, F2). The all-zero hash is the
+    // redaction sentinel and cannot be a real credential address
+    // (R-16 round 17, F10).
+    let raw: BTreeSet<[u8; 32]> = addresses
+        .iter()
+        .copied()
+        .filter(|address| *address != [0u8; 32])
+        .collect();
+    if raw.is_empty() {
+        return Ok(());
     }
-    let mut raw_carries = false;
-    for address in addresses {
-        // A first-byte prefilter: one compare per byte on average, so a 64 MiB
-        // image is one linear pass rather than `len * |set|` 32-byte compares.
-        let first = address[0];
-        for (index, byte) in bytes.iter().enumerate() {
-            if *byte == first
-                && bytes.len() - index >= 32
-                && bytes[index..index + 32] == address[..]
-            {
-                raw_carries = true;
-                break;
-            }
-        }
-        if raw_carries {
-            break;
-        }
-    }
-    if text_carries || raw_carries {
+    let hex = address_keys_from_raw(&raw);
+    if bytes_carry_an_address(bytes, &hex, &raw) {
         return Err(Error::Provider {
             code: "provider/redaction".to_string(),
         });
@@ -416,6 +402,10 @@ pub fn redact_derived(
 ///
 /// The domain passes the pre-patch content address: a text that quotes it is a
 /// lineage oracle even though it names no blob (R-16 round 13, F3).
+///
+/// This function does not touch `Provenance`: a caller that returns the module
+/// must drop or scrub it first (the domain provider does on every secret-bearing
+/// reply) (R-16 round 17, F16).
 pub fn redact_derived_with(
     module: &mut active_infinity::InfinityModule,
     redactor: &active_infinity::interop::Redactor,
@@ -504,6 +494,26 @@ pub(crate) fn tainted_blob_addresses(
     addresses
 }
 
+/// The content addresses a module's provenance names.
+///
+/// A parent image and a `Hash` entry are offline equality oracles over the
+/// pre-redaction heap, exactly like a tainted blob's hash: a secret-bearing
+/// module must treat them as sticky secret addresses (R-16 round 17, F1).
+pub(crate) fn provenance_addresses(module: &active_infinity::InfinityModule) -> Vec<[u8; 32]> {
+    let mut out = Vec::new();
+    if let Some(provenance) = module.provenance() {
+        if let Some(parent) = provenance.parent {
+            out.push(parent);
+        }
+        for entry in &provenance.entries {
+            if let active_infinity::ProvValue::Hash(hash) = entry.value {
+                out.push(hash);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn is_tainted_blob(node: &active_infinity::Inode) -> bool {
     matches!(node, active_infinity::Inode::Blob { tainted: true, .. })
 }
@@ -536,7 +546,13 @@ pub(crate) fn sanitize_tainted_blobs(
     }
     // A second untainted blob with the same hash is the same address, and one
     // whose payload or media type carries it is the same oracle. Both are
-    // doomed too (R-16 round 14, F4).
+    // doomed too (R-16 round 14, F4). With no address to look for there is
+    // nothing this pass can find, and skipping it keeps a public module with a
+    // huge payload from being scanned on every projection
+    // (R-16 round 17, F8).
+    if addresses.is_empty() && raw.is_empty() {
+        return Ok(raw);
+    }
     for index in 0..module.node_count() {
         let id = active_infinity::NodeId(index as u32);
         let Some(active_infinity::Inode::Blob {
@@ -705,8 +721,14 @@ fn scrub_text_copies(
             }
             active_infinity::Inode::Constrained { constraint, .. } => match constraint {
                 active_infinity::Constraint::Enum(members) => {
+                    let mut seen = BTreeSet::new();
                     for member in members.iter_mut() {
                         *member = scrub_addresses(member, addresses);
+                        if !seen.insert(member.clone()) {
+                            // Two members that scrub to one change the
+                            // projection's meaning (R-16 round 17, F11).
+                            return Err(redaction_failure());
+                        }
                     }
                 }
                 active_infinity::Constraint::Pattern(text)
@@ -727,8 +749,12 @@ fn scrub_text_copies(
             },
             active_infinity::Inode::SchemaField(spec) => {
                 if let active_infinity::TypeSpec::Enum(members) = &mut spec.typ {
+                    let mut seen = BTreeSet::new();
                     for member in members.iter_mut() {
                         *member = scrub_addresses(member, addresses);
+                        if !seen.insert(member.clone()) {
+                            return Err(redaction_failure());
+                        }
                     }
                 }
                 if let Some(text) = spec.deprecated.as_mut() {
@@ -813,7 +839,7 @@ fn redaction_failure() -> Error {
 /// address keeps its sentence. A separated copy cannot be cut without
 /// reconstructing the separators, so the whole text becomes the marker
 /// (R-16 round 14, F5).
-fn scrub_addresses(text: &str, addresses: &BTreeSet<[u8; 64]>) -> String {
+pub(crate) fn scrub_addresses(text: &str, addresses: &BTreeSet<[u8; 64]>) -> String {
     if !text_names_an_address(text, addresses) {
         return text.to_string();
     }
@@ -879,8 +905,7 @@ fn bytes_carry_an_address(
             addresses.contains(&key)
         })
     };
-    let compat_hit = !hex_hit
-        && std::str::from_utf8(bytes).is_ok_and(|text| text_names_an_address(text, addresses));
+    let compat_hit = !hex_hit && text_names_an_address(&String::from_utf8_lossy(bytes), addresses);
     raw_hit || hex_hit || compat_hit
 }
 
@@ -930,10 +955,12 @@ pub(crate) fn text_names_an_address(text: &str, addresses: &BTreeSet<[u8; 64]>) 
 
 /// Fold a compatibility-form hex character to ASCII.
 ///
-/// Fullwidth digits and A-F/a-f, and the mathematical alphanumeric letters and
-/// digits, are NFKC-equal to ASCII hex: a consumer that normalizes identifiers
-/// recovers the address, so the scrub must see the same character
-/// (R-16 round 16, F5).
+/// Fullwidth digits and A-F/a-f, the mathematical alphanumeric letters and
+/// digits, and the compatibility punctuation NFKC folds to `-`, `:` or `_`.
+///
+/// Only these compatibility forms are folded; circled, superscript and
+/// parenthesized forms are not, and the security docs name the covered set
+/// (R-16 round 16, F5; round 17, F6).
 fn fold_compat_hex(character: char) -> char {
     let code = character as u32;
     let from = |start: u32, ascii: u8| char::from(ascii + (code - start) as u8);
@@ -941,6 +968,12 @@ fn fold_compat_hex(character: char) -> char {
         0xFF10..=0xFF19 => from(0xFF10, b'0'),
         0xFF21..=0xFF26 => from(0xFF21, b'A'),
         0xFF41..=0xFF46 => from(0xFF41, b'a'),
+        // Compatibility punctuation that NFKC folds to a separator: a copy
+        // split by a fullwidth colon, hyphen or underscore is a split copy
+        // (R-16 round 17, F3).
+        0xFF1A | 0xFE55 => ':',
+        0xFF0D | 0xFE63 => '-',
+        0xFF3F | 0xFE33 => '_',
         // The mathematical alphanumeric symbols: thirteen alphabets of 52
         // letters (A-Z then a-z), then five digit sets of ten.
         0x1D400..=0x1D6A3 => {
@@ -965,21 +998,24 @@ fn fold_compat_hex(character: char) -> char {
 fn is_address_separator(character: char) -> bool {
     // One source for the invisible set: the same predicate the metadata
     // sanitizer uses, so a character the renderer hides cannot be a separator
-    // for one pass and opaque for the other (R-16 round 16, F4).
+    // for one pass and opaque for the other (R-16 round 16, F4). Only ASCII
+    // whitespace is excluded: U+2028/U+2029 are in the invisible set and a
+    // consumer may join across them (R-16 round 17, F4).
     matches!(character, '-' | ':' | '_')
-        || (is_invisible_or_reordering(character) && !character.is_whitespace())
+        || (is_invisible_or_reordering(character) && !character.is_ascii_whitespace())
 }
 
-/// [text_names_an_address] for a raw address set.
-pub(crate) fn text_names_any_address(text: &str, addresses: &[[u8; 32]]) -> bool {
-    let hex: BTreeSet<[u8; 64]> = addresses.iter().map(hex_key).collect();
-    text_names_an_address(text, &hex)
+/// The hex keys of a raw address set, computed once by a caller that scans
+/// many texts (R-16 round 17, F7).
+pub(crate) fn hex_addresses(addresses: &[[u8; 32]]) -> BTreeSet<[u8; 64]> {
+    addresses.iter().map(hex_key).collect()
 }
 
-/// [scrub_addresses] for a raw address set.
-pub(crate) fn scrub_any_addresses(text: &str, addresses: &[[u8; 32]]) -> String {
-    let hex: BTreeSet<[u8; 64]> = addresses.iter().map(hex_key).collect();
-    scrub_addresses(text, &hex)
+/// Whether a text carries one of the raw 32-byte addresses.
+pub(crate) fn text_carries_raw_address(text: &str, addresses: &[[u8; 32]]) -> bool {
+    addresses
+        .iter()
+        .any(|address| text.as_bytes().windows(32).any(|window| window == address))
 }
 
 /// The free text an annotation carries, if it carries any.

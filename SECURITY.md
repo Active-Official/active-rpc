@@ -97,8 +97,10 @@ capability id at rest (it is a bearer token).
   the scan. A second blob with the same identity, a payload that embeds the
   address and an extension payload that copies it are dropped as well. The address set is sticky on the slot, so a
   patch that removes the blob cannot declassify a hash an annotation or the
-  provenance still quotes, and the provenance's own text fields are scrubbed
-  where they name a secret address (a public producer string survives).
+  provenance still quotes, and the provenance's own text fields are scrubbed.
+  A secret-bearing module drops every `blake3:` text value; a public module
+  keeps a producer string that merely mentions the prefix and drops a full hex
+  run (a redacting answer serves no content address).
   The encoded projection is then re-read and refused (`provider/redaction`) if
   any address survives in raw or hex form — including the caller's sticky and
   parent addresses on every projection path — and a scrubbed-key collision is
