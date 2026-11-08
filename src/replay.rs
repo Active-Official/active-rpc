@@ -55,6 +55,39 @@ pub const MAX_PACKAGE_BYTES: usize = 64 << 20;
 /// package that would expand past it.
 pub const MAX_DECODE_BYTES: usize = 128 << 20;
 
+/// Heap one method string costs beyond its bytes: the `String` header and the
+/// vector element (48 bytes on a 64-bit target), which the earlier charge
+/// missed by 16 bytes per method (R-12 round 8, F4).
+const METHOD_HEAP: usize = 48;
+
+/// Heap one trace event costs beyond its bytes: the `Trace` record and the
+/// `String` header.
+const TRACE_HEAP: usize = 48;
+
+/// The decoded heap one operation describes.
+fn op_decoded_bytes(op: &Op) -> usize {
+    let base = std::mem::size_of::<Op>();
+    match op {
+        Op::Mint { methods, .. } | Op::Attenuate { methods, .. } => {
+            base + methods
+                .iter()
+                .map(|method| method.len().saturating_add(METHOD_HEAP))
+                .sum::<usize>()
+        }
+        Op::Call { method, .. } => base
+            .saturating_add(method.len())
+            .saturating_add(METHOD_HEAP),
+        Op::SetLatency(_) | Op::Revoke { .. } => base,
+    }
+}
+
+/// The decoded heap one trace entry describes.
+fn trace_decoded_bytes(event: &str) -> usize {
+    std::mem::size_of::<Trace>()
+        .saturating_add(event.len())
+        .saturating_add(TRACE_HEAP)
+}
+
 /// Largest sum of declared argument sizes in one package, in bytes.
 ///
 /// Replay synthesizes an argument of the declared size for each call, so the
@@ -137,6 +170,32 @@ impl ReplayPackage {
     /// refused here instead of silently truncated into a package that re-frames
     /// its own op stream.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.encode_with_ceiling(MAX_DECODE_BYTES)
+    }
+
+    /// [Self::encode] with the decoded-heap ceiling the caller supplies.
+    ///
+    /// The decoder refuses a package whose objects expand past
+    /// [`MAX_DECODE_BYTES`]; an encoder that wrote one anyway produced an
+    /// artifact this crate cannot read, so the same charge runs here
+    /// (R-12 round 9, F2). The test drives a one-byte ceiling.
+    fn encode_with_ceiling(&self, decode_ceiling: usize) -> Result<Vec<u8>> {
+        let decoded = self
+            .ops
+            .iter()
+            .map(op_decoded_bytes)
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(
+                self.trace
+                    .iter()
+                    .map(|entry| trace_decoded_bytes(&entry.event))
+                    .fold(0usize, usize::saturating_add),
+            );
+        if decoded > decode_ceiling {
+            return Err(Error::Replay(
+                "the package expands beyond the decode ceiling".into(),
+            ));
+        }
         // The format's first operation carries the header rate; a package that
         // does not is one `replay` refuses, so `encode` must not write it.
         if self.ops.first() != Some(&Op::SetLatency(self.latency_ms)) {
@@ -300,16 +359,7 @@ impl ReplayPackage {
                     return Err(Error::Replay(format!("unknown operation tag {other}")));
                 }
             };
-            // One `Op` plus its method strings and their heap headers.
-            let methods: usize = match &op {
-                Op::Mint { methods, .. } | Op::Attenuate { methods, .. } => methods
-                    .iter()
-                    .map(|method| method.len().saturating_add(32))
-                    .sum(),
-                Op::Call { method, .. } => method.len().saturating_add(32),
-                Op::SetLatency(_) | Op::Revoke { .. } => 0,
-            };
-            decoded_bytes = decoded_bytes.saturating_add(96).saturating_add(methods);
+            decoded_bytes = decoded_bytes.saturating_add(op_decoded_bytes(&op));
             if decoded_bytes > decode_ceiling {
                 return Err(Error::Replay(
                     "the package expands beyond the decode ceiling".into(),
@@ -333,9 +383,7 @@ impl ReplayPackage {
             } else {
                 None
             };
-            decoded_bytes = decoded_bytes
-                .saturating_add(48)
-                .saturating_add(event.len().saturating_add(32));
+            decoded_bytes = decoded_bytes.saturating_add(trace_decoded_bytes(&event));
             if decoded_bytes > decode_ceiling {
                 return Err(Error::Replay(
                     "the package expands beyond the decode ceiling".into(),
@@ -442,7 +490,12 @@ impl ReplayPackage {
                     method,
                     arg_bytes,
                 } => {
-                    ignore_refusal(recorder.call(*cap, method, *arg_bytes as usize))?;
+                    // A hand-built package on a 32-bit target could carry an `arg_bytes`
+                    // that truncates; the ceiling check below reads the full value
+                    // (R-12 round 8, F10).
+                    let arg_bytes = usize::try_from(*arg_bytes)
+                        .map_err(|_| Error::Replay("argument size exceeds the ceiling".into()))?;
+                    ignore_refusal(recorder.call(*cap, method, arg_bytes))?;
                     Ok(())
                 }
                 Op::Revoke { cap } => {
@@ -505,6 +558,15 @@ pub struct Recorder {
     /// so the recorder refuses to produce a package rather than emit one that
     /// cannot replay.
     poisoned: bool,
+    /// The decoded heap this session describes: every operation plus every
+    /// trace entry, charged with the same helpers the decoder uses.
+    ///
+    /// The decoder refuses a package past [`MAX_DECODE_BYTES`]; a recorder that
+    /// did not charge the same objects could write an artifact this crate
+    /// cannot read (R-12 round 9, F2).
+    decoded: usize,
+    /// The ceiling `decoded` is checked against.
+    decode_ceiling: usize,
     /// Declared argument bytes across every recorded call.
     ///
     /// The decoder refuses a package whose sum exceeds
@@ -539,6 +601,8 @@ impl Recorder {
             latency_ms,
             initial_latency_ms: latency_ms,
             poisoned: false,
+            decoded: 0,
+            decode_ceiling: MAX_DECODE_BYTES,
             arg_total: 0,
             // magic, version, flags, latency, op_count, and the trace count that
             // follows the operations.
@@ -611,6 +675,17 @@ impl Recorder {
         if self.body.saturating_add(addition) > MAX_PACKAGE_BYTES - 32 {
             return Err(Error::Replay("package exceeds the size ceiling".into()));
         }
+        // The same decoded-heap ceiling `encode` and `decode` apply, charged as
+        // each operation is recorded so the session fails early rather than at
+        // write time (R-12 round 9, F2). Trace entries are charged by
+        // `capture` as they arrive, so this counts the op alone.
+        let decoded = self.decoded.saturating_add(op_decoded_bytes(op));
+        if decoded > self.decode_ceiling {
+            return Err(Error::Replay(
+                "the session expands beyond the decode ceiling".into(),
+            ));
+        }
+        self.decoded = decoded;
         Ok(())
     }
 
@@ -675,6 +750,7 @@ impl Recorder {
     }
 
     fn capture(&mut self) -> Result<()> {
+        let before = self.trace.len();
         let result = capture(
             &self.agent,
             &mut self.seen_total,
@@ -682,6 +758,19 @@ impl Recorder {
             &mut self.ordinals,
             &mut self.body,
         );
+        // Every entry this capture appended is decoded heap a reader will
+        // build (R-12 round 9, F2).
+        for entry in &self.trace[before..] {
+            self.decoded = self
+                .decoded
+                .saturating_add(trace_decoded_bytes(&entry.event));
+        }
+        if result.is_ok() && self.decoded > self.decode_ceiling {
+            self.poisoned = true;
+            return Err(Error::Replay(
+                "the session expands beyond the decode ceiling".into(),
+            ));
+        }
         if result.is_err() {
             self.poisoned = true;
         }
@@ -891,6 +980,11 @@ impl Recorder {
         }
         if self.body.saturating_add(32) > MAX_PACKAGE_BYTES {
             return Err(Error::Replay("package exceeds the size ceiling".into()));
+        }
+        if self.decoded > self.decode_ceiling {
+            return Err(Error::Replay(
+                "the package expands beyond the decode ceiling".into(),
+            ));
         }
         Ok(ReplayPackage {
             // The header is the initial rate; each `SetLatency` op moves it from
@@ -1500,5 +1594,77 @@ mod recorder_handle_tests {
             .expect("decode")
             .replay()
             .expect("the recorded package replays");
+    }
+}
+
+#[cfg(test)]
+mod decode_ceiling_contract_tests {
+    use super::*;
+
+    impl Recorder {
+        /// A recorder whose decoded-heap ceiling is small, so the ceiling
+        /// contract can be driven through the real recording path.
+        fn with_decode_ceiling(latency_ms: u64, decode_ceiling: usize) -> Result<Self> {
+            let mut recorder = Self::new(latency_ms)?;
+            recorder.decode_ceiling = decode_ceiling;
+            Ok(recorder)
+        }
+    }
+
+    /// The recorder refuses an operation that would take the session past the
+    /// decoder's ceiling: a legal-looking session must not encode into an
+    /// artifact this crate cannot read (R-12 round 9, F2).
+    #[test]
+    fn a_session_that_expands_past_the_decode_ceiling_is_refused() {
+        let mut recorder = Recorder::with_decode_ceiling(1, 1).expect("recorder");
+        let error = recorder
+            .mint(&["echo"], None)
+            .expect_err("the ceiling refuses");
+        assert_eq!(error.code(), "rpc/replay", "{error}");
+        assert!(
+            error.to_string().contains("decode ceiling"),
+            "the refusal names the ceiling: {error}"
+        );
+    }
+
+    /// `encode` and `decode` charge the same objects: a package the decoder
+    /// accepts always encodes, and an encoder ceiling refuses what the decoder
+    /// would (R-12 round 9, F2).
+    #[test]
+    fn encode_refuses_what_decode_would_refuse() {
+        let mut recorder = Recorder::new(1).expect("recorder");
+        let cap = recorder.mint(&["echo"], None).expect("mint");
+        recorder.call(cap, "echo", 0).expect("call");
+        let package = recorder.package().expect("package");
+        let bytes = package.encode().expect("encode under the shipped ceiling");
+        ReplayPackage::decode(&bytes).expect("the shipped decoder accepts what encode wrote");
+        let error = package
+            .encode_with_ceiling(1)
+            .expect_err("a one-byte ceiling refuses the package");
+        assert_eq!(error.code(), "rpc/replay", "{error}");
+        assert!(
+            error.to_string().contains("decode ceiling"),
+            "the refusal names the ceiling: {error}"
+        );
+    }
+
+    /// The running body estimate is exact, not conservative: the comment on the
+    /// phantom-byte fix cited a test that did not exist (R-12 round 6, F6).
+    #[test]
+    fn the_size_estimate_matches_the_encoder() {
+        let mut recorder = Recorder::new(1).expect("recorder");
+        let cap = recorder.mint(&["echo"], None).expect("mint");
+        recorder.call(cap, "echo", 3).expect("call");
+        recorder.attenuate(cap, &["echo"], None).expect("attenuate");
+        recorder.revoke(cap).expect("revoke");
+        let package = recorder.package().expect("package");
+        let bytes = package.encode().expect("encode");
+        assert_eq!(
+            recorder.body + 32,
+            bytes.len(),
+            "the running estimate ({}) plus the checksum must equal the encoded length ({})",
+            recorder.body,
+            bytes.len()
+        );
     }
 }

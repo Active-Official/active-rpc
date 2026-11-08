@@ -225,6 +225,26 @@ it.
 
 Verdict after the fix pass: every r13 finding is closed; r14 must be clean.
 
+### R-12 replay - 2026-11-07 (round 9 fixes)
+
+Round 8's findings F2 (the encoder could write an artifact the decoder
+refuses), F4 (the decode ceiling undercharged method vectors), F6 (no test for
+the byte estimate) and F10 (a truncating cast on a hand-built op) are closed.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F2 | medium | `Recorder` and `encode` enforced only the 64 MiB body, not `MAX_DECODE_BYTES` | **fixed**: one `op_decoded_bytes`/`trace_decoded_bytes` pair is the single charge for decode, `Recorder::reserve_op`/`capture` and `encode_with_ceiling`; a session past the ceiling is refused while recording, at `package()` and at `encode`. `a_session_that_expands_past_the_decode_ceiling_is_refused`, `encode_refuses_what_decode_would_refuse` (both fail when the gate is disabled) |
+| F4 | low | method vectors were charged 32 + len where the heap is about 48 + len | **fixed**: `METHOD_HEAP = 48`, one helper for every charge |
+| F6 | low | the running body estimate had no test and its comment cited a missing one | **fixed**: `the_size_estimate_matches_the_encoder` asserts `body + 32 == encoded.len()` (a reintroduced four-byte phantom fails it) |
+| F10 | low | `*arg_bytes as usize` truncated a hand-built op on 32-bit targets | **fixed**: `usize::try_from` with the ceiling code |
+
+Still open for r10: F3 (the replay-side peak: a second kernel, a second op list
+and a second trace, ~391 MB for a 15.8 MB package), F5 (the three per-cap scans),
+and the pinned repeated-revoke timing test (the r6 test has no `record_pins`).
+
+Gate: green on both feature sets, fmt, clippy, doc, fuzz and the negative
+controls. R-12 needs r10 (with F3/F5 fixed) and r11 clean.
+
 ### R-12 replay - 2026-11-07 (round 8)
 
 Reviewer: DeepSeek through CommandCode (`max`), read-only at `7b22b9d`. F1 is
