@@ -234,7 +234,7 @@ ceiling is decoder-only.
 
 | # | Sev | Finding | Disposition |
 |---|-----|---------|-------------|
-| F1 | medium | a refused `attenuate`/`call`/`revoke` clones the handle before `reserve_op`, so the clone's retain/release events land in the next op's capture and the package fails its own replay | **open for r8**: the recorder must capture the clone's events with the refused op (or not clone) |
+| F1 | medium | a refused `attenuate`/`call`/`revoke` cloned the handle before `reserve_op`, so the clone's retain/release events landed in the next op's capture and the package failed its own replay | **fixed**: the ordinal is checked first, the handle is cloned only after the fallible recording steps, and nothing can fail between the clone and its drop (`a_refused_recording_step_does_not_leak_handle_events`: a ceiling-refused attenuate followed by a mint must still produce a package that replays; injecting the pre-fix clone fails it) |
 | F2 | medium | `MAX_DECODE_BYTES` is enforced only by the decoder, so a legal recording can be encoded into an artifact decode refuses | **open for r8**: charge the same objects in `encode` (and refuse at record time) |
 | F3 | medium | replay itself still peaks at ~391 MB for a ~15.8 MB package: it builds a second kernel whose `CapAttrs` copy every method string, and a second trace | **open for r8**: budget the replay-side objects |
 | F4 | medium | every `revoke_subtree` still scanned all `record_pins` for orphans, so a repeated revoke was O(pins) | **fixed**: a call that newly revokes nothing returns before the scan (`newly_doomed == 0`); no pin can newly match when nothing changed |

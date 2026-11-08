@@ -740,10 +740,17 @@ impl Recorder {
     /// recorded.
     pub fn attenuate(&mut self, parent: u32, methods: &[&str], ttl_ms: Option<u64>) -> Result<u32> {
         Self::check_methods(methods)?;
-        let handle =
-            self.caps.get(parent as usize).cloned().ok_or_else(|| {
-                Error::Replay(format!("capability ordinal {parent} does not exist"))
-            })?;
+        // The ordinal is checked before anything is recorded (a missing one is
+        // a recorder bug), but the handle is cloned only after the fallible
+        // recording steps. A clone made first and dropped by an early return
+        // leaves its retain/release events for the next operation's capture,
+        // and no recorded op produces them, so the package fails its own
+        // replay (R-12 round 7, F1).
+        if self.caps.get(parent as usize).is_none() {
+            return Err(Error::Replay(format!(
+                "capability ordinal {parent} does not exist"
+            )));
+        }
         let attrs = attrs_for(
             &methods
                 .iter()
@@ -759,6 +766,9 @@ impl Recorder {
         self.reserve_op(&op)?;
         self.ops.push(op.clone());
         self.note(&op)?;
+        // Nothing below can fail before the handle is dropped, so its
+        // retain/release events are captured with this operation.
+        let handle = self.caps[parent as usize].clone();
         let outcome = self.agent.attenuate(&handle, attrs);
         // The borrowed handle's `cap.released` is a decision of this operation:
         // drop it before the capture that closes the operation, or the trace
@@ -799,11 +809,11 @@ impl Recorder {
         if method.len() > MAX_STRING {
             return Err(Error::Replay("string exceeds the ceiling".into()));
         }
-        let handle = self
-            .caps
-            .get(cap as usize)
-            .cloned()
-            .ok_or_else(|| Error::Replay(format!("capability ordinal {cap} does not exist")))?;
+        if self.caps.get(cap as usize).is_none() {
+            return Err(Error::Replay(format!(
+                "capability ordinal {cap} does not exist"
+            )));
+        }
         let op = Op::Call {
             cap,
             method: method.to_string(),
@@ -813,6 +823,9 @@ impl Recorder {
         self.ops.push(op.clone());
         self.note(&op)?;
         self.arg_total = arg_total;
+        // Cloned after the fallible steps, so a refusal above cannot leave a
+        // retain/release pair for the next operation (R-12 round 7, F1).
+        let handle = self.caps[cap as usize].clone();
         let args = if arg_bytes == 0 {
             Vec::new()
         } else {
@@ -832,15 +845,17 @@ impl Recorder {
 
     /// Revoke a capability.
     pub fn revoke(&mut self, cap: u32) -> Result<()> {
-        let handle = self
-            .caps
-            .get(cap as usize)
-            .cloned()
-            .ok_or_else(|| Error::Replay(format!("capability ordinal {cap} does not exist")))?;
+        if self.caps.get(cap as usize).is_none() {
+            return Err(Error::Replay(format!(
+                "capability ordinal {cap} does not exist"
+            )));
+        }
         let op = Op::Revoke { cap };
         self.reserve_op(&op)?;
         self.ops.push(op.clone());
         self.note(&op)?;
+        // Cloned after the fallible steps (R-12 round 7, F1).
+        let handle = self.caps[cap as usize].clone();
         let outcome = self.agent.revoke(&handle);
         drop(handle);
         // A refused revoke still produced a decision, and a successful one must
@@ -1442,5 +1457,38 @@ mod decode_ceiling_tests {
             error.to_string().contains("decode ceiling"),
             "the refusal names the ceiling: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recorder_handle_tests {
+    use super::*;
+
+    /// A recording step that refuses before the kernel call must not clone the
+    /// capability handle. The clone's retain and release events would be
+    /// captured with the next operation, and no recorded op produces them, so
+    /// the package would encode, decode and then fail its own replay
+    /// (R-12 round 7, F1).
+    #[test]
+    fn a_refused_recording_step_does_not_leak_handle_events() {
+        let mut recorder = Recorder::new(1).expect("recorder");
+        let cap = recorder.mint(&["echo"], None).expect("mint");
+        // Force the next recording step to fail at the package ceiling, which
+        // is the only refusal between the handle lookup and the kernel call.
+        recorder.body = MAX_PACKAGE_BYTES;
+        let refused = recorder.attenuate(cap, &["echo"], None);
+        assert!(refused.is_err(), "the ceiling must refuse the operation");
+        // The session stays usable, and its package must replay: that fails if
+        // the refused step leaked two events into the next capture.
+        recorder.body = 0;
+        recorder
+            .mint(&["echo"], None)
+            .expect("the session continues after a refused step");
+        let package = recorder.package().expect("package");
+        let bytes = package.encode().expect("encode");
+        ReplayPackage::decode(&bytes)
+            .expect("decode")
+            .replay()
+            .expect("the recorded package replays");
     }
 }
