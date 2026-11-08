@@ -225,6 +225,26 @@ it.
 
 Verdict after the fix pass: every r13 finding is closed; r14 must be clean.
 
+### R-12 replay - 2026-11-07 (round 8)
+
+Reviewer: DeepSeek through CommandCode (`max`), read-only at `7b22b9d`. F1 is
+**verified fixed**; F4's claimed fix was dead code.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 1 | medium | F4 was dead: `newly_doomed` counted an already-revoked node too, so `newly_doomed == 0` was unreachable and the pin scan still ran on every repeated revoke | **fixed**: the counter increments only for a node that is present and not revoked. The r6 linear test has no pins, so it cannot catch this; a pinned timing test needs a durable-export fixture (recorded for r9) |
+| 2 | medium | F2: recorder/encode enforce only the 64 MiB body, not `MAX_DECODE_BYTES`, so a legal recording encodes to an artifact decode refuses | **open for r9** |
+| 3 | medium | F3: replay peaks at ~391 MB for a 15.8 MB package (second op list, second trace, a second copy of every method string) | **open for r9** |
+| 4 | low | the decode ceiling undercharges method vectors (~48+len actual vs 32+len charged) | **open for r9** |
+| 5 | low | F5: `tombstone_record`, `restore_capability_with` and `durable_ceiling_reached` scan every cap | **open for r9** |
+| 6 | low | F6: no regression test for the phantom-byte estimate; its comment cites a test that does not exist | **open for r9** |
+| 7 | low | F7: `mint_restored` linked under a revoked ancestor, breaking the premise of the revoke skip | **fixed**: a lineage ancestor that is revoked refuses the restore (`Revoked`), so no live child can sit under a node the walk skips |
+| 8 | low | F8 as stated is not a bypass; the residual is a missing pre-check of a hand-built op list | **noted** |
+| 9 | low | the F1 test covered only `attenuate` | **fixed**: it drives `call` and `revoke` through the same ceiling refusal too |
+| 10 | low | `*arg_bytes as usize` truncates a hand-built op on 32-bit targets | **open for r9** |
+
+R-12 needs r9 (with F2/F3 fixed) and r10 clean.
+
 ### R-12 replay - 2026-11-07 (round 7)
 
 Reviewer: DeepSeek through CommandCode (`max`), read-only at `a6b18e4`. Verdict

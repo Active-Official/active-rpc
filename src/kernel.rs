@@ -2047,6 +2047,20 @@ impl Agent {
         if kernel.caps.len() >= MAX_CAPS {
             return Err(Error::BudgetExceeded("caps"));
         }
+        // A revoked ancestor's subtree was already revoked, and
+        // `revoke_subtree` does not descend into a revoked node: a restore
+        // linked under one would be a live child no revocation could reach.
+        // The pin/tombstone paths make this unreachable today; the check keeps
+        // the premise local (R-12 round 8, F7).
+        for ancestor in lineage {
+            if kernel
+                .caps
+                .get(ancestor)
+                .is_some_and(|record| record.revoked)
+            {
+                return Err(Error::Revoked(cap_token(*ancestor)));
+            }
+        }
         let serial = kernel.next_serial;
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, None);
@@ -7215,7 +7229,6 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         if !doomed.insert(id) {
             continue;
         }
-        newly_doomed += 1;
         // A node already revoked had its whole subtree revoked with it: a new
         // child cannot appear under it (attenuation from a revoked capability
         // is refused, and a revoked durable record is tombstoned). The
@@ -7225,6 +7238,10 @@ fn revoke_subtree(kernel: &mut Kernel, seeds: impl IntoIterator<Item = CapId>) {
         if kernel.caps.get(&id).is_some_and(|record| record.revoked) {
             continue;
         }
+        // Counted only here: a repeated revoke inserts the seed into `doomed`
+        // and then skips it, and counting that visit kept the pin scan alive
+        // (R-12 round 8).
+        newly_doomed += 1;
         let record_id = kernel.caps.get(&id).map(|record| record.record_id);
         if let Some(record_id) = record_id {
             if record_ids.insert(record_id) {

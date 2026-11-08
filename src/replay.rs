@@ -1478,6 +1478,16 @@ mod recorder_handle_tests {
         recorder.body = MAX_PACKAGE_BYTES;
         let refused = recorder.attenuate(cap, &["echo"], None);
         assert!(refused.is_err(), "the ceiling must refuse the operation");
+        // The same shape on the other two paths: a regression that cloned the
+        // handle before the recording step would leak two events from either.
+        assert!(
+            recorder.call(cap, "echo", 0).is_err(),
+            "the ceiling must refuse a call"
+        );
+        assert!(
+            recorder.revoke(cap).is_err(),
+            "the ceiling must refuse a revoke"
+        );
         // The session stays usable, and its package must replay: that fails if
         // the refused step leaked two events into the next capture.
         recorder.body = 0;
