@@ -6502,8 +6502,10 @@ impl Kernel {
         // handle drops: `tombstone_record` seeds the revoke walk from this map,
         // and a descendant record exported through this copy would otherwise be
         // unreachable once the copy is gone, so the kill switch would miss it
-        // (R-12 round 13, F1). The entries are bounded by the restored-record
-        // set, which the record-id ceiling already bounds.
+        // (R-12 round 13, F1). Each restored record id keeps at most the
+        // exporter and one restored copy, so the key space is bounded by the
+        // restored-record set, which the record-id ceiling already bounds
+        // (R-12 round 14, F4).
         if !self.restored_records.contains(&record.record_id) {
             if let Some(ids) = self.record_index.get_mut(&record.record_id) {
                 ids.remove(&id);
@@ -7936,6 +7938,27 @@ mod pin_scan_tests {
         );
     }
 
+    /// Recompute the root counts from the pins and compare.
+    fn assert_pin_roots_match(agent: &Agent) {
+        let kernel = agent.cell.borrow();
+        let mut expected: BTreeMap<CapId, usize> = BTreeMap::new();
+        for pin in kernel.record_pins.values() {
+            for id in std::iter::once(pin.cap).chain(pin.lineage.iter().copied()) {
+                *expected.entry(id).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(
+            expected, kernel.pin_roots,
+            "the root counts drifted from the pin table"
+        );
+        if kernel.record_pins.is_empty() {
+            assert!(
+                kernel.pin_roots.is_empty(),
+                "a released pin must remove its root counts"
+            );
+        }
+    }
+
     /// The same early return must hold while the pin table is non-empty: a
     /// surviving export table is what makes the scan costly, and a future
     /// `record_pins.is_empty()` shortcut or a scan moved above the
@@ -8062,6 +8085,84 @@ mod pin_scan_tests {
             agent.cell.borrow().pin_visits.get() >= visits + 32,
             "the matching revoke must visit every pin"
         );
+        assert_eq!(
+            agent.export_pin_count(),
+            0,
+            "the matching revoke must release every pin it visits"
+        );
+    }
+
+    /// The `pin_roots` decrement is load-bearing: without it a released pin
+    /// keeps its key forever, the guard goes true for a capability that no
+    /// longer has a pin, and every distinct revoke scans the whole table again
+    /// (R-12 round 14, F1).
+    #[test]
+    fn pin_roots_tracks_export_release_and_rotation() {
+        let agent = Agent::new();
+        agent.set_durable_capabilities(true);
+        agent.set_record_seal_key([0x68; 32]);
+        let provider = agent.register(Box::new(Echo));
+        let old = crate::identity::IdentityPolicy::default()
+            .admit(
+                Some(&crate::identity::PeerIdentity::from_certificate(
+                    b"old-pins",
+                )),
+                false,
+            )
+            .expect("admitted");
+        let new = crate::identity::IdentityPolicy::default()
+            .admit(
+                Some(&crate::identity::PeerIdentity::from_certificate(
+                    b"new-pins",
+                )),
+                false,
+            )
+            .expect("admitted");
+        let mut root_attrs = CapAttrs::new(&["echo"]);
+        root_attrs.persistence = CapPersistence::Durable;
+        let root = agent
+            .mint_bound(&old, provider, 0, root_attrs)
+            .expect("durable root");
+        let small = || {
+            let mut attrs = CapAttrs::new(&["echo"]);
+            attrs.persistence = CapPersistence::Durable;
+            attrs.budget.max_calls = 1;
+            attrs.budget.max_bytes = 1;
+            attrs
+        };
+        let child = agent.attenuate(&root, small()).expect("durable child");
+        let record = agent.export_capability(&child).expect("export");
+        assert_pin_roots_match(&agent);
+        drop(child);
+        assert_pin_roots_match(&agent);
+        agent
+            .tombstone_record(record.record_id)
+            .expect("tombstone the record");
+        assert_eq!(
+            agent.export_pin_count(),
+            0,
+            "the tombstone releases the pin"
+        );
+        assert_pin_roots_match(&agent);
+
+        // A rotation tombstones the old peer's exported record too, and the
+        // released pin must not leave its root counts behind.
+        let rotated = agent.attenuate(&root, small()).expect("another child");
+        agent
+            .export_capability(&rotated)
+            .expect("export for rotation");
+        assert_pin_roots_match(&agent);
+        agent
+            .reintroduce_to(&root, old.identity(), &new)
+            .expect("rotate");
+        assert_eq!(
+            agent.export_pin_count(),
+            0,
+            "the rotation releases the old peer's pin"
+        );
+        assert_pin_roots_match(&agent);
+        agent.revoke(&root).expect("revoke the tree");
+        assert_pin_roots_match(&agent);
     }
 }
 

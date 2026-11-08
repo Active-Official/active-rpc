@@ -171,6 +171,13 @@ against `record_is_tombstoned` after a successful rotation (or replay the
 rotation's ids from its own copy) before it restores anything: otherwise a
 restart forgets a kill that the rotation only recorded in memory.
 
+Restores have the same cross-process limit. In one process a tombstone reaches a
+record exported through a restored copy by walking the retained record-id index
+and the export pins; both are memory-resident. A deployment that restarts, or a
+second kernel sharing only the seal key, must therefore persist and replay
+**every exported record id**, not only the ancestor it intends to kill
+(R-12 round 14).
+
 ### Why this is safe
 
 A record alone is not authority: using it requires a deployment that opted into

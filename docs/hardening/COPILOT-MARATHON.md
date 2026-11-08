@@ -25,7 +25,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
-| R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | rounds 1-13: r13 verified r12 and closed a high kill-switch gap plus four lows; r14 and r15 must be clean to close | 52 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018) | this commit |
+| R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | rounds 1-14: r14 **CLEAN**; r12-r13 findings verified and the four r14 lows fixed; r15 must also be clean to close | 56 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-15: r15 found the in-place edit behind the append cache (high), a partial-magic wedge and a repair refusal, open for r16 | 77 fixed / 0 rejected / 2 residuals (7 open) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
@@ -49,6 +49,28 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-12 replay - 2026-11-07 (round 14)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `81665df`. All five round-13 fixes verified with mutation controls (including
+deleting `pin_root_remove` and `decoded: 0`). Verdict **CLEAN**: no critical,
+high or medium; four lows, all test-strength or wording.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | low | the `pin_roots` *decrement* was ungated: deleting `pin_root_remove` passed the whole suite, so a released pin could keep its key and restore the O(N·P) scan | **fixed**: `pin_scan_tests::pin_roots_tracks_export_release_and_rotation` recomputes the counts from the pin table after export, drop, tombstone, rotation and revoke and requires the map empty once the pins are; the control (deleting the decrement) fails it |
+| F2 | low | the distinct-revoke test's comment claimed the matching revoke releases the pins, but it asserted only visits | **fixed**: it now asserts `export_pin_count() == 0` after the matching revoke |
+| F3 | low | observability named "the provider object is reclaimed" as a pin-release trigger; reclaim is a consequence, not a path | **fixed**: the row lists restore and tombstone (revoke, kill switch, rotation), then says the provider reclaims the object once the last pin and capability are gone |
+| F4 | low | the index-retention comment understated the per-key bound and did not say the entries are never pruned | **fixed**: at most the exporter and one restored copy per restored id; the key space is bounded by the restored-record set |
+
+The audit's residual note (transitive reach is in-process only) is now recorded in
+ADR-0010: a deployment that restarts, or a second kernel sharing only the seal
+key, must persist and replay every exported record id, not only the ancestor it
+kills.
+
+Gate: `scripts/local_gate.sh --no-msrv` green. R-12 has one clean round; r15 must
+also be clean to close.
 
 ### R-12 replay - 2026-11-07 (round 13)
 
