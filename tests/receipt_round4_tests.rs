@@ -177,16 +177,18 @@ fn an_empty_lock_is_stolen_and_a_non_regular_lock_is_refused() {
 fn a_reader_does_not_call_an_in_progress_append_damage() {
     let path = scratch("live");
     // The file exists before either thread touches it, so `open` cannot race the
-    // writer's `create`.
+    // writer's `create`. The reader opens first: `open` refuses while a live
+    // writer holds the lock, and the test's subject is a reader that polls
+    // *during* an append, not the open race.
     let writer_path = path.clone();
     drop(ReceiptLog::create(&path).expect("create"));
+    let reader = ReceiptLog::open(&path).expect("open");
     let writer = std::thread::spawn(move || {
         let log = ReceiptLog::open(&writer_path).expect("open for writing");
         for sequence in 1..=2_000u64 {
             log.append(&receipt(sequence, "echo")).expect("append");
         }
     });
-    let reader = ReceiptLog::open(&path).expect("open");
     let mut failures = Vec::new();
     for _ in 0..40 {
         if let Err(error) = reader.records() {
