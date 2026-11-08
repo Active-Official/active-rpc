@@ -2387,7 +2387,10 @@ mod lock_tests {
                 .expect("open");
             handle
                 .set_times(std::fs::FileTimes::new().set_modified(
-                    std::time::SystemTime::now() - std::time::Duration::from_secs(600),
+                    // Past the 20-minute live grace, so a partial line naming a
+                    // pid that is alive on this host is still judged stale
+                    // (Linux CI has a live pid 999).
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(1_300),
                 ))
                 .expect("age the lock");
             drop(handle);
