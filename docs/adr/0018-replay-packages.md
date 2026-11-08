@@ -142,9 +142,12 @@ than it read.
   would cross `MAX_PACKAGE_BYTES`, so an embedder cannot retain a body that
   `encode` will reject. The operator's session up to that point stays valid and
   readable.
-- **`encode` refuses a package `replay` refuses.** A missing or foreign header
+- **`encode` refuses a package `decode` refuses.** A missing or foreign header
   latency is an encode error, not only a replay error, so "written" implies
-  "readable" implies "replayable".
+  "readable". Replayability is a separate check: `replay()` executes the
+  operations, and a hand-built package that encodes (for example a call through
+  an ordinal the replay never minted) still fails with `rpc/replay` when it is
+  replayed. `tests/replay_tests.rs` drives exactly that package.
 - **A method over `MAX_STRING` is refused at record time**, matching `encode`.
 - **The op ceiling is a refusal, not a poisoning.** Reaching `MAX_OPS` refuses
   the next operation and leaves the recorder usable; only a lost capture poisons
@@ -154,6 +157,32 @@ than it read.
 The CLI writes a package through a `create_new` temporary beside the destination
 and renames it, so a planted symlink at the temporary path cannot redirect the
 write, and an interrupted write leaves the previous artifact intact.
+
+## Amendment (R-12 round 12, 2026-11-02)
+
+- **`replay_trace` reports the package's operation list.** The public diagnostic
+  half returns the operations the package names (operation 0 is the header
+  latency, the constructor's argument), not a second list the recorder rebuilt
+  from what it observed. The recorder keeps one list, so the two can no longer
+  disagree.
+- **The diagnostic path no longer repeats the body-ceiling check.** `into_parts`
+  returned the body with a final `body + 32 > MAX_PACKAGE_BYTES` refusal; that
+  check is unreachable because every addition is pre-checked in `reserve_op`
+  and `capture`, and it was removed with the split. `encode`, `decode` and
+  `package()` still enforce the ceiling.
+- **Disclosed limits** (bounded, but not charged by `MAX_DECODE_BYTES`):
+  - A replay re-materialises the grants it mints, so a package at the 128 MiB
+    decoded ceiling peaks at roughly twice that while the replay kernel holds
+    its own `CapAttrs` copies.
+  - The recorder drives a lane with `Budget::default()` (10 000 calls, 64 MiB,
+    5 000 virtual wall-ms). A longer recording becomes lane-budget refusals that
+    are harness artifacts, not kernel decisions; use several packages for a
+    longer session.
+  - `MAX_OPS` is a recording ceiling. A hand-built, in-memory package replayed
+    through `replay()` may name more operations; the trace ceiling and the body
+    ceiling still bound it, and the caller owns the process.
+  - `Recorder::trace()` after poisoning returns the partial decision log.
+    `poisoned()` (and `package()`'s refusal) is the signal that it is partial.
 
 ## Consequences
 

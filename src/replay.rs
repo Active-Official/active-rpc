@@ -448,7 +448,10 @@ impl ReplayPackage {
     }
 
     /// Execute the package and return the trace the kernel produced together
-    /// with the operations the replay actually ran.
+    /// with the package's own operation list (operation 0 is the header
+    /// latency, which the replay takes as the kernel's initial rate and does
+    /// not execute as an operation; the rest run in order). The recorder keeps
+    /// one list, so this cannot drift from what replay executes.
     ///
     /// This is the diagnostic half of [`ReplayPackage::replay`]: it lets a
     /// caller inspect where a package diverges instead of only learning that it
@@ -641,7 +644,10 @@ impl Recorder {
             initial_latency_ms: latency_ms,
             poisoned: false,
             record_ops,
-            decoded: 0,
+            // The header operation is part of the package and is charged by
+            // `encode` and `decode`; the recorder starts with it
+            // (R-12 round 12, F2).
+            decoded: op_decoded_bytes(&Op::SetLatency(latency_ms)),
             decode_ceiling: MAX_DECODE_BYTES,
             arg_total: 0,
             // magic, version, flags, latency, op_count, and the trace count that
@@ -1718,6 +1724,37 @@ mod decode_ceiling_contract_tests {
             "the running estimate ({}) plus the checksum must equal the encoded length ({})",
             recorder.body,
             bytes.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod note_ceiling_tests {
+    use super::*;
+
+    /// `note` appends the `op.*` entry outside `capture`; a session whose entry
+    /// takes it past the decode ceiling must be refused and poisoned, not
+    /// packaged into an artifact `encode`/`decode` reject
+    /// (R-12 round 12, F3).
+    #[test]
+    fn a_note_that_overflows_the_decode_ceiling_poisons_the_session() {
+        let mut recorder = Recorder::new(1).expect("recorder");
+        let op = Op::Mint {
+            methods: vec!["echo".to_string()],
+            ttl_ms: None,
+        };
+        let needed = op_decoded_bytes(&op).saturating_add(trace_decoded_bytes(&input_event(&op)));
+        // One byte short of what the operation and its input entry need: the
+        // operation charge passes, the entry charge must not.
+        recorder.decode_ceiling = recorder.decoded.saturating_add(needed).saturating_sub(1);
+        let error = recorder
+            .mint(&["echo"], None)
+            .expect_err("the note overflows");
+        assert_eq!(error.code(), "rpc/replay", "{error}");
+        assert!(recorder.poisoned(), "a lost entry must poison the session");
+        assert!(
+            recorder.package().is_err(),
+            "a poisoned session cannot be packaged"
         );
     }
 }

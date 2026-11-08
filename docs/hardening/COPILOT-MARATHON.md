@@ -25,7 +25,7 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 | R-09 | transports | `src/transport/**` | `CLEAN` (rounds 1-22: round 22 found no critical/high/medium; 6 lows fixed) | 158 fixed / 0 rejected / 15 noted (3 verification gaps in STATUS 17) | this commit |
 | R-10 | bulk | `src/bulk.rs` | rounds 1-12: round 12 found 1 medium and 5 lows, all fixed; round 13 must be clean | 95 fixed / 0 rejected / 1 noted (5 residuals recorded) | this commit |
 | R-11 | identity | `src/identity.rs` | rounds 1-10: round 10 found 1 high and 6 lows (the high fixed); rounds 11 and 12 must be clean to close | 58 fixed / 0 rejected / 6 noted (1 accepted: a placeholder certificate buffer is a shared principal) | this commit |
-| R-12 | replay | `src/replay.rs` | rounds 1-5: round 5 found no critical/high/medium (CLEAN) and 12 lows (2 fixed); round 6 must be clean to close | 32 fixed / 0 rejected / 10 noted | this commit |
+| R-12 | replay | `src/replay.rs`, `src/kernel.rs` (revoke walk, pins) | rounds 1-12: r12 verified r11 and found the surviving-pin fixture vacuous (medium) plus four lows, all fixed; r13 must be clean to close | 47 fixed / 0 rejected / 0 open (limits disclosed in ADR-0018) | this commit |
 | R-13 | receipts | `src/receipts.rs` | rounds 1-15: r15 found the in-place edit behind the append cache (high), a partial-magic wedge and a repair refusal, open for r16 | 77 fixed / 0 rejected / 2 residuals (7 open) | this commit |
 | R-14 | wasm tools | `src/wasm_tool.rs` | rounds 1-2: 15 + 7 findings fixed | 22 fixed / 0 rejected / 0 open (1 accepted design: host imports stay per instance) | this commit |
 | R-15 | observability | `src/observability.rs` | rounds 1-2: 19 + 7 findings (1 rejected as a false positive) | 25 fixed / 1 rejected / 1 noted | `cb44d07` |
@@ -49,6 +49,25 @@ the code → regression test first → minimal fix → targeted tests + clippy �
 ## Log
 
 Entries are appended per section: date, reviewer path, findings, disposition.
+
+### R-12 replay - 2026-11-07 (round 12)
+
+Reviewer: CommandCode DeepSeek (`deepseek/deepseek-v4.1-flash`, `max`), read-only
+at `48aa691` plus the working tree. Every r11 claim held (the poisoned-replay
+refusal, the diagnostic op list, the `note` charge, the counter test and the doc
+limits). Verdict **NOT CLEAN**: one medium and four lows.
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| F1 | medium | the "surviving pin table" timing fixture released every pin on its first revoke, so it could not see the scan it names; its doc stated the inverse of the code | **fixed**: `Agent::export_pin_count` plus a fixture that exports children of `root`, drops their handles and revokes an unrelated `victim`, so pins survive and the repeats are timed with the table full (48aa691). The reviewer's exact unit shape is `pin_scan_tests::a_repeated_revoke_does_not_scan_a_foreign_pin_table`: 64 surviving pins, a `pin_scans` count asserted flat across 200 repeats. Negative control: `newly_doomed == 0 && record_pins.is_empty()` fails only that test (201 vs 1 scans) |
+| F2 | low | the header `SetLatency` operation was never charged to `decoded`, so `package()` could bless a session `encode`/`decode` refuse | **fixed**: `with_record_ops` starts `decoded` at `op_decoded_bytes(&Op::SetLatency(latency_ms))`, the same charge the encoder and decoder apply |
+| F3 | low | the r11 `note` ceiling charge and poison had no test that reached `note` (the old tests tripped `reserve_op` first) | **fixed**: `replay::note_ceiling_tests::a_note_that_overflows_the_decode_ceiling_poisons_the_session` sets the ceiling one byte below the op plus its input entry; negative control deletes the charge block and the test fails with "the note overflows" |
+| F4 | low | the durable counter test omitted restore, a refused restore, tombstone and rotation; rotation counts a live capability and its tombstone twice in `durable_ceiling_reached` | **fixed**: `the_live_durable_counter_follows_restore_tombstone_and_rotation` drives all four steps (the restore on a second kernel with the same seal key), and the conservative double count is documented at `durable_ceiling_reached`. Negative control: an extra decrement in `mark_tombstoned` fails only this test, at the tombstone step |
+| F5 | low | `replay_trace`'s doc promised "the operations the replay actually ran" (it returns the package's list), the dropped body-ceiling check from `into_parts` was undocumented, and ADR-0018 claimed "written implies replayable" | **fixed**: the doc names the package's own operation list and operationalises operation 0; ADR-0018 narrows the claim to "written ⇒ readable" and adds a disclosed-limits list (replay heap, recorder lane budget, `MAX_OPS` as a recording ceiling, a partial trace after poisoning) |
+
+Gate: `scripts/local_gate.sh --no-msrv` green on the fixed tree (fmt, clippy both
+feature sets, tests both feature sets, doc, bench, fuzz, control-plane, CLI,
+hardening status, negative controls). R-12 needs r13 clean.
 
 ### R-13 receipts - 2026-11-06 (round 13)
 

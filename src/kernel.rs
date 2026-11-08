@@ -7069,6 +7069,13 @@ fn is_expired(kernel: &Kernel, record: &CapRecord) -> bool {
 /// A revoked capability is excluded: its tombstone already exists, so it can
 /// never add a second one. Counting it made a mint/revoke cycle grow the sum by
 /// two per pair and let the set pass its ceiling (round 40, residual R-3).
+///
+/// A rotation tombstones an exported record whose capability stays live and
+/// re-bound to the successor, so that pair counts twice. The over-count is
+/// conservative (the ceiling arrives early, never late) and is recorded here
+/// rather than special-cased: subtracting it would need a reverse index from a
+/// tombstone to a still-live capability, which is the scan the counter exists
+/// to avoid (R-12 round 12, F4).
 fn durable_ceiling_reached(kernel: &Kernel) -> bool {
     kernel
         .revoked_records
@@ -7877,6 +7884,72 @@ mod pin_scan_tests {
             "a repeated revoke of an already-revoked capability scanned the pin table"
         );
     }
+
+    /// The same early return must hold while the pin table is non-empty: a
+    /// surviving export table is what makes the scan costly, and a future
+    /// `record_pins.is_empty()` shortcut or a scan moved above the
+    /// `newly_doomed == 0` return would pass the empty-table test above while
+    /// scanning every pin here (R-12 round 12, F1).
+    #[test]
+    fn a_repeated_revoke_does_not_scan_a_foreign_pin_table() {
+        let agent = Agent::new();
+        agent.set_durable_capabilities(true);
+        agent.set_record_seal_key([0x66; 32]);
+        let provider = agent.register(Box::new(Echo));
+        let victim = agent
+            .mint(provider, 0, CapAttrs::new(&["echo"]))
+            .expect("victim root");
+        let mut pinned_attrs = CapAttrs::new(&["echo"]);
+        pinned_attrs.persistence = CapPersistence::Durable;
+        let owner = crate::identity::IdentityPolicy::default()
+            .admit(
+                Some(&crate::identity::PeerIdentity::from_certificate(b"pins")),
+                false,
+            )
+            .expect("admitted");
+        let pinned_root = agent
+            .mint_bound(&owner, provider, 1, pinned_attrs)
+            .expect("pinned root");
+        let mut children = Vec::new();
+        for _ in 0..64 {
+            let mut attrs = CapAttrs::new(&["echo"]);
+            attrs.persistence = CapPersistence::Durable;
+            attrs.budget.max_calls = 1;
+            attrs.budget.max_bytes = 1;
+            let child = agent.attenuate(&pinned_root, attrs).expect("durable child");
+            agent.export_capability(&child).expect("export");
+            children.push(child);
+        }
+        // Dropping the handles leaves the export pins in place: the pin, not
+        // the handle, keeps the record restorable.
+        drop(children);
+        assert_eq!(
+            agent.export_pin_count(),
+            64,
+            "the export table must survive the dropped handles"
+        );
+        agent.revoke(&victim).expect("the first revoke scans once");
+        let before = agent.cell.borrow().pin_scans.get();
+        assert!(before >= 1, "the first revoke must run the scan");
+        assert_eq!(
+            agent.export_pin_count(),
+            64,
+            "an unrelated revoke must not release a foreign pin"
+        );
+        for _ in 0..200 {
+            let _ = agent.revoke(&victim);
+        }
+        let after = agent.cell.borrow().pin_scans.get();
+        assert_eq!(
+            after, before,
+            "a repeated revoke scanned a non-empty pin table"
+        );
+        assert_eq!(
+            agent.export_pin_count(),
+            64,
+            "the repeats must not disturb the pins"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7908,6 +7981,30 @@ mod durable_counter_tests {
         attrs
     }
 
+    /// A durable child grant small enough that several exports can each
+    /// reserve their own copy from the parent (export reserves the child's
+    /// remaining grant on every meter in its chain).
+    fn small_durable() -> CapAttrs {
+        let mut attrs = durable();
+        attrs.budget.max_calls = 1;
+        attrs.budget.max_bytes = 1;
+        attrs
+    }
+
+    /// The counter and the registry must agree at every step.
+    fn assert_counter_matches(agent: &Agent) {
+        let kernel = agent.cell.borrow();
+        let counted = kernel
+            .caps
+            .values()
+            .filter(|record| record.attrs.persistence == CapPersistence::Durable && !record.revoked)
+            .count();
+        assert_eq!(
+            counted, kernel.live_durable_caps,
+            "the counter drifted from the registry"
+        );
+    }
+
     /// The counter `durable_ceiling_reached` reads must match a fresh count of
     /// the registry at every lifecycle step, or a drift silently raises or
     /// lowers the tombstone ceiling (R-12 round 11, F5).
@@ -7920,37 +8017,115 @@ mod durable_counter_tests {
         let owner = IdentityPolicy::default()
             .admit(Some(&PeerIdentity::from_certificate(b"owner")), false)
             .expect("admitted");
-        let manual = |agent: &Agent| {
-            let kernel = agent.cell.borrow();
-            let counted = kernel
-                .caps
-                .values()
-                .filter(|record| {
-                    record.attrs.persistence == CapPersistence::Durable && !record.revoked
-                })
-                .count();
-            assert_eq!(
-                counted, kernel.live_durable_caps,
-                "the counter drifted from the registry"
-            );
-        };
         let root = agent
             .mint_bound(&owner, provider, 0, durable())
             .expect("durable root");
-        manual(&agent);
+        assert_counter_matches(&agent);
         let child = agent.attenuate(&root, durable()).expect("durable child");
-        manual(&agent);
+        assert_counter_matches(&agent);
         let ephemeral = agent
             .mint(provider, 0, CapAttrs::new(&["echo"]))
             .expect("ephemeral");
-        manual(&agent);
+        assert_counter_matches(&agent);
         drop(ephemeral);
-        manual(&agent);
+        assert_counter_matches(&agent);
         agent.export_capability(&child).expect("export");
-        manual(&agent);
+        assert_counter_matches(&agent);
         drop(child);
-        manual(&agent);
+        assert_counter_matches(&agent);
         agent.revoke(&root).expect("revoke the tree");
-        manual(&agent);
+        assert_counter_matches(&agent);
+    }
+
+    /// Restore, tombstone and rotation each move capabilities between durable
+    /// and revoked (or leave them live while a record is tombstoned), so the
+    /// counter must follow every one of them (R-12 round 12, F4).
+    #[test]
+    fn the_live_durable_counter_follows_restore_tombstone_and_rotation() {
+        let agent = Agent::new();
+        agent.set_durable_capabilities(true);
+        agent.set_record_seal_key([0x65; 32]);
+        let provider = agent.register(Box::new(Echo));
+        let old = IdentityPolicy::default()
+            .admit(
+                Some(&PeerIdentity::from_certificate(b"rotating-owner")),
+                false,
+            )
+            .expect("admitted");
+        let new = IdentityPolicy::default()
+            .admit(
+                Some(&PeerIdentity::from_certificate(b"rotated-owner")),
+                false,
+            )
+            .expect("admitted");
+        let root = agent
+            .mint_bound(&old, provider, 0, durable())
+            .expect("durable root");
+        assert_counter_matches(&agent);
+        let child = agent
+            .attenuate(&root, small_durable())
+            .expect("durable child");
+        assert_counter_matches(&agent);
+
+        // Restore mints a fresh durable capability in the restoring kernel and
+        // releases the record's pin; the counter counts the restored copy. The
+        // record is refused by its exporting kernel while the original is live,
+        // so the restore runs on a second kernel with the same seal key.
+        let record = agent.export_capability(&child).expect("export");
+        assert_counter_matches(&agent);
+        let restorer = Agent::new();
+        restorer.set_durable_capabilities(true);
+        restorer.set_record_seal_key([0x65; 32]);
+        restorer.register(Box::new(Echo));
+        // A refused restore must not mint anything, so the counter stays put.
+        let stranger = IdentityPolicy::default()
+            .admit(Some(&PeerIdentity::from_certificate(b"stranger")), false)
+            .expect("admitted");
+        let error = restorer
+            .restore_capability(&record, &stranger)
+            .expect_err("a record restores only for its own peer");
+        assert_eq!(error.code(), "rpc/identity", "{error}");
+        assert_counter_matches(&restorer);
+        let restored = restorer
+            .restore_capability(&record, &old)
+            .expect("restore the record");
+        assert_counter_matches(&restorer);
+        assert_eq!(
+            restorer.restored_record_count(),
+            1,
+            "the record was restored exactly once"
+        );
+        drop(restored);
+        assert_counter_matches(&restorer);
+
+        // A tombstone revokes every live capability carrying the record id.
+        assert_counter_matches(&agent);
+        agent
+            .tombstone_record(record.record_id)
+            .expect("tombstone the record");
+        assert_counter_matches(&agent);
+
+        // The rotation tombstones the exported record of the old peer while
+        // the capability itself stays live and re-bound. The tombstone is not
+        // a capability revocation, so the live count must not move; a path that
+        // decremented it here would drift from the registry.
+        let rotated = agent
+            .attenuate(&root, small_durable())
+            .expect("a second durable child");
+        assert_counter_matches(&agent);
+        agent
+            .export_capability(&rotated)
+            .expect("export for rotation");
+        assert_counter_matches(&agent);
+        agent
+            .reintroduce_to(&root, old.identity(), &new)
+            .expect("rotate the tree");
+        assert_counter_matches(&agent);
+        assert!(
+            agent.record_tombstone_count() >= 1,
+            "the rotation must tombstone the old peer's record"
+        );
+        agent.revoke(&root).expect("revoke the tree");
+        assert_counter_matches(&agent);
     }
 }
