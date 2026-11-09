@@ -3286,6 +3286,38 @@ impl Agent {
                 kernel.metrics.backpressure_refusals.saturating_add(1);
             return Err(Error::Backpressure("the kernel's channel byte ceiling"));
         }
+        // A send exercises every transferred capability's grant, exactly like
+        // a publish or a call: the payload is charged against each cap's
+        // meter plus its ancestors (RPC-03, SEC-F2). The check runs for
+        // every chain before any meter is charged, so a refused send spends
+        // nothing -- the same check-then-charge shape `publish_inner` uses.
+        // A shared ancestor is charged once per chain that reaches it: the
+        // send exercises each transferred grant, and each grant draws on
+        // its ancestors.
+        let mut chains: Vec<Vec<CapId>> = Vec::with_capacity(cap_ids.len());
+        for id in &cap_ids {
+            let mut chain: Vec<CapId> = kernel
+                .caps
+                .get(id)
+                .map(|record| record.lineage.clone())
+                .unwrap_or_default();
+            chain.push(*id);
+            chains.push(chain);
+        }
+        for chain in &chains {
+            for id in chain {
+                if let Some(meter) = meter_for(&kernel, *id)? {
+                    meter.check(payload_bytes)?;
+                }
+            }
+        }
+        for chain in &chains {
+            for id in chain {
+                if let Some(meter) = meter_mut_for(&mut kernel, *id)? {
+                    meter.charge(payload_bytes)?;
+                }
+            }
+        }
         let record = kernel
             .channels
             .get_mut(&channel)
