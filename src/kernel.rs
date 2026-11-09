@@ -5190,7 +5190,12 @@ impl Agent {
                 // another principal's call, and a peer that guesses a key must not
                 // learn it: the owner check runs first, so the two answers are
                 // indistinguishable to a stranger (R-11 round 14, F2).
-                if stored_from_peer != peer.is_some()
+                // The comparison is against `peer.is_some() || from_peer`, the
+                // same expression the miss path stores: an envelope call from
+                // a peer that presents no identity stores `true` (F1-NF-06),
+                // and comparing it against `peer.is_some()` alone made every
+                // retry of such a key look like another peer's claim.
+                if stored_from_peer != (peer.is_some() || from_peer)
                     || stored_peer != crate::identity::presented_fingerprint(peer)
                 {
                     let error = Error::Identity("the idempotency key belongs to another peer");

@@ -7,6 +7,7 @@ use active_rpc::budget::Budget;
 use active_rpc::cap::CapAttrs;
 use active_rpc::kernel::MAX_IDEMPOTENCY;
 use active_rpc::value::{Arg, Call, Response, Value};
+use active_rpc::wire::Envelope;
 use active_rpc::{Agent, Provider};
 
 struct Counting {
@@ -89,6 +90,57 @@ fn the_same_key_returns_the_same_promise_and_runs_once() {
         .expect("third");
     agent.run();
     third.value().expect("value");
+    assert_eq!(calls.get(), 2);
+}
+
+#[test]
+fn an_anonymous_peers_envelope_call_replays() {
+    // F1-NF-06: an idempotent call that arrives as an envelope from a peer
+    // that presents no identity must replay under the same key, like every
+    // other idempotent call. The owner check compared the stored
+    // `from_peer` flag against `peer.is_some()` alone, so the stored flag
+    // (`true` for an envelope call) never matched on replay (`false` for
+    // an anonymous peer) and every retry was refused as belonging to
+    // another peer.
+    let (agent, cap, lane, calls, _, _) = setup();
+    let envelope = Envelope::request(1, "mutate", vec![]);
+    let first = agent
+        .call_idempotent_from_envelope(None, lane, &cap, &envelope, "peer-order-1")
+        .expect("first");
+    let second = agent
+        .call_idempotent_from_envelope(None, lane, &cap, &envelope, "peer-order-1")
+        .expect("the same envelope replays");
+    assert_eq!(first.id(), second.id());
+    agent.run();
+    assert_eq!(first.value().expect("value"), Value::Bool(true));
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn a_key_claimed_in_process_cannot_be_replayed_from_an_envelope() {
+    // F1-NF-06 (guard): the owner check still distinguishes the two
+    // origins. A key claimed by an in-process call is not replayable from
+    // a peer envelope, and a key claimed from a peer envelope is not
+    // replayable in-process — the fix only makes the two definitions of
+    // "from a peer" agree with each other (R-11 round 14, F2).
+    let (agent, cap, lane, calls, _, _) = setup();
+    let first = agent
+        .call_idempotent(lane, &cap, "mutate", vec![], "order-1")
+        .expect("in-process claim");
+    let envelope = Envelope::request(1, "mutate", vec![]);
+    let replay = agent.call_idempotent_from_envelope(None, lane, &cap, &envelope, "order-1");
+    assert_eq!(replay.unwrap_err().code(), "rpc/identity");
+    agent.run();
+    first.value().expect("value");
+    assert_eq!(calls.get(), 1);
+    // And the reverse: an envelope claim is not replayable in-process.
+    let env_first = agent
+        .call_idempotent_from_envelope(None, lane, &cap, &envelope, "peer-order-1")
+        .expect("envelope claim");
+    let in_process = agent.call_idempotent(lane, &cap, "mutate", vec![], "peer-order-1");
+    assert_eq!(in_process.unwrap_err().code(), "rpc/identity");
+    agent.run();
+    env_first.value().expect("value");
     assert_eq!(calls.get(), 2);
 }
 
