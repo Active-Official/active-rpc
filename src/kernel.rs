@@ -3245,6 +3245,27 @@ impl Agent {
         if value_too_deep(&payload, crate::wire::MAX_VALUE_DEPTH) {
             return Err(Error::BudgetExceeded("depth"));
         }
+        // The channel path enforces the call path's egress policy: a value
+        // carrying structural secrets must not cross it (R2-BND-01). The one
+        // call also proves canonical form for a decodable image and fails
+        // closed on a corrupt one, so no separate `check_module_payload`
+        // call is needed here: opaque bytes pass, a secret image is refused
+        // as `provider/secret-material`, and a non-canonical image as a
+        // payload fault. The check runs after the shape/depth ceilings, so
+        // the policy walk never runs on a value deeper than the stack
+        // (round 30, L-8), and before any meter is charged, so a refused
+        // send spends nothing. The decode runs on bytes a guest may have
+        // chosen, so a panic in it is contained and reported as a provider
+        // fault, exactly as the call path contains it.
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::security::assert_no_structural_secrets(&payload)
+        }))
+        .unwrap_or_else(|_| {
+            Err(Error::Provider {
+                code: "provider/egress-panic".to_string(),
+            })
+        });
+        checked?;
         // Two quantities, each with one owner. The caller's grant pays for the
         // payload it moves, which is what `Budget::max_bytes` documents. The
         // channel and the kernel pay for the whole stored record, which is what
@@ -3469,6 +3490,27 @@ impl Agent {
         if value_too_deep(&payload, crate::wire::MAX_VALUE_DEPTH) {
             return Err(Error::BudgetExceeded("depth"));
         }
+        // The channel path enforces the call path's egress policy: a value
+        // carrying structural secrets must not cross it (R2-BND-01). The one
+        // call also proves canonical form for a decodable image and fails
+        // closed on a corrupt one, so no separate `check_module_payload`
+        // call is needed here: opaque bytes pass, a secret image is refused
+        // as `provider/secret-material`, and a non-canonical image as a
+        // payload fault. The check runs after the shape/depth ceilings, so
+        // the policy walk never runs on a value deeper than the stack
+        // (round 30, L-8), and before any meter is charged, so a refused
+        // publish spends nothing. The decode runs on bytes a guest may have
+        // chosen, so a panic in it is contained and reported as a provider
+        // fault, exactly as the call path contains it.
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::security::assert_no_structural_secrets(&payload)
+        }))
+        .unwrap_or_else(|_| {
+            Err(Error::Provider {
+                code: "provider/egress-panic".to_string(),
+            })
+        });
+        checked?;
         // The topic name is metadata the channel stores and forwards, so it is
         // payload as far as the grant is concerned: charging only the value let
         // a 1 KiB topic ride through a 32-byte budget.

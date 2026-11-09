@@ -7,6 +7,8 @@
 //! that holds `&Agent` also sees a channel's existence and counts regardless of
 //! subscription, which is what the ADRs now say (L-3).
 
+use active_infinity::layout::EncodeOpts;
+use active_infinity::{encode, encode_with, InfinityModule, Inode};
 use active_rpc::cap::CapAttrs;
 use active_rpc::channel::{
     Channel, ChannelId, Direction, Message, MAX_QUEUED_BYTES, MAX_QUEUED_PER_CHANNEL,
@@ -437,4 +439,203 @@ fn a_send_charges_the_ancestors_of_a_transferred_cap() {
         "the parent grant must pay for the child's send"
     );
     assert_eq!(agent.remaining_calls(&parent).expect("meter"), 9);
+}
+
+/// A module whose root table holds one structural secret (R2-BND-01).
+fn secret_module() -> InfinityModule {
+    let mut module = InfinityModule::new();
+    let secret = module.push(Inode::Secret(active_infinity::SecretBytes::new(b"canary")));
+    let root = module.push(Inode::Table {
+        fields: vec![("token".to_string(), secret)],
+    });
+    module.set_root(Some(root));
+    module
+}
+
+/// A canonical secret-free module: one string under the root table.
+fn plain_module() -> InfinityModule {
+    let mut module = InfinityModule::new();
+    let node = module.push(Inode::Str("plain".to_string()));
+    let root = module.push(Inode::Table {
+        fields: vec![("v".to_string(), node)],
+    });
+    module.set_root(Some(root));
+    module
+}
+
+/// R2-BND-01: the channel path enforces the call path's egress policy. A
+/// secret-bearing module is refused at the send choke point with the same
+/// `provider/secret-material` the call path produces, nothing is enqueued,
+/// and the refusal spends nothing.
+#[test]
+fn a_send_refuses_a_secret_bearing_module() {
+    let agent = Agent::with_secret([0x53u8; 32]);
+    let provider = agent.register(Box::new(Sink));
+    let lane_a = agent.create_lane("a", Budget::default()).expect("lane a");
+    let lane_b = agent.create_lane("b", Budget::default()).expect("lane b");
+    let channel = agent
+        .create_channel("pipe", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane_a, channel).expect("sub a");
+    agent.subscribe(lane_b, channel).expect("sub b");
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["noop"]).with_budget(Budget {
+                max_calls: 5,
+                max_bytes: 10_000,
+                ..Budget::default()
+            }),
+        )
+        .expect("cap");
+    let secret = Value::Module(encode(&secret_module()).expect("encode"));
+    let refused = agent.send(lane_a, channel, secret, std::slice::from_ref(&cap));
+    let error = refused.expect_err("a secret-bearing module must not cross a channel");
+    assert_eq!(error.code(), "rpc/provider");
+    assert_eq!(error.provider_code(), Some("provider/secret-material"));
+    // Nothing was enqueued and nothing was spent: the refusal happens
+    // before the charge, exactly as a refused call spends nothing.
+    assert!(
+        agent.recv(lane_b, channel).expect("recv").is_none(),
+        "a refused send must enqueue nothing"
+    );
+    assert_eq!(agent.remaining_bytes(&cap).expect("meter"), 10_000);
+    assert_eq!(agent.remaining_calls(&cap).expect("meter"), 5);
+    // The gate walks the value, so a secret nested in a list is refused too.
+    let nested = Value::List(vec![Value::Module(
+        encode(&secret_module()).expect("encode"),
+    )]);
+    let refused = agent.send(lane_a, channel, nested, std::slice::from_ref(&cap));
+    assert_eq!(
+        refused
+            .expect_err("a nested secret-bearing module must not cross either")
+            .code(),
+        "rpc/provider"
+    );
+    assert_eq!(agent.remaining_bytes(&cap).expect("meter"), 10_000);
+    assert_eq!(agent.remaining_calls(&cap).expect("meter"), 5);
+    // Clean traffic still flows through the same channel.
+    agent
+        .send(
+            lane_a,
+            channel,
+            Value::text("ok"),
+            std::slice::from_ref(&cap),
+        )
+        .expect("clean send");
+    let message = agent
+        .recv(lane_b, channel)
+        .expect("recv")
+        .expect("a message is waiting");
+    assert_eq!(message.payload, Value::text("ok"));
+}
+
+/// R2-BND-01: the same gate at the publish choke point.
+#[test]
+fn a_publish_refuses_a_secret_bearing_module() {
+    let agent = Agent::with_secret([0x54u8; 32]);
+    let provider = agent.register(Box::new(Sink));
+    let lane = agent.create_lane("pub", Budget::default()).expect("lane");
+    let lane_b = agent.create_lane("recv", Budget::default()).expect("lane b");
+    let channel = agent
+        .create_channel("leak", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane, channel).expect("subscribe sender lane");
+    agent.subscribe(lane_b, channel).expect("subscribe receiver lane");
+    let mut attrs = CapAttrs::new(&["noop"]).with_budget(Budget {
+        max_calls: 5,
+        max_bytes: 10_000,
+        ..Budget::default()
+    });
+    attrs.publish = true;
+    let cap = agent.mint(provider, 0, attrs).expect("publish cap");
+    let secret = Value::Module(encode(&secret_module()).expect("encode"));
+    let refused = agent.publish(lane, channel, &cap, "t", secret);
+    let error = refused.expect_err("a secret-bearing module must not be published");
+    assert_eq!(error.code(), "rpc/provider");
+    assert_eq!(error.provider_code(), Some("provider/secret-material"));
+    assert!(
+        agent
+            .recv_topic(lane_b, channel, "t")
+            .expect("recv")
+            .is_none(),
+        "a refused publish must enqueue nothing"
+    );
+    assert_eq!(agent.remaining_bytes(&cap).expect("meter"), 10_000);
+    assert_eq!(agent.remaining_calls(&cap).expect("meter"), 5);
+    // Clean traffic still flows through the same channel and topic.
+    agent
+        .publish(lane, channel, &cap, "t", Value::text("ok"))
+        .expect("clean publish");
+    let message = agent
+        .recv_topic(lane_b, channel, "t")
+        .expect("recv")
+        .expect("a message is waiting");
+    assert_eq!(message.payload, Value::text("ok"));
+}
+
+/// R2-BND-01, design step 2: the same gate also proves canonical form, so a
+/// decodable-but-non-canonical image is refused as a payload fault, not
+/// delivered. (Wire ingress is the separate BND-F2 hole and stays open.)
+#[test]
+fn a_send_refuses_a_non_canonical_module() {
+    let agent = Agent::with_secret([0x55u8; 32]);
+    let lane_a = agent.create_lane("a", Budget::default()).expect("lane a");
+    let lane_b = agent.create_lane("b", Budget::default()).expect("lane b");
+    let channel = agent
+        .create_channel("pipe", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane_a, channel).expect("sub a");
+    agent.subscribe(lane_b, channel).expect("sub b");
+    let non_canonical = Value::Module(
+        encode_with(
+            &plain_module(),
+            EncodeOpts {
+                write_hash: true,
+                mark_canonical: false,
+                streamed: false,
+            },
+        )
+        .expect("encode"),
+    );
+    let refused = agent.send(lane_a, channel, non_canonical, &[]);
+    let error = refused.expect_err("a non-canonical image must not cross a channel");
+    assert_eq!(error.code(), "rpc/payload");
+    assert!(
+        agent.recv(lane_b, channel).expect("recv").is_none(),
+        "a refused send must enqueue nothing"
+    );
+}
+
+/// R2-BND-01 control: the gate refuses secrets, not modules. A canonical
+/// secret-free image and an opaque (non-image) module both still cross.
+#[test]
+fn a_canonical_secret_free_module_and_an_opaque_module_still_cross_a_channel() {
+    let agent = Agent::with_secret([0x56u8; 32]);
+    let lane_a = agent.create_lane("a", Budget::default()).expect("lane a");
+    let lane_b = agent.create_lane("b", Budget::default()).expect("lane b");
+    let channel = agent
+        .create_channel("pipe", Direction::Both)
+        .expect("channel");
+    agent.subscribe(lane_a, channel).expect("sub a");
+    agent.subscribe(lane_b, channel).expect("sub b");
+    let plain = Value::Module(encode(&plain_module()).expect("encode"));
+    agent
+        .send(lane_a, channel, plain.clone(), &[])
+        .expect("a canonical secret-free image crosses");
+    let message = agent
+        .recv(lane_b, channel)
+        .expect("recv")
+        .expect("a message is waiting");
+    assert_eq!(message.payload, plain);
+    let opaque = Value::Module(b"not an image".to_vec());
+    agent
+        .send(lane_a, channel, opaque.clone(), &[])
+        .expect("opaque bytes are not an image and cross");
+    let message = agent
+        .recv(lane_b, channel)
+        .expect("recv")
+        .expect("a message is waiting");
+    assert_eq!(message.payload, opaque);
 }
