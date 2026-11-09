@@ -1014,6 +1014,10 @@ pub struct StdioTransport {
     /// silent server would otherwise block the single-threaded kernel for as
     /// long as it stays quiet.
     lines: std::sync::mpsc::Receiver<Result<String>>,
+    /// Inodes of the stdout pipe the reader thread holds, captured at spawn
+    /// (R2-R08B-01): the drop kill needs them to find a descendant that
+    /// left the process group. Empty outside Linux.
+    pipes: Vec<u64>,
 }
 
 impl StdioTransport {
@@ -1073,15 +1077,17 @@ impl StdioTransport {
         let mut child = command.spawn().map_err(|error| Error::Provider {
             code: format!("mcp/spawn:{error}"),
         })?;
+        // Captured before the streams are taken into reader threads.
+        let pipes = child_pipe_inodes(&child);
         let stdin = child.stdin.take().ok_or_else(|| {
             // `Child::Drop` neither kills nor reaps (round 13, F-7).
-            kill_process_tree(&mut child);
+            kill_process_tree(&mut child, &pipes);
             Error::Provider {
                 code: "mcp/stdin".to_string(),
             }
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
-            kill_process_tree(&mut child);
+            kill_process_tree(&mut child, &pipes);
             Error::Provider {
                 code: "mcp/stdout".to_string(),
             }
@@ -1147,7 +1153,7 @@ impl StdioTransport {
             .map_err(|error| {
                 // `Child`'s Drop neither kills nor reaps: the server would
                 // outlive the error return (round 9, F-5).
-                kill_process_tree(&mut child);
+                kill_process_tree(&mut child, &pipes);
                 Error::Provider {
                     code: format!("mcp/thread:{error}"),
                 }
@@ -1164,7 +1170,7 @@ impl StdioTransport {
         // the life of the process. It takes the same process-wide slot as a
         // reader (round 58, L-4).
         let writer_slot = ReaderSlot::acquire().ok_or_else(|| {
-            kill_process_tree(&mut child);
+            kill_process_tree(&mut child, &pipes);
             Error::Provider {
                 code: "mcp/thread:too many readers".to_string(),
             }
@@ -1192,7 +1198,7 @@ impl StdioTransport {
             .map_err(|error| {
                 // The reader's arm already kills the child; this one must too
                 // (`Child::Drop` neither kills nor reaps) (round 10, F-1).
-                kill_process_tree(&mut child);
+                kill_process_tree(&mut child, &pipes);
                 Error::Provider {
                     code: format!("mcp/thread:{error}"),
                 }
@@ -1201,6 +1207,7 @@ impl StdioTransport {
             child,
             writer,
             lines,
+            pipes,
         })
     }
 }
@@ -1323,7 +1330,7 @@ impl McpTransport for StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        kill_process_tree(&mut self.child);
+        kill_process_tree(&mut self.child, &self.pipes);
     }
 }
 
@@ -3268,6 +3275,152 @@ pub(crate) fn args_contain_secret(args: &[Arg]) -> bool {
     })
 }
 
+/// Inode of the pipe behind `fd`, or `None` when it cannot be read
+/// (R2-R08B-01). The inode is what identifies a child's pipes after the
+/// leader exits: a descendant that called `setsid` keeps the write end,
+/// and only the inode can find it again. Read through `/proc/self/fd` --
+/// the crate forbids `unsafe`, so there is no `fstat` to call.
+#[cfg(target_os = "linux")]
+fn pipe_inode(fd: std::os::unix::io::RawFd) -> Option<u64> {
+    let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    pipe_inode_of_link(&link)
+}
+
+/// SIGKILL one pid through the `kill` binary (R2-R08B-01). The crate
+/// forbids `unsafe`, so there is no `libc::kill` to call; the group kill
+/// below uses the same mechanism.
+#[cfg(target_os = "linux")]
+fn kill_one(pid: u32) {
+    let pid = pid.to_string();
+    for candidate in ["/bin/kill", "/usr/bin/kill"] {
+        let killed = Command::new(candidate)
+            .args(["-KILL", "--", pid.as_str()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if killed {
+            break;
+        }
+    }
+}
+
+/// Inodes of the pipes a just-spawned child writes to (its stdout/stderr),
+/// on Linux; empty elsewhere. Captured before the streams are taken into
+/// reader threads, so the timeout kill can find a descendant that left the
+/// process group (R2-R08B-01).
+fn child_pipe_inodes(child: &Child) -> Vec<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut pipes = Vec::new();
+        if let Some(stdout) = child.stdout.as_ref() {
+            if let Some(ino) = pipe_inode(stdout.as_raw_fd()) {
+                pipes.push(ino);
+            }
+        }
+        if let Some(stderr) = child.stderr.as_ref() {
+            if let Some(ino) = pipe_inode(stderr.as_raw_fd()) {
+                pipes.push(ino);
+            }
+        }
+        pipes
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child;
+        Vec::new()
+    }
+}
+
+/// The inode of a `pipe:[ino]` link target, or `None` for anything else.
+#[cfg(target_os = "linux")]
+fn pipe_inode_of_link(link: &std::path::Path) -> Option<u64> {
+    let text = link.to_string_lossy();
+    let inner = text.strip_prefix("pipe:[")?.strip_suffix(']')?;
+    inner.parse().ok()
+}
+
+/// True when `/proc/<pid>/fdinfo/<fd>` says the descriptor is open for
+/// writing (access-mode bits 1 or 2). A read end (`0`) is a reader
+/// thread's side and must never be killed for holding it.
+#[cfg(target_os = "linux")]
+fn fd_is_write_end(pid: u32, name: &std::ffi::OsStr) -> bool {
+    let Ok(info) = std::fs::read_to_string(format!(
+        "/proc/{pid}/fdinfo/{}",
+        name.to_string_lossy()
+    )) else {
+        return false;
+    };
+    for line in info.lines() {
+        if let Some(flags) = line.strip_prefix("flags:") {
+            if let Ok(flags) = u32::from_str_radix(flags.trim(), 8) {
+                return flags & 0o3 != 0;
+            }
+        }
+    }
+    false
+}
+
+/// SIGKILL every process still holding the write end of one of `pipes`
+/// (R2-R08B-01, Linux only). A descendant that called `setsid` left the
+/// leader's process group, so the group kill cannot reach it -- but it
+/// cannot drop the pipe it inherited, and `/proc` names every holder.
+/// The scan repeats until a pass finds no holders, so a holder that
+/// forks between passes is caught by the next one; the passes are
+/// bounded so a pathological tree cannot spin the killer forever.
+/// Our own pid is skipped: the reader threads hold the read ends.
+#[cfg(target_os = "linux")]
+fn kill_pipe_holders(pipes: &[u64]) {
+    if pipes.is_empty() {
+        return;
+    }
+    let me = std::process::id();
+    for _ in 0..4 {
+        let mut holders: Vec<u32> = Vec::new();
+        let Ok(proc) = std::fs::read_dir("/proc") else {
+            return;
+        };
+        for entry in proc.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == me {
+                continue;
+            }
+            let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+                continue;
+            };
+            let mut holds = false;
+            for fd in fds.flatten() {
+                let Ok(link) = std::fs::read_link(fd.path()) else {
+                    continue;
+                };
+                let Some(ino) = pipe_inode_of_link(&link) else {
+                    continue;
+                };
+                if !pipes.contains(&ino) {
+                    continue;
+                }
+                if fd_is_write_end(pid, &fd.file_name()) {
+                    holds = true;
+                    break;
+                }
+            }
+            if holds {
+                holders.push(pid);
+            }
+        }
+        if holders.is_empty() {
+            break;
+        }
+        for pid in holders {
+            kill_one(pid);
+        }
+    }
+}
+
 /// End a child's process tree and reap the leader.
 ///
 /// On Unix the caller puts the child in its own process group, so one signal
@@ -3282,7 +3435,8 @@ pub(crate) fn args_contain_secret(args: &[Arg]) -> bool {
 /// needs `unsafe` FFI, which this crate forbids; until that lands, a descendant
 /// that outlives its leader is a recorded residual (STATUS.md), and no helper
 /// executable is ever launched.
-fn kill_process_tree(child: &mut Child) {
+
+fn kill_process_tree(child: &mut Child, pipes: &[u64]) {
     #[cfg(windows)]
     {
         let _ = child.kill();
@@ -3305,6 +3459,14 @@ fn kill_process_tree(child: &mut Child) {
                 break;
             }
         }
+        // A descendant that called `setsid` left the group, so the signal
+        // above never reaches it -- but it still holds the pipes, and on
+        // Linux the pipe inode finds every holder (R2-R08B-01). On other
+        // Unix there is no `/proc` to walk, so the group kill is all there
+        // is; the reader threads there still release when the descendant
+        // exits on its own schedule.
+        #[cfg(target_os = "linux")]
+        kill_pipe_holders(pipes);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -3692,6 +3854,8 @@ impl Provider for LocalProcess {
         let mut child = command.spawn().map_err(|error| Error::Provider {
             code: format!("process/spawn:{error}"),
         })?;
+        // Captured before the streams are taken into reader threads.
+        let pipes = child_pipe_inodes(&child);
         // Drain both pipes on their own threads. A child that writes more than
         // the ceiling stops being drained, blocks on the pipe, and is killed at
         // the deadline instead of growing our memory.
@@ -3818,7 +3982,7 @@ impl Provider for LocalProcess {
                 .map(|stream| Box::new(stream) as Box<dyn std::io::Read + Send>),
         );
         if let Some(error) = spawn_error {
-            kill_process_tree(&mut child);
+            kill_process_tree(&mut child, &pipes);
             // The child was already spawned, so it may have acted: the refusal is
             // a withheld reply (round 44, M-1).
             return Err(reply_withheld(Error::Provider {
@@ -3856,7 +4020,7 @@ impl Provider for LocalProcess {
                         // Both pipes together: checking each separately let a
                         // grant pay for twice the bytes (round 20, M2).
                         if stdout.len().saturating_add(stderr.len()) > max_output {
-                            kill_process_tree(&mut child);
+                            kill_process_tree(&mut child, &pipes);
                             // The child ran: the effect may stand, so a retry
                             // must not fork it again (round 43, F-4).
                             return Err(reply_withheld(Error::ToolPolicy("output too large")));
@@ -3866,13 +4030,13 @@ impl Provider for LocalProcess {
                         // The whole tree is killed, not just the direct child:
                         // the leader may have exited already while a descendant
                         // still holds the pipes.
-                        kill_process_tree(&mut child);
+                        kill_process_tree(&mut child, &pipes);
                         return Err(reply_withheld(Error::Timeout));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(error) => {
-                    kill_process_tree(&mut child);
+                    kill_process_tree(&mut child, &pipes);
                     return Err(reply_withheld(Error::Provider {
                         code: format!("process/wait:{error}"),
                     }));
@@ -3885,7 +4049,7 @@ impl Provider for LocalProcess {
         // leave a background process acting on the capability's behalf.
         while received < readers {
             let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                kill_process_tree(&mut child);
+                kill_process_tree(&mut child, &pipes);
                 return Err(reply_withheld(Error::Timeout));
             };
             match receiver.recv_timeout(left) {
@@ -3900,12 +4064,12 @@ impl Provider for LocalProcess {
                     // exits; refuse at the same ceiling instead of waiting out
                     // the grant (round 11, #2).
                     if stdout.len().saturating_add(stderr.len()) > max_output {
-                        kill_process_tree(&mut child);
+                        kill_process_tree(&mut child, &pipes);
                         return Err(reply_withheld(Error::ToolPolicy("output too large")));
                     }
                 }
                 Err(_) => {
-                    kill_process_tree(&mut child);
+                    kill_process_tree(&mut child, &pipes);
                     // The child ran; the drain deadline is a withheld reply
                     // (round 43, F-4).
                     return Err(reply_withheld(Error::Timeout));
