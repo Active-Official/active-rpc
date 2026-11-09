@@ -16,17 +16,18 @@ maturity release; the executed record lives in `STATUS.md`.
 
 ## The release workflow
 
-Pushing the tag runs `.github/workflows/release.yml` in that repository, which
+Pushing the tag runs `.github/workflows/release.yml`, which first verifies the
+tag's SSH signature (`scripts/verify_tag.sh`), asserts the tag version equals
+the library version in `Cargo.toml`, and requires the CI workflow to be green
+for the tagged commit; then it re-runs the format, clippy and test gates on the
+tagged commit, generates `dist/active-rpc-<version>.cdx.json` from
+`cargo metadata --locked`, verifies it with `scripts/sbom.py --check`, creates
+the GitHub Release if it does not exist, uploads the SBOM (never replacing an
+existing asset) and asserts the asset is attached. The job can also be run for
+an existing tag with `workflow_dispatch` -- it checks out the tag itself, not
+the dispatch branch.
 
-1. re-runs the format, clippy and test gates on the tagged commit,
-2. generates `dist/active-rpc-<version>.cdx.json` from `cargo metadata --locked`
-   and verifies it with `scripts/sbom.py --check`,
-3. creates the GitHub Release (generated notes) if it does not exist, uploads the
-   SBOM, and **asserts the asset is attached** (`gh release view --json assets`).
-
-The same job can be run for an existing tag with `workflow_dispatch` and the tag
-as input, which is how a release that was created by hand gets its SBOM. The
-workflow is the gate for M-5.1: an SBOM that is not attached is a failed run,
+The workflow is the gate for M-5.1: an SBOM that is not attached is a failed run,
 not a missing file someone notices later.
 
 Signing, attestation and the Sigstore spike: `docs/release-attestation.md`.
@@ -44,13 +45,13 @@ Signing, attestation and the Sigstore spike: `docs/release-attestation.md`.
    Both SHAs must equal the local `HEAD`.
 2. **Tag and push the tag.**
    ```text
-   git tag -a vX.Y.Z -m "active-rpc X.Y.Z"
+   git tag -s vX.Y.Z -m "active-rpc X.Y.Z"
    git push official vX.Y.Z
    git push ratio vX.Y.Z
    ```
    Tag pushes run the full CI, including the audit, deny and SBOM release gates.
-   A signed tag is produced when a signing key is available
-   (`git tag -s`).
+   The tag MUST be signed (`git tag -s`): the release job refuses unsigned
+   tags (`scripts/verify_tag.sh`), and an unsigned tag can never be released.
 3. **Publish the kernel.** `cargo publish`, waiting for the registry to report
    the version available.
 4. **Publish the CLI.** It pins the kernel version, so it must follow:

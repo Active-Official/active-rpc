@@ -1,10 +1,17 @@
 name: Release
 
-# A tag is the release trigger. This job re-runs the gates on the tagged commit,
-# generates the CycloneDX SBOM for the exact locked graph, and attaches it to the
-# GitHub Release. The release notes are generated from the commits since the
-# previous tag; crates.io publishing stays a human step (see
-# `docs/release-runbook.md`) so a registry token is never held by CI.
+# A tag is the release trigger. Before anything is built or published, the
+# job proves the tag is what it claims to be: it checks out the tag itself
+# (never the dispatch branch), verifies the tag's SSH signature with
+# scripts/verify_tag.sh, asserts the tag version equals the library version
+# in Cargo.toml, and requires the CI workflow to be green for the tagged
+# commit. Only then does it re-run the format, clippy and test gates on the
+# tagged commit, generate the CycloneDX SBOM for the exact locked graph,
+# and attach it to the GitHub Release. The release notes are generated from
+# the commits since the previous tag; crates.io publishing stays a human
+# step (see `docs/release-runbook.md`) so a registry token is never held
+# by CI. A release asset is never silently replaced: `gh release upload`
+# without --clobber fails if the asset already exists.
 on:
   push:
     tags: ["v*"]
@@ -14,16 +21,24 @@ on:
         description: "Existing tag to publish the SBOM for (for example v2.3.0)"
         required: true
 
-permissions:
-  contents: write
-
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      # contents: write creates the GitHub Release and uploads the SBOM.
+      # actions: read lets the CI-green check below read workflow runs.
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          # Check out the tag itself on BOTH paths. On the push-tag trigger
+          # the default ref is already the tag; on workflow_dispatch the
+          # default would be the dispatch branch (main), so the SBOM would
+          # be built from the wrong ref (R2-CI-02 hole 3). A nonexistent
+          # or non-tag ref fails here, before anything is published.
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
         with:
           components: rustfmt, clippy
@@ -33,6 +48,76 @@ jobs:
           tag="${{ inputs.tag || github.ref_name }}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - name: Verify the tag signature
+        # R2-CI-02 hole 1: FIRST, before any build or publish step. The
+        # script resolves the repo root from its own path and must be run
+        # from the repo root; it fails (rc=1) on an unsigned tag, on a
+        # missing tag, and when release-signing.allowed_signers is absent
+        # — three different failures, all fatal here.
+        run: scripts/verify_tag.sh "${{ steps.tag.outputs.tag }}"
+      - name: Assert the tag matches Cargo.toml
+        # R2-CI-02 hole 3: the tag names the library version, so the SBOM
+        # filename and content can only agree when the tag version equals
+        # the library version in Cargo.toml. A dispatched tag for any other
+        # version (or a branch name) fails here.
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${{ steps.tag.outputs.version }}"
+          pkg_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [ "$version" != "$pkg_version" ]; then
+            echo "tag $tag names version $version but Cargo.toml says $pkg_version" >&2
+            exit 1
+          fi
+          echo "tag $tag matches Cargo.toml $pkg_version"
+      - name: Require green CI for this commit
+        # R2-CI-02 hole 5: a dispatched release must not bypass the full
+        # CI. The tag push triggers the CI workflow for this same commit,
+        # so on the push-tag path the run may still be in flight: poll
+        # until it concludes (up to 60 minutes), then require success.
+        # On the dispatch path the run is the one from the tag push, so
+        # this returns as soon as it is found concluded. If no CI run
+        # exists for this commit, or it concludes anything but success,
+        # the release fails — never silently proceed. If the poll times
+        # out, re-run via workflow_dispatch once CI is green.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          start="$SECONDS"
+          while :; do
+            elapsed=$((SECONDS - start))
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&per_page=100" > "$RUNNER_TEMP/runs.json"
+            run="$(jq -c '.workflow_runs | map(select(.name == "CI" and .event == "push")) | sort_by(.created_at) | last // empty' "$RUNNER_TEMP/runs.json")"
+            if [ -z "$run" ]; then
+              status="missing"
+              conclusion="none"
+            else
+              status="$(printf '%s' "$run" | jq -r '.status // "missing"')"
+              conclusion="$(printf '%s' "$run" | jq -r '.conclusion // "none"')"
+            fi
+            case "$status" in
+              completed)
+                if [ "$conclusion" = "success" ]; then
+                  echo "CI is green for $sha"
+                  exit 0
+                fi
+                echo "CI concluded '$conclusion' for $sha; refusing to release" >&2
+                exit 1
+                ;;
+              missing)
+                if [ "$elapsed" -ge 300 ]; then
+                  echo "no CI run found for $sha after 5 minutes; refusing to release" >&2
+                  exit 1
+                fi
+                ;;
+            esac
+            if [ "$elapsed" -ge 3600 ]; then
+              echo "CI for $sha did not conclude within 60 minutes; refusing to release (re-run via workflow_dispatch once CI is green)" >&2
+              exit 1
+            fi
+            echo "CI status is '$status'; waiting 60s..."
+            sleep 60
+          done
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -54,9 +139,14 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag exists; attaching the SBOM"
           else
+            # The tag itself was already proven to exist (checkout with
+            # ref: + verify_tag.sh above), so this can only create the
+            # Release object for that existing tag — it cannot mint a tag.
             gh release create "$tag" --title "active-rpc ${version}" --generate-notes
           fi
-          gh release upload "$tag" "dist/active-rpc-${version}.cdx.json" --clobber
+          # No --clobber: if the SBOM asset already exists the upload
+          # fails instead of silently replacing a released artifact.
+          gh release upload "$tag" "dist/active-rpc-${version}.cdx.json"
       - name: Verify the asset is attached
         env:
           GH_TOKEN: ${{ github.token }}

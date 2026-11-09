@@ -182,6 +182,45 @@ fn release_and_supply_chain_process_is_operational() {
             "release guide must contain {phrase}"
         );
     }
+    // R2-CI-02: the enforcement must live in the workflow, not only in the
+    // prose — a phrase-presence test over the runbook is the same class of
+    // hole as the one being fixed. Assert the release workflow itself
+    // verifies the tag, checks the tag out, checks the version, gates on
+    // green CI, and never silently replaces an asset — and that the two
+    // proofs run BEFORE the SBOM step (ordering, not mere presence).
+    let workflow =
+        fs::read_to_string(repo_path(".github/workflows/release.yml")).expect("release.yml");
+    let verify = workflow
+        .find("run: scripts/verify_tag.sh")
+        .expect("release.yml must invoke scripts/verify_tag.sh");
+    let version_check = workflow
+        .find("Assert the tag matches Cargo.toml")
+        .expect("release.yml must assert the tag matches Cargo.toml");
+    let sbom = workflow
+        .find("name: SBOM")
+        .expect("release.yml must have an SBOM step");
+    assert!(
+        verify < sbom,
+        "the tag-signature verification step must run before the SBOM step"
+    );
+    assert!(
+        version_check < sbom,
+        "the tag-version check must run before the SBOM step"
+    );
+    assert!(
+        workflow.contains("ref: ${{ inputs.tag || github.ref_name }}"),
+        "release.yml must check out the tag itself, not the dispatch branch"
+    );
+    assert!(
+        workflow.contains("Require green CI for this commit"),
+        "release.yml must require green CI before publishing"
+    );
+    for line in workflow.lines() {
+        assert!(
+            !(line.contains("gh release upload") && line.contains("--clobber")),
+            "release.yml must never silently replace a release asset (--clobber)"
+        );
+    }
 }
 
 #[test]
