@@ -9,7 +9,7 @@ use active_rpc::domain::ModuleProvider;
 use active_rpc::error::Error;
 use active_rpc::kernel::{Event, Provider};
 use active_rpc::value::{Arg, Call, Response, Value};
-use active_rpc::wire::{CapDescriptor, Envelope, Kind, WireLimits};
+use active_rpc::wire::{cap_table_hash, CapDescriptor, CapTableDelta, Envelope, Kind, WireLimits};
 use active_rpc::{Agent, Budget, PromiseState};
 
 const SOURCE: &str = r#"
@@ -1358,4 +1358,57 @@ fn a_large_pipelined_batch_keeps_every_handle_readable() {
     // Dropping the handles makes the records evictable on the next drain; the
     // kernel must not have needed that to serve the reads above.
     drop(handles);
+}
+
+/// RPC-52: the envelope's non-argument wire size is the encoded size of the
+/// method, the capability table and the delta — nothing more, nothing less.
+///
+/// An argument-less, payload-less envelope encodes to exactly the 24-byte
+/// fixed overhead (16-byte header, argument-count prefix, payload-length
+/// prefix) plus `non_argument_wire_size()`. If the size function ever drifts
+/// from the encoder, the kernel's byte charge is wrong by exactly that
+/// amount, so the two are pinned together here across every shape: no
+/// descriptors, one descriptor with a path scope, two descriptors, and a
+/// delta with removals and an addition.
+#[test]
+fn the_envelopes_non_argument_size_is_its_encoded_size_less_the_fixed_overhead() {
+    fn descriptor(id: u8, methods: &[&str], scope: Option<&str>) -> CapDescriptor {
+        CapDescriptor {
+            id: CapId([id; 16]),
+            methods: methods.iter().map(|name| name.to_string()).collect(),
+            budget: Budget::default(),
+            read_only: false,
+            redact: false,
+            path_scope: scope.map(str::to_string),
+        }
+    }
+    let delta = CapTableDelta {
+        base: cap_table_hash(&[]).expect("hash of the empty table"),
+        removed: vec![CapId([7u8; 16]), CapId([8u8; 16])],
+        added: vec![descriptor(9, &["echo"], Some("public"))],
+    };
+    let envelopes = vec![
+        Envelope::request(1, "echo", vec![]),
+        Envelope::request(2, "echo", vec![])
+            .with_caps(vec![descriptor(1, &["echo"], None)]),
+        Envelope::request(3, "echo", vec![]).with_caps(vec![
+            descriptor(2, &["a", "b"], Some("public.scope")),
+            descriptor(3, &["c"], None),
+        ]),
+        Envelope::request(4, "echo", vec![]).with_cap_delta(delta),
+    ];
+    for envelope in envelopes {
+        let encoded = envelope.encode().expect("encode");
+        assert_eq!(
+            encoded.len() as u64,
+            24 + envelope.non_argument_wire_size(),
+            "the size function must match the encoder for {envelope:?}"
+        );
+    }
+    // The descriptor size itself, field by field: 16 id + 4 count + one
+    // 4+4 method + 56 budget + 1 + 1 flags + 1 absent scope.
+    assert_eq!(
+        descriptor(1, &["echo"], None).wire_size(),
+        16 + 4 + (4 + 4) + 56 + 1 + 1 + 1
+    );
 }

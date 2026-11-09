@@ -16,8 +16,11 @@ pub struct Budget {
     /// Maximum calls through this capability (and its children in total).
     pub max_calls: u64,
     /// Maximum payload bytes moved through this capability, in both
-    /// directions: arguments, envelope payload and the response the provider
-    /// returns.
+    /// directions: arguments, the method name, capability descriptors and
+    /// table deltas, envelope payload and the response the provider
+    /// returns. The descriptor half is charged at queue time from the
+    /// envelope (RPC-52); without it a peer could move a descriptor table
+    /// past a meter that only counted arguments.
     pub max_bytes: u64,
     /// Maximum wall-clock milliseconds for one call.
     pub max_wall_ms: u64,

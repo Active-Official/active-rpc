@@ -4810,13 +4810,24 @@ impl Agent {
         // The authority-argument guard is `call_with_origin_payload`'s, with
         // `from_peer` set: one choke point instead of a copy that a new entry
         // point can forget (round 4, #7).
+        // The envelope's non-argument bytes are charged too: the method name
+        // and any capability descriptors or table delta (RPC-52). Charging
+        // only `payload.len()` let a peer move ~1.3 MiB of descriptor bytes
+        // per call under a 100-byte grant. The charge is added to the payload
+        // bytes the call already carries, so the existing `call_bytes`
+        // accounting — capability ∩ lane, then the lane cumulative — enforces
+        // it with no new machinery. In-process `call`/`call_as` have no
+        // envelope, so they charge nothing extra.
+        let payload_bytes = (envelope.payload.len() as u64)
+            .checked_add(envelope.non_argument_wire_size())
+            .ok_or(Error::BudgetExceeded("byte"))?;
         self.call_with_origin_payload(
             peer,
             lane,
             cap,
             &envelope.method,
             envelope.args.clone(),
-            envelope.payload.len() as u64,
+            payload_bytes,
             envelope.payload.clone(),
             true,
         )
@@ -4995,13 +5006,22 @@ impl Agent {
         envelope: &crate::wire::Envelope,
         key: &str,
     ) -> Result<PromiseHandle> {
+        // The envelope's non-argument bytes are charged exactly as in
+        // `call_from_envelope` (RPC-52): the method name and any capability
+        // descriptors or table delta ride on `payload_bytes`, so the miss
+        // path charges them and the idempotency fingerprint covers them —
+        // a retry with a changed descriptor table is a different call, not
+        // a replay of the first one.
+        let payload_bytes = (envelope.payload.len() as u64)
+            .checked_add(envelope.non_argument_wire_size())
+            .ok_or(Error::BudgetExceeded("byte"))?;
         self.call_idempotent_inner(
             peer,
             lane,
             cap,
             &envelope.method,
             envelope.args.clone(),
-            envelope.payload.len() as u64,
+            payload_bytes,
             Some(&envelope.payload),
             key,
             true,

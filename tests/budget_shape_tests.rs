@@ -10,18 +10,23 @@
 //! Four boundaries are covered here, because a ceiling enforced on only one of
 //! them is a ceiling a caller can go around: a call's arguments (queue time), a
 //! promise's resolved value (dispatch time), a provider's response (egress), and
-//! lane traffic (`send`, `publish`).
+//! lane traffic (`send`, `publish`). The queue-time charge also covers the
+//! envelope's non-argument bytes — the method name and any capability
+//! descriptors or table delta (RPC-52) — so a peer cannot move a descriptor
+//! table past a meter that only counted arguments.
 //!
 //! `max_value_size` is the materialised size of one value — the same number
 //! `Value::wire_size` reports — so a list of ten thousand `Null` is 10 000 bytes
 //! of payload and not "size 1".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use active_rpc::cap::CapAttrs;
+use active_rpc::cap::{CapAttrs, CapId};
 use active_rpc::channel::Direction;
+use active_rpc::identity::PeerIdentity;
 use active_rpc::kernel::Provider;
 use active_rpc::value::{Arg, Call, Response, Value};
+use active_rpc::wire::{cap_table_hash, CapDescriptor, CapTableDelta, Envelope};
 use active_rpc::{Agent, Budget};
 
 /// A provider that answers `ping` with a fixed value and counts its calls.
@@ -1251,4 +1256,328 @@ fn a_deep_value_is_measured_iteratively() {
     );
     // Dropping the 100 000-deep value would recurse through `Drop`.
     std::mem::forget(value);
+}
+
+// --- queue time: envelope descriptor bytes (RPC-52) ------------------------
+//
+// The queue-time charge is arguments plus payload plus the envelope's
+// non-argument bytes — the method name and any capability descriptors or
+// table delta. Before RPC-52 the last leg was zero, so a peer with a
+// 100-byte grant could push ~1.3 MiB of descriptor bytes per call.
+
+/// One descriptor granting `methods`, for the RPC-52 envelope tests.
+fn descriptor(id: u8, methods: &[&str]) -> CapDescriptor {
+    CapDescriptor {
+        id: CapId([id; 16]),
+        methods: methods.iter().map(|name| name.to_string()).collect(),
+        budget: Budget::default(),
+        read_only: false,
+        redact: false,
+        path_scope: None,
+    }
+}
+
+/// Decode an envelope the way a transport would, so the test exercises the
+/// path a peer's frame takes.
+fn decoded(envelope: &Envelope) -> Envelope {
+    let bytes = envelope.encode().expect("encode");
+    Envelope::decode(&bytes).expect("decode")
+}
+
+/// The refusal code for an envelope call, and the fact that the provider
+/// never ran.
+fn envelope_refused(fixture: &Fixture, envelope: &Envelope) -> String {
+    let before = fixture.calls.get();
+    let error = fixture
+        .agent
+        .call_from_envelope(None, fixture.lane, &fixture.cap, envelope)
+        .expect_err("the envelope bytes must be refused");
+    assert_eq!(
+        fixture.calls.get(),
+        before,
+        "the provider ran for an envelope the grant refuses"
+    );
+    error.code().to_string()
+}
+
+/// An envelope call inside the budget is admitted and the provider runs once.
+fn envelope_admitted(fixture: &Fixture, envelope: &Envelope) {
+    let before = fixture.calls.get();
+    let promise = fixture
+        .agent
+        .call_from_envelope(None, fixture.lane, &fixture.cap, envelope)
+        .expect("an envelope inside the budget is admitted");
+    fixture.agent.run();
+    assert_eq!(promise.value().expect("value"), Value::text("ok"));
+    assert_eq!(fixture.calls.get(), before + 1, "the provider ran once");
+}
+
+/// RPC-52: a 1.25 MiB descriptor table does not run against a 100-byte grant.
+#[test]
+fn a_descriptor_table_larger_than_the_byte_budget_is_refused() {
+    let fixture = fixture_with(
+        Budget {
+            max_bytes: 100,
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    let mut caps = Vec::new();
+    for i in 0..100u8 {
+        let mut id = [0u8; 16];
+        id[0] = i + 1;
+        let mut methods = BTreeSet::new();
+        for m in 0..64 {
+            methods.insert(format!("method-{m:02}-{}", "x".repeat(180)));
+        }
+        caps.push(CapDescriptor {
+            id: CapId(id),
+            methods,
+            budget: Budget::default(),
+            read_only: false,
+            redact: false,
+            path_scope: None,
+        });
+    }
+    let envelope = decoded(&Envelope::request(1, "ping", vec![]).with_caps(caps));
+    assert_eq!(
+        envelope_refused(&fixture, &envelope),
+        "rpc/budget-exceeded"
+    );
+}
+
+/// RPC-52: the charge is exact — one byte under the descriptor size refuses,
+/// the size plus the response admits.
+#[test]
+fn a_descriptor_table_at_the_byte_budget_boundary() {
+    let envelope = decoded(
+        &Envelope::request(1, "ping", vec![]).with_caps(vec![descriptor(1, &["m"])]),
+    );
+    let charge = envelope.non_argument_wire_size();
+    // One byte under the charge refuses, and the provider never runs.
+    let under = fixture_with(
+        Budget {
+            max_bytes: charge - 1,
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    assert_eq!(
+        envelope_refused(&under, &envelope),
+        "rpc/budget-exceeded"
+    );
+    // The charge plus exactly the response's bytes admits, and the provider
+    // runs once: the response charge stacks on the queue-time charge, so
+    // this also pins the charge from above — any over-charge would eat the
+    // response headroom and settle the promise as budget-exceeded.
+    let exact = fixture_with(
+        Budget {
+            max_bytes: charge + Value::text("ok").wire_size(),
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    envelope_admitted(&exact, &envelope);
+}
+
+/// RPC-52: a 1,024-byte method name is charged too, not just the descriptors.
+#[test]
+fn a_long_method_name_is_charged_to_the_byte_budget() {
+    struct LongMethod {
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+        method: String,
+    }
+    impl Provider for LongMethod {
+        fn name(&self) -> &'static str {
+            "long"
+        }
+        fn methods(&self) -> Vec<String> {
+            vec![self.method.clone()]
+        }
+        fn mutating(&self, _method: &str) -> bool {
+            false
+        }
+        fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(Response::Value(Value::text("ok")))
+        }
+    }
+    let method = "m".repeat(1_024);
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let agent = Agent::with_secret([0x6c; 32]);
+    let provider = agent.register(Box::new(LongMethod {
+        calls: std::rc::Rc::clone(&calls),
+        method: method.clone(),
+    }));
+    let envelope = decoded(&Envelope::request(1, method, vec![]));
+    let charge = envelope.non_argument_wire_size();
+    // One byte under the charge refuses.
+    let under_budget = Budget {
+        max_bytes: charge - 1,
+        ..Budget::default()
+    };
+    let mut attrs = CapAttrs::new(&[envelope.method.as_str()]);
+    attrs.budget = under_budget;
+    let cap = agent.mint(provider, 0, attrs).expect("mint");
+    let lane = agent.create_lane("long", under_budget).expect("lane");
+    let error = agent
+        .call_from_envelope(None, lane, &cap, &envelope)
+        .expect_err("a 1,024-byte method name must be charged");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert_eq!(calls.get(), 0, "the provider never ran");
+    // The charge plus the response admits.
+    let exact_budget = Budget {
+        max_bytes: charge + Value::text("ok").wire_size(),
+        ..Budget::default()
+    };
+    let mut attrs = CapAttrs::new(&[envelope.method.as_str()]);
+    attrs.budget = exact_budget;
+    let cap = agent.mint(provider, 0, attrs).expect("mint");
+    let lane = agent
+        .create_lane("long-exact", exact_budget)
+        .expect("lane");
+    let promise = agent
+        .call_from_envelope(None, lane, &cap, &envelope)
+        .expect("the method charge plus the response admits");
+    agent.run();
+    assert_eq!(promise.value().expect("value"), Value::text("ok"));
+    assert_eq!(calls.get(), 1, "the provider ran once");
+}
+
+/// RPC-52: a capability-table delta is charged — removed ids and added
+/// descriptors alike — not just the table itself.
+#[test]
+fn a_capability_table_delta_is_charged_to_the_byte_budget() {
+    let delta = CapTableDelta {
+        base: cap_table_hash(&[]).expect("hash of the empty table"),
+        removed: vec![CapId([7u8; 16]), CapId([8u8; 16])],
+        added: vec![descriptor(9, &["m"])],
+    };
+    let envelope = decoded(&Envelope::request(1, "ping", vec![]).with_cap_delta(delta));
+    let charge = envelope.non_argument_wire_size();
+    let under = fixture_with(
+        Budget {
+            max_bytes: charge - 1,
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    assert_eq!(
+        envelope_refused(&under, &envelope),
+        "rpc/budget-exceeded"
+    );
+    let exact = fixture_with(
+        Budget {
+            max_bytes: charge + Value::text("ok").wire_size(),
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    envelope_admitted(&exact, &envelope);
+}
+
+/// RPC-52: the idempotent envelope entry point charges descriptor bytes too,
+/// and the charge is part of the call's fingerprint.
+///
+/// The calls here present a peer identity: an anonymous peer's idempotent
+/// envelope call can never replay today (the owner check compares the stored
+/// `from_peer` flag against `peer.is_some()` — F1-NF-06, found while writing
+/// this test), so the replay half needs a named peer. The charge itself is
+/// peer-independent.
+#[test]
+fn an_idempotent_envelope_call_charges_its_descriptor_bytes() {
+    let peer = PeerIdentity::from_certificate(b"rpc52-peer");
+    let mut caps = Vec::new();
+    for i in 0..100u8 {
+        let mut id = [0u8; 16];
+        id[0] = i + 1;
+        let mut methods = BTreeSet::new();
+        for m in 0..64 {
+            methods.insert(format!("method-{m:02}-{}", "x".repeat(180)));
+        }
+        caps.push(CapDescriptor {
+            id: CapId(id),
+            methods,
+            budget: Budget::default(),
+            read_only: false,
+            redact: false,
+            path_scope: None,
+        });
+    }
+    let big = decoded(&Envelope::request(1, "ping", vec![]).with_caps(caps));
+    let small = decoded(
+        &Envelope::request(1, "ping", vec![]).with_caps(vec![descriptor(1, &["m"])]),
+    );
+    let charge = small.non_argument_wire_size();
+    let fixture = fixture_with(
+        Budget {
+            max_bytes: charge + Value::text("ok").wire_size(),
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    // The big table is refused before the provider runs, key or no key.
+    let error = fixture
+        .agent
+        .call_idempotent_from_envelope(Some(&peer), fixture.lane, &fixture.cap, &big, "big")
+        .expect_err("a 1.25 MiB descriptor table must be refused");
+    assert_eq!(error.code(), "rpc/budget-exceeded");
+    assert_eq!(fixture.calls.get(), 0, "the provider never ran");
+    // The same small envelope under one key replays: the provider runs once.
+    let first = fixture
+        .agent
+        .call_idempotent_from_envelope(Some(&peer), fixture.lane, &fixture.cap, &small, "small")
+        .expect("the small envelope is admitted");
+    fixture.agent.run();
+    assert_eq!(first.value().expect("value"), Value::text("ok"));
+    assert_eq!(fixture.calls.get(), 1, "the provider ran once");
+    let replay = fixture
+        .agent
+        .call_idempotent_from_envelope(Some(&peer), fixture.lane, &fixture.cap, &small, "small")
+        .expect("the same envelope replays");
+    fixture.agent.run();
+    assert_eq!(replay.value().expect("value"), Value::text("ok"));
+    assert_eq!(fixture.calls.get(), 1, "the replay runs no provider");
+    // The same key with a changed descriptor table is a different call.
+    let changed = decoded(
+        &Envelope::request(1, "ping", vec![]).with_caps(vec![
+            descriptor(1, &["m"]),
+            descriptor(2, &["n"]),
+        ]),
+    );
+    let error = fixture
+        .agent
+        .call_idempotent_from_envelope(Some(&peer), fixture.lane, &fixture.cap, &changed, "small")
+        .expect_err("a changed descriptor table is a different call");
+    assert_eq!(error.code(), "rpc/invalid-argument");
+}
+
+/// RPC-52: an in-process call charges no descriptor bytes — the charge lives
+/// only in the envelope entry points, because only they see an envelope.
+#[test]
+fn an_in_process_call_charges_no_descriptor_bytes() {
+    let fixture = fixture_with(
+        Budget {
+            max_bytes: 1,
+            ..Budget::default()
+        },
+        Value::text("ok"),
+    );
+    // No arguments, no payload: the in-process call charges nothing and is
+    // admitted at queue time. (Only queue-time admission is asserted here:
+    // whether the response settles is the egress boundary's business,
+    // covered elsewhere.)
+    let _admitted = fixture
+        .agent
+        .call(fixture.lane, &fixture.cap, "ping", vec![])
+        .expect("an in-process call with no bytes is admitted");
+    fixture.agent.run();
+    // The same call from an envelope charges the method name (4+4) plus the
+    // empty capability table (4) — 12 bytes against a 1-byte grant.
+    let envelope = decoded(&Envelope::request(1, "ping", vec![]));
+    assert_eq!(envelope.non_argument_wire_size(), 12);
+    assert_eq!(
+        envelope_refused(&fixture, &envelope),
+        "rpc/budget-exceeded"
+    );
 }

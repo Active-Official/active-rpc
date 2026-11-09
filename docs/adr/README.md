@@ -28,6 +28,7 @@
 | [0024](0024-subscriptions-are-not-authority.md) | Subscriptions are not authority |
 | [0025](0025-fail-closed-idempotency-ceiling.md) | Fail-closed idempotency ceiling |
 | [0026](0026-one-method-ceiling.md) | One method ceiling, 64, in every layer |
+| [0027](0027-charge-envelope-descriptor-bytes.md) | Charge envelope descriptor bytes to the call budget |
 
 ## Reading order and supersessions
 

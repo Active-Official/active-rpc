@@ -186,6 +186,30 @@ impl CapDescriptor {
             path_scope: attrs.path_scope.clone(),
         }
     }
+
+    /// Encoded size of this descriptor, in bytes.
+    ///
+    /// Mirrors `write_cap` field for field, so the number is the bytes the
+    /// descriptor occupies on the wire: 16 for the id, 4 for the method
+    /// count, 4 plus the length per method, 56 for the seven budget
+    /// ceilings, 1 each for the read-only and redaction flags, and the path
+    /// scope (1 when absent, 1 plus 4 plus the length when present). The
+    /// kernel charges this size against a call's byte budget (RPC-52); a
+    /// test pins it against `encode()` so the two can never drift. The sum
+    /// saturates instead of overflowing, so a hand-built descriptor with
+    /// absurd counts charges the maximum and is refused, rather than
+    /// wrapping to a small charge.
+    pub fn wire_size(&self) -> u64 {
+        let mut size: u64 = 16 + 4 + 56 + 1 + 1;
+        for method in &self.methods {
+            size = size.saturating_add(4).saturating_add(method.len() as u64);
+        }
+        size = size.saturating_add(match &self.path_scope {
+            None => 1,
+            Some(scope) => 1 + 4 + scope.len() as u64,
+        });
+        size
+    }
 }
 
 /// A capability-table delta negotiated against a known base table.
@@ -802,6 +826,42 @@ impl Envelope {
             Arg::Value(value) => Some(value),
             _ => None,
         })
+    }
+
+    /// Encoded size of everything in this envelope except the arguments and
+    /// the payload, in bytes.
+    ///
+    /// The method name (4 plus its length), the capability table (4 for the
+    /// count plus each descriptor's [`CapDescriptor::wire_size`]), and the
+    /// table delta when present (32 for the base hash, 4 plus 16 per removed
+    /// id, 4 plus each added descriptor). The arguments are charged by
+    /// `Arg::wire_size` and the payload by its length, so this is the third
+    /// leg of a call's byte charge: the kernel adds it to `payload_bytes`
+    /// in `call_from_envelope` and `call_idempotent_from_envelope` (RPC-52),
+    /// so a peer cannot move a descriptor table past a meter that only
+    /// counted arguments. The fixed 24-byte frame overhead — the 16-byte
+    /// header, the argument-count prefix and the payload-length prefix — is
+    /// deliberately not in this number: it is constant per frame and cannot
+    /// be used to smuggle arbitrary bytes. A test pins this against
+    /// `encode()`: an argument-less, payload-less envelope encodes to
+    /// exactly 24 plus this number.
+    pub fn non_argument_wire_size(&self) -> u64 {
+        let mut size: u64 = 4 + self.method.len() as u64;
+        size = size.saturating_add(4);
+        for cap in &self.caps {
+            size = size.saturating_add(cap.wire_size());
+        }
+        if let Some(delta) = &self.cap_delta {
+            size = size
+                .saturating_add(32)
+                .saturating_add(4)
+                .saturating_add((delta.removed.len() as u64) * 16)
+                .saturating_add(4);
+            for cap in &delta.added {
+                size = size.saturating_add(cap.wire_size());
+            }
+        }
+        size
     }
 }
 
