@@ -238,6 +238,19 @@ file with a same-length copy is detected by content (RPC-05), not by
 identity. A deployment that needs assurance on a non-unix host should still
 read through a pinned head (`--expect-head`) and the MAC.
 
+The log file no longer shares the no-identity residual above either
+(F1-NF-07, fixed 2026-11-09; ADR-0032). An open handle pins the file
+identity it walked — `(dev, ino)` on unix, volume serial plus file index
+on Windows through the same helper crate — and an append that finds a
+different file at the path is refused before the walk, never re-walked
+into: the walk accepts any self-consistent chain, so a mismatch that only
+forced a re-walk would adopt a replacement chain, including a genuine
+backup with genuine MACs. The residual as written now holds only where
+neither platform's identity exists; `create` already fails on those
+filesystems (the header install needs a hard link), so no working log
+exists there to break. A deployment that needs assurance on such a host
+should still read through a pinned head (`--expect-head`) and the MAC.
+
 `receipts verify` and the `--receipt-key-file` / `--expect-head` flags live in
 the CLI crate that consumes this library; this ADR describes the library
 contract, not a command-line surface (R-13 round 12, F9).

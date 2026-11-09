@@ -96,6 +96,31 @@ fn session(count: usize) -> (Agent, Vec<Receipt>) {
     (agent, receipts)
 }
 
+/// A kernel whose cap admits `count` calls, with receipts enabled and the
+/// wall clock selected, so receipts carry real wall-clock `at_ms` instead
+/// of the virtual clock's 1, 2, 3, ... -- two virtual sessions produce
+/// byte-identical receipts for the same calls (same secret, same cap, same
+/// method, same at_ms), which is no replacement at all (F1-NF-07).
+fn session_wall_clock(count: usize) -> (Agent, Vec<Receipt>) {
+    let agent = Agent::with_secret(SECRET);
+    agent.use_wall_clock(true);
+    agent.enable_receipts(true);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("mint");
+    let lane = agent
+        .create_lane("receipts", Budget::default())
+        .expect("lane");
+    for _ in 0..count {
+        let promise = agent.call(lane, &cap, "echo", Vec::new()).expect("call");
+        agent.run();
+        promise.value().expect("value");
+    }
+    let receipts = agent.receipts();
+    (agent, receipts)
+}
+
 fn receipt(sequence: u64, at_ms: u64) -> Receipt {
     Receipt {
         sequence,
@@ -1009,5 +1034,242 @@ fn a_large_log_replacement_is_refused_within_the_re_walk_window() {
     eprintln!(
         "XPL-RPC-07 large-log replacement: refused at attempt {refused_at} ({linked_onto_tamper} appends linked onto the tamper first — within the 32-append bound)"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// F1-NF-07: an open handle must not adopt a self-consistent replacement chain
+// ---------------------------------------------------------------------------
+//
+// XPL-RPC-07 probe arm C (observational): a log file REPLACED by a different,
+// fully VALID log of the same length (same start sequence, different receipt
+// contents), mtime set back — the next append was ACCEPTED, linking onto the
+// replacement chain. The fast-path checks are an optimisation; the walk is
+// the arbiter, and the walk accepts any chain whose links verify. That is
+// true on Linux too (the inode check only forces the same re-walk) and true
+// under the audit's recommended identity fix for XPL-RPC-07 (an identity
+// mismatch also only forces the re-walk). RPC-14 does NOT cover it: RPC-14
+// is about the *read* path not verifying MACs; this is about the *append*
+// handle, and a genuine-backup substitution (same key, genuine MACs) evades
+// even a MAC-checking walk.
+//
+// The fix (this finding): the handle refuses when the file identity changes
+// — the file it walked is `(dev, ino)` on unix and the volume serial plus
+// file index on Windows (via the `active-rpc-file-identity` helper from
+// XPL-RPC-08). The survey in the F1-NF-07 record shows no legitimate flow
+// needs an open handle to survive a replacement: restore does not exist for
+// receipt logs (no API, no CLI command), repair truncates the same file in
+// place (same identity) and refreshes the cached state afterwards, and
+// `truncate`/`create` return a fresh handle — the round-4 test
+// `a_replacement_at_the_same_size_and_start_is_not_trusted` already blesses
+// refusal ("Either it refuses, or it re-reads..."). A refused append is
+// non-destructive: the handle keeps its cached state, so if the original
+// file returns the handle appends again; the operator's remedy is to reopen
+// the log, which is what the refusal message says.
+//
+// The swap is certified the same way as the XPL-RPC-07 tests: the original
+// is deleted (asserted gone) and the replacement is renamed into place,
+// plus byte equality of the file on disk with the replacement. The tests
+// assert the refusal *reason* (`replaced` in the message), not just the
+// code, so a time/sequence refusal cannot pass for the identity refusal.
+
+/// XPL-RPC-07 probe arm C, kept as a regression test: the log file is
+/// REPLACED by a different, fully VALID log of the same length (same start
+/// sequence, different receipt contents), mtime set back. The next append
+/// must be REFUSED — the handle must not adopt the replacement chain — with
+/// the file untouched and the replacement chain still reading back intact.
+#[test]
+fn an_open_handle_refuses_a_valid_replacement_chain() {
+    let dir = sandbox("nf07-valid-replacement");
+    let path_a = dir.join("a.arrl");
+    let path_b = dir.join("b.arrl");
+    let log_a = ReceiptLog::create(&path_a).expect("create A");
+    let log_b = ReceiptLog::create(&path_b).expect("create B");
+    // Same-shaped receipts, different contents (at_ms differs; the encoding
+    // stores at_ms fixed-width, so the two logs must be byte-identical in
+    // length — asserted below, not assumed).
+    log_a.append(&receipt(1, 1)).expect("A append 1");
+    log_a.append(&receipt(2, 2)).expect("A append 2");
+    log_b.append(&receipt(1, 11)).expect("B append 1");
+    log_b.append(&receipt(2, 12)).expect("B append 2");
+    drop(log_b);
+    let bytes_a = std::fs::read(&path_a).expect("read A");
+    let bytes_b = std::fs::read(&path_b).expect("read B");
+    assert_eq!(
+        bytes_b.len(),
+        bytes_a.len(),
+        "the valid replacement log has the same length (B {} vs A {})",
+        bytes_b.len(),
+        bytes_a.len()
+    );
+    assert_eq!(
+        &bytes_b[..16],
+        &bytes_a[..16],
+        "same header (start sequence)"
+    );
+    assert_ne!(
+        bytes_b, bytes_a,
+        "the replacement really is a different chain"
+    );
+    let cached_mtime = std::fs::metadata(&path_a)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    // Replace A's file with B's bytes, as a new file.
+    let staged = dir.join("staged.arrl");
+    std::fs::write(&staged, &bytes_b).expect("stage B bytes");
+    std::fs::remove_file(&path_a).expect("remove A");
+    assert!(
+        !path_a.exists(),
+        "the original file is gone before the swap"
+    );
+    std::fs::rename(&staged, &path_a).expect("move B bytes into place");
+    set_mtime_back(&path_a, cached_mtime);
+    assert_eq!(
+        std::fs::metadata(&path_a)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        cached_mtime,
+        "replacement carries the cached mtime"
+    );
+    assert_eq!(
+        std::fs::read(&path_a).expect("read log"),
+        bytes_b,
+        "the file on disk is the valid replacement chain"
+    );
+    // The next receipt continues A's sequence (3) with an at_ms past B's
+    // last_ms (12), so sequence/time checks cannot be what refuses it —
+    // only the identity check can.
+    let before = std::fs::read(&path_a).expect("read log");
+    let error = log_a
+        .append(&receipt(3, 100))
+        .expect_err("an open handle must refuse to append onto a valid replacement chain");
+    assert_eq!(error.code(), "rpc/receipt");
+    assert!(
+        error.to_string().contains("replaced"),
+        "the refusal must name the replacement, not another cause: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&path_a).expect("read log"),
+        before,
+        "a refused append must not touch the file"
+    );
+    let after = log_a.records().expect("the replacement chain still reads");
+    assert_eq!(after.len(), 2, "nothing was appended onto the replacement");
+    assert_eq!(
+        after.first().map(|receipt| receipt.at_ms),
+        Some(11),
+        "the history that reads back is the replacement's, unextended"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The genuine-backup form: the replacement is an older backup of a log
+/// built by a real kernel under the SAME receipt key, so every MAC in it is
+/// genuine — `verify_macs` passes on it before the swap, and a MAC-checking
+/// walk (shape (a), RPC-14's territory) would pass on it too. Only the file
+/// identity tells the backup from the log the handle walked. The append
+/// through the open handle must still be REFUSED, with the file untouched
+/// and the backup's MACs still verifying afterwards.
+#[test]
+fn an_open_handle_refuses_a_genuine_backup_replacement() {
+    let dir = sandbox("nf07-genuine-backup");
+    let path_a = dir.join("a.arrl");
+    let path_b = dir.join("b.arrl");
+    // The backup is built FIRST, so its receipts predate A's: A's third
+    // receipt (built later, wall clock) cannot run backwards against the
+    // backup's last_ms, and sequence 3 continues the backup's two records.
+    let log_b = ReceiptLog::create(&path_b).expect("create B");
+    let (_agent_b, receipts_b) = session_wall_clock(2);
+    assert_eq!(receipts_b.len(), 2, "two admitted calls for the backup");
+    log_b
+        .append_verified(&receipt_key(), &receipts_b)
+        .expect("append the genuine backup");
+    log_b
+        .verify_macs(&receipt_key())
+        .expect("the backup's MACs are genuine before the swap");
+    drop(log_b);
+    // The two sessions must land in different wall-clock milliseconds:
+    // receipts built in the same millisecond are byte-identical (same
+    // secret, same cap, same method, same at_ms), so without this the
+    // "backup" would be the same bytes as A's log, not a replacement at
+    // all -- the first fail-before run proved exactly that, and a sleep
+    // alone could not fix it while the receipts carried the virtual
+    // clock's 1, 2, 3, ... (the second fail-before run proved that too).
+    // Five milliseconds clears any clock granularity; the assertion
+    // below fails loudly if the clock were coarser, instead of letting
+    // the test pass vacuously.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let log_a = ReceiptLog::create(&path_a).expect("create A");
+    let (_agent_a, receipts_a) = session_wall_clock(3);
+    assert_eq!(receipts_a.len(), 3, "three admitted calls");
+    assert!(
+        receipts_a[0].at_ms > receipts_b[1].at_ms,
+        "A was built after the sleep, so its receipts postdate the backup's"
+    );
+    log_a.append(&receipts_a[0]).expect("A append 1");
+    log_a.append(&receipts_a[1]).expect("A append 2");
+    let bytes_a = std::fs::read(&path_a).expect("read A");
+    let bytes_b = std::fs::read(&path_b).expect("read B");
+    assert_eq!(
+        bytes_b.len(),
+        bytes_a.len(),
+        "the genuine backup has the same length (B {} vs A {})",
+        bytes_b.len(),
+        bytes_a.len()
+    );
+    assert_eq!(
+        &bytes_b[..16],
+        &bytes_a[..16],
+        "same header (start sequence)"
+    );
+    assert_ne!(bytes_b, bytes_a, "the backup really is a different chain");
+    let cached_mtime = std::fs::metadata(&path_a)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    // Swap the genuine backup under A's open handle, as a new file.
+    let staged = dir.join("staged.arrl");
+    std::fs::write(&staged, &bytes_b).expect("stage backup bytes");
+    std::fs::remove_file(&path_a).expect("remove A");
+    assert!(
+        !path_a.exists(),
+        "the original file is gone before the swap"
+    );
+    std::fs::rename(&staged, &path_a).expect("move backup into place");
+    set_mtime_back(&path_a, cached_mtime);
+    assert_eq!(
+        std::fs::metadata(&path_a)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        cached_mtime,
+        "replacement carries the cached mtime"
+    );
+    assert_eq!(
+        std::fs::read(&path_a).expect("read log"),
+        bytes_b,
+        "the file on disk is the genuine backup"
+    );
+    let before = std::fs::read(&path_a).expect("read log");
+    let error = log_a
+        .append(&receipts_a[2])
+        .expect_err("an open handle must refuse to append onto a genuine backup swapped under it");
+    assert_eq!(error.code(), "rpc/receipt");
+    assert!(
+        error.to_string().contains("replaced"),
+        "the refusal must name the replacement, not another cause: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&path_a).expect("read log"),
+        before,
+        "a refused append must not touch the file"
+    );
+    let after = log_a.records().expect("the backup chain still reads");
+    assert_eq!(after.len(), 2, "nothing was appended onto the backup");
+    log_a
+        .verify_macs(&receipt_key())
+        .expect("the backup's MACs still verify after the refusal");
     let _ = std::fs::remove_dir_all(&dir);
 }

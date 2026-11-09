@@ -33,6 +33,7 @@
 | [0029](0029-receipt-lock-liveness-on-windows-and-macos.md) | Receipt-lock pid liveness on Windows and macOS |
 | [0030](0030-windows-receipt-lock-file-identity.md) | Receipt-lock file identity on Windows |
 | [0031](0031-windows-receipt-key-file-acl.md) | Receipt-key file ACL check on Windows |
+| [0032](0032-receipt-log-handle-refuses-a-replaced-file.md) | Open receipt-log handle refuses a replaced log file |
 
 ## Reading order and supersessions
 

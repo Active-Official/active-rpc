@@ -272,6 +272,14 @@ struct LogState {
     /// three: only the inode tells the copy from the log that was walked
     /// (R-13 round 14, F1). `None` means the walk did not come from a handle,
     /// and the fast path then re-walks.
+    ///
+    /// On unix the identity is `(dev, ino)`; on Windows it is the volume
+    /// serial plus file index from the `active-rpc-file-identity` helper
+    /// (XPL-RPC-08). The identity is also the handle's pin: an append that
+    /// finds a different file at the path is refused, never re-walked into
+    /// (F1-NF-07) — the walk accepts any self-consistent chain, so a
+    /// mismatch that only forced a re-walk would adopt a replacement chain,
+    /// including a genuine backup with genuine MACs.
     identity: Option<(u64, u64)>,
     /// The file's modification time when the walk happened.
     ///
@@ -1714,6 +1722,29 @@ impl ReceiptLog {
                 cached
             } else {
                 let (bytes, identity, modified) = read_capped_with_identity(&self.path)?;
+                // An open handle never adopts a different file at its path
+                // (F1-NF-07). The walk below accepts any self-consistent
+                // chain, so a mismatch that only forced this re-walk would
+                // ratify the replacement: the next receipt would link onto
+                // a history the handle never wrote, including a genuine
+                // backup whose MACs are genuine under the same key (no MAC
+                // check, at walk time or anywhere else, can tell a backup
+                // from the log it backs up). Refuse instead, before the
+                // walk, and touch nothing: the cached state is left intact,
+                // so if the original file returns the handle appends again,
+                // and the remedy for a deliberate replacement is to reopen
+                // the log, which is what the error says. Only a pinned
+                // identity can refuse: `None` on either side means no
+                // baseline was ever established (a fresh `open` or `create`,
+                // or a state refreshed by `repair_tail`), and the walk then
+                // establishes one, exactly as a fresh handle would.
+                if let (Some(pinned), Some(fresh)) = (cached.identity, identity) {
+                    if pinned != fresh {
+                        return Err(Error::receipt(
+                            "the receipt log file was replaced since this handle opened it; reopen the log before appending",
+                        ));
+                    }
+                }
                 let (_, mut walked) = walk_log(&bytes)?;
                 walked.identity = identity;
                 walked.modified = modified;
@@ -2207,11 +2238,37 @@ fn path_identity(path: &std::path::Path) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
-/// Off unix there is no stable inode at the MSRV: the fast path and the reader
-/// fall back to the length and header checks, and the residual is stated in
-/// ADR-0021 (R-13 round 14, F2).
-#[cfg(not(unix))]
-#[cfg_attr(not(unix), allow(dead_code))]
+/// The identity of a path on Windows: volume serial plus file index.
+///
+/// The path is opened and the opened handle is identified, so the identity
+/// describes the file that was actually opened — the same shape as
+/// [`lock_path_identity`] (XPL-RPC-08), which does this for the lock file. A
+/// symlink at the path is refused outright: the link has its own file index,
+/// but a swapped-in link must never pass by pointing at the original. A
+/// recreated file gets a new file index even when its bytes are identical,
+/// so a byte-identical copy at the same path is a different file, as on
+/// unix. `None` when the filesystem supplies no file IDs (a zero file
+/// index — FAT/exFAT — where treating zero as an identity would equate
+/// every file on the volume); `create` already fails there (the header
+/// install needs a hard link), so no working log exists there to break.
+#[cfg(windows)]
+fn path_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    active_rpc_file_identity::file_identity(&file)
+}
+
+/// Off unix and Windows there is no stable inode at the MSRV: the fast path
+/// and the reader fall back to the length and header checks, and the
+/// residual is stated in ADR-0021 (R-13 round 14, F2). The append handle
+/// cannot pin a file it cannot identify there, so a replacement is adopted
+/// by the walk (F1-NF-07) — the same residual, now narrowed to platforms
+/// with no identity primitive.
+#[cfg(not(any(unix, windows)))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn path_identity(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
@@ -2227,15 +2284,15 @@ fn path_modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
 
 /// Whether the path still names the file the state was walked from.
 ///
-/// On unix a state with no recorded identity cannot be trusted, so the fast
-/// path re-walks. Off unix there is nothing to compare, and the documented
-/// residual applies (R-13 round 14, F1/F2).
+/// On unix and Windows a state with no recorded identity cannot be trusted,
+/// so the fast path re-walks. Where there is no identity primitive the
+/// documented residual applies (R-13 round 14, F1/F2; F1-NF-07).
 fn identity_matches(path: &std::path::Path, identity: Option<(u64, u64)>) -> bool {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         identity.is_some() && identity == path_identity(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, identity);
         true
@@ -2244,14 +2301,15 @@ fn identity_matches(path: &std::path::Path, identity: Option<(u64, u64)>) -> boo
 
 /// Whether the path still names the file that was read.
 ///
-/// On unix `(dev, ino)` decides; elsewhere the read and the length check are
-/// all that is available (the residual the ADR records).
+/// On unix and Windows `(dev, ino)` — or the volume serial plus file index
+/// — decides; elsewhere the read and the length check are all that is
+/// available (the residual the ADR records).
 fn same_identity(path: &std::path::Path, identity: Option<(u64, u64)>) -> bool {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         identity.is_some() && path_identity(path) == identity
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, identity);
         true
@@ -2277,7 +2335,14 @@ fn read_capped_with_identity(path: &std::path::Path) -> Result<ReadLog> {
         {
             file_identity(&file)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // The identity of the handle that was read, not of a second
+            // open: the bytes below come from this handle, so the identity
+            // must describe it (F1-NF-07).
+            active_rpc_file_identity::file_identity(&file)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             None
         }
