@@ -32,6 +32,8 @@ fn probe() -> CapabilityRecord {
     CapabilityRecord {
         provider: "echo".to_string(),
         object: 0,
+        // Echo is not a module provider, so no content address (R2-BND-03).
+        content_hash: None,
         methods: ["echo".to_string()].into_iter().collect(),
         budget: Budget::default(),
         read_only: false,
@@ -45,6 +47,8 @@ fn probe() -> CapabilityRecord {
         wall_clock: false,
         lease_ms: Some(60_000),
         record_id: [0x33; 32],
+        // First-generation capability: no ancestors (RPC-01).
+        ancestor_record_ids: Vec::new(),
         seal: None,
     }
 }
