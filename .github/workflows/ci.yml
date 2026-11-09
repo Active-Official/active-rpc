@@ -234,14 +234,18 @@ jobs:
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
           cargo install cargo-deny --version 0.20.2 --locked
-      # `--deny warnings` makes a new unmaintained/unsound advisory fail the job.
-      # The one accepted advisory is in both `audit.toml` and `deny.toml`; the
-      # flag repeats it so the gate holds even on a `cargo-audit` build that does
-      # not read the config file.
-      - name: Advisory audit
-        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0449
-      - name: Dependency policy
-        run: cargo deny check
+      # The script runs `cargo deny check` + `cargo audit` for the root AND
+      # every sub-crate (cli, control-plane, fuzz), each with the root
+      # deny.toml plus that crate's overlay (scripts/supply-chain/). A
+      # root-only run never sees the sub-crates' lockfiles, so a banned
+      # crate or unapproved license in a sub-crate passed silently
+      # (R2-SUPPLY-02). `--deny warnings` (inside the script) makes a new
+      # unmaintained/unsound advisory fail the job. The one accepted
+      # advisory is in both `audit.toml` and `deny.toml`; the flag repeats
+      # it so the gate holds even on a `cargo-audit` build that does not
+      # read the config file.
+      - name: Supply-chain gate
+        run: python3 scripts/supply_chain.py
 
   sbom:
     runs-on: ubuntu-latest

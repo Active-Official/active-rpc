@@ -15,7 +15,14 @@ multiple-versions = "allow"
 wildcards = "deny"
 deny = [
     { name = "md5" },
-    { name = "sha1" },
+    # sha1 is banned EXCEPT as the RFC 6455 WebSocket handshake hash
+    # (Sec-WebSocket-Accept = base64(SHA-1(key + GUID))): the hash is
+    # protocol-mandated, not a cryptographic choice, and is never used for
+    # signatures, secrets, or integrity decisions in this repo. The
+    # `wrappers` list scopes the exemption by provenance: only axum and
+    # tungstenite (the crates that perform the handshake) may bring sha1
+    # in. Any other path to sha1 is still banned. R2-SUPPLY-02.
+    { name = "sha1", wrappers = ["axum", "tungstenite"] },
 ]
 
 [sources]

@@ -1,0 +1,18 @@
+# R2-SUPPLY-02: per-crate cargo-deny overlay for fuzz.
+#
+# This file is APPENDED to the root deny.toml by scripts/supply_chain.py
+# (never committed as a standalone config, never copied into the crate
+# directory, never hand-edited into a generated file). It contains only
+# the exception that is specific to the fuzz graph; the root policy
+# still applies in full. See deny-control-plane.toml for why the overlay
+# stays a pure append.
+#
+# libfuzzer-sys (the libFuzzer harness runtime, fuzz-only, never shipped)
+# is licensed `(MIT OR Apache-2.0) AND NCSA`; NCSA is not on the root
+# allow-list. The exception is scoped to this crate and this license:
+# any other crate, or any other license on libfuzzer-sys, is still
+# rejected. A version bump of libfuzzer-sys fails the gate until the new
+# version is reviewed and added here.
+[[licenses.exceptions]]
+allow = ["NCSA"]
+crate = "libfuzzer-sys@0.4.13"

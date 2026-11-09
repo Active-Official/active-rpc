@@ -1,0 +1,26 @@
+# R2-SUPPLY-02: per-crate cargo-deny overlay for control-plane.
+#
+# This file is APPENDED to the root deny.toml by scripts/supply_chain.py
+# (never committed as a standalone config, never copied into the crate
+# directory, never hand-edited into a generated file). It contains only
+# the exceptions that are specific to the control-plane graph; the root
+# policy still applies in full. Appended `[[licenses.exceptions]]`
+# blocks extend the root [licenses] table, so the overlay stays a pure
+# append: if the root file ever defines an `exceptions` list inline, the
+# generated config fails to parse and the gate fails loudly instead of
+# silently weakening.
+#
+# webpki-roots is pulled in by ureq (rustls) for the control-plane's
+# outbound HTTPS client: ureq -> webpki-roots 0.26.11 -> webpki-roots
+# 1.0.11. Both locked versions are licensed CDLA-Permissive-2.0, which
+# is not on the root allow-list. The exception is scoped to this crate
+# and this license: any other crate, or any other license on
+# webpki-roots, is still rejected. A version bump of webpki-roots fails
+# the gate until the new version is reviewed and added here.
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+crate = "webpki-roots@0.26.11"
+
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+crate = "webpki-roots@1.0.11"
