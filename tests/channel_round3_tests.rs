@@ -253,12 +253,20 @@ fn a_send_charges_the_transferred_cap_s_meter() {
     let agent = Agent::with_secret([0x51u8; 32]);
     let provider = agent.register(Box::new(Sink));
     let lane = agent
-        .create_lane("wide", Budget { max_bytes: 1 << 26, ..Budget::default() })
+        .create_lane(
+            "wide",
+            Budget {
+                max_bytes: 1 << 26,
+                ..Budget::default()
+            },
+        )
         .expect("lane");
-    let channel = agent
-        .create_channel("c", Direction::Send)
-        .expect("channel");
-    let grant = Budget { max_calls: 5, max_bytes: 10_000, ..Budget::default() };
+    let channel = agent.create_channel("c", Direction::Send).expect("channel");
+    let grant = Budget {
+        max_calls: 5,
+        max_bytes: 10_000,
+        ..Budget::default()
+    };
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["noop"]).with_budget(grant))
         .expect("cap");
@@ -284,11 +292,17 @@ fn a_send_charges_the_transferred_cap_s_meter() {
         refused.is_err(),
         "a sixth send must be refused once the call budget is spent: {refused:?}"
     );
-    assert_eq!(agent.remaining_bytes(&cap).expect("meter"), 10_000 - 5 * charge);
+    assert_eq!(
+        agent.remaining_bytes(&cap).expect("meter"),
+        10_000 - 5 * charge
+    );
     assert_eq!(agent.remaining_calls(&cap).expect("meter"), 0);
     // The grant is spent: the call the audit's contrast relies on is refused too.
     let call = agent.call(lane, &cap, "noop", Vec::new());
-    assert!(call.is_err(), "the spent grant must refuse calls as well: {call:?}");
+    assert!(
+        call.is_err(),
+        "the spent grant must refuse calls as well: {call:?}"
+    );
 }
 
 /// RPC-03: the check runs for every transferred cap before any meter is
@@ -299,41 +313,73 @@ fn a_refused_send_spends_nothing() {
     let agent = Agent::with_secret([0x52u8; 32]);
     let provider = agent.register(Box::new(Sink));
     let lane = agent
-        .create_lane("wide", Budget { max_bytes: 1 << 26, ..Budget::default() })
+        .create_lane(
+            "wide",
+            Budget {
+                max_bytes: 1 << 26,
+                ..Budget::default()
+            },
+        )
         .expect("lane");
-    let channel = agent
-        .create_channel("c", Direction::Send)
-        .expect("channel");
+    let channel = agent.create_channel("c", Direction::Send).expect("channel");
     let generous = agent
         .mint(
             provider,
             0,
-            CapAttrs::new(&["noop"])
-                .with_budget(Budget { max_calls: 10, max_bytes: 10_000, ..Budget::default() }),
+            CapAttrs::new(&["noop"]).with_budget(Budget {
+                max_calls: 10,
+                max_bytes: 10_000,
+                ..Budget::default()
+            }),
         )
         .expect("generous cap");
     let tiny = agent
         .mint(
             provider,
             0,
-            CapAttrs::new(&["noop"])
-                .with_budget(Budget { max_calls: 10, max_bytes: 10, ..Budget::default() }),
+            CapAttrs::new(&["noop"]).with_budget(Budget {
+                max_calls: 10,
+                max_bytes: 10,
+                ..Budget::default()
+            }),
         )
         .expect("tiny cap");
     let payload = Value::text("x".repeat(100));
     // The tiny cap's check fails, so the generous cap must not be charged.
-    let refused = agent.send(lane, channel, payload.clone(), &[generous.clone(), tiny.clone()]);
-    assert!(refused.is_err(), "the tiny cap's meter must refuse the send: {refused:?}");
+    let refused = agent.send(
+        lane,
+        channel,
+        payload.clone(),
+        &[generous.clone(), tiny.clone()],
+    );
+    assert!(
+        refused.is_err(),
+        "the tiny cap's meter must refuse the send: {refused:?}"
+    );
     assert_eq!(agent.remaining_bytes(&generous).expect("meter"), 10_000);
     assert_eq!(agent.remaining_calls(&generous).expect("meter"), 10);
     assert_eq!(agent.remaining_bytes(&tiny).expect("meter"), 10);
     assert_eq!(agent.remaining_calls(&tiny).expect("meter"), 10);
     // A send the lane refuses must not spend the cap meter either.
     let narrow = agent
-        .create_lane("narrow", Budget { max_bytes: 50, ..Budget::default() })
+        .create_lane(
+            "narrow",
+            Budget {
+                max_bytes: 50,
+                ..Budget::default()
+            },
+        )
         .expect("narrow lane");
-    let refused = agent.send(narrow, channel, payload.clone(), std::slice::from_ref(&generous));
-    assert!(refused.is_err(), "the narrow lane must refuse the send: {refused:?}");
+    let refused = agent.send(
+        narrow,
+        channel,
+        payload.clone(),
+        std::slice::from_ref(&generous),
+    );
+    assert!(
+        refused.is_err(),
+        "the narrow lane must refuse the send: {refused:?}"
+    );
     assert_eq!(agent.remaining_bytes(&generous).expect("meter"), 10_000);
     assert_eq!(agent.remaining_calls(&generous).expect("meter"), 10);
 }
@@ -345,24 +391,34 @@ fn a_send_charges_the_ancestors_of_a_transferred_cap() {
     let agent = Agent::with_secret([0x53u8; 32]);
     let provider = agent.register(Box::new(Sink));
     let lane = agent
-        .create_lane("wide", Budget { max_bytes: 1 << 26, ..Budget::default() })
+        .create_lane(
+            "wide",
+            Budget {
+                max_bytes: 1 << 26,
+                ..Budget::default()
+            },
+        )
         .expect("lane");
-    let channel = agent
-        .create_channel("c", Direction::Send)
-        .expect("channel");
+    let channel = agent.create_channel("c", Direction::Send).expect("channel");
     let parent = agent
         .mint(
             provider,
             0,
-            CapAttrs::new(&["noop"])
-                .with_budget(Budget { max_calls: 10, max_bytes: 10_000, ..Budget::default() }),
+            CapAttrs::new(&["noop"]).with_budget(Budget {
+                max_calls: 10,
+                max_bytes: 10_000,
+                ..Budget::default()
+            }),
         )
         .expect("parent cap");
     let child = agent
         .attenuate(
             &parent,
-            CapAttrs::new(&["noop"])
-                .with_budget(Budget { max_calls: 5, max_bytes: 5_000, ..Budget::default() }),
+            CapAttrs::new(&["noop"]).with_budget(Budget {
+                max_calls: 5,
+                max_bytes: 5_000,
+                ..Budget::default()
+            }),
         )
         .expect("child cap");
     let payload = Value::text("x".repeat(100));
@@ -370,7 +426,10 @@ fn a_send_charges_the_ancestors_of_a_transferred_cap() {
     agent
         .send(lane, channel, payload, std::slice::from_ref(&child))
         .expect("send");
-    assert_eq!(agent.remaining_bytes(&child).expect("meter"), 5_000 - charge);
+    assert_eq!(
+        agent.remaining_bytes(&child).expect("meter"),
+        5_000 - charge
+    );
     assert_eq!(agent.remaining_calls(&child).expect("meter"), 4);
     assert_eq!(
         agent.remaining_bytes(&parent).expect("meter"),

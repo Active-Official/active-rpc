@@ -456,7 +456,6 @@ impl ReplayPackage {
     /// replay no longer matches its own trace. Comparing the replayed operation
     /// list would prove nothing, because `replay_trace` builds that list from
     /// the very operations it reads.
-
     pub fn replay(&self) -> Result<()> {
         let trace = self.replay_trace_inner()?;
         if self.trace.len() != trace.len() {

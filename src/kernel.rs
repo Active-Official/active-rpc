@@ -2613,15 +2613,7 @@ impl Agent {
             kernel.push_event(Event::CapExpired(parent_id));
             return Err(Error::Revoked(cap_token(parent_id)));
         }
-        let (
-            provider,
-            object,
-            lineage,
-            ancestor_record_ids,
-            parent_record_id,
-            expires_at,
-            attrs,
-        ) = {
+        let (provider, object, lineage, ancestor_record_ids, parent_record_id, expires_at, attrs) = {
             let record = kernel
                 .caps
                 .get(&parent_id)
@@ -6039,9 +6031,7 @@ impl Agent {
                     // revokes live copies it can see; this arm covers
                     // the copies it cannot, and any future tombstone
                     // path that inserts without revoking.
-                    Some(record)
-                        if kernel.revoked_records.contains(&record.record_id) =>
-                    {
+                    Some(record) if kernel.revoked_records.contains(&record.record_id) => {
                         Some(Error::Revoked(record_token(&record.record_id)))
                     }
                     Some(record) => {

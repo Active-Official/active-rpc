@@ -1472,9 +1472,7 @@ impl ReceiptLog {
                 return Err(Error::receipt("receipt time runs backwards"));
             }
             if receipt.at_ms > horizon {
-                return Err(Error::receipt(
-                    "receipt time is too far in the future",
-                ));
+                return Err(Error::receipt("receipt time is too far in the future"));
             }
             let record = encode_record(receipt, &previous)?;
             previous.copy_from_slice(&record[record.len() - 32..]);

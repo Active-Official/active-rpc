@@ -3347,10 +3347,9 @@ fn pipe_inode_of_link(link: &std::path::Path) -> Option<u64> {
 /// thread's side and must never be killed for holding it.
 #[cfg(target_os = "linux")]
 fn fd_is_write_end(pid: u32, name: &std::ffi::OsStr) -> bool {
-    let Ok(info) = std::fs::read_to_string(format!(
-        "/proc/{pid}/fdinfo/{}",
-        name.to_string_lossy()
-    )) else {
+    let Ok(info) =
+        std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", name.to_string_lossy()))
+    else {
         return false;
     };
     for line in info.lines() {
@@ -3435,7 +3434,6 @@ fn kill_pipe_holders(pipes: &[u64]) {
 /// needs `unsafe` FFI, which this crate forbids; until that lands, a descendant
 /// that outlives its leader is a recorded residual (STATUS.md), and no helper
 /// executable is ever launched.
-
 fn kill_process_tree(child: &mut Child, pipes: &[u64]) {
     // `pipes` is only consumed by the Linux `kill_pipe_holders` block below;
     // on Windows/macOS the parameter would otherwise warn as unused.

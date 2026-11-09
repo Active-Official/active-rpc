@@ -642,29 +642,21 @@ impl CapabilityRecord {
                 }
                 let mut ids = Vec::with_capacity(items.len());
                 for item in items {
-                    let text = item.as_str().ok_or_else(|| {
-                        Error::persistence("ancestor record id is not a string")
-                    })?;
+                    let text = item
+                        .as_str()
+                        .ok_or_else(|| Error::persistence("ancestor record id is not a string"))?;
                     let id = parse_hex32(text)?;
                     if id == [0u8; 32] {
-                        return Err(Error::persistence(
-                            "ancestor record id is not a record id",
-                        ));
+                        return Err(Error::persistence("ancestor record id is not a record id"));
                     }
                     if ids.contains(&id) {
-                        return Err(Error::persistence(
-                            "ancestor record list repeats an id",
-                        ));
+                        return Err(Error::persistence("ancestor record list repeats an id"));
                     }
                     ids.push(id);
                 }
                 ids
             }
-            Some(_) => {
-                return Err(Error::persistence(
-                    "ancestor record list is malformed",
-                ))
-            }
+            Some(_) => return Err(Error::persistence("ancestor record list is malformed")),
         };
         let seal = match value.get("seal") {
             None | Some(Json::Null) => None,

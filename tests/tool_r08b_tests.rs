@@ -130,12 +130,8 @@ fn reader_slots_are_not_pinned_by_setsid_descendants() {
 fn a_setsid_descendant_is_killed_when_the_stdio_transport_drops() {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
-    let transport = StdioTransport::spawn(
-        "/bin/sh",
-        &["-c", "setsid sleep 49 & exit 0"],
-        &env,
-    )
-    .expect("spawn MCP server");
+    let transport = StdioTransport::spawn("/bin/sh", &["-c", "setsid sleep 49 & exit 0"], &env)
+        .expect("spawn MCP server");
     // The leader exits at once; give the transport a moment to settle, then
     // drop it (which kills the leader's process group).
     std::thread::sleep(Duration::from_millis(300));
