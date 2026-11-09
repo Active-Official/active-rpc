@@ -205,6 +205,24 @@ pub const MAX_LOG_BYTES: u64 = 64 << 20;
 /// Largest number of records accepted.
 pub const MAX_LOG_RECORDS: u64 = 100_000;
 
+/// Strata the append fast path samples from the log body on every append
+/// (RPC-05). The record region is split into this many equal strata and one
+/// window is read from each; see [`sample_windows`].
+const FAST_PATH_SAMPLE_STRATA: usize = 8;
+/// Bytes read from each sampled stratum (RPC-05).
+///
+/// Eight strata of 64 bytes cover a record region of 512 bytes end to end, so
+/// every log that small is verified byte-for-byte on the fast path; above that
+/// the sample is a tripwire and the periodic re-walk is the backstop.
+const FAST_PATH_SAMPLE_WINDOW: usize = 64;
+/// Fast-path appends between full re-walks (RPC-05).
+///
+/// A writer who evades the content sample can link at most this many appends
+/// onto tampered history before the scheduled re-walk walks the whole chain
+/// and refuses. The re-walk is amortised over the appends it separates, so the
+/// linear-append property the hardening suite measures is kept.
+const FAST_PATH_REWALK_EVERY: u32 = 32;
+
 /// A receipt may not be dated more than this far ahead of the writer's wall
 /// clock (R2-R13-01, RPC-14). Without the bound, one receipt with
 /// `at_ms = u64::MAX` makes `last_ms` unreachable and bricks the log for
@@ -260,9 +278,37 @@ struct LogState {
     /// The inode is invariant under an in-place write, so an interior edit
     /// through the log's own path (or a hard link) kept length, header, tail
     /// and identity intact and the append kept trusting the cache. The mtime
-    /// changes on that write; a writer who can set it back is the authenticity
-    /// residual ADR-0021 records (R-13 round 15, F1).
+    /// changes on that write, but a writer who can set it back passed every
+    /// check and the next append linked onto the forged chain (RPC-05): mtime
+    /// is attacker-controllable metadata, not an integrity signal. It stays as
+    /// a cheap tripwire for the non-adversarial writer; the content sample
+    /// below is what the fast path now trusts.
     modified: Option<std::time::SystemTime>,
+    /// Keyed hash of the sampled windows of the file at the last known-good
+    /// state (RPC-05).
+    ///
+    /// The fast path used to admit an append on length, header, tail head,
+    /// identity and mtime alone, and an in-place same-length interior edit
+    /// whose mtime was set back passed every one of them. The sample binds the
+    /// admission to file *content*: on every append the windows are re-read
+    /// and re-hashed, and a mismatch falls through to the full re-walk, which
+    /// fails on the broken chain link and refuses the append. `None` means no
+    /// sample has been established for this state (fresh `create`/`open`, or a
+    /// state refreshed by `repair_tail`), and the fast path then re-walks.
+    /// The windows are chosen with the log's per-instance seed, so a writer
+    /// with file access but no access to this process's memory cannot predict
+    /// which bytes the next append will check. A log whose record region is
+    /// at most `FAST_PATH_SAMPLE_STRATA * FAST_PATH_SAMPLE_WINDOW` bytes is
+    /// covered end to end; above that the sample is probabilistic per append
+    /// and the re-walk count below bounds the evasion.
+    sample: Option<[u8; 32]>,
+    /// Fast-path appends since the last full walk of the file (RPC-05).
+    ///
+    /// The sample can miss an edit in a large log, so the fast path is not
+    /// trusted for ever: once this reaches [`FAST_PATH_REWALK_EVERY`] the
+    /// next append re-walks the whole chain however clean the metadata looks.
+    /// A state that comes from a walk starts at zero.
+    appends_since_walk: u32,
 }
 
 /// One read of a log: the records and the tail they end at.
@@ -1210,6 +1256,17 @@ impl Drop for LogLock {
 pub struct ReceiptLog {
     path: std::path::PathBuf,
     state: std::sync::Arc<std::sync::Mutex<LogState>>,
+    /// Per-instance seed for the append fast-path content sample (RPC-05).
+    ///
+    /// Drawn from the operating system CSPRNG when the log is created or
+    /// opened, held in memory only, and never written to the file: the sample
+    /// windows it chooses are unpredictable to a writer that has file access
+    /// but no access to this process's memory. Two handles to the same file
+    /// hold different seeds and therefore check different bytes, which is
+    /// safe because each handle establishes its own sample from a walk.
+    /// Cloning a handle shares the seed, which is correct: the clone is the
+    /// same writer.
+    sample_seed: [u8; 32],
 }
 
 impl ReceiptLog {
@@ -1290,7 +1347,17 @@ impl ReceiptLog {
                 last_ms: 0,
                 identity: None,
                 modified: None,
+                // No sample yet: the first append re-walks the header-only
+                // file and establishes it (RPC-05).
+                sample: None,
+                appends_since_walk: 0,
             })),
+            // The seed is drawn here so a log that cannot seed itself is
+            // never created: without it the fast path could not sample
+            // unpredictably, and silently falling back to fixed windows would
+            // leave the hole RPC-05 closes (a reader of the source would know
+            // exactly which bytes are never checked).
+            sample_seed: new_sample_seed()?,
         };
         let mut header = Vec::with_capacity(LOG_HEADER_LEN);
         header.extend_from_slice(LOG_MAGIC);
@@ -1338,6 +1405,9 @@ impl ReceiptLog {
         Ok(Self {
             path,
             state: std::sync::Arc::new(std::sync::Mutex::new(state)),
+            // The walked state carries no sample, so the first append
+            // re-walks and establishes one (RPC-05).
+            sample_seed: new_sample_seed()?,
         })
     }
 
@@ -1391,6 +1461,43 @@ impl ReceiptLog {
         self.append_inner(receipts)
     }
 
+    /// The keyed hash of the sampled windows of the file on disk (RPC-05).
+    ///
+    /// Reads the same windows [`sample_bytes`] hashes for a log held in
+    /// memory, so the two agree for the same seed and length. `None` means
+    /// the file could not be read: the caller treats that as "not verified"
+    /// and re-walks, never as "unchanged".
+    fn read_sample(&self, total_len: u64) -> Option<[u8; 32]> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = open_log_read(&self.path).ok()?;
+        let mut hasher = blake3::Hasher::new_keyed(&self.sample_seed);
+        let mut window = [0u8; FAST_PATH_SAMPLE_WINDOW];
+        for (offset, len) in sample_windows(&self.sample_seed, total_len) {
+            let len = len as usize;
+            if len == 0 {
+                continue;
+            }
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            file.read_exact(&mut window[..len]).ok()?;
+            hasher.update(&window[..len]);
+        }
+        Some(*hasher.finalize().as_bytes())
+    }
+
+    /// Whether the file on disk still carries the content the cached state
+    /// was sampled from (RPC-05).
+    ///
+    /// False when no sample was ever established, when the file cannot be
+    /// read, and when any sampled byte differs. A false answer never refuses
+    /// an append by itself: it sends the writer to the full re-walk, and the
+    /// walk is what refuses a log whose chain link no longer verifies.
+    fn sample_matches(&self, cached: &LogState) -> bool {
+        match cached.sample {
+            None => false,
+            Some(expected) => self.read_sample(cached.bytes) == Some(expected),
+        }
+    }
+
     fn append_inner(&self, receipts: &[Receipt]) -> Result<()> {
         if receipts.is_empty() {
             return Ok(());
@@ -1413,6 +1520,7 @@ impl ReceiptLog {
         let observed = std::fs::metadata(&self.path)
             .map_err(|_| Error::receipt("cannot stat the receipt log"))?
             .len();
+        let mut used_fast_path = false;
         let mut state = {
             let cached = *self
                 .state
@@ -1422,6 +1530,20 @@ impl ReceiptLog {
             // same length (a fresh header of another start sequence, for
             // instance) would let the append write a sequence the header does
             // not number, producing a log nothing can walk.
+            //
+            // None of the checks below reads file content except the last,
+            // and that is the hole RPC-05 closes: an in-place same-length
+            // interior edit whose mtime was set back passed length, identity,
+            // mtime, header and tail head alike, because every one of those
+            // is metadata the editor controls or bytes the edit never
+            // touched. A keyed MAC over (length, head, mtime) would not have
+            // closed it either — the attack leaves all three inputs exactly
+            // as cached, so the MAC still verifies. The admission is
+            // therefore bound to content: the sample re-reads bytes spread
+            // over the whole log (every byte of a small log), and a mismatch
+            // sends the writer to the re-walk, which fails on the broken
+            // chain link. The re-walk count bounds how long the sample is
+            // trusted for a large log, where it is probabilistic.
             let usable = cached.bytes == observed
                 // A copy swapped over the path keeps every other check: same
                 // length, same header, same trailing head (its middle record
@@ -1435,14 +1557,21 @@ impl ReceiptLog {
                 // checks above while its trailing head is another chain: the
                 // append would link to a head the file does not carry, and
                 // nothing could read the log again.
-                && read_tail_head(&self.path) == Some(cached.head);
+                && read_tail_head(&self.path) == Some(cached.head)
+                && cached.appends_since_walk < FAST_PATH_REWALK_EVERY
+                && self.sample_matches(&cached);
             if usable {
+                used_fast_path = true;
                 cached
             } else {
                 let (bytes, identity, modified) = read_capped_with_identity(&self.path)?;
                 let (_, mut walked) = walk_log(&bytes)?;
                 walked.identity = identity;
                 walked.modified = modified;
+                // The walk verified every byte, so this state is the one the
+                // next sample is taken from.
+                walked.sample = Some(sample_bytes(&self.sample_seed, &bytes));
+                walked.appends_since_walk = 0;
                 walked
             }
         };
@@ -1503,6 +1632,18 @@ impl ReceiptLog {
         // here, or every later append re-walks the whole log (the linearity
         // test caught exactly that).
         state.modified = path_modified(&self.path);
+        // The file grew by the batch, so the sample must cover the new bytes:
+        // refresh it from disk, and advance the re-walk count only when this
+        // append trusted the fast path (a walk has just happened, so its
+        // count restarts at zero). A refresh that cannot read the file leaves
+        // no sample, and the next append re-walks instead of trusting stale
+        // bytes (RPC-05).
+        if used_fast_path {
+            state.appends_since_walk = state.appends_since_walk.saturating_add(1);
+        } else {
+            state.appends_since_walk = 0;
+        }
+        state.sample = self.read_sample(total);
         if let Ok(mut cached) = self.state.lock() {
             *cached = state;
         }
@@ -1810,6 +1951,86 @@ fn read_tail_head(path: &std::path::Path) -> Option<[u8; 32]> {
     let mut head = [0u8; 32];
     file.read_exact(&mut head).ok()?;
     Some(head)
+}
+
+/// One per-instance seed for the append fast-path content sample (RPC-05).
+///
+/// The operating system CSPRNG is the same source the kernel seeds itself
+/// from; a log that cannot draw one is not created at all, rather than
+/// running with predictable sample windows.
+fn new_sample_seed() -> Result<[u8; 32]> {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed)
+        .map_err(|_| Error::receipt("the operating system CSPRNG must be available"))?;
+    Ok(seed)
+}
+
+/// The windows of the log body the fast path samples on every append
+/// (RPC-05): one `(offset, length)` pair per stratum, in file order.
+///
+/// The record region (everything past the header) is split into
+/// [`FAST_PATH_SAMPLE_STRATA`] equal strata — the first strata hold one byte
+/// more when the region does not divide evenly, so every byte belongs to
+/// exactly one stratum — and one window of at most [`FAST_PATH_SAMPLE_WINDOW`]
+/// bytes is taken from each. Where the window sits inside its stratum is
+/// derived from the per-instance seed, the stratum index and the file length,
+/// so the checked bytes change as the log grows and are unpredictable to a
+/// writer that has file access but no access to this process's memory. A
+/// stratum no larger than the window is covered end to end, which is what
+/// makes a small log's fast path verify every byte.
+///
+/// The offsets depend on the total length, so a sample is only meaningful for
+/// the length it was computed over: the caller must have checked the length
+/// first, which the fast-path gate does.
+fn sample_windows(seed: &[u8; 32], total_len: u64) -> [(u64, u64); FAST_PATH_SAMPLE_STRATA] {
+    let mut windows = [(0u64, 0u64); FAST_PATH_SAMPLE_STRATA];
+    let region_len = total_len.saturating_sub(LOG_HEADER_LEN as u64);
+    if region_len == 0 {
+        return windows;
+    }
+    let base = region_len / FAST_PATH_SAMPLE_STRATA as u64;
+    let extra = region_len % FAST_PATH_SAMPLE_STRATA as u64;
+    let mut start = LOG_HEADER_LEN as u64;
+    for (index, window) in windows.iter_mut().enumerate() {
+        let stratum_len = base + u64::from((index as u64) < extra);
+        let take = stratum_len.min(FAST_PATH_SAMPLE_WINDOW as u64);
+        let slack = stratum_len - take;
+        let shift = if slack == 0 {
+            0
+        } else {
+            let mut hasher = blake3::Hasher::new_keyed(seed);
+            hasher.update(&(index as u64).to_le_bytes());
+            hasher.update(&total_len.to_le_bytes());
+            hasher.update(&slack.to_le_bytes());
+            let derived = hasher.finalize();
+            u64::from_le_bytes(
+                derived.as_bytes()[..8]
+                    .try_into()
+                    .expect("8 bytes of a hash"),
+            ) % (slack + 1)
+        };
+        *window = (start + shift, take);
+        start += stratum_len;
+    }
+    windows
+}
+
+/// The keyed hash of the sampled windows of a whole log held in memory
+/// (RPC-05).
+///
+/// `bytes` is the complete file, header included; only the record region is
+/// sampled. The windows come from [`sample_windows`], so this agrees with
+/// [`ReceiptLog::read_sample`] for the same seed and length by construction.
+fn sample_bytes(seed: &[u8; 32], bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_keyed(seed);
+    for (offset, len) in sample_windows(seed, bytes.len() as u64) {
+        let offset = offset as usize;
+        let len = len as usize;
+        // The windows are derived from this very length, so they lie inside
+        // the bytes by construction; the slice is the contract, not a guess.
+        hasher.update(&bytes[offset..offset + len]);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// Read a log file under the size ceiling, refusing a larger one without
@@ -2258,6 +2479,11 @@ fn walk_log(bytes: &[u8]) -> Result<(Vec<Receipt>, LogState)> {
         last_ms: last_time.unwrap_or(0),
         identity: None,
         modified: None,
+        // A bare walk knows no seed, so it establishes no sample: the
+        // caller that owns the seed sets it from the walked bytes, and any
+        // other consumer re-walks on its next append (RPC-05).
+        sample: None,
+        appends_since_walk: 0,
     };
     Ok((receipts, state))
 }
@@ -2389,6 +2615,60 @@ mod walk_tests {
             cursor = next;
         }
         assert_eq!(records, MAX_LOG_RECORDS, "the ceiling is the stop");
+    }
+}
+
+#[cfg(test)]
+mod sample_tests {
+    use super::*;
+
+    /// The sample windows of a small log cover every byte of it, so the fast
+    /// path verifies a small log byte-for-byte and no interior edit can hide
+    /// between windows (RPC-05). Above the coverage limit the windows are
+    /// still in order, in bounds and disjoint, and sample the full budget.
+    #[test]
+    fn small_logs_are_sampled_end_to_end() {
+        let seed = [0x5au8; 32];
+        // An empty record region samples nothing.
+        assert!(
+            sample_windows(&seed, LOG_HEADER_LEN as u64)
+                .iter()
+                .all(|&(_, len)| len == 0),
+            "an empty region has no windows"
+        );
+        for region in 1..=600usize {
+            let total = (LOG_HEADER_LEN + region) as u64;
+            let windows = sample_windows(&seed, total);
+            let mut covered = 0u64;
+            let mut cursor = LOG_HEADER_LEN as u64;
+            for (offset, len) in windows {
+                assert!(
+                    offset >= cursor && offset + len <= total,
+                    "window {offset}+{len} escapes its stratum in a {region}-byte region"
+                );
+                covered += len;
+                cursor = offset + len;
+            }
+            if region <= FAST_PATH_SAMPLE_STRATA * FAST_PATH_SAMPLE_WINDOW {
+                assert_eq!(
+                    covered, region as u64,
+                    "a {region}-byte region must be covered end to end"
+                );
+            } else {
+                assert_eq!(
+                    covered,
+                    (FAST_PATH_SAMPLE_STRATA * FAST_PATH_SAMPLE_WINDOW) as u64,
+                    "a large region samples the full window budget"
+                );
+            }
+        }
+        // Same seed and length, same windows: the sample a walk establishes
+        // is the sample the next append checks.
+        assert_eq!(
+            sample_windows(&seed, 300),
+            sample_windows(&seed, 300),
+            "the windows are deterministic"
+        );
     }
 }
 

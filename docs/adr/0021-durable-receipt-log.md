@@ -210,6 +210,22 @@ unlinks the link, never a target), and a log open still refuses a device or FIFO
 after the open. A host that cannot accept the window should keep the receipt
 directory writable only by the service (R-13 round 16, F9/F4).
 
+The append fast path no longer trusts mtime (RPC-05, fixed 2026-11-09). An
+in-place same-length interior edit whose mtime was set back passed the length,
+header, tail-head, identity and mtime checks, so the next append linked onto a
+forged chain. The fast path now also verifies a keyed content sample on every
+platform — eight 64-byte windows spread over the log body, placed by a
+per-instance seed drawn from the operating system CSPRNG — and re-walks the
+whole chain at least every 33 appends; a sample mismatch falls through to the
+re-walk, which fails on the broken chain link and refuses the append. A log
+whose record region is at most 512 bytes is verified byte-for-byte on the fast
+path. The remaining residual is bounded, not open: a writer who evades the
+sample in a large log can link at most 32 appends onto tampered history before
+the scheduled re-walk refuses, and the tamper is then visible to every reader
+(the walk fails at the edited record). A keyed MAC over (length, head, mtime)
+was considered and rejected: the attack leaves all three inputs exactly as
+cached, so such a MAC still verifies.
+
 `receipts verify` and the `--receipt-key-file` / `--expect-head` flags live in
 the CLI crate that consumes this library; this ADR describes the library
 contract, not a command-line surface (R-13 round 12, F9).

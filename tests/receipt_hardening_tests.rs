@@ -718,3 +718,111 @@ fn many_appends_stay_linear() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// RPC-05: the append fast path must not trust a forged mtime
+// ---------------------------------------------------------------------------
+
+/// An interior edit whose mtime is set back to the cached value used to pass
+/// every fast-path check and link the next append onto a forged chain
+/// (RPC-05). The content sample now catches the edit, and the re-walk it
+/// falls through to fails on the broken chain link, so the append is refused
+/// and the file is untouched. Mirrors audit probe p23.
+#[test]
+fn an_interior_edit_with_the_mtime_set_back_is_refused() {
+    let dir = sandbox("mtime-setback");
+    let path = dir.join("receipts.arrl");
+    let log = ReceiptLog::create(&path).expect("create");
+    let (_agent, receipts) = session(3);
+    assert_eq!(receipts.len(), 3, "three admitted calls");
+    log.append(&receipts[0]).expect("append 1");
+    log.append(&receipts[1]).expect("append 2");
+    // Snapshot the cached mtime, then edit an interior byte in place
+    // (same length, header and tail untouched) and set the mtime back.
+    let cached_mtime = std::fs::metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    let bytes = std::fs::read(&path).expect("read log");
+    let middle = bytes.len() / 2;
+    let mut edited = bytes.clone();
+    edited[middle] ^= 0xff;
+    std::fs::write(&path, &edited).expect("edit in place");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open");
+    file.set_times(std::fs::FileTimes::new().set_modified(cached_mtime))
+        .expect("set mtime back");
+    drop(file);
+    let before = std::fs::read(&path).expect("read log");
+    let error = log
+        .append(&receipts[2])
+        .expect_err("an interior edit with the mtime set back must be refused");
+    assert_eq!(error.code(), "rpc/receipt");
+    assert_eq!(
+        std::fs::read(&path).expect("read log"),
+        before,
+        "a refused append must not touch the file"
+    );
+    // The tamper is still in the file, so readers see it too: the refusal
+    // kept the log from gaining a third record chained onto the forgery, it
+    // did not repair the edit.
+    assert!(
+        log.records().is_err(),
+        "the tampered log must not read as clean"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tamper the content sample happens to miss is still caught: the fast path
+/// re-walks the whole chain at least every 33 appends, so within that window
+/// some append is refused (RPC-05). The test does not depend on which layer
+/// fires — the sample usually fires first on a log this size — only on the
+/// bound: no more than 32 appends can link onto tampered history.
+#[test]
+fn a_tamper_is_caught_within_the_scheduled_re_walk_window() {
+    let dir = sandbox("rewalk-window");
+    let path = dir.join("receipts.arrl");
+    let log = ReceiptLog::create(&path).expect("create");
+    // Fifty receipts make the record region several kilobytes, so the sample
+    // covers only a fraction of it.
+    for sequence in 1..=50u64 {
+        log.append(&receipt(sequence, sequence)).expect("append");
+    }
+    let cached_mtime = std::fs::metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    let bytes = std::fs::read(&path).expect("read log");
+    let mut edited = bytes.clone();
+    edited[bytes.len() / 2] ^= 0xff;
+    std::fs::write(&path, &edited).expect("edit in place");
+    // The mtime is set back, as in the p23 attack: the mtime tripwire must
+    // not be what catches this, or the test would not exercise the sample
+    // and the scheduled re-walk.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open");
+    file.set_times(std::fs::FileTimes::new().set_modified(cached_mtime))
+        .expect("set mtime back");
+    drop(file);
+    let mut refused = false;
+    for attempt in 1..=40u64 {
+        let next = 50 + attempt;
+        match log.append(&receipt(next, next)) {
+            Ok(()) => {}
+            Err(error) => {
+                assert_eq!(error.code(), "rpc/receipt");
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        refused,
+        "a tampered log must refuse an append within 40 attempts (32 fast-path appends, then the scheduled re-walk)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
