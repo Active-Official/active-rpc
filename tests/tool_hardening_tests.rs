@@ -269,6 +269,88 @@ fn a_timeout_after_the_leader_exits_kills_the_tree() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// The Windows twin of `a_timeout_after_the_leader_exits_kills_the_tree`:
+/// the leader exits at once and leaves a grandchild holding the pipes. The
+/// call times out in the reader wait, and the job-object kill must end the
+/// grandchild too (XPL-RPC-04): before the fix only the leader died, the
+/// grandchild survived and wrote the marker two seconds later.
+///
+/// The leader is a batch file so the grandchild's command line needs no
+/// nested quoting: it starts a background `cmd` that waits ~2 s and then
+/// writes the marker, and exits at once itself. `ping` is the wait because
+/// `timeout` fails when stdin is redirected (the adapter pipes stdin null),
+/// and `choice` reads the console.
+#[cfg(windows)]
+#[test]
+fn a_timeout_after_the_leader_exits_kills_the_tree_on_windows() {
+    use std::time::{Duration, Instant};
+
+    // No `{:?}` of the thread id here: it prints `ThreadId(3)`, and the
+    // parentheses break `cmd /c` parsing of the unquoted script path.
+    let directory =
+        std::env::temp_dir().join(format!("active-rpc-process-job-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("scratch directory");
+    let marker = directory.join("marker");
+    let _ = std::fs::remove_file(&marker);
+    let script = directory.join("leader.bat");
+    std::fs::write(
+        &script,
+        "@echo off\r\nstart /b cmd /c \"ping -n 3 127.0.0.1 >nul & echo late > %1\"\r\nexit /b 0\r\n",
+    )
+    .expect("write leader batch file");
+
+    let mut tool = LocalProcess::new(
+        absolute_shell(),
+        &[
+            "/c",
+            script.to_string_lossy().as_ref(),
+            marker.to_string_lossy().as_ref(),
+        ],
+    )
+    .expect("an absolute program")
+    .with_timeout(300);
+    tool.env.insert(
+        "PATH".to_string(),
+        "C:\\Windows\\System32;C:\\Windows".to_string(),
+    );
+    tool.env
+        .insert("SystemRoot".to_string(), "C:\\Windows".to_string());
+    let mut call = Call::new(
+        "run",
+        vec![
+            Arg::text("/c"),
+            Arg::text(script.to_string_lossy().into_owned()),
+            Arg::text(marker.to_string_lossy().into_owned()),
+        ],
+    );
+    call.tool_allows_process = true;
+
+    let started = Instant::now();
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the inherited pipes outlive the ceiling");
+    // The child ran, so the refusal is a withheld reply (round 43, F-4); the
+    // tree-kill assertions below are unchanged.
+    assert_eq!(error.code(), "rpc/provider", "{error}");
+    assert_eq!(
+        error.provider_code(),
+        Some("provider/reply-withheld"),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the call returned after {:?}",
+        started.elapsed()
+    );
+
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert!(
+        !marker.exists(),
+        "a grandchild of an exited leader survived the timeout and wrote {marker:?}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 // ---------------------------------------------------------------------------
 // HTTP: wall ceiling, framing, request line
 // ---------------------------------------------------------------------------

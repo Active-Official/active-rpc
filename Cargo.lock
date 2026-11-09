@@ -41,6 +41,7 @@ dependencies = [
  "active-core",
  "active-infinity",
  "active-rpc-liveness",
+ "active-rpc-process-tree",
  "blake3",
  "bytes",
  "criterion",
@@ -66,6 +67,13 @@ name = "active-rpc-liveness"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "active-rpc-process-tree"
+version = "0.1.0"
+dependencies = [
  "windows-sys 0.61.2",
 ]
 

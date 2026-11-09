@@ -20,6 +20,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use active_rpc_process_tree::{prepare_command, Job};
 use serde_json::{json, Value as Json};
 
 use crate::cap::ToolPolicy;
@@ -536,35 +537,65 @@ const MAX_OUTPUT_BYTES: usize = 16 << 20;
 
 /// Process reader threads that may still be draining an earlier child.
 ///
-/// On Windows the cleanup kills the leader only (ARPC-004), so a descendant
-/// that holds the pipe keeps its reader blocked in `read` until it exits. The
-/// count is capped so a timeout loop cannot exhaust the process
-/// (round 33, H3).
-static LIVE_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// On Windows the cleanup used to kill the leader only (ARPC-004), so a
+/// descendant that holds the pipe kept its reader blocked in `read` until
+/// it exited. The job object (XPL-RPC-04) now kills the whole tree, but a
+/// reader can still outlive its call elsewhere — a descendant that called
+/// `setsid` leaves the process group, and the pipe inode finds it only on
+/// Linux (R2-R08B-01) — so the count stays capped, and the cap is now per
+/// adapter: a leak in one adapter cannot starve the other (round 33, H3).
+static LIVE_READERS_MCP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIVE_READERS_PROCESS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
-/// Cap for [`LIVE_READERS`]; well above any legitimate concurrency.
-const MAX_LIVE_READERS: usize = 256;
+/// Cap for each adapter's live-reader count; well above any legitimate
+/// concurrency. The two reservations add up to the previous single cap of
+/// 256, so the process-wide bound is unchanged — it is only split, so one
+/// adapter can no longer consume the other's places (XPL-RPC-04).
+const MAX_LIVE_READERS_PER_ADAPTER: usize = 128;
 
-/// One reserved place in [`LIVE_READERS`], released when the reader ends.
+/// Which adapter a reader thread belongs to. The cap is per adapter (see
+/// [`MAX_LIVE_READERS_PER_ADAPTER`]).
+#[derive(Clone, Copy)]
+enum ReaderKind {
+    /// An MCP stdio session: its reader thread and its writer thread.
+    Mcp,
+    /// A local process invocation: its stdout/stderr drain threads.
+    Process,
+}
+
+/// One reserved place in an adapter's live-reader count, released when the
+/// reader ends.
 ///
 /// A guard rather than paired calls: a thread that fails to spawn drops the
 /// closure, so a failed spawn cannot leak a place and eventually refuse every
 /// process call (round 33, H3).
-struct ReaderSlot;
+struct ReaderSlot {
+    kind: ReaderKind,
+}
 
 impl ReaderSlot {
-    fn acquire() -> Option<Self> {
-        if LIVE_READERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_LIVE_READERS {
-            LIVE_READERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    fn acquire(kind: ReaderKind) -> Option<Self> {
+        let counter = match kind {
+            ReaderKind::Mcp => &LIVE_READERS_MCP,
+            ReaderKind::Process => &LIVE_READERS_PROCESS,
+        };
+        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_LIVE_READERS_PER_ADAPTER
+        {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return None;
         }
-        Some(Self)
+        Some(Self { kind })
     }
 }
 
 impl Drop for ReaderSlot {
     fn drop(&mut self) {
-        let _ = LIVE_READERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let counter = match self.kind {
+            ReaderKind::Mcp => &LIVE_READERS_MCP,
+            ReaderKind::Process => &LIVE_READERS_PROCESS,
+        };
+        let _ = counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1018,6 +1049,11 @@ pub struct StdioTransport {
     /// (R2-R08B-01): the drop kill needs them to find a descendant that
     /// left the process group. Empty outside Linux.
     pipes: Vec<u64>,
+    /// The job object the child and its descendants run in (Windows): the
+    /// drop kill terminates the job, so no descendant outlives the session
+    /// (XPL-RPC-04). A stub on other platforms, where the process group is
+    /// the mechanism.
+    job: Job,
 }
 
 impl StdioTransport {
@@ -1063,6 +1099,10 @@ impl StdioTransport {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        // On Windows the child is born suspended so it can join its job
+        // object before it runs (XPL-RPC-04); on other platforms this is a
+        // no-op.
+        prepare_command(&mut command);
         for (key, value) in env {
             // A bad entry never reaches the child as written: `Command` asserts
             // on a NUL, and an empty or `=`-bearing key fails at spawn (or is
@@ -1077,17 +1117,28 @@ impl StdioTransport {
         let mut child = command.spawn().map_err(|error| Error::Provider {
             code: format!("mcp/spawn:{error}"),
         })?;
+        // The child was spawned suspended on Windows: it has not run yet, so
+        // assigning it to a job now cannot miss a grandchild it started. A
+        // failure here refuses the spawn rather than running a server
+        // outside the job (XPL-RPC-04).
+        let job = Job::assign_and_resume(&child).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            Error::Provider {
+                code: format!("mcp/spawn:{error}"),
+            }
+        })?;
         // Captured before the streams are taken into reader threads.
         let pipes = child_pipe_inodes(&child);
         let stdin = child.stdin.take().ok_or_else(|| {
             // `Child::Drop` neither kills nor reaps (round 13, F-7).
-            kill_process_tree(&mut child, &pipes);
+            kill_process_tree(&mut child, &pipes, Some(&job));
             Error::Provider {
                 code: "mcp/stdin".to_string(),
             }
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
-            kill_process_tree(&mut child, &pipes);
+            kill_process_tree(&mut child, &pipes, Some(&job));
             Error::Provider {
                 code: "mcp/stdout".to_string(),
             }
@@ -1102,7 +1153,7 @@ impl StdioTransport {
                 // descendant that inherits the pipe keeps this thread blocked
                 // for the life of the process, so abandoned sessions must not
                 // leak threads without bound (round 49, L-5).
-                let Some(_slot) = ReaderSlot::acquire() else {
+                let Some(_slot) = ReaderSlot::acquire(ReaderKind::Mcp) else {
                     let _ = sender.send(Err(Error::Provider {
                         code: "mcp/thread:too many readers".to_string(),
                     }));
@@ -1153,7 +1204,7 @@ impl StdioTransport {
             .map_err(|error| {
                 // `Child`'s Drop neither kills nor reaps: the server would
                 // outlive the error return (round 9, F-5).
-                kill_process_tree(&mut child, &pipes);
+                kill_process_tree(&mut child, &pipes, Some(&job));
                 Error::Provider {
                     code: format!("mcp/thread:{error}"),
                 }
@@ -1165,12 +1216,13 @@ impl StdioTransport {
         // never holds a backlog (round 8, F1).
         let (writer, commands) =
             std::sync::mpsc::sync_channel::<(String, std::sync::mpsc::Sender<Result<()>>)>(1);
-        // The writer blocks in `write_all` when the server stops reading, and on
-        // Windows only the leader is killed, so a descendant can hold stdin for
-        // the life of the process. It takes the same process-wide slot as a
-        // reader (round 58, L-4).
-        let writer_slot = ReaderSlot::acquire().ok_or_else(|| {
-            kill_process_tree(&mut child, &pipes);
+        // The writer blocks in `write_all` when the server stops reading, and a
+        // descendant that holds stdin can keep it blocked past the call: on
+        // Windows the job kill ends the whole tree (XPL-RPC-04), but a reader
+        // can still outlive its call elsewhere (see the live-reader note
+        // above). It takes an MCP-adapter slot like a reader (round 58, L-4).
+        let writer_slot = ReaderSlot::acquire(ReaderKind::Mcp).ok_or_else(|| {
+            kill_process_tree(&mut child, &pipes, Some(&job));
             Error::Provider {
                 code: "mcp/thread:too many readers".to_string(),
             }
@@ -1198,7 +1250,7 @@ impl StdioTransport {
             .map_err(|error| {
                 // The reader's arm already kills the child; this one must too
                 // (`Child::Drop` neither kills nor reaps) (round 10, F-1).
-                kill_process_tree(&mut child, &pipes);
+                kill_process_tree(&mut child, &pipes, Some(&job));
                 Error::Provider {
                     code: format!("mcp/thread:{error}"),
                 }
@@ -1208,6 +1260,7 @@ impl StdioTransport {
             writer,
             lines,
             pipes,
+            job,
         })
     }
 }
@@ -1330,7 +1383,7 @@ impl McpTransport for StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        kill_process_tree(&mut self.child, &self.pipes);
+        kill_process_tree(&mut self.child, &self.pipes, Some(&self.job));
     }
 }
 
@@ -3427,20 +3480,31 @@ fn kill_pipe_holders(pipes: &[u64]) {
 /// tried because this crate forbids `unsafe` and std has no signal API; a
 /// platform with neither still loses the leader.
 ///
-/// On Windows only the leader is killed. The previous implementation spawned
-/// `%SystemRoot%\System32\taskkill.exe`, and `SystemRoot` is a mutable process
-/// environment value: a poisoned environment chose the binary that ran during
-/// every error path (audit ARPC-004). A job object is the complete fix and
-/// needs `unsafe` FFI, which this crate forbids; until that lands, a descendant
-/// that outlives its leader is a recorded residual (STATUS.md), and no helper
-/// executable is ever launched.
-fn kill_process_tree(child: &mut Child, pipes: &[u64]) {
+/// On Windows the child runs in a job object (XPL-RPC-04), so terminating
+/// the job ends the leader and every descendant it started, atomically. The
+/// previous implementation spawned `%SystemRoot%\System32\taskkill.exe`, and
+/// `SystemRoot` is a mutable process environment value: a poisoned environment
+/// chose the binary that ran during every error path (audit ARPC-004). The
+/// job-object FFI lives in the `active-rpc-process-tree` helper crate, since
+/// this crate forbids `unsafe`; no helper executable is ever launched.
+fn kill_process_tree(child: &mut Child, pipes: &[u64], job: Option<&Job>) {
     // `pipes` is only consumed by the Linux `kill_pipe_holders` block below;
     // on Windows/macOS the parameter would otherwise warn as unused.
     let _ = pipes;
+    // `job` is only consumed by the Windows branch below; on other
+    // platforms the parameter would otherwise warn as unused.
+    #[cfg(not(windows))]
+    let _ = job;
     #[cfg(windows)]
     {
-        let _ = child.kill();
+        // The job holds the leader and every descendant it started: one
+        // terminate ends the whole tree atomically (XPL-RPC-04). A `None`
+        // job cannot happen for a child this module spawned — spawn fails
+        // closed when the job setup fails — so the leader kill below is
+        // only a fallback, never the mechanism.
+        if let Some(job) = job {
+            job.terminate();
+        }
     }
     #[cfg(unix)]
     {
@@ -3841,6 +3905,10 @@ impl Provider for LocalProcess {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        // On Windows the child is born suspended so it can join its job
+        // object before it runs (XPL-RPC-04); on other platforms this is a
+        // no-op.
+        prepare_command(&mut command);
         for (key, value) in &self.env {
             // Same rule as the transport: a bad entry never reaches `Command`.
             if !valid_env_entry(key, value) {
@@ -3854,6 +3922,17 @@ impl Provider for LocalProcess {
         self.calls += 1;
         let mut child = command.spawn().map_err(|error| Error::Provider {
             code: format!("process/spawn:{error}"),
+        })?;
+        // The child was spawned suspended on Windows: it has not run yet, so
+        // assigning it to a job now cannot miss a grandchild it started. A
+        // failure here refuses the spawn rather than running a tool outside
+        // the job (XPL-RPC-04).
+        let job = Job::assign_and_resume(&child).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            Error::Provider {
+                code: format!("process/spawn:{error}"),
+            }
         })?;
         // Captured before the streams are taken into reader threads.
         let pipes = child_pipe_inodes(&child);
@@ -3894,7 +3973,7 @@ impl Provider for LocalProcess {
                     // Every reader of a descendant-held pipe outlives its call
                     // on Windows; a timeout loop must not be able to exhaust
                     // the process (round 33, H3).
-                    let Some(slot) = ReaderSlot::acquire() else {
+                    let Some(slot) = ReaderSlot::acquire(ReaderKind::Process) else {
                         // Short enough that the provider code survives the
                         // receipt's 64-byte ceiling: a longer reason turned
                         // `process/thread:…` into a generic `rpc/provider`
@@ -3983,7 +4062,7 @@ impl Provider for LocalProcess {
                 .map(|stream| Box::new(stream) as Box<dyn std::io::Read + Send>),
         );
         if let Some(error) = spawn_error {
-            kill_process_tree(&mut child, &pipes);
+            kill_process_tree(&mut child, &pipes, Some(&job));
             // The child was already spawned, so it may have acted: the refusal is
             // a withheld reply (round 44, M-1).
             return Err(reply_withheld(Error::Provider {
@@ -4021,7 +4100,7 @@ impl Provider for LocalProcess {
                         // Both pipes together: checking each separately let a
                         // grant pay for twice the bytes (round 20, M2).
                         if stdout.len().saturating_add(stderr.len()) > max_output {
-                            kill_process_tree(&mut child, &pipes);
+                            kill_process_tree(&mut child, &pipes, Some(&job));
                             // The child ran: the effect may stand, so a retry
                             // must not fork it again (round 43, F-4).
                             return Err(reply_withheld(Error::ToolPolicy("output too large")));
@@ -4031,13 +4110,13 @@ impl Provider for LocalProcess {
                         // The whole tree is killed, not just the direct child:
                         // the leader may have exited already while a descendant
                         // still holds the pipes.
-                        kill_process_tree(&mut child, &pipes);
+                        kill_process_tree(&mut child, &pipes, Some(&job));
                         return Err(reply_withheld(Error::Timeout));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(error) => {
-                    kill_process_tree(&mut child, &pipes);
+                    kill_process_tree(&mut child, &pipes, Some(&job));
                     return Err(reply_withheld(Error::Provider {
                         code: format!("process/wait:{error}"),
                     }));
@@ -4050,7 +4129,7 @@ impl Provider for LocalProcess {
         // leave a background process acting on the capability's behalf.
         while received < readers {
             let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                kill_process_tree(&mut child, &pipes);
+                kill_process_tree(&mut child, &pipes, Some(&job));
                 return Err(reply_withheld(Error::Timeout));
             };
             match receiver.recv_timeout(left) {
@@ -4065,12 +4144,12 @@ impl Provider for LocalProcess {
                     // exits; refuse at the same ceiling instead of waiting out
                     // the grant (round 11, #2).
                     if stdout.len().saturating_add(stderr.len()) > max_output {
-                        kill_process_tree(&mut child, &pipes);
+                        kill_process_tree(&mut child, &pipes, Some(&job));
                         return Err(reply_withheld(Error::ToolPolicy("output too large")));
                     }
                 }
                 Err(_) => {
-                    kill_process_tree(&mut child, &pipes);
+                    kill_process_tree(&mut child, &pipes, Some(&job));
                     // The child ran; the drain deadline is a withheld reply
                     // (round 43, F-4).
                     return Err(reply_withheld(Error::Timeout));
@@ -4113,38 +4192,47 @@ impl Provider for LocalProcess {
 
 #[cfg(test)]
 mod reader_slot_tests {
-    use super::{ReaderSlot, MAX_LIVE_READERS};
+    use super::{ReaderKind, ReaderSlot, MAX_LIVE_READERS_PER_ADAPTER};
 
-    /// The reservation is a hard cap and a drop always gives the place back,
-    /// including when the thread that took it never started
-    /// (round 33, H3).
+    /// Each adapter has its own reservation: the cap refuses past the
+    /// ceiling, a drop always gives the place back, and filling one
+    /// adapter never takes a place from the other (XPL-RPC-04).
     #[test]
     fn the_reader_cap_refuses_beyond_its_ceiling_and_releases_on_drop() {
         let mut held = Vec::new();
-        while let Some(slot) = ReaderSlot::acquire() {
+        while let Some(slot) = ReaderSlot::acquire(ReaderKind::Mcp) {
             held.push(slot);
             assert!(
-                held.len() <= MAX_LIVE_READERS,
+                held.len() <= MAX_LIVE_READERS_PER_ADAPTER,
                 "the cap admitted {} reservations",
                 held.len()
             );
         }
-        assert_eq!(held.len(), MAX_LIVE_READERS);
-        assert!(ReaderSlot::acquire().is_none(), "the cap is full");
+        assert_eq!(held.len(), MAX_LIVE_READERS_PER_ADAPTER);
+        assert!(
+            ReaderSlot::acquire(ReaderKind::Mcp).is_none(),
+            "the cap is full"
+        );
+
+        // The other adapter is unaffected: its reservation is separate, so
+        // a leak in the MCP adapter cannot starve process calls.
+        let other = ReaderSlot::acquire(ReaderKind::Process)
+            .expect("the other adapter still has its own reservation");
+        drop(other);
 
         // A dropped reservation is reusable: a reader that ends (or a spawn
         // that fails) must not consume a place for the life of the process.
         held.pop();
-        let again = ReaderSlot::acquire().expect("a released place is reusable");
+        let again = ReaderSlot::acquire(ReaderKind::Mcp).expect("a released place is reusable");
         drop(again);
         drop(held);
 
         // And every place is back.
         let mut recovered = Vec::new();
-        while let Some(slot) = ReaderSlot::acquire() {
+        while let Some(slot) = ReaderSlot::acquire(ReaderKind::Mcp) {
             recovered.push(slot);
         }
-        assert_eq!(recovered.len(), MAX_LIVE_READERS);
+        assert_eq!(recovered.len(), MAX_LIVE_READERS_PER_ADAPTER);
     }
 }
 

@@ -1,0 +1,30 @@
+[package]
+name = "active-rpc-process-tree"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "One OS primitive for Active RPC: a Windows job object holding a tool child and every descendant it starts, so a timeout kill ends the whole tree (XPL-RPC-04)"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+publish = false
+
+[lib]
+name = "active_rpc_process_tree"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+# Already in the root lockfile (transitive via tokio/mio): no new registry
+# crate enters the graph (XPL-RPC-02). The API paths were verified in the
+# vendored windows-sys 0.61.2 source before this crate was written.
+# Win32_Security is required, not incidental: CreateJobObjectW takes
+# *const SECURITY_ATTRIBUTES, so windows-sys gates it on that feature.
+# Without it this crate only builds by workspace feature unification
+# (another crate enabling the feature) — a standalone build fails
+# with E0432 (unresolved import CreateJobObjectW). Every other symbol
+# used here was checked against the vendored source: only
+# CreateJobObjectW/A needs Win32_Security, and
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION needs Win32_System_Threading
+# (already declared).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }

@@ -32,6 +32,11 @@ wasm-tools = ["dep:wasmi", "dep:wat"]
 [dependencies]
 active-infinity = "2.4.0"
 active-core = { version = "1.4.0" }
+# The tool adapters' Windows children run in a job object so a timeout kill
+# ends the whole tree (XPL-RPC-04): the FFI lives in a one-purpose helper
+# crate with a safe API, since this crate forbids `unsafe` (same shape as
+# the liveness helper below).
+active-rpc-process-tree = { path = "process-tree", version = "0.1.0" }
 thiserror = "1.0"
 blake3 = "1.5"
 getrandom = "0.3"
