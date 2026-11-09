@@ -205,6 +205,31 @@ pub const MAX_LOG_BYTES: u64 = 64 << 20;
 /// Largest number of records accepted.
 pub const MAX_LOG_RECORDS: u64 = 100_000;
 
+/// A receipt may not be dated more than this far ahead of the writer's wall
+/// clock (R2-R13-01, RPC-14). Without the bound, one receipt with
+/// `at_ms = u64::MAX` makes `last_ms` unreachable and bricks the log for
+/// appends forever: no legitimate `at_ms` can ever be `>= u64::MAX`, and
+/// `repair` finds nothing to cut in a log that walks cleanly. 24 h absorbs
+/// real clock skew (NTP steps, a machine whose clock runs fast) while keeping
+/// `last_ms` within reach of every future legitimate receipt.
+pub const MAX_RECEIPT_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Wall-clock milliseconds since the Unix epoch; 0 when the clock is before
+/// the epoch (a clock that far wrong cannot stamp a plausible receipt).
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The latest `at_ms` a receipt may carry: the writer's wall clock plus
+/// [`MAX_RECEIPT_SKEW_MS`]. Computed once per operation, not once per
+/// receipt, so a large batch does not pay a clock read per record.
+fn future_horizon_ms() -> u64 {
+    wall_ms().saturating_add(MAX_RECEIPT_SKEW_MS)
+}
+
 /// Domain separator for the log chain hash.
 const LOG_DOMAIN: &[u8] = b"active-rpc/receipt-log/v2";
 
@@ -1428,6 +1453,9 @@ impl ReceiptLog {
         let mut previous = state.head;
         let mut count = state.count;
         let mut last_ms = state.last_ms;
+        // The skew bound is checked against one horizon for the whole batch,
+        // so a receipt dated beyond it is refused before anything is written.
+        let horizon = future_horizon_ms();
         for receipt in receipts {
             // `checked_add`, like the reader: a sequence this close to the
             // ceiling must be refused here rather than written and unreadable.
@@ -1442,6 +1470,11 @@ impl ReceiptLog {
             }
             if receipt.at_ms < last_ms {
                 return Err(Error::receipt("receipt time runs backwards"));
+            }
+            if receipt.at_ms > horizon {
+                return Err(Error::receipt(
+                    "receipt time is too far in the future",
+                ));
             }
             let record = encode_record(receipt, &previous)?;
             previous.copy_from_slice(&record[record.len() - 32..]);
@@ -1622,9 +1655,48 @@ impl ReceiptLog {
         if bytes.len() as u64 > MAX_LOG_BYTES {
             return Err(Error::receipt("the receipt log is too large"));
         }
-        // A log that already walks is intact: repair has nothing to do.
-        if walk_log(&bytes).is_ok() {
-            return Ok(0);
+        // A log that already walks is intact -- unless its tail is dated
+        // beyond the skew bound (R2-R13-01): one future-dated receipt bricks
+        // appends forever, and the walk alone cannot see it, so `repair`
+        // used to report 0 bytes cut for a log that could never be appended
+        // to again. Cut back to the last record within the bound; the suffix
+        // is exactly the records no legitimate writer could have produced,
+        // and the prefix is a valid log (a prefix of a walking log still
+        // walks). `encode_record` is deterministic, so re-encoding the
+        // walked receipts reproduces the exact record boundaries.
+        if let Ok((receipts, _)) = walk_log(&bytes) {
+            let horizon = future_horizon_ms();
+            let mut previous = [0u8; 32];
+            let mut offset = LOG_HEADER_LEN;
+            let mut cut_at: Option<usize> = None;
+            for receipt in &receipts {
+                if receipt.at_ms > horizon {
+                    cut_at = Some(offset);
+                    break;
+                }
+                let record = encode_record(receipt, &previous)?;
+                previous.copy_from_slice(&record[record.len() - 32..]);
+                offset += record.len();
+            }
+            let cut_at = match cut_at {
+                Some(at) => at,
+                None => return Ok(0),
+            };
+            // The prefix must itself be a valid log, or the cut would keep
+            // damage.
+            let _ = walk_log(&bytes[..cut_at])?;
+            // The same check as the append: a repair that lost its lock must
+            // not truncate a log another writer now owns (R-13 round 10, A).
+            if !lock.still_holds() {
+                return Err(Error::receipt(
+                    "the receipt log lock was displaced by another process",
+                ));
+            }
+            file.set_len(cut_at as u64)
+                .map_err(|_| Error::receipt("cannot truncate the future-dated tail"))?;
+            file.sync_all()
+                .map_err(|_| Error::receipt("cannot flush the repaired log"))?;
+            return Ok((bytes.len() - cut_at) as u64);
         }
         verify_header(&bytes)?;
         let good_end = walk_prefix(&bytes);
@@ -2740,5 +2812,98 @@ mod round11_tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+}
+
+#[cfg(test)]
+mod future_tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "active-rpc-receipt-future-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn receipt(sequence: u64, at_ms: u64) -> Receipt {
+        Receipt {
+            sequence,
+            cap: "0123456789abcdef".to_string(),
+            method: "echo".to_string(),
+            at_ms,
+            decision: Decision::Admitted,
+            mac: [0u8; 32],
+        }
+    }
+
+    /// R2-R13-01 (a): a receipt dated beyond the skew bound is refused at
+    /// append, and the refusal spends nothing -- the log keeps its one
+    /// record and still accepts a legitimate receipt afterwards.
+    #[test]
+    fn a_future_dated_receipt_is_refused_at_append() {
+        let dir = scratch_dir("append-gate");
+        let path = dir.join("log.arrl");
+        let log = ReceiptLog::create(&path).expect("create");
+        log.append(&receipt(1, 100)).expect("append seq 1");
+        let err = log
+            .append(&receipt(2, u64::MAX))
+            .expect_err("u64::MAX must be refused");
+        assert!(
+            err.to_string().contains("too far in the future"),
+            "the refusal must name the skew bound, not the backwards rule: {err}"
+        );
+        assert_eq!(log.records().expect("records").len(), 1);
+        // A receipt stamped with the real wall clock still appends.
+        log.append(&receipt(2, wall_ms())).expect("append seq 2");
+        assert_eq!(log.records().expect("records").len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-R13-01 (b): a log bricked before the fix -- one future-dated
+    /// record at the tail -- is cut back to the last in-bound record by
+    /// repair, and appends resume at the sequence that follows the
+    /// surviving records.
+    #[test]
+    fn repair_cuts_a_future_dated_suffix_and_appends_resume() {
+        let dir = scratch_dir("repair-cut");
+        let path = dir.join("log.arrl");
+        // Build the bricked log by hand: the append gate (a) now refuses the
+        // future record, so a log bricked before the fix can only be
+        // constructed from encoded records.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LOG_MAGIC);
+        bytes.push(LOG_VERSION);
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let mut previous = [0u8; 32];
+        let first = encode_record(&receipt(1, 100), &previous).expect("record 1");
+        previous.copy_from_slice(&first[first.len() - 32..]);
+        bytes.extend_from_slice(&first);
+        let future = encode_record(&receipt(2, u64::MAX), &previous).expect("record 2");
+        bytes.extend_from_slice(&future);
+        std::fs::write(&path, &bytes).expect("write bricked log");
+
+        let log = ReceiptLog::open(&path).expect("open walks the bricked log");
+        assert_eq!(log.records().expect("records").len(), 2);
+        let err = log
+            .append(&receipt(3, wall_ms()))
+            .expect_err("the bricked log must refuse appends");
+        assert!(err.to_string().contains("backwards"), "{err}");
+
+        let cut = ReceiptLog::repair(&path).expect("repair runs");
+        assert_eq!(
+            cut,
+            future.len() as u64,
+            "repair must cut exactly the future record"
+        );
+        assert_eq!(log.records().expect("records").len(), 1);
+        log.append(&receipt(2, wall_ms()))
+            .expect("appends resume at the sequence after the surviving records");
+        assert_eq!(log.records().expect("records").len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

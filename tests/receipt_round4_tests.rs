@@ -271,3 +271,37 @@ fn filetime_set(path: &std::path::Path, when: std::time::SystemTime) {
     file.set_times(std::fs::FileTimes::new().set_modified(when))
         .expect("times");
 }
+
+/// R2-R13-01 (a), public API: a receipt dated beyond the 24 h skew bound is
+/// refused at append, and the log still accepts a legitimate receipt after
+/// the refusal.
+#[test]
+fn a_future_dated_receipt_is_refused_at_append() {
+    let path = scratch("future-append-gate");
+    let log = ReceiptLog::create(&path).expect("create");
+    let at = |sequence: u64, at_ms: u64| Receipt {
+        sequence,
+        cap: "0123456789abcdef".to_string(),
+        method: "echo".to_string(),
+        at_ms,
+        decision: Decision::Admitted,
+        mac: [0u8; 32],
+    };
+    log.append(&at(1, 100)).expect("append seq 1");
+    let err = log
+        .append(&at(2, u64::MAX))
+        .expect_err("u64::MAX must be refused");
+    assert!(
+        err.to_string().contains("too far in the future"),
+        "the refusal must name the skew bound: {err}"
+    );
+    assert_eq!(log.records().expect("records").len(), 1);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .expect("wall clock");
+    log.append(&at(2, now_ms)).expect("append seq 2");
+    assert_eq!(log.records().expect("records").len(), 2);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("lock"));
+}
