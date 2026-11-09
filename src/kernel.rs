@@ -2046,7 +2046,12 @@ impl Agent {
         {
             return Err(Error::BudgetExceeded("tombstones"));
         }
-        let serial = kernel.next_serial;
+        // RPC-02: a fixed secret restarts serials at 0, so a restart
+        // followed by a kill-list replay would re-issue a tombstoned
+        // record id. Skip past any serial whose record id the kill list
+        // already holds, so a fresh mint never resurrects a revoked
+        // credential.
+        let serial = skip_tombstoned_serials(&mut kernel, None);
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, None);
         let expires_at = attrs.ttl_ms.map(|ttl| kernel.now_ms.saturating_add(ttl));
@@ -2145,7 +2150,10 @@ impl Agent {
                 return Err(Error::Revoked(cap_token(*ancestor)));
             }
         }
-        let serial = kernel.next_serial;
+        // RPC-02: as in `mint` — the derived record id is transient
+        // here (restore overwrites it with the record's own id), but
+        // the serial must still not be one the kill list holds.
+        let serial = skip_tombstoned_serials(&mut kernel, None);
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, None);
         let expires_at = attrs.ttl_ms.map(|ttl| kernel.now_ms.saturating_add(ttl));
@@ -2657,7 +2665,10 @@ impl Agent {
                 attrs,
             )
         };
-        let serial = kernel.next_serial;
+        // RPC-02: as in `mint` — a restarted kernel re-derives child
+        // record ids from the same (serial, parent) pairs, so a child
+        // minted after a kill-list replay must skip a tombstoned pair.
+        let serial = skip_tombstoned_serials(&mut kernel, Some(&parent_id));
         kernel.next_serial += 1;
         let id = CapId::derive(&kernel.secret, serial, Some(&parent_id));
         let mut child = CapRecord::new(id, provider, object, attrs.clone());
@@ -5986,6 +5997,21 @@ impl Agent {
                 let mut failure = match &record {
                     None => Some(Error::UnknownCapability(cap_token(job.cap))),
                     Some(record) if record.revoked => Some(Error::Revoked(cap_token(record.id))),
+                    // RPC-02: the tombstone set is the durable record of
+                    // the revocation, so dispatch — the last gate before
+                    // the provider — consults it too. A capability
+                    // minted before its record id was tombstoned (or
+                    // minted by a kernel that never saw the kill list)
+                    // must not dispatch, whatever order the replay and
+                    // the mint happened in. `tombstone_record` already
+                    // revokes live copies it can see; this arm covers
+                    // the copies it cannot, and any future tombstone
+                    // path that inserts without revoking.
+                    Some(record)
+                        if kernel.revoked_records.contains(&record.record_id) =>
+                    {
+                        Some(Error::Revoked(record_token(&record.record_id)))
+                    }
                     Some(record) => {
                         if record.expires_at.is_some_and(|expires_at| {
                             kernel.now_ms >= expires_at || record.wall_clock != kernel.wall_clock
@@ -7731,6 +7757,33 @@ pub(crate) fn value_too_deep(value: &Value, limit: usize) -> bool {
 fn refresh_clock(kernel: &mut Kernel) {
     if kernel.wall_clock {
         kernel.now_ms = kernel.now_ms.max(wall_now_ms());
+    }
+}
+
+/// Advance `next_serial` past any serial whose record id was tombstoned,
+/// and return the first usable serial (RPC-02).
+///
+/// A fixed secret restarts serials at 0, so after a restart + kill-list
+/// replay the next mint would re-derive a tombstoned record id and hand
+/// out a live capability for a revoked credential. Skipping keeps the
+/// invariant "a tombstoned record id is dead forever" true across
+/// restarts, whatever order the replay and the mint happen in. The loop
+/// is bounded by the tombstone set itself (at most `MAX_TOMBSTONES`
+/// entries can force a skip, plus one usable serial), and each step is
+/// one keyed hash + one set lookup; the common case — no tombstone for
+/// this serial — takes exactly one step. The caller still consumes the
+/// returned serial (`next_serial += 1`); this function only moves the
+/// cursor to usable ground first. `parent` must be the same parent the
+/// caller derives the record id with, or the check answers for a
+/// different id.
+fn skip_tombstoned_serials(kernel: &mut Kernel, parent: Option<&CapId>) -> u64 {
+    loop {
+        let serial = kernel.next_serial;
+        let record_id = CapId::derive_record(&kernel.secret, serial, parent);
+        if !kernel.revoked_records.contains(&record_id) {
+            return serial;
+        }
+        kernel.next_serial = kernel.next_serial.saturating_add(1);
     }
 }
 

@@ -540,18 +540,26 @@ fn a_tombstone_after_the_handle_is_dropped_releases_the_pin() {
     );
 }
 
-/// An export refuses a record id a replayed kill list already holds, before it
-/// reserves anything (round 38, F2).
+/// A restart with a replayed kill list mints a fresh record id instead of
+/// re-issuing the tombstoned one (RPC-02).
+///
+/// This test used to assert the opposite — that the second kernel's first
+/// durable capability re-issued serial 0 and its export was refused as
+/// tombstoned (round 38, F2). The mint now skips any serial whose record id
+/// the kill list holds, so the fresh grant carries a new id and exports.
+/// The export-side tombstone check itself is unchanged: a capability that
+/// did carry a tombstoned id is still refused there, before anything is
+/// reserved.
 #[test]
-fn an_export_refuses_a_tombstoned_record_id() {
+fn a_restart_after_a_tombstone_mints_a_fresh_record_id() {
     let (agent, _provider, cap) = durable_agent();
     let record = agent.export_capability(&cap).expect("export");
     agent.revoke(&cap).expect("revoke");
     drop(cap);
     agent.tombstone_record(record.record_id).expect("tombstone");
 
-    // A second kernel with the same secret re-issues serial 0, so its first
-    // durable capability carries the tombstoned record id.
+    // A second kernel with the same secret used to re-issue serial 0, so
+    // its first durable capability carried the tombstoned record id.
     let second = Agent::with_secret([0x71; 32]);
     second.set_durable_capabilities(true);
     second.set_record_seal_key([0x91; 32]);
@@ -566,10 +574,13 @@ fn an_export_refuses_a_tombstoned_record_id() {
     let cap = second
         .mint_bound(&owner, provider, 0, attrs)
         .expect("durable cap");
-    let error = second
+    let fresh = second
         .export_capability(&cap)
-        .expect_err("the id is tombstoned");
-    assert_eq!(error.code(), "rpc/revoked", "{error}");
+        .expect("the fresh grant exports");
+    assert_ne!(
+        fresh.record_id, record.record_id,
+        "the restart must skip the tombstoned serial"
+    );
     let _ = provider;
 }
 
@@ -1811,4 +1822,151 @@ fn a_legacy_record_without_an_ancestor_list_restores_under_the_old_rule() {
     agent
         .restore_capability(&parsed, &admitted(b"durable-owner"))
         .expect("a legacy record restores under the old rule");
+}
+
+/// RPC-02: a fixed-secret restart + kill-list replay never re-issues a
+/// tombstoned record id, and a call queued before the replay is refused.
+///
+/// Mirrors audit probe `probe_sec_f1_serial_reuse_after_tombstone_replay`,
+/// asserting the FIXED behaviour: the fresh mint skips the tombstoned
+/// serial, so the new capability carries a new record id, calls, and
+/// exports — while the tombstoned id stays dead.
+#[test]
+fn a_restart_with_a_replayed_kill_list_never_reissues_a_tombstoned_record_id() {
+    let secret = [0x42u8; 32];
+    let seal_key = [0x43u8; 32];
+    let tombstoned: [u8; 32];
+    {
+        let agent = Agent::with_secret(secret);
+        agent.set_record_seal_key(seal_key);
+        agent.set_durable_capabilities(true);
+        let provider = agent.register(Box::new(Echo));
+        let owner = admitted(b"owner-public-certificate-bytes");
+        let mut attrs = CapAttrs::new(&["echo"]);
+        attrs.persistence = CapPersistence::Durable;
+        let cap = agent
+            .mint_bound(&owner, provider, 0, attrs)
+            .expect("durable cap");
+        let record = agent.export_capability(&cap).expect("export");
+        tombstoned = record.record_id;
+        agent
+            .tombstone_record(tombstoned)
+            .expect("tombstone the record");
+    }
+    // Restart: same secret, same seal key, kill list replayed first.
+    let agent = Agent::with_secret(secret);
+    agent.set_record_seal_key(seal_key);
+    agent.set_durable_capabilities(true);
+    agent
+        .tombstone_record(tombstoned)
+        .expect("replay the kill list");
+    assert!(agent.record_is_tombstoned(&tombstoned));
+    let provider = agent.register(Box::new(Echo));
+    let owner = admitted(b"owner-public-certificate-bytes");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let cap = agent
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect("re-mint after replay");
+    // The fresh grant is a NEW credential, not the tombstoned one: it
+    // calls, and its record id differs from the tombstoned one. The call
+    // runs before the export because an export reserves the grant's
+    // remaining calls on the capability, leaving it nothing to call with.
+    let lane = agent
+        .create_lane("rpc-02", Budget::default())
+        .expect("lane");
+    let peer = peer(b"owner-public-certificate-bytes");
+    let promise = agent
+        .call_as(Some(&peer), lane, &cap, "echo", Vec::new())
+        .expect("queued");
+    agent.run();
+    promise.value().expect("the fresh grant answers");
+    let record = agent.export_capability(&cap).expect("export the new cap");
+    assert_ne!(
+        record.record_id, tombstoned,
+        "the re-mint must skip the tombstoned serial"
+    );
+}
+
+/// RPC-02 (dispatch gate): a call queued before the kill list is replayed
+/// is refused at dispatch, so the outcome does not depend on the order of
+/// the replay and the mint. The refusal travels through the tombstone
+/// revoke in practice; the dispatch-side tombstone arm is the second gate
+/// for any copy that revoke cannot see.
+#[test]
+fn a_call_queued_before_the_kill_list_replay_is_refused_at_dispatch() {
+    let (agent, _provider, cap) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let lane = agent
+        .create_lane("rpc-02-dispatch", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(Some(owner.identity()), lane, &cap, "echo", Vec::new())
+        .expect("queued");
+    // The handle stays alive until dispatch: dropping the last handle
+    // removes the capability from the registry, and the queued call would
+    // then fail as unknown-capability instead of revoked.
+    let record = agent.export_capability(&cap).expect("export");
+    agent
+        .tombstone_record(record.record_id)
+        .expect("replay the kill list after queueing");
+    agent.run();
+    let error = promise.value().expect_err("the queued call must not run");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+/// RPC-02 (attenuate arm): a child minted after a kill-list replay skips
+/// a tombstoned (serial, parent) pair just like a first-generation mint.
+#[test]
+fn an_attenuated_child_after_a_replayed_kill_list_skips_a_tombstoned_serial() {
+    let secret = [0x42u8; 32];
+    let seal_key = [0x43u8; 32];
+    // Tombstone the (serial 0, no parent) record id on a first kernel.
+    let tombstoned: [u8; 32];
+    {
+        let agent = Agent::with_secret(secret);
+        agent.set_record_seal_key(seal_key);
+        agent.set_durable_capabilities(true);
+        let provider = agent.register(Box::new(Echo));
+        let owner = admitted(b"owner-public-certificate-bytes");
+        let mut attrs = CapAttrs::new(&["echo"]);
+        attrs.persistence = CapPersistence::Durable;
+        let cap = agent
+            .mint_bound(&owner, provider, 0, attrs)
+            .expect("durable cap");
+        let record = agent.export_capability(&cap).expect("export");
+        tombstoned = record.record_id;
+    }
+    let agent = Agent::with_secret(secret);
+    agent.set_record_seal_key(seal_key);
+    agent.set_durable_capabilities(true);
+    agent
+        .tombstone_record(tombstoned)
+        .expect("replay the kill list");
+    let provider = agent.register(Box::new(Echo));
+    let owner = admitted(b"owner-public-certificate-bytes");
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    let root = agent
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect("root after replay");
+    // The child narrows its budget: an export reserves the grant on the
+    // capability and every ancestor, so a child exported at the parent's
+    // full budget would leave the parent with nothing left to export.
+    let mut child_attrs = CapAttrs::new(&["echo"]);
+    child_attrs.persistence = CapPersistence::Durable;
+    child_attrs.budget = Budget::strict();
+    let child = agent
+        .attenuate(&root, child_attrs)
+        .expect("child after replay");
+    let child_record = agent.export_capability(&child).expect("export child");
+    assert_ne!(
+        child_record.record_id, tombstoned,
+        "the child must not reuse the tombstoned record id"
+    );
+    let root_record = agent.export_capability(&root).expect("export root");
+    assert_ne!(
+        root_record.record_id, tombstoned,
+        "the root must not reuse the tombstoned record id"
+    );
 }
