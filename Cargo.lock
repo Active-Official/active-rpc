@@ -40,6 +40,7 @@ version = "2.3.0"
 dependencies = [
  "active-core",
  "active-infinity",
+ "active-rpc-liveness",
  "blake3",
  "bytes",
  "criterion",
@@ -58,6 +59,14 @@ dependencies = [
  "tokio",
  "wasmi",
  "wat",
+]
+
+[[package]]
+name = "active-rpc-liveness"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

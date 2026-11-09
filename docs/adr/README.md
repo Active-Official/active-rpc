@@ -30,6 +30,7 @@
 | [0026](0026-one-method-ceiling.md) | One method ceiling, 64, in every layer |
 | [0027](0027-charge-envelope-descriptor-bytes.md) | Charge envelope descriptor bytes to the call budget |
 | [0028](0028-windows-receipt-log-reparse-point-refusal.md) | Refuse reparse points at the receipt-log open on Windows |
+| [0029](0029-receipt-lock-liveness-on-windows-and-macos.md) | Receipt-lock pid liveness on Windows and macOS |
 
 ## Reading order and supersessions
 

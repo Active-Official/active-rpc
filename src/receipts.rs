@@ -811,18 +811,20 @@ fn lock_is_live(age_ms: u64, pid: Option<u32>) -> bool {
 
 /// Whether `pid` names a live process.
 ///
-/// Cheap only where the kernel exposes it as a directory; elsewhere the age rule
-/// is the whole test, which is why `LOCK_STALE_MS` is generous.
+/// Linux reads `/proc/{pid}` directly. Windows and macOS have no `/proc`, so
+/// the probe there is one FFI call per platform (`OpenProcess` on Windows,
+/// `kill(pid, 0)` on macOS) — and this crate forbids `unsafe`, so the call
+/// lives in the `active-rpc-liveness` helper crate, which exposes it through
+/// one safe function (XPL-RPC-02). Any other platform has no probe, so the
+/// age rule is the whole test there, which is why `LOCK_STALE_MS` is generous.
 #[cfg(target_os = "linux")]
 fn process_is_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// See the Linux implementation: without a cheap existence check the age rule is
-/// the whole test.
 #[cfg(not(target_os = "linux"))]
-fn process_is_alive(_pid: u32) -> bool {
-    false
+fn process_is_alive(pid: u32) -> bool {
+    active_rpc_liveness::process_is_alive(pid)
 }
 
 /// The nonce and (when the creator wrote one) the pid of an open lock file.
@@ -2762,6 +2764,20 @@ mod lock_tests {
             path.file_name().unwrap().to_string_lossy()
         ))
     }
+    /// Age a lock file past the stale ceiling. A write handle is needed:
+    /// on Windows `set_times` through a read-only handle is refused
+    /// (XPL-RPC-02 probe shape).
+    fn age_lock(lock_path: &std::path::Path, seconds: u64) {
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(lock_path)
+            .expect("open for set_times");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(seconds),
+            ))
+            .expect("age the lock");
+    }
 
     /// A crash mid-write leaves a partial line that still starts with the lock
     /// magic. The magic is proof of origin, so the shape gate must not apply:
@@ -2952,6 +2968,95 @@ mod lock_tests {
             "touch followed the path and refreshed somebody else's file"
         );
 
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A lock naming a live pid is not stolen past the stale ceiling
+    /// (XPL-RPC-02): on Windows `process_is_alive` always returned `false`,
+    /// so a live holder's lock was stolen 130 s in, while Linux honours it
+    /// until the 20-minute grace. The mirror of the W6 verification probe,
+    /// which plants exactly this lock and watches the append go through.
+    #[test]
+    fn a_lock_naming_a_live_pid_is_not_stolen_past_the_stale_ceiling() {
+        let path = scratch("live-pid");
+        let lock_path = lock_of(&path);
+        std::fs::write(
+            &lock_path,
+            format!(
+                "{}live-1 pid {} started 1",
+                super::LOCK_MAGIC,
+                std::process::id()
+            ),
+        )
+        .expect("lock");
+        age_lock(&lock_path, 130);
+        assert!(
+            super::judged_stale(&lock_path).is_none(),
+            "a lock naming a live pid is live until the grace, not stealable at 130 s"
+        );
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The other direction of the same rule (XPL-RPC-02): a lock naming a
+    /// pid that does not exist is still stolen past the ceiling, or a
+    /// liveness fix that never reports dead would wedge the log for ever.
+    /// 4294967294 is the dead pid the steal tests already use: no host
+    /// hands it out.
+    #[test]
+    fn a_lock_naming_a_dead_pid_is_stolen_past_the_stale_ceiling() {
+        let path = scratch("dead-pid");
+        let lock_path = lock_of(&path);
+        std::fs::write(
+            &lock_path,
+            format!("{}dead-1 pid 4294967294 started 1", super::LOCK_MAGIC),
+        )
+        .expect("lock");
+        age_lock(&lock_path, 130);
+        let (nonce, identity) =
+            super::judged_stale(&lock_path).expect("a lock naming a dead pid is judged stale");
+        assert_eq!(nonce, "dead-1");
+        assert!(
+            super::take_stale(&lock_path, &nonce, identity),
+            "the judged dead-pid lock is stolen"
+        );
+        assert!(!lock_path.exists(), "the stolen lock is gone");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `process_is_alive` is the primitive the steal rule stands on
+    /// (XPL-RPC-02): the caller's own pid is alive on every platform, and
+    /// a pid no host hands out is not.
+    #[test]
+    fn process_is_alive_reports_the_callers_own_pid_and_rejects_an_impossible_one() {
+        assert!(
+            super::process_is_alive(std::process::id()),
+            "the test process itself is alive"
+        );
+        assert!(
+            !super::process_is_alive(u32::MAX),
+            "no host hands out pid u32::MAX"
+        );
+    }
+
+    /// The corruption case behind XPL-RPC-02, not just the planted-lock
+    /// probe: a writer that really holds the lock (its file open, its pid
+    /// live) but has not touched it for 130 s must not lose it to a
+    /// stealer. `touch` is what a progressing writer calls; a stalled one
+    /// is covered by the pid, up to the grace.
+    #[test]
+    fn a_live_holders_lock_is_not_stolen_while_it_is_held() {
+        let path = scratch("live-holder");
+        std::fs::write(&path, b"").expect("log");
+        let lock = LogLock::acquire(&path).expect("the lock is free");
+        let lock_path = lock_of(&path);
+        age_lock(&lock_path, 130);
+        assert!(
+            super::judged_stale(&lock_path).is_none(),
+            "a lock its holder still holds is live, however old its mtime"
+        );
+        drop(lock);
         let _ = std::fs::remove_file(&lock_path);
         let _ = std::fs::remove_file(&path);
     }

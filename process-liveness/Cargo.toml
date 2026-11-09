@@ -1,0 +1,23 @@
+[package]
+name = "active-rpc-liveness"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "One OS primitive for Active RPC: whether a pid names a live process (Windows OpenProcess, macOS kill(pid, 0))"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+publish = false
+
+[lib]
+name = "active_rpc_liveness"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+# Already in the root lockfile (transitive via tokio/mio): no new registry
+# crate enters the graph (XPL-RPC-02).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
