@@ -70,6 +70,17 @@ pub const MAX_LINEAGE_DEPTH: usize = 64;
 /// Largest idempotency key a caller may present.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 
+/// Most live idempotency claims one kernel keeps.
+///
+/// The ceiling is fail-closed (RPC-06): a new key past this count is refused
+/// with `BudgetExceeded("idempotency")` instead of evicting a live claim —
+/// eviction silently re-executed the mutating call a replayed key named.
+/// Claims whose promise can no longer answer a replay (rejected, cancelled,
+/// or gone) are dead weight, not live claims: they are reclaimed when a new
+/// key arrives at the ceiling, so ordinary failures can never brick
+/// idempotent calls for the life of the kernel.
+pub const MAX_IDEMPOTENCY: usize = 1024;
+
 /// Aggregate stored message-record bytes every channel in one kernel may hold.
 ///
 /// The per-channel ceiling alone is not a memory bound: 4 096 channels of 64 MiB
@@ -680,7 +691,6 @@ pub struct Kernel {
     /// fingerprint of the peer that claimed the key.
     idempotency: BTreeMap<IdempotencyKey, IdempotencyEntry>,
     allow_durable: bool,
-    idempotency_order: VecDeque<IdempotencyKey>,
     now_ms: u64,
     latency_ms: u64,
     /// When true, dispatch advances the clock to wall time instead of by one
@@ -1239,7 +1249,6 @@ impl Agent {
             queued_channel_bytes: 0,
             idempotency: BTreeMap::new(),
             allow_durable: false,
-            idempotency_order: VecDeque::new(),
             now_ms: 0,
             latency_ms: 1,
             wall_clock: false,
@@ -4820,6 +4829,10 @@ impl Agent {
     /// can be retried. The key is scoped to the capability id and method.
     /// Mutating-domain semantics remain the provider's responsibility; this
     /// cache prevents a second invocation, it does not make a provider atomic.
+    /// At most [`MAX_IDEMPOTENCY`] live claims are kept: a new key past the
+    /// ceiling is refused with `BudgetExceeded("idempotency")` rather than
+    /// evicting a live claim (RPC-06), so a flood can deny new idempotent
+    /// calls but can never make a replayed key re-execute a mutation.
     pub fn call_idempotent(
         &self,
         lane: LaneId,
@@ -5221,20 +5234,7 @@ impl Agent {
                         }
                     }
                 }
-                let reusable = kernel
-                    .promises
-                    .get(&id)
-                    .map(|record| match &record.state {
-                        PromiseState::Pending | PromiseState::Resolved(_) => true,
-                        // A withheld reply means the write landed, so replaying
-                        // the key returns the same outcome instead of running
-                        // the mutating provider a second time (round 33, F2).
-                        PromiseState::Rejected(error) => {
-                            error.provider_code() == Some("provider/reply-withheld")
-                        }
-                        _ => false,
-                    })
-                    .unwrap_or(false);
+                let reusable = idempotency_claim_reusable(&kernel, id);
                 if reusable {
                     // The value was admitted under the grant at the time. A lane
                     // narrowed since then must not serve it again, or a replay
@@ -5272,9 +5272,6 @@ impl Agent {
                 }
                 kernel.idempotency.remove(&map_key);
             }
-            // A stale entry leaves its key in the order deque; without this the
-            // deque grows with caller-controlled keys.
-            kernel.idempotency_order.retain(|queued| *queued != map_key);
         }
         if !self
             .cell
@@ -5286,6 +5283,27 @@ impl Agent {
             let error = Error::BudgetExceeded("lane call");
             self.record_refusal(lane, Some(cap.id()), &error);
             return Err(error);
+        }
+        // The ceiling is fail-closed (RPC-06): a new key is refused before the
+        // provider runs, never admitted by evicting a live claim. Refusing
+        // after the call would be worse than eviction — the side effect would
+        // have happened while the caller was told it had not — so the check
+        // sits here, ahead of `call_with_origin_payload`, and after the
+        // stale-entry removal above, which has already freed this key's slot
+        // when the key was replayed against a dead promise. Dead claims are
+        // reclaimed first: a full table of live claims refuses the new key,
+        // but a table full of claims whose promises can no longer replay must
+        // not brick idempotent calls for the life of the kernel.
+        {
+            let mut kernel = self.cell.borrow_mut();
+            if kernel.idempotency.len() >= MAX_IDEMPOTENCY {
+                reclaim_dead_idempotency_claims(&mut kernel);
+                if kernel.idempotency.len() >= MAX_IDEMPOTENCY {
+                    let error = Error::BudgetExceeded("idempotency");
+                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    return Err(error);
+                }
+            }
         }
         let promise = self.call_with_origin_payload(
             peer,
@@ -5299,8 +5317,11 @@ impl Agent {
         )?;
         let id = promise.id();
         let mut kernel = self.cell.borrow_mut();
+        // No eviction here (RPC-06): the ceiling check above refused the call
+        // before the provider ran, so the table cannot be over the ceiling at
+        // this point and every claim already in it stays live.
         kernel.idempotency.insert(
-            map_key.clone(),
+            map_key,
             (
                 id,
                 fingerprint,
@@ -5308,15 +5329,6 @@ impl Agent {
                 crate::identity::presented_fingerprint(peer),
             ),
         );
-        kernel.idempotency_order.push_back(map_key);
-        const MAX_IDEMPOTENCY: usize = 1024;
-        while kernel.idempotency.len() > MAX_IDEMPOTENCY {
-            if let Some(oldest) = kernel.idempotency_order.pop_front() {
-                kernel.idempotency.remove(&oldest);
-            } else {
-                break;
-            }
-        }
         Ok(promise)
     }
 
@@ -7941,6 +7953,54 @@ type IdempotencyKey = (CapId, LaneId, String, String);
 /// fingerprint of the peer that claimed the key (so a replay from another peer
 /// is refused at the hit rather than at dispatch).
 type IdempotencyEntry = (PromiseId, [u8; 32], bool, Option<[u8; 32]>);
+
+/// Whether the promise an idempotency claim names can still answer a replay.
+///
+/// Pending or resolved promises replay as before. A rejected promise replays
+/// only when the provider withheld its reply — the write landed, so the key
+/// must keep returning that outcome instead of running the mutating provider
+/// a second time (round 33, F2). Every other terminal state (an ordinary
+/// rejection, a cancellation) and a promise that is gone altogether make the
+/// claim dead: replaying its key is a fresh call, and the claim is reclaimable
+/// at the ceiling (RPC-06). The hit path and the reclaimer share this one
+/// predicate so the two can never disagree about which claims are live.
+fn idempotency_claim_reusable(kernel: &Kernel, id: PromiseId) -> bool {
+    kernel
+        .promises
+        .get(&id)
+        .map(|record| match &record.state {
+            PromiseState::Pending | PromiseState::Resolved(_) => true,
+            // A withheld reply means the write landed, so replaying
+            // the key returns the same outcome instead of running
+            // the mutating provider a second time (round 33, F2).
+            PromiseState::Rejected(error) => {
+                error.provider_code() == Some("provider/reply-withheld")
+            }
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+/// Drop every idempotency claim whose promise can no longer answer a replay.
+///
+/// Only called when a new key arrives at the ceiling (RPC-06): live claims
+/// are never evicted, so a full table of live claims refuses the new key —
+/// but dead claims are not live claims, and without this a kernel that had
+/// served 1,024 failed or cancelled idempotent calls would refuse every
+/// further idempotent call for the rest of its life. The scan is bounded by
+/// `MAX_IDEMPOTENCY` (1,024 entries) and runs only at the ceiling, so it
+/// costs nothing on the ordinary path.
+fn reclaim_dead_idempotency_claims(kernel: &mut Kernel) {
+    let dead: Vec<IdempotencyKey> = kernel
+        .idempotency
+        .iter()
+        .filter(|(_, entry)| !idempotency_claim_reusable(kernel, entry.0))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in dead {
+        kernel.idempotency.remove(&key);
+    }
+}
 
 /// True when a provider's value nests deeper than the wire accepts.
 ///

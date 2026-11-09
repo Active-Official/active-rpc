@@ -26,6 +26,7 @@
 | [0022](0022-clock-policy.md) | Clock policy: virtual default, wall clock on request |
 | [0023](0023-no-io-uring-backend.md) | No io_uring backend for TCP and QUIC I/O |
 | [0024](0024-subscriptions-are-not-authority.md) | Subscriptions are not authority |
+| [0025](0025-fail-closed-idempotency-ceiling.md) | Fail-closed idempotency ceiling |
 
 ## Reading order and supersessions
 
