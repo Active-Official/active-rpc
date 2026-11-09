@@ -537,12 +537,18 @@ fn a_publish_refuses_a_secret_bearing_module() {
     let agent = Agent::with_secret([0x54u8; 32]);
     let provider = agent.register(Box::new(Sink));
     let lane = agent.create_lane("pub", Budget::default()).expect("lane");
-    let lane_b = agent.create_lane("recv", Budget::default()).expect("lane b");
+    let lane_b = agent
+        .create_lane("recv", Budget::default())
+        .expect("lane b");
     let channel = agent
         .create_channel("leak", Direction::Both)
         .expect("channel");
-    agent.subscribe(lane, channel).expect("subscribe sender lane");
-    agent.subscribe(lane_b, channel).expect("subscribe receiver lane");
+    agent
+        .subscribe(lane, channel)
+        .expect("subscribe sender lane");
+    agent
+        .subscribe(lane_b, channel)
+        .expect("subscribe receiver lane");
     let mut attrs = CapAttrs::new(&["noop"]).with_budget(Budget {
         max_calls: 5,
         max_bytes: 10_000,
