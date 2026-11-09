@@ -449,7 +449,22 @@ enum ModuleKind {
 }
 
 fn inspect_module(bytes: &[u8]) -> ModuleKind {
-    match active_infinity::decode(bytes) {
+    // The readability probe must be the STRUCTURAL decode, not the
+    // canonical-proving default: since Infinity 1.1 (INF-02) `decode`
+    // refuses a decodable-but-non-canonical image, and this probe would
+    // then classify it `Corrupt` — so both egress gates would refuse it
+    // as `provider/secret-material` instead of the designed `rpc/payload`
+    // the canonical proof in `check_module_payload` produces (BND-F1).
+    // The lenient form is the explicit opt-out INF-02 established; it
+    // still verifies structure and the stored hash, and it means exactly
+    // what `decode` meant before 1.1 on both Infinity versions.
+    match active_infinity::decode_with(
+        bytes,
+        active_infinity::DecodeOpts {
+            verify_canonical: false,
+            ..active_infinity::DecodeOpts::default()
+        },
+    ) {
         Ok(module) => ModuleKind::Image {
             secret: module_holds_secret(&module),
         },
@@ -1096,11 +1111,13 @@ pub fn is_infinity_image(bytes: &[u8]) -> bool {
 /// Prove an outgoing module payload is a canonical image before it is handed
 /// to a transport or a tool.
 ///
-/// `validate` alone proves structure and the stored hash, not the canonical
-/// form: the decoder drops an unreferenced string, blob or type entry, so two
-/// byte strings can name one module, and a receiver's install gate
-/// (`ModuleProvider::install_canonical_image`) refuses what the weaker check
-/// passed. The proof here is the one the receiver applies (R-16 round 7, L-2).
+/// Since Infinity 1.1 (INF-02) `validate` proves the canonical form as well
+/// as structure and the stored hash; before 1.1 it proved structure and the
+/// stored hash only, and the decoder drops an unreferenced string, blob or
+/// type entry, so two byte strings can name one module. Either way a
+/// receiver's install gate (`ModuleProvider::install_canonical_image`)
+/// refuses what a weaker check passed. The proof here is the one the
+/// receiver applies (R-16 round 7, L-2).
 pub fn check_module_payload(bytes: &[u8]) -> Result<()> {
     active_infinity::validate_canonical(bytes, active_infinity::Limits::default())
         .map(|_| ())

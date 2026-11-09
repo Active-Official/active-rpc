@@ -109,12 +109,20 @@ fn a_non_canonical_image_is_refused_by_the_egress() {
         },
     )
     .expect("encode");
+    // The fixture is structurally valid but not canonical: since Infinity
+    // 1.1 (INF-02) the plain `validate`/`decode` prove canonical form and
+    // refuse it, so structural validity is asserted with the explicit
+    // lenient opt-out — the same forms the egress probe uses (BND-F1).
+    let lenient = active_infinity::DecodeOpts {
+        verify_canonical: false,
+        ..active_infinity::DecodeOpts::default()
+    };
     assert!(
-        active_infinity::validate(&non_canonical).is_ok(),
+        active_infinity::validate_with(&non_canonical, lenient).is_ok(),
         "the fixture is structurally valid"
     );
     assert!(
-        active_infinity::decode(&non_canonical).is_ok(),
+        active_infinity::decode_with(&non_canonical, lenient).is_ok(),
         "the fixture decodes"
     );
     let error = check_module_payload(&non_canonical).expect_err("canonicity is not proven");
