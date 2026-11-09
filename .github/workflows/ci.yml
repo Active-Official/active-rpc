@@ -43,6 +43,79 @@ jobs:
       - name: Benchmarks compile
         run: cargo bench --locked --benches --no-run
 
+  # XPL-01 (2026-11-08): Windows and macOS gates. Each mirrors the Linux
+  # `gates` job above exactly — same pinned actions, same gate set — on
+  # windows-latest / macos-latest. These two jobs are INFORMATIONAL (not
+  # branch-protection required) until green: they are expected to go red on
+  # the first runs until the XPL-RPC cross-platform fixes land. Flip them to
+  # required in the branch-protection settings once they are green; do NOT
+  # weaken them with `continue-on-error` to get them green. A test that
+  # fails only on Windows/macOS for a legitimate platform reason belongs to
+  # its own finding — fix the test or the code there, never the job.
+  # The macOS job is the first macOS execution of these suites anywhere;
+  # there is no local macOS host, so the CI run itself is the proof.
+  gates-windows:
+    runs-on: windows-latest
+    env:
+      # Same cap as the Linux gates job: keep link parallelism bounded on
+      # the hosted runners while linking ~90 test binaries.
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (all targets)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Clippy (no default features)
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Tests
+        run: cargo test --locked --all-features
+      - name: Invariant gate (secret canary and capability authority)
+        run: cargo test --locked --test invariant_gate
+      - name: Tests (no default features)
+        run: cargo test --locked --no-default-features
+      - name: Documentation
+        env:
+          # A broken intra-doc link is a documentation defect, not a warning.
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+      - name: Benchmarks compile
+        run: cargo bench --locked --benches --no-run
+
+  gates-macos:
+    runs-on: macos-latest
+    env:
+      # Same cap as the Linux gates job: keep link parallelism bounded on
+      # the hosted runners while linking ~90 test binaries.
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (all targets)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Clippy (no default features)
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Tests
+        run: cargo test --locked --all-features
+      - name: Invariant gate (secret canary and capability authority)
+        run: cargo test --locked --test invariant_gate
+      - name: Tests (no default features)
+        run: cargo test --locked --no-default-features
+      - name: Documentation
+        env:
+          # A broken intra-doc link is a documentation defect, not a warning.
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+      - name: Benchmarks compile
+        run: cargo bench --locked --benches --no-run
+
   perf-gate:
     runs-on: ubuntu-latest
     steps:
