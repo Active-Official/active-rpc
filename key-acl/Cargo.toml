@@ -1,0 +1,31 @@
+[package]
+name = "active-rpc-key-acl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "One OS primitive for Active RPC: the Windows DACL check for a receipt-key file, so a key readable by other accounts is refused exactly as the unix mode check refuses it"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+publish = false
+
+[lib]
+name = "active_rpc_key_acl"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+# Already in the lockfile (transitive via tokio/mio): no new registry crate
+# enters the graph (XPL-RPC-09). The API paths were verified in the vendored
+# windows-sys 0.61.2 source before this crate was written: `GetSecurityInfo`
+# and `ConvertSidToStringSidW` live in `Win32::Security::Authorization`;
+# `GetAclInformation`, `GetAce`, `EqualSid`, `IsWellKnownSid`,
+# `CreateWellKnownSid`, `LookupAccountSidW`, the `ACE` / `ACL` structs and
+# `OWNER_` / `DACL_SECURITY_INFORMATION` live in `Win32::Security`;
+# `FILE_READ_DATA` lives in `Win32::Storage::FileSystem`; `GENERIC_READ` /
+# `GENERIC_ALL` and `LocalFree` live in `Win32::Foundation`; every
+# `*_ACE_TYPE` constant lives in `Win32::System::SystemServices`;
+# `NetLocalGroupGetMembers`, `NetApiBufferFree`,
+# `LOCALGROUP_MEMBERS_INFO_0` and `MAX_PREFERRED_LENGTH` live in
+# `Win32::NetworkManagement::NetManagement`.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_NetManagement", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices"] }

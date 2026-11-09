@@ -32,6 +32,7 @@
 | [0028](0028-windows-receipt-log-reparse-point-refusal.md) | Refuse reparse points at the receipt-log open on Windows |
 | [0029](0029-receipt-lock-liveness-on-windows-and-macos.md) | Receipt-lock pid liveness on Windows and macOS |
 | [0030](0030-windows-receipt-lock-file-identity.md) | Receipt-lock file identity on Windows |
+| [0031](0031-windows-receipt-key-file-acl.md) | Receipt-key file ACL check on Windows |
 
 ## Reading order and supersessions
 

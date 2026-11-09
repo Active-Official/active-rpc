@@ -20,3 +20,9 @@ __pycache__/
 *.pyc
 
 control-plane/target/
+
+# Helper crates keep no build outputs: their target/ is root-anchored out by
+# /target, so without these lines a `cargo fmt` run from inside a helper
+# directory would stage its target/ (XPL-RPC-08 lesson; XPL-RPC-09).
+key-acl/target/
+key-acl/Cargo.lock

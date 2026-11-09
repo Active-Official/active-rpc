@@ -1893,13 +1893,16 @@ fn receipts_show(path: &str, limit: usize) -> CliResult {
     Ok(())
 }
 
-/// Read a receipt key from a file: 64 hex characters, one line.
+/// Read a receipt key from a file: 64 hex characters, one line, tolerating a
+/// trailing line ending.
 ///
-/// A file on a shared or world-readable path is refused on unix (mode `0o077`
-/// must be clear): the key proves an audit log, and a leaked key lets a stranger
-/// forge one. Windows ACLs are the deployment's responsibility, so the check is
-/// unix-only and documented.
-/// Read a 64-hex receipt key, tolerating a trailing line ending.
+/// A file on a shared or world-readable path is refused: the key proves an
+/// audit log, and a leaked key lets a stranger forge one. On unix the mode
+/// must be `0600` (`0o077` clear); on Windows the file's DACL must grant
+/// read access to nobody but the owner, plus `SYSTEM`, `Administrators`,
+/// and members of the local Administrators group (explicitly allow-listed
+/// — see `active-rpc-key-acl`). A file with no DACL (FAT/exFAT) is
+/// refused: the invariant cannot be established there.
 ///
 /// The ceiling used to be 65 bytes, so a Windows file of 64 hex plus CRLF was
 /// refused as too large.
@@ -1926,6 +1929,19 @@ fn read_receipt_key(path: &str) -> Result<[u8; 32], CliError> {
                 "{path:?} is readable by other accounts (mode {mode:o}); chmod 600 it"
             )));
         }
+    }
+    #[cfg(windows)]
+    {
+        // Same shape as the unix arm above: open the file and check the
+        // opened handle's ACL, so the check describes the file actually
+        // opened rather than a path re-read afterwards.
+        let file = std::fs::File::open(path)
+            .map_err(|error| CliError::usage(format!("cannot open {path:?}: {error}")))?;
+        active_rpc_key_acl::check_key_file_acl(&file).map_err(|reason| {
+            CliError::usage(format!(
+                "{path:?} is readable by other accounts ({reason}); restrict the file's ACL to the owner"
+            ))
+        })?;
     }
     parse_hex32(text.trim()).ok_or_else(|| {
         CliError::usage(format!(

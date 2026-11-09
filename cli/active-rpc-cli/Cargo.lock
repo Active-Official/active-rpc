@@ -40,6 +40,9 @@ version = "2.3.0"
 dependencies = [
  "active-core",
  "active-infinity",
+ "active-rpc-file-identity",
+ "active-rpc-liveness",
+ "active-rpc-process-tree",
  "blake3",
  "bytes",
  "getrandom 0.3.4",
@@ -59,8 +62,38 @@ name = "active-rpc-cli"
 version = "0.3.1"
 dependencies = [
  "active-rpc",
+ "active-rpc-key-acl",
  "rustls-pki-types",
  "serde_json",
+]
+
+[[package]]
+name = "active-rpc-file-identity"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "active-rpc-key-acl"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "active-rpc-liveness"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "active-rpc-process-tree"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

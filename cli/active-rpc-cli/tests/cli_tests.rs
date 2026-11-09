@@ -28,6 +28,54 @@ fn sandbox(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Windows only: run `icacls` and fail the test if it refuses — a test bug,
+/// not a CLI bug, so the failure says which invocation failed.
+#[cfg(windows)]
+fn icacls(args: &[&str]) {
+    let output = Command::new("icacls")
+        .args(args)
+        .output()
+        .expect("spawn icacls");
+    assert!(
+        output.status.success(),
+        "icacls {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Windows only: the account running the test, as `icacls` spells it
+/// (`DOMAIN\user`).
+#[cfg(windows)]
+fn current_user() -> String {
+    let output = Command::new("whoami").output().expect("spawn whoami");
+    assert!(output.status.success(), "whoami failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Windows only: restrict a key file to its owner — the Windows mirror of
+/// the unix `chmod 600` blocks below. A file created under `%TEMP%` inherits
+/// an ACL that lets other accounts read it (XPL-RPC-09), so a test that
+/// needs the CLI to accept the key must drop the inherited ACEs first
+/// (`/inheritance:r` only removes inherited ACEs; a later `/grant` only
+/// adds), then grant the owner full control.
+#[cfg(windows)]
+fn restrict_key_to_owner(path: &std::path::Path) {
+    let path_arg = path.to_str().expect("key path");
+    icacls(&[path_arg, "/inheritance:r"]);
+    let grant = format!("{}:(F)", current_user());
+    icacls(&[path_arg, "/grant:r", &grant]);
+}
+
+/// Windows only: grant `BUILTIN\Users` read access to a key file, by SID —
+/// the group's name is localised (`Usuarios` on this machine), the SID is
+/// not. This is the attack shape of XPL-RPC-09: a key any local account
+/// can read.
+#[cfg(windows)]
+fn grant_users_read(path: &std::path::Path) {
+    let path_arg = path.to_str().expect("key path");
+    icacls(&[path_arg, "/grant", "*S-1-5-32-545:(R)"]);
+}
+
 /// A peer process kept alive until the test drops it.
 struct Peer {
     child: Child,
@@ -361,13 +409,16 @@ fn receipts_dump_verify_and_tamper_paths() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     std::fs::write(&key_path, format!("{key_hex}\n")).expect("write key");
-    // The reader refuses a key file other accounts can read (unix only).
+    // The reader refuses a key file other accounts can read: mode `0o600`
+    // on unix, an owner-only DACL on Windows (XPL-RPC-09).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
             .expect("chmod the key");
     }
+    #[cfg(windows)]
+    restrict_key_to_owner(&key_path);
     let key_arg = key_path.to_str().expect("key path");
 
     // An unauthenticated check is not offered as "ok": it proves the chain and
@@ -433,6 +484,8 @@ fn receipts_dump_verify_and_tamper_paths() {
         std::fs::set_permissions(&foreign_path, std::fs::Permissions::from_mode(0o600))
             .expect("chmod the key");
     }
+    #[cfg(windows)]
+    restrict_key_to_owner(&foreign_path);
     let forged = run(&[
         "receipts",
         "verify",
@@ -456,6 +509,10 @@ fn receipts_dump_verify_and_tamper_paths() {
         std::fs::set_permissions(&bad_key, std::fs::Permissions::from_mode(0o600))
             .expect("chmod the key");
     }
+    // Without this the Windows refusal would be the ACL, not the format,
+    // and the assertion below would fail for the wrong reason.
+    #[cfg(windows)]
+    restrict_key_to_owner(&bad_key);
     let panic_free = run(&[
         "receipts",
         "verify",
@@ -535,4 +592,65 @@ fn receipts_dump_verify_and_tamper_paths() {
         dir.join("nope.arrl").to_str().unwrap(),
     ]);
     assert_eq!(missing.status.code(), Some(2));
+}
+
+/// The finding (XPL-RPC-09, Windows only): a receipt key readable by other
+/// accounts was silently accepted — the permission check was unix-only, so
+/// a key with a world-readable ACL verified MACs and the CLI printed `ok`.
+///
+/// Control arm first: the same key, restricted to its owner, verifies.
+/// Then the attack: the same key, readable by `BUILTIN\Users`, is refused
+/// with exit 2, and the refusal names the offending SID.
+#[cfg(windows)]
+#[test]
+fn a_world_readable_receipt_key_is_refused() {
+    let dir = sandbox("world-readable-key");
+    let log = dir.join("session.arrl");
+    let log_arg = log.to_str().expect("log path");
+
+    let dump = run(&["receipts", "dump", "--output", log_arg]);
+    assert!(dump.status.success(), "{}", stderr(&dump));
+    assert!(log.is_file());
+
+    // The demo's kernel is fixed, so the test can derive the same receipt key
+    // the CLI sealed with: `receipts::derive_receipt_key(&[0x5e; 32])`.
+    let receipt_key = active_rpc::receipts::derive_receipt_key(&[0x5e; 32]);
+    let key_hex: String = receipt_key
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let key_path = dir.join("receipt.key");
+    std::fs::write(&key_path, format!("{key_hex}\n")).expect("write key");
+    let key_arg = key_path.to_str().expect("key path");
+
+    // Control arm: owner-only, the CLI verifies the MACs.
+    restrict_key_to_owner(&key_path);
+    let owned = run(&["receipts", "verify", log_arg, "--receipt-key-file", key_arg]);
+    assert!(owned.status.success(), "{}", stderr(&owned));
+    assert!(
+        stdout(&owned).contains("macs verified"),
+        "{}",
+        stdout(&owned)
+    );
+
+    // The finding: the same key, readable by every local account, is
+    // refused before any MAC is checked.
+    grant_users_read(&key_path);
+    let world_readable = run(&["receipts", "verify", log_arg, "--receipt-key-file", key_arg]);
+    assert_eq!(
+        world_readable.status.code(),
+        Some(2),
+        "{}",
+        stderr(&world_readable)
+    );
+    assert!(
+        stderr(&world_readable).contains("readable by other accounts"),
+        "{}",
+        stderr(&world_readable)
+    );
+    assert!(
+        stderr(&world_readable).contains("S-1-5-32-545"),
+        "the refusal names the account that can read the key: {}",
+        stderr(&world_readable)
+    );
 }

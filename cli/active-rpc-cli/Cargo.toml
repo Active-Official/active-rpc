@@ -18,6 +18,13 @@ active-rpc = { path = "../..", version = "2.3.0", features = ["quic", "http2"] }
 serde_json = "1"
 rustls-pki-types = "1"
 
+[target.'cfg(windows)'.dependencies]
+# The receipt-key permission check is a DACL check on Windows (XPL-RPC-09):
+# the mode check is unix-only, so the ACL probe lives in a one-function
+# helper crate with a safe API instead of a carve-out here (same shape as
+# the file-identity helper the root crate uses for the receipt lock).
+active-rpc-key-acl = { path = "../../key-acl", version = "0.1.0" }
+
 [[bin]]
 name = "active-rpc-cli"
 path = "src/main.rs"
