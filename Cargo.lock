@@ -40,6 +40,7 @@ version = "2.3.0"
 dependencies = [
  "active-core",
  "active-infinity",
+ "active-rpc-file-identity",
  "active-rpc-liveness",
  "active-rpc-process-tree",
  "blake3",
@@ -60,6 +61,13 @@ dependencies = [
  "tokio",
  "wasmi",
  "wat",
+]
+
+[[package]]
+name = "active-rpc-file-identity"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

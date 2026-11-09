@@ -226,6 +226,18 @@ the scheduled re-walk refuses, and the tamper is then visible to every reader
 was considered and rejected: the attack leaves all three inputs exactly as
 cached, so such a MAC still verifies.
 
+The lock no longer shares the no-identity residual above (XPL-RPC-08,
+fixed 2026-11-09; ADR-0030). On Windows the lock's ownership is the file
+identity — volume serial plus file index from `GetFileInformationByHandle`
+through the `active-rpc-file-identity` helper crate — so a byte-identical
+copy of a live lock is not the holder's lock, and the steal proves it moved
+the file it judged. The residual as written still holds for the log file
+itself: the reader and the append fast path keep the length, header and
+trailing-head checks off unix, and a local writer who can replace the log
+file with a same-length copy is detected by content (RPC-05), not by
+identity. A deployment that needs assurance on a non-unix host should still
+read through a pinned head (`--expect-head`) and the MAC.
+
 `receipts verify` and the `--receipt-key-file` / `--expect-head` flags live in
 the CLI crate that consumes this library; this ADR describes the library
 contract, not a command-line surface (R-13 round 12, F9).

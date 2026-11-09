@@ -70,6 +70,15 @@ libc = "0.2"
 # one-function helper crate with a safe API instead of a carve-out here.
 active-rpc-liveness = { path = "process-liveness", version = "0.1.0" }
 
+[target.'cfg(windows)'.dependencies]
+# The receipt lock's ownership proof is a file identity on Windows
+# (XPL-RPC-08): the nonce is copyable plaintext, so `still_holds` must
+# compare the held handle against the path by file index + volume serial.
+# The probe is one FFI call, and this crate forbids `unsafe`, so the call
+# lives in a one-function helper crate with a safe API instead of a
+# carve-out here (same shape as liveness).
+active-rpc-file-identity = { path = "file-identity", version = "0.1.0" }
+
 [dev-dependencies]
 proptest = "1"
 sha2 = "0.10"

@@ -380,10 +380,13 @@ impl Snapshot {
 /// Exclusive access to one log file, held for the length of an append.
 struct LogLock {
     path: std::path::PathBuf,
-    /// Written into the lock file: the proof a non-unix host checks, and what an
-    /// operator reads. On unix the held handle's `(dev, ino)` decides ownership
-    /// (a copied text is not a file identity), so the field is write-only there.
-    #[cfg_attr(unix, allow(dead_code))]
+    /// Written into the lock file: what an operator reads, and the name the
+    /// steal's claim file is built from. It is not the proof of ownership:
+    /// the nonce is plaintext, so a local user can read it and recreate the
+    /// same text (XPL-RPC-08). Ownership is the file the held handle names —
+    /// `(dev, ino)` on unix, volume serial plus file index on Windows — so
+    /// the field is write-only on both.
+    #[cfg_attr(any(unix, windows), allow(dead_code))]
     nonce: String,
     /// The handle `create_new` returned.
     ///
@@ -423,6 +426,59 @@ const WRITE_CHUNK_BYTES: usize = 1 << 20;
 /// reader must not allocate a gigabyte to discover that it holds no nonce.
 const MAX_LOCK_BYTES: u64 = 512;
 
+/// The identity of a file the lock holder created, on Windows.
+///
+/// The held handle's volume serial plus file index, from
+/// `GetFileInformationByHandle` through the `active-rpc-file-identity`
+/// helper crate (XPL-RPC-08). Stable `std` cannot supply it:
+/// `MetadataExt::file_index` needs the unstable `windows_by_handle`
+/// feature, and this crate forbids `unsafe`, so the one call lives in the
+/// helper, as the liveness probe does (XPL-RPC-02). A recreated file gets a
+/// new file index — NTFS reuses the record number only with an incremented
+/// sequence number, which is part of the 64-bit index — so a byte-identical
+/// copy at the same path is a different file, as on unix.
+#[cfg(windows)]
+fn lock_held_identity(file: &std::fs::File) -> Option<(u64, u64)> {
+    active_rpc_file_identity::file_identity(file)
+}
+
+/// The identity of the file at a lock path, on Windows.
+///
+/// The path is opened and the opened handle is identified, so the identity
+/// describes the file that was actually opened. A symlink at the path is
+/// refused outright: the link has its own file index, but a swapped-in link
+/// must never pass by pointing at the original — and it cannot, since the
+/// original was unlinked and no path names it any more.
+#[cfg(windows)]
+fn lock_path_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    active_rpc_file_identity::file_identity(&file)
+}
+
+/// Whether the file at `path` is the file `judged` describes, on Windows.
+///
+/// The volume serial plus file index must match, and so must the
+/// modification time: the identity alone is reusable (the Linux CI reuses an
+/// inode for an immediate replacement, and NTFS likewise reuses a record
+/// number), so the mtime is part of the identity and it survives the rename
+/// that quarantines the judged file (R-13 round 16, F4 — the same rule the
+/// unix branch applies).
+#[cfg(windows)]
+fn lock_file_is_judged(path: &std::path::Path, judged: FileIdentity) -> bool {
+    let Some(identity) = lock_path_identity(path) else {
+        return false;
+    };
+    identity == (judged.dev, judged.ino)
+        && std::fs::symlink_metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            == judged.modified
+}
+
 impl LogLock {
     /// Take the log's lock, waiting for a concurrent writer.
     ///
@@ -457,15 +513,20 @@ impl LogLock {
     /// Whether the lock path still names this holder's lock.
     ///
     /// The mtime of a lock is advisory, but **ownership** is checked before
-    /// every write: if the path no longer carries this nonce, another process
-    /// displaced this lock and a second writer may hold the path, so this writer
-    /// refuses rather than append a second chain into the file (R-13 round 8,
-    /// M1). The check is one bounded read of the path.
+    /// every write: if the path no longer names this holder's file, another
+    /// process displaced this lock and a second writer may hold the path, so
+    /// this writer refuses rather than append a second chain into the file
+    /// (R-13 round 8, M1). Ownership is the file, never the text in it: the
+    /// nonce is plaintext, so a copy carrying the same nonce is not the
+    /// holder's file (XPL-RPC-08).
     fn still_holds(&self) -> bool {
         // On unix the lock is a file identity: a local user with directory
         // write can read a live nonce, unlink the lock and recreate the same
         // text, so a text check alone let two writers append (R-13 round 11,
-        // L-3). Everywhere else the nonce is the best available check.
+        // L-3). On Windows the same attack passed the text check too, so the
+        // lock is a file identity there as well: the held handle's volume
+        // serial plus file index against the path's. Anywhere else the nonce
+        // is the best available check.
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -480,7 +541,16 @@ impl LogLock {
             }
             held.ino() != 0 && held.dev() == current.dev() && held.ino() == current.ino()
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Either side unavailable means the holder cannot prove the path
+            // still names its file: fail closed, as on unix.
+            let Some(held) = self.file.as_ref().and_then(lock_held_identity) else {
+                return false;
+            };
+            lock_path_identity(&self.path) == Some(held)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             nonce_of(&self.path).as_deref() == Some(self.nonce.as_str())
         }
@@ -525,6 +595,8 @@ impl LogLock {
                         // an unchecked unlink deleted whatever held the path
                         // after a displacement (R-13 round 14, F6).
                         let held = file.metadata().ok();
+                        #[cfg(windows)]
+                        let held_identity = lock_held_identity(&file);
                         drop(file);
                         let ours = match &held {
                             Some(held) => {
@@ -539,7 +611,12 @@ impl LogLock {
                                             && current.ino() == held.ino()
                                     })
                                 }
-                                #[cfg(not(unix))]
+                                #[cfg(windows)]
+                                {
+                                    held_identity
+                                        .is_some_and(|id| lock_path_identity(&path) == Some(id))
+                                }
+                                #[cfg(not(any(unix, windows)))]
                                 {
                                     nonce_of(&path).as_deref() == Some(nonce.as_str())
                                 }
@@ -621,12 +698,13 @@ fn judged_stale(path: &std::path::Path) -> Option<(String, Option<FileIdentity>)
     Some((facts.nonce, facts.identity))
 }
 
-/// Identity of the lock file a judgement read (unix).
+/// Identity of the lock file a judgement read.
 ///
-/// The inode alone is not enough: a filesystem may hand a removed file's inode
-/// to its immediate replacement (the Linux CI does). The modification time
-/// changes with the replacement and survives the rename that quarantines the
-/// judged file (R-13 round 16, F4).
+/// `(dev, ino)` on unix, volume serial plus file index on Windows
+/// (XPL-RPC-08). The identity alone is not enough: a filesystem may hand a
+/// removed file's identity to its immediate replacement (the Linux CI does
+/// with inodes). The modification time changes with the replacement and
+/// survives the rename that quarantines the judged file (R-13 round 16, F4).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     dev: u64,
@@ -644,8 +722,8 @@ struct LockFacts {
     age_ms: u64,
     nonce: String,
     pid: Option<u32>,
-    /// The file the judgement read (unix), so the steal can prove it moved the
-    /// same file and not a replacement with the same text
+    /// The file the judgement read (unix and Windows), so the steal can prove
+    /// it moved the same file and not a replacement with the same text
     /// (R-13 round 16, F4).
     identity: Option<FileIdentity>,
 }
@@ -680,7 +758,13 @@ fn lock_state(path: &std::path::Path) -> Option<LockFacts> {
             modified: metadata.modified().ok(),
         })
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let identity = lock_held_identity(&file).map(|(dev, ino)| FileIdentity {
+        dev,
+        ino,
+        modified: metadata.modified().ok(),
+    });
+    #[cfg(not(any(unix, windows)))]
     let identity = None;
     Some(LockFacts {
         age_ms,
@@ -734,9 +818,10 @@ fn take_stale(path: &std::path::Path, judged: &str, identity: Option<FileIdentit
         unique
     };
     let moved_nonce = nonce_of(&quarantine).unwrap_or_else(|| "missing".to_string());
-    // Unix proves identity by inode: the text alone let a replacement that
-    // copied the judged nonce be deleted (R-13 round 16, F4). Other platforms
-    // compare the text, which is the best identity their open gives.
+    // Unix proves identity by inode, Windows by volume serial plus file
+    // index: the text alone let a replacement that copied the judged nonce
+    // be deleted (R-13 round 16, F4; XPL-RPC-08). Anywhere else the text is
+    // compared, which is the best identity that platform's open gives.
     #[cfg(unix)]
     let matched = match identity {
         Some(judged) => {
@@ -753,7 +838,12 @@ fn take_stale(path: &std::path::Path, judged: &str, identity: Option<FileIdentit
         }
         None => lock_text_matches(&moved_nonce, judged),
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let matched = match identity {
+        Some(judged) => lock_file_is_judged(&quarantine, judged),
+        None => lock_text_matches(&moved_nonce, judged),
+    };
+    #[cfg(not(any(unix, windows)))]
     let matched = {
         let _ = identity;
         lock_text_matches(&moved_nonce, judged)
@@ -1271,7 +1361,17 @@ impl Drop for LogLock {
                     _ => false,
                 }
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            {
+                // The moved claim is the holder's file only if its identity
+                // is still the held handle's: a copy carrying the same nonce
+                // is not (XPL-RPC-08).
+                self.file
+                    .as_ref()
+                    .and_then(lock_held_identity)
+                    .is_some_and(|held| lock_path_identity(&claim) == Some(held))
+            }
+            #[cfg(not(any(unix, windows)))]
             {
                 nonce_of(&claim).as_deref() == Some(self.nonce.as_str())
             }
@@ -2966,6 +3066,142 @@ mod lock_tests {
         assert_eq!(
             before, after,
             "touch followed the path and refreshed somebody else's file"
+        );
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A byte-identical copy of a live lock is not the holder's lock
+    /// (XPL-RPC-08): the nonce is plaintext, so on Windows the text check
+    /// could not tell the copy from the original and the displaced writer
+    /// kept appending. Ownership is the file, not the text — a recreated
+    /// file, however identical its bytes, is a different file.
+    #[test]
+    fn a_copied_lock_nonce_does_not_keep_a_live_lock() {
+        let path = scratch("copied-nonce");
+        std::fs::write(&path, b"").expect("log");
+        let lock = LogLock::acquire(&path).expect("the lock is free");
+        let lock_path = lock_of(&path);
+        assert!(lock.still_holds(), "a fresh lock owns the path");
+
+        // The attack: a local user reads the plaintext nonce, unlinks the
+        // lock and recreates the same text.
+        let bytes = std::fs::read(&lock_path).expect("read the live lock");
+        std::fs::remove_file(&lock_path).expect("remove");
+        std::fs::write(&lock_path, &bytes).expect("replacement");
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read the copy"),
+            bytes,
+            "the copy is byte-identical: the attack's premise"
+        );
+        assert!(
+            !lock.still_holds(),
+            "a byte-identical copy of the lock is not the holder's lock"
+        );
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The `Drop` half of the same hole (XPL-RPC-08): a displaced holder
+    /// must not delete the replacement lock when it finishes. Before the
+    /// fix the drop's nonce check passed on the copy and removed a file
+    /// the holder did not own.
+    #[test]
+    fn a_displaced_holders_drop_does_not_delete_the_replacement_lock() {
+        let path = scratch("drop-copy");
+        std::fs::write(&path, b"").expect("log");
+        let lock = LogLock::acquire(&path).expect("the lock is free");
+        let lock_path = lock_of(&path);
+        let bytes = std::fs::read(&lock_path).expect("read the live lock");
+        std::fs::remove_file(&lock_path).expect("remove");
+        std::fs::write(&lock_path, &bytes).expect("replacement");
+        drop(lock);
+        let kept = std::fs::read(&lock_path).expect("the replacement survives the holder's drop");
+        assert_eq!(kept, bytes, "the replacement is intact");
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The steal half of the same hole (XPL-RPC-08, and XPL-RPC-03's
+    /// Windows side): a replacement carrying the judged nonce is not the
+    /// judged file, so the steal must preserve it. On unix the judged
+    /// inode decides (R-13 round 16, F4); on Windows the judged file
+    /// index must decide the same way.
+    #[test]
+    fn the_steal_uses_the_judged_identity_not_its_text() {
+        let path = scratch("steal-copy");
+        let lock_path = lock_of(&path);
+        let body = format!("{}stale-1 pid 4294967294 started 1", super::LOCK_MAGIC);
+        std::fs::write(&lock_path, &body).expect("lock");
+        age_lock(&lock_path, 130);
+        let (nonce, identity) =
+            super::judged_stale(&lock_path).expect("a lock naming a dead pid is judged stale");
+        assert_eq!(nonce, "stale-1");
+
+        // Same text, new file: the steal must not delete this file.
+        std::fs::remove_file(&lock_path).expect("remove");
+        std::fs::write(&lock_path, &body).expect("replacement");
+        assert!(
+            !super::take_stale(&lock_path, &nonce, identity),
+            "a replacement carrying the judged nonce is not the judged file"
+        );
+        assert!(lock_path.exists(), "the replacement is preserved");
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The attack as audited (XPL-RPC-08): the copy is made by another
+    /// process, not by this test. The holder's `still_holds` inspects only
+    /// the filesystem, so the process boundary is the attack's shape, not a
+    /// timing race — each child is awaited before the assertion runs, and
+    /// no sleep or retry is involved.
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_nonce_copied_by_another_process_does_not_keep_the_lock() {
+        let path = scratch("copied-by-child");
+        std::fs::write(&path, b"").expect("log");
+        let lock = LogLock::acquire(&path).expect("the lock is free");
+        let lock_path = lock_of(&path);
+        assert!(lock.still_holds(), "a fresh lock owns the path");
+        let bytes = std::fs::read(&lock_path).expect("read the live lock");
+
+        let lock_text = lock_path.to_str().expect("the temp path is UTF-8");
+        let copy_path = lock_path.with_file_name(format!(
+            "{}.copy",
+            lock_path.file_name().unwrap().to_string_lossy()
+        ));
+        let copy_text = copy_path.to_str().expect("the temp path is UTF-8");
+        // One `cmd` per step, each awaited: copy the live lock aside, unlink
+        // the lock, move the copy back. The lock path then carries the same
+        // bytes from a file another process wrote.
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("cmd")
+                .arg("/C")
+                .args(args)
+                .output()
+                .expect("spawn cmd");
+            assert!(
+                output.status.success(),
+                "cmd {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["copy", "/Y", lock_text, copy_text]);
+        run(&["del", lock_text]);
+        run(&["move", "/Y", copy_text, lock_text]);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read the copy"),
+            bytes,
+            "the copy another process made is byte-identical"
+        );
+        assert!(
+            !lock.still_holds(),
+            "a copy another process made is not the holder's lock"
         );
 
         let _ = std::fs::remove_file(&lock_path);
