@@ -3437,6 +3437,9 @@ fn kill_pipe_holders(pipes: &[u64]) {
 /// executable is ever launched.
 
 fn kill_process_tree(child: &mut Child, pipes: &[u64]) {
+    // `pipes` is only consumed by the Linux `kill_pipe_holders` block below;
+    // on Windows/macOS the parameter would otherwise warn as unused.
+    let _ = pipes;
     #[cfg(windows)]
     {
         let _ = child.kill();
