@@ -141,9 +141,12 @@ port = 8080
         Some(&Value::text(hex(&raw))),
         "the raw canonical hash is an offline equality oracle"
     );
-    assert_eq!(
-        reply.get("body_hash"),
-        Some(&Value::text(hex(blake3::hash(&image).as_bytes())))
+    // R2-BND-02: the raw digest is the same offline equality oracle over the
+    // secret-bearing bytes, so a secret image's finish omits `body_hash` —
+    // the redacted `content` address above is the identifier.
+    assert!(
+        !reply.contains_key("body_hash"),
+        "a secret image's finish must not serve the raw digest"
     );
     // The host's view carries the same redacted address.
     let taken = provider.take_body(0).expect("body");

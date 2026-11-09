@@ -1544,6 +1544,11 @@ struct FinishedTransfer {
     body_hash: [u8; 32],
     content: Option<[u8; 32]>,
     content_error: Option<&'static str>,
+    /// Whether the finish reply for this body omits `body_hash`: the body is —
+    /// or may be — a secret-bearing image (R2-BND-02). Recorded at finish time
+    /// because the bytes are gone when a retransmitted marker is answered, and
+    /// re-synced by the `completed` replay when it recomputes the address.
+    suppress_body_hash: bool,
     /// When the reply was recorded: the record is released with the same window
     /// as an untaken body (round 6, L7).
     at_ms: u64,
@@ -1577,6 +1582,29 @@ fn classify_body(body: &[u8]) -> (Option<[u8; 32]>, Option<&'static str>) {
         Ok(Err(false)) => (None, None),
         Err(_) => (None, Some("parser")),
     }
+}
+
+/// Whether a finish reply must omit `body_hash` for this body.
+///
+/// The raw Blake3 digest is an offline equality oracle over the un-redacted
+/// bytes, so it is withheld whenever the body is — or may be — a
+/// secret-bearing image: a body that holds a structural secret, or a body
+/// that claims to be an image but cannot be classified (`"parser"`). The
+/// decision is keyed on the BODY's secrecy, never on the caller's `redact`
+/// flag (R2-BND-02). A non-image body and a secret-free image keep
+/// `body_hash`: it is their transfer-integrity value.
+///
+/// The secret check runs one structural decode over the resident bytes. A
+/// decode panic fails closed: a body that cannot be read cannot be proven
+/// secret-free.
+fn suppress_body_hash(body: &[u8], content_error: Option<&'static str>) -> bool {
+    if matches!(content_error, Some("parser")) {
+        return true;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::security::module_carries_a_secret(body)
+    }))
+    .unwrap_or(true)
 }
 
 /// A provider that receives a bulk body through ordinary calls.
@@ -1649,10 +1677,15 @@ fn finished_reply(
     content: Option<[u8; 32]>,
     content_error: Option<&'static str>,
     redact: bool,
+    suppress_body_hash: bool,
 ) -> Response {
     let mut entries = BTreeMap::new();
     entries.insert("length".to_string(), Value::Int(length as i64));
-    if !redact {
+    // `body_hash` is the raw Blake3 of the bytes: an offline equality oracle
+    // over a secret-bearing body. It is withheld when the caller asked for
+    // redaction, and whenever the body is — or may be — a secret-bearing
+    // image, whether or not the caller asked (R2-BND-02).
+    if !redact && !suppress_body_hash {
         entries.insert("body_hash".to_string(), Value::text(hex(&body_hash)));
     }
     // A client that keys on `content` must be able to tell "not an image" from
@@ -2155,15 +2188,23 @@ impl BulkProvider {
                     if let Some(last) = self.last_finished.get_mut(&object) {
                         last.content = content;
                         last.content_error = content_error;
+                        // The recompute can move the error to `"parser"`, so
+                        // the recorded omission moves with it (R2-BND-02).
+                        last.suppress_body_hash =
+                            suppress_body_hash(done.body.body(), done.body.content_error());
                     }
                 }
             }
+            // The body is still resident here, so the omission is computed
+            // fresh from it — the recorded flag is only for the
+            // `last_finished` path below, where the bytes are gone.
             let reply = finished_reply(
                 done.body.len() as u64,
                 done.body.body_hash(),
                 done.body.content_hash(),
                 done.body.content_error(),
                 call.redact,
+                suppress_body_hash(done.body.body(), done.body.content_error()),
             );
             return Ok(reply);
         }
@@ -2175,6 +2216,7 @@ impl BulkProvider {
                 done.content,
                 done.content_error,
                 call.redact,
+                done.suppress_body_hash,
             ));
         }
         // Validate before taking: a marker for another transfer, or a finish
@@ -2341,8 +2383,21 @@ impl BulkProvider {
             .saturating_add(entered.elapsed().as_millis() as u64);
         // A raw digest over a secret-bearing body is the value the domain
         // provider withholds from a redacting capability; `content` is the
-        // redacted address and is enough (round 5 residual).
-        let reply = finished_reply(length, body_hash, content, content_error, call.redact);
+        // redacted address and is enough (round 5 residual). The digest is
+        // withheld whenever the BODY is — or may be — a secret-bearing image,
+        // never merely because the caller asked for redaction (R2-BND-02):
+        // the omission is computed from the body bytes here and recorded in
+        // the digest reply, so a retransmitted marker re-serves the same
+        // omission after the bytes are gone.
+        let suppress = suppress_body_hash(&body, content_error);
+        let reply = finished_reply(
+            length,
+            body_hash,
+            content,
+            content_error,
+            call.redact,
+            suppress,
+        );
         self.last_finished.insert(
             object,
             FinishedTransfer {
@@ -2352,6 +2407,7 @@ impl BulkProvider {
                 body_hash,
                 content,
                 content_error,
+                suppress_body_hash: suppress,
                 at_ms: finished_ms,
             },
         );
