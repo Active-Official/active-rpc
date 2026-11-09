@@ -917,13 +917,27 @@ fn looks_like_a_lock(body: &str) -> bool {
 /// A link planted in the log's directory would make every append write through
 /// it (and `repair` truncate through it), so the type is checked without
 /// following it (R-13 round 9, L2).
+/// Windows flags for refusing a reparse point at the open (XPL-RPC-01).
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` makes the open return a handle to the link
+/// itself instead of following it; `FILE_ATTRIBUTE_REPARSE_POINT` is the bit
+/// the handle's own attributes carry when it is one. Both are stable Win32
+/// values, spelled out here so the crate needs no `windows-sys` dependency
+/// and no `unsafe` block (`#![forbid(unsafe_code)]`).
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
 /// Open the log for writing through a handle that is verified to be a regular
 /// file.
 ///
 /// The path check before an open cannot be atomic with it, so the open itself
-/// refuses a symlink (`O_NOFOLLOW`) and the handle's own metadata decides
-/// (R-13 round 13, F2). `read` adds `O_RDONLY`-style access for `repair`, which
-/// walks and truncates the same inode.
+/// refuses a symlink (`O_NOFOLLOW` on unix, `FILE_FLAG_OPEN_REPARSE_POINT`
+/// plus a reparse-point check on the handle on Windows — XPL-RPC-01) and the
+/// handle's own metadata decides (R-13 round 13, F2). `read` adds
+/// `O_RDONLY`-style access for `repair`, which walks and truncates the same
+/// inode.
 fn open_log_write(path: &std::path::Path, append: bool, read: bool) -> Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true);
@@ -938,12 +952,29 @@ fn open_log_write(path: &std::path::Path, append: bool, read: bool) -> Result<st
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        // Open a reparse point itself instead of following it (XPL-RPC-01):
+        // without this flag the open follows a symlink to its target and the
+        // post-open `is_file()` check passes, because the target is a regular
+        // file. The handle's own attributes are checked below, so the
+        // refusal is atomic with the open — no check-then-open race.
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options
         .open(path)
         .map_err(|_| Error::receipt("cannot open the receipt log for writing"))?;
     let meta = file
         .metadata()
         .map_err(|_| Error::receipt("cannot inspect the receipt log"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::receipt("the receipt log path is a reparse point"));
+        }
+    }
     if !meta.file_type().is_file() {
         return Err(Error::receipt("the receipt log is not a regular file"));
     }
@@ -955,7 +986,9 @@ fn open_log_write(path: &std::path::Path, append: bool, read: bool) -> Result<st
 /// The reader used a plain `File::open` and relied on a post-hoc identity
 /// check, so a reparse point swapped in between the type check and the open
 /// redirected it on every platform, and on unix the `O_NOFOLLOW` the manifest
-/// claimed for "write and read opens" was missing (R-13 round 14, F2).
+/// claimed for "write and read opens" was missing (R-13 round 14, F2). On
+/// Windows the same hole is closed with `FILE_FLAG_OPEN_REPARSE_POINT` plus
+/// the handle's own reparse-point check (XPL-RPC-01).
 fn open_log_read(path: &std::path::Path) -> Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -964,12 +997,26 @@ fn open_log_read(path: &std::path::Path) -> Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        // As in `open_log_write`: open the link itself, then refuse it from
+        // the handle's own attributes (XPL-RPC-01).
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options
         .open(path)
         .map_err(|_| Error::receipt("cannot read the receipt log"))?;
     let meta = file
         .metadata()
         .map_err(|_| Error::receipt("cannot inspect the receipt log"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(Error::receipt("the receipt log path is a reparse point"));
+        }
+    }
     if !meta.file_type().is_file() {
         return Err(Error::receipt("the receipt log is not a regular file"));
     }
@@ -3070,6 +3117,61 @@ mod round11_tests {
         std::fs::write(&target, vec![0x41u8; 4096]).expect("victim");
         let link = dir.join("log.arrl");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(ReceiptLog::repair(&link).is_err());
+        assert_eq!(
+            std::fs::read(&target).expect("victim").len(),
+            4096,
+            "the victim was truncated through the link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On Windows the open itself must refuse a reparse point (XPL-RPC-01):
+    /// `O_NOFOLLOW` is unix-only, and the post-open `is_file()` check follows
+    /// the link to a regular file, so without the refusal the open hands back
+    /// a handle to the attacker's target. The mirror of
+    /// `the_write_open_refuses_a_symlink` above.
+    #[cfg(windows)]
+    #[test]
+    fn the_write_open_refuses_a_reparse_point_on_windows() {
+        let dir = scratch_dir("nofollow-win");
+        let target = dir.join("victim");
+        std::fs::write(&target, b"keep").expect("victim");
+        let link = dir.join("log.arrl");
+        std::os::windows::fs::symlink_file(&target, &link).expect("symlink");
+        let error = open_log_write(&link, true, false).expect_err("refused");
+        assert_eq!(error.code(), "rpc/receipt");
+        assert_eq!(std::fs::read(&target).expect("victim"), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The read open is the same hole (XPL-RPC-01): the reader has no
+    /// pre-open check of its own, so a link at the path is followed and the
+    /// target's bytes are read as the log's.
+    #[cfg(windows)]
+    #[test]
+    fn the_read_open_refuses_a_reparse_point_on_windows() {
+        let dir = scratch_dir("nofollow-read-win");
+        let target = dir.join("victim");
+        std::fs::write(&target, b"keep").expect("victim");
+        let link = dir.join("log.arrl");
+        std::os::windows::fs::symlink_file(&target, &link).expect("symlink");
+        let error = open_log_read(&link).expect_err("refused");
+        assert_eq!(error.code(), "rpc/receipt");
+        assert_eq!(std::fs::read(&target).expect("victim"), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `repair` truncates the file it walked, never a link planted at the path
+    /// — on Windows too (XPL-RPC-01).
+    #[cfg(windows)]
+    #[test]
+    fn repair_never_truncates_through_a_symlink_on_windows() {
+        let dir = scratch_dir("repair-link-win");
+        let target = dir.join("victim");
+        std::fs::write(&target, vec![0x41u8; 4096]).expect("victim");
+        let link = dir.join("log.arrl");
+        std::os::windows::fs::symlink_file(&target, &link).expect("symlink");
         assert!(ReceiptLog::repair(&link).is_err());
         assert_eq!(
             std::fs::read(&target).expect("victim").len(),

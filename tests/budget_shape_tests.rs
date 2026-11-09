@@ -1340,19 +1340,15 @@ fn a_descriptor_table_larger_than_the_byte_budget_is_refused() {
         });
     }
     let envelope = decoded(&Envelope::request(1, "ping", vec![]).with_caps(caps));
-    assert_eq!(
-        envelope_refused(&fixture, &envelope),
-        "rpc/budget-exceeded"
-    );
+    assert_eq!(envelope_refused(&fixture, &envelope), "rpc/budget-exceeded");
 }
 
 /// RPC-52: the charge is exact — one byte under the descriptor size refuses,
 /// the size plus the response admits.
 #[test]
 fn a_descriptor_table_at_the_byte_budget_boundary() {
-    let envelope = decoded(
-        &Envelope::request(1, "ping", vec![]).with_caps(vec![descriptor(1, &["m"])]),
-    );
+    let envelope =
+        decoded(&Envelope::request(1, "ping", vec![]).with_caps(vec![descriptor(1, &["m"])]));
     let charge = envelope.non_argument_wire_size();
     // One byte under the charge refuses, and the provider never runs.
     let under = fixture_with(
@@ -1362,10 +1358,7 @@ fn a_descriptor_table_at_the_byte_budget_boundary() {
         },
         Value::text("ok"),
     );
-    assert_eq!(
-        envelope_refused(&under, &envelope),
-        "rpc/budget-exceeded"
-    );
+    assert_eq!(envelope_refused(&under, &envelope), "rpc/budget-exceeded");
     // The charge plus exactly the response's bytes admits, and the provider
     // runs once: the response charge stacks on the queue-time charge, so
     // this also pins the charge from above — any over-charge would eat the
@@ -1433,9 +1426,7 @@ fn a_long_method_name_is_charged_to_the_byte_budget() {
     let mut attrs = CapAttrs::new(&[envelope.method.as_str()]);
     attrs.budget = exact_budget;
     let cap = agent.mint(provider, 0, attrs).expect("mint");
-    let lane = agent
-        .create_lane("long-exact", exact_budget)
-        .expect("lane");
+    let lane = agent.create_lane("long-exact", exact_budget).expect("lane");
     let promise = agent
         .call_from_envelope(None, lane, &cap, &envelope)
         .expect("the method charge plus the response admits");
@@ -1462,10 +1453,7 @@ fn a_capability_table_delta_is_charged_to_the_byte_budget() {
         },
         Value::text("ok"),
     );
-    assert_eq!(
-        envelope_refused(&under, &envelope),
-        "rpc/budget-exceeded"
-    );
+    assert_eq!(envelope_refused(&under, &envelope), "rpc/budget-exceeded");
     let exact = fixture_with(
         Budget {
             max_bytes: charge + Value::text("ok").wire_size(),
@@ -1505,9 +1493,8 @@ fn an_idempotent_envelope_call_charges_its_descriptor_bytes() {
         });
     }
     let big = decoded(&Envelope::request(1, "ping", vec![]).with_caps(caps));
-    let small = decoded(
-        &Envelope::request(1, "ping", vec![]).with_caps(vec![descriptor(1, &["m"])]),
-    );
+    let small =
+        decoded(&Envelope::request(1, "ping", vec![]).with_caps(vec![descriptor(1, &["m"])]));
     let charge = small.non_argument_wire_size();
     let fixture = fixture_with(
         Budget {
@@ -1540,10 +1527,8 @@ fn an_idempotent_envelope_call_charges_its_descriptor_bytes() {
     assert_eq!(fixture.calls.get(), 1, "the replay runs no provider");
     // The same key with a changed descriptor table is a different call.
     let changed = decoded(
-        &Envelope::request(1, "ping", vec![]).with_caps(vec![
-            descriptor(1, &["m"]),
-            descriptor(2, &["n"]),
-        ]),
+        &Envelope::request(1, "ping", vec![])
+            .with_caps(vec![descriptor(1, &["m"]), descriptor(2, &["n"])]),
     );
     let error = fixture
         .agent
@@ -1576,8 +1561,5 @@ fn an_in_process_call_charges_no_descriptor_bytes() {
     // empty capability table (4) — 12 bytes against a 1-byte grant.
     let envelope = decoded(&Envelope::request(1, "ping", vec![]));
     assert_eq!(envelope.non_argument_wire_size(), 12);
-    assert_eq!(
-        envelope_refused(&fixture, &envelope),
-        "rpc/budget-exceeded"
-    );
+    assert_eq!(envelope_refused(&fixture, &envelope), "rpc/budget-exceeded");
 }

@@ -548,3 +548,41 @@ fn a_symlinked_log_path_is_refused() {
     let _ = std::fs::remove_file(&target);
     let _ = std::fs::remove_file(&moved);
 }
+
+/// A symlink planted at the log path must not receive the append on Windows
+/// either (XPL-RPC-01) — the mirror of the unix test above, same shape: the
+/// writer refuses it instead of following the link. Symlink creation works
+/// on this machine and on CI runners (admin), so the test plants a real one.
+#[cfg(windows)]
+#[test]
+fn a_symlinked_log_path_is_refused_on_windows() {
+    let path = scratch("symlink-win");
+    drop(ReceiptLog::create(&path).expect("create"));
+    // The handle is opened while the path is the real log; the link is planted
+    // afterwards, which is the shape an attacker can actually produce.
+    let log = ReceiptLog::open(&path).expect("open the real log");
+    let target = scratch("symlink-win-target");
+    std::fs::write(&target, b"").expect("target");
+    let moved = path.with_extension("moved");
+    std::fs::rename(&path, &moved).expect("move the real log");
+    std::os::windows::fs::symlink_file(&target, &path).expect("symlink");
+
+    let error = log
+        .append(&receipt(1, "echo"))
+        .expect_err("a symlinked log path is refused");
+    assert_eq!(error.code(), "rpc/receipt", "{error}");
+    assert!(
+        error.to_string().contains("reparse")
+            || error.to_string().contains("symlink")
+            || error.to_string().contains("regular file"),
+        "the refusal says the path is not our log: {error}"
+    );
+    assert_eq!(
+        std::fs::metadata(&target).expect("stat").len(),
+        0,
+        "nothing was written through the link"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&moved);
+}

@@ -1389,8 +1389,7 @@ fn the_envelopes_non_argument_size_is_its_encoded_size_less_the_fixed_overhead()
     };
     let envelopes = vec![
         Envelope::request(1, "echo", vec![]),
-        Envelope::request(2, "echo", vec![])
-            .with_caps(vec![descriptor(1, &["echo"], None)]),
+        Envelope::request(2, "echo", vec![]).with_caps(vec![descriptor(1, &["echo"], None)]),
         Envelope::request(3, "echo", vec![]).with_caps(vec![
             descriptor(2, &["a", "b"], Some("public.scope")),
             descriptor(3, &["c"], None),

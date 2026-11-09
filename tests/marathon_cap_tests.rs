@@ -679,8 +679,7 @@ fn a_grant_at_the_tool_ceiling_mints_and_one_over_is_refused() {
     let at = CapAttrs::new(&["echo"]).with_tool_policy(ToolPolicy::allow(&name_refs(&tools)));
     agent.mint(provider, 0, at).expect("64 tools mint");
     let tools = method_names(MAX_METHODS_PER_GRANT + 1);
-    let over =
-        CapAttrs::new(&["echo"]).with_tool_policy(ToolPolicy::allow(&name_refs(&tools)));
+    let over = CapAttrs::new(&["echo"]).with_tool_policy(ToolPolicy::allow(&name_refs(&tools)));
     let error = agent
         .mint(provider, 0, over)
         .expect_err("a 65th tool is refused");
@@ -696,10 +695,17 @@ fn a_grant_at_the_tool_ceiling_mints_and_one_over_is_refused() {
 fn an_attenuation_past_the_method_ceiling_is_refused() {
     let (agent, provider, _) = agent();
     let parent = agent
-        .mint(provider, 0, grant_over(&method_names(MAX_METHODS_PER_GRANT)))
+        .mint(
+            provider,
+            0,
+            grant_over(&method_names(MAX_METHODS_PER_GRANT)),
+        )
         .expect("64-method parent");
     let error = agent
-        .attenuate(&parent, grant_over(&method_names(MAX_METHODS_PER_GRANT + 1)))
+        .attenuate(
+            &parent,
+            grant_over(&method_names(MAX_METHODS_PER_GRANT + 1)),
+        )
         .expect_err("attenuation cannot widen past the ceiling");
     assert_eq!(error.code(), "rpc/attenuation-escalation", "{error}");
 }
@@ -720,7 +726,8 @@ fn a_restore_of_a_grant_over_the_ceiling_is_refused() {
     let record = agent.export_capability(&cap).expect("export");
     drop(cap);
     let mut over = record;
-    over.methods.insert(format!("m{:03}", MAX_METHODS_PER_GRANT));
+    over.methods
+        .insert(format!("m{:03}", MAX_METHODS_PER_GRANT));
     over.seal_with(&[0x82; 32]);
     let error = agent
         .restore_capability_in_process_only(&over, &owner)
