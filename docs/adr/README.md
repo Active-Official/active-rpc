@@ -27,6 +27,7 @@
 | [0023](0023-no-io-uring-backend.md) | No io_uring backend for TCP and QUIC I/O |
 | [0024](0024-subscriptions-are-not-authority.md) | Subscriptions are not authority |
 | [0025](0025-fail-closed-idempotency-ceiling.md) | Fail-closed idempotency ceiling |
+| [0026](0026-one-method-ceiling.md) | One method ceiling, 64, in every layer |
 
 ## Reading order and supersessions
 

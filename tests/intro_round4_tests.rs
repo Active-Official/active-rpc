@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use active_rpc::cap::{CapAttrs, CapId, CapPersistence};
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
-use active_rpc::kernel::Provider;
+use active_rpc::kernel::{Provider, MAX_METHODS_PER_GRANT};
 use active_rpc::value::{Call, Response, Value};
 use active_rpc::{Agent, Budget, CapHandle, ProviderId};
 
@@ -553,4 +553,55 @@ fn a_capture_stops_at_the_introduction_bound() {
         "capture asked mutating() {asked} times for {} names",
         active_rpc::intro::MAX_METHODS_PER_PROVIDER + 1
     );
+}
+
+/// RPC-07: a provider over the one method ceiling is left out of the
+/// introduction, and its methods past the captured prefix are unreachable.
+///
+/// The introduction bound is now the grant ceiling, so a 100-method provider
+/// is skipped and taped, while a subset capability for the first 64 methods
+/// still mints and calls; a capability for a method past the prefix mints —
+/// mint does not check provider membership — but the call itself is refused,
+/// because the kernel only captured the first 64.
+#[test]
+fn a_provider_past_the_method_ceiling_is_skipped_but_its_captured_prefix_still_calls() {
+    let agent = Agent::new();
+    let methods: Vec<String> = (0..100).map(|index| format!("m{index:03}")).collect();
+    let provider = agent.register(Box::new(Adapter {
+        name: "huge",
+        methods: methods.clone(),
+    }));
+    let bytes = agent
+        .intro()
+        .expect("one huge surface does not deny the rest");
+    let module = active_infinity::decode(&bytes).expect("a valid module");
+    let json = active_infinity::interop::to_redacted_json(&module).expect("json");
+    assert!(!json.contains("\"huge\""), "{json}");
+    assert!(
+        agent
+            .trace()
+            .iter()
+            .any(|event| event.event() == "intro.skipped"),
+        "the skip is on the tape"
+    );
+    let lane = agent.create_lane("huge", Budget::default()).expect("lane");
+    // The captured prefix mints and calls.
+    let prefix: Vec<String> = methods[..MAX_METHODS_PER_GRANT].to_vec();
+    let refs: Vec<&str> = prefix.iter().map(String::as_str).collect();
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&refs))
+        .expect("a 64-method subset cap mints");
+    let promise = agent.call(lane, &cap, "m000", Vec::new()).expect("queued");
+    agent.run();
+    promise.value().expect("the captured prefix calls");
+    // A method past the captured prefix cannot be called: a capability for
+    // it mints, but the call itself is refused — the prefix is all the
+    // kernel knows.
+    let beyond = agent
+        .mint(provider, 0, CapAttrs::new(&["m064"]))
+        .expect("a one-method cap for m064 mints");
+    let error = agent
+        .call(lane, &beyond, "m064", Vec::new())
+        .expect_err("m064 is past the captured prefix");
+    assert_eq!(error.code(), "rpc/method-not-granted", "{error}");
 }

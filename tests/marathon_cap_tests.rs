@@ -9,10 +9,12 @@ use std::rc::Rc;
 use active_rpc::budget::{Budget, BudgetMeter};
 use active_rpc::cap::{CapAttrs, CapId, ToolPolicy};
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
-use active_rpc::kernel::Provider;
+use active_rpc::intro::MAX_METHODS_PER_PROVIDER;
+use active_rpc::kernel::{Provider, MAX_METHODS_PER_GRANT};
+use active_rpc::replay::MAX_METHODS;
 use active_rpc::tool::HttpTool;
 use active_rpc::value::{Arg, Call, Response, Value};
-use active_rpc::wire::{decode_capability_table, CapDescriptor};
+use active_rpc::wire::{decode_capability_table, CapDescriptor, WireLimits};
 use active_rpc::{Agent, CapHandle, CapPersistence, CapabilityRecord};
 
 struct Echo;
@@ -611,4 +613,131 @@ fn a_record_keeps_its_identity_across_the_round_trip() {
         .restore_capability_in_process_only(&tampered, &admitted(b"owner"))
         .expect_err("a re-pointed record is not sealed");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
+}
+
+// RPC-07: one ceiling for every name set a grant carries.
+//
+// A grant the wire cannot encode and the replay cannot record used to mint
+// without complaint: the kernel checked each name's shape but never counted
+// the names. Every test below fails on the pre-fix tree and pins the ceiling
+// the four layers now share.
+
+/// `count` distinct method names, `m000`.. — the RPC-07 boundary tests build
+/// their grants from this, so a set is exactly at or one over the ceiling.
+fn method_names(count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("m{index:03}")).collect()
+}
+
+/// A grant over exactly these names.
+fn grant_over(methods: &[String]) -> CapAttrs {
+    let names: Vec<&str> = methods.iter().map(String::as_str).collect();
+    CapAttrs::new(&names)
+}
+
+/// The same names as `&str` slices, for the builders that take them.
+fn name_refs(names: &[String]) -> Vec<&str> {
+    names.iter().map(String::as_str).collect()
+}
+
+/// The ceiling is inclusive: a 64-method grant mints, and the 65th method is
+/// refused (RPC-07). Mint checks shape only per name before this fix, so a
+/// 5,000-method cap minted and could never be encoded or replayed.
+#[test]
+fn a_grant_at_the_method_ceiling_mints_and_one_over_is_refused() {
+    let (agent, provider, _) = agent();
+    let at = grant_over(&method_names(MAX_METHODS_PER_GRANT));
+    agent.mint(provider, 0, at).expect("64 methods mint");
+    let over = grant_over(&method_names(MAX_METHODS_PER_GRANT + 1));
+    let error = agent
+        .mint(provider, 0, over)
+        .expect_err("a 65th method is refused");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// Topics are a name set like methods: the same ceiling bounds them, so a
+/// topic list cannot be the unbounded one instead (RPC-07).
+#[test]
+fn a_grant_at_the_topic_ceiling_mints_and_one_over_is_refused() {
+    let (agent, provider, _) = agent();
+    let topics = method_names(MAX_METHODS_PER_GRANT);
+    let at = CapAttrs::new(&["echo"]).restrict_topics(&name_refs(&topics));
+    agent.mint(provider, 0, at).expect("64 topics mint");
+    let topics = method_names(MAX_METHODS_PER_GRANT + 1);
+    let over = CapAttrs::new(&["echo"]).restrict_topics(&name_refs(&topics));
+    let error = agent
+        .mint(provider, 0, over)
+        .expect_err("a 65th topic is refused");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// Tool names are method names on the other side of the policy: the same
+/// ceiling bounds them (RPC-07).
+#[test]
+fn a_grant_at_the_tool_ceiling_mints_and_one_over_is_refused() {
+    let (agent, provider, _) = agent();
+    let tools = method_names(MAX_METHODS_PER_GRANT);
+    let at = CapAttrs::new(&["echo"]).with_tool_policy(ToolPolicy::allow(&name_refs(&tools)));
+    agent.mint(provider, 0, at).expect("64 tools mint");
+    let tools = method_names(MAX_METHODS_PER_GRANT + 1);
+    let over =
+        CapAttrs::new(&["echo"]).with_tool_policy(ToolPolicy::allow(&name_refs(&tools)));
+    let error = agent
+        .mint(provider, 0, over)
+        .expect_err("a 65th tool is refused");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// Attenuation cannot produce a grant over the ceiling either. The subset rule
+/// fires first — a 65-method child of a 64-method parent is a widening by
+/// definition, so the refusal is `rpc/attenuation-escalation`, not the count
+/// check; the count check in `check_method_names` is the second line for a
+/// legacy parent that already holds more than the ceiling.
+#[test]
+fn an_attenuation_past_the_method_ceiling_is_refused() {
+    let (agent, provider, _) = agent();
+    let parent = agent
+        .mint(provider, 0, grant_over(&method_names(MAX_METHODS_PER_GRANT)))
+        .expect("64-method parent");
+    let error = agent
+        .attenuate(&parent, grant_over(&method_names(MAX_METHODS_PER_GRANT + 1)))
+        .expect_err("attenuation cannot widen past the ceiling");
+    assert_eq!(error.code(), "rpc/attenuation-escalation", "{error}");
+}
+
+/// A sealed record with one method over the ceiling does not restore. The seal
+/// covers the method set, so the tampered record has to be re-sealed with the
+/// deployment key first: the restore must judge the count, not the seal
+/// (RPC-07).
+#[test]
+fn a_restore_of_a_grant_over_the_ceiling_is_refused() {
+    let (agent, provider) = durable_agent();
+    let mut attrs = grant_over(&method_names(MAX_METHODS_PER_GRANT));
+    attrs.persistence = CapPersistence::Durable;
+    let owner = admitted(b"owner");
+    let cap = agent
+        .mint_bound(&owner, provider, 0, attrs)
+        .expect("64-method durable cap");
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+    let mut over = record;
+    over.methods.insert(format!("m{:03}", MAX_METHODS_PER_GRANT));
+    over.seal_with(&[0x82; 32]);
+    let error = agent
+        .restore_capability_in_process_only(&over, &owner)
+        .expect_err("a 65-method record is refused");
+    assert_eq!(error.code(), "rpc/invalid-argument", "{error}");
+}
+
+/// The four ceilings are one number: if any layer drifts, a grant the kernel
+/// mints is one the wire cannot encode, the replay cannot record, or the
+/// introduction cannot describe (RPC-07, BND-F5).
+#[test]
+fn the_method_ceiling_is_the_same_in_every_layer() {
+    assert_eq!(MAX_METHODS_PER_GRANT, 64);
+    assert_eq!(MAX_METHODS_PER_PROVIDER, MAX_METHODS_PER_GRANT);
+    assert_eq!(MAX_METHODS, MAX_METHODS_PER_GRANT);
+    assert_eq!(
+        WireLimits::default().max_methods as usize,
+        MAX_METHODS_PER_GRANT
+    );
 }

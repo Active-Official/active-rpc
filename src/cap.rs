@@ -151,6 +151,10 @@ pub struct ToolPolicy {
 
 impl ToolPolicy {
     /// Build a policy from tool names.
+    ///
+    /// A policy naming more than 64 tools is refused at mint, attenuate and
+    /// restore (`kernel::MAX_METHODS_PER_GRANT`, RPC-07); this builder itself
+    /// collects without refusing, so the refusal lands at the grant.
     pub fn allow(names: &[&str]) -> Self {
         Self {
             allowed: names.iter().map(|name| name.to_string()).collect(),
@@ -222,6 +226,10 @@ pub struct CapAttrs {
 
 impl CapAttrs {
     /// Full authority over `methods` with the default budget.
+    ///
+    /// More than 64 methods is refused at mint, attenuate and restore
+    /// (`kernel::MAX_METHODS_PER_GRANT`, RPC-07); this constructor itself
+    /// collects without refusing, so the refusal lands at the grant.
     pub fn new(methods: &[&str]) -> Self {
         Self {
             methods: methods.iter().map(|method| method.to_string()).collect(),
@@ -239,6 +247,9 @@ impl CapAttrs {
     }
 
     /// Restrict methods.
+    ///
+    /// More than 64 methods is refused when the grant is minted, attenuated
+    /// or restored; this builder itself collects without refusing.
     pub fn with_methods(mut self, methods: &[&str]) -> Self {
         self.methods = methods.iter().map(|method| method.to_string()).collect();
         self
@@ -284,6 +295,8 @@ impl CapAttrs {
     ///
     /// A topic set implies the publish grant: naming the topics a capability may
     /// publish to is the grant. Use [`CapAttrs::allow_publish`] for "any topic".
+    /// More than 64 topics is refused at mint, attenuate and restore
+    /// (`kernel::MAX_METHODS_PER_GRANT`, RPC-07).
     pub fn restrict_topics(mut self, topics: &[&str]) -> Self {
         self.topics = Some(topics.iter().map(|topic| topic.to_string()).collect());
         self.publish = true;

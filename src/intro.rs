@@ -18,10 +18,16 @@ pub const MAX_NAME_BYTES: usize = 1024;
 
 /// Most methods one provider may advertise in an introduction.
 ///
-/// The module carries every method name, so an unbounded list is an
-/// unbounded description: one adapter with millions of methods made the
-/// introduction fail for the whole kernel (R-17 round 8, #4).
-pub const MAX_METHODS_PER_PROVIDER: usize = 4_096;
+/// This is one ceiling with the grant itself, not a second one: it aliases
+/// `kernel::MAX_METHODS_PER_GRANT` (RPC-07, BND-F5), so the introduction,
+/// the wire and the replay all agree on 64 and the bound cannot drift. The
+/// module carries every method name, so an unbounded list is an unbounded
+/// description: one adapter with millions of methods made the introduction
+/// fail for the whole kernel (R-17 round 8, #4). A provider over the bound
+/// is left out of the introduction and the omission is taped once
+/// (`Event::IntroSkipped`); it is still callable through a subset
+/// capability for the methods the kernel captured.
+pub const MAX_METHODS_PER_PROVIDER: usize = crate::kernel::MAX_METHODS_PER_GRANT;
 
 /// Why a captured provider surface cannot go into an introduction, if it
 /// cannot.

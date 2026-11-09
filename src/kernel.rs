@@ -7499,6 +7499,18 @@ pub const MAX_METHOD_EVENT_BYTES: usize = 64;
 /// call may name. `receipts::valid_method` enforces the same bound at mint.
 pub const MAX_GRANTED_METHOD_BYTES: usize = 1_024;
 
+/// Most names one grant may carry: methods, topics, or tool names.
+///
+/// One ceiling for every name set a capability grants (RPC-07, BND-F5): the
+/// wire carries at most 64 methods per descriptor
+/// (`WireLimits::default().max_methods`) and the replay recorder refuses a
+/// 65th (`replay::MAX_METHODS`), so a grant larger than this could never be
+/// encoded or replayed — and a single minted cap could otherwise carry
+/// ~1 GiB of method names. The introduction bound
+/// (`intro::MAX_METHODS_PER_PROVIDER`) is the same number, so all three layers
+/// agree by construction; a test pins the equality.
+pub const MAX_METHODS_PER_GRANT: usize = 64;
+
 /// Most arguments one call may carry.
 ///
 /// The wire caps an envelope at 4 096 arguments, and the kernel holds an
@@ -7583,6 +7595,30 @@ fn receipt_method(method: &str) -> String {
 /// either would be minted but never exportable, which turns one bad grant into
 /// an audit log that cannot be written at all.
 fn check_method_names(attrs: &CapAttrs) -> Result<()> {
+    // The count is checked before any name is walked: a 100,000-name set is
+    // refused on its length alone, and no grant larger than the wire and the
+    // replay can carry is ever minted (RPC-07, BND-F5). The same ceiling
+    // bounds every name set a grant carries, so a topic or tool list cannot
+    // be the unbounded one instead.
+    if attrs.methods.len() > MAX_METHODS_PER_GRANT {
+        return Err(Error::InvalidArgument(
+            "a capability grants too many methods (at most 64)",
+        ));
+    }
+    if let Some(topics) = &attrs.topics {
+        if topics.len() > MAX_METHODS_PER_GRANT {
+            return Err(Error::InvalidArgument(
+                "a capability grants too many topics (at most 64)",
+            ));
+        }
+    }
+    if let Some(policy) = &attrs.tool_policy {
+        if policy.allowed.len() > MAX_METHODS_PER_GRANT {
+            return Err(Error::InvalidArgument(
+                "a capability grants too many tools (at most 64)",
+            ));
+        }
+    }
     if attrs
         .methods
         .iter()
