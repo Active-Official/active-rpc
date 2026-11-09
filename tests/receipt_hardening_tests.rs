@@ -826,3 +826,188 @@ fn a_tamper_is_caught_within_the_scheduled_re_walk_window() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// XPL-RPC-07: the append fast path must not trust a same-length, same-mtime
+// REPLACEMENT file on Windows (Critical, round 1; verified CONFIRMED by W6)
+// ---------------------------------------------------------------------------
+//
+// The verified attack (W6, end to end on Windows): a 1-byte interior edit
+// breaks the chain, yet all four Windows fast-path checks pass (length,
+// header, tail, mtime — `identity_matches` returns `true` unconditionally
+// off unix), and the real `append` was ACCEPTED, extending a broken chain.
+// RPC-05 (`ec24d55`, keyed content sample + scheduled re-walk) closed the
+// interior-edit form, and the probe in the XPL-RPC-07 record showed it also
+// closes the replacement form this finding names: the file below is not
+// edited in place, it is deleted and a same-length forgery is moved into
+// its place, with the mtime set back. No source change was needed for this
+// finding; these tests pin the replacement form so the closure is proven
+// on every run, not taken on RPC-05's word alone.
+//
+// A note on proving "different file": NTFS tunnelling preserves the
+// creation time when a name is freed and a new file takes it within ~15 s,
+// so creation time cannot certify the swap (the probe observed identical
+// creation times), and `MetadataExt::file_index` is still unstable
+// (`windows_by_handle`). The swap is certified by the operation itself —
+// the original is deleted (asserted gone) and the forgery is renamed into
+// place — plus byte equality of the file on disk with the forgery.
+
+/// Restore a file's mtime, as the attacker would after the swap.
+fn set_mtime_back(path: &std::path::Path, mtime: std::time::SystemTime) {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for set_times");
+    file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .expect("set mtime back");
+    drop(file);
+}
+
+/// The XPL-RPC-07 attack in its exact form: the log file is REPLACED — not
+/// edited in place — by a same-length copy whose middle record is edited,
+/// with the mtime set back. On Windows the fast path's identity check cannot
+/// tell the forgery from the original, so only the content sample stands
+/// between the forgery and the append. The sample covers every byte of a
+/// log this small, the re-walk it falls through to fails on the broken
+/// chain link, and the append is refused with the file untouched.
+#[test]
+fn a_same_length_replacement_with_the_mtime_set_back_is_refused() {
+    let dir = sandbox("xpl07-replacement");
+    let path = dir.join("receipts.arrl");
+    let log = ReceiptLog::create(&path).expect("create");
+    let (_agent, receipts) = session(3);
+    assert_eq!(receipts.len(), 3, "three admitted calls");
+    log.append(&receipts[0]).expect("append 1");
+    log.append(&receipts[1]).expect("append 2");
+    let cached_mtime = std::fs::metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    let original = std::fs::read(&path).expect("read log");
+    // Forge the replacement: same length, same header, same tail head (the
+    // last record's bytes are untouched — the flip is in the middle), one
+    // interior byte flipped so the chain is broken.
+    let middle = original.len() / 2;
+    let mut forged = original.clone();
+    forged[middle] ^= 0xff;
+    assert_eq!(forged.len(), original.len(), "same length");
+    assert_eq!(
+        &forged[..16],
+        &original[..16],
+        "same header (start sequence)"
+    );
+    assert_eq!(
+        &forged[forged.len() - 32..],
+        &original[original.len() - 32..],
+        "same tail head bytes"
+    );
+    // Replace the file: delete the original, move the forgery into place.
+    // This is a new file, not an edit of the old one.
+    let forged_path = dir.join("forged.arrl");
+    std::fs::write(&forged_path, &forged).expect("write forgery");
+    std::fs::remove_file(&path).expect("remove original");
+    assert!(!path.exists(), "the original file is gone before the swap");
+    std::fs::rename(&forged_path, &path).expect("move forgery into place");
+    // Preconditions of the attack, asserted, not assumed.
+    assert_eq!(
+        std::fs::read(&path).expect("read log"),
+        forged,
+        "the file on disk is the forgery"
+    );
+    set_mtime_back(&path, cached_mtime);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        cached_mtime,
+        "replacement carries the cached mtime"
+    );
+    let before = std::fs::read(&path).expect("read log");
+    let error = log
+        .append(&receipts[2])
+        .expect_err("a same-length replacement with the mtime set back must be refused");
+    assert_eq!(error.code(), "rpc/receipt");
+    assert_eq!(
+        std::fs::read(&path).expect("read log"),
+        before,
+        "a refused append must not touch the file"
+    );
+    assert!(
+        log.records().is_err(),
+        "the tampered log must not read as clean"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The replacement form at a size where the content sample is
+/// probabilistic: a 50-receipt log is REPLACED by a same-length copy with
+/// one interior byte flipped, mtime set back. The flipped byte may evade
+/// the sample — the scheduled re-walk (at most 32 fast-path appends) is
+/// then the backstop, exactly the bounded residual RPC-05 documents. Some
+/// append within 40 attempts must be refused; the count of appends that
+/// linked onto the tamper first is printed so the bound is observed, not
+/// assumed.
+#[test]
+fn a_large_log_replacement_is_refused_within_the_re_walk_window() {
+    let dir = sandbox("xpl07-replacement-large");
+    let path = dir.join("receipts.arrl");
+    let log = ReceiptLog::create(&path).expect("create");
+    for sequence in 1..=50u64 {
+        log.append(&receipt(sequence, sequence)).expect("append");
+    }
+    let cached_mtime = std::fs::metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
+    let original = std::fs::read(&path).expect("read log");
+    assert!(
+        original.len() > 512,
+        "the record region must exceed the 512-byte full-sample coverage (got {} bytes)",
+        original.len()
+    );
+    let mut forged = original.clone();
+    forged[original.len() / 2] ^= 0xff;
+    assert_eq!(forged.len(), original.len(), "same length");
+    let forged_path = dir.join("forged.arrl");
+    std::fs::write(&forged_path, &forged).expect("write forgery");
+    std::fs::remove_file(&path).expect("remove original");
+    assert!(!path.exists(), "the original file is gone before the swap");
+    std::fs::rename(&forged_path, &path).expect("move forgery into place");
+    assert_eq!(
+        std::fs::read(&path).expect("read log"),
+        forged,
+        "the file on disk is the forgery"
+    );
+    set_mtime_back(&path, cached_mtime);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        cached_mtime,
+        "replacement carries the cached mtime"
+    );
+    let mut linked_onto_tamper = 0u64;
+    let mut refused_at: Option<u64> = None;
+    for attempt in 1..=40u64 {
+        let next = 50 + attempt;
+        match log.append(&receipt(next, next)) {
+            Ok(()) => {
+                linked_onto_tamper += 1;
+            }
+            Err(error) => {
+                assert_eq!(error.code(), "rpc/receipt");
+                refused_at = Some(attempt);
+                break;
+            }
+        }
+    }
+    let refused_at = refused_at.expect(
+        "a tampered large log must refuse an append within 40 attempts (32 fast-path appends, then the scheduled re-walk)",
+    );
+    eprintln!(
+        "XPL-RPC-07 large-log replacement: refused at attempt {refused_at} ({linked_onto_tamper} appends linked onto the tamper first — within the 32-append bound)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
