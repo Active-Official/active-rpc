@@ -184,6 +184,42 @@ pub trait Provider {
     fn take_drop_notifications(&mut self) -> Vec<(u64, CapId)> {
         Vec::new()
     }
+
+    /// The content address of the module at `object`, when this provider serves
+    /// modules (R2-BND-03).
+    ///
+    /// The default is [`ModuleIdentity::NotAModuleProvider`]: most providers do
+    /// not serve modules, and the kernel must record that the hash check is
+    /// skipped for them rather than assume it. A module provider overrides this
+    /// to return the domain `content_hash` value for the slot. The method runs
+    /// with no kernel borrow held (the kernel checks the provider out first, as
+    /// dispatch does), so it may read and fill the provider's own caches but
+    /// must not call back into the agent.
+    fn module_content_hash(&mut self, _object: u64) -> Result<ModuleIdentity> {
+        Ok(ModuleIdentity::NotAModuleProvider)
+    }
+}
+
+/// What a provider can say about the module at an object (R2-BND-03).
+///
+/// The three cases are distinct on purpose: the restore path must refuse a
+/// module provider that holds no module at the object, refuse a record that
+/// seals a module hash when the named provider serves no modules, and
+/// record explicitly — never implicitly — when the hash check is skipped
+/// because the provider cannot carry modules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleIdentity {
+    /// This provider does not serve modules: it has no content address to
+    /// bind a record to.
+    NotAModuleProvider,
+    /// This provider serves modules, but no module lives at the object.
+    NoSuchObject,
+    /// This provider serves modules, and the module at the object has this
+    /// content address — the domain `content_hash` value: the redacted
+    /// projection's hash for a secret-bearing module, the raw canonical hash
+    /// otherwise. Never the raw hash of a secret image, or the address itself
+    /// would be an offline equality oracle over the secret.
+    Hash([u8; 32]),
 }
 
 /// Observable kernel events. Tests and operators assert on these.
@@ -1033,6 +1069,36 @@ struct DispatchGuard<'a> {
     provider: Option<Box<dyn Provider>>,
 }
 
+/// Re-inserts a provider checked out for a module-identity query (R2-BND-03).
+///
+/// The same shape as `DispatchGuard`: the query runs with no kernel borrow
+/// held, and the provider goes back even if the query unwinds. A borrow that
+/// cannot be re-taken parks the provider instead of dropping it, so `facts`
+/// never advertises a provider that no longer exists (R-17 round 10, R10-3).
+struct IdentityGuard<'a> {
+    agent: &'a Agent,
+    provider_id: ProviderId,
+    provider: Option<Box<dyn Provider>>,
+}
+
+impl Drop for IdentityGuard<'_> {
+    fn drop(&mut self) {
+        match self.agent.cell.try_borrow_mut() {
+            Ok(mut kernel) => {
+                if let Some(provider) = self.provider.take() {
+                    kernel.providers.insert(self.provider_id, provider);
+                }
+            }
+            Err(_) => {
+                if let Some(provider) = self.provider.take() {
+                    let mut parked = self.agent.parked.borrow_mut();
+                    parked.providers.push((self.provider_id, provider));
+                }
+            }
+        }
+    }
+}
+
 /// Fails the jobs of a batch that a panic prevented from running.
 ///
 /// Provider code is contained by `catch_unwind`, but a panic in phase 1 (a
@@ -1443,6 +1509,47 @@ impl Agent {
         self.cell.borrow().record_key
     }
 
+    /// The module identity of `object` on `provider`, with no kernel borrow
+    /// held (R2-BND-03).
+    ///
+    /// The provider is checked out of the registry, asked, and put back — the
+    /// same rule dispatch follows: provider code never runs under a kernel
+    /// borrow, so a provider that calls back into the agent cannot panic on a
+    /// re-entrant borrow. An [`IdentityGuard`] re-inserts the provider even if
+    /// the query unwinds. A provider that is not in the registry is an
+    /// internal inconsistency (the registry and `facts` move together), so it
+    /// is refused rather than treated as "not a module provider".
+    fn module_identity(
+        &self,
+        provider: ProviderId,
+        object: u64,
+    ) -> Result<ModuleIdentity> {
+        let checked_out = {
+            let mut kernel = self.cell.borrow_mut();
+            kernel
+                .providers
+                .remove(&provider)
+                .ok_or(Error::InvalidArgument("unknown provider"))?
+        };
+        let mut guard = IdentityGuard {
+            agent: self,
+            provider_id: provider,
+            provider: Some(checked_out),
+        };
+        let identity = guard
+            .provider
+            .as_mut()
+            .expect("the guard holds the provider")
+            .module_content_hash(object)?;
+        // Put it back explicitly; the guard is a no-op on the normal path.
+        let provider = guard
+            .provider
+            .take()
+            .expect("the guard holds the provider");
+        self.cell.borrow_mut().providers.insert(guard.provider_id, provider);
+        Ok(identity)
+    }
+
     /// Export a durable capability's authority as a record.
     ///
     /// Only a `Durable` capability can be exported, only while it is live, and
@@ -1640,9 +1747,39 @@ impl Agent {
         // or the restore would mint authority over a dead object (round 32,
         // #3). The pin is released when the record is restored.
         let pinned = (record.provider, record.object);
+        // R2-BND-03: the content address the record seals. It is computed
+        // here — after every check that can refuse the export, before the
+        // record is built and before any grant is reserved — so a provider
+        // fault fails the export with the grant intact, like every other
+        // refusal that means "this record cannot be built". The kernel borrow
+        // is released for the query and re-taken afterwards: provider code
+        // never runs under a kernel borrow (see `module_identity`). Every
+        // value the rest of the export needs is already in owned locals
+        // (`record`, `remaining_calls`, `remaining_bytes`, `lineage`,
+        // `pin_lineage`), so the re-borrow cannot observe a changed kernel.
+        // A module provider with no module at the object names a dead object:
+        // the export is refused rather than sealing a record no kernel can
+        // restore. A provider that does not serve modules seals no hash.
+        let content_hash = {
+            let provider_id = record.provider;
+            let object = record.object;
+            drop(kernel);
+            let hash = match self.module_identity(provider_id, object)? {
+                ModuleIdentity::Hash(hash) => Some(hash),
+                ModuleIdentity::NoSuchObject => {
+                    return Err(Error::persistence(
+                        "the capability's module is not installed on its provider",
+                    ));
+                }
+                ModuleIdentity::NotAModuleProvider => None,
+            };
+            kernel = self.cell.borrow_mut();
+            hash
+        };
         let mut record = crate::persistence::CapabilityRecord {
             provider: provider_name,
             object: record.object,
+            content_hash,
             methods: record.attrs.methods.clone(),
             budget: crate::budget::Budget {
                 max_calls: remaining_calls,
@@ -1904,6 +2041,44 @@ impl Agent {
             if kernel.caps.len() >= MAX_CAPS {
                 return Err(Error::BudgetExceeded("caps"));
             }
+        }
+        // R2-BND-03: the record's sealed content hash binds the credential to
+        // the module it was exported for. A restore onto a provider that holds
+        // a different module at the same object id — or no module at all — is
+        // a rebind, not a restore. The check runs before the claim, like every
+        // other deterministic refusal: a hash refusal must not burn the
+        // record's single use. A record that seals a hash but names a provider
+        // that serves no modules cannot be verified, so it is refused rather
+        // than restored on trust. A record sealed before the hash existed
+        // restores under the migration rule: the object must exist on a module
+        // provider (the dead-credential half), but the hash cannot be checked
+        // — a deployment that needs the binding re-exports it.
+        match (
+            record.content_hash,
+            self.module_identity(provider, record.object)?,
+        ) {
+            (Some(expected), ModuleIdentity::Hash(actual)) if actual == expected => {}
+            (Some(_), ModuleIdentity::Hash(_)) => {
+                return Err(Error::persistence(
+                    "the record's module does not match the module installed on this provider",
+                ));
+            }
+            (Some(_), ModuleIdentity::NoSuchObject) => {
+                return Err(Error::persistence(
+                    "the record's module is not installed on this provider",
+                ));
+            }
+            (Some(_), ModuleIdentity::NotAModuleProvider) => {
+                return Err(Error::persistence(
+                    "the record names a module but the provider does not serve modules",
+                ));
+            }
+            (None, ModuleIdentity::NoSuchObject) => {
+                return Err(Error::persistence(
+                    "the record's module is not installed on this provider",
+                ));
+            }
+            (None, _) => {}
         }
         // The export pin remembers where the credential stood. A record
         // restored on another kernel has no local pin, so its grant starts a

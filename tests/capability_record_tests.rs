@@ -5,11 +5,13 @@
 //! changes; the authority, the absolute deadline and the binding are what
 //! survive.
 
+use active_infinity::{InfinityModule, Inode, SecretBytes};
 use active_rpc::cap::CapAttrs;
+use active_rpc::domain::ModuleProvider;
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::kernel::{Provider, MAX_LINEAGE_DEPTH};
-use active_rpc::value::{Call, Response, Value};
-use active_rpc::{Agent, Budget, CapPersistence, CapabilityRecord, Error};
+use active_rpc::value::{Arg, Call, Response, Value};
+use active_rpc::{Agent, Budget, CapHandle, CapPersistence, CapabilityRecord, Error, LaneId};
 
 struct Echo;
 
@@ -1968,5 +1970,382 @@ fn an_attenuated_child_after_a_replayed_kill_list_skips_a_tombstoned_serial() {
     assert_ne!(
         root_record.record_id, tombstoned,
         "the root must not reuse the tombstoned record id"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// R2-BND-03: a durable module capability is bound to its module's content
+// address, so a restore cannot rebind by bare object id.
+// ---------------------------------------------------------------------------
+
+/// A plain module whose root table holds one string value (for evaluate).
+fn plain_module(value: &str) -> InfinityModule {
+    let mut module = InfinityModule::new();
+    let node = module.push(Inode::Str(value.to_string()));
+    let root = module.push(Inode::Table {
+        fields: vec![("v".to_string(), node)],
+    });
+    module.set_root(Some(root));
+    module
+}
+
+/// A module whose root table holds one structural secret.
+fn secret_module(secret: &str) -> InfinityModule {
+    let mut module = InfinityModule::new();
+    let secret_node = module.push(Inode::Secret(SecretBytes::new(secret)));
+    let root = module.push(Inode::Table {
+        fields: vec![("token".to_string(), secret_node)],
+    });
+    module.set_root(Some(root));
+    module
+}
+
+/// A durable-capable agent with the deployment's secret and seal key, and the
+/// owner the records are bound to. Two agents built this way are the same
+/// deployment, as in the W15 probes.
+fn module_agent() -> (Agent, active_rpc::AdmittedIdentity) {
+    let agent = Agent::with_secret([0x71; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x91; 32]);
+    (agent, admitted(b"durable-owner"))
+}
+
+fn mint_module_cap(
+    agent: &Agent,
+    provider: active_rpc::ProviderId,
+    object: u64,
+    owner: &active_rpc::AdmittedIdentity,
+    methods: &[&str],
+    durable: bool,
+) -> CapHandle {
+    let mut attrs = CapAttrs::new(methods);
+    if durable {
+        attrs.persistence = CapPersistence::Durable;
+    }
+    agent
+        .mint_bound(owner, provider, object, attrs)
+        .expect("module cap")
+}
+
+/// Call a method as the owner peer and return the value.
+fn call_as_owner(
+    agent: &Agent,
+    lane: LaneId,
+    cap: &CapHandle,
+    method: &str,
+    args: Vec<Arg>,
+) -> active_rpc::Result<Value> {
+    let promise = agent.call_as(Some(&peer(b"durable-owner")), lane, cap, method, args)?;
+    agent.run();
+    promise.value()
+}
+
+/// The domain `content_hash` answer for a module capability, without the
+/// `blake3:` prefix.
+fn content_hash_via(agent: &Agent, lane: LaneId, cap: &CapHandle) -> String {
+    match call_as_owner(agent, lane, cap, "content_hash", Vec::new()).expect("content_hash") {
+        Value::Text(text) => text.strip_prefix("blake3:").expect("prefix").to_string(),
+        other => panic!("unexpected content_hash reply {other:?}"),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// R2-BND-03: a record exported for module A restores onto a kernel that
+/// installed module B at the same object id — the restore is refused, not
+/// rebound.
+#[test]
+fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
+    let (agent_a, owner) = module_agent();
+    let mut provider_a = ModuleProvider::new();
+    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    assert_eq!(object_a, 0);
+    let id_a = agent_a.register(Box::new(provider_a));
+    let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
+    let record = agent_a.export_capability(&cap_a).expect("export");
+    assert!(
+        record.content_hash.is_some(),
+        "a module export seals the content address"
+    );
+    drop(cap_a);
+
+    let (agent_b, _) = module_agent();
+    let mut provider_b = ModuleProvider::new();
+    let object_b = provider_b.install(plain_module("module-B")).expect("install B");
+    assert_eq!(object_b, 0);
+    let _id_b = agent_b.register(Box::new(provider_b));
+    let error = agent_b
+        .restore_capability(&record, &owner)
+        .expect_err("a different module at the same id is a rebind, not a restore");
+    assert_eq!(error.code(), "rpc/persistence");
+    assert!(
+        error.to_string().contains("does not match"),
+        "the refusal names the mismatch: {error}"
+    );
+}
+
+/// R2-BND-03: a record exported for module A restores onto a kernel whose
+/// module provider holds nothing — the restore is refused at the restore,
+/// not at the first call.
+#[test]
+fn a_restore_refuses_a_module_cap_when_the_object_does_not_exist() {
+    let (agent_a, owner) = module_agent();
+    let mut provider_a = ModuleProvider::new();
+    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let id_a = agent_a.register(Box::new(provider_a));
+    let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
+    let record = agent_a.export_capability(&cap_a).expect("export");
+    drop(cap_a);
+
+    let (agent_c, _) = module_agent();
+    let _id_c = agent_c.register(Box::new(ModuleProvider::new()));
+    let error = agent_c
+        .restore_capability(&record, &owner)
+        .expect_err("no module lives at the object on this kernel");
+    assert_eq!(error.code(), "rpc/persistence");
+    assert!(
+        error.to_string().contains("not installed"),
+        "the refusal names the missing module: {error}"
+    );
+}
+
+/// R2-BND-03: the same module on another kernel restores, and evaluates to
+/// the module it was minted for.
+#[test]
+fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
+    let (agent_a, owner) = module_agent();
+    let mut provider_a = ModuleProvider::new();
+    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let id_a = agent_a.register(Box::new(provider_a));
+    let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
+    let record = agent_a.export_capability(&cap_a).expect("export");
+    drop(cap_a);
+
+    let (agent_b, _) = module_agent();
+    let mut provider_b = ModuleProvider::new();
+    let object_b = provider_b.install(plain_module("module-A")).expect("install A");
+    assert_eq!(object_b, 0);
+    let _id_b = agent_b.register(Box::new(provider_b));
+    let lane_b = agent_b.create_lane("b", Budget::default()).expect("lane");
+    let restored = agent_b
+        .restore_capability(&record, &owner)
+        .expect("the same module restores");
+    let value = call_as_owner(&agent_b, lane_b, &restored, "evaluate", vec![]).expect("evaluate");
+    assert_eq!(
+        value,
+        Value::Map(
+            [("v".to_string(), Value::Text("module-A".to_string()))]
+                .into_iter()
+                .collect()
+        ),
+        "the restored cap serves the module it was minted for"
+    );
+}
+
+/// R2-BND-03 (design step 5): a record exported before a patch must not
+/// silently rebind to the patched module. The sealed address is the hash at
+/// export, and the patch changes it.
+#[test]
+fn a_restore_refuses_a_record_exported_before_a_patch() {
+    let (agent, owner) = module_agent();
+    let mut provider = ModuleProvider::new();
+    let object = provider.install(plain_module("module-A")).expect("install A");
+    let id = agent.register(Box::new(provider));
+    let cap = mint_module_cap(
+        &agent,
+        id,
+        object,
+        &owner,
+        &["evaluate", "content_hash"],
+        true,
+    );
+    let patcher = mint_module_cap(
+        &agent,
+        id,
+        object,
+        &owner,
+        &["evaluate", "patch", "content_hash"],
+        false,
+    );
+    let lane = agent.create_lane("patch", Budget::default()).expect("lane");
+    let record = agent.export_capability(&cap).expect("export");
+    let sealed = record.content_hash.expect("a module export seals the address");
+    assert_eq!(
+        content_hash_via(&agent, lane, &patcher),
+        hex(&sealed),
+        "the sealed address is the domain content_hash at export"
+    );
+
+    call_as_owner(
+        &agent,
+        lane,
+        &patcher,
+        "patch",
+        vec![
+            Arg::Value(Value::path("v")),
+            Arg::Value(Value::Text("module-A-patched".to_string())),
+        ],
+    )
+    .expect("patch");
+    assert_ne!(
+        content_hash_via(&agent, lane, &patcher),
+        hex(&sealed),
+        "the patch changes the module's address"
+    );
+    drop(cap);
+    let error = agent
+        .restore_capability(&record, &owner)
+        .expect_err("the patched module is not the module the record was minted for");
+    assert_eq!(error.code(), "rpc/persistence");
+    assert!(
+        error.to_string().contains("does not match"),
+        "the refusal names the mismatch: {error}"
+    );
+}
+
+/// R2-BND-03: the sealed address for a secret-bearing module is the redacted
+/// projection's hash — never the raw hash of the secret image, or the record
+/// itself would carry an offline equality oracle over the secret.
+#[test]
+fn a_sealed_record_carries_the_redacted_hash_for_a_secret_module() {
+    let module = secret_module("s3cr3t-value");
+    let bytes = active_infinity::encode(&module).expect("encode");
+    let raw = active_infinity::content_hash(&bytes).expect("raw hash");
+    let (agent_a, owner) = module_agent();
+    let mut provider_a = ModuleProvider::new();
+    let object_a = provider_a.install(module).expect("install secret module");
+    let id_a = agent_a.register(Box::new(provider_a));
+    let cap_a = mint_module_cap(
+        &agent_a,
+        id_a,
+        object_a,
+        &owner,
+        &["evaluate", "content_hash"],
+        true,
+    );
+    let lane_a = agent_a
+        .create_lane("hash", Budget::default())
+        .expect("lane");
+    // Before the export: the export reserves the capability's remaining
+    // grant, so a content_hash call through it afterwards would exceed its
+    // budget.
+    let via = content_hash_via(&agent_a, lane_a, &cap_a);
+    let record = agent_a.export_capability(&cap_a).expect("export");
+    let sealed = record.content_hash.expect("a module export seals the address");
+    assert_eq!(
+        hex(&sealed), via,
+        "the sealed address is the domain content_hash"
+    );
+    assert_ne!(
+        sealed, raw,
+        "the sealed address is the redacted hash, not the raw hash of the secret image"
+    );
+    assert!(
+        !record.to_json().contains(&hex(&raw)),
+        "the record text must not carry the raw hash of a secret image"
+    );
+    drop(cap_a);
+
+    // The same secret module on another kernel restores: the redacted
+    // address is the same there.
+    let (agent_b, _) = module_agent();
+    let mut provider_b = ModuleProvider::new();
+    let object_b = provider_b
+        .install(secret_module("s3cr3t-value"))
+        .expect("install same secret module");
+    assert_eq!(object_b, 0);
+    let _id_b = agent_b.register(Box::new(provider_b));
+    agent_b
+        .restore_capability(&record, &owner)
+        .expect("the same secret module restores");
+}
+
+/// R2-BND-03: an export for a provider that serves no modules seals no hash,
+/// and restores exactly as before.
+#[test]
+fn an_export_for_a_provider_that_serves_no_modules_seals_no_hash() {
+    let (agent, _provider, cap) = durable_agent();
+    let record = agent.export_capability(&cap).expect("export");
+    assert_eq!(
+        record.content_hash, None,
+        "a non-module provider has no content address to seal"
+    );
+    drop(cap);
+    let owner = admitted(b"durable-owner");
+    agent
+        .restore_capability(&record, &owner)
+        .expect("a hash-less record for a non-module provider restores");
+}
+
+/// R2-BND-03 (migration rule): a record sealed before the hash existed
+/// carries no hash. It restores when the object exists on a module provider
+/// — the dead-credential half — but the hash cannot be checked, so it can
+/// still rebind to a different module at the same id. That is the documented
+/// migration bridge, not the fix: a deployment that needs the binding
+/// re-exports the record. It refuses when the object does not exist.
+#[test]
+fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
+    let (agent_a, owner) = module_agent();
+    let mut provider_a = ModuleProvider::new();
+    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let id_a = agent_a.register(Box::new(provider_a));
+    let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
+    let record = agent_a.export_capability(&cap_a).expect("export");
+    assert!(record.content_hash.is_some(), "the export seals a hash");
+    drop(cap_a);
+    // A legacy record: the hash stripped, the seal recomputed over the
+    // hash-less fields.
+    let mut legacy = record.clone();
+    legacy.content_hash = None;
+    legacy.seal_with(&[0x91; 32]);
+
+    // The object exists on kernel B, with a different module: the migration
+    // bridge restores it (the hash cannot be checked).
+    let (agent_b, _) = module_agent();
+    let mut provider_b = ModuleProvider::new();
+    let object_b = provider_b.install(plain_module("module-B")).expect("install B");
+    assert_eq!(object_b, 0);
+    let _id_b = agent_b.register(Box::new(provider_b));
+    let lane_b = agent_b.create_lane("b", Budget::default()).expect("lane");
+    let restored = agent_b
+        .restore_capability(&legacy, &owner)
+        .expect("a legacy record restores when the object exists");
+    let value = call_as_owner(&agent_b, lane_b, &restored, "evaluate", vec![]).expect("evaluate");
+    assert_eq!(
+        value,
+        Value::Map(
+            [("v".to_string(), Value::Text("module-B".to_string()))]
+                .into_iter()
+                .collect()
+        ),
+        "the migration bridge is the old rule: the legacy record rebinds, which is why re-export matters"
+    );
+}
+
+#[test]
+fn a_legacy_record_without_a_hash_refuses_when_the_object_does_not_exist() {
+    let (agent_a, owner) = module_agent();
+    let mut provider_a = ModuleProvider::new();
+    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let id_a = agent_a.register(Box::new(provider_a));
+    let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
+    let record = agent_a.export_capability(&cap_a).expect("export");
+    drop(cap_a);
+    let mut legacy = record.clone();
+    legacy.content_hash = None;
+    legacy.seal_with(&[0x91; 32]);
+
+    let (agent_c, _) = module_agent();
+    let _id_c = agent_c.register(Box::new(ModuleProvider::new()));
+    let error = agent_c
+        .restore_capability(&legacy, &owner)
+        .expect_err("a legacy record still refuses a missing object");
+    assert_eq!(error.code(), "rpc/persistence");
+    assert!(
+        error.to_string().contains("not installed"),
+        "the refusal names the missing module: {error}"
     );
 }

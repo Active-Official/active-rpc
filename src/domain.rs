@@ -29,7 +29,7 @@ use active_infinity::{
 
 use crate::cap::CapId;
 use crate::error::{Error, Result};
-use crate::kernel::Provider;
+use crate::kernel::{ModuleIdentity, Provider};
 use crate::security;
 use crate::value::Response;
 use crate::value::{Arg, Call, Value};
@@ -228,6 +228,82 @@ impl ModuleProvider {
     /// the redacted projection. `None` means "not computed yet".
     pub fn cached_hash(&self, object: u64) -> Option<[u8; 32]> {
         self.modules.get(&object).and_then(|slot| slot.hash)
+    }
+
+    /// The content address of a slot, as the `content_hash` method answers it
+    /// (R2-BND-03): the raw canonical hash when the slot holds no secret, the
+    /// redacted projection's hash when it does. Fills the slot caches.
+    ///
+    /// This is the single computation both the `content_hash` method and the
+    /// provider's [`Provider::module_content_hash`] answer from: an export
+    /// seals this address into the durable record and a restore checks it, so
+    /// the two must never disagree about what a module's address is. The
+    /// redacted hash is the address even for a non-redacting caller: the raw
+    /// hash covers the secret heap and is an offline equality oracle over a
+    /// low-entropy secret (round 12, F4).
+    fn content_address(slot: &mut ModuleSlot) -> Result<[u8; 32]> {
+        // Fill the slot cache first: it holds the raw canonical hash, which is
+        // the module's identity and the parent of a later patch. The answer
+        // below may be the redacted one.
+        let hash = match slot.hash {
+            Some(hash) => hash,
+            None => {
+                let bytes = encode(&slot.module)
+                    .map_err(|error| Error::Payload(error.code().to_string()))?;
+                let hash = active_infinity::content_hash(&bytes)
+                    .map_err(|error| Error::Payload(error.code().to_string()))?;
+                slot.hash = Some(hash);
+                hash
+            }
+        };
+        if !slot.held_secret {
+            // Nothing to redact: the redacted projection is the module itself,
+            // so the answer is the stored hash — including a streamed image,
+            // which a re-encode would not reproduce (R-16 round 10, Finding 3).
+            return Ok(hash);
+        }
+        // A module that holds a secret is hashed in redacted form for every
+        // capability: the raw hash covers the secret heap and is an offline
+        // equality oracle over a low-entropy secret, even for a caller that
+        // cannot read the bytes. The redacted hash still proves structural
+        // identity (round 12, F4).
+        // Redact in memory with the install-time handle: deriving the literal
+        // set from the stored image made the "redacted" hash equal the raw one
+        // once a patch removed the last secret node (round 28, critical). The
+        // result is cached: a patch invalidates it (round 32, #8).
+        match slot.redacted_hash {
+            Some(hash) => Ok(hash),
+            None => {
+                let mut redacted = slot.module.clone();
+                crate::security::redact_derived(&mut redacted, &slot.redactor)
+                    .map_err(redaction_fault)?;
+                // Only a secret-bearing module has something to hide: its
+                // provenance names the pre-redaction image, and those addresses
+                // are an offline oracle. A secret-free module's redacted
+                // projection *is* the module, so its digest must stay the true
+                // content address a `fetch by address` flow uses (R-16 round 8,
+                // #1; round 9, F-1).
+                if slot.held_secret {
+                    redacted.set_provenance(None);
+                }
+                // A tainted blob's hash is secret-derived whatever the module's
+                // provenance says (round 9, F-2).
+                let mut extra: Vec<[u8; 32]> =
+                    slot.secret_addresses.iter().copied().collect();
+                extra.extend(slot.hash);
+                crate::security::sanitize_tainted_blobs(&mut redacted, &extra)
+                    .map_err(redaction_fault)?;
+                let redacted_bytes = encode(&redacted).map_err(|error| {
+                    redaction_fault(Error::Payload(error.code().to_string()))
+                })?;
+                crate::security::assert_module_bytes(&redacted_bytes, &extra)
+                    .map_err(redaction_fault)?;
+                let hash = active_infinity::content_hash(&redacted_bytes)
+                    .map_err(|error| Error::Payload(error.code().to_string()))?;
+                slot.redacted_hash = Some(hash);
+                Ok(hash)
+            }
+        }
     }
 
     /// Number of modules installed (including patch results).
@@ -778,85 +854,10 @@ impl ModuleProvider {
                 // so the raw value is an offline equality oracle over a
                 // low-entropy secret even for a caller that cannot read the
                 // bytes. The redacted hash still proves structural identity
-                // (round 12, F4).
-                let holds_secret = slot.held_secret;
-                // Fill the slot cache first: it holds the raw canonical hash,
-                // which is the module's identity and the parent of a later
-                // patch. The answer below may be the redacted one.
-                let hash = match slot.hash {
-                    Some(hash) => hash,
-                    None => {
-                        let bytes = encode(&slot.module)
-                            .map_err(|error| Error::Payload(error.code().to_string()))?;
-                        let hash = active_infinity::content_hash(&bytes)
-                            .map_err(|error| Error::Payload(error.code().to_string()))?;
-                        slot.hash = Some(hash);
-                        hash
-                    }
-                };
-                if !holds_secret {
-                    // Nothing to redact: the redacted projection is the module
-                    // itself, so the answer is the stored hash -- including a
-                    // streamed image, which a re-encode would not reproduce
-                    // (R-16 round 10, Finding 3).
-                    check_wall_budget(started, call)?;
-                    return Ok(Response::Value(Value::Text(format!(
-                        "blake3:{}",
-                        hex32(&hash)
-                    ))));
-                }
-                if call.redact || holds_secret {
-                    // A module that holds a secret is hashed in redacted form
-                    // for every capability: the raw hash covers the secret heap
-                    // and is an offline equality oracle over a low-entropy
-                    // secret, even for a caller that cannot read the bytes. The
-                    // redacted hash still proves structural identity
-                    // (round 12, F4).
-                    // Redact in memory with the install-time handle: deriving
-                    // the literal set from the stored image made the "redacted"
-                    // hash equal the raw one once a patch removed the last
-                    // secret node (round 28, critical). The result is cached: a
-                    // patch invalidates it (round 32, #8).
-                    let redacted_hash = match slot.redacted_hash {
-                        Some(hash) => hash,
-                        None => {
-                            let mut redacted = slot.module.clone();
-                            crate::security::redact_derived(&mut redacted, &slot.redactor)
-                                .map_err(redaction_fault)?;
-                            // Only a secret-bearing module has something to
-                            // hide: its provenance names the pre-redaction
-                            // image, and those addresses are an offline oracle.
-                            // A secret-free module's redacted projection *is*
-                            // the module, so its digest must stay the true
-                            // content address a `fetch by address` flow uses
-                            // (R-16 round 8, #1; round 9, F-1).
-                            if holds_secret {
-                                redacted.set_provenance(None);
-                            }
-                            // A tainted blob's hash is secret-derived whatever
-                            // the module's provenance says (round 9, F-2).
-                            let mut extra: Vec<[u8; 32]> =
-                                slot.secret_addresses.iter().copied().collect();
-                            extra.extend(slot.hash);
-                            crate::security::sanitize_tainted_blobs(&mut redacted, &extra)
-                                .map_err(redaction_fault)?;
-                            let redacted_bytes = encode(&redacted).map_err(|error| {
-                                redaction_fault(Error::Payload(error.code().to_string()))
-                            })?;
-                            crate::security::assert_module_bytes(&redacted_bytes, &extra)
-                                .map_err(redaction_fault)?;
-                            let hash = active_infinity::content_hash(&redacted_bytes)
-                                .map_err(|error| Error::Payload(error.code().to_string()))?;
-                            slot.redacted_hash = Some(hash);
-                            hash
-                        }
-                    };
-                    check_wall_budget(started, call)?;
-                    return Ok(Response::Value(Value::Text(format!(
-                        "blake3:{}",
-                        hex32(&redacted_hash)
-                    ))));
-                }
+                // (round 12, F4). The address itself is computed by
+                // `content_address`, the same computation the export seals and
+                // the restore checks (R2-BND-03).
+                let hash = Self::content_address(slot)?;
                 check_wall_budget(started, call)?;
                 Ok(Response::Value(Value::Text(format!(
                     "blake3:{}",
@@ -1163,6 +1164,18 @@ impl Provider for ModuleProvider {
 
     fn take_drop_notifications(&mut self) -> Vec<(u64, CapId)> {
         std::mem::take(&mut self.drops)
+    }
+
+    /// The content address of the module at `object` (R2-BND-03): the same
+    /// address the `content_hash` method answers, so an export seals exactly
+    /// what a restore checks. `NoSuchObject` when no module lives at the
+    /// object; a computation fault fails the export or the restore rather
+    /// than sealing or accepting an unverified binding.
+    fn module_content_hash(&mut self, object: u64) -> Result<ModuleIdentity> {
+        let Some(slot) = self.modules.get_mut(&object) else {
+            return Ok(ModuleIdentity::NoSuchObject);
+        };
+        Self::content_address(slot).map(ModuleIdentity::Hash)
     }
 }
 

@@ -137,6 +137,7 @@ const RECORD_KEYS: &[&str] = &[
     "format",
     "provider",
     "object",
+    "content_hash",
     "methods",
     "budget",
     "read_only",
@@ -216,6 +217,28 @@ pub struct CapabilityRecord {
     pub provider: String,
     /// Object within the provider.
     pub object: u64,
+    /// Content address of the module the exported capability stands on, when
+    /// the provider serves modules (R2-BND-03).
+    ///
+    /// The address is the domain `content_hash` value: the redacted
+    /// projection's hash for a secret-bearing module, the raw canonical hash
+    /// otherwise — never the raw hash of a secret image, or the record itself
+    /// would carry an offline equality oracle over the secret. A restore
+    /// refuses unless the target kernel's provider holds a module with this
+    /// address at this object, so a record cannot rebind by bare object id to
+    /// whatever module another kernel installed there. A patch changes the
+    /// address, so a record exported before a patch does not silently rebind
+    /// to the patched module either: the restore compares against the hash at
+    /// export, which is what the seal covers.
+    ///
+    /// `None` for providers that do not serve modules, and for records sealed
+    /// before this field existed. Those legacy records restore under the
+    /// migration rule (the object must exist on a module provider; the hash
+    /// cannot be checked) — a deployment that needs the binding re-exports
+    /// them. The field is omitted from the JSON when `None`, so legacy records
+    /// keep their seal and their canonical text, as `ancestor_record_ids`
+    /// did (RPC-01).
+    pub content_hash: Option<[u8; 32]>,
     /// Granted methods; never empty.
     pub methods: BTreeSet<String>,
     /// Resource budget.
@@ -283,6 +306,12 @@ impl CapabilityRecord {
         map.insert("format".into(), RECORD_FORMAT.into());
         map.insert("provider".into(), self.provider.clone().into());
         map.insert("object".into(), self.object.into());
+        // Omitted when `None`: a record for a provider that does not serve
+        // modules, or one sealed before this field existed, must keep its seal
+        // and its canonical text (R2-BND-03).
+        if let Some(hash) = self.content_hash {
+            map.insert("content_hash".into(), hex(&hash).into());
+        }
         let methods: Vec<Json> = self.methods.iter().cloned().map(Json::String).collect();
         map.insert("methods".into(), Json::Array(methods));
         map.insert(
@@ -447,6 +476,15 @@ impl CapabilityRecord {
             .get("object")
             .and_then(Json::as_u64)
             .ok_or_else(|| Error::persistence("missing object"))?;
+        // Absent on records sealed before this field existed, and on records
+        // for providers that do not serve modules: those restore under the
+        // migration rule (R2-BND-03). Present as 64 lowercase hex characters;
+        // anything else is a malformed record, not a missing hash.
+        let content_hash = match value.get("content_hash") {
+            None | Some(Json::Null) => None,
+            Some(Json::String(text)) => Some(parse_hex32(text)?),
+            Some(_) => return Err(Error::persistence("content hash is malformed")),
+        };
         let methods =
             string_set(&value, "methods")?.ok_or_else(|| Error::persistence("missing methods"))?;
         if methods.is_empty() {
@@ -678,6 +716,7 @@ impl CapabilityRecord {
         let record = Self {
             provider: provider.to_string(),
             object,
+            content_hash,
             methods,
             budget,
             read_only,
