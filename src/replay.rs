@@ -410,6 +410,41 @@ impl ReplayPackage {
         })
     }
 
+    /// The ceilings `decode` enforces, over the struct fields (W1-NF-01).
+    ///
+    /// A hand-built package `decode` would refuse must not replay either:
+    /// the recorder no longer keeps an op list in replay mode (R-12 round
+    /// 10), so the per-op ceiling in `reserve_op` cannot see the package's
+    /// ops, and `replay()` itself never counted them. The ceiling belongs
+    /// here, on the data replay consumes, charged with the same helpers
+    /// `decode` uses -- so the verdicts agree by construction.
+    fn check_package_ceilings(&self) -> Result<()> {
+        if self.ops.len() > MAX_OPS {
+            return Err(Error::Replay("too many operations".into()));
+        }
+        if self.trace.len() > MAX_TRACES {
+            return Err(Error::Replay("trace is too long".into()));
+        }
+        let mut decoded_bytes: usize = 0;
+        for op in &self.ops {
+            decoded_bytes = decoded_bytes.saturating_add(op_decoded_bytes(op));
+            if decoded_bytes > MAX_DECODE_BYTES {
+                return Err(Error::Replay(
+                    "the package expands beyond the decode ceiling".into(),
+                ));
+            }
+        }
+        for event in self.trace.iter().map(|trace| trace.event.as_str()) {
+            decoded_bytes = decoded_bytes.saturating_add(trace_decoded_bytes(event));
+            if decoded_bytes > MAX_DECODE_BYTES {
+                return Err(Error::Replay(
+                    "the package expands beyond the decode ceiling".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Replay the package against a fresh kernel and compare the trace.
     ///
     /// Operation errors are part of the recorded decision (the trace carries the
@@ -421,6 +456,7 @@ impl ReplayPackage {
     /// replay no longer matches its own trace. Comparing the replayed operation
     /// list would prove nothing, because `replay_trace` builds that list from
     /// the very operations it reads.
+
     pub fn replay(&self) -> Result<()> {
         let trace = self.replay_trace_inner()?;
         if self.trace.len() != trace.len() {
@@ -477,6 +513,9 @@ impl ReplayPackage {
                 "the package does not begin with its header latency".into(),
             ));
         }
+        // The ceilings `decode` enforces, over the fields replay consumes:
+        // both `replay()` and `replay_trace()` funnel through here.
+        self.check_package_ceilings()?;
         // Replay through the same recorder code path the original session used,
         // so handle lifetimes (retain/release events) are identical by
         // construction.

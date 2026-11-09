@@ -298,3 +298,97 @@ fn a_package_larger_than_the_size_ceiling_is_refused() {
     assert_eq!(error.code(), "rpc/replay");
     assert!(error.to_string().contains("size ceiling"), "{error}");
 }
+
+/// W1-NF-01: a hand-built package with more ops than `MAX_OPS` must be
+/// refused at the replay entry, the way `decode` refuses it -- the replay
+/// recorder no longer keeps an op list, so nothing else counts them.
+#[test]
+fn a_handbuilt_package_over_the_operation_ceiling_is_refused_at_replay() {
+    const OVER: usize = 100_001; // MAX_OPS is 100,000
+    let mut ops: Vec<Op> = Vec::with_capacity(OVER);
+    ops.push(Op::SetLatency(1));
+    for _ in 1..OVER {
+        ops.push(Op::SetLatency(1));
+    }
+    let package = ReplayPackage {
+        latency_ms: 1,
+        ops,
+        trace: Vec::new(),
+    };
+    let err = package
+        .replay()
+        .expect_err("100,001 ops must be refused at the replay entry");
+    assert!(
+        err.to_string().contains("too many operations"),
+        "the refusal must name the operation ceiling: {err}"
+    );
+    // The diagnostic path refuses it too: it replays the same ops.
+    let err = package
+        .replay_trace()
+        .expect_err("replay_trace must refuse the same package");
+    assert!(
+        err.to_string().contains("too many operations"),
+        "the refusal must name the operation ceiling: {err}"
+    );
+}
+
+/// W1-NF-01: the same entry check bounds the trace side.
+#[test]
+fn a_handbuilt_package_over_the_trace_ceiling_is_refused_at_replay() {
+    let trace = vec![
+        Trace {
+            event: String::new(),
+            cap: None,
+        };
+        1_000_001 // MAX_TRACES is 1,000,000
+    ];
+    let package = ReplayPackage {
+        latency_ms: 1,
+        ops: vec![Op::SetLatency(1)],
+        trace,
+    };
+    let err = package
+        .replay()
+        .expect_err("1,000,001 trace entries must be refused at the replay entry");
+    assert!(
+        err.to_string().contains("trace is too long"),
+        "the refusal must name the trace ceiling: {err}"
+    );
+}
+
+/// W1-NF-01: the decoded-heap charge is enforced at the replay entry too.
+/// 100,000 calls plus 450,000 trace events describe ~146 MiB of decoded
+/// heap, past the 128 MiB decode ceiling -- while staying inside the op
+/// and trace counts, so only the heap charge can refuse it.
+#[test]
+fn a_handbuilt_package_over_the_decode_ceiling_is_refused_at_replay() {
+    // The first op is the header latency, or the header check (not the
+    // heap charge) refuses the package.
+    let mut ops: Vec<Op> = Vec::with_capacity(100_000);
+    ops.push(Op::SetLatency(1));
+    ops.extend((1..100_000).map(|_| Op::Call {
+        cap: 0,
+        method: "m".repeat(100),
+        arg_bytes: 0,
+    }));
+    let trace = vec![
+        Trace {
+            event: "e".repeat(200),
+            cap: None,
+        };
+        450_000
+    ];
+    let package = ReplayPackage {
+        latency_ms: 1,
+        ops,
+        trace,
+    };
+    let err = package
+        .replay()
+        .expect_err("a package past the decode ceiling must be refused at the replay entry");
+    assert!(
+        err.to_string()
+            .contains("the package expands beyond the decode ceiling"),
+        "the refusal must name the decode ceiling: {err}"
+    );
+}
