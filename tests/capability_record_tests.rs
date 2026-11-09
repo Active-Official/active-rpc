@@ -1640,3 +1640,175 @@ fn a_tombstone_reaches_a_record_exported_through_a_dropped_restored_copy() {
         .expect_err("a tombstoned descendant record is dead");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
+
+/// RPC-01: the record seals its ancestors' record ids.
+///
+/// Setup mirrors audit probe p03a: a durable root, a durable child with a
+/// narrowed budget (export reserves the remaining grant on the cap and
+/// every ancestor), both exported, both handles dropped, then the root's
+/// record is tombstoned. The child is live nowhere, so no live-cap check
+/// can see the revoked ancestor — only the sealed ancestor list can.
+fn revoked_ancestor_setup() -> (Agent, active_rpc::CapabilityRecord, [u8; 32]) {
+    let agent = Agent::with_secret([0x71; 32]);
+    agent.set_durable_capabilities(true);
+    agent.set_record_seal_key([0x91; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let owner = admitted(b"durable-owner");
+    let root = agent
+        .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]).durable())
+        .expect("mint root");
+    let child = agent
+        .attenuate(
+            &root,
+            CapAttrs::new(&["echo"])
+                .durable()
+                .with_budget(Budget::strict()),
+        )
+        .expect("attenuate child");
+    let child_record = agent.export_capability(&child).expect("export child");
+    let root_record = agent.export_capability(&root).expect("export root");
+    drop(child);
+    drop(root);
+    (agent, child_record, root_record.record_id)
+}
+
+#[test]
+fn export_seals_the_ancestors_record_ids() {
+    let (agent, child_record, root_record_id) = revoked_ancestor_setup();
+    assert_eq!(
+        child_record.ancestor_record_ids,
+        vec![root_record_id],
+        "the child record must seal the root's record id"
+    );
+    // A first-generation capability has no ancestors to seal.
+    let owner = admitted(b"durable-owner");
+    let (agent2, _provider, root) = durable_agent();
+    let root_record = agent2.export_capability(&root).expect("export root");
+    assert!(
+        root_record.ancestor_record_ids.is_empty(),
+        "a root record seals an empty ancestor list"
+    );
+    drop(agent);
+    drop(owner);
+}
+
+#[test]
+fn restore_under_a_tombstoned_ancestor_is_refused() {
+    let (agent, child_record, root_record_id) = revoked_ancestor_setup();
+    agent
+        .tombstone_record(root_record_id)
+        .expect("tombstone root");
+    let error = agent
+        .restore_capability(&child_record, &admitted(b"durable-owner"))
+        .expect_err("a restore under a tombstoned ancestor must fail");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+#[test]
+fn restore_under_a_live_ancestor_succeeds_and_calls() {
+    let (agent, child_record, _root_record_id) = revoked_ancestor_setup();
+    let owner = admitted(b"durable-owner");
+    let restored = agent
+        .restore_capability(&child_record, &owner)
+        .expect("restore under a live ancestor");
+    let lane = agent
+        .create_lane("rpc-01-control", Budget::default())
+        .expect("lane");
+    let promise = agent
+        .call_as(Some(owner.identity()), lane, &restored, "echo", Vec::new())
+        .expect("the restored call is queued");
+    agent.run();
+    promise.value().expect("the restored grant answers");
+}
+
+#[test]
+fn restore_under_a_tombstoned_ancestor_is_refused_cross_kernel_after_kill_list_replay() {
+    let (_agent, child_record, root_record_id) = revoked_ancestor_setup();
+    // A fresh kernel with the same secret and seal key never saw the
+    // tombstone: the kill list reaches it the same way every kill list
+    // does, replayed with `tombstone_record` before the restore (RPC-01).
+    // Without the replay no kernel could know, and the restore succeeds —
+    // that is the documented cross-kernel contract, not a bypass.
+    let agent_b = Agent::with_secret([0x71; 32]);
+    agent_b.set_durable_capabilities(true);
+    agent_b.set_record_seal_key([0x91; 32]);
+    agent_b.register(Box::new(Echo));
+    agent_b
+        .tombstone_record(root_record_id)
+        .expect("replay the kill list");
+    let error = agent_b
+        .restore_capability(&child_record, &admitted(b"durable-owner"))
+        .expect_err("a restore under a replayed tombstoned ancestor must fail");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+#[test]
+fn restore_without_kill_list_replay_succeeds_cross_kernel() {
+    let (_agent, child_record, _root_record_id) = revoked_ancestor_setup();
+    let agent_b = Agent::with_secret([0x71; 32]);
+    agent_b.set_durable_capabilities(true);
+    agent_b.set_record_seal_key([0x91; 32]);
+    agent_b.register(Box::new(Echo));
+    agent_b
+        .restore_capability(&child_record, &admitted(b"durable-owner"))
+        .expect("no replayed tombstone, so the restore succeeds");
+}
+
+#[test]
+fn a_descendant_of_a_restored_capability_re_exports_its_ancestors() {
+    let (agent, child_record, root_record_id) = revoked_ancestor_setup();
+    let owner = admitted(b"durable-owner");
+    let restored = agent
+        .restore_capability(&child_record, &owner)
+        .expect("restore under a live ancestor");
+    // A restored capability itself cannot be re-exported under the same
+    // record id ("the record was already exported and consumed"): the
+    // documented path is to attenuate it and export the new grant.
+    // The restored grant carries the narrowed strict budget the child
+    // was exported with, so the attenuation must narrow, not grow, it.
+    let mut attrs = CapAttrs::new(&["echo"]);
+    attrs.persistence = CapPersistence::Durable;
+    attrs.budget = Budget::strict();
+    let descendant = agent
+        .attenuate(&restored, attrs)
+        .expect("attenuate the restored capability");
+    let re_exported = agent
+        .export_capability(&descendant)
+        .expect("export the descendant of the restored capability");
+    assert_eq!(
+        re_exported.ancestor_record_ids,
+        vec![root_record_id, child_record.record_id],
+        "the kill switch must survive a restore round trip: the root and \
+         the restored record it came from are both ancestors"
+    );
+    drop(descendant);
+    drop(restored);
+    agent
+        .tombstone_record(root_record_id)
+        .expect("tombstone root");
+    let error = agent
+        .restore_capability(&re_exported, &owner)
+        .expect_err("the re-exported record dies with its ancestor");
+    assert_eq!(error.code(), "rpc/revoked", "{error}");
+}
+
+#[test]
+fn a_legacy_record_without_an_ancestor_list_restores_under_the_old_rule() {
+    // Records sealed before the ancestor field existed carry an empty
+    // list and cannot prove their ancestry: they restore under the old
+    // rule (own id only). This pins that limitation, so a deployment
+    // that needs the guarantee knows to re-export them.
+    let (agent, child_record, root_record_id) = revoked_ancestor_setup();
+    let mut legacy = child_record.clone();
+    legacy.ancestor_record_ids = Vec::new();
+    legacy.seal_with(&[0x91; 32]);
+    let parsed = active_rpc::CapabilityRecord::from_json(&legacy.to_json())
+        .expect("a stripped record still parses");
+    assert!(parsed.ancestor_record_ids.is_empty());
+    agent
+        .tombstone_record(root_record_id)
+        .expect("tombstone root");
+    agent
+        .restore_capability(&parsed, &admitted(b"durable-owner"))
+        .expect("a legacy record restores under the old rule");
+}

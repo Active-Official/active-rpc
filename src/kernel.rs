@@ -1662,6 +1662,7 @@ impl Agent {
                 .expires_at
                 .map(|expires_at| expires_at.saturating_sub(kernel.now_ms)),
             record_id: record.record_id,
+            ancestor_record_ids: record.ancestor_record_ids.clone(),
             seal: None,
         };
         record.seal_with(&key);
@@ -1699,7 +1700,8 @@ impl Agent {
     /// recorded authority, the original absolute deadline and a binding to
     /// `peer`. Restoring is refused unless durable capabilities are enabled, a
     /// record seal key is configured, the record's seal verifies, its record id
-    /// was never tombstoned by a revocation, the provider is registered, the
+    /// — or any sealed ancestor's record id — was never tombstoned by a
+    /// revocation (RPC-01), the provider is registered, the
     /// deadline has not passed and the record is not bound to a different peer.
     /// A record alone is therefore not authority: it must have been sealed by
     /// this deployment, and the peer must be admitted too.
@@ -1765,6 +1767,25 @@ impl Agent {
             let kernel = self.cell.borrow();
             if kernel.revoked_records.contains(&record.record_id) {
                 return Err(Error::Revoked(record_token(&record.record_id)));
+            }
+            // RPC-01: the record seals the record ids of every ancestor the
+            // exported capability stood under. A tombstone on any of them
+            // is a kill switch on the whole subtree, and it must reach a
+            // restore even after every handle to the ancestor is dropped —
+            // a dropped ancestor is absent from the registry, so no
+            // live-cap check can see it. The check runs before the store
+            // claim, like every other deterministic refusal here. A
+            // record sealed before this field existed carries an empty
+            // list and restores under the old rule (own id only).
+            // Cross-kernel, the tombstone reaches this kernel the same way
+            // every kill list does: the deployment replays it with
+            // `tombstone_record` before the restore.
+            if let Some(tombstoned) = record
+                .ancestor_record_ids
+                .iter()
+                .find(|id| kernel.revoked_records.contains(*id))
+            {
+                return Err(Error::Revoked(record_token(tombstoned)));
             }
         }
         {
@@ -1916,7 +1937,14 @@ impl Agent {
         if let Some(store) = store {
             store.claim(&record.record_id)?;
         }
-        let restored = self.mint_restored(peer, provider, record.object, attrs, &lineage)?;
+        let restored = self.mint_restored(
+            peer,
+            provider,
+            record.object,
+            attrs,
+            &lineage,
+            &record.ancestor_record_ids,
+        )?;
         self.cell
             .borrow_mut()
             .restored_records
@@ -2075,6 +2103,7 @@ impl Agent {
         object: u64,
         attrs: CapAttrs,
         lineage: &[CapId],
+        ancestor_record_ids: &[[u8; 32]],
     ) -> Result<CapHandle> {
         if !peer.can_bind() {
             return Err(Error::Identity(
@@ -2102,8 +2131,11 @@ impl Agent {
         // A revoked ancestor's subtree was already revoked, and
         // `revoke_subtree` does not descend into a revoked node: a restore
         // linked under one would be a live child no revocation could reach.
-        // The pin/tombstone paths make this unreachable today; the check keeps
-        // the premise local (R-12 round 8, F7).
+        // This live check catches an ancestor still in the registry; a
+        // dropped ancestor is caught earlier, in
+        // `restore_capability_with`, against the record's sealed
+        // ancestor list (RPC-01). Both stay: neither subsumes the other.
+        // (R-12 round 8, F7).
         for ancestor in lineage {
             if kernel
                 .caps
@@ -2125,6 +2157,11 @@ impl Agent {
             record.parent = Some(*parent);
         }
         record.tree_ancestors = lineage.to_vec();
+        // The restored grant stands under the same ancestors the exported
+        // record did, so a later export of this capability seals the same
+        // list (and a later attenuation extends it): the kill switch keeps
+        // reaching through restores (RPC-01).
+        record.ancestor_record_ids = ancestor_record_ids.to_vec();
         // The restored grant stands where the exported capability stood: it is
         // linked under every ancestor still live, so `revoke` and
         // `reintroduce_to`, which walk the child index, reach it (round 44,
@@ -2568,7 +2605,15 @@ impl Agent {
             kernel.push_event(Event::CapExpired(parent_id));
             return Err(Error::Revoked(cap_token(parent_id)));
         }
-        let (provider, object, lineage, expires_at, attrs) = {
+        let (
+            provider,
+            object,
+            lineage,
+            ancestor_record_ids,
+            parent_record_id,
+            expires_at,
+            attrs,
+        ) = {
             let record = kernel
                 .caps
                 .get(&parent_id)
@@ -2606,6 +2651,8 @@ impl Agent {
                 record.provider,
                 record.object,
                 record.lineage.clone(),
+                record.ancestor_record_ids.clone(),
+                record.record_id,
                 record.expires_at,
                 attrs,
             )
@@ -2618,6 +2665,12 @@ impl Agent {
         child.record_id = CapId::derive_record(&kernel.secret, serial, Some(&parent_id));
         child.lineage = lineage;
         child.lineage.push(parent_id);
+        // The child stands under every ancestor the parent stood under,
+        // plus the parent itself: the parent is live here, so its record
+        // id is known — after the parent handle is dropped no lookup can
+        // recover it, yet a tombstone names exactly that id (RPC-01).
+        child.ancestor_record_ids = ancestor_record_ids;
+        child.ancestor_record_ids.push(parent_record_id);
         // A derived capability never outlives its parent: keep the parent's
         // absolute expiry when the child asked for a longer (or no) lifetime.
         child.expires_at = match (expires_at, attrs.ttl_ms) {

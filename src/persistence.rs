@@ -150,6 +150,7 @@ const RECORD_KEYS: &[&str] = &[
     "wall_clock",
     "lease_ms",
     "record_id",
+    "ancestor_record_ids",
     "seal",
 ];
 
@@ -252,6 +253,20 @@ pub struct CapabilityRecord {
     /// revocation, so the id is authority-bearing metadata: it is derived from
     /// the kernel secret and is not a capability by itself.
     pub record_id: [u8; 32],
+    /// Record ids of every ancestor the exported capability stands under,
+    /// root first (RPC-01).
+    ///
+    /// A restore is refused when any id in this list was tombstoned by a
+    /// revocation, so a kill switch on an ancestor reaches exported
+    /// descendants even after every handle to the ancestor is dropped. The
+    /// list is sealed with the rest of the record: stripping an ancestor
+    /// breaks the seal. It is empty for a first-generation capability and
+    /// for records sealed before this field existed; those legacy records
+    /// cannot prove their ancestry, so they restore under the old rule
+    /// (own id only) — a deployment that needs the guarantee re-exports
+    /// them. The field is omitted from the JSON when empty, so legacy
+    /// records keep their seal and their canonical text.
+    pub ancestor_record_ids: Vec<[u8; 32]>,
     /// Keyed MAC over every other field, when the record was sealed.
     ///
     /// A record is a credential: whoever writes one can mint the authority it
@@ -333,6 +348,17 @@ impl CapabilityRecord {
             },
         );
         map.insert("record_id".into(), hex(&self.record_id).into());
+        // Omitted when empty: a first-generation capability has no
+        // ancestors, and a record sealed before this field existed must
+        // keep its seal and its canonical text (RPC-01).
+        if !self.ancestor_record_ids.is_empty() {
+            let ids: Vec<Json> = self
+                .ancestor_record_ids
+                .iter()
+                .map(|id| Json::String(hex(id)))
+                .collect();
+            map.insert("ancestor_record_ids".into(), Json::Array(ids));
+        }
         map
     }
 
@@ -599,6 +625,47 @@ impl CapabilityRecord {
         if record_id == [0u8; 32] {
             return Err(Error::persistence("the record id is not a record id"));
         }
+        // Absent on records sealed before this field existed: those
+        // restore under the old rule (own id only). Present as an array of
+        // lowercase-hex record ids, root first; the chain order is
+        // meaningful, so it is kept as written and the final canonical-text
+        // comparison refuses any reordering. A zero id is not a record id,
+        // a duplicate names one ancestor twice, and the list can never be
+        // longer than the lineage ceiling (RPC-01).
+        let ancestor_record_ids = match value.get("ancestor_record_ids") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Array(items)) => {
+                if items.len() > crate::kernel::MAX_LINEAGE_DEPTH {
+                    return Err(Error::persistence(
+                        "ancestor record list exceeds the lineage ceiling",
+                    ));
+                }
+                let mut ids = Vec::with_capacity(items.len());
+                for item in items {
+                    let text = item.as_str().ok_or_else(|| {
+                        Error::persistence("ancestor record id is not a string")
+                    })?;
+                    let id = parse_hex32(text)?;
+                    if id == [0u8; 32] {
+                        return Err(Error::persistence(
+                            "ancestor record id is not a record id",
+                        ));
+                    }
+                    if ids.contains(&id) {
+                        return Err(Error::persistence(
+                            "ancestor record list repeats an id",
+                        ));
+                    }
+                    ids.push(id);
+                }
+                ids
+            }
+            Some(_) => {
+                return Err(Error::persistence(
+                    "ancestor record list is malformed",
+                ))
+            }
+        };
         let seal = match value.get("seal") {
             None | Some(Json::Null) => None,
             // Lowercase hex only: `to_json` writes the seal in that form, and a
@@ -632,6 +699,7 @@ impl CapabilityRecord {
             wall_clock,
             lease_ms,
             record_id,
+            ancestor_record_ids,
             seal,
         };
         // The text must be the one this crate writes, key order included.

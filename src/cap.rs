@@ -562,6 +562,18 @@ pub struct CapRecord {
     /// what revocation tombstones: an exported record of a revoked capability
     /// stays dead no matter how many times it is presented.
     pub record_id: [u8; 32],
+    /// Record ids of every ancestor this capability stands under, root first.
+    ///
+    /// Kept alongside `lineage`/`tree_ancestors` (which name ancestors by
+    /// kernel-local `CapId`) because a dropped ancestor is absent from the
+    /// registry, so its record id is unrecoverable at export time — yet a
+    /// tombstone names exactly that record id. The list is built when the
+    /// parent is necessarily live (attenuate, restore) and sealed into an
+    /// exported record, so restore can refuse a credential whose ancestor
+    /// was tombstoned even after every handle to the ancestor is gone
+    /// (RPC-01). The list is the union of the budget chain and the tree
+    /// edge, matching the export pin's lineage.
+    pub ancestor_record_ids: Vec<[u8; 32]>,
 }
 
 impl CapRecord {
@@ -581,6 +593,7 @@ impl CapRecord {
             descendants: 0,
             tree_ancestors: Vec::new(),
             record_id: [0u8; 32],
+            ancestor_record_ids: Vec::new(),
         }
     }
 }
