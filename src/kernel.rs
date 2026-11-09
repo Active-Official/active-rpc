@@ -1519,11 +1519,7 @@ impl Agent {
     /// the query unwinds. A provider that is not in the registry is an
     /// internal inconsistency (the registry and `facts` move together), so it
     /// is refused rather than treated as "not a module provider".
-    fn module_identity(
-        &self,
-        provider: ProviderId,
-        object: u64,
-    ) -> Result<ModuleIdentity> {
+    fn module_identity(&self, provider: ProviderId, object: u64) -> Result<ModuleIdentity> {
         let checked_out = {
             let mut kernel = self.cell.borrow_mut();
             kernel
@@ -1542,11 +1538,11 @@ impl Agent {
             .expect("the guard holds the provider")
             .module_content_hash(object)?;
         // Put it back explicitly; the guard is a no-op on the normal path.
-        let provider = guard
-            .provider
-            .take()
-            .expect("the guard holds the provider");
-        self.cell.borrow_mut().providers.insert(guard.provider_id, provider);
+        let provider = guard.provider.take().expect("the guard holds the provider");
+        self.cell
+            .borrow_mut()
+            .providers
+            .insert(guard.provider_id, provider);
         Ok(identity)
     }
 

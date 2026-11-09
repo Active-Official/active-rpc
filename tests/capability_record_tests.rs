@@ -1973,7 +1973,6 @@ fn an_attenuated_child_after_a_replayed_kill_list_skips_a_tombstoned_serial() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // R2-BND-03: a durable module capability is bound to its module's content
 // address, so a restore cannot rebind by bare object id.
@@ -2061,7 +2060,9 @@ fn hex(bytes: &[u8]) -> String {
 fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
     let (agent_a, owner) = module_agent();
     let mut provider_a = ModuleProvider::new();
-    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let object_a = provider_a
+        .install(plain_module("module-A"))
+        .expect("install A");
     assert_eq!(object_a, 0);
     let id_a = agent_a.register(Box::new(provider_a));
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
@@ -2074,7 +2075,9 @@ fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
 
     let (agent_b, _) = module_agent();
     let mut provider_b = ModuleProvider::new();
-    let object_b = provider_b.install(plain_module("module-B")).expect("install B");
+    let object_b = provider_b
+        .install(plain_module("module-B"))
+        .expect("install B");
     assert_eq!(object_b, 0);
     let _id_b = agent_b.register(Box::new(provider_b));
     let error = agent_b
@@ -2094,7 +2097,9 @@ fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
 fn a_restore_refuses_a_module_cap_when_the_object_does_not_exist() {
     let (agent_a, owner) = module_agent();
     let mut provider_a = ModuleProvider::new();
-    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let object_a = provider_a
+        .install(plain_module("module-A"))
+        .expect("install A");
     let id_a = agent_a.register(Box::new(provider_a));
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");
@@ -2118,7 +2123,9 @@ fn a_restore_refuses_a_module_cap_when_the_object_does_not_exist() {
 fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
     let (agent_a, owner) = module_agent();
     let mut provider_a = ModuleProvider::new();
-    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let object_a = provider_a
+        .install(plain_module("module-A"))
+        .expect("install A");
     let id_a = agent_a.register(Box::new(provider_a));
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");
@@ -2126,7 +2133,9 @@ fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
 
     let (agent_b, _) = module_agent();
     let mut provider_b = ModuleProvider::new();
-    let object_b = provider_b.install(plain_module("module-A")).expect("install A");
+    let object_b = provider_b
+        .install(plain_module("module-A"))
+        .expect("install A");
     assert_eq!(object_b, 0);
     let _id_b = agent_b.register(Box::new(provider_b));
     let lane_b = agent_b.create_lane("b", Budget::default()).expect("lane");
@@ -2152,7 +2161,9 @@ fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
 fn a_restore_refuses_a_record_exported_before_a_patch() {
     let (agent, owner) = module_agent();
     let mut provider = ModuleProvider::new();
-    let object = provider.install(plain_module("module-A")).expect("install A");
+    let object = provider
+        .install(plain_module("module-A"))
+        .expect("install A");
     let id = agent.register(Box::new(provider));
     let cap = mint_module_cap(
         &agent,
@@ -2172,7 +2183,9 @@ fn a_restore_refuses_a_record_exported_before_a_patch() {
     );
     let lane = agent.create_lane("patch", Budget::default()).expect("lane");
     let record = agent.export_capability(&cap).expect("export");
-    let sealed = record.content_hash.expect("a module export seals the address");
+    let sealed = record
+        .content_hash
+        .expect("a module export seals the address");
     assert_eq!(
         content_hash_via(&agent, lane, &patcher),
         hex(&sealed),
@@ -2234,9 +2247,12 @@ fn a_sealed_record_carries_the_redacted_hash_for_a_secret_module() {
     // budget.
     let via = content_hash_via(&agent_a, lane_a, &cap_a);
     let record = agent_a.export_capability(&cap_a).expect("export");
-    let sealed = record.content_hash.expect("a module export seals the address");
+    let sealed = record
+        .content_hash
+        .expect("a module export seals the address");
     assert_eq!(
-        hex(&sealed), via,
+        hex(&sealed),
+        via,
         "the sealed address is the domain content_hash"
     );
     assert_ne!(
@@ -2290,7 +2306,9 @@ fn an_export_for_a_provider_that_serves_no_modules_seals_no_hash() {
 fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
     let (agent_a, owner) = module_agent();
     let mut provider_a = ModuleProvider::new();
-    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let object_a = provider_a
+        .install(plain_module("module-A"))
+        .expect("install A");
     let id_a = agent_a.register(Box::new(provider_a));
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");
@@ -2306,7 +2324,9 @@ fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
     // bridge restores it (the hash cannot be checked).
     let (agent_b, _) = module_agent();
     let mut provider_b = ModuleProvider::new();
-    let object_b = provider_b.install(plain_module("module-B")).expect("install B");
+    let object_b = provider_b
+        .install(plain_module("module-B"))
+        .expect("install B");
     assert_eq!(object_b, 0);
     let _id_b = agent_b.register(Box::new(provider_b));
     let lane_b = agent_b.create_lane("b", Budget::default()).expect("lane");
@@ -2329,7 +2349,9 @@ fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
 fn a_legacy_record_without_a_hash_refuses_when_the_object_does_not_exist() {
     let (agent_a, owner) = module_agent();
     let mut provider_a = ModuleProvider::new();
-    let object_a = provider_a.install(plain_module("module-A")).expect("install A");
+    let object_a = provider_a
+        .install(plain_module("module-A"))
+        .expect("install A");
     let id_a = agent_a.register(Box::new(provider_a));
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");

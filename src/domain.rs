@@ -288,14 +288,12 @@ impl ModuleProvider {
                 }
                 // A tainted blob's hash is secret-derived whatever the module's
                 // provenance says (round 9, F-2).
-                let mut extra: Vec<[u8; 32]> =
-                    slot.secret_addresses.iter().copied().collect();
+                let mut extra: Vec<[u8; 32]> = slot.secret_addresses.iter().copied().collect();
                 extra.extend(slot.hash);
                 crate::security::sanitize_tainted_blobs(&mut redacted, &extra)
                     .map_err(redaction_fault)?;
-                let redacted_bytes = encode(&redacted).map_err(|error| {
-                    redaction_fault(Error::Payload(error.code().to_string()))
-                })?;
+                let redacted_bytes = encode(&redacted)
+                    .map_err(|error| redaction_fault(Error::Payload(error.code().to_string())))?;
                 crate::security::assert_module_bytes(&redacted_bytes, &extra)
                     .map_err(redaction_fault)?;
                 let hash = active_infinity::content_hash(&redacted_bytes)
