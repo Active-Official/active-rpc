@@ -365,7 +365,7 @@ fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
         .expect("a name the introduction accepts is persistable");
     drop(cap);
     agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("and restorable");
     assert!(!agent.intro().expect("intro").is_empty());
 }

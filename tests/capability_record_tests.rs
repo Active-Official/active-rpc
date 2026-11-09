@@ -80,7 +80,9 @@ fn export_and_restore_are_on_the_trace() {
     // restore, exactly as the round-trip test does.
     drop(cap);
     let owner = admitted(b"durable-owner");
-    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
 
     let trace = agent.trace();
     let names: Vec<&str> = trace.iter().map(|event| event.event()).collect();
@@ -126,7 +128,9 @@ fn a_durable_capability_round_trips_through_a_record() {
     let original = cap.id();
     drop(cap);
     let owner = admitted(b"durable-owner");
-    let restored = agent.restore_capability(&parsed, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&parsed, &owner)
+        .expect("restore");
     assert_ne!(
         restored.id(),
         original,
@@ -179,7 +183,7 @@ fn restore_requires_the_durable_policy() {
     let other = Agent::with_secret([0x73; 32]);
     other.register(Box::new(Echo));
     let error = other
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("durable restore must be opt-in");
     assert_eq!(error.code(), "rpc/persistence");
 }
@@ -208,7 +212,7 @@ fn restore_refuses_a_passed_deadline() {
     agent.run();
     let _ = promise.value();
     let error = agent
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("an expired record must not restore");
     assert_eq!(error.code(), "rpc/persistence");
 }
@@ -228,14 +232,14 @@ fn restore_refuses_a_record_bound_to_another_peer() {
     let record = agent.export_capability(&cap).expect("export");
     assert_eq!(record.bound_to, Some(peer(b"owner-a").fingerprint()));
     let error = agent
-        .restore_capability(&record, &admitted(b"owner-b"))
+        .restore_capability_in_process_only(&record, &admitted(b"owner-b"))
         .expect_err("a bound record must not move");
     assert_eq!(error.code(), "rpc/identity");
     // The same peer restores it, once the source handle is gone.
     let original = cap.id();
     drop(cap);
     let restored = agent
-        .restore_capability(&record, &admitted(b"owner-a"))
+        .restore_capability_in_process_only(&record, &admitted(b"owner-a"))
         .expect("restore for the bound peer");
     // Restore always re-mints, even in the same kernel: a record is authority
     // metadata, not an id.
@@ -250,7 +254,7 @@ fn restore_refuses_an_unknown_provider() {
     // Re-seal: the point of this case is provider resolution, not the seal.
     record.seal_with(&[0x91; 32]);
     let error = agent
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("an unknown provider must not restore");
     assert_eq!(error.code(), "rpc/persistence");
 }
@@ -289,7 +293,9 @@ fn a_restored_capability_keeps_the_original_deadline() {
     let record = agent.export_capability(&cap).expect("export");
     drop(cap);
     let owner = admitted(b"durable-owner");
-    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
     // The restored deadline is the original absolute one: at t=1000 it is
     // refused, exactly like the original.
     let lane = agent
@@ -326,7 +332,7 @@ fn a_restored_capability_keeps_the_original_deadline() {
     // handle is released first, so the deadline is what refuses it.
     drop(restored);
     let record_error = agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("the record's deadline passed");
     assert!(matches!(record_error, Error::Persistence(_)));
 }
@@ -365,11 +371,11 @@ fn a_tombstoned_record_reports_the_binding_first() {
     let record = agent.export_capability(&cap).expect("export");
     agent.revoke(&cap).expect("revoke");
     let error = agent
-        .restore_capability(&record, &admitted(b"someone-else"))
+        .restore_capability_in_process_only(&record, &admitted(b"someone-else"))
         .expect_err("the wrong peer cannot probe the tombstone");
     assert_eq!(error.code(), "rpc/identity", "{error}");
     let error = agent
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("the owner reaches the tombstone");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -430,7 +436,9 @@ fn an_exported_record_keeps_its_object_alive() {
         "the pinned object was reclaimed: {drops:?}"
     );
 
-    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
     let lane = agent
         .create_lane("restored", Budget::default())
         .expect("lane");
@@ -461,10 +469,11 @@ fn dropping_a_restored_capability_is_not_an_orphan() {
     };
     assert_eq!(orphans(&agent), 1, "the export orphan is reported");
 
-    let restored = match agent.restore_capability(&record, &admitted(b"durable-owner")) {
-        Ok(cap) => cap,
-        Err(error) => panic!("restore: {error}"),
-    };
+    let restored =
+        match agent.restore_capability_in_process_only(&record, &admitted(b"durable-owner")) {
+            Ok(cap) => cap,
+            Err(error) => panic!("restore: {error}"),
+        };
     drop(restored);
     let _ = agent.take_drops(provider);
     assert_eq!(
@@ -599,7 +608,7 @@ fn a_rotation_tombstones_the_records_of_the_old_peer() {
         .reintroduce_to(&cap, &old, &new)
         .expect("rotate the binding");
     let error = agent
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("the old peer's record is tombstoned");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -706,7 +715,7 @@ fn a_rotation_tombstones_the_record_of_a_dropped_exporter() {
         .reintroduce_to(&ancestor, &old, &new)
         .expect("rotate the binding");
     let error = agent
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("the retired peer's record is tombstoned");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
     // A deployment can find the kill through its own API and append it to its
@@ -727,7 +736,7 @@ fn a_restore_is_refused_when_the_tombstone_budget_is_spent() {
     agent.run();
     fill_tombstones(&agent);
     let error = agent
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("no tombstone budget is left");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
     assert_eq!(
@@ -756,7 +765,7 @@ fn two_records_on_one_object_hold_two_pins() {
     );
 
     let restored = agent
-        .restore_capability(&first_record, &owner)
+        .restore_capability_in_process_only(&first_record, &owner)
         .expect("restore the first");
     assert!(
         agent.take_drops(provider).is_empty(),
@@ -769,7 +778,7 @@ fn two_records_on_one_object_hold_two_pins() {
     );
 
     let _restored = agent
-        .restore_capability(&second_record, &owner)
+        .restore_capability_in_process_only(&second_record, &owner)
         .expect("restore the second");
 }
 
@@ -808,10 +817,10 @@ fn a_rotation_leaves_a_siblings_record_restorable() {
         "the sibling's record is not this rotation's authority"
     );
     let restored = agent
-        .restore_capability(&second_record, &owner)
+        .restore_capability_in_process_only(&second_record, &owner)
         .expect("the sibling record is still restorable");
     let error = agent
-        .restore_capability(&first_record, &owner)
+        .restore_capability_in_process_only(&first_record, &owner)
         .expect_err("the rotated capability's record is tombstoned");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
     drop(restored);
@@ -960,7 +969,7 @@ fn a_rotation_to_the_same_peer_tombstones_nothing() {
     drop(cap);
     agent.run();
     agent
-        .restore_capability(&record, &same)
+        .restore_capability_in_process_only(&record, &same)
         .expect("the record is still restorable");
 }
 
@@ -982,7 +991,7 @@ fn a_restored_capability_cannot_be_exported_again() {
     target.set_record_seal_key([0x91; 32]);
     target.register(Box::new(Echo));
     let restored = target
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect("restore");
     let error = target
         .export_capability(&restored)
@@ -1056,7 +1065,7 @@ fn a_revocation_tombstones_an_orphaned_descendant_record() {
         "the dropped exporter's record is retired with the subtree"
     );
     let error = agent
-        .restore_capability(&record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("the record is tombstoned");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
     assert!(
@@ -1156,7 +1165,9 @@ fn a_revocation_reaches_a_restored_copy_of_a_descendant() {
     source.run();
 
     // Restore on the same kernel so the record and its lineage are known.
-    let restored = source.restore_capability(&record, &owner).expect("restore");
+    let restored = source
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
     let grandchild = source
         .attenuate(&restored, CapAttrs::new(&["echo"]))
         .expect("attenuate from the restored copy");
@@ -1194,7 +1205,9 @@ fn a_rotation_reaches_a_restored_copy() {
     let record = agent.export_capability(&child).expect("export");
     drop(child);
     agent.run();
-    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
 
     let old = peer(b"durable-owner");
     let new = admitted(b"rotated-owner");
@@ -1315,7 +1328,9 @@ fn dropping_a_restored_copy_does_not_leave_a_stale_child() {
     let record = agent.export_capability(&child).expect("export");
     drop(child);
     agent.run();
-    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
     let restored_id = restored.id();
     drop(restored);
     agent.run();
@@ -1355,7 +1370,9 @@ fn a_live_restored_copy_keeps_its_ancestor_alive() {
     let record = agent.export_capability(&child).expect("export");
     drop(child);
     agent.run();
-    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
 
     let parent_id = parent.id();
     drop(parent);
@@ -1451,7 +1468,9 @@ fn a_rotation_reaches_a_record_behind_a_restored_copy() {
     let source = agent.export_capability(&parent).expect("export");
     drop(parent);
     agent.run();
-    let restored = agent.restore_capability(&source, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&source, &owner)
+        .expect("restore");
     let child = agent.attenuate(&restored, attrs).expect("child");
     let record = agent.export_capability(&child).expect("export the child");
     drop(child);
@@ -1485,7 +1504,9 @@ fn a_record_exported_through_a_restored_copy_is_revoked_with_the_root() {
     let first = agent.export_capability(&child).expect("export the child");
     drop(child);
     agent.run();
-    let restored = agent.restore_capability(&first, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&first, &owner)
+        .expect("restore");
     let descendant = agent.attenuate(&restored, attrs).expect("attenuate");
     let second = agent
         .export_capability(&descendant)
@@ -1501,7 +1522,7 @@ fn a_record_exported_through_a_restored_copy_is_revoked_with_the_root() {
         "the record of the restored subtree is retired with the root"
     );
     let error = agent
-        .restore_capability(&second, &owner)
+        .restore_capability_in_process_only(&second, &owner)
         .expect_err("the record is tombstoned");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -1560,7 +1581,7 @@ fn an_export_past_the_restore_ceiling_is_refused_and_spends_nothing() {
     drop(deepest);
     agent.run();
     agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("the deepest restorable chain restores");
 }
 
@@ -1631,7 +1652,7 @@ fn a_tombstone_reaches_a_record_exported_through_a_dropped_restored_copy() {
     let parent_record = agent.export_capability(&grandchild).expect("export");
     drop(grandchild);
     let restored = agent
-        .restore_capability(&parent_record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&parent_record, &admitted(b"durable-owner"))
         .expect("restore the exported record");
     let descendant = agent.attenuate(&restored, durable()).expect("descendant");
     let descendant_record = agent
@@ -1649,7 +1670,7 @@ fn a_tombstone_reaches_a_record_exported_through_a_dropped_restored_copy() {
         "the tombstone must reach the record exported through the dropped restored copy"
     );
     let error = agent
-        .restore_capability(&descendant_record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&descendant_record, &admitted(b"durable-owner"))
         .expect_err("a tombstoned descendant record is dead");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -1712,7 +1733,7 @@ fn restore_under_a_tombstoned_ancestor_is_refused() {
         .tombstone_record(root_record_id)
         .expect("tombstone root");
     let error = agent
-        .restore_capability(&child_record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&child_record, &admitted(b"durable-owner"))
         .expect_err("a restore under a tombstoned ancestor must fail");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -1722,7 +1743,7 @@ fn restore_under_a_live_ancestor_succeeds_and_calls() {
     let (agent, child_record, _root_record_id) = revoked_ancestor_setup();
     let owner = admitted(b"durable-owner");
     let restored = agent
-        .restore_capability(&child_record, &owner)
+        .restore_capability_in_process_only(&child_record, &owner)
         .expect("restore under a live ancestor");
     let lane = agent
         .create_lane("rpc-01-control", Budget::default())
@@ -1750,7 +1771,7 @@ fn restore_under_a_tombstoned_ancestor_is_refused_cross_kernel_after_kill_list_r
         .tombstone_record(root_record_id)
         .expect("replay the kill list");
     let error = agent_b
-        .restore_capability(&child_record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&child_record, &admitted(b"durable-owner"))
         .expect_err("a restore under a replayed tombstoned ancestor must fail");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -1763,7 +1784,7 @@ fn restore_without_kill_list_replay_succeeds_cross_kernel() {
     agent_b.set_record_seal_key([0x91; 32]);
     agent_b.register(Box::new(Echo));
     agent_b
-        .restore_capability(&child_record, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&child_record, &admitted(b"durable-owner"))
         .expect("no replayed tombstone, so the restore succeeds");
 }
 
@@ -1772,7 +1793,7 @@ fn a_descendant_of_a_restored_capability_re_exports_its_ancestors() {
     let (agent, child_record, root_record_id) = revoked_ancestor_setup();
     let owner = admitted(b"durable-owner");
     let restored = agent
-        .restore_capability(&child_record, &owner)
+        .restore_capability_in_process_only(&child_record, &owner)
         .expect("restore under a live ancestor");
     // A restored capability itself cannot be re-exported under the same
     // record id ("the record was already exported and consumed"): the
@@ -1800,7 +1821,7 @@ fn a_descendant_of_a_restored_capability_re_exports_its_ancestors() {
         .tombstone_record(root_record_id)
         .expect("tombstone root");
     let error = agent
-        .restore_capability(&re_exported, &owner)
+        .restore_capability_in_process_only(&re_exported, &owner)
         .expect_err("the re-exported record dies with its ancestor");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -1822,7 +1843,7 @@ fn a_legacy_record_without_an_ancestor_list_restores_under_the_old_rule() {
         .tombstone_record(root_record_id)
         .expect("tombstone root");
     agent
-        .restore_capability(&parsed, &admitted(b"durable-owner"))
+        .restore_capability_in_process_only(&parsed, &admitted(b"durable-owner"))
         .expect("a legacy record restores under the old rule");
 }
 
@@ -2081,7 +2102,7 @@ fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
     assert_eq!(object_b, 0);
     let _id_b = agent_b.register(Box::new(provider_b));
     let error = agent_b
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("a different module at the same id is a rebind, not a restore");
     assert_eq!(error.code(), "rpc/persistence");
     assert!(
@@ -2108,7 +2129,7 @@ fn a_restore_refuses_a_module_cap_when_the_object_does_not_exist() {
     let (agent_c, _) = module_agent();
     let _id_c = agent_c.register(Box::new(ModuleProvider::new()));
     let error = agent_c
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("no module lives at the object on this kernel");
     assert_eq!(error.code(), "rpc/persistence");
     assert!(
@@ -2140,7 +2161,7 @@ fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
     let _id_b = agent_b.register(Box::new(provider_b));
     let lane_b = agent_b.create_lane("b", Budget::default()).expect("lane");
     let restored = agent_b
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("the same module restores");
     let value = call_as_owner(&agent_b, lane_b, &restored, "evaluate", vec![]).expect("evaluate");
     assert_eq!(
@@ -2210,7 +2231,7 @@ fn a_restore_refuses_a_record_exported_before_a_patch() {
     );
     drop(cap);
     let error = agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("the patched module is not the module the record was minted for");
     assert_eq!(error.code(), "rpc/persistence");
     assert!(
@@ -2275,7 +2296,7 @@ fn a_sealed_record_carries_the_redacted_hash_for_a_secret_module() {
     assert_eq!(object_b, 0);
     let _id_b = agent_b.register(Box::new(provider_b));
     agent_b
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("the same secret module restores");
 }
 
@@ -2292,7 +2313,7 @@ fn an_export_for_a_provider_that_serves_no_modules_seals_no_hash() {
     drop(cap);
     let owner = admitted(b"durable-owner");
     agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("a hash-less record for a non-module provider restores");
 }
 
@@ -2331,7 +2352,7 @@ fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
     let _id_b = agent_b.register(Box::new(provider_b));
     let lane_b = agent_b.create_lane("b", Budget::default()).expect("lane");
     let restored = agent_b
-        .restore_capability(&legacy, &owner)
+        .restore_capability_in_process_only(&legacy, &owner)
         .expect("a legacy record restores when the object exists");
     let value = call_as_owner(&agent_b, lane_b, &restored, "evaluate", vec![]).expect("evaluate");
     assert_eq!(
@@ -2363,11 +2384,103 @@ fn a_legacy_record_without_a_hash_refuses_when_the_object_does_not_exist() {
     let (agent_c, _) = module_agent();
     let _id_c = agent_c.register(Box::new(ModuleProvider::new()));
     let error = agent_c
-        .restore_capability(&legacy, &owner)
+        .restore_capability_in_process_only(&legacy, &owner)
         .expect_err("a legacy record still refuses a missing object");
     assert_eq!(error.code(), "rpc/persistence");
     assert!(
         error.to_string().contains("not installed"),
         "the refusal names the missing module: {error}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RPC-04 — restore without a RecordStore double-mints across kernels
+// ---------------------------------------------------------------------------
+
+/// `restore_capability` refuses without a store: the "already restored" set
+/// is in-process only, so a no-store restore on a second kernel used to mint
+/// a second live grant for the full recorded budget (RPC-04, SEC-F3).
+#[test]
+fn a_restore_without_a_store_is_refused_on_a_second_kernel() {
+    use active_rpc::persistence::MemoryRecordStore;
+
+    let (agent, _provider, cap) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+
+    // A second kernel in the same deployment: same secret, same seal key,
+    // no RecordStore anywhere — the exact shape the audit probe reproduces.
+    let second = Agent::with_secret([0x71; 32]);
+    second.set_durable_capabilities(true);
+    second.set_record_seal_key([0x91; 32]);
+    second.register(Box::new(Echo));
+    let error = second
+        .restore_capability(&record, &owner)
+        .expect_err("a no-store restore must be refused");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
+    assert!(
+        error.to_string().contains("RecordStore"),
+        "the refusal names the fix: {error}"
+    );
+
+    // The refusal burns nothing: the same record still restores through the
+    // store-backed path, and the grant it mints is callable.
+    let mut store = MemoryRecordStore::new();
+    let restored = second
+        .restore_capability_with(&record, &owner, Some(&mut store))
+        .expect("the record is still usable with a store");
+    let lane = second
+        .create_lane("restore", Budget::default())
+        .expect("lane");
+    let promise = second
+        .call_as(
+            Some(&peer(b"durable-owner")),
+            lane,
+            &restored,
+            "echo",
+            Vec::new(),
+        )
+        .expect("call as the bound peer");
+    second.run();
+    promise.value().expect("value");
+}
+
+/// The explicit opt-in keeps the old behaviour under its own name: a
+/// single-process deployment restores once per kernel, and a repeat restore
+/// in the same kernel is still refused (RPC-04).
+#[test]
+fn an_in_process_only_restore_still_restores_once_per_kernel() {
+    let (agent, _provider, cap) = durable_agent();
+    let owner = admitted(b"durable-owner");
+    let record = agent.export_capability(&cap).expect("export");
+    drop(cap);
+
+    let second = Agent::with_secret([0x71; 32]);
+    second.set_durable_capabilities(true);
+    second.set_record_seal_key([0x91; 32]);
+    second.register(Box::new(Echo));
+    let restored = second
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("the explicit single-process path still restores");
+    let lane = second
+        .create_lane("restore", Budget::default())
+        .expect("lane");
+    let promise = second
+        .call_as(
+            Some(&peer(b"durable-owner")),
+            lane,
+            &restored,
+            "echo",
+            Vec::new(),
+        )
+        .expect("call as the bound peer");
+    second.run();
+    promise.value().expect("value");
+    drop(restored);
+    second.run();
+    let error = second
+        .restore_capability_in_process_only(&record, &owner)
+        .expect_err("a repeat restore in the same kernel is refused");
+    assert_eq!(error.code(), "rpc/persistence", "{error}");
 }

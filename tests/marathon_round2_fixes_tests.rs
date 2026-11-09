@@ -125,7 +125,7 @@ fn a_tombstone_replayed_at_startup_refuses_the_record() {
     restarted.set_record_seal_key([0x84; 32]);
     restarted.register(Box::new(Echo));
     let accepted = restarted
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("without the tombstone the record restores");
     drop(accepted);
 
@@ -133,7 +133,7 @@ fn a_tombstone_replayed_at_startup_refuses_the_record() {
         .tombstone_record(record.record_id)
         .expect("replay the tombstone");
     let error = restarted
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("a replayed tombstone refuses the record");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -152,15 +152,15 @@ fn restoring_the_same_record_twice_is_refused() {
     let record = agent.export_capability(&cap).expect("export");
     drop(cap);
     let first = agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("first restore");
     let error = agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("the credential is already live");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
     drop(first);
     let error = agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("a record is consumed once it has been restored");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }
@@ -238,7 +238,7 @@ fn a_record_keeps_the_clock_mode_its_deadline_was_taken_in() {
     virtual_kernel.set_record_seal_key([0x84; 32]);
     virtual_kernel.register(Box::new(Echo));
     let error = virtual_kernel
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("a wall-clock deadline cannot be read in virtual time");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }

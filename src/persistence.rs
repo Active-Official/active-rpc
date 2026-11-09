@@ -21,12 +21,15 @@ use crate::{Error, Result};
 
 /// A durable home for the "already restored" set.
 ///
-/// [`crate::Agent::restore_capability`] remembers restored record ids only in
-/// the process that restored them. A record is a bearer credential whose seal is
-/// deployment-wide, so without a durable set a restart (or a second kernel)
-/// restores the same record again and mints a second grant for the full recorded
-/// budget. A deployment with persistent storage implements this over it and
-/// calls [`crate::Agent::restore_capability_with`].
+/// [`crate::Agent::restore_capability_in_process_only`] remembers restored
+/// record ids only in the process that restored them. A record is a bearer
+/// credential whose seal is deployment-wide, so without a durable set a
+/// restart (or a second kernel) restores the same record again and mints a
+/// second grant for the full recorded budget — which is why
+/// [`crate::Agent::restore_capability`] refuses a restore with no store
+/// (RPC-04) instead of minting on the in-process set alone. A deployment
+/// with persistent storage implements this over it and calls
+/// [`crate::Agent::restore_capability_with`].
 ///
 /// Both methods are fallible in spirit: `is_restored` answers from the store, and
 /// `mark_restored` must fail closed — a store that cannot write must return an
@@ -750,8 +753,9 @@ impl CapabilityRecord {
     /// Crate-internal on purpose: this converts a parsed record into authority
     /// attributes without looking at the seal, so exposing it would publish a
     /// bridge that skips authentication (a record with `seal: null` would mint).
-    /// The audited path is [`crate::Agent::restore_capability`], which verifies
-    /// the seal, the tombstone and the binding first; an embedder that needs the
+    /// The audited path is [`crate::Agent::restore_capability_with`], which
+    /// verifies the seal, the tombstone and the binding first (and claims the
+    /// record in the deployment's store); an embedder that needs the
     /// attributes should go through it.
     ///
     /// `ttl_ms` is the remaining lifetime, so the restored capability keeps the

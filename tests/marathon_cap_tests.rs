@@ -237,7 +237,7 @@ fn a_revoked_durable_capability_cannot_be_restored() {
     // The record belongs to `owner`; the binding is reported before the
     // tombstone, so the restore must present that peer to reach the tombstone.
     let error = agent
-        .restore_capability(&record, &admitted(b"owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"owner"))
         .expect_err("a revoked record must not restore");
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
@@ -262,14 +262,14 @@ fn an_edited_or_unsealed_record_is_refused() {
         max_value_size: u64::MAX,
     };
     let error = agent
-        .restore_capability(&widened, &peer)
+        .restore_capability_in_process_only(&widened, &peer)
         .expect_err("an edited record must not restore");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 
     let mut unsealed = record.clone();
     unsealed.seal = None;
     let error = agent
-        .restore_capability(&unsealed, &peer)
+        .restore_capability_in_process_only(&unsealed, &peer)
         .expect_err("an unsealed record must not restore");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 
@@ -569,7 +569,7 @@ fn the_registry_and_the_lineage_are_bounded() {
 ///
 /// `CapabilityRecord::attrs` used to be public, which published a bridge that
 /// turned an unauthenticated record into mintable authority (the seal is checked
-/// by `restore_capability`, not by the parser). The audited path is the restore
+/// by `restore_capability_with`, not by the parser). The audited path is the restore
 /// itself, so this test drives that and compares the restored capability with
 /// the record.
 #[test]
@@ -585,7 +585,9 @@ fn a_restore_preserves_the_binding() {
     // One live capability per credential: releasing the handle frees the grant
     // for the restore (a revocation would tombstone the record instead).
     drop(cap);
-    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
     assert_eq!(
         agent.cap_attrs(&restored).expect("attrs").bound_to,
         Some(PeerIdentity::from_certificate(b"owner").fingerprint())
@@ -606,7 +608,7 @@ fn a_record_keeps_its_identity_across_the_round_trip() {
     let mut tampered = parsed;
     tampered.record_id[0] ^= 1;
     let error = agent
-        .restore_capability(&tampered, &admitted(b"owner"))
+        .restore_capability_in_process_only(&tampered, &admitted(b"owner"))
         .expect_err("a re-pointed record is not sealed");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }

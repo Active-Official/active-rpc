@@ -52,7 +52,8 @@ Two fields make the record a credential rather than a suggestion:
 - `record_id` is a secret-derived identity for the capability. It survives an
   export/restore round trip inside one authority domain and is what a
   revocation tombstones: `revoke` inserts the record id of every capability in
-  the doomed subtree, and `restore_capability` refuses a tombstoned id with
+  the doomed subtree, and `restore_capability_with` (and the single-process
+  `restore_capability_in_process_only`) refuse a tombstoned id with
   `rpc/revoked`. A record exported before the revocation therefore cannot
   revive the authority.
 - `seal` is a keyed Blake3 MAC over every other field, keyed by the deployment
@@ -64,8 +65,8 @@ Two fields make the record a credential rather than a suggestion:
 
 ### Restore
 
-`Agent::restore_capability(record, admitted_peer)` is a **re-mint**, never a
-resurrection:
+`Agent::restore_capability_with(record, admitted_peer, Some(&mut store))` is
+a **re-mint**, never a resurrection:
 
 - the id is new (and differs even in the same kernel);
 - the authority is exactly the record's, with the record's absolute deadline as
@@ -97,9 +98,14 @@ resurrection:
   claimed **before** the mint: `claim` is the atomic check-and-mark, so a failed
   mint leaves the claim spent (fail-closed: a retry is refused and the operator
   reconciles) rather than allowing two processes to mint from one record.
-  Without a store the record is a
-  single-use token **per process**, which is the fail-closed default for a
-  deployment that has not built persistent storage yet.
+  `Agent::restore_capability` refuses a restore with no store at all
+  (`rpc/persistence`, RPC-04): without a shared store the "already restored"
+  set is in-process only, so a second kernel — or a restart — would restore
+  the same record again and mint a second live grant for the full recorded
+  budget. A deployment whose restore path is genuinely single-process uses
+  the explicit `Agent::restore_capability_in_process_only`, where the record
+  is a single-use token **per process** — and accepts that limitation by
+  naming it.
 
 Restore is refused (`rpc/persistence`) unless the agent enabled durable
 capabilities, a seal key is configured and the seal verifies, and the provider

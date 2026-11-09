@@ -1838,7 +1838,40 @@ impl Agent {
     /// deadline has not passed and the record is not bound to a different peer.
     /// A record alone is therefore not authority: it must have been sealed by
     /// this deployment, and the peer must be admitted too.
+    ///
+    /// Durable restore requires a [`crate::persistence::RecordStore`]: pass
+    /// one to [`Agent::restore_capability_with`]. This method refuses
+    /// unconditionally (RPC-04): without a shared store the "already
+    /// restored" set is in-process only, so a second kernel — or a restart —
+    /// would restore the same sealed record again and mint a second live
+    /// grant for the full recorded budget, which no revocation could reach
+    /// as one credential. A deployment whose restore path is genuinely
+    /// single-process uses [`Agent::restore_capability_in_process_only`]
+    /// instead, and accepts that limitation explicitly.
     pub fn restore_capability(
+        &self,
+        _record: &crate::persistence::CapabilityRecord,
+        _peer: &crate::identity::AdmittedIdentity,
+    ) -> Result<CapHandle> {
+        Err(Error::persistence(
+            "durable restore requires a RecordStore: pass one to \
+             restore_capability_with, or use restore_capability_in_process_only \
+             for a single-process-only restore",
+        ))
+    }
+
+    /// Restore a durable capability with no shared store: single-process only.
+    ///
+    /// This is the old [`Agent::restore_capability`] behaviour, kept under an
+    /// explicit name (RPC-04): the restored record ids are remembered only in
+    /// this process, so a restart — or a second kernel in the same deployment
+    /// — restores the same sealed record again and mints a second live grant
+    /// for the full recorded budget. Use it only when the deployment is
+    /// genuinely single-process (tests, a single embedded agent); every
+    /// production restore path passes a shared
+    /// [`crate::persistence::RecordStore`] to
+    /// [`Agent::restore_capability_with`] instead.
+    pub fn restore_capability_in_process_only(
         &self,
         record: &crate::persistence::CapabilityRecord,
         peer: &crate::identity::AdmittedIdentity,
@@ -1848,12 +1881,12 @@ impl Agent {
 
     /// Restore a durable capability, checking a durable "already restored" set.
     ///
-    /// [`Agent::restore_capability`] remembers restored record ids *in this
-    /// process*: a restart, or a second kernel in the same deployment, would
-    /// restore the same sealed record again and mint a fresh grant for the full
-    /// recorded budget. A deployment that stores records passes a
-    /// [`crate::persistence::RecordStore`] here, so the record is single-use
-    /// across kernels and restarts.
+    /// [`Agent::restore_capability_in_process_only`] remembers restored record
+    /// ids *in this process*: a restart, or a second kernel in the same
+    /// deployment, would restore the same sealed record again and mint a fresh
+    /// grant for the full recorded budget. A deployment that stores records
+    /// passes a [`crate::persistence::RecordStore`] here, so the record is
+    /// single-use across kernels and restarts.
     ///
     /// The record is claimed atomically before the mint: `claim` is the
     /// check-and-mark step, so a failed mint leaves the claim spent rather than
@@ -8510,7 +8543,7 @@ mod pin_scan_tests {
         // object, so the pin and its root counts must be gone
         // (R-12 round 15, L1).
         let restored = agent
-            .restore_capability(&record, &old)
+            .restore_capability_in_process_only(&record, &old)
             .expect("restore the record");
         assert_eq!(agent.export_pin_count(), 0, "the restore releases the pin");
         assert_pin_roots_match(&agent);
@@ -8677,12 +8710,12 @@ mod durable_counter_tests {
             .admit(Some(&PeerIdentity::from_certificate(b"stranger")), false)
             .expect("admitted");
         let error = restorer
-            .restore_capability(&record, &stranger)
+            .restore_capability_in_process_only(&record, &stranger)
             .expect_err("a record restores only for its own peer");
         assert_eq!(error.code(), "rpc/identity", "{error}");
         assert_counter_matches(&restorer);
         let restored = restorer
-            .restore_capability(&record, &old)
+            .restore_capability_in_process_only(&record, &old)
             .expect("restore the record");
         assert_counter_matches(&restorer);
         assert_eq!(

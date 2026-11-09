@@ -214,7 +214,7 @@ aspirational without a date.
 | Lane isolation | Per-lane budgets and closed lanes; destroying a lane removes its queued work | `tests/concurrency_tests.rs`, `dispatch_authority_matrix` | enforced |
 | Transfer explicit | Capabilities move only as `Arg::Cap` or channel messages; a bound capability cannot cross a channel | `a_bound_capability_cannot_be_transferred_over_a_channel` | enforced |
 | Durable receipts | `ReceiptLog` (`ARRL` v2): append-only, hash-chained, records the decision taken at dispatch, no arguments or secrets; the chain verifies without the key, MACs with it, `append_verified` refuses a record this kernel did not seal, and a pinned head detects a truncated tail | `tests/receipts_tests.rs`, `tests/receipt_log_tests.rs`, `tests/receipt_hardening_tests.rs`, `fuzz_receipt_log`, ADR-0021 | enforced |
-| Durable capabilities | `CapPersistence::Durable` is opt-in; `CapabilityRecord` + `restore_capability` re-mint with the original deadline and bind to an admitted peer | `tests/persistence_tests.rs`, `tests/capability_record_tests.rs`, ADR-0010 | enforced |
+| Durable capabilities | `CapPersistence::Durable` is opt-in; `CapabilityRecord` + `restore_capability_with` (with a `RecordStore`) re-mint with the original deadline and bind to an admitted peer; `restore_capability` refuses a restore with no store (RPC-04) | `tests/persistence_tests.rs`, `tests/capability_record_tests.rs`, ADR-0010 | enforced |
 | Topic filters | `CapAttrs::topics` restricts `publish`; attenuation only narrows | `tests/topic_tests.rs` | enforced |
 | No oracle | Secrets never compare, never render, never enter a receipt; capability ids are correlated for telemetry | `tests/invariant_gate.rs`, H2.43, `tests/observability_tests.rs` | enforced |
 

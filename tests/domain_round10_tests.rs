@@ -1777,7 +1777,7 @@ fn a_sibling_revoke_does_not_release_an_export_pin() {
         "the restorable record lost its object: {drops:?}"
     );
     let restored = agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("restore A");
     let lane = agent
         .create_lane("r10-pin", Budget::default())

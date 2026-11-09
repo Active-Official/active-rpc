@@ -13,7 +13,7 @@
 //! 3. A record the parser accepts survives a `to_json`/`from_json` round trip
 //!    unchanged, so a seal computed over one form verifies over the other.
 //!
-//! The restore path (`Agent::restore_capability`) reads exactly these bytes, and
+//! The restore path (`Agent::restore_capability_with`) reads exactly these bytes, and
 //! the parser is the boundary that used to have no coverage.
 //!
 //! Run with `cargo +nightly fuzz run fuzz_persistence_record -- -runs=200000`.

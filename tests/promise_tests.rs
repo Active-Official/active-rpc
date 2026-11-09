@@ -496,7 +496,7 @@ fn a_virtual_deadline_does_not_inflate_across_a_restart() {
     restarted.register(Box::new(Echo));
     let owner = admitted(b"owner");
     let restored = restarted
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect("restore");
     let lane = restarted
         .create_lane("after", Budget::default())
@@ -571,7 +571,7 @@ fn an_unbound_record_is_refused_by_restore() {
     record.bound_to = None;
     record.seal_with(&[0x86; 32]);
     let error = agent
-        .restore_capability(&record, &admitted(b"owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"owner"))
         .expect_err("a record must name its peer");
     assert_eq!(error.code(), "rpc/identity", "{error}");
 }
@@ -739,10 +739,12 @@ fn a_record_restores_once_per_kernel() {
     let record = agent.export_capability(&cap).expect("export");
     drop(cap);
     let owner = admitted(b"owner");
-    let restored = agent.restore_capability(&record, &owner).expect("restore");
+    let restored = agent
+        .restore_capability_in_process_only(&record, &owner)
+        .expect("restore");
     drop(restored);
     let error = agent
-        .restore_capability(&record, &owner)
+        .restore_capability_in_process_only(&record, &owner)
         .expect_err("the record was already restored");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }
@@ -847,7 +849,7 @@ fn a_tombstone_revokes_the_live_capability_it_names() {
     restarted.set_record_seal_key([0x86; 32]);
     restarted.register(Box::new(Echo));
     let restored = restarted
-        .restore_capability(&record, &admitted(b"owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"owner"))
         .expect("restore");
     // The deployment replays its persistent kill list after the restore path
     // already ran; the live copy is the authority that has to die.
@@ -897,11 +899,11 @@ fn the_record_id_sets_are_bounded() {
     restarted.set_record_id_ceiling(1).expect("ceiling");
     restarted.register(Box::new(Echo));
     let first = restarted
-        .restore_capability(&records[0], &admitted(b"owner"))
+        .restore_capability_in_process_only(&records[0], &admitted(b"owner"))
         .expect("first restore");
     drop(first);
     let error = restarted
-        .restore_capability(&records[1], &admitted(b"owner"))
+        .restore_capability_in_process_only(&records[1], &admitted(b"owner"))
         .expect_err("the restored set is full");
     assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
     assert_eq!(restarted.restored_record_count(), 1);
@@ -921,7 +923,7 @@ fn a_record_that_disables_a_ceiling_is_a_durable_refusal() {
     restarted.set_record_seal_key([0x86; 32]);
     restarted.register(Box::new(Echo));
     let error = restarted
-        .restore_capability(&record, &admitted(b"owner"))
+        .restore_capability_in_process_only(&record, &admitted(b"owner"))
         .expect_err("a zero ceiling is refused");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }

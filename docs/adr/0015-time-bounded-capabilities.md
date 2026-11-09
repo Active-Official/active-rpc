@@ -46,7 +46,7 @@ Rules:
 exported by a kernel that reads the wall clock cannot be restored into a kernel
 that uses the virtual clock (or the reverse): the absolute deadline belongs to
 the exporting clock domain, and reading it in another domain either extends or
-truncates the grant by an arbitrary amount. `restore_capability` refuses the
-mismatch with `rpc/persistence`; the exporting deployment re-exports from the
+truncates the grant by an arbitrary amount. `restore_capability_with` (and `restore_capability_in_process_only`) refuse
+the mismatch with `rpc/persistence`; the exporting deployment re-exports from the
 target domain, or restores the record with its TTL and lets the target resolve
 it. The field is additive: an older record without it is read as virtual time.

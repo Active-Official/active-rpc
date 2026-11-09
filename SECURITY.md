@@ -59,9 +59,11 @@ capability id at rest (it is a bearer token).
   are memory-only (ADR-0010). The restored set is memory-only too, so a
   deployment that stores records passes a `RecordStore` to
   `restore_capability_with`, which makes a record single-use across kernels and
-  restarts; without one the record is single-use per process.
+  restarts; `restore_capability` refuses a restore with no store at all
+  (RPC-04), and the single-process-only path is the explicit
+  `restore_capability_in_process_only`.
 - `CapabilityRecord::from_json` is a parser, not a verifier: it accepts a record
-  with no seal. `restore_capability` is the only path that turns a record into
+  with no seal. `restore_capability_with` is the only path that turns a record into
   authority, and it checks the seal, the tombstone, the binding and the clock
   first. The attribute bridge it uses is crate-internal for that reason.
 - A capability's budget bounds its whole subtree even after the parent handle is

@@ -117,7 +117,7 @@ fn a_wall_clock_record_does_not_restore_unbounded_in_virtual_mode() {
     target.register(Box::new(Echo));
     let peer = admitted(b"peer");
     let error = target
-        .restore_capability(&record, &peer)
+        .restore_capability_in_process_only(&record, &peer)
         .expect_err("a wall-clock deadline cannot be read in virtual time");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }
@@ -275,7 +275,7 @@ fn restore_refuses_an_ambiguous_provider_name() {
     target.register(Box::new(Echo)); // same name
     let peer = admitted(b"peer");
     let error = target
-        .restore_capability(&record, &peer)
+        .restore_capability_in_process_only(&record, &peer)
         .expect_err("two providers answer to one name");
     assert_eq!(error.code(), "rpc/persistence", "{error}");
 }

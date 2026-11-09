@@ -161,7 +161,7 @@ fn an_unsealed_record_parses_but_never_restores() {
     assert!(parsed.seal.is_none());
     // The authority comes only from the audited path, which checks the seal.
     let error = agent
-        .restore_capability(&parsed, &admitted(b"owner"))
+        .restore_capability_in_process_only(&parsed, &admitted(b"owner"))
         .expect_err("an unsealed record is not authority");
     assert_eq!(error.code(), "rpc/persistence");
 }
