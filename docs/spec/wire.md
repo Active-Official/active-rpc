@@ -323,7 +323,7 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
 | `http/read:truncated`, `http/read:truncated-body` | the peer closed before a full line or body arrived |
 | `http/<status>` | the endpoint answered a status outside 2xx (3xx included: the adapter does not follow redirects) |
-| `rpc/tool-policy` | the base is not `http://host:port` with a printable scheme and authority (a scheme other than `http`, a path, query or fragment, a control character, userinfo, no authority, no port, a port outside `1..=65535`, or a host that is not a DNS name or an IP literal); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; or the call carries a secret or a path scope the adapter cannot enforce |
+| `rpc/tool-policy` | the base is not `http://host:port` with a printable scheme and authority (a scheme other than `http`, a path, query or fragment, a control character, userinfo, no authority, no port, a port outside `1..=65535`, or a host that is not a DNS name or an IP literal); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; a resolved address is not diallable under the tool's dial policy (private, link-local, shared, unspecified, multicast, reserved, documentation, benchmarking, or an IPv6 translation or tunnel prefix, unless the operator opted in); or the call carries a secret or a path scope the adapter cannot enforce |
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `content-length` only for a method defined to carry content (`POST`, `PUT`,
@@ -333,11 +333,29 @@ grant is `rpc/budget-exceeded` before the connection, and one past the adapter's
 extra bytes make simple servers and intermediaries reset the connection instead
 of answering. The `max_wall_ms` grant (clamped to 10 s) is **one deadline** for
 the exchange from connect onward: connect, write, every header line and the body.
-Resolution of the base URL happens before the deadline starts and uses the
-system resolver’s own timeout, because the endpoint is the operator’s, not the
-peer’s. A server that drips a byte per timeout period cannot stretch the
+Resolution of the base URL happens under the same deadline, on a
+short-lived resolver thread the deadline waits on: a slow resolver used to
+burn unbounded time outside the grant, so the wall grant did not bound the
+call (RPC-32). A resolution that outlives the deadline is `rpc/timeout`,
+and the rest of the exchange then has no time left. The base URL is
+resolved once per call and the returned addresses are the only ones
+dialled, so a name that retargets between resolution and dial (DNS
+rebinding) cannot change the target mid-call. A server that drips a byte per timeout period cannot stretch the
 ceiling. A HEAD,
-204 or 304 reply is read as bodyless whatever its headers say. A base must be `http://host:port` and nothing else: a path,
+204 or 304 reply is read as bodyless whatever its headers say. Every resolved
+address must be diallable under the tool's dial policy before any socket is
+opened, or the call is refused with `rpc/tool-policy`: by default only
+globally routable addresses and loopback are diallable. A resolved address
+that is private, link-local (including the cloud-metadata address
+169.254.169.254), shared, unspecified, multicast, reserved, documentation,
+benchmarking, or under an IPv6 translation or tunnel prefix is refused, and
+one refused record poisons the whole call — a name that resolves to a mix of
+allowed and refused addresses is refused whole. An IPv4-mapped or
+IPv4-compatible IPv6 literal is classified by the IPv4 it spells.
+`HttpTool::with_allow_non_public(true)` opts a deliberately internal
+endpoint into every non-public class at once, and
+`HttpTool::with_allow_loopback(false)` forbids even loopback; the two flags
+are independent. A base must be `http://host:port` and nothing else: a path,
 query or fragment would either be dropped (retargeting the request at another
 resource on the same authority) or concatenated with every request path, a
 control character would forge a request head or a log line, and any other shape

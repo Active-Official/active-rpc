@@ -2150,6 +2150,14 @@ impl<T: McpTransport> Provider for McpSession<T> {
 /// The allowlist is `(METHOD, path)` pairs. There is no redirect following, no
 /// chunked encoding, and the body is bounded by `max_body`. A URL outside the
 /// allowlist is `rpc/tool-policy`.
+///
+/// The dial is bounded too: a base URL is resolved once per call under the
+/// call's wall deadline, and every resolved address must be diallable under
+/// the tool's dial policy before any socket is opened (RPC-32). By default
+/// only globally routable addresses and loopback are diallable; every other
+/// resolved address is refused with `rpc/tool-policy`. An operator that
+/// points the tool at an internal service opts in explicitly with
+/// [`HttpTool::with_allow_non_public`].
 pub struct HttpTool {
     /// Base URL, e.g. `http://127.0.0.1:8080`.
     /// The endpoint this tool can reach. Private: a caller that assigned a
@@ -2165,6 +2173,25 @@ pub struct HttpTool {
     max_body: usize,
     /// Maximum request bytes.
     max_request: usize,
+    /// Whether loopback addresses may be dialled (default `true`).
+    ///
+    /// Loopback is the carve-out the repo's own stub servers and every
+    /// loopback deployment rely on: refusing it by default would break
+    /// them all, so it stays allowed unless the operator forbids it with
+    /// [`HttpTool::with_allow_loopback`] (RPC-32).
+    allow_loopback: bool,
+    /// Whether non-public, non-loopback addresses may be dialled (default
+    /// `false`).
+    ///
+    /// An operator that points this tool at an internal service opts in
+    /// explicitly with [`HttpTool::with_allow_non_public`]. The opt-in
+    /// admits every non-public class at once — private, link-local
+    /// (including the cloud-metadata address 169.254.169.254), shared,
+    /// unspecified, multicast, reserved, documentation, benchmarking, and
+    /// the IPv6 translation/tunnel prefixes — because the operator is
+    /// saying "this endpoint is internal", not "this one range is fine"
+    /// (RPC-32).
+    allow_non_public: bool,
     /// Calls served.
     pub calls: u64,
     /// Whether the last exchange put bytes on the wire. A refusal after that
@@ -2225,6 +2252,8 @@ impl std::fmt::Debug for HttpTool {
             .field("allow", &allow)
             .field("max_body", &self.max_body)
             .field("max_request", &self.max_request)
+            .field("allow_loopback", &self.allow_loopback)
+            .field("allow_non_public", &self.allow_non_public)
             .field("calls", &self.calls)
             .finish()
     }
@@ -2258,6 +2287,31 @@ impl HttpTool {
     /// Set the request ceiling, clamped at use like the constructor's default.
     pub fn with_max_request(mut self, max_request: usize) -> Self {
         self.max_request = max_request;
+        self
+    }
+
+    /// Allow or forbid dialling loopback addresses (default `true`).
+    ///
+    /// Loopback stays allowed by default because the repo's own stub
+    /// servers and every loopback deployment dial it; an operator that
+    /// wants even loopback refused sets this to `false`. The flag is
+    /// independent of [`HttpTool::with_allow_non_public`]: opting into
+    /// non-public addresses does not reinstate loopback once it is
+    /// forbidden here (RPC-32).
+    pub fn with_allow_loopback(mut self, allow: bool) -> Self {
+        self.allow_loopback = allow;
+        self
+    }
+
+    /// Allow or forbid dialling non-public, non-loopback addresses
+    /// (default `false`).
+    ///
+    /// Set this to `true` only for a tool whose endpoint is deliberately
+    /// internal: it admits every non-public class at once, including the
+    /// cloud-metadata address, so it must never be set for a tool whose
+    /// base host comes from anywhere but the operator (RPC-32).
+    pub fn with_allow_non_public(mut self, allow: bool) -> Self {
+        self.allow_non_public = allow;
         self
     }
 
@@ -2419,6 +2473,8 @@ impl HttpTool {
                 .collect(),
             max_body: 1 << 20,
             max_request: 1 << 20,
+            allow_loopback: true,
+            allow_non_public: false,
             calls: 0,
             after_send: false,
             base_invalid,
@@ -2453,6 +2509,169 @@ impl HttpTool {
             max_arg_bytes: ((self.max_request.min(MAX_REQUEST_BYTES) as u64) / 6)
                 .saturating_sub(256),
             allow_process: false,
+        }
+    }
+
+    /// Whether `ip` may be dialled under this tool's dial policy (RPC-32).
+    ///
+    /// Loopback is governed by `allow_loopback` alone; a globally routable
+    /// address is always diallable; anything else needs `allow_non_public`.
+    /// The two flags are independent: opting into non-public addresses
+    /// never reinstates loopback once it is forbidden.
+    fn dial_policy_allows(
+        ip: std::net::IpAddr,
+        allow_loopback: bool,
+        allow_non_public: bool,
+    ) -> bool {
+        // `to_ipv4` maps `::1` to `0.0.0.1`, which is neither loopback
+        // nor public — so loopback is decided on the address as given,
+        // before the mapping is consulted. (The unit test caught this:
+        // `::1` was refused until this check moved first.)
+        if ip.is_loopback() {
+            return allow_loopback;
+        }
+        // An IPv4-mapped (`::ffff:10.0.0.1`) or IPv4-compatible
+        // (`::10.0.0.1`) IPv6 literal spells an IPv4 address: classify the
+        // IPv4 it spells, or the mapping smuggles a private address past
+        // the check in the other direction. `to_ipv4` covers both forms;
+        // `::1` never reaches it, because the loopback check above already
+        // decided it.
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4() {
+                Some(v4) => std::net::IpAddr::V4(v4),
+                None => std::net::IpAddr::V6(v6),
+            },
+            v4 => v4,
+        };
+        if ip.is_loopback() {
+            return allow_loopback;
+        }
+        if Self::ip_is_public(ip) {
+            return true;
+        }
+        allow_non_public
+    }
+
+    /// Whether `ip` is a globally routable unicast address (RPC-32).
+    ///
+    /// The table is the IANA special-purpose registries, written out
+    /// instead of calling `IpAddr::is_global`: that predicate is still
+    /// behind the `ip` feature on this toolchain (rustc 1.99.1), and a
+    /// security boundary must not depend on a std predicate whose meaning
+    /// can move under it without the code changing. Every range is pinned
+    /// by a unit test.
+    fn ip_is_public(ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => Self::ipv4_is_public(v4),
+            std::net::IpAddr::V6(v6) => Self::ipv6_is_public(v6),
+        }
+    }
+
+    /// Whether an IPv4 address is globally routable: every IANA IPv4
+    /// special-purpose range (RFC 6890 / RFC 8190) is denied.
+    fn ipv4_is_public(addr: std::net::Ipv4Addr) -> bool {
+        let [a, b, c, _d] = addr.octets();
+        !(a == 0 // 0.0.0.0/8: "this network"
+            || a == 10 // 10.0.0.0/8: private
+            || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10: shared / CGNAT
+            || a == 127 // 127.0.0.0/8: loopback
+            || (a == 169 && b == 254) // 169.254.0.0/16: link-local
+            || (a == 172 && (16..=31).contains(&b)) // 172.16.0.0/12: private
+            || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24: IETF protocol assignments
+            || (a == 192 && b == 0 && c == 2) // 192.0.2.0/24: documentation
+            || (a == 192 && b == 31 && c == 196) // 192.31.196.0/24: AS112
+            || (a == 192 && b == 52 && c == 193) // 192.52.193.0/24: AMT
+            || (a == 192 && b == 168) // 192.168.0.0/16: private
+            || (a == 192 && b == 175 && c == 48) // 192.175.48.0/24: AS112
+            || (a == 198 && (18..=19).contains(&b)) // 198.18.0.0/15: benchmarking
+            || (a == 198 && b == 51 && c == 100) // 198.51.100.0/24: documentation
+            || (a == 203 && b == 0 && c == 113) // 203.0.113.0/24: documentation
+            || a >= 224) // 224.0.0.0/4: multicast; 240.0.0.0/4: reserved
+    }
+
+    /// Whether an IPv6 address is globally routable: every IANA IPv6
+    /// special-purpose range (RFC 6890 / RFC 8190) is denied.
+    fn ipv6_is_public(addr: std::net::Ipv6Addr) -> bool {
+        let s = addr.segments();
+        !(addr.is_loopback()
+            || addr.is_unspecified()
+            || addr.is_multicast()
+            || addr.is_unique_local() // fc00::/7: unique-local
+            || addr.is_unicast_link_local() // fe80::/10: link-local
+            || (s[0] == 0x2001 && s[1] < 0x0200) // 2001::/23: IETF protocol assignments
+            || (s[0] == 0x2001 && s[1] == 0x0db8) // 2001:db8::/32: documentation
+            || s[0] == 0x2002 // 2002::/16: 6to4
+            || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
+            // 64:ff9b::/96: NAT64 well-known prefix
+            || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1)
+            // 64:ff9b:1::/48: NAT64 local-use prefix
+            || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0))
+        // 100::/64: discard-only
+    }
+
+    /// Resolve `base` once, under `deadline` (RPC-32).
+    ///
+    /// [`std::net::ToSocketAddrs`] blocks with no timeout of its own, so
+    /// the resolution runs on a short-lived thread and the caller waits
+    /// for it with only the time the deadline leaves. A resolution that
+    /// outlives the deadline is `rpc/timeout`, and the rest of the
+    /// exchange then has no time left — so the resolution time is charged
+    /// against the same wall grant as the connect and the read. The
+    /// thread owns only the base copy and the sender: on a timeout it is
+    /// left to finish and exit by itself, and its answer is dropped with
+    /// the receiver. It holds no socket, no lock and no shared state, so
+    /// nothing leaks but a transient thread.
+    fn resolve_under_deadline(
+        base: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<std::net::SocketAddr>> {
+        // The system resolver yields an iterator, not a vector: collect it
+        // on the resolver thread, so the pinned list is complete before
+        // the caller waits on it.
+        Self::resolve_with(base, deadline, |name| {
+            std::net::ToSocketAddrs::to_socket_addrs(name).map(|iter| iter.collect())
+        })
+    }
+
+    /// [`Self::resolve_under_deadline`] with the resolver as a parameter,
+    /// so the deadline enforcement is unit-testable without a slow DNS:
+    /// the test passes a resolver that sleeps, and the production path
+    /// passes the system resolver. The seam is the same code path in both
+    /// cases — the resolver runs on the thread and the caller waits with
+    /// `recv_timeout` — so the test pins the mechanism, not a copy of it.
+    fn resolve_with(
+        base: &str,
+        deadline: std::time::Instant,
+        resolve: impl FnOnce(&str) -> std::io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
+    ) -> Result<Vec<std::net::SocketAddr>> {
+        // No time left means no thread: a resolver that is never started
+        // cannot outlive the deadline it was never given.
+        let left = remaining_until(deadline)?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let owned = base.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("active-rpc-http-resolve".to_string())
+            .spawn(move || {
+                let _ = sender.send(resolve(&owned));
+            });
+        // Dropping the handle detaches the thread: on a timeout it
+        // finishes on its own and its answer is dropped with the receiver.
+        let _handle = match spawned {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Err(Error::Provider {
+                    code: format!("http/resolve:{error}"),
+                });
+            }
+        };
+        match receiver.recv_timeout(left) {
+            Ok(outcome) => outcome.map_err(|error| Error::Provider {
+                code: format!("http/resolve:{error}"),
+            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Error::Timeout),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::Provider {
+                code: "http/resolve: resolver thread ended without an answer".to_string(),
+            }),
         }
     }
 
@@ -2531,17 +2750,13 @@ impl HttpTool {
             });
         }
         let header_cap = MAX_HTTP_HEADER_BYTES.min(max_body.max(1));
-        // Resolution is not peer-controlled: the base URL is the operator's
-        // endpoint, so the system resolver's own timeout applies here and its
-        // time is not charged against the grant (round 16, F-3).
-        let addresses: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(base)
-            .map_err(|error| Error::Provider {
-                code: format!("http/resolve:{error}"),
-            })?
-            .collect();
-        // The adapter's fixed ten seconds and the capability's wall ceiling both
-        // bound the wait; the smaller one wins. This is one deadline for the
-        // whole exchange, not a per-syscall timeout: a timeout bounds one
+        // The deadline is armed before resolution, and resolution runs
+        // under it: a slow resolver used to burn unbounded time outside
+        // the grant (round 16, F-3 charged it to nobody), so the wall
+        // grant did not bound the call (RPC-32). The adapter's fixed ten
+        // seconds and the capability's wall ceiling both bound the wait;
+        // the smaller one wins. This is one deadline for the whole
+        // exchange, not a per-syscall timeout: a timeout bounds one
         // `read`, so a server that drips one byte per period would otherwise
         // hold the dispatch thread for (bytes x timeout).
         let deadline = std::time::Instant::now()
@@ -2550,6 +2765,21 @@ impl HttpTool {
                     .min(std::time::Duration::from_secs(10)),
             )
             .unwrap_or_else(std::time::Instant::now);
+        // Resolution is once per call, and the returned addresses are the
+        // only ones dialled: a name that retargets between resolution and
+        // dial (DNS rebinding) cannot change the target mid-call (RPC-32).
+        let addresses = Self::resolve_under_deadline(base, deadline)?;
+        // Every resolved address must be diallable under this tool's
+        // policy before any socket is opened: one refused record poisons
+        // the whole call, so a name with a private record cannot smuggle
+        // it past the check on a later, allowed address (RPC-32).
+        if addresses.iter().any(|address| {
+            !Self::dial_policy_allows(address.ip(), self.allow_loopback, self.allow_non_public)
+        }) {
+            return Err(Error::ToolPolicy(
+                "the base URL resolves to an address this tool is not allowed to dial",
+            ));
+        }
         let mut connected = None;
         let mut last = None;
         for address in addresses {
@@ -4276,5 +4506,212 @@ mod write_tests {
         assert!(sent > 0, "the bytes already written are reported");
         assert!(sent < payload.len(), "the write did not complete");
         let _ = server.join();
+    }
+}
+
+#[cfg(test)]
+mod http_dial_policy_tests {
+    use super::HttpTool;
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    /// The default policy, one address per IANA special-purpose range plus
+    /// the boundary address on each side of it: the table in
+    /// [`HttpTool::ipv4_is_public`] / [`HttpTool::ipv6_is_public`] is a
+    /// security boundary, so a range that drifts — a new std predicate, a
+    /// typo in an octet — must fail loudly here, not silently dial.
+    /// `true` means "diallable by default": globally routable, or loopback
+    /// under the loopback carve-out.
+    #[test]
+    fn the_default_policy_admits_only_public_and_loopback_addresses() {
+        let cases: &[(&str, bool)] = &[
+            // Loopback (carve-out).
+            ("127.0.0.1", true),
+            ("127.255.255.255", true),
+            ("::1", true),
+            // IPv4-mapped / IPv4-compatible loopback spells 127.0.0.1.
+            ("::ffff:127.0.0.1", true),
+            ("::127.0.0.1", true),
+            // Globally routable.
+            ("8.8.8.8", true),
+            ("1.1.1.1", true),
+            ("9.255.255.255", true),
+            ("11.0.0.0", true),
+            ("172.15.255.255", true),
+            ("172.32.0.0", true),
+            ("192.167.255.255", true),
+            ("192.169.0.0", true),
+            ("223.255.255.255", true),
+            ("2606:4700:4700::1111", true),
+            ("2001:4860::1", true),
+            // Just outside the 2001::/23 IETF block: globally routable.
+            ("2001:200::1", true),
+            // Just outside the 100::/64 discard block: globally routable.
+            ("100:0:0:1::", true),
+            // "This network".
+            ("0.0.0.0", false),
+            ("0.1.2.3", false),
+            // Private.
+            ("10.0.0.1", false),
+            ("172.16.0.1", false),
+            ("172.31.255.255", false),
+            ("192.168.1.69", false),
+            // Shared / CGNAT.
+            ("100.63.255.255", true),
+            ("100.64.0.0", false),
+            ("100.102.113.94", false),
+            ("100.127.255.255", false),
+            ("100.128.0.0", true),
+            // Link-local (including the cloud-metadata address).
+            ("169.254.169.254", false),
+            ("169.254.1.1", false),
+            // IETF protocol assignments.
+            ("192.0.0.1", false),
+            ("192.0.0.170", false),
+            // Documentation.
+            ("192.0.2.1", false),
+            ("198.51.100.1", false),
+            ("203.0.113.1", false),
+            // AS112 / AMT.
+            ("192.31.196.1", false),
+            ("192.52.193.1", false),
+            ("192.175.48.1", false),
+            // Benchmarking.
+            ("198.18.0.1", false),
+            ("198.19.255.255", false),
+            // Multicast / reserved.
+            ("224.0.0.1", false),
+            ("239.255.255.255", false),
+            ("240.0.0.1", false),
+            ("255.255.255.255", false),
+            // IPv6 special-purpose.
+            ("::", false),
+            ("ff02::1", false),
+            ("fc00::1", false),
+            ("fdff::1", false),
+            ("fe80::1", false),
+            ("febf::1", false),
+            ("2001::1", false),
+            ("2001:1ff::1", false),
+            ("2001:2::1", false),
+            ("2001:3::1", false),
+            ("2001:4:112::1", false),
+            ("2001:10::1", false),
+            ("2001:db8::1", false),
+            ("2002::1", false),
+            ("64:ff9b::1.2.3.4", false),
+            ("64:ff9b:1::1", false),
+            ("100::1", false),
+            ("100::ffff:ffff:ffff:ffff", false),
+            // IPv4-mapped / IPv4-compatible private spells 10.0.0.1.
+            ("::ffff:10.0.0.1", false),
+            ("::10.0.0.1", false),
+        ];
+        for (text, allowed) in cases {
+            let ip = IpAddr::from_str(text).unwrap_or_else(|_| panic!("{text} parses"));
+            assert_eq!(
+                HttpTool::dial_policy_allows(ip, true, false),
+                *allowed,
+                "{text} under the default policy"
+            );
+        }
+    }
+
+    /// The two flags are independent: the non-public opt-in admits every
+    /// refused class but loopback, and forbidding loopback refuses it even
+    /// with the opt-in on.
+    #[test]
+    fn the_opt_ins_are_independent() {
+        let private = IpAddr::from_str("10.0.0.1").expect("private");
+        let loopback = IpAddr::from_str("127.0.0.1").expect("loopback");
+        let public = IpAddr::from_str("8.8.8.8").expect("public");
+        assert!(
+            HttpTool::dial_policy_allows(private, true, true),
+            "the opt-in admits a private address"
+        );
+        assert!(
+            HttpTool::dial_policy_allows(loopback, true, true),
+            "loopback stays allowed with the opt-in on"
+        );
+        assert!(
+            !HttpTool::dial_policy_allows(loopback, false, true),
+            "forbidding loopback refuses it even with the opt-in on"
+        );
+        assert!(
+            HttpTool::dial_policy_allows(public, false, false),
+            "a public address needs neither flag"
+        );
+    }
+
+    /// A resolver that answers at once returns its addresses: the thread
+    /// and the channel add no failure of their own.
+    #[test]
+    fn a_fast_resolver_returns_its_addresses() {
+        let wanted: Vec<std::net::SocketAddr> = vec!["127.0.0.1:80".parse().expect("addr")];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let found = HttpTool::resolve_with("http://127.0.0.1:80", deadline, move |_| Ok(wanted))
+            .expect("a fast resolver answers");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].ip().to_string(), "127.0.0.1");
+    }
+
+    /// A resolver that fails reports its failure as `http/resolve`, not as
+    /// a timeout and not as a connect failure.
+    #[test]
+    fn a_failing_resolver_reports_http_resolve() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let error = HttpTool::resolve_with("http://example.invalid:80", deadline, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such host",
+            ))
+        })
+        .expect_err("a failing resolver fails");
+        assert_eq!(
+            error.provider_code(),
+            Some("http/resolve:no such host"),
+            "{error}"
+        );
+    }
+
+    /// A resolver that sleeps past the deadline is `rpc/timeout`, and the
+    /// wait ends at the deadline instead of at the resolver: this is the
+    /// deterministic half of the resolution-charging fix (RPC-32 leg b).
+    /// The sleeping thread is left to finish by itself; the test only
+    /// asserts the caller is back by the deadline.
+    #[test]
+    fn a_slow_resolver_is_a_timeout_at_the_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let error = HttpTool::resolve_with("http://slow.invalid:80", deadline, |_| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            Ok(Vec::new())
+        })
+        .expect_err("a slow resolver times out");
+        assert_eq!(error.code(), "rpc/timeout", "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(2000),
+            "the caller waited {:?} past a 100 ms deadline",
+            started.elapsed()
+        );
+    }
+
+    /// A deadline that has already passed starts no resolver thread at
+    /// all: the refusal is immediate and the resolver is never invoked.
+    #[test]
+    fn an_elapsed_deadline_starts_no_resolver() {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&called);
+        let deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let error = HttpTool::resolve_with("http://127.0.0.1:80", deadline, move |_| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        })
+        .expect_err("an elapsed deadline refuses");
+        assert_eq!(error.code(), "rpc/timeout", "{error}");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "the resolver must never run past its deadline"
+        );
     }
 }
