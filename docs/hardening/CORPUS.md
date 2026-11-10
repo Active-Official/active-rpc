@@ -46,7 +46,7 @@ omits a target the manifest declares.
 | `fuzz_topic_policy` | `fuzz_targets/fuzz_topic_policy.rs` | topic masks | publish exactly inside the grant, attenuation never widens |
 | `fuzz_receipt_log` | `fuzz_targets/fuzz_receipt_log.rs` | real log plus three variants | reader total and canonical, writer/reader agreement |
 | `fuzz_wasm_module` | `fuzz_targets/fuzz_wasm_module.rs` | four module classes | construction total, oversize module and huge table refused, bounded run with an embedder-seeded clock and entropy disabled |
-| `fuzz_domain_module` | `fuzz_targets/fuzz_domain_module.rs` | module images and paths | the image parser is total; every domain method answers or refuses |
+| `fuzz_domain_module` | `fuzz_targets/fuzz_domain_module.rs` | module images and paths | the image parser is total; every domain method answers or refuses (`evaluate` / `patch` time-boxed on small images, RPC-26) |
 | `fuzz_persistence_record` | `fuzz_targets/fuzz_persistence_record.rs` | sealed and edited records | parser total and canonical, seal only under its own key |
 
 `common.rs` holds the deterministic `Echo` provider and budget helpers; it is

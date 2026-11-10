@@ -104,3 +104,30 @@ pub fn budget_from(data: &[u8]) -> Budget {
         max_value_size: 1 + byte(6) % 4096,
     }
 }
+
+/// True when an answer a caller can read carries `secret` anywhere.
+///
+/// The redaction oracle's old check formatted the answer and searched the
+/// text. That is blind for `Value::Module`: its `Debug` prints only
+/// `Module(<N bytes>)`, never the bytes, so a secret leaked inside a
+/// `subgraph` / `patch` module answer was invisible to it (RPC-26). Module
+/// bytes are therefore searched as bytes; text as text; map keys are
+/// searched too, so this subsumes the old formatted check; containers
+/// recurse. The `Secret` marker carries no content and never counts as a
+/// leak, and an empty secret matches nothing.
+pub fn answer_leaks_secret(value: &Value, secret: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    match value {
+        Value::Text(text) => text.contains(secret),
+        Value::Module(bytes) => bytes
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()),
+        Value::List(items) => items.iter().any(|item| answer_leaks_secret(item, secret)),
+        Value::Map(entries) => entries
+            .iter()
+            .any(|(key, item)| key.contains(secret) || answer_leaks_secret(item, secret)),
+        _ => false,
+    }
+}

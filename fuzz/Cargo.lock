@@ -40,6 +40,10 @@ version = "2.3.0"
 dependencies = [
  "active-core",
  "active-infinity",
+ "active-rpc-dir-sync",
+ "active-rpc-file-identity",
+ "active-rpc-liveness",
+ "active-rpc-process-tree",
  "blake3",
  "bytes",
  "getrandom 0.3.4",
@@ -57,6 +61,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "active-rpc-dir-sync"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "active-rpc-file-identity"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "active-rpc-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -64,6 +82,21 @@ dependencies = [
  "active-rpc",
  "blake3",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "active-rpc-liveness"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "active-rpc-process-tree"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
