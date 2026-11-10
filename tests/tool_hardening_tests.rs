@@ -3656,3 +3656,135 @@ fn a_process_mint_without_a_policy_is_gated_by_the_tool_policy() {
     };
     assert_eq!(err.code(), "rpc/tool-policy", "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// RPC-45: `env_clear()` drops `SystemRoot` on Windows.
+// ---------------------------------------------------------------------------
+
+/// The parent's `SystemRoot`: the value the adapter must inject on Windows.
+#[cfg(windows)]
+fn rpc45_parent_systemroot() -> String {
+    std::env::var("SystemRoot").expect("the test host has a SystemRoot")
+}
+
+/// The stdout text of a `LocalProcess` answer.
+#[cfg(windows)]
+fn rpc45_stdout(response: Response) -> String {
+    let Response::Value(Value::Map(entries)) = response else {
+        panic!("a run returns a map: {response:?}");
+    };
+    match entries.get("stdout") {
+        Some(Value::Text(text)) => text.clone(),
+        other => panic!("unexpected stdout {other:?}"),
+    }
+}
+
+/// W2's `w2_rpc45_env_clear_drops_systemroot_windows` shape (a): `cmd /c
+/// echo %SystemRoot%` with the default (empty) env. Before the fix the child
+/// printed the literal `%SystemRoot%`, because the variable was absent, not
+/// empty; the adapter now injects the parent's `SystemRoot` after the
+/// caller's entries, so a caller that passes nothing still gets a child
+/// that can start.
+#[cfg(windows)]
+#[test]
+fn a_cleared_env_still_gives_cmd_its_systemroot() {
+    let mut tool = LocalProcess::new(
+        "C:\\Windows\\System32\\cmd.exe",
+        &["/C", "echo %SystemRoot%"],
+    )
+    .expect("an absolute program");
+    assert!(tool.env.is_empty(), "the test passes no env at all");
+    let mut call = Call::new("run", vec![Arg::text("/C"), Arg::text("echo %SystemRoot%")]);
+    call.tool_allows_process = true;
+    let response = tool.invoke(0, &call).expect("cmd answers");
+    let stdout = rpc45_stdout(response);
+    let expected = rpc45_parent_systemroot();
+    assert!(
+        !stdout.contains("%SystemRoot%"),
+        "the child saw no SystemRoot at all: {stdout:?}"
+    );
+    assert_eq!(stdout.trim(), expected, "stdout: {stdout:?}");
+}
+
+/// W2's `w2_rpc45_env_clear_drops_systemroot_windows` shape (b): PowerShell
+/// with the cleared env failed to start (`Internal Windows PowerShell error.
+/// Loading managed Windows PowerShell failed with error 8007000d`), so the
+/// call answered with empty stdout. With only the injected `SystemRoot`
+/// added, PowerShell starts and answers.
+#[cfg(windows)]
+#[test]
+fn a_cleared_env_still_starts_powershell() {
+    let root = rpc45_parent_systemroot();
+    let program = format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let script = "Write-Output $env:SystemRoot";
+    let mut tool = LocalProcess::new(&program, &["-NoProfile", "-Command", script])
+        .expect("an absolute program");
+    assert!(tool.env.is_empty(), "the test passes no env at all");
+    let mut call = Call::new(
+        "run",
+        vec![
+            Arg::text("-NoProfile"),
+            Arg::text("-Command"),
+            Arg::text(script),
+        ],
+    );
+    call.tool_allows_process = true;
+    let response = tool.invoke(0, &call).expect("powershell answers");
+    let stdout = rpc45_stdout(response);
+    assert_eq!(stdout.trim(), root, "stdout: {stdout:?}");
+}
+
+/// W2's `w2_rpc45_stdio_powershell_server_fails_without_systemroot` (filed
+/// as W2-NF-01, the stdio half of the same finding): a PowerShell MCP server
+/// through `StdioTransport` exited at once and the session saw `mcp/eof`,
+/// because `StdioTransport::spawn` also just called `.env_clear()` — the
+/// audit's comment at `tool.rs:1024` acknowledged the need but neither
+/// adapter injected anything. The server reads one line and answers it
+/// with a canned JSON-RPC result.
+#[cfg(windows)]
+#[test]
+fn a_cleared_env_still_starts_a_powershell_mcp_server() {
+    use active_rpc::tool::{McpTransport, StdioTransport};
+
+    let root = rpc45_parent_systemroot();
+    let program = format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let script = "$line = [Console]::In.ReadLine(); [Console]::Out.WriteLine('{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}'); [Console]::Out.Flush()";
+    let env = std::collections::BTreeMap::new();
+    let mut transport =
+        StdioTransport::spawn(&program, &["-NoProfile", "-Command", script], &env).expect("spawn");
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}")
+        .expect("send");
+    let line = transport
+        .recv_line_within(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ))
+        .expect("an answer line");
+    assert!(line.contains("\"result\""), "answer: {line:?}");
+}
+
+/// The injection is read-only, not caller-controlled: a caller-supplied
+/// `SystemRoot` must not reach the child. Before the fix the caller's value
+/// won — a `C:\\Bogus` entry made `cmd` echo `C:\\Bogus` — so a caller could
+/// redirect the child at a spoofed system root. The parent's value is
+/// applied after the caller's entries and always wins.
+#[cfg(windows)]
+#[test]
+fn a_caller_supplied_systemroot_does_not_reach_the_child() {
+    let mut tool = LocalProcess::new(
+        "C:\\Windows\\System32\\cmd.exe",
+        &["/C", "echo %SystemRoot%"],
+    )
+    .expect("an absolute program");
+    tool.env
+        .insert("SystemRoot".to_string(), "C:\\Bogus".to_string());
+    let mut call = Call::new("run", vec![Arg::text("/C"), Arg::text("echo %SystemRoot%")]);
+    call.tool_allows_process = true;
+    let response = tool.invoke(0, &call).expect("cmd answers");
+    let stdout = rpc45_stdout(response);
+    assert_eq!(
+        stdout.trim(),
+        rpc45_parent_systemroot(),
+        "stdout: {stdout:?}"
+    );
+}

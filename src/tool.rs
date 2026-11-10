@@ -493,6 +493,32 @@ fn valid_env_entry(key: &str, value: &str) -> bool {
     !key.is_empty() && !key.contains('=') && !key.contains('\0') && !value.contains('\0')
 }
 
+/// Inject the parent's `SystemRoot` into a cleared child environment on
+/// Windows (RPC-45).
+///
+/// Both spawn paths clear the environment, and most Windows children fail
+/// to start without `SystemRoot`: `cmd` expands it to nothing and
+/// PowerShell refuses to load at all. The value comes from the parent
+/// process, never from the caller's env map: it is applied after the
+/// caller's entries, so a caller-supplied `SystemRoot` cannot redirect the
+/// child at a spoofed system root — and a caller that passes nothing still
+/// gets a child that can start. A parent without `SystemRoot` (not a real
+/// Windows configuration) injects nothing, and the child fails exactly as
+/// it did before the fix: no default is invented, because a hardcoded
+/// `C:\Windows` would be wrong on a system rooted elsewhere. The value is
+/// the system root path, not a secret, so there is nothing to redact.
+#[cfg(windows)]
+fn inject_system_root(command: &mut Command) {
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+}
+
+/// Unix has no `SystemRoot`: the injection is a no-op, so both spawn paths
+/// call the same helper and cannot drift apart (RPC-45).
+#[cfg(not(windows))]
+fn inject_system_root(_command: &mut Command) {}
+
 // ---------------------------------------------------------------------------
 // MCP
 // ---------------------------------------------------------------------------
@@ -1161,8 +1187,11 @@ impl StdioTransport {
     /// what the caller passes).
     ///
     /// The environment is cleared, so the caller supplies everything the server
-    /// needs. On Windows that includes `SystemRoot`: a process started without
-    /// it exits at once, and the session sees `mcp/eof` before its first line.
+    /// needs — except `SystemRoot` on Windows, which the adapter injects from
+    /// the parent process (RPC-45): a process started without it exits at
+    /// once, and the session sees `mcp/eof` before its first line. The
+    /// injection happens after the caller's entries, so a caller-supplied
+    /// `SystemRoot` cannot redirect the server at a spoofed system root.
     /// Reads happen on a thread, so [`McpTransport::recv_line_within`] can
     /// abandon a server that stays silent.
     ///
@@ -1214,6 +1243,10 @@ impl StdioTransport {
             }
             command.env(key, value);
         }
+        // RPC-45: `SystemRoot` comes from the parent, after the caller's
+        // entries, so a caller cannot spoof it — and a caller that passes
+        // nothing still gets a server that can start on Windows.
+        inject_system_root(&mut command);
         // RPC-43: the pin is the content, not just the path. The hash
         // is re-verified immediately before the exec, so a binary
         // swapped in after the pin — in the gap the working-directory
@@ -4563,7 +4596,10 @@ pub struct LocalProcess {
     /// genuinely takes arbitrary arguments. The metacharacter guard
     /// still applies to arguments admitted only through the `"*"` rule.
     pub allow_any_arg: bool,
-    /// Environment variables the child inherits.
+    /// Environment variables the child inherits. On Windows `SystemRoot`
+    /// is always injected from the parent process at spawn time (RPC-45),
+    /// after these entries, so a value supplied here never reaches the
+    /// child: the parent's system root is read-only, not caller-controlled.
     pub env: BTreeMap<String, String>,
     /// Directory the child runs in. Pinned at construction (canonicalised) and
     /// never inherited at spawn time, so a later `chdir` in this process cannot
@@ -4981,6 +5017,10 @@ impl Provider for LocalProcess {
             }
             command.env(key, value);
         }
+        // RPC-45: `SystemRoot` comes from the parent, after the caller's
+        // entries, so a caller cannot spoof it — and a caller that passes
+        // nothing still gets a child that can start on Windows.
+        inject_system_root(&mut command);
         // Count admitted calls only (round 31, F7).
         self.calls += 1;
         let mut child = command.spawn().map_err(|error| Error::Provider {
