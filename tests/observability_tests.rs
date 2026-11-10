@@ -87,13 +87,18 @@ fn every_event(cap: CapId) -> Vec<Event> {
             lane,
             cap: Some(cap),
             code: "rpc/method-not-granted".to_string(),
+            method: Some("nope".to_string()),
         },
         Event::BatchDispatched {
             provider: ProviderId(1),
             jobs: 2,
             lane_count: 1,
         },
-        Event::JobCompleted { job: 9, lane },
+        Event::JobCompleted {
+            job: 9,
+            lane,
+            method: "echo".to_string(),
+        },
         Event::PromiseResolved(PromiseId(5)),
         Event::PromiseRejected {
             promise: PromiseId(6),
@@ -461,5 +466,218 @@ fn a_label_escapes_every_invisible_character() {
     assert_eq!(
         active_rpc::observability::label("rpc/revoked"),
         "rpc/revoked"
+    );
+}
+
+/// RPC-46 (W2 probe shape): one successful call and one refused call through
+/// the kernel. The trace must name the method on every call-lifecycle event —
+/// `call.queued`, `call.refused` and `job.completed` — and the charged
+/// argument bytes on the queued one, so incident response can tell from
+/// telemetry *which* tool was called or refused. The queued and completed
+/// labels must agree byte-for-byte, or a collector cannot join them.
+#[test]
+fn a_trace_names_the_method_on_queued_refused_and_completed() {
+    let agent = Agent::with_secret([0x70; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    let lane = agent.create_lane("rpc46", Budget::default()).expect("lane");
+    let promise = agent
+        .call(lane, &cap, "echo", vec![Arg::value(Value::text("hi"))])
+        .expect("call");
+    agent.run();
+    assert_eq!(promise.value().expect("value"), Value::text("hi"));
+    let error = agent
+        .call(lane, &cap, "nope", Vec::new())
+        .expect_err("an ungranted method is refused");
+    assert_eq!(error.code(), "rpc/method-not-granted");
+
+    let json: serde_json::Value = serde_json::from_str(&agent.trace_json()).expect("json array");
+    let events = json.as_array().expect("array");
+    // Schema v2 is the fix: a v2 field under a v1 declaration would leave
+    // consumers reading the old table.
+    assert!(
+        events.iter().all(|event| event["schema"] == SCHEMA),
+        "every record declares the schema it carries: {}",
+        agent.trace_json()
+    );
+    let queued = events
+        .iter()
+        .find(|event| event["event"] == "call.queued")
+        .expect("a queued event");
+    assert_eq!(queued["method"], "echo", "the queued call names its method");
+    assert!(
+        queued["args_bytes"].as_u64().unwrap_or(0) > 0,
+        "the queued call names the bytes it was charged for: {queued}"
+    );
+    let refused = events
+        .iter()
+        .find(|event| event["event"] == "call.refused")
+        .expect("a refused event");
+    assert_eq!(
+        refused["method"], "nope",
+        "the refused call names the method that was refused: {refused}"
+    );
+    let completed = events
+        .iter()
+        .find(|event| event["event"] == "job.completed")
+        .expect("a completed event");
+    assert_eq!(
+        completed["method"], "echo",
+        "the completed job names the method that ran: {completed}"
+    );
+    assert_eq!(
+        queued["method"], completed["method"],
+        "queued and completed agree byte-for-byte so a collector can join them"
+    );
+}
+
+/// RPC-46, decision 3: an over-long refused method is labelled, not omitted
+/// and not refused — the same escaped-prefix-plus-digest rule the queued
+/// event already uses, so two long names that share a prefix stay distinct
+/// on the refused side too, and the raw name never reaches the trace.
+#[test]
+fn an_over_long_refused_method_is_labelled_not_omitted() {
+    let agent = Agent::with_secret([0x71; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("rpc46-long", Budget::default())
+        .expect("lane");
+    let long = "m".repeat(200);
+    let error = agent
+        .call(lane, &cap, &long, Vec::new())
+        .expect_err("an over-long ungranted method is refused");
+    assert_eq!(error.code(), "rpc/method-not-granted");
+    let other = format!("{long}-other");
+    let _ = agent.call(lane, &cap, &other, Vec::new());
+
+    let trace = agent.trace_json();
+    assert!(
+        !trace.contains(&long),
+        "the raw over-long name never reaches the trace"
+    );
+    let json: serde_json::Value = serde_json::from_str(&trace).expect("json array");
+    let methods: Vec<&str> = json
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter(|event| event["event"] == "call.refused")
+        .filter_map(|event| event["method"].as_str())
+        .collect();
+    assert_eq!(
+        methods.len(),
+        2,
+        "both refusals name their method: {methods:?}"
+    );
+    for method in &methods {
+        assert!(
+            method.contains('#'),
+            "an over-long name carries the digest tail: {method}"
+        );
+        assert!(method.len() < long.len(), "the label is bounded: {method}");
+    }
+    assert_ne!(
+        methods[0], methods[1],
+        "two long names that share a prefix must not share a label: {methods:?}"
+    );
+}
+
+/// RPC-46: the projection carries the method label verbatim and the charged
+/// bytes, and omits the method exactly when the event has none.
+#[test]
+fn the_projection_carries_method_and_args_bytes() {
+    let cap = CapId([0xab; 16]);
+    let lane = LaneId(3);
+    let queued = project(
+        &Event::CallQueued {
+            job: 9,
+            lane,
+            cap,
+            method: "echo".to_string(),
+            args_bytes: 4,
+        },
+        0,
+    );
+    let json: serde_json::Value = serde_json::from_str(&queued.to_json()).expect("json");
+    assert_eq!(json["method"], "echo");
+    assert_eq!(json["args_bytes"], 4);
+    assert_eq!(queued.method(), Some("echo"));
+    assert_eq!(queued.args_bytes(), Some(4));
+
+    let refused = project(
+        &Event::CallRefused {
+            lane,
+            cap: Some(cap),
+            code: "rpc/method-not-granted".to_string(),
+            method: Some("nope".to_string()),
+        },
+        1,
+    );
+    let json: serde_json::Value = serde_json::from_str(&refused.to_json()).expect("json");
+    assert_eq!(json["method"], "nope");
+    assert!(
+        json.get("args_bytes").is_none(),
+        "a refused call was never charged"
+    );
+
+    let refused_without_call = project(
+        &Event::CallRefused {
+            lane,
+            cap: None,
+            code: "rpc/unknown-lane".to_string(),
+            method: None,
+        },
+        2,
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&refused_without_call.to_json()).expect("json");
+    assert!(json.get("method").is_none(), "no call, no method: {json}");
+
+    let completed = project(
+        &Event::JobCompleted {
+            job: 9,
+            lane,
+            method: "echo".to_string(),
+        },
+        3,
+    );
+    let json: serde_json::Value = serde_json::from_str(&completed.to_json()).expect("json");
+    assert_eq!(json["method"], "echo");
+    assert!(
+        json.get("args_bytes").is_none(),
+        "the bytes live on the queued record"
+    );
+}
+
+/// RPC-46, decision 2: a refusal that names no call names no method. The
+/// field is optional precisely so a send/recv refusal does not invent one.
+#[test]
+fn a_refusal_with_no_call_carries_no_method() {
+    let agent = Agent::with_secret([0x72; 32]);
+    let provider = agent.register(Box::new(Echo));
+    let _cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("cap");
+    let lane = agent
+        .create_lane("rpc46-nomethod", Budget::default())
+        .expect("lane");
+    let _ = agent
+        .recv(lane, ChannelId(999))
+        .expect_err("no such subscription");
+
+    let json: serde_json::Value = serde_json::from_str(&agent.trace_json()).expect("json array");
+    let refused = json
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|event| event["event"] == "call.refused")
+        .expect("a refused event");
+    assert!(
+        refused.get("method").is_none(),
+        "a refusal that names no call names no method: {refused}"
     );
 }

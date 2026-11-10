@@ -1310,13 +1310,22 @@ impl PlaneCore {
                 detail: format!("promise {} rejected", promise.0),
                 ..base
             },
-            Event::CallRefused { lane, cap, code } => UiEvent {
+            Event::CallRefused {
+                lane,
+                cap,
+                code,
+                method,
+            } => UiEvent {
                 category: category_for("call_refused").into(),
                 kind: "call_refused".into(),
                 lane: Some(format!("lane {}", lane.0)),
                 // A refusal that names no capability shows none: the zero id
                 // would look like a real one in the console.
                 capability: cap.map(|cap| cap.correlation_id()),
+                // The method is the bounded label the kernel records, so the
+                // console names the tool that was refused — and shows none
+                // for a refusal that names no call (RPC-46).
+                method: method.clone(),
                 code: Some(code.clone()),
                 detail: "call refused".into(),
                 ..base
@@ -1337,10 +1346,13 @@ impl PlaneCore {
                 detail: format!("tool refused: {reason}"),
                 ..base
             },
-            Event::JobCompleted { job, lane } => UiEvent {
+            Event::JobCompleted { job, lane, method } => UiEvent {
                 category: category_for("job").into(),
                 kind: "job".into(),
                 lane: Some(format!("lane {}", lane.0)),
+                // The same label the queued event carried for this job
+                // (RPC-46).
+                method: Some(method.clone()),
                 detail: format!("job {job} completed"),
                 ..base
             },

@@ -11,6 +11,12 @@ and `#[non_exhaustive]` on `Event`, the `ARRL` v2 log, a purpose-separate receip
 key, `ReceiptLog::snapshot`/`repair_tail`, `Snapshot`, `derive_receipt_key`,
 `Agent::receipt_key`/`set_receipt_sequence`, and `Receipt::fields_are_representable`.
 
+Observability schema v2 (`active-rpc/observability/2`, RPC-46): the
+call-lifecycle events (`call.queued`, `call.refused`, `job.completed`) carry
+the bounded method label, and `call.queued` carries the charged `args_bytes`,
+so telemetry names the tool that was called or refused. A refusal that names
+no call carries no `method` field. No field was renamed or removed.
+
 Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
 (replay) and R-13 (receipts) audit rounds.
 

@@ -408,6 +408,10 @@ pub enum Event {
         job: u64,
         /// Issuing lane.
         lane: LaneId,
+        /// Method the job ran, as the bounded label the queued event records
+        /// it — the same string `call.queued` carried, so a collector can join
+        /// the two records for one job (RPC-46).
+        method: String,
     },
     /// A promise settled.
     PromiseResolved(PromiseId),
@@ -467,6 +471,15 @@ pub enum Event {
         cap: Option<CapId>,
         /// Stable error code (`rpc/...`).
         code: String,
+        /// Method the refused call named, as the bounded label
+        /// `method_event_label` records it — the same string `call.queued`
+        /// carries for a queued call, so a collector can join a refusal to
+        /// the call it refused (RPC-46).
+        ///
+        /// `None` is a refusal that names no call: a send, a publish, or a
+        /// receive that failed before any method was selected. A refusal must
+        /// not invent a method it never saw.
+        method: Option<String>,
     },
     /// A budget ceiling refused work.
     BudgetExhausted {
@@ -3320,9 +3333,17 @@ impl Agent {
     /// `publish`, `publish_as`) reports the same counters and the same event:
     /// the transport-facing `*_as` variants used to bypass this entirely, so a
     /// peer-initiated refusal produced no metric and no event.
-    fn note_refusal(&self, lane: LaneId, cap: Option<CapId>, result: Result<u64>) -> Result<u64> {
+    /// `method` is the refused call's method when the refusal names a call,
+    /// `None` for a send/publish/receive refusal (RPC-46).
+    fn note_refusal(
+        &self,
+        lane: LaneId,
+        cap: Option<CapId>,
+        method: Option<&str>,
+        result: Result<u64>,
+    ) -> Result<u64> {
         if let Err(error) = &result {
-            self.record_refusal(lane, cap, error);
+            self.record_refusal(lane, cap, method, error);
         }
         result
     }
@@ -3333,13 +3354,25 @@ impl Agent {
     /// Every refusing entry point goes through here. The idempotent path used to
     /// return early without it, so the highest-value replay denials (`rpc/revoked`
     /// on a cache hit, a key reused with different arguments) were invisible.
-    fn record_refusal(&self, lane: LaneId, cap: Option<CapId>, error: &Error) {
+    fn record_refusal(
+        &self,
+        lane: LaneId,
+        cap: Option<CapId>,
+        method: Option<&str>,
+        error: &Error,
+    ) {
         let mut kernel = self.cell.borrow_mut();
-        Self::record_refusal_in(&mut kernel, lane, cap, error);
+        Self::record_refusal_in(&mut kernel, lane, cap, method, error);
     }
 
     /// [`Agent::record_refusal`] for a caller that already holds the kernel.
-    fn record_refusal_in(kernel: &mut Kernel, lane: LaneId, cap: Option<CapId>, error: &Error) {
+    fn record_refusal_in(
+        kernel: &mut Kernel,
+        lane: LaneId,
+        cap: Option<CapId>,
+        method: Option<&str>,
+        error: &Error,
+    ) {
         kernel.metrics.calls_refused = kernel.metrics.calls_refused.saturating_add(1);
         if matches!(error, Error::BudgetExceeded(_)) {
             kernel.metrics.budget_exhaustions = kernel.metrics.budget_exhaustions.saturating_add(1);
@@ -3374,6 +3407,10 @@ impl Agent {
             lane,
             cap,
             code: error.code().to_string(),
+            // The label is computed once, here, from the raw name: the
+            // projection carries it verbatim, and re-labelling a label would
+            // change its digest and break the queued/refused join (RPC-46).
+            method: method.map(method_event_label),
         });
     }
 
@@ -3415,7 +3452,7 @@ impl Agent {
             [only] => Some(only.id()),
             _ => None,
         };
-        self.note_refusal(lane, cause, result)
+        self.note_refusal(lane, cause, None, result)
     }
 
     fn send_inner(
@@ -3657,7 +3694,7 @@ impl Agent {
         payload: Value,
     ) -> Result<u64> {
         let result = self.publish_inner(peer, lane, channel, cap, topic, payload);
-        self.note_refusal(lane, Some(cap.id()), result)
+        self.note_refusal(lane, Some(cap.id()), None, result)
     }
 
     fn publish_inner(
@@ -3900,7 +3937,7 @@ impl Agent {
             // A refused receive is a refusal like any other: a lane scanning
             // channel ids must not be invisible in the metrics (R-17 round 5,
             // L-6).
-            self.record_refusal(lane, None, error);
+            self.record_refusal(lane, None, None, error);
         }
         outcome
     }
@@ -3934,7 +3971,7 @@ impl Agent {
             })()
         };
         if let Err(error) = &outcome {
-            self.record_refusal(lane, None, error);
+            self.record_refusal(lane, None, None, error);
         }
         outcome
     }
@@ -4053,7 +4090,7 @@ impl Agent {
             // An uncounted refusal is an operator blind spot, and a peer could
             // hide an identity refusal behind it (round 8, F2).
             let error = Error::Wire("an envelope cannot carry a promise or capability argument");
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         let cap_id = cap.id();
@@ -4074,6 +4111,7 @@ impl Agent {
                 lane,
                 cap: Some(cap_id),
                 code: error.code().to_string(),
+                method: Some(method_event_label(method)),
             });
             match error {
                 Error::BudgetExceeded(dimension) => {
@@ -4133,7 +4171,7 @@ impl Agent {
                 .any(|arg| matches!(arg, Arg::Promise(_) | Arg::Cap(_)))
         {
             let error = Error::Wire("an envelope cannot carry a promise or capability argument");
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         // A method name is caller-controlled text that reaches a refusal
@@ -4574,7 +4612,13 @@ impl Agent {
                 let error =
                     Error::Identity("a promise can only be answered by the peer that queued it");
                 let lane = LaneId(record_lane);
-                Self::record_refusal_in(&mut kernel, lane, None, &error);
+                Self::record_refusal_in(
+                    &mut kernel,
+                    lane,
+                    None,
+                    job.as_ref().map(|job| job.call.method.as_str()),
+                    &error,
+                );
                 return Err(error);
             }
         }
@@ -4621,7 +4665,13 @@ impl Agent {
                 None => Some(Error::UnknownPromise(promise.id.0)),
             };
             if let Some(error) = owner_refusal {
-                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                Self::record_refusal_in(
+                    &mut kernel,
+                    job.lane,
+                    Some(job.cap),
+                    Some(job.call.method.as_str()),
+                    &error,
+                );
                 return Err(error);
             }
             // Everything the checks need is read out first: recording a refusal
@@ -4639,7 +4689,13 @@ impl Agent {
                     // handle was dropped): a peer answering it must see the
                     // refusal on the tape too (R-15 round 5, #1).
                     let error = Error::UnknownCapability(cap_token(job.cap));
-                    Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                    Self::record_refusal_in(
+                        &mut kernel,
+                        job.lane,
+                        Some(job.cap),
+                        Some(job.call.method.as_str()),
+                        &error,
+                    );
                     return Err(error);
                 }
             };
@@ -4648,6 +4704,7 @@ impl Agent {
                     &mut kernel,
                     job.lane,
                     Some(job.cap),
+                    Some(job.call.method.as_str()),
                     &Error::Revoked(cap_token(job.cap)),
                 );
                 return Err(Error::Revoked(cap_token(job.cap)));
@@ -4660,7 +4717,13 @@ impl Agent {
                 } else {
                     Error::Revoked(cap_token(job.cap))
                 };
-                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                Self::record_refusal_in(
+                    &mut kernel,
+                    job.lane,
+                    Some(job.cap),
+                    Some(job.call.method.as_str()),
+                    &error,
+                );
                 return Err(error);
             }
             if let Some(bound) = bound_to {
@@ -4668,7 +4731,13 @@ impl Agent {
                     let error = Error::Identity(
                         "a bound capability's promise can only be answered by its peer",
                     );
-                    Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                    Self::record_refusal_in(
+                        &mut kernel,
+                        job.lane,
+                        Some(job.cap),
+                        Some(job.call.method.as_str()),
+                        &error,
+                    );
                     return Err(error);
                 }
             }
@@ -4681,7 +4750,13 @@ impl Agent {
                 .map(|record| record.budget);
             let Some(lane_budget) = lane_budget else {
                 let error = Error::UnknownLane(job.lane.0);
-                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                Self::record_refusal_in(
+                    &mut kernel,
+                    job.lane,
+                    Some(job.cap),
+                    Some(job.call.method.as_str()),
+                    &error,
+                );
                 return Err(error);
             };
             let budget = job.call.budget.intersect(&lane_budget);
@@ -4690,14 +4765,26 @@ impl Agent {
             // must reach the metrics and the tape like every other refusal
             // (R-11 round 12, F2).
             if let Some(error) = shape_refusal(&value, &budget) {
-                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                Self::record_refusal_in(
+                    &mut kernel,
+                    job.lane,
+                    Some(job.cap),
+                    Some(job.call.method.as_str()),
+                    &error,
+                );
                 return Err(error);
             }
             // The absolute wire ceiling too: a redaction or a later clone walks
             // the value recursively (round 10, #1).
             if value_too_deep(&value, crate::wire::MAX_VALUE_DEPTH) {
                 let error = Error::BudgetExceeded("depth");
-                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                Self::record_refusal_in(
+                    &mut kernel,
+                    job.lane,
+                    Some(job.cap),
+                    Some(job.call.method.as_str()),
+                    &error,
+                );
                 return Err(error);
             }
         }
@@ -4763,7 +4850,13 @@ impl Agent {
             // (R-11 round 12, F2).
             if let Err(error) = self.charge_egress(job, value.wire_size()) {
                 let mut kernel = self.cell.borrow_mut();
-                Self::record_refusal_in(&mut kernel, job.lane, Some(job.cap), &error);
+                Self::record_refusal_in(
+                    &mut kernel,
+                    job.lane,
+                    Some(job.cap),
+                    Some(job.call.method.as_str()),
+                    &error,
+                );
                 return Err(error);
             }
         }
@@ -4807,6 +4900,10 @@ impl Agent {
             kernel.record_queued_refusal(job_id, &Error::PromiseAlreadyResolved(promise.id.0));
             kernel.queue.retain(|queued| *queued != job_id);
             let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
+            let method = kernel
+                .jobs
+                .get(&job_id)
+                .map(|job| method_event_label(&job.call.method));
             let deps = kernel
                 .jobs
                 .get(&job_id)
@@ -4814,14 +4911,18 @@ impl Agent {
                 .unwrap_or_default();
             Kernel::release_waiters(&mut kernel, &deps);
             kernel.jobs.remove(&job_id);
-            if let Some(lane) = lane {
+            if let (Some(lane), Some(method)) = (lane, method) {
                 if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
                     lane_record.complete();
                 }
                 // The answered job never ran, but a tape that ends at
                 // `call.queued` cannot tell that from a stranded job
                 // (round 7, #3).
-                kernel.push_event(Event::JobCompleted { job: job_id, lane });
+                kernel.push_event(Event::JobCompleted {
+                    job: job_id,
+                    lane,
+                    method,
+                });
             }
         }
         kernel.push_event(Event::PromiseResolved(promise.id));
@@ -4974,7 +5075,7 @@ impl Agent {
     ) -> Result<PromiseHandle> {
         if envelope.kind != crate::wire::Kind::Request {
             let error = Error::Wire("an envelope entry point takes a request");
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), None, &error);
             return Err(error);
         }
         let admitted = match policy.admit(peer, loopback) {
@@ -4983,7 +5084,13 @@ impl Agent {
                 // An authentication refusal is an identity refusal an operator
                 // must be able to see (round 7, L4).
                 let mut kernel = self.cell.borrow_mut();
-                Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                Self::record_refusal_in(
+                    &mut kernel,
+                    lane,
+                    Some(cap.id()),
+                    Some(&envelope.method),
+                    &error,
+                );
                 return Err(error);
             }
         };
@@ -5109,22 +5216,22 @@ impl Agent {
         // is checked before anything copies it (round 7, F3).
         if method.len() > MAX_GRANTED_METHOD_BYTES {
             let error = Error::InvalidArgument("a method name must be at most 1024 bytes");
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         if args.len() > MAX_ARGS_PER_CALL {
             let error = Error::BudgetExceeded("args");
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         if key.is_empty() {
             let error = Error::InvalidArgument("idempotency key is empty");
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
             let error = Error::InvalidArgument("idempotency key is too long");
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         // The fingerprint hashes every byte of the arguments, so the shape
@@ -5133,7 +5240,7 @@ impl Agent {
         // lane intersection is re-checked on the queue path (round 5, N3).
         if !self.cell.borrow().caps.contains_key(&cap.id()) {
             let error = Error::UnknownCapability(cap_token(cap.id()));
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         // Identity is checked before any authority is measured: a capability
@@ -5156,7 +5263,7 @@ impl Agent {
             };
             if revoked {
                 let error = Error::Revoked(cap_token(cap.id()));
-                Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), Some(method), &error);
                 return Err(error);
             }
             match state {
@@ -5164,20 +5271,38 @@ impl Agent {
                 Liveness::Dead => {
                     kernel.push_event(Event::CapExpired(cap.id()));
                     let error = Error::Revoked(cap_token(cap.id()));
-                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    Self::record_refusal_in(
+                        &mut kernel,
+                        lane,
+                        Some(cap.id()),
+                        Some(method),
+                        &error,
+                    );
                     return Err(error);
                 }
                 Liveness::ForeignClock => {
                     let error =
                         Error::Identity("the capability's deadline is in another clock domain");
-                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    Self::record_refusal_in(
+                        &mut kernel,
+                        lane,
+                        Some(cap.id()),
+                        Some(method),
+                        &error,
+                    );
                     return Err(error);
                 }
             }
             if let Some(bound) = bound {
                 if !crate::identity::matches(crate::identity::presented_fingerprint(peer), bound) {
                     let error = Error::Identity("capability is bound to a different peer identity");
-                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    Self::record_refusal_in(
+                        &mut kernel,
+                        lane,
+                        Some(cap.id()),
+                        Some(method),
+                        &error,
+                    );
                     return Err(error);
                 }
             }
@@ -5188,7 +5313,7 @@ impl Agent {
             else {
                 drop(kernel);
                 let error = Error::UnknownCapability(cap_token(cap.id()));
-                self.record_refusal(lane, Some(cap.id()), &error);
+                self.record_refusal(lane, Some(cap.id()), Some(method), &error);
                 return Err(error);
             };
             // The lane may be narrower than the capability: gating on the cap
@@ -5213,7 +5338,7 @@ impl Agent {
             error
         };
         if let Some(error) = shape_error {
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         let fingerprint = fingerprint_with_payload(&args, payload_bytes, body);
@@ -5227,7 +5352,7 @@ impl Agent {
             drop(kernel);
             if unknown {
                 let error = Error::UnknownLane(lane.0);
-                self.record_refusal(lane, Some(cap.id()), &error);
+                self.record_refusal(lane, Some(cap.id()), Some(method), &error);
                 return Err(error);
             }
             // Capacity is checked on the miss path only: a cached replay makes
@@ -5257,7 +5382,13 @@ impl Agent {
                     || stored_peer != crate::identity::presented_fingerprint(peer)
                 {
                     let error = Error::Identity("the idempotency key belongs to another peer");
-                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    Self::record_refusal_in(
+                        &mut kernel,
+                        lane,
+                        Some(cap.id()),
+                        Some(method),
+                        &error,
+                    );
                     return Err(error);
                 }
                 // A key names the principal that claimed it. A replay from
@@ -5269,7 +5400,13 @@ impl Agent {
                     let error = Error::InvalidArgument(
                         "the idempotency key was used with different arguments",
                     );
-                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    Self::record_refusal_in(
+                        &mut kernel,
+                        lane,
+                        Some(cap.id()),
+                        Some(method),
+                        &error,
+                    );
                     return Err(error);
                 }
                 {
@@ -5277,13 +5414,25 @@ impl Agent {
                         Some(record) => record.clone(),
                         None => {
                             let error = Error::UnknownCapability(cap_token(cap.id()));
-                            Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                            Self::record_refusal_in(
+                                &mut kernel,
+                                lane,
+                                Some(cap.id()),
+                                Some(method),
+                                &error,
+                            );
                             return Err(error);
                         }
                     };
                     if record.revoked {
                         let error = Error::Revoked(cap_token(cap.id()));
-                        Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                        Self::record_refusal_in(
+                            &mut kernel,
+                            lane,
+                            Some(cap.id()),
+                            Some(method),
+                            &error,
+                        );
                         return Err(error);
                     }
                     match liveness(&kernel, &record) {
@@ -5291,7 +5440,13 @@ impl Agent {
                         Liveness::Dead => {
                             kernel.push_event(Event::CapExpired(cap.id()));
                             let error = Error::Revoked(cap_token(cap.id()));
-                            Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                            Self::record_refusal_in(
+                                &mut kernel,
+                                lane,
+                                Some(cap.id()),
+                                Some(method),
+                                &error,
+                            );
                             return Err(error);
                         }
                         // The pre-check above already refused this; the branch
@@ -5301,7 +5456,13 @@ impl Agent {
                             let error = Error::Identity(
                                 "the capability's deadline is in another clock domain",
                             );
-                            Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                            Self::record_refusal_in(
+                                &mut kernel,
+                                lane,
+                                Some(cap.id()),
+                                Some(method),
+                                &error,
+                            );
                             return Err(error);
                         }
                     }
@@ -5312,7 +5473,13 @@ impl Agent {
                         ) {
                             let error =
                                 Error::Identity("capability is bound to a different peer identity");
-                            Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                            Self::record_refusal_in(
+                                &mut kernel,
+                                lane,
+                                Some(cap.id()),
+                                Some(method),
+                                &error,
+                            );
                             return Err(error);
                         }
                     }
@@ -5331,7 +5498,13 @@ impl Agent {
                     };
                     let Some(current) = current else {
                         let error = Error::UnknownCapability(cap_token(cap.id()));
-                        Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                        Self::record_refusal_in(
+                            &mut kernel,
+                            lane,
+                            Some(cap.id()),
+                            Some(method),
+                            &error,
+                        );
                         return Err(error);
                     };
                     let over = match kernel.promises.get(&id) {
@@ -5342,7 +5515,13 @@ impl Agent {
                         None => None,
                     };
                     if let Some(error) = over {
-                        Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                        Self::record_refusal_in(
+                            &mut kernel,
+                            lane,
+                            Some(cap.id()),
+                            Some(method),
+                            &error,
+                        );
                         return Err(error);
                     }
                     if let Some(record) = kernel.promises.get_mut(&id) {
@@ -5364,7 +5543,7 @@ impl Agent {
             .is_some_and(|record| record.has_capacity())
         {
             let error = Error::BudgetExceeded("lane call");
-            self.record_refusal(lane, Some(cap.id()), &error);
+            self.record_refusal(lane, Some(cap.id()), Some(method), &error);
             return Err(error);
         }
         // The ceiling is fail-closed (RPC-06): a new key is refused before the
@@ -5383,7 +5562,13 @@ impl Agent {
                 reclaim_dead_idempotency_claims(&mut kernel);
                 if kernel.idempotency.len() >= MAX_IDEMPOTENCY {
                     let error = Error::BudgetExceeded("idempotency");
-                    Self::record_refusal_in(&mut kernel, lane, Some(cap.id()), &error);
+                    Self::record_refusal_in(
+                        &mut kernel,
+                        lane,
+                        Some(cap.id()),
+                        Some(method),
+                        &error,
+                    );
                     return Err(error);
                 }
             }
@@ -5445,6 +5630,10 @@ impl Agent {
             kernel.record_queued_refusal(job_id, &Error::PromiseCancelled(promise.id.0));
             kernel.queue.retain(|id| *id != job_id);
             let lane = kernel.jobs.get(&job_id).map(|job| job.lane);
+            let method = kernel
+                .jobs
+                .get(&job_id)
+                .map(|job| method_event_label(&job.call.method));
             let cap = kernel.jobs.get(&job_id).map(|job| job.cap);
             // A cancelled job never ran: count and trace the refusal exactly as
             // `fail_job` does, so the tape does not end at `call.queued`
@@ -5455,6 +5644,7 @@ impl Agent {
                     lane,
                     cap,
                     code: "rpc/promise-cancelled".to_string(),
+                    method: method.clone(),
                 });
             }
             let deps = kernel
@@ -5465,11 +5655,15 @@ impl Agent {
             Kernel::release_waiters(&mut kernel, &deps);
             kernel.jobs.remove(&job_id);
             kernel.record_settled(promise.id);
-            if let Some(lane) = lane {
+            if let (Some(lane), Some(method)) = (lane, method) {
                 if let Some(lane_record) = kernel.lanes.get_mut(&lane) {
                     lane_record.complete();
                 }
-                kernel.push_event(Event::JobCompleted { job: job_id, lane });
+                kernel.push_event(Event::JobCompleted {
+                    job: job_id,
+                    lane,
+                    method,
+                });
             }
         } else if let Some(job) = kernel
             .jobs
@@ -5565,14 +5759,22 @@ impl Agent {
         // `Queued`: it can be cancelled for real, exactly as `cancel` does, so it
         // is counted and traced rather than treated as a provider that already
         // ran (round 8, #1).
-        let queued: Vec<(u64, PromiseId, u64, CapId)> = kernel
+        let queued: Vec<(u64, PromiseId, u64, CapId, String)> = kernel
             .jobs
             .iter()
             .filter(|(_, job)| job.state == JobState::Queued && targets_set.contains(&job.promise))
-            .map(|(id, job)| (*id, job.promise, job.lane.0, job.cap))
+            .map(|(id, job)| {
+                (
+                    *id,
+                    job.promise,
+                    job.lane.0,
+                    job.cap,
+                    method_event_label(&job.call.method),
+                )
+            })
             .collect();
         let mut queued_promises: BTreeSet<PromiseId> = BTreeSet::new();
-        for (job_id, promise_id, lane, cap) in queued {
+        for (job_id, promise_id, lane, cap, method) in queued {
             kernel.record_queued_refusal(job_id, &Error::PromiseCancelled(promise_id.0));
             kernel.queue.retain(|queued_id| *queued_id != job_id);
             let deps = kernel
@@ -5589,6 +5791,7 @@ impl Agent {
                 lane: LaneId(lane),
                 cap: Some(cap),
                 code: "rpc/promise-cancelled".to_string(),
+                method: Some(method.clone()),
             });
             if let Some(lane_record) = kernel.lanes.get_mut(&LaneId(lane)) {
                 lane_record.complete();
@@ -5596,6 +5799,7 @@ impl Agent {
             kernel.push_event(Event::JobCompleted {
                 job: job_id,
                 lane: LaneId(lane),
+                method,
             });
         }
         // A promise cancelled while its job is in the current batch is removed
@@ -6793,6 +6997,7 @@ impl Agent {
                                     lane: job.lane,
                                     cap: Some(job.cap),
                                     code: error.code().to_string(),
+                                    method: Some(method_event_label(&job.call.method)),
                                 });
                                 kernel.metrics.budget_exhaustions =
                                     kernel.metrics.budget_exhaustions.saturating_add(1);
@@ -6808,6 +7013,7 @@ impl Agent {
                                     lane: job.lane,
                                     cap: Some(job.cap),
                                     code: error.code().to_string(),
+                                    method: Some(method_event_label(&job.call.method)),
                                 });
                                 kernel.metrics.tool_refusals =
                                     kernel.metrics.tool_refusals.saturating_add(1);
@@ -6829,6 +7035,7 @@ impl Agent {
                                     lane: job.lane,
                                     cap: Some(job.cap),
                                     code: error.code().to_string(),
+                                    method: Some(method_event_label(&job.call.method)),
                                 });
                             }
                             Error::Revoked(_)
@@ -6848,6 +7055,7 @@ impl Agent {
                                     lane: job.lane,
                                     cap: Some(job.cap),
                                     code: error.code().to_string(),
+                                    method: Some(method_event_label(&job.call.method)),
                                 });
                             }
                             _ => {}
@@ -6869,6 +7077,7 @@ impl Agent {
             kernel.push_event(Event::JobCompleted {
                 job: *job_id,
                 lane: job.lane,
+                method: method_event_label(&job.call.method),
             });
             batch_guard.pending.remove(job_id);
         }
@@ -7367,10 +7576,12 @@ impl Kernel {
                 let lane = job.lane;
                 let cap = job.cap;
                 let code = error.code().to_string();
+                let method = method_event_label(&job.call.method);
                 self.push_event(Event::CallRefused {
                     lane,
                     cap: Some(cap),
                     code,
+                    method: Some(method),
                 });
             }
         }
@@ -7383,6 +7594,7 @@ impl Kernel {
         if let Some(job) = self.jobs.get_mut(&job_id) {
             let promise = job.promise;
             let lane = job.lane;
+            let method = method_event_label(&job.call.method);
             let code = error.code().to_string();
             let mut settled_now = false;
             if let Some(record) = self.promises.get_mut(&promise) {
@@ -7409,7 +7621,11 @@ impl Kernel {
             }
             self.jobs.remove(&job_id);
             if events {
-                self.push_event(Event::JobCompleted { job: job_id, lane });
+                self.push_event(Event::JobCompleted {
+                    job: job_id,
+                    lane,
+                    method,
+                });
             }
         }
     }

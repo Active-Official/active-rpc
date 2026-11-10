@@ -8,7 +8,7 @@
 //!
 //! Two documents are versioned here:
 //!
-//! - [`SCHEMA`] `active-rpc/observability/1`: one JSON object per kernel event.
+//! - [`SCHEMA`] `active-rpc/observability/2`: one JSON object per kernel event.
 //! - [`METRICS_SCHEMA`] `active-rpc/metrics/1`: a point-in-time counter snapshot.
 //!
 //! The event names are part of the schema. [`EVENT_NAMES`] is the closed set, and
@@ -20,7 +20,13 @@ use serde_json::{Map, Value};
 use crate::kernel::{Event, Metrics};
 
 /// Observability event schema version.
-pub const SCHEMA: &str = "active-rpc/observability/1";
+///
+/// v2 (RPC-46) adds the call-lifecycle `method` label and the queued
+/// `args_bytes` count. No field was renamed or removed: a v1 reader ignores
+/// the fields it does not know, but the version moves because consumers that
+/// assert exact field sets (the control plane's event match, the projection
+/// tests) must be updated with the shape, not silently left behind.
+pub const SCHEMA: &str = "active-rpc/observability/2";
 /// Metrics snapshot schema version.
 pub const METRICS_SCHEMA: &str = "active-rpc/metrics/1";
 
@@ -78,6 +84,15 @@ pub struct TraceEvent {
     channel: Option<u64>,
     sequence_on_channel: Option<u64>,
     code: Option<String>,
+    /// Bounded method label for a call-lifecycle event (`call.queued`,
+    /// `call.refused`, `job.completed`). The label was computed once, at
+    /// event creation, by the kernel's `method_event_label`: a 64-byte
+    /// escaped prefix plus a digest tail for a longer name. The projection
+    /// carries it verbatim — re-labelling a label would change its digest
+    /// and break the queued/refused/completed join (RPC-46).
+    method: Option<String>,
+    /// Argument bytes the queued call was charged for (`call.queued` only).
+    args_bytes: Option<u64>,
     dimension: Option<String>,
     identity: Option<String>,
     detail: Option<String>,
@@ -102,6 +117,16 @@ impl TraceEvent {
     /// Stable code carried by a refusal or rejection.
     pub fn code(&self) -> Option<&str> {
         self.code.as_deref()
+    }
+
+    /// Bounded method label carried by a call-lifecycle event, if any.
+    pub fn method(&self) -> Option<&str> {
+        self.method.as_deref()
+    }
+
+    /// Argument bytes the queued call was charged for, if any.
+    pub fn args_bytes(&self) -> Option<u64> {
+        self.args_bytes
     }
 
     /// JSON object for this event.
@@ -138,6 +163,12 @@ impl TraceEvent {
         if let Some(code) = &self.code {
             map.insert("code".to_string(), Value::from(code.clone()));
         }
+        if let Some(method) = &self.method {
+            map.insert("method".to_string(), Value::from(method.clone()));
+        }
+        if let Some(args_bytes) = self.args_bytes {
+            map.insert("args_bytes".to_string(), Value::from(args_bytes));
+        }
         if let Some(dimension) = &self.dimension {
             map.insert("dimension".to_string(), Value::from(dimension.clone()));
         }
@@ -168,6 +199,8 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
         channel: None,
         sequence_on_channel: None,
         code: None,
+        method: None,
+        args_bytes: None,
         dimension: None,
         identity: None,
         detail: None,
@@ -249,19 +282,38 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.lane = Some(lane.0);
             trace.detail = Some(jobs.to_string());
         }
-        Event::CallQueued { job, lane, cap, .. } => {
+        Event::CallQueued {
+            job,
+            lane,
+            cap,
+            method,
+            args_bytes,
+        } => {
             trace.event = "call.queued";
             trace.job = Some(*job);
             trace.lane = Some(lane.0);
             trace.cap = Some(cap.correlation_id());
+            // The label was computed once, at queue time, from the raw name:
+            // carrying it verbatim keeps the queued label identical to the
+            // refused and completed labels for the same call (RPC-46).
+            trace.method = Some(method.clone());
+            trace.args_bytes = Some(*args_bytes);
         }
-        Event::CallRefused { lane, cap, code } => {
+        Event::CallRefused {
+            lane,
+            cap,
+            code,
+            method,
+        } => {
             trace.event = "call.refused";
             trace.lane = Some(lane.0);
             // A refusal with no capability reports no capability: a synthetic
             // zero id would be indistinguishable from a real one.
             trace.cap = cap.map(|cap| cap.correlation_id());
             trace.code = Some(label(code));
+            // A refusal that names no call carries no method: the field is
+            // absent, not invented (RPC-46).
+            trace.method = method.clone();
         }
         Event::BatchDispatched {
             provider,
@@ -272,10 +324,13 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             trace.provider = Some(provider.0);
             trace.detail = Some(format!("{jobs} jobs in {lane_count} lanes"));
         }
-        Event::JobCompleted { job, lane } => {
+        Event::JobCompleted { job, lane, method } => {
             trace.event = "job.completed";
             trace.job = Some(*job);
             trace.lane = Some(lane.0);
+            // The same label the queued event carried for this job, so the
+            // two records join on (`job`, `method`) (RPC-46).
+            trace.method = Some(method.clone());
         }
         Event::PromiseResolved(promise) => {
             trace.event = "promise.resolved";

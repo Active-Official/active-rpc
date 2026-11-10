@@ -5,7 +5,7 @@ authority.
 
 | Schema | Emitted by | Shape |
 |--------|-----------|-------|
-| `active-rpc/observability/1` | `Agent::trace()`, `Agent::trace_json()` | one object per kernel event |
+| `active-rpc/observability/2` | `Agent::trace()`, `Agent::trace_json()` | one object per kernel event |
 | `active-rpc/metrics/1` | `Agent::metrics_json()` | counters and gauges |
 
 ## Hard rules
@@ -20,14 +20,29 @@ authority.
 3. **No secrets.** Secret material is a marker in the value model and has no
    representation here.
 4. **Stable names.** Event names and counter names are part of the schema. Adding
-   a field is compatible; renaming one is a schema version bump.
+   a field is wire-compatible — a reader ignores fields it does not know — but
+   the schema version still moves when the shape changes, so a consumer that
+   asserts exact field sets is told to update instead of silently reading the
+   old shape. v2 added the optional `method` label on the call-lifecycle
+   events and `args_bytes` on `call.queued` (RPC-46). Renaming a field is a
+   schema version bump.
 
 ## Event record
 
 ```json
-{"schema":"active-rpc/observability/1","sequence":42,"event":"call.refused",
- "lane":0,"cap":"9f1c0e2d4b6a8c31","code":"rpc/method-not-granted"}
+{"schema":"active-rpc/observability/2","sequence":42,"event":"call.refused",
+ "lane":0,"cap":"9f1c0e2d4b6a8c31","method":"nope","code":"rpc/method-not-granted"}
 ```
+
+The `method` label is the bounded name the kernel records for the call: a
+granted name is carried exactly, and a name longer than 64 bytes (or one
+carrying characters the trace cannot hold) is an escaped 64-byte prefix plus
+a 128-bit digest tail, so two long names that share a prefix stay distinct.
+A refusal that names no call — a send, a publish, or a receive that failed
+before any method was selected — carries no `method` field at all. A
+`method` is a tool identifier, never an argument value: argument values
+have no representation in any event (rule 2), and a name the kernel cannot
+represent is labelled, never dropped silently and never refused.
 
 | Field | Type | Present when |
 |-------|------|--------------|
@@ -42,6 +57,8 @@ authority.
 | `channel` | u64 | the event names a channel |
 | `channel_sequence` | u64 | a channel send or receive |
 | `code` | string | a refusal or rejection with a stable `rpc/...` code, projected from `Error::code` (a provider-authored code is always `rpc/provider`, never the provider's own text) |
+| `method` | string | a call-lifecycle event (`call.queued`, `call.refused`, `job.completed`): the method the call named, as the bounded label the kernel records; absent on a refusal that names no call |
+| `args_bytes` | u64 | `call.queued`: the argument bytes the call was charged for (a refused call was never charged, so a refusal carries none; a completed job's bytes are on its queued record) |
 | `dimension` | string | a budget exhaustion or ceiling: `call`, `byte`, `lane call`, `lane byte`, `promises`, `jobs`, `caps`, `caps per message`, `lanes`, `channels`, `subscriptions`, `records`, `tombstones`, `nodes`, `keys`, `value`, `wall`, `depth`, `array_len`, `value_size`, `channel queue`, `args`, or `other` for a ceiling added without a label |
 | `identity` | string | a capability's peer: one fingerprint (a public label) for `cap.introduced`, or `from->to` for `cap.rebound`, which carries the same field twice |
 | `detail` | string | a short, value-free explanation (`"3 jobs in 2 lanes"`) |
@@ -65,10 +82,10 @@ authority.
 | `cap.transferred` | `cap`, `channel` | a capability travelled on a channel |
 | `lane.created` | `lane` | a lane was created |
 | `lane.destroyed` | `lane`, `detail` | a lane was destroyed; `detail` is the number of queued jobs dropped with it (their per-job events are coalesced into this one, receipts still record each refusal) |
-| `call.queued` | `job`, `lane`, `cap` | a call entered the queue |
-| `call.refused` | `lane`, `cap`, `code` | a call was refused before a provider saw it |
+| `call.queued` | `job`, `lane`, `cap`, `method`, `args_bytes` | a call entered the queue |
+| `call.refused` | `lane`, `cap`, `method`, `code` | a call was refused before a provider saw it; `method` is absent when the refusal names no call |
 | `batch.dispatched` | `provider`, `detail` | one provider round-trip carrying a batch |
-| `job.completed` | `job`, `lane` | a dispatched job finished |
+| `job.completed` | `job`, `lane`, `method` | a dispatched job finished; `method` is the same label `call.queued` carried for the job, so the two records join on (`job`, `method`) |
 | `promise.resolved` | `promise` | a promise settled with a value |
 | `promise.rejected` | `promise`, `code` | a promise settled with an error; the code is an `rpc/...` class, except that a withheld reply is `provider/reply-withheld` (the kernel authors that one, so the tape says what actually happened) |
 | `channel.send` | `channel`, `channel_sequence` | a message was sent |
