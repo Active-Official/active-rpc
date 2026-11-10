@@ -6,10 +6,14 @@
 
 use std::collections::VecDeque;
 
+use active_rpc::cap::CapAttrs;
 use active_rpc::error::Error;
 use active_rpc::kernel::Provider;
-use active_rpc::tool::{McpSession, McpTransport, MAX_MCP_LINE_BYTES};
+use active_rpc::tool::{
+    McpSession, McpTransport, MAX_MCP_LINE_BYTES, UNTRUSTED_MCP_DESCRIPTION_PREFIX,
+};
 use active_rpc::value::{Arg, Call, Response, Value};
+use active_rpc::{Agent, Budget};
 
 struct Scripted {
     queue: VecDeque<String>,
@@ -307,7 +311,10 @@ fn a_tool_description_is_capped_and_stripped_of_control_characters() {
         !description.contains('\u{200F}'),
         "a bidi override survived: {description:?}"
     );
-    assert!(description.starts_with("esc [31mred "), "{description:?}");
+    let body = description
+        .strip_prefix(UNTRUSTED_MCP_DESCRIPTION_PREFIX)
+        .expect("a non-empty description carries the untrusted-source marker");
+    assert!(body.starts_with("esc [31mred "), "{description:?}");
 }
 
 #[test]
@@ -347,11 +354,18 @@ fn a_multibyte_character_cannot_straddle_the_description_ceiling() {
     let session =
         McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
     let description = &session.tools()[0].description;
+    // The ceiling bounds the stored description, marker included: the
+    // body is capped at the ceiling minus the marker, so the total is
+    // exactly the ceiling and the straddling character is still dropped.
     assert_eq!(
         description.len(),
-        active_rpc::tool::MAX_MCP_DESCRIPTION_BYTES - 1,
+        active_rpc::tool::MAX_MCP_DESCRIPTION_BYTES,
         "the straddling character must be dropped, not truncated"
     );
+    let body = description
+        .strip_prefix(UNTRUSTED_MCP_DESCRIPTION_PREFIX)
+        .expect("a non-empty description carries the untrusted-source marker");
+    assert!(body.bytes().all(|byte| byte == b'x'));
     assert!(description.is_char_boundary(description.len()));
 }
 
@@ -375,8 +389,11 @@ fn a_description_cannot_inject_a_line_separator() {
             separator as u32
         );
     }
+    let body = description
+        .strip_prefix(UNTRUSTED_MCP_DESCRIPTION_PREFIX)
+        .expect("a non-empty description carries the untrusted-source marker");
     assert!(
-        description.starts_with("ok fake record "),
+        body.starts_with("ok fake record "),
         "the visible text is kept: {description:?}"
     );
 }
@@ -846,4 +863,242 @@ fn a_lost_write_ack_is_withheld_only_for_a_writable_call() {
     call.read_only = true;
     let error = Provider::invoke(&mut read_only, 0, &call).expect_err("the writer died");
     assert_eq!(error.provider_code(), Some("mcp/write:lost"), "{error}");
+}
+
+/// RPC-36 fail-before probes (round 1, R-08 F1).
+///
+/// These five tests use only the pre-fix public API (`mutating()`,
+/// `tools()[i].description`, the kernel `Agent` harness). Three of them
+/// must fail on the pre-fix tree -- they are the bug, written as tests --
+/// and two are guards that already pass and pin the fail-closed default:
+/// a tool with no annotations, and a tool whose annotations contradict
+/// each other, must stay mutating.
+///
+/// The fail-before run (native Windows, HEAD 7dd6c4a) is recorded in
+/// `records/F1-RPC/RPC-36.md`: the three fail-before tests fail, the two
+/// guards pass.
+
+#[test]
+fn a_read_only_hint_tool_is_not_mutating() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"read","description":"Read-only lookup","annotations":{"readOnlyHint":true,"destructiveHint":false}}]"#,
+    );
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    assert_eq!(session.tools().len(), 1);
+    assert!(
+        !session.mutating("read"),
+        "a readOnlyHint:true tool must not be mutating"
+    );
+}
+
+#[test]
+fn a_description_claiming_read_only_behaviour_is_marked_untrusted() {
+    // The description is an unverified claim from the server: a tool can
+    // advertise "read-only" while doing anything. The stored description
+    // must carry the untrusted-source marker, so no operator or LLM ever
+    // reads the claim as host text.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"read","description":"Read-only lookup, never modifies anything"}]"#,
+    );
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    let description = &session.tools()[0].description;
+    assert!(
+        description.starts_with(UNTRUSTED_MCP_DESCRIPTION_PREFIX),
+        "description carries no untrusted-source marker: {description:?}"
+    );
+    assert!(
+        description.contains("Read-only lookup, never modifies anything"),
+        "the original claim is kept, marked: {description:?}"
+    );
+}
+
+#[test]
+fn a_read_only_capability_can_call_a_read_only_hint_tool() {
+    // The kernel-level leg of RPC-36 (the W2 probe
+    // `probe_mcp_readonly_hint_ignored_and_readonly_cap_dead`, as a
+    // committed regression test): a read-only capability calling a
+    // readOnlyHint:true tool was refused `rpc/read-only` at queue time
+    // because `mutating()` returned true for every method.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"read","description":"Read-only lookup","annotations":{"readOnlyHint":true,"destructiveHint":false}}]"#,
+    );
+    let session = McpSession::handshake(Scripted::new(&[
+        initialize,
+        list.as_str(),
+        r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#,
+    ]))
+    .expect("handshake");
+    let policy = session.policy();
+    let agent = Agent::with_secret([0x36; 32]);
+    let provider = agent.register(Box::new(session));
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["read"])
+                .read_only()
+                .with_tool_policy(policy),
+        )
+        .expect("mint read-only cap");
+    let lane = agent.create_lane("p", Budget::default()).expect("lane");
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "read",
+            vec![Arg::Value(Value::Text("hi".into()))],
+        )
+        .expect("a read-only cap must be admitted to a read-only tool");
+    agent.run();
+    let response = promise.value().expect("a read-only call must succeed");
+    assert!(matches!(response, Value::Map(_)));
+}
+
+#[test]
+fn a_read_only_capability_is_still_refused_a_tool_without_annotations() {
+    // Guard (passes pre-fix too): the fail-closed default. A tool with no
+    // annotations is mutating, so a read-only capability must still be
+    // refused `rpc/read-only`.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(r#"[{"name":"read","description":"Read-only lookup"}]"#);
+    let session = McpSession::handshake(Scripted::new(&[
+        initialize,
+        list.as_str(),
+        r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#,
+    ]))
+    .expect("handshake");
+    let policy = session.policy();
+    let agent = Agent::with_secret([0x36; 32]);
+    let provider = agent.register(Box::new(session));
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["read"])
+                .read_only()
+                .with_tool_policy(policy),
+        )
+        .expect("mint read-only cap");
+    let lane = agent.create_lane("p", Budget::default()).expect("lane");
+    match agent.call(
+        lane,
+        &cap,
+        "read",
+        vec![Arg::Value(Value::Text("hi".into()))],
+    ) {
+        Err(err) => assert_eq!(err.code(), "rpc/read-only", "{err}"),
+        Ok(promise) => {
+            agent.run();
+            let err = promise
+                .value()
+                .expect_err("a tool without annotations must be refused to a read-only cap");
+            assert_eq!(err.code(), "rpc/read-only", "{err}");
+        }
+    }
+}
+
+#[test]
+fn a_read_only_hint_with_an_explicit_destructive_hint_is_mutating() {
+    // Guard (passes pre-fix too): contradictory peer claims fail closed.
+    // A tool that claims to be read-only AND destructive is mutating.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"read","description":"Read-only lookup","annotations":{"readOnlyHint":true,"destructiveHint":true}}]"#,
+    );
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    assert!(
+        session.mutating("read"),
+        "contradictory annotations (read-only AND destructive) must fail closed to mutating"
+    );
+}
+
+/// RPC-36 post-fix tests: the annotations surface itself.
+///
+/// These tests reference the new API (`McpToolDef.annotations`,
+/// `is_mutating`/`is_read_only`), so they were added with the fix rather
+/// than run fail-before. The fail-before tests above them prove the bug
+/// with the pre-fix API; these pin the retained-annotation contract.
+
+#[test]
+fn annotations_are_retained_from_the_handshake() {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"read","description":"Read-only lookup","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}]"#,
+    );
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    let tool = &session.tools()[0];
+    assert!(tool.annotations.read_only_hint);
+    assert_eq!(tool.annotations.destructive_hint, Some(false));
+    assert_eq!(tool.annotations.idempotent_hint, Some(true));
+    assert_eq!(tool.annotations.open_world_hint, Some(false));
+    assert!(!tool.is_mutating());
+    assert!(tool.is_read_only());
+    assert!(!session.mutating("read"));
+    // An unknown method is still mutating: the fail-closed default.
+    assert!(session.mutating("nope"));
+}
+
+#[test]
+fn a_non_boolean_read_only_hint_is_ignored() {
+    // A hint that is not a JSON boolean is the same as absent: the tool
+    // stays mutating. A server that sends `"readOnlyHint": "true"` does
+    // not get read-only access by accident.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"read","description":"Read-only lookup","annotations":{"readOnlyHint":"true"}}]"#,
+    );
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    assert!(!session.tools()[0].annotations.read_only_hint);
+    assert!(session.mutating("read"));
+}
+
+#[test]
+fn a_non_object_annotations_value_is_ignored() {
+    // Same fail-closed reading for a malformed `annotations` value: the
+    // whole handshake is not refused over one tool's bad metadata, but
+    // no hint is honoured from it either.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"read","description":"Read-only lookup","annotations":"yes"}]"#,
+    );
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    assert_eq!(
+        session.tools()[0].annotations,
+        active_rpc::tool::McpToolAnnotations::default()
+    );
+    assert!(session.mutating("read"));
+}
+
+#[test]
+fn an_absent_description_stays_empty() {
+    // There is no claim to mark, so no marker is added: an empty
+    // description stays exactly empty.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(r#"[{"name":"read"}]"#);
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    assert_eq!(session.tools()[0].description, "");
+}
+
+#[test]
+fn a_destructive_hint_alone_keeps_a_tool_mutating() {
+    // `destructiveHint` without `readOnlyHint` changes nothing: the tool
+    // is mutating, as it was before the fix.
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(
+        r#"[{"name":"write","description":"Deletes the file","annotations":{"destructiveHint":true}}]"#,
+    );
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    assert!(session.tools()[0].is_mutating());
+    assert!(session.mutating("write"));
 }

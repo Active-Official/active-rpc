@@ -673,23 +673,37 @@ fn valid_tool_name(name: &str) -> bool {
 }
 
 /// The longest tool description a session keeps, in bytes.
+///
+/// The ceiling bounds the stored description, marker included: the body is
+/// capped at this minus the marker length (see [`marked_description`]).
 pub const MAX_MCP_DESCRIPTION_BYTES: usize = 4 << 10;
 
-/// Cap a description and replace control characters and invisible formatting
-/// with spaces.
+/// Prefix marking a tool description as unverified text from the MCP server.
+///
+/// A description is a claim the server makes about its own tool, and
+/// nothing verifies the claim against what the tool actually does (RPC-36):
+/// a server can advertise "read-only lookup" for a tool that deletes
+/// files. The marker is part of the stored description, so every consumer
+/// -- operator UI, log line, LLM tool list -- sees the provenance without
+/// having to opt into it, and the claim can never be read as host text.
+/// A description that is empty stays empty: there is no claim to mark.
+pub const UNTRUSTED_MCP_DESCRIPTION_PREFIX: &str = "[untrusted MCP server] ";
+
+/// Cap a description at `max_bytes` and replace control characters and
+/// invisible formatting with spaces.
 ///
 /// The text is still untrusted: a renderer must escape it for its own output
 /// context. Replacing these characters here means a description can never carry
 /// a terminal escape, reorder rendered text, or start a new line in a log.
 /// `char::is_control` covers C0 and C1, but not the Unicode separators (Zl/Zp)
 /// or the format characters that render as nothing.
-fn bounded_description(text: &str) -> String {
-    let mut out = String::with_capacity(text.len().min(MAX_MCP_DESCRIPTION_BYTES));
+fn bounded_description(text: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_bytes));
     for character in text.chars() {
         // Reserve the whole encoded character: checking only the current length
         // would let a multi-byte character straddle the ceiling by up to three
         // bytes.
-        if out.len() + character.len_utf8() > MAX_MCP_DESCRIPTION_BYTES {
+        if out.len() + character.len_utf8() > max_bytes {
             break;
         }
         if character.is_control() || is_invisible_or_reordering(character) {
@@ -699,6 +713,28 @@ fn bounded_description(text: &str) -> String {
         }
     }
     out
+}
+
+/// Bound a tool description and mark it as untrusted peer text (RPC-36).
+///
+/// The body is capped so the stored text -- marker included -- never exceeds
+/// [`MAX_MCP_DESCRIPTION_BYTES`]. The marker is the only verification the
+/// client can offer for a description: the text itself cannot be checked
+/// against the tool's behaviour, because MCP gives the client no behavioural
+/// attestation to check it against. What the client *can* do is make sure
+/// the claim is never mistaken for host text, and make sure the claim can
+/// never grant a capability on its own (method grants come from the tool
+/// name alone; see [`McpToolDef::is_mutating`]).
+fn marked_description(text: &str) -> String {
+    let body = bounded_description(
+        text,
+        MAX_MCP_DESCRIPTION_BYTES.saturating_sub(UNTRUSTED_MCP_DESCRIPTION_PREFIX.len()),
+    );
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("{UNTRUSTED_MCP_DESCRIPTION_PREFIX}{body}")
+    }
 }
 
 use crate::security::is_invisible_or_reordering;
@@ -1387,13 +1423,97 @@ impl Drop for StdioTransport {
     }
 }
 
+/// The `annotations` object of one MCP tool, as the server sent it (RPC-36).
+///
+/// The MCP 2025-06-18 spec defines four boolean hints. They are
+/// unauthenticated peer claims, not verified properties of the tool: a
+/// hostile or buggy server can claim `readOnlyHint: true` for a tool that
+/// deletes files, and nothing on the client can detect the lie -- there is
+/// no behavioural attestation in the protocol. The kernel therefore treats
+/// the hints as a claim to be honoured fail-closed, never as proof: a
+/// missing or non-boolean hint is the same as absent, and contradictory
+/// claims fail closed to mutating (see [`McpToolDef::is_mutating`]).
+/// Operators should grant MCP access -- even read-only access -- only to
+/// servers they trust, exactly as they would trust any other peer text
+/// (same trust class as the description problem in RPC-31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct McpToolAnnotations {
+    /// `annotations.readOnlyHint`: the peer claims the tool does not modify
+    /// its environment. True only when the server sent JSON `true`.
+    pub read_only_hint: bool,
+    /// `annotations.destructiveHint`, as sent, when it was a boolean.
+    /// `None` means absent or not a boolean.
+    pub destructive_hint: Option<bool>,
+    /// `annotations.idempotentHint`, as sent, when it was a boolean.
+    /// `None` means absent or not a boolean.
+    pub idempotent_hint: Option<bool>,
+    /// `annotations.openWorldHint`, as sent, when it was a boolean.
+    /// `None` means absent or not a boolean.
+    pub open_world_hint: Option<bool>,
+}
+
+/// Parse a tool's `annotations` object from `tools/list` (RPC-36).
+///
+/// A non-object `annotations` value and a non-boolean hint are both treated
+/// as absent: refusing the whole handshake over one tool's malformed
+/// metadata would brick a session for a buggy server, and absent is the
+/// fail-closed reading anyway (a tool with no `readOnlyHint` is mutating).
+fn parse_tool_annotations(value: Option<&Json>) -> McpToolAnnotations {
+    let Some(annotations) = value.and_then(Json::as_object) else {
+        return McpToolAnnotations::default();
+    };
+    McpToolAnnotations {
+        read_only_hint: annotations
+            .get("readOnlyHint")
+            .and_then(Json::as_bool)
+            .unwrap_or(false),
+        destructive_hint: annotations.get("destructiveHint").and_then(Json::as_bool),
+        idempotent_hint: annotations.get("idempotentHint").and_then(Json::as_bool),
+        open_world_hint: annotations.get("openWorldHint").and_then(Json::as_bool),
+    }
+}
+
 /// One tool exposed by an MCP server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpToolDef {
     /// Tool name.
     pub name: String,
     /// Free-form description.
+    ///
+    /// Unverified text from the MCP server, stored with the
+    /// [`UNTRUSTED_MCP_DESCRIPTION_PREFIX`] marker (RPC-36). A description
+    /// can claim anything -- including that a destructive tool is read-only
+    /// -- and nothing verifies the claim against the tool's behaviour:
+    /// there is no mechanism in MCP by which a client could. Never present
+    /// this as host text, and never let it grant a capability: method
+    /// grants come from the tool name alone.
     pub description: String,
+    /// The tool's `annotations` object, as the server sent it (RPC-36).
+    /// This is what [`Self::is_mutating`] reads, which is what the kernel's
+    /// read-only gate reads -- so a read-only capability can call a tool
+    /// the peer marks read-only, and no other MCP tool.
+    pub annotations: McpToolAnnotations,
+}
+
+impl McpToolDef {
+    /// Whether calling this tool mutates provider state, from the peer's
+    /// own annotations (RPC-36).
+    ///
+    /// Only an explicit `readOnlyHint: true` makes a tool non-mutating,
+    /// and an explicit `destructiveHint: true` overrides it: contradictory
+    /// claims fail closed to mutating. A missing or non-boolean hint is
+    /// the same as absent, so a tool with no annotations is mutating.
+    /// The hint is a peer claim, not a verified property -- see
+    /// [`McpToolAnnotations`].
+    pub fn is_mutating(&self) -> bool {
+        !self.annotations.read_only_hint || self.annotations.destructive_hint == Some(true)
+    }
+
+    /// Whether the peer claims this tool is read-only (the negation of
+    /// [`Self::is_mutating`]).
+    pub fn is_read_only(&self) -> bool {
+        !self.is_mutating()
+    }
 }
 
 /// A provider backed by an MCP session.
@@ -1556,14 +1676,24 @@ impl<T: McpTransport> McpSession<T> {
                 }
                 // The description is free text shown to an operator. It is
                 // capped so a hostile server cannot make the client buffer a
-                // megabyte per tool, and control characters (including ANSI
-                // escapes) are replaced so the text cannot drive a terminal.
-                let description = bounded_description(
+                // megabyte per tool, control characters (including ANSI
+                // escapes) are replaced so the text cannot drive a terminal,
+                // and it is stored with the untrusted-source marker because
+                // the claim it makes is unverified (RPC-36). The
+                // `annotations` object is parsed and retained alongside it:
+                // it is what decides whether the tool is mutating, so
+                // discarding it made a read-only capability unable to call
+                // any MCP tool at all. `inputSchema`/`outputSchema` are
+                // still not retained -- that is RPC-27's finding, not this
+                // one's.
+                let description = marked_description(
                     item.get("description").and_then(Json::as_str).unwrap_or(""),
                 );
+                let annotations = parse_tool_annotations(item.get("annotations"));
                 session.tools.push(McpToolDef {
                     name: name.to_string(),
                     description,
+                    annotations,
                 });
             }
         }
@@ -1935,8 +2065,17 @@ impl<T: McpTransport> Provider for McpSession<T> {
         self.tools.iter().any(|tool| tool.name == method)
     }
 
-    fn mutating(&self, _method: &str) -> bool {
-        true
+    fn mutating(&self, method: &str) -> bool {
+        // The tool's own annotations decide (RPC-36): a tool the peer marks
+        // read-only is callable under a read-only capability, which the
+        // kernel's read-only gate reads from `ProviderFacts`. An unknown
+        // method and a tool without the hint are mutating -- the fail-closed
+        // default. This used to return `true` for every method, which made
+        // a read-only capability unable to call any MCP tool at all.
+        match self.tools.iter().find(|tool| tool.name == method) {
+            Some(tool) => tool.is_mutating(),
+            None => true,
+        }
     }
 
     fn invoke(&mut self, object: u64, call: &Call) -> Result<Response> {
