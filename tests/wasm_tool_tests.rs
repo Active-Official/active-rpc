@@ -108,7 +108,67 @@ fn fuel_exhaustion_is_refused_with_its_own_code() {
         ..WasmLimits::default()
     };
     let mut tool = WasmTool::from_bytes(&binary(BURN), limits).expect("compile");
-    assert_eq!(error_code(tool.call(b"")), "wasm/fuel");
+    // The fuel code is pinned with the wall deadline held open: the same
+    // guest under plain `call` stops by the 2 ms fuel-derived deadline on a
+    // slow machine instead (RPC-37), so a bare `call` cannot pin `wasm/fuel`
+    // for a loop. `call_with_deadline` with a generous deadline isolates the
+    // fuel mechanism.
+    assert_eq!(
+        error_code(tool.call_with_deadline(b"", std::time::Duration::from_secs(10))),
+        "wasm/fuel"
+    );
+}
+
+/// A looping guest is stopped by an explicit wall deadline, not by its fuel
+/// (RPC-37). The fuel budget is huge, so fuel exhaustion is seconds away in
+/// any build; only the deadline can stop the guest in 100 ms.
+#[test]
+fn a_looping_guest_is_stopped_by_an_explicit_wall_deadline() {
+    use active_rpc::wasm_tool::MAX_FUEL;
+
+    let limits = WasmLimits {
+        fuel: MAX_FUEL,
+        ..WasmLimits::default()
+    };
+    let mut tool = WasmTool::from_bytes(&binary(BURN), limits).expect("compile");
+    let started = std::time::Instant::now();
+    let error = tool
+        .call_with_deadline(b"", std::time::Duration::from_millis(100))
+        .expect_err("the loop must stop");
+    let elapsed = started.elapsed();
+    assert!(matches!(error, Error::Timeout), "{error:?}");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(100),
+        "the call returned before its deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(100) + std::time::Duration::from_secs(2),
+        "the deadline did not bind the call: {elapsed:?}"
+    );
+    // A timed-out call reports no partial evidence: the worker owns the log
+    // and the draw, and both are discarded with its result.
+    assert!(tool.log().is_empty(), "a timed-out call kept a log");
+    assert_eq!(tool.entropy_used(), 0, "a timed-out call kept a draw");
+}
+
+/// The same deadline binds a direct `call`: the deadline is derived from the
+/// fuel budget (`fuel / FUEL_PER_MS`), so a default-limits loop stops at
+/// ~200 ms with `rpc/timeout` instead of running until its fuel exhausts.
+#[test]
+fn a_looping_guest_is_stopped_by_the_fuel_derived_wall_deadline() {
+    let mut tool = WasmTool::from_bytes(&binary(BURN), WasmLimits::default()).expect("compile");
+    let started = std::time::Instant::now();
+    let error = tool.call(b"").expect_err("the loop must stop");
+    let elapsed = started.elapsed();
+    assert!(matches!(error, Error::Timeout), "{error:?}");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(200),
+        "the call returned before its deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(200) + std::time::Duration::from_secs(2),
+        "the deadline did not bind the call: {elapsed:?}"
+    );
 }
 
 #[test]

@@ -73,8 +73,13 @@ fn a_random_loop_cannot_outlive_its_wall_budget() {
     let started = Instant::now();
     let error = tool.invoke(0, &call).expect_err("the guest must stop");
     let elapsed = started.elapsed();
+    // The guest stops by whichever budget binds first: fuel exhaustion
+    // (`wasm/fuel`) on a machine faster than the documented rate, the wall
+    // deadline (`rpc/timeout`) on a slower one (RPC-37). Both are budget
+    // refusals; the entropy cap below is the assertion that does not depend
+    // on the machine.
     assert!(
-        error.to_string().contains("wasm/"),
+        error.to_string().contains("wasm/") || error.code() == "rpc/timeout",
         "unexpected refusal: {error}"
     );
     // The structural bound is the cumulative entropy cap: one call cannot draw
@@ -94,6 +99,40 @@ fn a_random_loop_cannot_outlive_its_wall_budget() {
     const _: () = assert!(
         MAX_RANDOM_PER_CALL <= 64 << 10,
         "the cumulative entropy budget is bounded"
+    );
+}
+
+/// A looping guest cannot outlive a small wall grant through the kernel
+/// (RPC-37): the grant is the deadline, not just the fuel derivation.
+#[test]
+fn a_looping_guest_cannot_outlive_a_small_wall_grant() {
+    const BURN: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "run") (param i32) (result i32)
+    (loop $l (br $l))
+    (i32.const 0)))
+"#;
+    let mut tool = tool(BURN, WasmLimits::default());
+    let mut call = Call::new("run", vec![Arg::text("")]);
+    call.budget = Budget {
+        max_wall_ms: 100,
+        ..Budget::default()
+    };
+    call.now_ms = 1;
+    let started = Instant::now();
+    let error = tool.invoke(0, &call).expect_err("the guest must stop");
+    let elapsed = started.elapsed();
+    // Whichever budget binds first is a legitimate stop (see the test above);
+    // the deadline is what binds it on a slow machine, fuel on a fast one.
+    assert!(
+        error.to_string().contains("wasm/") || error.code() == "rpc/timeout",
+        "unexpected refusal: {error}"
+    );
+    // A hang guard, not a performance budget.
+    assert!(
+        elapsed < std::time::Duration::from_millis(100) + std::time::Duration::from_secs(2),
+        "a 100 ms grant took {elapsed:?}"
     );
 }
 

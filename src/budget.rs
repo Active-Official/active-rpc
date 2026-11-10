@@ -4,7 +4,7 @@
 //! kernel charges calls and bytes: the request when the call is queued, the
 //! resolved arguments when a promise grows at dispatch, and the response before
 //! it is delivered. `max_wall_ms` is enforced by the adapters that can measure
-//! time (`LocalProcess` today). Domain operations translate the same budget into
+//! time (`LocalProcess` and `WasmTool` today). Domain operations translate the same budget into
 //! the Active evaluator's limits, so a call cannot spend more than the caller
 //! granted even inside the evaluator.
 

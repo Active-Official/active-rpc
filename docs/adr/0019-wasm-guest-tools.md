@@ -36,7 +36,14 @@ imports:  none; a module that declares any import is refused
   including one raised by the `start` function. A capability's wall budget
   bounds it further: the call gets at most `max_wall_ms × FUEL_PER_MS`
   (5 000 fuel per millisecond), so a 100 ms grant buys 500 000 fuel whatever the
-  tool's default is.
+  tool's default is. Fuel is the instruction bound, not a wall clock: on a slow
+  or loaded machine the same fuel takes far longer than the rate predicts, so
+  every call is also bounded by a real wall-clock deadline enforced by a clock
+  around the guest's execution (RPC-37). A direct `WasmTool::call` derives its
+  deadline from its fuel budget (`fuel / FUEL_PER_MS`); a call through the
+  kernel runs under the granted `max_wall_ms`. A guest that outlives its
+  deadline is refused with `rpc/timeout`, and its worker thread is detached
+  until its fuel exhausts.
 - **Memory**: a `StoreLimits` limiter caps linear memory at
   `max_memory_bytes` (default 16 MiB, ceiling 256 MiB); a module that asks for
   more fails to instantiate with `wasm/limits`.
@@ -64,6 +71,8 @@ imports:  none; a module that declares any import is refused
 | `wasm/input` | the call input is missing, exceeds the input window, is not one text/module argument, or is a module image carrying a structural secret |
 | `wasm/output` | the guest returned a negative length, which is its own fault signal |
 | `wasm/output-limit` | the returned length is past the output ceiling (the static cap or the call's share); the adapter reports it as `rpc/budget-exceeded` when the grant is what bound it and as this code otherwise |
+| `wasm/spawn` | the host could not start the guest's worker thread; the guest never ran |
+| `rpc/timeout` | the wall deadline elapsed before the guest finished. This is not provider class: it is the top-level timeout code, shared with the other adapters |
 
 ## Consequences
 
@@ -74,6 +83,21 @@ imports:  none; a module that declares any import is refused
 - Output is text when the guest returns valid UTF-8; other bytes travel as a
   module value, so a binary result is never mangled into replacement
   characters.
+
+## Addendum (2026-11-09) — RPC-37: a real wall deadline
+
+Fuel was the only wall-clock bound, and it is not a wall clock: on a slow or
+loaded machine a 100 ms grant's worth of fuel runs well past the grant
+(158 ms measured on the fix machine, 370-487 ms for 1M fuel in verification),
+and a direct `WasmTool::call` took no wall parameter at all. Every call now
+runs on a worker thread under a real wall-clock deadline: the granted
+`max_wall_ms` through the kernel, the fuel-derived `fuel / FUEL_PER_MS` for a
+direct call. A guest that outlives its deadline is refused with `rpc/timeout`;
+the worker thread is detached and runs until its fuel exhausts, so the deadline
+binds the caller even though the guest's remaining work is still bounded by
+fuel. A watchdog that zeroes fuel from another thread was considered and
+rejected: wasmi 2.0.0 exposes no interrupt handle, and `Store::set_fuel` needs
+`&mut Store`, which the executing thread holds.
 
 ## Addendum (2026-11-01) — R-14 hostile review
 

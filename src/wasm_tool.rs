@@ -1,7 +1,10 @@
 //! Fuel-metered WebAssembly guest tools.
 //!
 //! A guest runs in an interpreter with a bounded linear memory and a fuel
-//! budget. The kernel still owns authority: the tool is only reachable through
+//! budget, and every call is bounded by a real wall-clock deadline as well
+//! as by fuel (RPC-37): fuel is the instruction bound, the deadline is the
+//! wall bound, and the deadline is enforced by a clock around the
+//! execution. The kernel still owns authority: the tool is only reachable through
 //! a minted capability. Host imports are deny-by-default: a module that declares
 //! an import the build's WasmHostPolicy does not explicitly grant is refused
 //! before it runs, and a granted one is a single checked host function
@@ -21,6 +24,8 @@
 use crate::error::{Error, Result};
 use crate::kernel::Provider;
 use crate::value::{Arg, Call, Response, Value};
+
+use std::time::Duration;
 
 use wasmi::{
     Config, Engine, ExternType, FuncType, Linker, Module, Store, StoreLimitsBuilder, ValType,
@@ -49,10 +54,14 @@ pub const MAX_FUEL: u64 = 1_000_000_000;
 /// Fuel a guest may burn per millisecond of its wall budget.
 ///
 /// The interpreter costs roughly 4 000 fuel per millisecond of debug-build work,
-/// so this rate makes a wall budget binding (a 100 ms grant buys 500 000 fuel)
-/// without throttling a fast guest. It is a proportional ceiling, not a
-/// deadline: a guest that never executes an instruction cannot exceed it, and
-/// the interpreter cannot outrun it by more than the measurement error.
+/// so this rate converts a wall budget into a fuel budget (a 100 ms grant buys
+/// 500 000 fuel) without throttling a fast guest, and converts a fuel budget
+/// back into the wall deadline a direct [`WasmTool::call`] enforces. It is a
+/// conversion rate, not a deadline: on a slow or loaded machine the same fuel
+/// takes far longer than the rate predicts, so the rate alone never bound a
+/// call's wall time (RPC-37). The wall deadline is enforced by a real clock
+/// around the guest's execution ([`WasmTool::call_with_deadline`]); fuel stays
+/// the instruction bound and the wall clock is the additional bound.
 pub const FUEL_PER_MS: u64 = 5_000;
 
 /// Largest table a guest may declare or grow to, in elements.
@@ -338,7 +347,42 @@ impl WasmTool {
     }
 
     /// Run the guest on `input` and return its output.
+    ///
+    /// The guest runs on a worker thread under a real wall-clock deadline
+    /// derived from the fuel budget: `fuel / FUEL_PER_MS` milliseconds. Fuel
+    /// alone never bound wall time (RPC-37): on a slow or loaded machine the
+    /// same fuel takes far longer than the rate predicts, so the deadline is
+    /// enforced by a clock around the execution, not by the meter. A call
+    /// that outlives its deadline is refused with [`Error::Timeout`]
+    /// (`rpc/timeout`); the fuel budget still bounds the guest's total work,
+    /// and a guest that exhausts it first is refused with `wasm/fuel` as
+    /// before. Use [`WasmTool::call_with_deadline`] to set the deadline
+    /// explicitly instead of deriving it from fuel.
     pub fn call(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+        let max_wall = Duration::from_millis((self.limits.fuel / FUEL_PER_MS).max(1));
+        self.call_with_deadline(input, max_wall)
+    }
+
+    /// Run the guest on `input` under an explicit wall-clock deadline.
+    ///
+    /// The guest runs on a worker thread; the calling thread waits at most
+    /// `max_wall` for it. A guest that outlives the deadline is refused with
+    /// [`Error::Timeout`] (`rpc/timeout`) and the worker thread is detached:
+    /// it keeps running until its fuel exhausts (fuel still bounds the
+    /// guest's total work), then exits. A worker thread is never killed:
+    /// there is no safe way to stop a wasmi execution from another thread
+    /// (wasmi 2.0.0 exposes no interrupt handle, and `Store::set_fuel`
+    /// needs `&mut Store`, which the executing thread holds), so the
+    /// deadline is enforced by the join, not by the engine. A zero deadline
+    /// is treated as one millisecond. A timed-out call reports no guest log
+    /// and no entropy draw: the worker owns that evidence and it is
+    /// discarded with the result.
+    ///
+    /// The checks that need no execution run on the calling thread before
+    /// the worker starts, so their refusals are deterministic: an input past
+    /// the input window is `wasm/input`, and a grant too small to pay for
+    /// the guest's own declared memory is `wasm/fuel`.
+    pub fn call_with_deadline(&mut self, input: &[u8], max_wall: Duration) -> Result<Vec<u8>> {
         // Every refusal below must leave no log behind: `log()` is documented as
         // this call's evidence, and a stale buffer would attribute one caller's
         // bytes to another caller's failed call. The entropy metric is per call
@@ -349,6 +393,130 @@ impl WasmTool {
         if input.len() > OUTPUT_OFFSET {
             return Err(provider("wasm/input"));
         }
+        // The module's declared initial memory, read before anything is
+        // allocated: this is the same reservation `WasmCall::run` recomputes
+        // for the store setup. It is checked here, synchronously, so a grant
+        // too small to pay for the guest's own memory is refused before any
+        // thread starts instead of racing the deadline. The module's own
+        // declaration, not the configured ceiling, is what instantiation
+        // allocates (round 19, M1); a module with no exported memory falls
+        // back to the ceiling because its size is not knowable here.
+        let declared_kib = self
+            .module
+            .exports()
+            .find(|export| export.name() == "memory")
+            .and_then(|export| match export.ty() {
+                wasmi::ExternType::Memory(memory) => Some(memory.minimum()),
+                _ => None,
+            })
+            .map(|pages| pages.saturating_mul(64))
+            .unwrap_or((self.limits.max_memory_bytes as u64).div_ceil(1024));
+        let reserved_fuel = declared_kib.saturating_mul(FUEL_PER_MEMORY_KIB);
+        if reserved_fuel > self.limits.fuel {
+            // A grant too small to pay for the guest's own memory is a fuel
+            // shortfall, not a resource over a ceiling (round 19, L2).
+            return Err(provider("wasm/fuel"));
+        }
+        let max_wall = max_wall.max(Duration::from_millis(1));
+        let engine = self.engine.clone();
+        let module = self.module.clone();
+        let limits = self.limits;
+        let host = self.host;
+        let random_cap = self.random_cap;
+        let now_ms = self.now_ms;
+        let input = input.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("active-wasm-call".to_string())
+            .spawn(move || {
+                let mut call = WasmCall {
+                    engine,
+                    module,
+                    limits,
+                    host,
+                    log: Vec::new(),
+                    last_random_used: 0,
+                    random_cap,
+                    now_ms,
+                };
+                let result = call.run(&input);
+                let outcome = CallOutcome {
+                    result,
+                    log: std::mem::take(&mut call.log),
+                    random_used: call.last_random_used,
+                };
+                let _ = tx.send(outcome);
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            // The host could not start the guest's worker thread: the guest
+            // never ran, so there is no log and no draw to report.
+            Err(_) => return Err(provider("wasm/spawn")),
+        };
+        match rx.recv_timeout(max_wall) {
+            Ok(outcome) => {
+                // The worker sent its outcome, so it is already returning;
+                // reaping it here keeps no finished thread behind.
+                let _ = handle.join();
+                self.log = outcome.log;
+                self.last_random_used = outcome.random_used;
+                outcome.result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The deadline, not the meter, stopped this call. The worker
+                // is detached on purpose: it runs until its fuel exhausts and
+                // then exits, so a timed-out guest can never hold the caller
+                // past the deadline, and its remaining work is still bounded
+                // by the fuel grant it was given.
+                drop(handle);
+                Err(Error::Timeout)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The worker died before it could report (a panic in the
+                // guest's execution): the panic itself is on stderr via the
+                // default hook, and the call is the guest's fault.
+                let _ = handle.join();
+                Err(provider("wasm/trap"))
+            }
+        }
+    }
+}
+
+/// What a guest worker reports back to the thread that called it.
+///
+/// The result plus the per-call evidence (`log`, `random_used`) that
+/// [`WasmTool::log`] and [`WasmTool::entropy_used`] report. A timed-out call
+/// never produces one: the worker owns the evidence and it is discarded.
+struct CallOutcome {
+    result: Result<Vec<u8>>,
+    log: Vec<u8>,
+    random_used: usize,
+}
+
+/// A guest call, owned by the worker thread that runs it.
+///
+/// This is the owned half of [`WasmTool`]: everything [`WasmCall::run`]
+/// needs, so the worker never borrows the tool and the calling thread can
+/// wait on the result with a deadline.
+struct WasmCall {
+    engine: Engine,
+    module: Module,
+    limits: WasmLimits,
+    host: WasmHostPolicy,
+    log: Vec<u8>,
+    last_random_used: usize,
+    random_cap: usize,
+    now_ms: u64,
+}
+
+impl WasmCall {
+    /// Instantiate the guest and run it, returning its output.
+    ///
+    /// This is the body [`WasmTool::call`] used to run inline: the checks
+    /// that need no execution (input window, memory reservation) already ran
+    /// on the calling thread in [`WasmTool::call_with_deadline`], so every
+    /// refusal here comes from the guest or its fuel.
+    fn run(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         // The module's declared initial memory, read before anything is
         // allocated: it is both the reservation below and the subtraction in the
         // growth ceiling. The module's own declaration, not the configured
@@ -500,13 +668,11 @@ impl WasmTool {
         // (and its wall time) before the refusal (round 18, #1). Charging the
         // ceiling instead refused a two-page module under a small grant
         // (round 19, M1); the declaration was read before the store existed.
+        // The reservation was checked before the worker started (see
+        // `call_with_deadline`): a grant too small to pay for the guest's own
+        // memory is refused there, synchronously, so by the time the worker
+        // runs this debit cannot fail for that reason.
         let granted = store.get_fuel().unwrap_or(0);
-        if reserved_fuel > granted {
-            // A grant too small to pay for the guest's own memory is a fuel
-            // shortfall, not a resource over a ceiling (round 19, L2).
-            self.last_random_used = store.data().random_used;
-            return Err(provider("wasm/fuel"));
-        }
         if store.set_fuel(granted - reserved_fuel).is_err() {
             self.last_random_used = store.data().random_used;
             return Err(provider("wasm/fuel"));
@@ -777,7 +943,12 @@ impl Provider for WasmTool {
             random_cap: self.random_cap.min(share),
             now_ms: call.now_ms,
         };
-        let result = tool.call(&input);
+        // The wall budget binds twice: it derived the fuel above, and it is
+        // the wall deadline the call runs under. Fuel alone never bound wall
+        // time (RPC-37), so the grant is enforced by a clock here, not just
+        // by the meter.
+        let result =
+            tool.call_with_deadline(&input, Duration::from_millis(call.budget.max_wall_ms));
         // Keep the guest's log even when the call was refused: a trap is exactly
         // when its diagnostics matter, and `call` cleared the buffer first so it
         // can only hold this call's bytes.
