@@ -38,6 +38,7 @@
 | [0034](0034-directory-sync-and-signalled-child-on-windows.md) | Parent-directory sync and the signalled-child guard on Windows |
 | [0035](0035-bare-star-argument-rule-opt-in.md) | A bare `*` argument rule needs an explicit opt-in |
 | [0036](0036-mint-attaches-the-provider-tool-policy.md) | Mint attaches the provider's tool policy by default |
+| [0037](0037-control-plane-mcp-response-ceiling-and-degraded.md) | Control-plane MCP: plane responses are capped and embedded-plane answers are marked degraded |
 
 ## Reading order and supersessions
 

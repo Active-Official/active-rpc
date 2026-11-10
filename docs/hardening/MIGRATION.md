@@ -55,6 +55,17 @@ program identity rather than trusting the environment:
   policy-less mint (`rpc/invalid-argument`, "a capability grants too many
   tools") -- mint with an explicit policy naming only the tools the
   capability may use.
+- The control-plane MCP now reads plane responses with a 1 MiB ceiling
+  and marks embedded-plane answers `degraded` (RPC-42). A plane
+  response larger than 1 MiB used to be read whole -- W2's probe
+  carried a 20 MB `/metrics` body back through `cp_metrics` -- and is
+  now refused with an error (`control-plane response exceeds the
+  1048576-byte ceiling`, JSON-RPC -32603), never truncated. A legitimate
+  plane snapshot is tens of KiB and is unaffected. And when the attach
+  target is unreachable the MCP used to fall back to an empty embedded
+  plane and answer as if real; every answer from the embedded plane now
+  carries `"degraded": true` inside the answer text, so offline `--mcp`
+  use still works but is visible as degraded.
 - A Unix timeout now signals the child's whole process group, and a Windows
   timeout still uses `taskkill /T`, so descendants do not outlive the call.
 

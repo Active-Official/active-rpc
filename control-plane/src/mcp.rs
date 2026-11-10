@@ -3,9 +3,12 @@
 //! By default it attaches to a running control plane (`--attach` or
 //! `http://127.0.0.1:8787`) so agents read the same snapshot the dashboard
 //! shows. If the service is not running, it falls back to an embedded real
-//! plane and says so on stderr.
+//! plane, says so on stderr, and marks every answer from the embedded plane
+//! `degraded`, so an agent never mistakes it for the live plane's snapshot
+//! (RPC-42). Plane responses are read with a 1 MiB ceiling; a larger body
+//! is refused with an error, never truncated.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::Mutex;
 
 use serde_json::{json, Value as Json};
@@ -13,6 +16,39 @@ use serde_json::{json, Value as Json};
 use crate::plane::PlaneCore;
 
 const DEFAULT_ATTACH: &str = "http://127.0.0.1:8787";
+
+/// Largest plane response body accepted, in bytes (RPC-42).
+///
+/// The plane's own `/metrics` is tens of KiB, so 1 MiB leaves an order of
+/// magnitude of headroom for a legitimate snapshot — and it matches the
+/// `MAX_REQUEST_LINE` ceiling already enforced on the MCP stdin side. The
+/// bound is on bytes, not time: the 5 s `ureq` timeout is a time bound, and
+/// on a fast local plane 15+ MB arrived inside it before the timeout fired.
+/// A body past this ceiling is refused with an error, never truncated:
+/// a truncated snapshot would still parse (or fail to parse) as if it were
+/// the plane's real answer.
+pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
+
+/// Read one plane response body as JSON, refusing one larger than
+/// `MAX_RESPONSE_BYTES` (RPC-42).
+///
+/// `take(MAX_RESPONSE_BYTES + 1)` bounds the read itself: at most one byte
+/// past the ceiling is ever buffered, however large the body the plane
+/// serves, and the connection is dropped as soon as the ceiling is crossed
+/// instead of draining the rest.
+fn read_json(response: ureq::Response) -> Result<Json, String> {
+    let mut reader = response.into_reader().take(MAX_RESPONSE_BYTES as u64 + 1);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err(format!(
+            "control-plane response exceeds the {MAX_RESPONSE_BYTES}-byte ceiling"
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
 
 struct Attach {
     base: String,
@@ -34,7 +70,9 @@ impl Attach {
             .call()
             .is_ok();
         if !reachable {
-            eprintln!("active-control-plane MCP: {base} is not reachable; using an embedded plane");
+            eprintln!(
+                "active-control-plane MCP: {base} is not reachable; using an embedded plane (answers are marked degraded)"
+            );
         }
         let local = (!reachable).then(|| {
             let mut core = PlaneCore::new();
@@ -52,13 +90,44 @@ impl Attach {
     }
 
     fn get(&self, path: &str) -> Result<Json, String> {
-        self.http
+        let response = self
+            .http
             .get(&format!("{}{}", self.base, path))
             .timeout(std::time::Duration::from_secs(5))
             .call()
-            .map_err(|error| error.to_string())?
-            .into_json::<Json>()
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        read_json(response)
+    }
+
+    /// Whether this attach answers from the embedded plane (RPC-42).
+    ///
+    /// Derived from `local`, not stored separately: the embedded plane
+    /// exists exactly when the attach target was unreachable at startup,
+    /// so the two cannot drift apart.
+    fn is_degraded(&self) -> bool {
+        self.local.is_some()
+    }
+
+    /// Mark an answer that came from the embedded plane as `degraded`
+    /// (RPC-42).
+    ///
+    /// The key goes inside the answer itself, so it is visible in the text
+    /// the agent reads — a stderr line at startup is not enough, because
+    /// the agent may never see it. A non-object answer (none of today's
+    /// tools returns one) is wrapped instead of left unmarked, so the
+    /// invariant "every embedded-plane answer carries `degraded`" holds
+    /// structurally rather than by inspection of each tool.
+    fn mark_degraded(&self, value: Json) -> Json {
+        if !self.is_degraded() {
+            return value;
+        }
+        match value {
+            Json::Object(mut object) => {
+                object.insert("degraded".to_string(), Json::Bool(true));
+                Json::Object(object)
+            }
+            other => json!({"degraded": true, "value": other}),
+        }
     }
 
     fn snapshot(&self) -> Result<Json, String> {
@@ -161,13 +230,13 @@ impl Attach {
                     .map_err(|error| error.to_string())
             });
         }
-        self.http
+        let response = self
+            .http
             .post(&format!("{}/demo/scenario/{id}", self.base))
             .timeout(std::time::Duration::from_secs(60))
             .send_json(json!({}))
-            .map_err(|error| error.to_string())?
-            .into_json::<Json>()
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        read_json(response)
     }
 
     fn level(&self, level: u8, up_to: bool) -> Result<Json, String> {
@@ -189,13 +258,13 @@ impl Attach {
             }))
             .map_err(|error| error.to_string());
         }
-        self.http
+        let response = self
+            .http
             .post(&format!("{}/demo/level/{level}?up_to={up_to}", self.base))
             .timeout(std::time::Duration::from_secs(120))
             .send_json(json!({}))
-            .map_err(|error| error.to_string())?
-            .into_json::<Json>()
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        read_json(response)
     }
 }
 
@@ -259,6 +328,7 @@ fn tools() -> Json {
 /// (-32602), a plane or transport failure is an internal error (-32603). Every
 /// failure used to be -32602, so a down plane looked like a bad request
 /// (R-19 round 4, F16).
+#[derive(Debug)]
 struct ToolFailure {
     code: i64,
     message: String,
@@ -335,6 +405,10 @@ fn call(attach: &Attach, params: &Json) -> Result<Json, ToolFailure> {
         }
         other => return Err(ToolFailure::invalid(format!("unknown tool {other}"))),
     };
+    // One choke point for the degraded marking (RPC-42): every tool answer
+    // from the embedded plane carries `degraded`, whichever tool produced
+    // it, and a live-plane answer never does.
+    let value = attach.mark_degraded(value);
     Ok(json!({
         "content": [{"type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default()}],
         "isError": false
@@ -472,7 +546,8 @@ pub fn run(attach_url: Option<String>, read_only: bool) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_bounded_line, MAX_REQUEST_LINE};
+    use super::{read_bounded_line, Json, MAX_REQUEST_LINE, MAX_RESPONSE_BYTES};
+    use serde_json::json;
     use std::io::Cursor;
 
     #[test]
@@ -569,5 +644,185 @@ mod tests {
         }
         assert_eq!(since["gap"], serde_json::Value::Bool(true));
         assert_eq!(since["cursor"], serde_json::Value::from(3u64));
+    }
+
+    /// Serve `body` for every request on a loopback stub, returning its
+    /// base URL. The stub answers every path with `body`, whatever the
+    /// method — the same shape as the redirect stub above, with the
+    /// response body as the variable. Tests build `Attach` literally, so
+    /// no `/health` check runs against the stub.
+    fn serve(body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("stub");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let body = Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let body = Arc::clone(&body);
+                std::thread::spawn(move || {
+                    // Read the whole request before answering: headers up
+                    // to `\r\n\r\n`, then the `Content-Length` body, if
+                    // any. Answering after a partial read leaves the
+                    // request body unread, and closing with unread
+                    // received data makes Windows reset the connection
+                    // (os error 10054) while the client is still reading
+                    // the response — which is exactly what a `POST` leg
+                    // hit before this read loop existed.
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    loop {
+                        let Ok(read) = stream.read(&mut buffer) else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let mut content_length = 0usize;
+                        for line in headers.lines().skip(1) {
+                            let mut parts = line.splitn(2, ':');
+                            let name = parts.next().unwrap_or("");
+                            let value = parts.next().unwrap_or("");
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        if request.len() >= end + 4 + content_length {
+                            break;
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(&body);
+                });
+            }
+        });
+        base
+    }
+
+    /// A valid JSON body of exactly `size` bytes: `{"pad": "<x…>"}` — a
+    /// 9-byte prefix (`{"pad": "`), the pad, and a 2-byte suffix (`"}`).
+    fn json_body_of_size(size: usize) -> Vec<u8> {
+        assert!(size >= 11, "body too small for the envelope");
+        let body = format!("{{\"pad\": \"{}\"}}", "x".repeat(size - 11)).into_bytes();
+        assert_eq!(body.len(), size, "body is not the requested size");
+        body
+    }
+
+    fn attach_to(base: String, read_only: bool) -> super::Attach {
+        super::Attach {
+            base,
+            http: ureq::AgentBuilder::new().redirects(0).build(),
+            local: None,
+            read_only,
+        }
+    }
+
+    /// The text payload of a successful tool call, parsed back to JSON.
+    fn tool_answer(result: &Json) -> Json {
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tool answer carries text");
+        serde_json::from_str(text).expect("tool answer text is JSON")
+    }
+
+    /// A loopback port nothing listens on: bind an ephemeral port, then
+    /// close it, so the attach target is unreachable (connection refused).
+    fn closed_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    /// A plane response past the ceiling is refused with an error naming
+    /// the ceiling — never read in full, never truncated (RPC-42).
+    ///
+    /// W2's probe showed the pre-fix shape: a 20 MB `/metrics` body came
+    /// back through `cp_metrics` whole (12.2 s, marker present), and at
+    /// the audited head 15.3 MB had already been read before the 5 s
+    /// timeout fired. The boundary is pinned too: exactly the ceiling
+    /// parses, one byte past it is refused.
+    #[test]
+    fn an_oversized_plane_response_is_refused_not_read() {
+        let big = attach_to(serve(json_body_of_size(MAX_RESPONSE_BYTES + 1)), true);
+        let error = big.get("/metrics").expect_err("oversized body refused");
+        assert!(
+            error.contains("exceeds") && error.contains(&MAX_RESPONSE_BYTES.to_string()),
+            "the refusal must name the ceiling, got: {error}"
+        );
+
+        let exact = attach_to(serve(json_body_of_size(MAX_RESPONSE_BYTES)), true);
+        let value = exact.get("/metrics").expect("ceiling-sized body parses");
+        assert_eq!(
+            value["pad"].as_str().expect("pad").len(),
+            MAX_RESPONSE_BYTES - 11,
+            "the ceiling-sized body must arrive whole, not truncated"
+        );
+
+        let small = attach_to(serve(json_body_of_size(64)), true);
+        let value = small.get("/metrics").expect("small body parses");
+        assert_eq!(value["pad"].as_str().expect("pad").len(), 53);
+    }
+
+    /// The cap is on every plane response, not just `GET /metrics`: the
+    /// scenario/level `POST` replies went through the same unbounded
+    /// `into_json()` (RPC-42).
+    #[test]
+    fn a_posted_plane_response_is_capped_too() {
+        let big = attach_to(serve(json_body_of_size(MAX_RESPONSE_BYTES + 1)), false);
+        let error = big
+            .level(0, false)
+            .expect_err("oversized POST body refused");
+        assert!(
+            error.contains("exceeds") && error.contains(&MAX_RESPONSE_BYTES.to_string()),
+            "the refusal must name the ceiling, got: {error}"
+        );
+    }
+
+    /// Answers from the embedded plane carry `degraded`, and answers from
+    /// a live plane never do (RPC-42).
+    ///
+    /// The fallback itself is preserved — offline use still answers —
+    /// but the marking is applied at the one choke point in `call()`, so
+    /// every tool is marked, not just `cp_metrics`.
+    #[test]
+    fn embedded_plane_answers_are_marked_degraded() {
+        let port = closed_loopback_port();
+        let embedded = super::Attach::new(format!("http://127.0.0.1:{port}"), true);
+        assert!(embedded.is_degraded(), "unreachable target is degraded");
+
+        for tool in ["cp_metrics", "cp_engines"] {
+            let result = super::call(&embedded, &json!({"name": tool, "arguments": {}}))
+                .expect("embedded plane answers");
+            let answer = tool_answer(&result);
+            assert_eq!(
+                answer["degraded"],
+                Json::Bool(true),
+                "{tool} from the embedded plane must be marked degraded: {answer}"
+            );
+        }
+
+        let live = attach_to(serve(json_body_of_size(64)), true);
+        let result = super::call(&live, &json!({"name": "cp_metrics", "arguments": {}}))
+            .expect("live plane answers");
+        let answer = tool_answer(&result);
+        assert!(
+            answer.get("degraded").is_none(),
+            "a live-plane answer must not be marked degraded: {answer}"
+        );
+        assert_eq!(answer["pad"].as_str().expect("pad").len(), 53);
     }
 }
