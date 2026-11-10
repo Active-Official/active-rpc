@@ -55,6 +55,9 @@ imports:  none; a module that declares any import is refused
 - **Module text**: WebAssembly *text* is refused (`wasm/module`) unless the
   embedder sets `WasmHostPolicy::accept_wat`. Text expands far beyond its own
   size during compilation, and compilation happens before any fuel is charged.
+  Text that is accepted is capped at 64 KiB (`MAX_WAT_BYTES`) *before*
+  parsing, and the compile itself runs under a 5 s wall deadline
+  (`MAX_COMPILE_WALL`, RPC-39) — see the addendum below.
 
 ### Error codes (provider class `rpc/provider`)
 
@@ -72,6 +75,7 @@ imports:  none; a module that declares any import is refused
 | `wasm/output` | the guest returned a negative length, which is its own fault signal |
 | `wasm/output-limit` | the returned length is past the output ceiling (the static cap or the call's share); the adapter reports it as `rpc/budget-exceeded` when the grant is what bound it and as this code otherwise |
 | `wasm/spawn` | the host could not start the guest's worker thread; the guest never ran |
+| `wasm/timeout` | the compile outlived its wall deadline (RPC-39) |
 | `rpc/timeout` | the wall deadline elapsed before the guest finished. This is not provider class: it is the top-level timeout code, shared with the other adapters |
 
 ## Consequences
@@ -98,6 +102,26 @@ binds the caller even though the guest's remaining work is still bounded by
 fuel. A watchdog that zeroes fuel from another thread was considered and
 rejected: wasmi 2.0.0 exposes no interrupt handle, and `Store::set_fuel` needs
 `&mut Store`, which the executing thread holds.
+
+## Addendum (2026-11-09) — RPC-39: a wall deadline on compilation
+
+Compilation happened before any fuel existed, with no time bound at all: a
+1 MiB text module held the caller thread for ~1.1 s (1.24 s in verification)
+while the fuel meter and the call deadline (RPC-37) both bound execution
+only — the module does not exist yet when they would apply. Two bounds now
+apply before execution can start: text input is capped at 64 KiB
+(`MAX_WAT_BYTES`) *before* parsing (~70 ms worst case on the fix machine,
+against ~1.0 s for a 1 MiB text module), and the parse plus `Module::new`
+run on a worker thread under a 5 s wall deadline (`MAX_COMPILE_WALL`, one
+default call's wall grant and 16x the worst legitimate compile measured —
+~311 ms in debug for a binary just under the 1 MiB ceiling). A compile that
+outlives its deadline is refused with `wasm/timeout` and its worker is
+detached to finish on its own; the deadline is enforced by the join, never
+by killing the worker. The timeout is a `wasm/...` provider code, not the
+top-level `rpc/timeout` the call deadline reports: every construction
+refusal is a provider-coded `wasm/...` error, and the fuzz target asserts
+that shape. `from_bytes_with_policy_and_deadline` sets the deadline
+explicitly; `from_bytes` and `from_bytes_with_policy` use the default.
 
 ## Addendum (2026-11-01) — R-14 hostile review
 

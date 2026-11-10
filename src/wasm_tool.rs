@@ -4,7 +4,11 @@
 //! budget, and every call is bounded by a real wall-clock deadline as well
 //! as by fuel (RPC-37): fuel is the instruction bound, the deadline is the
 //! wall bound, and the deadline is enforced by a clock around the
-//! execution. The kernel still owns authority: the tool is only reachable through
+//! execution. Compilation is bounded the same way (RPC-39): it runs before
+//! any fuel exists, so the text input is capped before parsing and the
+//! compile itself runs on a worker thread under a wall deadline, or the
+//! caller would be held for the full compile time of a hostile module.
+//! The kernel still owns authority: the tool is only reachable through
 //! a minted capability. Host imports are deny-by-default: a module that declares
 //! an import the build's WasmHostPolicy does not explicitly grant is refused
 //! before it runs, and a granted one is a single checked host function
@@ -40,8 +44,38 @@ pub const OUTPUT_OFFSET: usize = 64 * 1024;
 ///
 /// Compilation happens before any fuel exists, so an unbounded module is an
 /// unbounded allocation and an unbounded compile. One MiB is far above any
-/// hand-written tool and far below a denial-of-service payload.
+/// hand-written tool and far below a denial-of-service payload. The compile
+/// itself is bounded by a wall deadline as well as by this ceiling
+/// ([`MAX_COMPILE_WALL`], RPC-39): the ceiling bounds the work, the
+/// deadline bounds the wall time even on a machine where the work runs
+/// far slower than the rate predicts.
 pub const MAX_MODULE_BYTES: usize = 1 << 20;
+
+/// Largest WebAssembly *text* the host parses, in bytes.
+///
+/// Text expands far beyond its own size during compilation — a 1 MiB text
+/// module held the caller thread for ~1.1 s with no deadline anywhere
+/// (RPC-39) — so text is capped far below the binary ceiling, *before*
+/// parsing. 64 KiB is far above any hand-written tool (every WAT fixture
+/// in this repo is under 1 KiB) and bounds the worst text compile to
+/// ~70 ms on the fix machine. Anything that is not binary module bytes and
+/// is past this cap is refused with `wasm/module` before a byte of it is
+/// parsed.
+pub const MAX_WAT_BYTES: usize = 64 << 10;
+
+/// Longest a compile may hold the caller, in wall time.
+///
+/// Compilation runs before any fuel exists, so neither the fuel meter nor
+/// the call deadline (RPC-37) reaches it — both bound execution, and the
+/// module does not exist yet. A compile that outlives this deadline is
+/// refused with `wasm/timeout` instead of holding the caller. Five seconds
+/// is one default call's wall grant (`Budget::default().max_wall_ms`) and
+/// 16x the worst legitimate compile measured on the fix machine (a binary
+/// just under the 1 MiB ceiling compiles in ~311 ms in debug; the worst
+/// text compile under [`MAX_WAT_BYTES`] is ~70 ms), so a legitimate module
+/// has ample headroom in either build while a hostile one is still cut
+/// off in seconds.
+pub const MAX_COMPILE_WALL: Duration = Duration::from_secs(5);
 
 /// Largest fuel budget a caller may configure.
 ///
@@ -137,7 +171,9 @@ pub struct WasmHostPolicy {
     /// Off by default: a 1 MiB text module can expand into far more compiled
     /// code than 1 MiB, and compilation happens before any fuel is charged. An
     /// embedder that compiles its own hand-written tools can turn it on for
-    /// those, and must never turn it on for bytes from a peer.
+    /// those, and must never turn it on for bytes from a peer. Text that is
+    /// accepted is still capped at [`MAX_WAT_BYTES`] before parsing and the
+    /// compile still runs under [`MAX_COMPILE_WALL`] (RPC-39).
     pub accept_wat: bool,
 }
 
@@ -209,7 +245,9 @@ impl WasmTool {
     ///
     /// WAT text is accepted only by a policy that opts in (WasmHostPolicy::accept_wat);
     /// this entry point uses the deny-by-default policy, which refuses anything
-    /// that does not start with the wasm magic.
+    /// that does not start with the wasm magic. The compile runs under the
+    /// default wall deadline ([`MAX_COMPILE_WALL`], RPC-39); use
+    /// [`WasmTool::from_bytes_with_policy_and_deadline`] to set it explicitly.
     pub fn from_bytes(bytes: &[u8], limits: WasmLimits) -> Result<WasmTool> {
         Self::from_bytes_with_policy(bytes, limits, WasmHostPolicy::default())
     }
@@ -219,30 +257,62 @@ impl WasmTool {
     /// Every ceiling is validated before anything is allocated or compiled. A
     /// module may import only the functions the policy grants; anything else is
     /// refused before instantiation, so a guest can never reach a host function
-    /// the embedder did not declare.
+    /// the embedder did not declare. The compile runs under the default wall
+    /// deadline ([`MAX_COMPILE_WALL`], RPC-39); use
+    /// [`WasmTool::from_bytes_with_policy_and_deadline`] to set it explicitly.
     pub fn from_bytes_with_policy(
         bytes: &[u8],
         limits: WasmLimits,
+        host: WasmHostPolicy,
+    ) -> Result<WasmTool> {
+        Self::from_bytes_with_policy_and_deadline(bytes, limits, host, MAX_COMPILE_WALL)
+    }
+
+    /// Compile a guest with an explicit host policy and an explicit wall
+    /// deadline on the compile itself.
+    ///
+    /// Every ceiling is validated before anything is allocated or compiled, on
+    /// the calling thread, so those refusals are deterministic: an empty or
+    /// oversized module is `wasm/module`, text past [`MAX_WAT_BYTES`] is
+    /// `wasm/module` before a byte of it is parsed, and a limit past its
+    /// ceiling is `wasm/limits`. The compile itself — parsing the text, if
+    /// any, and `Module::new` — then runs on a worker thread; the caller
+    /// waits at most `max_compile_wall` for it. A compile that outlives the
+    /// deadline is refused with `wasm/timeout` and the worker thread is
+    /// detached: it finishes the compile on its own — its remaining work is
+    /// bounded by the size ceilings — so a timed-out compile can never hold
+    /// the caller past the deadline. A worker thread is never killed: there
+    /// is no safe way to stop a wasmi compile from another thread, so the
+    /// deadline is enforced by the join, not by the engine. A zero deadline
+    /// is treated as one millisecond.
+    ///
+    /// The timeout is a `wasm/...` provider code, not the top-level
+    /// `rpc/timeout` the call deadline reports (RPC-37): every construction
+    /// refusal is a provider-coded `wasm/...` error, and the fuzz target
+    /// (`fuzz/fuzz_targets/fuzz_wasm_module.rs`) asserts that shape, so a
+    /// top-level code from construction would break it. The phase matters
+    /// too: this deadline names the compile, the other names a call.
+    pub fn from_bytes_with_policy_and_deadline(
+        bytes: &[u8],
+        limits: WasmLimits,
         mut host: WasmHostPolicy,
+        max_compile_wall: Duration,
     ) -> Result<WasmTool> {
         if bytes.is_empty() || bytes.len() > MAX_MODULE_BYTES {
+            return Err(provider("wasm/module"));
+        }
+        // Text expands far beyond its own size during compilation, and
+        // compilation happens before any fuel exists: a 1 MiB text module
+        // held the caller thread for ~1.1 s with no deadline anywhere
+        // (RPC-39). The text ceiling is checked before a byte of it is
+        // parsed, so no text input can buy more than ~70 ms of parse time.
+        if !bytes.starts_with(b"\0asm") && bytes.len() > MAX_WAT_BYTES {
             return Err(provider("wasm/module"));
         }
         // Text modules expand far beyond their own size during compilation, and
         // compilation happens before any fuel exists. Only an embedder that
         // compiles its own tools may feed text.
         if !host.accept_wat && !bytes.starts_with(b"\0asm") {
-            return Err(provider("wasm/module"));
-        }
-        // Text is parsed to binary here, so the module ceiling bounds what the
-        // engine compiles rather than the source that produced it: a 1 MiB cap on
-        // the text bounded nothing (R-14 round 3, L-5).
-        let binary = if bytes.starts_with(b"\0asm") {
-            std::borrow::Cow::Borrowed(bytes)
-        } else {
-            wat::parse_bytes(bytes).map_err(|_| provider("wasm/module"))?
-        };
-        if binary.len() > MAX_MODULE_BYTES {
             return Err(provider("wasm/module"));
         }
         if limits.fuel == 0 || limits.fuel > MAX_FUEL {
@@ -271,7 +341,74 @@ impl WasmTool {
         config.set_max_recursion_depth(MAX_RECURSION_DEPTH);
         config.set_max_stack_height(MAX_STACK_BYTES);
         let engine = Engine::new(&config);
-        let module = Module::new(&engine, &binary).map_err(|_| provider("wasm/module"))?;
+        // Compilation itself is the unbounded step: it runs before any fuel
+        // exists, and neither the fuel meter nor the call deadline (RPC-37)
+        // reaches it — both bound execution, and the module does not exist
+        // yet. So the parse and the compile run on a worker thread under the
+        // same wall discipline as execution (RPC-39): the caller waits at
+        // most `max_compile_wall`, and a compile that outlives it is refused
+        // with `wasm/timeout` while the worker is detached to finish the
+        // compile on its own. A worker thread is never killed: there is no
+        // safe way to stop a wasmi compile from another thread, so the
+        // deadline is enforced by the join, not by the engine. A zero
+        // deadline is treated as one millisecond.
+        let max_compile_wall = max_compile_wall.max(Duration::from_millis(1));
+        let worker_engine = engine.clone();
+        let input = bytes.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("active-wasm-compile".to_string())
+            .spawn(move || {
+                let outcome = (|| {
+                    // Text is parsed to binary here, so the module ceiling bounds what the
+                    // engine compiles rather than the source that produced it: a 1 MiB cap on
+                    // the text bounded nothing (R-14 round 3, L-5).
+                    let binary = if input.starts_with(b"\0asm") {
+                        input
+                    } else {
+                        match wat::parse_bytes(&input) {
+                            Ok(parsed) => parsed.into_owned(),
+                            Err(_) => return Err(provider("wasm/module")),
+                        }
+                    };
+                    if binary.len() > MAX_MODULE_BYTES {
+                        return Err(provider("wasm/module"));
+                    }
+                    Module::new(&worker_engine, &binary).map_err(|_| provider("wasm/module"))
+                })();
+                let _ = tx.send(outcome);
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            // The host could not start the compile's worker thread: the
+            // guest never compiled, so there is nothing to report.
+            Err(_) => return Err(provider("wasm/spawn")),
+        };
+        let module = match rx.recv_timeout(max_compile_wall) {
+            Ok(module) => {
+                // The worker sent its outcome, so it is already returning;
+                // reaping it here keeps no finished thread behind.
+                let _ = handle.join();
+                module?
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The deadline, not the meter, stopped this compile. The
+                // worker is detached on purpose: it finishes the compile on
+                // its own — its remaining work is bounded by the size
+                // ceilings — so a timed-out compile can never hold the
+                // caller past the deadline.
+                drop(handle);
+                return Err(provider("wasm/timeout"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The worker died before it could report (a panic in the
+                // parser or the compiler): the panic itself is on stderr
+                // via the default hook, and the compile is the guest's
+                // fault.
+                let _ = handle.join();
+                return Err(provider("wasm/module"));
+            }
+        };
         // The policy is about *functions*: an import with a granted name but the
         // wrong kind or signature is not a granted import, and accepting it
         // would rest the guarantee on the linker's own resolution instead of on

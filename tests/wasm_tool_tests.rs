@@ -77,6 +77,19 @@ fn binary(wat: &str) -> Vec<u8> {
     wat::parse_str(wat).expect("the fixture is valid WAT")
 }
 
+/// A module of `n` empty functions plus the ABI `run` export, as WAT text.
+///
+/// Used to build large-but-legal modules for the compile-bound tests
+/// (RPC-39): the text is ~16 bytes per function, the binary ~13.
+fn many_functions_wat(n: usize) -> String {
+    let mut wat = String::from("(module (memory (export \"memory\") 1)\n");
+    for i in 0..n {
+        wat.push_str(&format!("  (func $f{i})\n"));
+    }
+    wat.push_str("  (func (export \"run\") (param i32) (result i32) i32.const 0))\n");
+    wat
+}
+
 fn error_code(result: active_rpc::Result<impl std::fmt::Debug>) -> String {
     match result {
         Ok(value) => panic!("the guest was accepted: {value:?}"),
@@ -341,6 +354,100 @@ fn a_module_larger_than_the_ceiling_is_refused_before_compiling() {
     let error = WasmTool::from_bytes(&[], WasmLimits::default())
         .expect_err("an empty module must be refused");
     assert_eq!(error_code(Err::<(), _>(error)), "wasm/module");
+}
+
+/// A WAT module past the text ceiling is refused before parsing (RPC-39).
+///
+/// Text expands far beyond its own size during compilation, and compilation
+/// happens before any fuel exists: a 1 MiB text module held the caller
+/// thread for ~1.1 s with no deadline anywhere. The 64 KiB text ceiling is
+/// checked before a byte of it is parsed, so the refusal is immediate.
+#[test]
+fn a_wat_module_over_the_text_ceiling_is_refused_before_parsing() {
+    let wat = many_functions_wat(5_000);
+    assert!(
+        wat.len() > active_rpc::wasm_tool::MAX_WAT_BYTES,
+        "the fixture must be past the text ceiling: {} bytes",
+        wat.len()
+    );
+    let policy = WasmHostPolicy {
+        accept_wat: true,
+        ..WasmHostPolicy::default()
+    };
+    let start = std::time::Instant::now();
+    let error = WasmTool::from_bytes_with_policy(wat.as_bytes(), WasmLimits::default(), policy)
+        .expect_err("text past the ceiling must be refused");
+    assert_eq!(error_code(Err::<(), _>(error)), "wasm/module");
+    assert!(
+        start.elapsed().as_millis() < 1_000,
+        "the refusal must come from the ceiling, not from a parse that ran: {:?}",
+        start.elapsed()
+    );
+}
+
+/// A WAT module under the text ceiling still compiles (RPC-39).
+///
+/// The ceiling must bind hostile text without refusing a hand-written tool:
+/// 4,000 empty functions is ~63 KiB of text, far above any hand-written
+/// tool and just under the ceiling.
+#[test]
+fn a_wat_module_under_the_text_ceiling_still_compiles() {
+    let wat = many_functions_wat(4_000);
+    assert!(
+        wat.len() <= active_rpc::wasm_tool::MAX_WAT_BYTES,
+        "the fixture must be under the text ceiling: {} bytes",
+        wat.len()
+    );
+    let policy = WasmHostPolicy {
+        accept_wat: true,
+        ..WasmHostPolicy::default()
+    };
+    let mut tool = WasmTool::from_bytes_with_policy(wat.as_bytes(), WasmLimits::default(), policy)
+        .expect("text under the ceiling must compile");
+    assert!(tool.call(b"").expect("run").is_empty());
+}
+
+/// A compile that outlives its deadline is refused with `wasm/timeout`
+/// (RPC-39).
+///
+/// The module below compiles in ~80 ms in debug, so a 1 ms deadline can
+/// only be met by the deadline mechanism, not by a fast compile; a zero
+/// deadline is clamped to 1 ms rather than read as "no deadline".
+#[test]
+fn a_compile_that_outlives_its_deadline_is_refused_with_timeout() {
+    let binary = binary(&many_functions_wat(20_000));
+    for deadline in [
+        std::time::Duration::from_millis(1),
+        std::time::Duration::ZERO,
+    ] {
+        let start = std::time::Instant::now();
+        let error = WasmTool::from_bytes_with_policy_and_deadline(
+            &binary,
+            WasmLimits::default(),
+            WasmHostPolicy::default(),
+            deadline,
+        )
+        .expect_err("a compile past its deadline must be refused");
+        assert_eq!(error_code(Err::<(), _>(error)), "wasm/timeout");
+        assert!(
+            start.elapsed().as_millis() < 2_000,
+            "the deadline must bind the caller: {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+/// A large binary module still compiles under the default deadline (RPC-39).
+///
+/// The deadline must bind hostile compiles without refusing legitimate
+/// work: a 252 KiB binary (20,000 functions) compiles in ~80 ms in debug,
+/// far inside the 5 s default.
+#[test]
+fn a_large_binary_module_compiles_within_the_default_deadline() {
+    let binary = binary(&many_functions_wat(20_000));
+    let mut tool = WasmTool::from_bytes(&binary, WasmLimits::default())
+        .expect("a large legal module must compile within the default deadline");
+    assert!(tool.call(b"").expect("run").is_empty());
 }
 
 #[test]
