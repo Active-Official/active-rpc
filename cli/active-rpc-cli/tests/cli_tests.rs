@@ -1,8 +1,10 @@
 //! End-to-end CLI tests: every command drives the shipped binary and a real
 //! kernel peer over a real transport.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 fn cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_active-rpc-cli"))
@@ -281,6 +283,136 @@ fn loadgen_reports_percentiles() {
     assert!(text.contains("errors=0"), "{text}");
     assert!(text.contains("p50_ms="), "{text}");
     assert!(text.contains("p99_ms="), "{text}");
+}
+
+/// RPC-49: `--timeout-ms` bounds the whole `loadgen` run, not one request.
+/// A peer that accepts and never answers used to cost one full timeout per
+/// request (8 requests x 2000 ms = ~16 s); the run must now fail at the
+/// total deadline (~2 s) with a transport error. The audit's suggested
+/// probe (a `pipeline` against a silent peer exiting within ~5 s) does not
+/// prove this: `pipeline` aborts on its first failed call, so it already
+/// exited in ~2 s before the fix.
+#[test]
+fn loadgen_against_a_silent_peer_fails_at_the_total_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent-peer listener");
+    let address = listener.local_addr().expect("listener address");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => {
+                    // Drain what the client sends so its writes never block;
+                    // never write anything back.
+                    let mut buffer = [0u8; 4096];
+                    while let Ok(read) = stream.read(&mut buffer) {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let started = Instant::now();
+    let output = run(&[
+        "loadgen",
+        "--addr",
+        &address.to_string(),
+        "--cap",
+        "00112233445566778899aabbccddeeff",
+        "--requests",
+        "8",
+        "--concurrency",
+        "1",
+        "--timeout-ms",
+        "2000",
+    ]);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "loadgen against a silent peer took {elapsed:?}, expected the ~2 s total deadline"
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no answer within 2000 ms"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// RPC-49: `--timeout-ms` bounds the whole `pipeline` run, not one reply.
+/// A peer that answers one frame every 600 ms is healthy per request but
+/// takes ~4.8 s for 8 calls; against a 2000 ms total deadline the run must
+/// fail at ~2 s. Pre-fix this completed in ~4.8 s with exit 0: the
+/// behaviour change is the fix, so this test pins it on purpose.
+#[test]
+fn pipeline_against_a_slow_peer_fails_at_the_total_deadline() {
+    // A proxy between the CLI and the real peer: requests pass through at
+    // once, each response frame is held back 600 ms. Frames are length
+    // prefixed with a 4-byte little-endian length, as the transport writes
+    // them.
+    let peer = start_peer(&["peer", "--limit", "1"]);
+    let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy listener");
+    let proxy_address = proxy.local_addr().expect("proxy address");
+    let peer_address = peer.address.clone();
+    std::thread::spawn(move || {
+        let Ok((mut client, _)) = proxy.accept() else {
+            return;
+        };
+        let Ok(mut upstream) = TcpStream::connect(&peer_address) else {
+            return;
+        };
+        // Client to peer: forward at once.
+        let mut upstream_write = upstream.try_clone().expect("clone upstream");
+        let mut client_read = client.try_clone().expect("clone client");
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut client_read, &mut upstream_write);
+        });
+        // Peer to client: one frame, then 600 ms, then the next.
+        let mut header = [0u8; 4];
+        loop {
+            if upstream.read_exact(&mut header).is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; len];
+            if upstream.read_exact(&mut body).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(600));
+            if client.write_all(&header).is_err() {
+                break;
+            }
+            if client.write_all(&body).is_err() {
+                break;
+            }
+        }
+    });
+    let started = Instant::now();
+    let output = run(&[
+        "pipeline",
+        "--addr",
+        &proxy_address.to_string(),
+        "--cap",
+        &peer.cap,
+        "--calls",
+        "8",
+        "--text",
+        "pipelined",
+        "--timeout-ms",
+        "2000",
+    ]);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "pipeline against a slow peer took {elapsed:?}, expected the ~2 s total deadline"
+    );
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no answer within 2000 ms"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]

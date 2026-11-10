@@ -1016,54 +1016,74 @@ fn pipeline(args: &[String]) -> CliResult {
     let method = method(&flags);
     let deadline = timeout(&flags)?;
     let payload = payload(&flags)?;
-    let mut transport = TcpTransport::connect_with_timeout(&address, deadline)
-        .map_err(|error| CliError::transport(error.to_string()))?;
     let started = Instant::now();
-    for id in 0..calls as u64 {
-        let envelope = request(id + 1, &method, Vec::new(), &payload, Some(cap));
-        transport
-            .send(&envelope)
+    // `--timeout-ms` bounds the whole run, not one request: the connect and
+    // every `recv` used to get a fresh full deadline, so a peer that answered
+    // one frame just inside the deadline stretched an 8-call pipeline to
+    // 8 x timeout (RPC-49). `call` already bounds its whole exchange this
+    // way, and so does `loadgen` below. A multi-call pipeline against a
+    // slow-but-healthy peer now fails at the total deadline instead of
+    // completing in N x timeout: that is the intended semantics, and the
+    // help text says so.
+    let exchange_address = address.clone();
+    let exchange_method = method.clone();
+    let exchange_payload = payload.clone();
+    let (responses, refusals) = with_deadline(deadline, move || {
+        let mut transport = TcpTransport::connect_with_timeout(&exchange_address, deadline)
             .map_err(|error| CliError::transport(error.to_string()))?;
-    }
-    let mut responses = Vec::with_capacity(calls);
-    // Each reply must answer a request that is still outstanding, once. A peer
-    // that answers `Response` with one id N times used to make the run look
-    // clean: it replayed one answer and the counters believed it.
-    let mut outstanding: std::collections::BTreeSet<u64> = (1..=calls as u64).collect();
-    let mut uncorrelated = 0usize;
-    let mut retained_bytes = 0u64;
-    for _ in 0..calls {
-        let response = transport
-            .recv()
-            .map_err(|error| CliError::transport(error.to_string()))?
-            .ok_or_else(|| CliError::transport("the peer closed mid-pipeline"))?;
-        // `calls` does not bound the memory a hostile peer can make this keep:
-        // every reply may be the full body ceiling.
-        retained_bytes = retained_bytes.saturating_add(
-            response.payload.len() as u64
-                + response
-                    .args
-                    .iter()
-                    .map(active_rpc::Arg::wire_size)
-                    .sum::<u64>(),
-        );
-        if retained_bytes > MAX_PIPELINE_BYTES {
-            return Err(CliError::refused(format!(
-                "the peer returned more than the {MAX_PIPELINE_BYTES}-byte pipeline ceiling"
-            )));
+        for id in 0..calls as u64 {
+            let envelope = request(
+                id + 1,
+                &exchange_method,
+                Vec::new(),
+                &exchange_payload,
+                Some(cap),
+            );
+            transport
+                .send(&envelope)
+                .map_err(|error| CliError::transport(error.to_string()))?;
         }
-        if !outstanding.remove(&response.request_id) {
-            uncorrelated += 1;
+        let mut responses = Vec::with_capacity(calls);
+        // Each reply must answer a request that is still outstanding, once. A peer
+        // that answers `Response` with one id N times used to make the run look
+        // clean: it replayed one answer and the counters believed it.
+        let mut outstanding: std::collections::BTreeSet<u64> = (1..=calls as u64).collect();
+        let mut uncorrelated = 0usize;
+        let mut retained_bytes = 0u64;
+        for _ in 0..calls {
+            let response = transport
+                .recv()
+                .map_err(|error| CliError::transport(error.to_string()))?
+                .ok_or_else(|| CliError::transport("the peer closed mid-pipeline"))?;
+            // `calls` does not bound the memory a hostile peer can make this keep:
+            // every reply may be the full body ceiling.
+            retained_bytes = retained_bytes.saturating_add(
+                response.payload.len() as u64
+                    + response
+                        .args
+                        .iter()
+                        .map(active_rpc::Arg::wire_size)
+                        .sum::<u64>(),
+            );
+            if retained_bytes > MAX_PIPELINE_BYTES {
+                return Err(CliError::refused(format!(
+                    "the peer returned more than the {MAX_PIPELINE_BYTES}-byte pipeline ceiling"
+                )));
+            }
+            if !outstanding.remove(&response.request_id) {
+                uncorrelated += 1;
+            }
+            responses.push(response);
         }
-        responses.push(response);
-    }
+        let refusals = responses
+            .iter()
+            .filter(|response| response.kind != Kind::Response)
+            .count()
+            + uncorrelated
+            + outstanding.len();
+        Ok((responses, refusals))
+    })?;
     let elapsed = started.elapsed();
-    let refusals = responses
-        .iter()
-        .filter(|response| response.kind != Kind::Response)
-        .count()
-        + uncorrelated
-        + outstanding.len();
     out_line(format!(
         "calls={calls} round_trips=1 responses={} refusals={refusals} elapsed_ms={:.3}",
         responses.len().saturating_sub(refusals),
@@ -1132,66 +1152,80 @@ fn loadgen(args: &[String]) -> CliResult {
     // 64 GiB of address space before the first request.
     let total = requests;
     let started = Instant::now();
-    let next_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let mut handles = Vec::new();
-    for worker in 0..concurrency {
-        let address = address.clone();
-        let method = method.clone();
-        let payload = std::sync::Arc::clone(&payload);
-        let next_id = std::sync::Arc::clone(&next_id);
-        let per_worker = total / concurrency + usize::from(worker < total % concurrency);
-        let spawned = std::thread::Builder::new()
-            .name(format!("loadgen-{worker}"))
-            .spawn(move || {
-                let mut latencies = Vec::new();
-                let mut errors = 0usize;
-                let mut transport = match TcpTransport::connect_with_timeout(&address, deadline) {
-                    Ok(transport) => transport,
-                    // The worker could not open its connection: every
-                    // request it was assigned failed.
-                    Err(_) => return (Vec::new(), per_worker),
-                };
-                for _ in 0..per_worker {
-                    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let envelope = request(id, &method, Vec::new(), &payload, Some(cap));
-                    let started = Instant::now();
-                    let result = transport
-                        .send(&envelope)
-                        .and_then(|()| transport.recv())
-                        .map(|response| {
-                            response.map(|envelope| (envelope.kind, envelope.request_id))
-                        });
-                    match result {
-                        // A reply must carry the id this request used: a peer that
-                        // replays one answer stopped being counted as `ok`.
-                        Ok(Some((Kind::Response, echoed))) if echoed == id => {
-                            latencies.push(started.elapsed())
+    // `--timeout-ms` bounds the whole run, not one request: every worker used
+    // to get a fresh full deadline per request, so 8 requests against a
+    // silent peer cost 8 x timeout (RPC-49). `call` already bounds its whole
+    // exchange this way, and so does `pipeline` above. A run against a
+    // slow-but-healthy peer now fails at the total deadline instead of
+    // completing in N x timeout: that is the intended semantics, and the
+    // help text says so.
+    let exchange_address = address.clone();
+    let exchange_method = method.clone();
+    let exchange_payload = std::sync::Arc::clone(&payload);
+    let (mut latencies, errors) = with_deadline(deadline, move || {
+        let next_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let mut handles = Vec::new();
+        for worker in 0..concurrency {
+            let address = exchange_address.clone();
+            let method = exchange_method.clone();
+            let payload = std::sync::Arc::clone(&exchange_payload);
+            let next_id = std::sync::Arc::clone(&next_id);
+            let per_worker = total / concurrency + usize::from(worker < total % concurrency);
+            let spawned = std::thread::Builder::new()
+                .name(format!("loadgen-{worker}"))
+                .spawn(move || {
+                    let mut latencies = Vec::new();
+                    let mut errors = 0usize;
+                    let mut transport = match TcpTransport::connect_with_timeout(&address, deadline)
+                    {
+                        Ok(transport) => transport,
+                        // The worker could not open its connection: every
+                        // request it was assigned failed.
+                        Err(_) => return (Vec::new(), per_worker),
+                    };
+                    for _ in 0..per_worker {
+                        let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let envelope = request(id, &method, Vec::new(), &payload, Some(cap));
+                        let started = Instant::now();
+                        let result = transport
+                            .send(&envelope)
+                            .and_then(|()| transport.recv())
+                            .map(|response| {
+                                response.map(|envelope| (envelope.kind, envelope.request_id))
+                            });
+                        match result {
+                            // A reply must carry the id this request used: a peer that
+                            // replays one answer stopped being counted as `ok`.
+                            Ok(Some((Kind::Response, echoed))) if echoed == id => {
+                                latencies.push(started.elapsed())
+                            }
+                            _ => errors += 1,
                         }
-                        _ => errors += 1,
                     }
+                    (latencies, errors)
+                });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    return Err(CliError::transport(format!(
+                        "could not start {concurrency} workers: {error}"
+                    )))
                 }
-                (latencies, errors)
-            });
-        match spawned {
-            Ok(handle) => handles.push(handle),
-            Err(error) => {
-                return Err(CliError::transport(format!(
-                    "could not start {concurrency} workers: {error}"
-                )))
             }
         }
-    }
-    let mut latencies = Vec::new();
-    let mut errors = 0usize;
-    for handle in handles {
-        match handle.join() {
-            Ok((worker_latencies, worker_errors)) => {
-                latencies.extend(worker_latencies);
-                errors += worker_errors;
+        let mut latencies = Vec::new();
+        let mut errors = 0usize;
+        for handle in handles {
+            match handle.join() {
+                Ok((worker_latencies, worker_errors)) => {
+                    latencies.extend(worker_latencies);
+                    errors += worker_errors;
+                }
+                Err(_) => errors += 1,
             }
-            Err(_) => errors += 1,
         }
-    }
+        Ok((latencies, errors))
+    })?;
     let elapsed = started.elapsed();
     latencies.sort();
     let percentile = |percent: usize| -> f64 {
@@ -2018,10 +2052,13 @@ usage: active-rpc-cli <command> [options]
   pipeline --addr HOST:PORT --cap HEX [--calls N] [--method M] [--payload FILE]
            [--timeout-ms N]
       Send N calls on one connection before reading any response; prints the
-      round-trip count.
+      round-trip count. --timeout-ms bounds the whole run: a peer that
+      answers every call just inside the deadline still fails the run at
+      the total deadline.
   loadgen --addr HOST:PORT --cap HEX [--requests N] [--concurrency C]
-          [--method M] [--payload FILE]
+          [--method M] [--payload FILE] [--timeout-ms N]
       Controlled load over C connections; prints p50/p95/p99 and throughput.
+      --timeout-ms bounds the whole run, as for pipeline.
   bridge [--limit N]
       Serve the Connect/gRPC interop bridge against the demo kernel.
   events [--plane URL] [--after ID] [--follow] [--interval-ms N]
