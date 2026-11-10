@@ -465,7 +465,10 @@ the returned output, the guest log the host buffers and the entropy drawn by
 dimension `byte`. The static `max_output_bytes` and `max_log_bytes` still apply;
 the tighter ceiling decides the code, so `wasm/output-limit` maps to
 `rpc/budget-exceeded` only when the grant share is the tighter bound, and a
-guest's own `-1` stays `wasm/output`.
+guest's own `-1` stays `wasm/output`. A `log: true` policy with
+`max_log_bytes = 0` is refused at construction with `wasm/limits` (RPC-48):
+a granted log import with no cap would capture nothing; zero still means "no
+logging" when the import is not granted.
 
 ---
 

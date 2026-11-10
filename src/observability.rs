@@ -185,8 +185,12 @@ impl TraceEvent {
 /// Project a kernel event.
 ///
 /// Capability ids become correlation ids (`CapId::correlation_id`), which are
-/// stable per id and cannot be replayed as authority. Argument values and secret
-/// material never enter the projection because [`Event`] never carries them.
+/// stable per id and cannot be replayed as authority. Argument values never
+/// enter the projection because [`Event`] never carries them; secret-looking
+/// text is a different case — a refusal reason is provider-controlled text,
+/// so it reaches [`label()`], which scrubs secret-looking shapes before
+/// they reach a trace line (RPC-48). The scrubber is the second line of
+/// defence behind the rule that events carry no values.
 pub fn project(event: &Event, sequence: u64) -> TraceEvent {
     let mut trace = TraceEvent {
         sequence,
@@ -514,18 +518,359 @@ fn hex(bytes: &[u8; 32]) -> String {
 /// Longest label a trace carries, in bytes, including the ellipsis.
 pub const MAX_LABEL_BYTES: usize = 128;
 
-/// Bound and escape a free-form label before it enters a trace.
+/// Marker that stands where a secret-looking value was removed from a
+/// label (RPC-48). The marker is the whole replacement: the key name, the
+/// scheme word, or the surrounding prose stays, so an operator still sees
+/// *that* a credential was refused, never the credential itself.
+pub const REDACTED: &str = "[redacted]";
+
+/// Credential words a `key = value` / `key: value` assignment may use
+/// (RPC-48). The match is case-insensitive, and a key also matches when it
+/// ends in one of these after `_`, `-` or `.` (`my_token`,
+/// `client_secret`), so an embedder's own key names are covered without
+/// matching words that merely contain one (`monkey` is not `key`).
+const CREDENTIAL_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "api-key",
+    "access_token",
+    "refresh_token",
+    "auth_token",
+    "client_secret",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "key",
+];
+
+/// True when `byte` joins a word: a letter, a digit, `_` or `-`. A `.`
+/// separates dotted components, so it is a boundary here.
+fn is_word_byte(byte: Option<u8>) -> bool {
+    matches!(
+        byte,
+        Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')
+    )
+}
+
+/// True when `key` is a credential word, or ends in one after `_`, `-` or
+/// `.` (RPC-48). The comparison is case-insensitive: `API_KEY` and
+/// `Api-Key` are the same assignment as `api_key`.
+fn is_credential_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    CREDENTIAL_KEYS.iter().any(|word| {
+        lower == *word
+            || lower.ends_with(&format!("_{word}"))
+            || lower.ends_with(&format!("-{word}"))
+            || lower.ends_with(&format!(".{word}"))
+    })
+}
+
+/// End of a PEM private-key block in `text`: the byte just past the closing
+/// `-----` of an `-----END ... PRIVATE KEY-----` marker, or `None` when
+/// there is no complete END marker.
+fn pem_end(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(at) = text[from..].find("-----END ") {
+        let start = from + at;
+        let after = &text[start + "-----END ".len()..];
+        // A missing closing run means no complete END marker exists later
+        // either: any later marker would contain the run this search just
+        // missed, so the question-mark ends the search exactly as the
+        // explicit None did (clippy::question_mark).
+        let end = after.find("-----")?;
+        if after[..end].contains("PRIVATE KEY") {
+            return Some(start + "-----END ".len() + end + 5);
+        }
+        from = start + 1;
+    }
+    None
+}
+
+/// What a secret-looking shape starting at `at` consumes, and what
+/// replaces it: `(bytes consumed, replacement)`, or `None` when no pattern
+/// starts at `at`. The replacement carries the preserved shape (a key
+/// name, a scheme word) with the value replaced by [`REDACTED`].
+fn secret_match_at(text: &str, at: usize) -> Option<(usize, String)> {
+    let bytes = text.as_bytes();
+    let rest = &text[at..];
+
+    // A PEM private-key block: the BEGIN marker through the END marker, or
+    // to the end of the label when the block is cut short. Everything
+    // between the markers is key material, so the whole span is one
+    // redaction; a certificate marker is not a private key and stays.
+    for marker in ["-----BEGIN ", "-----END "] {
+        if let Some(after) = rest.strip_prefix(marker) {
+            if let Some(end) = after.find("-----") {
+                let header = &after[..end];
+                if header.contains("PRIVATE KEY") {
+                    let consumed = marker.len() + end + 5;
+                    if marker == "-----BEGIN " {
+                        if let Some(end_at) = pem_end(&rest[consumed..]) {
+                            return Some((consumed + end_at, REDACTED.to_string()));
+                        }
+                        return Some((rest.len(), REDACTED.to_string()));
+                    }
+                    return Some((consumed, REDACTED.to_string()));
+                }
+            }
+        }
+    }
+
+    // `Bearer <token>` / `Basic <token>`: the scheme word stays, the token
+    // goes. A short word after the scheme is prose ("Bearer token
+    // required"), not a credential, so only a run of at least 8
+    // characters is redacted.
+    for scheme in ["Bearer", "Basic"] {
+        // Byte comparison, not a rest[..6] slice: a multibyte character
+        // straddling the sixth byte would panic the slice, and the text
+        // here is provider-controlled (RPC-48).
+        if rest.len() > scheme.len()
+            && rest.as_bytes()[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes())
+            && !is_word_byte(if at == 0 { None } else { Some(bytes[at - 1]) })
+            && bytes[at + scheme.len()].is_ascii_whitespace()
+        {
+            let mut value = at + scheme.len();
+            while value < bytes.len() && bytes[value].is_ascii_whitespace() {
+                value += 1;
+            }
+            let mut end = value;
+            while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+                end += 1;
+            }
+            if end - value >= 8 {
+                let replacement = format!("{} {REDACTED}", &text[at..at + scheme.len()]);
+                return Some((end - at, replacement));
+            }
+        }
+    }
+
+    // URL userinfo: `scheme://user:pass@host` carries the credential
+    // before the `@`, exactly the shape `redacted_base` removes from a
+    // base URL. The `@` must come before any `/`, `?`, `#` or whitespace,
+    // so a bare `user@host` without a scheme is untouched.
+    if rest.starts_with("://") {
+        let mut end = at + 3;
+        while end < bytes.len()
+            && bytes[end] != b'@'
+            && bytes[end] != b'/'
+            && bytes[end] != b'?'
+            && bytes[end] != b'#'
+            && !bytes[end].is_ascii_whitespace()
+        {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'@' && end > at + 3 {
+            return Some((end + 1 - at, format!("://{REDACTED}@")));
+        }
+    }
+
+    // Fixed credential prefixes: the prefix plus a run of token
+    // characters, with a minimum run length so a short word that happens
+    // to start the same way stays. The character before must not join a
+    // word, so `task-...` never reads as a key.
+    if !is_word_byte(if at == 0 { None } else { Some(bytes[at - 1]) }) {
+        for (prefix, min_run) in [
+            ("sk-", 16),
+            ("sk_live_", 16),
+            ("sk_test_", 16),
+            ("ghp_", 20),
+            ("gho_", 20),
+            ("ghu_", 20),
+            ("ghs_", 20),
+            ("ghr_", 20),
+            ("github_pat_", 20),
+        ] {
+            if let Some(after) = rest.strip_prefix(prefix) {
+                let run = after
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+                    .count();
+                if run >= min_run {
+                    return Some((prefix.len() + run, REDACTED.to_string()));
+                }
+            }
+        }
+        if let Some(after) = rest.strip_prefix("AKIA") {
+            let run = after
+                .bytes()
+                .take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                .count();
+            if run >= 16 {
+                return Some((4 + run, REDACTED.to_string()));
+            }
+        }
+    }
+
+    // `key = value` / `key: value`: the key stays, the value goes. The key
+    // must start at a word boundary, so `monkey` does not match through
+    // its `key` tail. A quoted value is redacted inside its quotes. A
+    // value that is just the scheme word `Bearer`/`Basic` is left for the
+    // scheme arm above, which redacts the token that follows it instead
+    // of the scheme word itself.
+    if !is_word_byte(if at == 0 { None } else { Some(bytes[at - 1]) }) {
+        let mut key_end = at;
+        while key_end < bytes.len()
+            && (bytes[key_end].is_ascii_alphanumeric()
+                || matches!(bytes[key_end], b'_' | b'-' | b'.'))
+        {
+            key_end += 1;
+        }
+        // A JSON-quoted key: the closing quote ends the key and the
+        // separator follows it. The quote only counts as a closer when
+        // the same quote opened the key, so an apostrophe in prose
+        // (`secret's: ...`) is not a key. Spaces may sit between the
+        // key (or its closer) and the separator, and between the
+        // separator and the value (`password = "x"`).
+        let mut sep_at = key_end;
+        if sep_at < bytes.len()
+            && (bytes[sep_at] == b'"' || bytes[sep_at] == b'\'')
+            && at > 0
+            && bytes[at - 1] == bytes[sep_at]
+        {
+            sep_at += 1;
+        }
+        while sep_at < bytes.len() && (bytes[sep_at] == b' ' || bytes[sep_at] == b'\t') {
+            sep_at += 1;
+        }
+        if key_end > at
+            && sep_at < bytes.len()
+            && (bytes[sep_at] == b'=' || bytes[sep_at] == b':')
+            && is_credential_key(&text[at..key_end])
+        {
+            let mut value_start = sep_at + 1;
+            while value_start < bytes.len()
+                && (bytes[value_start] == b' ' || bytes[value_start] == b'\t')
+            {
+                value_start += 1;
+            }
+            if value_start < bytes.len()
+                && (bytes[value_start] == b'"' || bytes[value_start] == b'\'')
+            {
+                let quote = bytes[value_start];
+                let mut end = value_start + 1;
+                while end < bytes.len() && bytes[end] != quote {
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    let mut replacement = text[at..=value_start].to_string();
+                    replacement.push_str(REDACTED);
+                    replacement.push(quote as char);
+                    return Some((end + 1 - at, replacement));
+                }
+            } else {
+                let mut end = value_start;
+                while end < bytes.len()
+                    && !bytes[end].is_ascii_whitespace()
+                    && !matches!(
+                        bytes[end],
+                        b'"' | b'\'' | b',' | b';' | b'&' | b'}' | b']' | b')'
+                    )
+                {
+                    end += 1;
+                }
+                if end > value_start {
+                    let value = &text[value_start..end];
+                    if !value.eq_ignore_ascii_case("Bearer") && !value.eq_ignore_ascii_case("Basic")
+                    {
+                        let mut replacement = text[at..value_start].to_string();
+                        replacement.push_str(REDACTED);
+                        return Some((end - at, replacement));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Scrub secret-looking shapes from a label before it enters a trace.
+///
+/// Defence in depth (RPC-48): the fields `label()` bounds are meant to be
+/// closed sets, but a provider-controlled reason reaches one of them —
+/// `tool.refused`'s detail used to be the refusal error verbatim — so the
+/// first producer that embeds a value would turn telemetry into a
+/// credential leak. The scrubber redacts the *value* and keeps the shape,
+/// so a trace still shows that a credential was refused without carrying
+/// the credential.
+///
+/// The patterns are fixed prefixes and `key = value` shapes the codebase
+/// already treats as credential homes — `sk-...` API keys (the `--api-key`
+/// shape in `src/tool.rs`), `Bearer` header values (redacted to lengths
+/// there), PEM private keys, URL userinfo (the same rule
+/// `redacted_base` applies to a base URL) — never a bare entropy or
+/// length heuristic, so a hash, a correlation id, or a long method name
+/// passes through untouched. What is redacted, exactly:
+///
+/// - a `key = value` or `key: value` assignment whose key is a credential
+///   word ([`CREDENTIAL_KEYS`]) or ends in one; the key stays, the value
+///   becomes [`REDACTED`]. A quoted value is redacted inside its quotes,
+///   a JSON-quoted key (`"password": "hunter2"`) is covered, and spaces
+///   around the separator are allowed (`password = "x"`).
+/// - `Bearer <token>` / `Basic <token>` with a token of at least 8
+///   characters; the scheme word stays. A short word (`Bearer token
+///   required`) is prose, not a credential, and stays.
+/// - a token with a fixed credential prefix: `sk-`, `sk_live_`,
+///   `sk_test_` plus at least 16 characters; `ghp_`, `gho_`, `ghu_`,
+///   `ghs_`, `ghr_`, `github_pat_` plus at least 20; `AKIA` plus 16
+///   uppercase alphanumerics.
+/// - a PEM private-key block: `-----BEGIN ... PRIVATE KEY-----` through
+///   its `-----END ... PRIVATE KEY-----`, or to the end of the label when
+///   the block is cut short. A lone `-----END ... PRIVATE KEY-----` is
+///   redacted on its own. A `-----BEGIN CERTIFICATE-----` is not a
+///   private key and stays.
+/// - URL userinfo: `scheme://user:pass@host` becomes
+///   `scheme://[redacted]@host`.
+///
+/// The scan is one left-to-right pass over the label and allocates only
+/// when a pattern actually matches, so ordinary labels cost one pass and
+/// no allocation.
+fn scrub_secrets(text: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some((len, replacement)) = secret_match_at(text, i) {
+            let out = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            out.push_str(&text[copied..i]);
+            out.push_str(&replacement);
+            i += len;
+            copied = i;
+        } else {
+            // Advance one character, not one byte: labels are Unicode and
+            // the scan must stay on char boundaries.
+            i += text[i..].chars().next().map_or(1, |ch| ch.len_utf8());
+        }
+    }
+    match out {
+        Some(mut out) => {
+            out.push_str(&text[copied..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+/// Bound, scrub and escape a free-form label before it enters a trace.
 ///
 /// The fields that carry a label (`code`, `dimension`, `detail`, a provider
 /// phase) are meant to be closed sets, but a provider-controlled code reaches
 /// one of them, and a trace is text that a collector may write into a line log
 /// or a terminal. Escaping and truncating here is the fail-closed boundary,
-/// independent of what each producer does.
+/// independent of what each producer does. Secret-looking shapes are
+/// scrubbed first, by [`scrub_secrets`]: the fast path below returns short
+/// clean text unchanged, and a secret must not take it (RPC-48).
 ///
 /// The result is at most [`MAX_LABEL_BYTES`] bytes and contains no control
 /// character: the ellipsis is reserved for out of the budget, so the bound is
 /// the constant and not the constant plus three.
 pub fn label(text: &str) -> String {
+    // Scrub before the fast path: a short secret-looking label must not
+    // return unchanged below (RPC-48).
+    let scrubbed = scrub_secrets(text);
+    let text = scrubbed.as_ref();
     // The crate's one rule for text that must not reach a line log: control
     // characters and invisible/reordering ones. The fast path used to check
     // only `is_control`, so U+2028 and bidi overrides passed through

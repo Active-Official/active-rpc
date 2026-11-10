@@ -165,6 +165,14 @@ pub struct WasmHostPolicy {
     /// `env.log(ptr, len) -> i32`: appends to a bounded host-side log.
     pub log: bool,
     /// Largest log a guest may produce in one call, in bytes.
+    ///
+    /// A granted log import needs a nonzero cap: `log: true` with
+    /// `max_log_bytes = 0` is refused at construction with
+    /// `wasm/limits` (RPC-48) — a log import that can never capture
+    /// anything is a configuration error, not a default. Zero still
+    /// means "no logging" when the import is not granted:
+    /// construction zeroes the cap when `log` is false, so the
+    /// default policy is untouched.
     pub max_log_bytes: usize,
     /// Accept WebAssembly *text* as well as binary.
     ///
@@ -329,6 +337,20 @@ impl WasmTool {
             return Err(provider("wasm/limits"));
         }
         if host.max_log_bytes > MAX_HOST_LOG {
+            return Err(provider("wasm/limits"));
+        }
+        // A log grant without a cap builds a tool whose log import can
+        // never capture anything (RPC-48): the host refuses every
+        // write past a zero cap, so the guest's `env.log` calls all
+        // return -1 and the embedder gets silence it did not ask
+        // for. Refusing at construction is the same shape as the
+        // over-ceiling refusal above — a configuration error,
+        // `wasm/limits` — and a missing cap is not a request for a
+        // default: the embedder must say how much log it wants. The
+        // `!host.log` arm below still zeroes the cap when the
+        // import is not granted, so zero keeps meaning "no
+        // logging" there and the default policy is untouched.
+        if host.log && host.max_log_bytes == 0 {
             return Err(provider("wasm/limits"));
         }
         if !host.log {
@@ -681,10 +703,20 @@ impl WasmCall {
         let spare_fuel = self.limits.fuel.saturating_sub(reserved_fuel);
         let declared_bytes = declared_kib.saturating_mul(1024);
         let growth = (spare_fuel / FUEL_PER_MEMORY_KIB).saturating_mul(1024);
-        let affordable = declared_bytes
-            .saturating_add(growth)
-            .min(u64::try_from(self.limits.max_memory_bytes).unwrap_or(u64::MAX))
-            .max(MIN_MEMORY_BYTES as u64) as usize;
+        // Checked, not `as`: the value is capped at `max_memory_bytes`
+        // (at most MAX_MEMORY_BYTES, 256 MiB) by the `.min` above, so
+        // it fits a 32-bit usize too — but a bare `as usize` would
+        // silently truncate a u64 past 4 GiB if the chain were ever
+        // reordered (RPC-48). A value that cannot fit is a limits
+        // refusal, not a wrap: the guest asked for more memory than
+        // the ceiling allows.
+        let affordable = usize::try_from(
+            declared_bytes
+                .saturating_add(growth)
+                .min(u64::try_from(self.limits.max_memory_bytes).unwrap_or(u64::MAX))
+                .max(MIN_MEMORY_BYTES as u64),
+        )
+        .map_err(|_| provider("wasm/limits"))?;
         let limits = StoreLimitsBuilder::new()
             .memory_size(affordable)
             .table_elements(self.limits.max_table_elements)
@@ -871,7 +903,14 @@ impl WasmCall {
                 return Err(provider("wasm/entry"));
             }
         };
-        let returned = match run.call(&mut store, input.len() as i32) {
+        // Checked, not `as`: the call window already refuses any input
+        // past 64 KiB with `wasm/input`, so the live maximum that
+        // reaches here is 64 KiB — but a bare `as i32` would silently
+        // wrap a length past 2 GiB into a negative one on any target
+        // if the window check were ever bypassed (RPC-48). The
+        // refusal is the window's own code.
+        let input_len = i32::try_from(input.len()).map_err(|_| provider("wasm/input"))?;
+        let returned = match run.call(&mut store, input_len) {
             Ok(value) => value,
             Err(error) => {
                 // Keep whatever the guest logged before it trapped: the log is

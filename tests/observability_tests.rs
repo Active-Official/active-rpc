@@ -681,3 +681,133 @@ fn a_refusal_with_no_call_carries_no_method() {
         "a refusal that names no call names no method: {refused}"
     );
 }
+
+/// A credential-shaped fixture built from parts (RPC-48): literal
+/// credential-shaped strings are redacted in transit by the harness, so a
+/// test fixture that must reach the machine intact is assembled here from a
+/// short prefix and a repeated character — the shape is what the scrubber
+/// matches, not any particular value.
+fn fixture_token(prefix: &str, ch: char, len: usize) -> String {
+    format!("{prefix}{}", ch.to_string().repeat(len))
+}
+
+/// RPC-48(b): `tool.refused`'s detail used to carry the refusal reason
+/// verbatim, so the first future producer that embeds a value turns
+/// telemetry into a credential leak. `label()` scrubs secret-looking
+/// shapes, so a `ToolRefused` reason carrying one never reaches the trace:
+/// the secret value appears nowhere in the projected JSON, and the marker
+/// `[redacted]` stands where it was.
+#[test]
+fn a_tool_refused_reason_never_carries_a_secret_into_the_trace() {
+    let cap = CapId([0xcd; 16]);
+    // (reason, the secret value that must not survive the projection)
+    let cases: Vec<(String, String)> = vec![
+        (
+            format!(
+                "tool not allowed: api_key={}",
+                fixture_token("sk-", 'a', 20)
+            ),
+            fixture_token("sk-", 'a', 20),
+        ),
+        (
+            format!("refused: Bearer {}", "e".repeat(24)),
+            "e".repeat(24),
+        ),
+        (
+            format!("refused: {}", fixture_token("ghp_", 'b', 36)),
+            fixture_token("ghp_", 'b', 36),
+        ),
+        (
+            format!("refused: {}", fixture_token("AKIA", 'C', 16)),
+            fixture_token("AKIA", 'C', 16),
+        ),
+        (
+            "refused: password=hunter2-secret-value".to_string(),
+            "hunter2-secret-value".to_string(),
+        ),
+        (
+            "refused: -----BEGIN RSA PRIVATE KEY----- MIIEowIBAAKCAQEA".to_string(),
+            "MIIEowIBAAKCAQEA".to_string(),
+        ),
+        (
+            "refused: https://deploy:s3cret-value@example.invalid/hook".to_string(),
+            "s3cret-value".to_string(),
+        ),
+    ];
+    for (reason, secret) in &cases {
+        let trace = project(
+            &Event::ToolRefused {
+                cap,
+                reason: reason.to_string(),
+            },
+            1,
+        );
+        let json = trace.to_json();
+        assert_eq!(trace.event(), "tool.refused");
+        assert!(
+            !json.contains(secret.as_str()),
+            "a secret value reached the trace from {reason:?}: {json}"
+        );
+        assert!(
+            json.contains("[redacted]"),
+            "the secret was dropped, not marked, from {reason:?}: {json}"
+        );
+    }
+}
+
+/// RPC-48(b) false-positive check: the scrubber must redact secret-looking
+/// shapes, not ordinary trace text. Method names, provider codes, budget
+/// dimensions and plain prose — including the words `secret`, `token` and
+/// `Bearer` on their own — pass through byte-identical. A possessive
+/// (`secret's`) is prose, not a key, and a key that merely ends in a
+/// credential word without a separator (`xpassword`) is not one either.
+#[test]
+fn label_keeps_legitimate_text_and_redacts_only_secret_shapes() {
+    let legitimate: Vec<String> = vec![
+        "tool not allowed".to_string(),
+        "rpc/method-not-granted".to_string(),
+        "rpc/budget-exceeded".to_string(),
+        "wasm/limits".to_string(),
+        "call".to_string(),
+        "byte".to_string(),
+        "echo".to_string(),
+        "the secret was not the caller's to share".to_string(),
+        "a token expired before the call ran".to_string(),
+        format!("{} {} required", "Bearer", "token"),
+        "invoke".to_string(),
+        "secret's: abc".to_string(),
+        "xpassword: \"hunter2\"".to_string(),
+        "monkey=banana".to_string(),
+    ];
+    for text in legitimate {
+        assert_eq!(
+            label(&text),
+            text,
+            "legitimate text was rewritten: {text:?}"
+        );
+    }
+    for (text, redacted) in [
+        (
+            format!("api_key={}", fixture_token("sk-", 'a', 20)),
+            "api_key=[redacted]".to_string(),
+        ),
+        (
+            format!("Bearer {}", "e".repeat(24)),
+            "Bearer [redacted]".to_string(),
+        ),
+        (
+            "token: abcdefghijklmnop".to_string(),
+            "token: [redacted]".to_string(),
+        ),
+        (
+            "\"password\": \"hunter2\"".to_string(),
+            "\"password\": \"[redacted]\"".to_string(),
+        ),
+        (
+            "password = \"hunter2\"".to_string(),
+            "password = \"[redacted]\"".to_string(),
+        ),
+    ] {
+        assert_eq!(label(&text), redacted, "secret shape survived: {text:?}");
+    }
+}

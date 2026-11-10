@@ -25,6 +25,22 @@ the MCP adapter and `LocalProcess` use; a timeout at that bound is still
 `rpc/timeout`, and a dripping server still cannot stretch the ceiling past
 the grant.
 
+WASM log cap and observability scrubber (RPC-48): a `log: true` WASM host
+policy with `max_log_bytes = 0` used to compile and then capture nothing —
+a granted log import that can never log. Construction now refuses it with
+`wasm/limits`, the same configuration error as a cap over the ceiling; a
+cap of zero still means "no logging" when the import is not granted, so
+the default policy is untouched. The two narrowing casts on the WASM path
+are now checked conversions (`affordable` from `u64`, the input length
+to `i32`), behaviour-identical on 64-bit and non-truncating by
+construction on 32-bit. And every trace label is scrubbed before it is
+bounded and escaped: secret-looking shapes (`key=value` assignments,
+`Bearer`/`Basic` tokens, `sk-`/`ghp_`/`AKIA` prefixed tokens, PEM
+private keys, URL userinfo) become `[redacted]`, so a `tool.refused`
+detail carrying a refusal reason can no longer turn telemetry into a
+credential leak; ordinary method, code and dimension text passes through
+unchanged.
+
 Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
 (replay) and R-13 (receipts) audit rounds.
 

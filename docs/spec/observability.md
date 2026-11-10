@@ -18,7 +18,14 @@ authority.
 2. **No argument values.** Kernel events carry ids, counts and stable codes. A
    provider error code is reported; the arguments that produced it are not.
 3. **No secrets.** Secret material is a marker in the value model and has no
-   representation here.
+   representation here. Free-form label fields (`code`, `dimension`,
+   `detail`) pass through `label()`, which scrubs secret-looking shapes
+   (`key=value` assignments, `Bearer`/`Basic` tokens, `sk-`/`ghp_`/`AKIA`
+   prefixed tokens, PEM private keys, URL userinfo) to `[redacted]`
+   (RPC-48): a refusal reason is provider-controlled text, so the scrubber
+   is the second line of defence behind the rule that events carry no
+   values. A hash, a correlation id, or a long method name is not a
+   secret shape and passes through untouched.
 4. **Stable names.** Event names and counter names are part of the schema. Adding
    a field is wire-compatible — a reader ignores fields it does not know — but
    the schema version still moves when the shape changes, so a consumer that

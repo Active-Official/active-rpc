@@ -680,3 +680,52 @@ fn a_log_policy_over_the_ceiling_is_a_configuration_error() {
         .expect_err("an over-cap log policy must be refused");
     assert_eq!(error_code(Err::<(), _>(error)), "wasm/limits");
 }
+
+#[test]
+fn a_log_grant_without_a_cap_is_a_configuration_error() {
+    // RPC-48(a): `log: true` with the default cap 0 used to compile and then
+    // capture nothing — a granted import that can never log (W2's probe
+    // `w2_rpc48_wasm_log_true_without_cap_captures_nothing`:
+    // `captured-log=[]`). A log grant without a cap is a configuration error,
+    // exactly like a cap over the ceiling
+    // (`a_log_policy_over_the_ceiling_is_a_configuration_error`): the
+    // embedder asked for logging and gave it no room, so construction
+    // refuses with `wasm/limits` instead of building a useless tool.
+    let policy = WasmHostPolicy {
+        log: true,
+        ..WasmHostPolicy::default()
+    };
+    let error = WasmTool::from_bytes_with_policy(&binary(LOG_GUEST), WasmLimits::default(), policy)
+        .expect_err("a log grant without a cap must be refused");
+    assert_eq!(error_code(Err::<(), _>(error)), "wasm/limits");
+}
+
+#[test]
+fn a_log_grant_with_a_cap_still_captures() {
+    // RPC-48(a) control: the refusal above is about a *missing* cap, not
+    // about logging itself — W2's control shape (`max_log_bytes=1024`
+    // captures `hello-log`); LOG_GUEST logs `hello`, which fits in 1024.
+    let policy = WasmHostPolicy {
+        log: true,
+        max_log_bytes: 1024,
+        ..WasmHostPolicy::default()
+    };
+    let mut tool =
+        WasmTool::from_bytes_with_policy(&binary(LOG_GUEST), WasmLimits::default(), policy)
+            .expect("compile");
+    tool.call(b"").expect("run");
+    assert_eq!(tool.log(), b"hello");
+}
+
+#[test]
+fn an_input_at_the_window_ceiling_still_runs() {
+    // RPC-48(a): `run` receives `input.len()` as an i32. The call window
+    // already refuses any input past 64 KiB with `wasm/input`, so the live
+    // maximum that can reach the cast is exactly 64 KiB; this pins that
+    // boundary end to end (ECHO copies the input to the output window and
+    // returns its length).
+    let mut tool = WasmTool::from_bytes(&binary(ECHO), WasmLimits::default()).expect("compile");
+    let input = vec![b'x'; 64 * 1024];
+    let output = tool.call(&input).expect("run");
+    assert_eq!(output, input);
+}
