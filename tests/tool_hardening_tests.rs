@@ -1076,6 +1076,117 @@ fn a_prefix_argument_cannot_expand_a_glob() {
         assert_eq!(error.code(), "rpc/tool-policy", "{injected:?}: {error}");
     }
 }
+/// A bare `"*"` rule is a prefix of `""`, so it used to admit every
+/// argument: any file to a path-taking program, any command line to a
+/// shell — through metachar-free arguments the shell-syntax guard cannot
+/// see (RPC-40; W2's `w2_rpc40_star_prefix_admits_arbitrary_argv_windows`).
+/// Without the explicit opt-in it now admits nothing.
+#[test]
+fn a_bare_star_rule_admits_nothing_without_the_opt_in() {
+    #[cfg(windows)]
+    let (program, flag, script) = (
+        "C:\\Windows\\System32\\cmd.exe",
+        "/C",
+        "echo rpc40-star-marker-42",
+    );
+    #[cfg(not(windows))]
+    let (program, flag, script) = ("/bin/sh", "-c", "echo rpc40-star-marker-42");
+    let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    let mut call = Call::new("run", vec![Arg::text(flag), Arg::text(script)]);
+    call.tool_allows_process = true;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a bare * rule must admit nothing");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// The audit's P2-PROC-3 shape: `cat` reads an arbitrary file through the
+/// wildcard. Unix only; Windows has no `/bin/cat`.
+#[cfg(not(windows))]
+#[test]
+fn a_bare_star_rule_admits_no_path_argument() {
+    let mut tool = LocalProcess::new("/bin/cat", &["*"]).expect("an absolute program");
+    let mut call = Call::new("run", vec![Arg::text("/etc/passwd")]);
+    call.tool_allows_process = true;
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("a bare * rule must not admit a path");
+    assert_eq!(error.code(), "rpc/tool-policy", "{error}");
+}
+
+/// The opt-in restores the old grant, explicitly: the same W2 shape runs
+/// and produces the marker.
+#[test]
+fn a_bare_star_rule_with_the_opt_in_admits_any_argument() {
+    #[cfg(windows)]
+    let (program, flag, script) = (
+        "C:\\Windows\\System32\\cmd.exe",
+        "/C",
+        "echo rpc40-star-marker-42",
+    );
+    #[cfg(not(windows))]
+    let (program, flag, script) = ("/bin/sh", "-c", "echo rpc40-star-marker-42");
+    let mut tool = LocalProcess::new(program, &["*"])
+        .expect("an absolute program")
+        .with_allow_any_arg();
+    let mut call = Call::new("run", vec![Arg::text(flag), Arg::text(script)]);
+    call.tool_allows_process = true;
+    let response = tool.invoke(0, &call).expect("the opt-in admits the call");
+    let Response::Value(Value::Map(entries)) = response else {
+        panic!("expected a map");
+    };
+    let stdout = match entries.get("stdout") {
+        Some(Value::Text(text)) => text.clone(),
+        other => panic!("unexpected stdout {other:?}"),
+    };
+    assert!(
+        stdout.contains("rpc40-star-marker-42"),
+        "the opt-in call ran: {stdout:?}"
+    );
+}
+
+/// The opt-in does not switch off the shell-syntax guard: an argument
+/// admitted only through `"*"` that carries shell syntax is still refused.
+#[test]
+fn a_bare_star_rule_with_the_opt_in_still_refuses_shell_syntax() {
+    #[cfg(windows)]
+    let (program, flag) = ("C:\\Windows\\System32\\cmd.exe", "/C");
+    #[cfg(not(windows))]
+    let (program, flag) = ("/bin/sh", "-c");
+    let mut tool = LocalProcess::new(program, &["*"])
+        .expect("an absolute program")
+        .with_allow_any_arg();
+    for injected in ["echo ok & echo pwned", "echo ok; echo pwned"] {
+        let mut call = Call::new("run", vec![Arg::text(flag), Arg::text(injected)]);
+        call.tool_allows_process = true;
+        let error = tool
+            .invoke(0, &call)
+            .expect_err("shell syntax is not an argument, even opted in");
+        assert_eq!(error.code(), "rpc/tool-policy", "{injected:?}: {error}");
+    }
+}
+
+/// A non-empty prefix rule needs no opt-in: only the bare `"*"` is inert
+/// without one.
+#[test]
+fn a_nonempty_prefix_rule_needs_no_opt_in() {
+    #[cfg(windows)]
+    let (program, flag) = ("C:\\Windows\\System32\\cmd.exe", "/C");
+    #[cfg(not(windows))]
+    let (program, flag) = ("/bin/sh", "-c");
+    let mut tool = LocalProcess::new(program, &[flag, "echo*"]).expect("an absolute program");
+    let mut call = Call::new("run", vec![Arg::text(flag), Arg::text("echo hello")]);
+    call.tool_allows_process = true;
+    let response = tool.invoke(0, &call).expect("a prefix rule still admits");
+    let Response::Value(Value::Map(entries)) = response else {
+        panic!("expected a map");
+    };
+    let stdout = match entries.get("stdout") {
+        Some(Value::Text(text)) => text.trim().to_string(),
+        other => panic!("unexpected stdout {other:?}"),
+    };
+    assert_eq!(stdout, "hello", "{stdout:?}");
+}
 
 /// A server that reads the head and then stops reading fills the socket: the
 /// write must report the ceiling, not a transport fault, or a caller retries a
@@ -1535,7 +1646,9 @@ fn a_nul_argument_is_refused() {
     let program = "C:\\Windows\\System32\\cmd.exe";
     #[cfg(not(windows))]
     let program = "/bin/sh";
-    let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+    let mut tool = LocalProcess::new(program, &["*"])
+        .expect("an absolute program")
+        .with_allow_any_arg();
     let mut call = Call::new(
         "run",
         vec![Arg::text("/C"), Arg::text("echo"), Arg::text("a\0b")],
@@ -1564,7 +1677,9 @@ fn an_invalid_environment_key_is_refused() {
     #[cfg(not(windows))]
     let program = "/bin/sh";
     for key in ["", "A=B"] {
-        let mut tool = LocalProcess::new(program, &["*"]).expect("an absolute program");
+        let mut tool = LocalProcess::new(program, &["*"])
+            .expect("an absolute program")
+            .with_allow_any_arg();
         tool.env.insert(key.to_string(), "x".to_string());
         let mut call = Call::new("run", vec![Arg::text("echo")]);
         call.tool_allows_process = true;

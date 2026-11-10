@@ -442,7 +442,11 @@ canonical path is pinned at construction, and the working directory is pinned to
 the parent's directory at that moment, so a later `chdir` or symlink swap cannot
 redirect the child. A `*` allowlist rule admits a command-line prefix, so an
 argument that only a prefix rule admits may not contain shell syntax: with a
-shell as the program the rest of the line would be code.
+shell as the program the rest of the line would be code. A bare `*` rule is the
+exception: it admits nothing unless the operator opts in explicitly with
+`LocalProcess::with_allow_any_arg` (RPC-40), because a prefix of `""` would
+otherwise admit any argument — any file to a path-taking program, any command
+line to a shell — through metachar-free arguments the syntax guard cannot see.
 
 ### WASM guest tool codes (`wasm-tools`)
 

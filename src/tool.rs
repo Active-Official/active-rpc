@@ -4325,6 +4325,13 @@ fn has_nul(path: &std::path::Path) -> bool {
 /// gets a scrubbed environment (only what the caller allows), no shell, a pinned
 /// working directory and a byte-bounded stdout. Anything else is
 /// `rpc/tool-policy`.
+///
+/// A bare `"*"` rule is not a prefix: it is a grant to pass any argument, and
+/// it admits nothing unless the operator opts in explicitly with
+/// [`LocalProcess::with_allow_any_arg`] (RPC-40). A path-taking program
+/// (`cat`, `curl`) would otherwise read any file, and a shell program
+/// (`cmd /C`, `sh -c`) would run any command line, through metachar-free
+/// arguments the shell-syntax guard cannot see.
 /// A local program under capability control.
 ///
 /// `Debug` is written by hand: `env` conventionally holds a child's token, and
@@ -4339,7 +4346,24 @@ pub struct LocalProcess {
     program: String,
     /// Arguments the caller may pass (each must be an exact match or a prefix
     /// when it ends with `*`).
+    ///
+    /// A bare `"*"` rule is inert unless [`LocalProcess::allow_any_arg`] is
+    /// set: it matches no argument on its own (RPC-40). A non-empty prefix
+    /// (`"echo*"`) is unaffected by the opt-in.
     pub allow_args: Vec<String>,
+    /// Whether a bare `"*"` argument rule admits any argument (RPC-40).
+    ///
+    /// Off by default. A bare `"*"` rule is a prefix of `""`, so without
+    /// this opt-in it would admit every argument — any file to a
+    /// path-taking program, any command line to a shell — while the
+    /// shell-metacharacter guard stays silent, because the admitted
+    /// arguments carry no shell syntax. The rule is therefore inert
+    /// unless this flag is set, and setting it is an explicit statement
+    /// that the operator accepts that grant: prefer exact rules, or a
+    /// non-empty prefix, and reach for this only when the program
+    /// genuinely takes arbitrary arguments. The metacharacter guard
+    /// still applies to arguments admitted only through the `"*"` rule.
+    pub allow_any_arg: bool,
     /// Environment variables the child inherits.
     pub env: BTreeMap<String, String>,
     /// Directory the child runs in. Pinned at construction (canonicalised) and
@@ -4385,6 +4409,7 @@ impl std::fmt::Debug for LocalProcess {
             .debug_struct("LocalProcess")
             .field("program", &self.program)
             .field("allow_args", &allow)
+            .field("allow_any_arg", &self.allow_any_arg)
             .field("env", &env)
             .field("workdir", &self.workdir)
             .field("max_output", &self.max_output)
@@ -4402,6 +4427,12 @@ impl LocalProcess {
     /// would choose the binary the capability runs. The canonical path is
     /// pinned here, and the working directory is pinned to this process's
     /// current directory (see [`LocalProcess::with_current_dir`]).
+    ///
+    /// A bare `"*"` rule in `allow_args` is inert unless the tool is built
+    /// with [`LocalProcess::with_allow_any_arg`]: it admits no argument on
+    /// its own (RPC-40). Construction prints a warning to stderr when a
+    /// bare `"*"` rule is present, so a deployment that relied on it
+    /// notices the change at startup instead of at the first refused call.
     pub fn new(program: impl Into<String>, allow_args: &[&str]) -> Result<Self> {
         let program = program.into();
         let resolved = pin_program(&program, "a local process program must be an absolute path")?;
@@ -4415,9 +4446,18 @@ impl LocalProcess {
         let workdir = std::fs::canonicalize(&workdir).map_err(|_| Error::Provider {
             code: "process/cwd".to_string(),
         })?;
+        if allow_args.contains(&"*") {
+            // Loud on purpose (RPC-40): a deployment that relied on the bare
+            // `*` rule now gets a refusal instead of a grant, and a silent
+            // change to a refusal would read as a regression. The crate has
+            // no logging facade, so the warning goes to stderr at
+            // construction, where the operator configures the tool.
+            eprintln!("warning: LocalProcess for {program}: a bare \"*\" argument rule admits any argument only when allow_any_arg is explicitly enabled (LocalProcess::with_allow_any_arg); without it the rule admits nothing");
+        }
         Ok(Self {
             program,
             allow_args: allow_args.iter().map(|arg| arg.to_string()).collect(),
+            allow_any_arg: false,
             env: BTreeMap::new(),
             workdir,
             max_output: 1 << 20,
@@ -4475,6 +4515,23 @@ impl LocalProcess {
         self
     }
 
+    /// Opt in to a bare `"*"` argument rule admitting any argument (RPC-40).
+    ///
+    /// Without this, a `"*"` rule in `allow_args` admits nothing: it is a
+    /// prefix of `""`, so it used to admit every argument — any file to a
+    /// path-taking program, any command line to a shell — while the
+    /// shell-metacharacter guard stayed silent, because the admitted
+    /// arguments carry no shell syntax. Enabling this is an explicit
+    /// statement that the operator accepts that grant for this program.
+    /// Prefer exact rules, or a non-empty prefix (`"echo*"`), and reach
+    /// for this only when the program genuinely takes arbitrary arguments.
+    /// The metacharacter guard still refuses an argument admitted only
+    /// through the `"*"` rule when it carries shell syntax.
+    pub fn with_allow_any_arg(mut self) -> Self {
+        self.allow_any_arg = true;
+        self
+    }
+
     /// Policy for a capability: process execution must be granted explicitly.
     pub fn policy(&self) -> ToolPolicy {
         ToolPolicy {
@@ -4486,6 +4543,14 @@ impl LocalProcess {
 
     fn permitted(&self, arg: &str) -> bool {
         self.allow_args.iter().any(|allowed| {
+            // A bare `"*"` rule is a prefix of `""`, so it would admit
+            // every argument. It is inert unless the operator opted in
+            // explicitly (RPC-40): the check runs here, at invoke time,
+            // so a rule assigned to the public `allow_args` field after
+            // construction is bound by the same opt-in.
+            if allowed == "*" && !self.allow_any_arg {
+                return false;
+            }
             if let Some(prefix) = allowed.strip_suffix('*') {
                 arg.starts_with(prefix)
             } else {
@@ -4507,6 +4572,13 @@ impl LocalProcess {
             .any(|allowed| !allowed.ends_with('*') && allowed == arg);
         !exact
             && self.allow_args.iter().any(|allowed| {
+                // The same opt-in as `permitted`: an inert `"*"` rule is
+                // not a prefix grant, so it must not count here either
+                // (RPC-40). Unreachable in practice — `permitted` already
+                // refused the argument — but the two predicates must agree.
+                if allowed == "*" && !self.allow_any_arg {
+                    return false;
+                }
                 allowed
                     .strip_suffix('*')
                     .is_some_and(|prefix| arg.starts_with(prefix))

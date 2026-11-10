@@ -30,6 +30,17 @@ program identity rather than trusting the environment:
   `with_current_dir` pins the working directory (it also returns `Result` and
   refuses a relative directory).
 - `StdioTransport::spawn` refuses a non-absolute `program` for the same reason.
+- A bare `"*"` argument rule in `LocalProcess::new(program, args)` no longer
+  admits any argument: it is a prefix of `""`, so it used to admit every
+  argument — any file to a path-taking program, any command line to a shell —
+  through metachar-free arguments the shell-syntax guard cannot see (RPC-40).
+  A deployment that relied on `"*"` must either list the arguments exactly,
+  use a non-empty prefix (`"echo*"`), or opt in explicitly with
+  `LocalProcess::with_allow_any_arg()` — the opt-in is a deliberate statement
+  that the program may receive arbitrary arguments, and the shell-syntax guard
+  still applies to arguments admitted only through it. Construction prints a
+  warning to stderr whenever a bare `"*"` rule is present, so the change is
+  visible at startup rather than at the first refused call.
 - A Unix timeout now signals the child's whole process group, and a Windows
   timeout still uses `taskkill /T`, so descendants do not outlive the call.
 

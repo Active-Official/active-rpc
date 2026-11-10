@@ -222,7 +222,9 @@ fn a_poisoned_system_root_does_not_run_a_planted_helper() {
     let previous = std::env::var_os("SystemRoot");
     std::env::set_var("SystemRoot", &dir);
     let program = "C:\\Windows\\System32\\cmd.exe";
-    let mut tool = active_rpc::tool::LocalProcess::new(program, &["*"]).expect("absolute program");
+    let mut tool = active_rpc::tool::LocalProcess::new(program, &["*"])
+        .expect("absolute program")
+        .with_allow_any_arg();
     tool.timeout_ms = 50;
     let mut call = Call::new(
         "run",

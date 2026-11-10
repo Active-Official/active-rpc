@@ -984,6 +984,7 @@ fn local_process_timeout_kills_a_hung_child() {
 
     let mut tool = LocalProcess::new("C:\\Windows\\System32\\cmd.exe", &["/C", "*"])
         .expect("an absolute program")
+        .with_allow_any_arg()
         .with_timeout(150);
     let mut call = Call::new(
         "run",
@@ -1018,6 +1019,7 @@ fn local_process_timeout_kills_a_hung_child() {
 
     let mut tool = LocalProcess::new("/bin/sh", &["-c", "*"])
         .expect("an absolute program")
+        .with_allow_any_arg()
         .with_timeout(150);
     let mut call = Call::new("run", vec![Arg::text("-c"), Arg::text("sleep 5")]);
     call.tool_allows_process = true;
@@ -1164,6 +1166,7 @@ fn capability_wall_budget_caps_a_slow_tool() {
 
     let mut tool = LocalProcess::new("C:\\Windows\\System32\\cmd.exe", &["/C", "*"])
         .expect("an absolute program")
+        .with_allow_any_arg()
         .with_timeout(10_000);
     let mut call = Call::new(
         "run",
