@@ -204,6 +204,25 @@ pub const MIN_LOG_RECORD: usize = 8 + 8 + 1 + 2 + 2 + 2 + 32 + 32;
 pub const MAX_LOG_BYTES: u64 = 64 << 20;
 /// Largest number of records accepted.
 pub const MAX_LOG_RECORDS: u64 = 100_000;
+/// Longest receipt-log path accepted at `create`, in characters
+/// (XPL-RPC-10, XPL-RPC-11).
+///
+/// Windows `MAX_PATH` is 260, including the terminating NUL, so a path of
+/// 260 characters or more cannot be opened on a default Windows host
+/// (`LongPathsEnabled` off). The ceiling is enforced on every platform so a
+/// log created on Linux still opens on Windows; the count is UTF-16 code
+/// units, the unit Windows counts. A path is refused at 260 characters, not
+/// 259: 259 is the longest path a default Windows host can open.
+pub const MAX_LOG_PATH_CHARS: usize = 260;
+/// Longest final component (file name) of a receipt-log path accepted at
+/// `create`, in bytes (XPL-RPC-11).
+///
+/// A filesystem component holds at most 255 bytes, and `create` installs the
+/// header through a staging file named `<log>.writing-<pid>-<nanos>`, so the
+/// log's own name must leave room for the longest that suffix can be:
+/// `.writing-` (9 bytes) + pid (a `u32`, at most 10 digits) + `-` (1 byte) +
+/// nanos (a `u64`, at most 20 digits) = 40 bytes. 255 - 40 = 215.
+pub const MAX_LOG_NAME_BYTES: usize = 215;
 
 /// Strata the append fast path samples from the log body on every append
 /// (RPC-05). The record region is split into this many equal strata and one
@@ -1334,6 +1353,158 @@ fn file_name_text(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "receipt-lock".to_string())
 }
 
+/// Longest single filesystem component, in bytes (NTFS, ext4, APFS).
+const MAX_COMPONENT_BYTES: usize = 255;
+/// Longest the staging suffix `.writing-<pid>-<nanos>` can be, in bytes:
+/// `.writing-` (9) + pid (a `u32`, at most 10 digits) + `-` (1) + nanos (a
+/// `u64`, at most 20 digits).
+const STAGING_SUFFIX_MAX_BYTES: usize = 40;
+/// Windows reserved device names: a final component whose stem is one of
+/// these opens a device on Windows, not a file.
+const RESERVED_DEVICE_STEMS: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// The final component's stem with Windows' trailing-dot/space stripping
+/// applied, uppercased for comparison: `CON.arrl` -> `CON`, `NUL.` -> `NUL`,
+/// `CON ` -> `CON`, `com1.arrl` -> `COM1`. `None` when the path has no file
+/// name or the stem is empty (`.arrl`).
+fn reserved_device_stem(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    let trimmed = name.trim_end_matches(['.', ' ']);
+    let stem = trimmed.split('.').next().unwrap_or("");
+    let stem = stem.trim_end_matches(['.', ' ']);
+    if stem.is_empty() {
+        return None;
+    }
+    Some(stem.to_ascii_uppercase())
+}
+
+/// A sibling in the same directory whose name differs from the requested log
+/// name only by case, if one exists. `None` when the parent cannot be listed
+/// (it does not exist yet, so there is no sibling) or no such sibling exists.
+///
+/// The comparison is Unicode lowercase, which is what the audit recommends
+/// and what covers the realistic collision (same letters, different case).
+/// A sibling that is byte-identical to the requested name is not a variant:
+/// that is the same file, and the existing-content check reports it.
+fn case_variant_sibling(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let lowered = name.to_lowercase();
+    let entries = std::fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        let sibling = entry.file_name();
+        let sibling_text = sibling.to_string_lossy();
+        if sibling_text.to_lowercase() == lowered && sibling_text != name {
+            return Some(sibling_text.into_owned());
+        }
+    }
+    None
+}
+
+/// The path as the operating system resolves it: a relative path is joined
+/// onto the working directory, because that is the path the OS opens. `.`
+/// and `..` are left in place — they only inflate the count, so the check
+/// stays fail-closed.
+fn absolute_log_path(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// The length Windows counts for `MAX_PATH`: UTF-16 code units of the path
+/// as displayed. A non-UTF-8 name is measured through its lossy form, so the
+/// count is approximate there; the names that carry a log are UTF-8 in
+/// practice, and the approximation only ever moves the boundary by the
+/// replacement characters.
+fn path_len_utf16(path: &std::path::Path) -> usize {
+    path.to_string_lossy().encode_utf16().count()
+}
+
+/// Refuse a log path that cannot name a log portably (XPL-RPC-10,
+/// XPL-RPC-11), before the lock is taken or any file is created, so the
+/// refusal names the rule instead of surfacing as a lock or staging error.
+///
+/// The checks are uniform on all platforms: a log created on Linux must open
+/// on Windows and macOS, so the strictest platform's rules apply everywhere.
+///
+/// - a sibling that differs only by case (`log.arrl` vs `LOG.arrl`) is one
+///   file on NTFS and default APFS: two audit logs silently become one;
+/// - a final component whose stem is a Windows reserved device name (`CON`,
+///   `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, after stripping
+///   trailing dots and spaces) opens a device on Windows, not a file;
+/// - a total path of 260 characters or more cannot be opened on a default
+///   Windows host (`MAX_PATH` 260, including the terminating NUL);
+/// - a final component longer than 215 bytes leaves no room for the staging
+///   suffix `<log>.writing-<pid>-<nanos>` (at most 40 bytes) inside the
+///   255-byte component limit, so `create` would fail at the staging step
+///   with no cause named.
+///
+/// `open` and `repair` do not validate: they work on a log that already
+/// exists, and refusing to open evidence created before this check (or on
+/// another platform) would strand it. The collision can only be *created* by
+/// `create` (and `truncate`, which funnels through the same `create_locked`),
+/// so that is where it is refused.
+fn validate_log_path(path: &std::path::Path) -> Result<()> {
+    // Reserved device names first: the check needs no filesystem access, and
+    // a device name must never reach the lock (W6 saw the lock errors
+    // instead of a validation error).
+    if let Some(stem) = reserved_device_stem(path) {
+        if RESERVED_DEVICE_STEMS.contains(&stem.as_str()) {
+            return Err(Error::receipt(format!(
+                "the receipt log name {stem:?} is a reserved device name on Windows \
+                 (CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9); choose another log name"
+            )));
+        }
+    }
+    // Case collision: a sibling that differs only by case.
+    if let Some(sibling) = case_variant_sibling(path) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        return Err(Error::receipt(format!(
+            "a file named {sibling:?} already exists in this directory and differs \
+             from {name:?} only by case; on a case-insensitive filesystem the two \
+             names are one file, so the log cannot be created under this name"
+        )));
+    }
+    // Total-path ceiling, measured on the absolute path: the path the OS opens.
+    let absolute = absolute_log_path(path);
+    let total = path_len_utf16(&absolute);
+    if total >= MAX_LOG_PATH_CHARS {
+        return Err(Error::receipt(format!(
+            "the receipt log path is {total} characters; paths of {MAX_LOG_PATH_CHARS} \
+             characters or more cannot be opened on a default Windows host (MAX_PATH \
+             {MAX_LOG_PATH_CHARS}, including the terminating NUL); choose a shorter path"
+        )));
+    }
+    // Final-component ceiling, in bytes: the filesystem component limit is in
+    // bytes, and the staging suffix must fit beside the log name.
+    let component = path
+        .file_name()
+        .map(|name| name.to_string_lossy().len())
+        .unwrap_or(0);
+    if component + STAGING_SUFFIX_MAX_BYTES > MAX_COMPONENT_BYTES {
+        return Err(Error::receipt(format!(
+            "the receipt log name is {component} bytes; with the staging suffix \
+             `<log>.writing-<pid>-<nanos>` (up to {STAGING_SUFFIX_MAX_BYTES} bytes) it \
+             would exceed the {MAX_COMPONENT_BYTES}-byte filesystem component limit; \
+             choose a log name of at most {MAX_LOG_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 impl Drop for LogLock {
     fn drop(&mut self) {
         // Only the owner removes the lock. Moving it to a claim name first, then
@@ -1432,6 +1603,12 @@ impl ReceiptLog {
     /// Evidence is not overwritten silently: a path that already holds a
     /// non-empty log is refused. Use [`ReceiptLog::truncate`] when starting over
     /// is the intent.
+    ///
+    /// The log path is validated before anything is created (XPL-RPC-10,
+    /// XPL-RPC-11): a name that collides case-insensitively with an existing
+    /// file, a Windows reserved device name, a total path of
+    /// [`MAX_LOG_PATH_CHARS`] characters or more, or a final component longer
+    /// than [`MAX_LOG_NAME_BYTES`] bytes is refused with the rule named.
     pub fn create(path: impl Into<std::path::PathBuf>) -> Result<Self> {
         Self::create_starting_at(path, 1)
     }
@@ -1441,6 +1618,8 @@ impl ReceiptLog {
     /// A kernel ring that has wrapped exports its retained window this way: the
     /// window is honest about where it starts, and [`Decision`] plus
     /// `Agent::receipts_dropped` say what came before.
+    ///
+    /// The log path is validated as [`ReceiptLog::create`] describes.
     pub fn create_starting_at(
         path: impl Into<std::path::PathBuf>,
         start_sequence: u64,
@@ -1452,6 +1631,8 @@ impl ReceiptLog {
     ///
     /// This is the explicit "start over" entry point; [`ReceiptLog::create`]
     /// refuses to overwrite.
+    ///
+    /// The log path is validated as [`ReceiptLog::create`] describes.
     pub fn truncate(path: impl Into<std::path::PathBuf>) -> Result<Self> {
         Self::create_locked(path.into(), 1, true)
     }
@@ -1466,6 +1647,10 @@ impl ReceiptLog {
         start_sequence: u64,
         replacing: bool,
     ) -> Result<Self> {
+        // The path is validated before the lock is taken or any file is
+        // created (XPL-RPC-10, XPL-RPC-11): a refused path must never leave a
+        // lock or staging file behind, and the refusal must name the rule.
+        validate_log_path(&path)?;
         if start_sequence == 0 {
             return Err(Error::receipt("a log cannot start at sequence 0"));
         }
@@ -1541,7 +1726,24 @@ impl ReceiptLog {
                 .write(true)
                 .create_new(true)
                 .open(&staging)
-                .map_err(|_| Error::receipt("cannot create the receipt log"))?;
+                .map_err(|_| {
+                    // The staged path is longer than the log path by the
+                    // suffix; on a default Windows host it can pass the
+                    // log-path ceiling and still exceed MAX_PATH (a deep
+                    // directory with short components), so name that cause
+                    // instead of the generic refusal (XPL-RPC-11).
+                    let staged = path_len_utf16(&staging);
+                    if staged >= MAX_LOG_PATH_CHARS {
+                        Error::receipt(format!(
+                            "the staged receipt log path is {staged} characters; the \
+                             staging suffix `<log>.writing-<pid>-<nanos>` pushes it past \
+                             the {MAX_LOG_PATH_CHARS}-character Windows path limit; \
+                             choose a shorter log path"
+                        ))
+                    } else {
+                        Error::receipt("cannot create the receipt log")
+                    }
+                })?;
             let written = file.write_all(&header).and_then(|()| file.sync_all());
             if written.is_err() {
                 let _ = std::fs::remove_file(&staging);
@@ -3691,5 +3893,324 @@ mod future_tests {
             .expect("appends resume at the sequence after the surviving records");
         assert_eq!(log.records().expect("records").len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod path_validation_tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "active-rpc-path-validation-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn receipt(sequence: u64, at_ms: u64) -> Receipt {
+        Receipt {
+            sequence,
+            cap: "0123456789abcdef".to_string(),
+            method: "echo".to_string(),
+            at_ms,
+            decision: Decision::Admitted,
+            mac: [0u8; 32],
+        }
+    }
+
+    /// XPL-RPC-10: `log.arrl` and `LOG.arrl` are two files on Linux and one
+    /// file on NTFS and default APFS. Creating the second must be refused
+    /// with the case collision named, not with "already holds records"
+    /// (which is what the same file says through a differently-cased name),
+    /// and the first log must be untouched afterwards.
+    #[test]
+    fn a_case_variant_of_an_existing_log_is_refused_at_create() {
+        let dir = scratch_dir("case");
+        let lower = dir.join("log.arrl");
+        let upper = dir.join("LOG.arrl");
+        let log = ReceiptLog::create(&lower).expect("create lower");
+        log.append(&receipt(1, 100)).expect("append lower");
+        let len_before = std::fs::metadata(&lower).expect("metadata").len();
+
+        let error = ReceiptLog::create(&upper).expect_err("case variant refused");
+        assert!(
+            error.to_string().contains("only by case"),
+            "the refusal must name the case collision: {error}"
+        );
+
+        assert_eq!(
+            std::fs::metadata(&lower).expect("metadata").len(),
+            len_before,
+            "the refused create must not touch the existing log"
+        );
+        assert_eq!(
+            log.records().expect("records").len(),
+            1,
+            "the existing log keeps its one receipt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// XPL-RPC-10: the refusal is the validation, not the install step. A
+    /// zero-length file at the case-variant name would otherwise reach the
+    /// hard link and come back as "created by another writer".
+    #[test]
+    fn a_case_variant_of_an_empty_existing_file_is_refused_at_create() {
+        let dir = scratch_dir("case-empty");
+        let lower = dir.join("log.arrl");
+        std::fs::write(&lower, b"").expect("empty file");
+        let error = ReceiptLog::create(dir.join("LOG.arrl")).expect_err("refused");
+        assert!(
+            error.to_string().contains("only by case"),
+            "the refusal must name the case collision: {error}"
+        );
+        assert_eq!(
+            std::fs::metadata(&lower).expect("metadata").len(),
+            0,
+            "the empty file is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// XPL-RPC-10: `truncate` is the dangerous direction — on NTFS it would
+    /// rename a fresh header over the differently-cased name, wiping the
+    /// log it names. It must be refused the same way `create` is.
+    #[test]
+    fn truncate_refuses_a_case_variant_of_an_existing_log() {
+        let dir = scratch_dir("case-truncate");
+        let lower = dir.join("log.arrl");
+        let log = ReceiptLog::create(&lower).expect("create lower");
+        log.append(&receipt(1, 100)).expect("append lower");
+
+        let error = ReceiptLog::truncate(dir.join("LOG.arrl")).expect_err("truncate refused");
+        assert!(
+            error.to_string().contains("only by case"),
+            "the refusal must name the case collision: {error}"
+        );
+        assert_eq!(
+            log.records().expect("records").len(),
+            1,
+            "the existing log survives the refused truncate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// XPL-RPC-11: every legacy device stem is refused at `create` with the
+    /// rule named — including lowercase spellings and the trailing-dot /
+    /// trailing-space variants Windows strips — and the refusal happens
+    /// before the lock is taken, so no lock or staging file is left behind.
+    #[test]
+    fn a_reserved_device_name_is_refused_at_create() {
+        let dir = scratch_dir("reserved");
+        for name in [
+            "CON.arrl",
+            "NUL.arrl",
+            "COM1.arrl",
+            "AUX.arrl",
+            "PRN.arrl",
+            "LPT1.arrl",
+            "COM9.arrl",
+            "LPT9.arrl",
+            "con.arrl",
+            "nul.arrl",
+            "NUL.",
+            "CON ",
+            "COM1.",
+        ] {
+            let error = ReceiptLog::create(dir.join(name)).expect_err("refused");
+            assert!(
+                error.to_string().contains("reserved device name"),
+                "{name}: the refusal must name the reserved device rule: {error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("read dir").count(),
+            0,
+            "a refused create must not leave a lock or staging file behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// XPL-RPC-11: a total path of 260 characters or more cannot be opened
+    /// on a default Windows host, so `create` refuses it on every platform
+    /// with the ceiling named. The parent directories are deliberately not
+    /// created: the validation runs before any filesystem touch, so the
+    /// refusal must fire even for a path whose parents do not exist yet.
+    /// The depth adapts to the machine's temp prefix (a short pid in a
+    /// container shortens it), so the total is over the ceiling on any
+    /// machine.
+    #[test]
+    fn a_log_path_of_260_or_more_characters_is_refused_at_create() {
+        let dir = scratch_dir("long");
+        let mut path = dir.clone();
+        let mut i = 0;
+        while path.to_string_lossy().len() + 1 + 8 < 260 {
+            path = path.join(format!("{}{}", "a".repeat(50), i));
+            i += 1;
+        }
+        let path = path.join("log.arrl");
+        let total = path.to_string_lossy().len();
+        assert!(
+            total >= 260,
+            "the test path must be over the ceiling: {total}"
+        );
+
+        let error = ReceiptLog::create(&path).expect_err("long path refused");
+        assert!(
+            error.to_string().contains("260"),
+            "the refusal must name the 260-character ceiling: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// XPL-RPC-11: a component longer than 215 bytes leaves no room for the
+    /// staging suffix inside the 255-byte component limit. `create` must
+    /// refuse it with the staging suffix named, not fail at the staging
+    /// step with "cannot create the receipt log".
+    ///
+    /// No subdirectory: the temp prefix plus the component must stay under
+    /// the 260-character total ceiling, or the total-path rule fires first
+    /// (a 235-byte component under an 80-character prefix is over both
+    /// ceilings, and the total is reported first). The name carries the pid
+    /// so parallel runs cannot collide in the shared temp directory, and the
+    /// component is 219–221 bytes whatever the pid's length, so the
+    /// component rule — not the pid — decides the outcome.
+    #[test]
+    fn a_log_name_too_long_for_the_staging_suffix_is_refused_at_create() {
+        let dir = std::env::temp_dir();
+        let name = format!("{}{}.arrl", "a".repeat(210), std::process::id());
+        assert!(
+            name.len() > 215,
+            "the test name must be over the component ceiling: {}",
+            name.len()
+        );
+        let path = dir.join(&name);
+        assert!(
+            path.to_string_lossy().len() < 260,
+            "the test path must stay under the total ceiling"
+        );
+        let error = ReceiptLog::create(&path).expect_err("long name refused");
+        assert!(
+            error.to_string().contains("staging"),
+            "the refusal must name the staging suffix: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// XPL-RPC-11 (control): a long name that fits the staging suffix still
+    /// creates. The length adapts to the machine's temp prefix so the total
+    /// path stays under the 260-character ceiling; the floor keeps the test
+    /// meaningful on any machine.
+    #[test]
+    fn a_long_log_name_that_fits_the_staging_suffix_is_created() {
+        let dir = std::env::temp_dir().join(format!("r10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("short temp dir");
+        let prefix = dir.to_string_lossy().len();
+        let stem_len = 200.min(250usize.saturating_sub(prefix + 1 + 5));
+        assert!(
+            stem_len >= 150,
+            "temp prefix too long to test a long log name: {prefix}"
+        );
+        let name = format!("{}.arrl", "a".repeat(stem_len));
+        let path = dir.join(&name);
+        assert!(
+            path.to_string_lossy().len() < 260,
+            "the control path must stay under the total ceiling"
+        );
+        let log = ReceiptLog::create(&path).expect("a fitting long name creates");
+        log.append(&receipt(1, 100)).expect("append");
+        assert_eq!(log.records().expect("records").len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// XPL-RPC-11 (unit): the reserved-stem rule is a property of the final
+    /// component's stem, case-insensitively, after trailing dots and spaces
+    /// are stripped. `COM10` is not a legacy device, and a stem that merely
+    /// starts with a device name is not one.
+    #[test]
+    fn a_reserved_device_stem_is_refused_by_path_validation() {
+        let dir = std::env::temp_dir().join(format!("v10-{}", std::process::id()));
+        for name in ["CON.arrl", "con.arrl", "NUL.", "CON ", "COM1.arrl", "LPT9"] {
+            let error = validate_log_path(&dir.join(name)).expect_err("reserved stem refused");
+            assert!(
+                error.to_string().contains("reserved device name"),
+                "{name}: {error}"
+            );
+        }
+        for name in ["log.arrl", "COM10.arrl", "auxiliary.arrl", "console.arrl"] {
+            assert!(
+                validate_log_path(&dir.join(name)).is_ok(),
+                "{name} is not a reserved device name"
+            );
+        }
+    }
+
+    /// XPL-RPC-11 (unit): the total-path ceiling is exact — 259 characters
+    /// are accepted, 260 are refused. The path is built from short
+    /// components so the component ceiling cannot fire first, and the
+    /// lengths are computed from the machine's temp prefix so the boundary
+    /// is exact on any machine.
+    #[test]
+    fn a_path_of_260_characters_is_refused_by_path_validation_and_259_is_accepted() {
+        let mut dir = std::env::temp_dir().join(format!("v10-{}", std::process::id()));
+        while dir.to_string_lossy().len() + 51 + 9 <= 240 {
+            dir = dir.join("d".repeat(50));
+        }
+        let current = dir.to_string_lossy().len();
+        let stem_len = 259usize.saturating_sub(current + 1 + 5);
+        assert!(
+            (9..=215).contains(&stem_len),
+            "temp prefix too long to pin the total-path boundary: {current}"
+        );
+        let accepted = dir.join(format!("{}.arrl", "n".repeat(stem_len)));
+        assert_eq!(accepted.to_string_lossy().len(), 259);
+        assert!(
+            validate_log_path(&accepted).is_ok(),
+            "a 259-character path must be accepted"
+        );
+        let refused = dir.join(format!("{}.arrl", "n".repeat(stem_len + 1)));
+        assert_eq!(refused.to_string_lossy().len(), 260);
+        let error = validate_log_path(&refused).expect_err("260 refused");
+        assert!(
+            error.to_string().contains("260"),
+            "the refusal must name the 260-character ceiling: {error}"
+        );
+    }
+
+    /// XPL-RPC-11 (unit): the component ceiling is exact — a 215-byte final
+    /// component leaves room for the longest staging suffix (40 bytes)
+    /// inside the 255-byte limit, a 216-byte one does not. The total path
+    /// is asserted short so the total-path ceiling cannot fire first.
+    #[test]
+    fn a_component_of_216_bytes_is_refused_by_path_validation_and_215_is_accepted() {
+        // A one-letter base keeps the total path short: the temp prefix plus
+        // a 215-byte component must stay under the 260-character ceiling, or
+        // the total-path rule would fire first.
+        let dir = std::env::temp_dir().join("q");
+        let accepted = dir.join(format!("{}.arrl", "a".repeat(210)));
+        assert_eq!(accepted.file_name().unwrap().len(), 215);
+        assert!(
+            accepted.to_string_lossy().len() < 260,
+            "the accepted path must stay under the total ceiling"
+        );
+        assert!(
+            validate_log_path(&accepted).is_ok(),
+            "a 215-byte component must be accepted"
+        );
+        let refused = dir.join(format!("{}.arrl", "a".repeat(211)));
+        assert_eq!(refused.file_name().unwrap().len(), 216);
+        assert!(
+            refused.to_string_lossy().len() < 260,
+            "the refused path must stay under the total ceiling"
+        );
+        let error = validate_log_path(&refused).expect_err("216 refused");
+        assert!(
+            error.to_string().contains("staging"),
+            "the refusal must name the staging suffix: {error}"
+        );
     }
 }

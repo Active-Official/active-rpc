@@ -34,6 +34,7 @@
 | [0030](0030-windows-receipt-lock-file-identity.md) | Receipt-lock file identity on Windows |
 | [0031](0031-windows-receipt-key-file-acl.md) | Receipt-key file ACL check on Windows |
 | [0032](0032-receipt-log-handle-refuses-a-replaced-file.md) | Open receipt-log handle refuses a replaced log file |
+| [0033](0033-receipt-log-path-validation.md) | Receipt-log paths are validated at creation, uniformly on all platforms |
 
 ## Reading order and supersessions
 

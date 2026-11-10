@@ -2041,6 +2041,12 @@ usage: active-rpc-cli <command> [options]
   receipts dump [--output PATH]
       Record a demo session with receipts enabled into an append-only ARRL log
       (correlation ids, methods and times only; no arguments or secrets).
+      The log path is validated at creation, the same on every platform: it
+      must not collide case-insensitively with an existing file, must not be
+      a Windows reserved device name (CON, PRN, AUX, NUL, COM1-COM9,
+      LPT1-LPT9), must be under 260 characters in total, and its file name
+      must be at most 215 bytes (room for the staging suffix inside the
+      255-byte component limit).
   receipts verify <log> (--receipt-key-file PATH | --expect-head HEX | --chain-only)
       Verify the log's record hashes and chain links. --receipt-key-file holds the
       kernel's 64-hex receipt key (Agent::receipt_key; 0600) and verifies every
