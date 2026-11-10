@@ -265,10 +265,10 @@ fn a_planted_staging_entry_does_not_redirect_the_header() {
 
 /// A lock that names a live writer is not abandoned however old it looks: a
 /// stopped process or a slow batch still holds it, and stealing it writes a
-/// second chain into the file (R-13 round 6, M1). The liveness check exists only
-/// where the kernel exposes another process cheaply (`/proc`), so the assertion
-/// is Linux-only.
-#[cfg(target_os = "linux")]
+/// second chain into the file (R-13 round 6, M1). The liveness check is one
+/// OS call per platform (`/proc` on Linux, `OpenProcess` on Windows,
+/// `kill(pid, 0)` on macOS — XPL-RPC-02), so the assertion runs everywhere
+/// (XPL-RPC-12).
 #[test]
 fn a_lock_whose_pid_is_alive_is_not_stolen() {
     let path = scratch("alive");
@@ -399,7 +399,6 @@ fn a_planted_quarantine_name_does_not_block_the_steal() {
 }
 
 /// A lock that names a live writer keeps being honoured inside the grace.
-#[cfg(target_os = "linux")]
 #[test]
 fn a_live_pid_lock_inside_the_grace_is_not_stolen() {
     let path = scratch("grace");

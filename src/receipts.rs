@@ -1180,10 +1180,11 @@ fn claim_name(nonce: &str) -> Option<String> {
 /// Ownership is re-checked immediately before the rename: a creator suspended
 /// past the grace can resume to find its lock stolen, and installing a fresh
 /// header over a log the new owner is appending to destroys every record
-/// (R-13 round 11, H-1). On unix the parent directory is flushed so `create`
-/// does not return Ok for a name that a power loss forgets; that flush is
-/// best-effort and has no Windows equivalent here, so the durability guarantee
-/// is a unix one (L-6; round 12, F6).
+/// (R-13 round 11, H-1). The parent directory is flushed so `create` does
+/// not return Ok for a name that a power loss forgets; that flush is
+/// best-effort and is a directory flush on every OS (XPL-RPC-12) — on
+/// Windows the directory handle is flushed with `FlushFileBuffers` — so
+/// the durability guarantee is no longer a unix one (L-6; round 12, F6).
 fn install_staged(
     staging: &std::path::Path,
     path: &std::path::Path,
@@ -1250,17 +1251,19 @@ fn install_staged(
     }
 }
 
+/// Sync the parent directory of `path`, so the directory entry of a just
+/// installed log is durable and not just the file's bytes.
+///
+/// Best effort, as before: a parent that cannot be opened or flushed is
+/// ignored, and the file's own `sync_all` is what orders the bytes. The
+/// flush is a directory flush on every OS now (XPL-RPC-12): on Windows the
+/// directory handle is opened with `FILE_FLAG_BACKUP_SEMANTICS` and
+/// flushed with `FlushFileBuffers`, which `File::sync_all` cannot do —
+/// the call lives in the `active-rpc-dir-sync` helper crate because this
+/// crate forbids `unsafe`. On Unix the helper does the `File::open` +
+/// `sync_all` this function used to do inline.
 fn sync_parent(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path;
+    let _ = active_rpc_dir_sync::sync_parent_dir(path);
 }
 
 /// Remove aged claim, quarantine, orphan and staging files beside the lock.

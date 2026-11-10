@@ -40,6 +40,7 @@ version = "2.3.0"
 dependencies = [
  "active-core",
  "active-infinity",
+ "active-rpc-dir-sync",
  "active-rpc-file-identity",
  "active-rpc-liveness",
  "active-rpc-process-tree",
@@ -62,9 +63,17 @@ name = "active-rpc-cli"
 version = "0.3.1"
 dependencies = [
  "active-rpc",
+ "active-rpc-dir-sync",
  "active-rpc-key-acl",
  "rustls-pki-types",
  "serde_json",
+]
+
+[[package]]
+name = "active-rpc-dir-sync"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

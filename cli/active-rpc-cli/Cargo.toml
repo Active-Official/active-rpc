@@ -15,6 +15,12 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 active-rpc = { path = "../..", version = "2.3.0", features = ["quic", "http2"] }
+# The replay dump's parent-directory sync is a directory flush on every OS
+# (XPL-RPC-12): on Windows the directory handle is flushed with
+# `FlushFileBuffers`, which `File::sync_all` cannot do — the call lives in
+# a one-function helper crate with a safe API instead of a carve-out here
+# (same shape as the key-acl helper below).
+active-rpc-dir-sync = { path = "../../dir-sync", version = "0.1.0" }
 serde_json = "1"
 rustls-pki-types = "1"
 

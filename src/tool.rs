@@ -4167,13 +4167,27 @@ impl Provider for LocalProcess {
         // the receipt (round 24, #3).
         // A signalled child ran to completion (something killed it): the
         // effect may stand, so the class is a withheld reply (round 44, M-2).
+        // Windows has no signals: `ExitStatus::code()` always yields `Some`
+        // there (TerminateProcess always supplies a code), so this guard is
+        // unix-only by construction (XPL-RPC-12). An externally terminated
+        // child reports its termination code as an ordinary status — the
+        // reply is not withheld for it, because Windows cannot tell a
+        // termination code from a code the child exited with itself. That
+        // is a documented residual, pinned by
+        // `a_child_terminated_by_another_process_reports_its_exit_code`.
         let status_code = match status.code() {
             Some(code) => code,
+            #[cfg(unix)]
             None => {
                 return Err(reply_withheld(Error::Provider {
                     code: "process/signalled".to_string(),
                 }))
             }
+            // Unreachable by construction on Windows (`code()` is always
+            // `Some` there); the arm exists only so the match stays
+            // exhaustive, and `-1` is never reported.
+            #[cfg(not(unix))]
+            None => -1,
         };
         map.insert("status".to_string(), Value::Int(i64::from(status_code)));
         // A binary stream is not text: transcoding it inserts replacement

@@ -197,6 +197,89 @@ fn a_child_killed_by_a_signal_withholds_the_reply() {
     );
 }
 
+/// Windows has no signals, so a child terminated by another process still
+/// yields an exit code — `taskkill` terminates with code 1 — and the
+/// `process/signalled` guard never fires there (XPL-RPC-12). The reply is
+/// NOT withheld: the termination code is reported as an ordinary status,
+/// because Windows cannot tell a termination code from a code the child
+/// exited with itself. That is the documented residual, pinned here so a
+/// future change to the guard cannot silently reclassify it.
+#[cfg(windows)]
+#[test]
+fn a_child_terminated_by_another_process_reports_its_exit_code() {
+    use active_rpc::tool::LocalProcess;
+
+    // The child kills itself with `taskkill` (TerminateProcess, code 1)
+    // after a short sleep; the `exit 77` after it only runs if the kill
+    // failed, so a status of 1 proves the termination happened and a
+    // status of 77 would prove it did not. The script is an exact
+    // allowlist entry (not a prefix match), which is the shape that may
+    // carry shell metacharacters. `taskkill` is named, not pathed: a
+    // bare `C:\...\\taskkill.exe` statement is parsed by PowerShell as a
+    // string expression (and as a document in a pipeline), so it never
+    // runs — the name resolves through `PATH` + `PATHEXT` instead.
+    let script = "Start-Sleep -Milliseconds 400; taskkill /F /PID $PID > $null; exit 77";
+    let mut tool = LocalProcess::new(
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        &["-NoProfile", "-Command", script],
+    )
+    .expect("an absolute program");
+    tool.timeout_ms = 5_000;
+    // The adapter spawns with an empty environment (`env_clear`), and
+    // Windows PowerShell's managed host cannot load without a user
+    // profile (it fails with 8009001d, "keyset does not exist"): the
+    // profile variables are provisioned explicitly from this process.
+    // `PATHEXT` is load-bearing too: without it an extensionless name
+    // such as `taskkill` never resolves to `taskkill.exe`. `SystemDrive`
+    // and `ProgramData` are load-bearing as well: without them a Windows
+    // component that expands `%SystemDrive%\ProgramData` (the font cache)
+    // falls back to the literal string as a relative path and writes
+    // `%SystemDrive%\ProgramData\...` under the child's working directory.
+    for key in [
+        "SystemRoot",
+        "SystemDrive",
+        "ProgramData",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "PATH",
+        "PATHEXT",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            tool.env.insert(key.to_string(), value);
+        }
+    }
+    let mut call = Call::new(
+        "run",
+        vec![
+            Arg::text("-NoProfile"),
+            Arg::text("-Command"),
+            Arg::text(script),
+        ],
+    );
+    call.tool_allows_process = true;
+    call.budget = Budget {
+        max_wall_ms: 5_000,
+        max_bytes: 1 << 20,
+        ..Budget::default()
+    };
+    let response = tool
+        .invoke(0, &call)
+        .expect("a terminated child reports its exit code on Windows, it is not a signalled child");
+    let active_rpc::Response::Value(Value::Map(entries)) = response else {
+        panic!("a terminated child answers with a value map, got {response:?}");
+    };
+    let Some(Value::Int(status)) = entries.get("status") else {
+        panic!("the reply carries the child's exit code, got {entries:?}");
+    };
+    assert_eq!(
+        *status, 1,
+        "taskkill terminates with code 1; 77 would mean the kill failed: {entries:?}"
+    );
+}
+
 /// The mutating axis is the capability's method, not the resolution: a
 /// `request` capability stays conservative even when the method text is `GET`,
 /// which is the axis the kernel sees (round 45, finding 1).

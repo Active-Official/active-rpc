@@ -1529,17 +1529,12 @@ fn replay(args: &[String]) -> CliResult {
             }
             // The rename is atomic but not durable until the parent directory is
             // synced; without this a crash can leave the old name or no name
-            // (R-12 round 5, L-6).
-            #[cfg(unix)]
-            {
-                let parent = std::path::Path::new(&path)
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| std::path::Path::new("."));
-                if let Ok(directory) = std::fs::File::open(parent) {
-                    let _ = directory.sync_all();
-                }
-            }
+            // (R-12 round 5, L-6). The sync is a directory flush on every OS
+            // (XPL-RPC-12): on Windows the directory handle is flushed with
+            // `FlushFileBuffers`, which `File::sync_all` cannot do — the call
+            // lives in the `active-rpc-dir-sync` helper crate because the
+            // library forbids `unsafe`.
+            let _ = active_rpc_dir_sync::sync_parent_dir(std::path::Path::new(&path));
             out_line(format!(
                 "wrote {path} ops={} trace={}",
                 package.ops.len(),

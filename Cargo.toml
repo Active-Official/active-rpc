@@ -37,6 +37,12 @@ active-core = { version = "1.4.0" }
 # crate with a safe API, since this crate forbids `unsafe` (same shape as
 # the liveness helper below).
 active-rpc-process-tree = { path = "process-tree", version = "0.1.0" }
+# `sync_parent` is a directory flush on every OS (XPL-RPC-12): Windows has
+# no `File::open(dir).sync_all()` — the directory handle needs
+# `FILE_FLAG_BACKUP_SEMANTICS` + `FlushFileBuffers` — and this crate forbids
+# `unsafe`, so the call lives in a one-function helper crate with a safe API
+# instead of a carve-out here (same shape as liveness).
+active-rpc-dir-sync = { path = "dir-sync", version = "0.1.0" }
 thiserror = "1.0"
 blake3 = "1.5"
 getrandom = "0.3"

@@ -35,6 +35,7 @@
 | [0031](0031-windows-receipt-key-file-acl.md) | Receipt-key file ACL check on Windows |
 | [0032](0032-receipt-log-handle-refuses-a-replaced-file.md) | Open receipt-log handle refuses a replaced log file |
 | [0033](0033-receipt-log-path-validation.md) | Receipt-log paths are validated at creation, uniformly on all platforms |
+| [0034](0034-directory-sync-and-signalled-child-on-windows.md) | Parent-directory sync and the signalled-child guard on Windows |
 
 ## Reading order and supersessions
 

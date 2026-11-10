@@ -1,0 +1,23 @@
+[package]
+name = "active-rpc-dir-sync"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Active Language Team"]
+license = "MIT OR Apache-2.0"
+description = "One OS primitive for Active RPC: sync a file's parent directory to durable storage (Windows FlushFileBuffers on the directory handle, Unix sync_all)"
+repository = "https://github.com/Active-Official/active-rpc"
+homepage = "https://github.com/Active-Official/active-rpc"
+publish = false
+
+[lib]
+name = "active_rpc_dir_sync"
+path = "src/lib.rs"
+
+[target.'cfg(windows)'.dependencies]
+# Already in the root lockfile (transitive via tokio/mio): no new registry
+# crate enters the graph (XPL-RPC-12). `Win32_Security` is needed because
+# `CreateFileW` takes a `SECURITY_ATTRIBUTES` pointer, so windows-sys
+# gates it on that feature; `FILE_GENERIC_READ` (not `GENERIC_READ`) is
+# the access constant windows-sys 0.61 provides.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security"] }
