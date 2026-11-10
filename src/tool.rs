@@ -2908,6 +2908,11 @@ impl HttpTool {
 
     /// Build a tool policy for a capability. Mint attaches this policy
     /// by default when the minter supplies none (RPC-41).
+    ///
+    /// The wall ceiling is not a policy field: the exchange honours the
+    /// capability's `max_wall_ms` grant up to the 300 s sane window the
+    /// MCP adapter and `LocalProcess` use (RPC-47) — a grant over 300 s
+    /// waits at most 300 s, and a timeout at that bound is `rpc/timeout`.
     pub fn policy(&self) -> ToolPolicy {
         ToolPolicy {
             allowed: ["get", "post", "request"]
@@ -3300,17 +3305,23 @@ impl HttpTool {
         // The deadline is armed before resolution, and resolution runs
         // under it: a slow resolver used to burn unbounded time outside
         // the grant (round 16, F-3 charged it to nobody), so the wall
-        // grant did not bound the call (RPC-32). The adapter's fixed ten
-        // seconds and the capability's wall ceiling both bound the wait;
-        // the smaller one wins. This is one deadline for the whole
-        // exchange, not a per-syscall timeout: a timeout bounds one
-        // `read`, so a server that drips one byte per period would otherwise
-        // hold the dispatch thread for (bytes x timeout).
+        // grant did not bound the call (RPC-32). The capability's wall
+        // ceiling bounds the wait (RPC-47): an earlier fixed ten-second
+        // cap narrowed every grant over ten seconds without telling the
+        // caller, so a 300 s grant against an 11 s server timed out at
+        // 10 s with `rpc/timeout`. The ceiling is clamped to the same
+        // 300 s sane window the MCP adapter and `LocalProcess::with_timeout`
+        // use, so an extreme grant can neither overflow the deadline
+        // arithmetic nor wedge the dispatch thread past 300 s; the cap
+        // is part of the contract (docs/spec/wire.md). This is one
+        // deadline for the whole exchange, not a per-syscall timeout:
+        // a timeout bounds one `read`, so a server that drips one byte
+        // per period would otherwise hold the dispatch thread for
+        // (bytes x timeout).
         let deadline = std::time::Instant::now()
-            .checked_add(
-                std::time::Duration::from_millis(ceiling_ms.max(1))
-                    .min(std::time::Duration::from_secs(10)),
-            )
+            .checked_add(std::time::Duration::from_millis(
+                ceiling_ms.clamp(1, 300_000),
+            ))
             .unwrap_or_else(std::time::Instant::now);
         // Resolution is once per call, and the returned addresses are the
         // only ones dialled: a name that retargets between resolution and

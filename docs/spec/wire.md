@@ -335,7 +335,7 @@ grant like the rest of the request. The request body shares the capability's byt
 grant is `rpc/budget-exceeded` before the connection, and one past the adapter's
 `max_request` is `rpc/tool-policy`. A GET sends no body: the request is complete at the empty line, and
 extra bytes make simple servers and intermediaries reset the connection instead
-of answering. The `max_wall_ms` grant (clamped to 10 s) is **one deadline** for
+of answering. The `max_wall_ms` grant (clamped to 300 s, RPC-47) is **one deadline** for
 the exchange from connect onward: connect, write, every header line and the body.
 Resolution of the base URL happens under the same deadline, on a
 short-lived resolver thread the deadline waits on: a slow resolver used to

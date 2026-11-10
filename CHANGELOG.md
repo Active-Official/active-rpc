@@ -17,6 +17,14 @@ the bounded method label, and `call.queued` carries the charged `args_bytes`,
 so telemetry names the tool that was called or refused. A refusal that names
 no call carries no `method` field. No field was renamed or removed.
 
+HTTP wall ceiling honours the grant (RPC-47): an HTTP exchange used to cap
+its one deadline at a fixed ten seconds, so a 300 s grant against an 11 s
+server timed out at 10 s with `rpc/timeout`. The exchange now waits up to
+the capability's `max_wall_ms` grant, clamped to the same 300 s sane window
+the MCP adapter and `LocalProcess` use; a timeout at that bound is still
+`rpc/timeout`, and a dripping server still cannot stretch the ceiling past
+the grant.
+
 Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
 (replay) and R-13 (receipts) audit rounds.
 

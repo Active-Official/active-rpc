@@ -417,6 +417,99 @@ fn a_dripping_server_cannot_stretch_the_wall_ceiling() {
     );
 }
 
+/// A server that reads the request, waits `delay`, then answers at once.
+/// Unlike `slow_response`, the delay is before the first byte, so the call
+/// waits the full delay under the grant instead of under a drip.
+fn slow_to_answer(listener: TcpListener, response: Vec<u8>, delay: std::time::Duration) {
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+
+        let Ok((mut socket, _)) = listener.accept() else {
+            return;
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .ok();
+        let mut scratch = [0u8; 4096];
+        let _ = socket.read(&mut scratch);
+        std::thread::sleep(delay);
+        let _ = socket.write_all(&response);
+        let _ = socket.flush();
+    });
+}
+
+/// RPC-47: the wall grant is honoured, not silently capped at ten seconds.
+/// A 300 s grant against a server that answers after 11 s used to time out
+/// at 10 s with `rpc/timeout` (audit probe P2-HTTP-5); it must succeed, and
+/// the wait must pass the old ten-second cap.
+#[test]
+fn a_slow_server_within_a_large_grant_is_not_cut_off_at_ten_seconds() {
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    slow_to_answer(
+        listener,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec(),
+        Duration::from_secs(11),
+    );
+
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/slow")]);
+    let mut call = http_get("/slow", 300_000);
+    call.read_only = true;
+    let started = Instant::now();
+    let response = tool
+        .invoke(0, &call)
+        .expect("an 11 s server is inside a 300 s grant");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(10_500),
+        "an 11 s server answered in {elapsed:?}: the wait never passed the old ten-second cap"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "an 11 s server took {elapsed:?}"
+    );
+    match response {
+        Response::Value(Value::Text(text)) => assert_eq!(text, "ok"),
+        other => panic!("unexpected response {other:?}"),
+    }
+}
+
+/// RPC-47: honouring the grant does not remove the ceiling — it moves it to
+/// the granted value. A 12 s grant against a server that answers after 30 s
+/// must still time out, at about 12 s rather than the old fixed 10 s.
+#[test]
+fn a_grant_above_ten_seconds_still_binds_the_wall_ceiling() {
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    slow_to_answer(
+        listener,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec(),
+        Duration::from_secs(30),
+    );
+
+    let mut tool = HttpTool::new(format!("http://{address}"), &[("GET", "/slow")]);
+    let mut call = http_get("/slow", 12_000);
+    call.read_only = true;
+    let started = Instant::now();
+    let error = tool
+        .invoke(0, &call)
+        .expect_err("the server is slower than the 12 s grant");
+    let elapsed = started.elapsed();
+    assert_eq!(error.code(), "rpc/timeout", "{error}");
+    assert!(
+        elapsed >= Duration::from_millis(10_500),
+        "a 12 s grant timed out after {elapsed:?}: the old ten-second cap still binds"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "a 12 s grant took {elapsed:?} to refuse a slow server"
+    );
+}
+
 /// A HEAD reply describes a representation it does not carry. Reading
 /// `content-length` bytes would stall the dispatcher until the ceiling.
 #[test]
