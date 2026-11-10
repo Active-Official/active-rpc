@@ -27,6 +27,17 @@
 //!   children out of the job with `CREATE_BREAKAWAY_FROM_JOB`. Job
 //!   membership is inherited by default, so grandchildren join the job
 //!   without any action by the parent.
+//! * The resume is a single `NtResumeProcess` call on the child's process
+//!   handle ([`Job::assign_and_resume`]), never a system-wide thread
+//!   enumeration (F1-NF-08). The first version of this crate resumed by
+//!   snapshotting every thread on the machine
+//!   (`CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`) and walking the list
+//!   to find the child's one thread: ~90 ms per spawn even uncontended,
+//!   and ~55 s per spawn under a 130-way concurrent spawn storm, because
+//!   the snapshot serializes against the whole system's thread list. The
+//!   snapshot walk survives only as the fallback when ntdll does not
+//!   export `NtResumeProcess` — no real Windows — so the spawn still
+//!   succeeds there, slowly, rather than failing outright.
 //!
 //! On any other platform there is no job object: the process group is the
 //! mechanism there, so [`Job`] is a zero-sized stub whose methods do
@@ -192,14 +203,10 @@ impl Job {
         // `SetInformationJobObject` takes a pointer to `info` and its size,
         // and `info` lives until the call returns; `AssignProcessToJobObject`
         // takes the job handle and the child's process handle, which
-        // `as_raw_handle` reports for a live `Child`; the Toolhelp calls
-        // take a snapshot handle this function created, and `entry` is a
-        // stack slot whose `dwSize` is set before the first call, as the
-        // API requires; `OpenThread`/`ResumeThread` take a thread id the
-        // snapshot just reported for this child's pid, and the returned
-        // thread handle is closed before the next iteration. No handle is
-        // duplicated or stored, and the job handle is closed on every
-        // error path.
+        // `as_raw_handle` reports for a live `Child`. The resume is one
+        // `NtResumeProcess` call on that same handle (see
+        // [`resume_child_process`]); no handle is duplicated or stored,
+        // and the job handle is closed on every error path.
         unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
@@ -225,7 +232,7 @@ impl Job {
                 if assigned == 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                resume_main_threads(child.id())?;
+                resume_child_process(child)?;
                 Ok(())
             })();
             if let Err(error) = setup {
@@ -256,13 +263,138 @@ impl Job {
     }
 }
 
-/// Resume every thread of `pid`, which was spawned suspended.
+/// Resume `child`, which was spawned suspended, without enumerating the
+/// system (F1-NF-08).
+///
+/// One `NtResumeProcess` call on the child's process handle resumes every
+/// thread of the process — exactly what [`resume_main_threads`] did by
+/// walking the system thread list, and at suspended-spawn time the child
+/// has exactly one thread, its primary, so one resume starts it. No
+/// snapshot, no walk: the ~90 ms per-spawn tax and the ~55 s storm stall
+/// of the snapshot resume are both gone (bisect probe, this host: the
+/// 130-way storm wall time fell from 53.8 s to 0.22 s, and the sequential
+/// assign-and-resume from 94–167 ms to a ~2 ms floor — 11.8 ms mean,
+/// dominated by spawn jitter, with the resume itself adding ~0.04 ms).
+///
+/// `NtResumeProcess` has no typed windows-sys binding, so it is resolved
+/// at runtime from ntdll.dll (see [`nt_resume_process`]); ntdll has
+/// exported it since NT 3.1, so the resolution only ever fails on an
+/// exotic Windows. When it does fail, the old snapshot walk runs instead:
+/// the spawn still succeeds, slowly, rather than failing outright. A
+/// `NtResumeProcess` call that resolves but returns a failure status is
+/// a real error and is returned as-is, never retried through the
+/// fallback: resuming twice would corrupt the suspend-count accounting,
+/// and a failed resume means the process handle is bad or the child is
+/// already dying.
+#[cfg(windows)]
+fn resume_child_process(child: &std::process::Child) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    let Some(resume) = nt_resume_process() else {
+        return resume_main_threads(child.id());
+    };
+    // SAFETY: `NtResumeProcess` takes the child's process handle, which
+    // `as_raw_handle` reports for a live `Child` and which this function
+    // neither duplicates nor stores. It resumes every thread of that one
+    // process — the child, and only the child — and touches no memory
+    // through the handle. The return is an `NTSTATUS`: 0 is success.
+    let status = unsafe { resume(child.as_raw_handle() as HANDLE) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(ntstatus_to_io_error(status))
+    }
+}
+
+/// `NTSTATUS NtResumeProcess(HANDLE ProcessHandle)` — an ntdll export with
+/// no typed windows-sys binding, resolved once per process and cached.
+#[cfg(windows)]
+type NtResumeProcessFn = unsafe extern "system" fn(windows_sys::Win32::Foundation::HANDLE) -> i32;
+
+/// `ULONG RtlNtStatusToDosError(NTSTATUS Status)` — the NTSTATUS-to-Win32
+/// error translation, also resolved once per process and cached.
+#[cfg(windows)]
+type RtlNtStatusToDosErrorFn = unsafe extern "system" fn(i32) -> u32;
+
+/// Resolve `NtResumeProcess` from ntdll.dll, once, and cache the result
+/// — including the failure, so a host without the export pays one lookup
+/// per process, not one per spawn. A function pointer is `Send` + `Sync`,
+/// so the `OnceLock` needs no further synchronization.
+#[cfg(windows)]
+fn nt_resume_process() -> Option<NtResumeProcessFn> {
+    static NT_RESUME_PROCESS: std::sync::OnceLock<Option<NtResumeProcessFn>> =
+        std::sync::OnceLock::new();
+    *NT_RESUME_PROCESS.get_or_init(|| {
+        ntdll_export(b"NtResumeProcess\0")
+            .map(|address| unsafe { std::mem::transmute::<usize, NtResumeProcessFn>(address) })
+    })
+}
+
+/// Translate an `NTSTATUS` from `NtResumeProcess` into the `io::Error` the
+/// caller reports. `RtlNtStatusToDosError` is resolved the same way as
+/// `NtResumeProcess`; if that export is missing too, the raw status is
+/// carried in the message instead of being squeezed through
+/// `from_raw_os_error`, which would misread an NTSTATUS as a Win32 error.
+#[cfg(windows)]
+fn ntstatus_to_io_error(status: i32) -> std::io::Error {
+    static RTL_NT_STATUS_TO_DOS_ERROR: std::sync::OnceLock<Option<RtlNtStatusToDosErrorFn>> =
+        std::sync::OnceLock::new();
+    let mapper = *RTL_NT_STATUS_TO_DOS_ERROR.get_or_init(|| {
+        ntdll_export(b"RtlNtStatusToDosError\0").map(|address| unsafe {
+            std::mem::transmute::<usize, RtlNtStatusToDosErrorFn>(address)
+        })
+    });
+    match mapper {
+        Some(map) => {
+            // SAFETY: `RtlNtStatusToDosError` is a pure translation of one
+            // integer to another; it takes no pointer and no handle.
+            let code = unsafe { map(status) };
+            std::io::Error::from_raw_os_error(code as i32)
+        }
+        None => std::io::Error::other(format!(
+            "NtResumeProcess failed with NTSTATUS {status:#010x}"
+        )),
+    }
+}
+
+/// Resolve one export of ntdll.dll by its NUL-terminated name, returning
+/// its address, or `None` when the module or the export is missing.
+/// ntdll is loaded into every Windows process, so `None` only ever means
+/// an exotic Windows without that export.
+#[cfg(windows)]
+fn ntdll_export(name: &[u8]) -> Option<usize> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: `GetModuleHandleA` takes a NUL-terminated module name and
+    // returns null when the module is not loaded; `GetProcAddress` takes
+    // that handle and a NUL-terminated export name — every caller passes
+    // a `b"...\0"` literal — and returns null when the export is missing.
+    // Neither call touches memory through a pointer the caller owns.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8);
+        if ntdll.is_null() {
+            return None;
+        }
+        GetProcAddress(ntdll, name.as_ptr()).map(|function| function as usize)
+    }
+}
+
+/// Resume every thread of `pid`, which was spawned suspended — the
+/// fallback when ntdll does not export `NtResumeProcess`
+/// (see [`resume_child_process`]).
 ///
 /// At suspended-spawn time the child has exactly one thread, its primary;
 /// resuming every thread the snapshot reports for the pid is the same
 /// thing, and it stays correct if that ever changes. Finding no thread at
 /// all is an error — the child cannot have run, so the caller must not
 /// treat the spawn as live.
+///
+/// This is the fallback only: it snapshots every thread on the machine
+/// (`CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`), which costs ~90 ms
+/// per spawn uncontended and ~55 s per spawn under a concurrent spawn
+/// storm (F1-NF-08) — the defect the `NtResumeProcess` resume exists to
+/// remove. It is kept because a spawn that succeeds slowly beats a spawn
+/// that fails outright on a Windows without the export.
 #[cfg(windows)]
 fn resume_main_threads(pid: u32) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -487,6 +619,34 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
+        }
+    }
+
+    /// The resume is not a system-wide enumeration (F1-NF-08): assigning
+    /// and resuming a suspended child costs under 50 ms each, every time.
+    /// The old Toolhelp-snapshot resume floored at ~84 ms per spawn even
+    /// uncontended (93.7 ms minimum re-measured the morning of the fix)
+    /// and took ~55 s under a 130-way storm; the `NtResumeProcess` resume
+    /// is a single call on a handle the crate already holds, so 50 ms is
+    /// 50x headroom over the new path and still fails the old one
+    /// outright. The storm leg of the proof is the bisect binary, not
+    /// this test — a 130-way storm does not belong in the crate suite.
+    #[cfg(windows)]
+    #[test]
+    fn assign_and_resume_costs_no_snapshot_tax() {
+        for _ in 0..5 {
+            let mut command = std::process::Command::new("C:\\Windows\\System32\\cmd.exe");
+            command.args(["/C", "exit", "0"]);
+            prepare_command(&mut command);
+            let mut child = command.spawn().expect("spawn a trivial child");
+            let started = std::time::Instant::now();
+            let _job = Job::assign_and_resume(&child).expect("assign and resume");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(50),
+                "assign-and-resume took {elapsed:?}: the snapshot tax is back"
+            );
+            let _ = child.wait();
         }
     }
 

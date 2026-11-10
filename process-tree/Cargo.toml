@@ -35,5 +35,9 @@ libc = "0.2"
 # used here was checked against the vendored source: only
 # CreateJobObjectW/A needs Win32_Security, and
 # JOBOBJECT_EXTENDED_LIMIT_INFORMATION needs Win32_System_Threading
-# (already declared).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+# (already declared). Win32_System_LibraryLoader is the
+# `GetModuleHandleA`/`GetProcAddress` pair the `NtResumeProcess` lookup
+# uses (F1-NF-08): the resume resolves the ntdll export at runtime
+# instead of taking a new dependency, so no new registry crate enters
+# the graph and the lockfile is untouched.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader"] }
