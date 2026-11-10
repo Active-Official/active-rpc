@@ -24,6 +24,43 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Windows only: run `icacls` and fail the test if it refuses -- a test bug,
+/// not a CLI bug, so the failure says which invocation failed.
+/// (Same shape as the receipt-key helpers in `cli_tests.rs`.)
+#[cfg(windows)]
+fn icacls(args: &[&str]) {
+    let output = Command::new("icacls")
+        .args(args)
+        .output()
+        .expect("spawn icacls");
+    assert!(
+        output.status.success(),
+        "icacls {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Windows only: the account running the test, as `icacls` spells it.
+#[cfg(windows)]
+fn current_user() -> String {
+    let output = Command::new("whoami").output().expect("spawn whoami");
+    assert!(output.status.success(), "whoami failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Windows only: restrict a cap file to its owner -- the Windows mirror of
+/// the unix `chmod 600` above. A file created under `%TEMP%` inherits an
+/// ACL that lets other accounts read it, so a test that needs the CLI to
+/// accept the file must drop the inherited ACEs first, then grant the
+/// owner full control.
+#[cfg(windows)]
+fn restrict_cap_to_owner(path: &std::path::Path) {
+    let path_arg = path.to_str().expect("cap path");
+    icacls(&[path_arg, "/inheritance:r"]);
+    let grant = format!("{}:(F)", current_user());
+    icacls(&[path_arg, "/grant:r", &grant]);
+}
+
 /// A peer that reads one frame and answers with `build(id)`.
 fn answer_with<F>(reply: F) -> String
 where
@@ -340,6 +377,18 @@ fn a_capability_file_works_and_the_hint_is_not_a_cap_line() {
     std::fs::create_dir_all(&dir).expect("dir");
     let cap_file = dir.join("cap.hex");
     std::fs::write(&cap_file, format!("{}\r\n", "1".repeat(32))).expect("write");
+
+    // RPC-50: the cap file is bearer credentials, so the CLI refuses a file
+    // other accounts can read. The test's own cap file must be owner-only
+    // first, or the call is refused with exit 2 before it reaches the peer.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cap_file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 600");
+    }
+    #[cfg(windows)]
+    restrict_cap_to_owner(&cap_file);
 
     let address = answer_with(|id| {
         active_rpc::wire::Envelope::response(id, active_rpc::Value::text("ok"))

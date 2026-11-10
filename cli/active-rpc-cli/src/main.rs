@@ -313,6 +313,13 @@ fn request(id: u64, method: &str, args: Vec<Arg>, payload: &[u8], cap: Option<Ca
 /// world-readable check as a receipt key.
 fn cap_from_file(path: &str) -> Result<CapId, CliError> {
     let bytes = read_bounded(path, 65)?;
+    // The cap id is bearer credentials (whoever holds the 16 bytes can
+    // call): the file holding it goes through the same world-readable
+    // check as a receipt key, as the doc above promises. The check runs
+    // after the bounded read, matching `read_receipt_key`: the bytes in
+    // memory are process-private, and the refusal happens before the cap
+    // is used.
+    check_bearer_file_private(path)?;
     let text =
         String::from_utf8(bytes).map_err(|_| CliError::usage(format!("{path} is not UTF-8")))?;
     parse_cap(text.trim())
@@ -1922,29 +1929,24 @@ fn receipts_show(path: &str, limit: usize) -> CliResult {
     Ok(())
 }
 
-/// Read a receipt key from a file: 64 hex characters, one line, tolerating a
-/// trailing line ending.
+/// Refuse a file holding bearer material that other accounts can read.
 ///
-/// A file on a shared or world-readable path is refused: the key proves an
-/// audit log, and a leaked key lets a stranger forge one. On unix the mode
-/// must be `0600` (`0o077` clear); on Windows the file's DACL must grant
-/// read access to nobody but the owner, plus `SYSTEM`, `Administrators`,
-/// and members of the local Administrators group (explicitly allow-listed
-/// — see `active-rpc-key-acl`). A file with no DACL (FAT/exFAT) is
-/// refused: the invariant cannot be established there.
+/// The cap file and the receipt key file hold bearer secrets (whoever holds
+/// the bytes can call, or can forge a receipt log), so both go through the
+/// same gate: on unix the mode must be `0600` (`0o077` clear); on Windows
+/// the file's DACL must grant read access to nobody but the owner, plus
+/// `SYSTEM`, `Administrators`, and members of the local Administrators
+/// group (explicitly allow-listed -- see `active-rpc-key-acl`). A file with
+/// no DACL (FAT/exFAT) is refused: the invariant cannot be established
+/// there.
 ///
-/// The ceiling used to be 65 bytes, so a Windows file of 64 hex plus CRLF was
-/// refused as too large.
-fn read_receipt_key(path: &str) -> Result<[u8; 32], CliError> {
-    // 64 hex characters plus a line ending: a Windows file is 66 bytes, and the
-    // old 65-byte ceiling refused a perfectly normal key file.
-    let text = String::from_utf8(read_bounded(path, 68)?)
-        .map_err(|_| CliError::usage(format!("{path:?} is not text")))?;
-    let text = text.trim_end_matches(['\r', '\n']);
+/// The check opens the file and inspects the opened handle, not the path:
+/// a rename between the read and the stat would check a different file.
+fn check_bearer_file_private(path: &str) -> Result<(), CliError> {
     #[cfg(unix)]
     {
-        // The open handle, not the path: a rename between the read and the stat
-        // would check a different file.
+        // The open handle, not the path: a rename between the read and the
+        // stat would check a different file.
         use std::os::unix::fs::PermissionsExt;
         let file = std::fs::File::open(path)
             .map_err(|error| CliError::usage(format!("cannot open {path:?}: {error}")))?;
@@ -1972,6 +1974,35 @@ fn read_receipt_key(path: &str) -> Result<[u8; 32], CliError> {
             ))
         })?;
     }
+    Ok(())
+}
+
+/// Read a receipt key from a file: 64 hex characters, one line, tolerating a
+/// trailing line ending.
+///
+/// A file on a shared or world-readable path is refused: the key proves an
+/// audit log, and a leaked key lets a stranger forge one. On unix the mode
+/// must be `0600` (`0o077` clear); on Windows the file's DACL must grant
+/// read access to nobody but the owner, plus `SYSTEM`, `Administrators`,
+/// and members of the local Administrators group (explicitly allow-listed
+/// — see `active-rpc-key-acl`). A file with no DACL (FAT/exFAT) is
+/// refused: the invariant cannot be established there.
+///
+/// The ceiling used to be 65 bytes, so a Windows file of 64 hex plus CRLF was
+/// refused as too large.
+fn read_receipt_key(path: &str) -> Result<[u8; 32], CliError> {
+    // 64 hex characters plus a line ending: a Windows file is 66 bytes, and the
+    // old 65-byte ceiling refused a perfectly normal key file.
+    let text = String::from_utf8(read_bounded(path, 68)?)
+        .map_err(|_| CliError::usage(format!("{path:?} is not text")))?;
+    let text = text.trim_end_matches(['\r', '\n']);
+    // Same gate as the cap file: a leaked key lets a stranger forge a
+    // receipt log, so a key readable by other accounts is refused before
+    // any MAC is checked. The check used to live inline here; it is now
+    // the shared `check_bearer_file_private` helper so the two bearer
+    // paths cannot drift apart. The check itself is byte-identical to
+    // what was here (same mask, same messages, same exit code).
+    check_bearer_file_private(path)?;
     parse_hex32(text.trim()).ok_or_else(|| {
         CliError::usage(format!(
             "{path:?} must hold 64 hex characters (the kernel's receipt key)"

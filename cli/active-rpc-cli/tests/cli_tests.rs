@@ -786,3 +786,146 @@ fn a_world_readable_receipt_key_is_refused() {
         stderr(&world_readable)
     );
 }
+
+/// The finding (RPC-50, unix): a cap file is bearer credentials -- whoever
+/// holds the 16 bytes can call -- but `cap_from_file` never checked the
+/// file's mode, so a world-readable cap file was silently accepted. The
+/// doc promised the same world-readable check as a receipt key; the code
+/// did not perform it.
+///
+/// Control arm first: the same cap, owner-only (`chmod 600`), completes
+/// a round trip against a live peer. Then the attack: the same cap,
+/// world-readable (`chmod 644`), is refused with exit 2 before any
+/// connection is attempted, and the refusal tells the operator to
+/// `chmod 600` it.
+#[cfg(unix)]
+#[test]
+fn a_world_readable_cap_file_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let peer = start_peer(&["peer", "--limit", "2"]);
+    let dir = sandbox("world-readable-cap");
+    let cap_path = dir.join("cap.hex");
+    std::fs::write(&cap_path, format!("{}\n", peer.cap)).expect("write cap");
+    let cap_arg = cap_path.to_str().expect("cap path");
+
+    // Control arm: owner-only, the call completes.
+    std::fs::set_permissions(&cap_path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    let owned = run(&[
+        "call",
+        "--addr",
+        &peer.address,
+        "--cap-file",
+        cap_arg,
+        "--method",
+        "echo",
+        "--text",
+        "hello",
+    ]);
+    assert!(owned.status.success(), "{}", stderr(&owned));
+    assert!(
+        stdout(&owned).contains("kind=response"),
+        "{}",
+        stdout(&owned)
+    );
+
+    // The finding: the same cap, readable by every local account, is
+    // refused before any connection is attempted.
+    std::fs::set_permissions(&cap_path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    let world_readable = run(&[
+        "call",
+        "--addr",
+        &peer.address,
+        "--cap-file",
+        cap_arg,
+        "--method",
+        "echo",
+        "--text",
+        "hello",
+    ]);
+    assert_eq!(
+        world_readable.status.code(),
+        Some(2),
+        "{}",
+        stderr(&world_readable)
+    );
+    assert!(
+        stderr(&world_readable).contains("readable by other accounts"),
+        "{}",
+        stderr(&world_readable)
+    );
+    assert!(
+        stderr(&world_readable).contains("chmod 600"),
+        "the refusal tells the operator how to fix the file: {}",
+        stderr(&world_readable)
+    );
+}
+
+/// The finding (RPC-50, Windows): the same missing check as the unix arm
+/// above, on the other platform -- a cap file readable by `BUILTIN\Users`
+/// was silently accepted. The fix routes the cap file through the same
+/// DACL gate as a receipt key (XPL-RPC-09's `check_key_file_acl`).
+///
+/// Control arm first: the same cap, restricted to its owner, completes a
+/// round trip against a live peer. Then the attack: the same cap, readable
+/// by `BUILTIN\Users`, is refused with exit 2, and the refusal names the
+/// offending SID.
+#[cfg(windows)]
+#[test]
+fn a_world_readable_cap_file_is_refused() {
+    let peer = start_peer(&["peer", "--limit", "2"]);
+    let dir = sandbox("world-readable-cap");
+    let cap_path = dir.join("cap.hex");
+    std::fs::write(&cap_path, format!("{}\n", peer.cap)).expect("write cap");
+    let cap_arg = cap_path.to_str().expect("cap path");
+
+    // Control arm: owner-only, the call completes.
+    restrict_key_to_owner(&cap_path);
+    let owned = run(&[
+        "call",
+        "--addr",
+        &peer.address,
+        "--cap-file",
+        cap_arg,
+        "--method",
+        "echo",
+        "--text",
+        "hello",
+    ]);
+    assert!(owned.status.success(), "{}", stderr(&owned));
+    assert!(
+        stdout(&owned).contains("kind=response"),
+        "{}",
+        stdout(&owned)
+    );
+
+    // The finding: the same cap, readable by every local account, is
+    // refused before any connection is attempted.
+    grant_users_read(&cap_path);
+    let world_readable = run(&[
+        "call",
+        "--addr",
+        &peer.address,
+        "--cap-file",
+        cap_arg,
+        "--method",
+        "echo",
+        "--text",
+        "hello",
+    ]);
+    assert_eq!(
+        world_readable.status.code(),
+        Some(2),
+        "{}",
+        stderr(&world_readable)
+    );
+    assert!(
+        stderr(&world_readable).contains("readable by other accounts"),
+        "{}",
+        stderr(&world_readable)
+    );
+    assert!(
+        stderr(&world_readable).contains("S-1-5-32-545"),
+        "the refusal names the account that can read the cap: {}",
+        stderr(&world_readable)
+    );
+}
