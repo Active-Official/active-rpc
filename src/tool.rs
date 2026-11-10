@@ -2093,7 +2093,8 @@ impl<T: McpTransport> McpSession<T> {
         &self.tools
     }
 
-    /// A policy allowing exactly the discovered tools.
+    /// A policy allowing exactly the discovered tools. Mint attaches this
+    /// policy by default when the minter supplies none (RPC-41).
     pub fn policy(&self) -> ToolPolicy {
         let mut policy = ToolPolicy::default();
         for tool in &self.tools {
@@ -2125,6 +2126,13 @@ impl<T: McpTransport> Provider for McpSession<T> {
     /// megabyte of allocation per dispatch.
     fn has_method(&self, method: &str) -> bool {
         self.tools.iter().any(|tool| tool.name == method)
+    }
+
+    /// The policy `Agent::mint` attaches when the minter supplies none
+    /// (RPC-41): exactly the discovered tools, at the session's argument
+    /// ceiling.
+    fn tool_policy(&self) -> Option<ToolPolicy> {
+        Some(self.policy())
     }
 
     fn mutating(&self, method: &str) -> bool {
@@ -2845,7 +2853,8 @@ impl HttpTool {
         Ok(tool)
     }
 
-    /// Build a tool policy for a capability.
+    /// Build a tool policy for a capability. Mint attaches this policy
+    /// by default when the minter supplies none (RPC-41).
     pub fn policy(&self) -> ToolPolicy {
         ToolPolicy {
             allowed: ["get", "post", "request"]
@@ -3572,6 +3581,12 @@ impl Provider for HttpTool {
             .iter()
             .map(|method| method.to_string())
             .collect()
+    }
+
+    /// The policy `Agent::mint` attaches when the minter supplies none
+    /// (RPC-41): the three HTTP methods, at the tool's request ceiling.
+    fn tool_policy(&self) -> Option<ToolPolicy> {
+        Some(self.policy())
     }
 
     fn mutating(&self, method: &str) -> bool {
@@ -4533,6 +4548,8 @@ impl LocalProcess {
     }
 
     /// Policy for a capability: process execution must be granted explicitly.
+    /// Mint attaches this policy by default when the minter supplies none
+    /// (RPC-41).
     pub fn policy(&self) -> ToolPolicy {
         ToolPolicy {
             allowed: ["run"].iter().map(|method| method.to_string()).collect(),
@@ -4593,6 +4610,14 @@ impl Provider for LocalProcess {
 
     fn methods(&self) -> Vec<String> {
         vec!["run".to_string()]
+    }
+
+    /// The policy `Agent::mint` attaches when the minter supplies none
+    /// (RPC-41): `run`, at the 64 KiB argument ceiling, with process
+    /// execution granted -- the grant the adapter itself requires before
+    /// it will spawn.
+    fn tool_policy(&self) -> Option<ToolPolicy> {
+        Some(self.policy())
     }
 
     fn mutating(&self, _method: &str) -> bool {

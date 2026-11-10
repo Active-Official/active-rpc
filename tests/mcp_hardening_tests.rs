@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 
-use active_rpc::cap::CapAttrs;
+use active_rpc::cap::{CapAttrs, ToolPolicy};
 use active_rpc::error::Error;
 use active_rpc::kernel::Provider;
 use active_rpc::tool::{
@@ -1101,4 +1101,198 @@ fn a_destructive_hint_alone_keeps_a_tool_mutating() {
         McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
     assert!(session.tools()[0].is_mutating());
     assert!(session.mutating("write"));
+}
+
+// ---------------------------------------------------------------------------
+// RPC-41: mint attaches the provider's tool policy by default.
+// ---------------------------------------------------------------------------
+
+/// An `echo` session with one call answer queued. The RPC-41 tests mint
+/// through the kernel, so the handshake answers and the call answer must
+/// both be scripted.
+fn rpc41_echo_session() -> McpSession<Scripted> {
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(r#"[{"name":"echo","description":"echo"}]"#);
+    McpSession::handshake(Scripted::new(&[
+        initialize,
+        list.as_str(),
+        r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}"#,
+    ]))
+    .expect("handshake")
+}
+
+/// The finding, as a committed regression test (W2's
+/// `w2_rpc41_mint_without_policy_skips_arg_gate`, code-level): minting a
+/// capability over an MCP session without attaching the session's policy
+/// used to skip the method/arg-byte gate entirely, so a 200 KiB argument
+/// sailed through. Mint now attaches the session's policy, and the same
+/// call is refused `rpc/tool-policy` at queue time.
+#[test]
+fn a_mint_without_a_policy_is_gated_by_the_session_policy() {
+    let agent = Agent::with_secret([0x41; 32]);
+    let provider = agent.register(Box::new(rpc41_echo_session()));
+    // No explicit policy: the mint attaches the session's.
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("mint without policy");
+    let attrs = agent.cap_attrs(&cap).expect("minted cap attrs");
+    let attached = attrs
+        .tool_policy
+        .expect("mint attaches the provider policy");
+    assert!(attached.allowed.contains("echo"), "policy allows echo");
+    assert_eq!(
+        attached.max_arg_bytes,
+        (MAX_MCP_LINE_BYTES as u64 / 6).saturating_sub(256),
+        "the attached ceiling is the session's own"
+    );
+    let lane = agent.create_lane("p", Budget::default()).expect("lane");
+    // A small call still succeeds through the attached policy.
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::Value(Value::Text("hi".into()))],
+        )
+        .expect("a small call is admitted");
+    agent.run();
+    let response = promise.value().expect("a small call succeeds");
+    assert!(matches!(response, Value::Map(_)));
+    // The W2 shape: the same session, a 200 KiB argument.
+    let big = "x".repeat(200_000);
+    let err = match agent.call(lane, &cap, "echo", vec![Arg::Value(Value::Text(big))]) {
+        Err(err) => err,
+        Ok(promise) => {
+            agent.run();
+            promise
+                .value()
+                .expect_err("a 200 KiB argument past the session policy must be refused")
+        }
+    };
+    assert_eq!(err.code(), "rpc/tool-policy", "{err}");
+}
+
+/// Guard: the attach is a default, not a ceiling. An explicit policy the
+/// minter supplies wins over the provider's -- narrower (a 1 KiB policy
+/// refuses a 2 KiB argument the session default would admit) and wider
+/// (a 1 MiB policy admits the 200 KiB argument the session default would
+/// refuse).
+#[test]
+fn an_explicit_policy_wins_over_the_attached_default() {
+    // Narrower: an explicit 1 KiB policy refuses a 2 KiB argument.
+    let agent = Agent::with_secret([0x41; 32]);
+    let provider = agent.register(Box::new(rpc41_echo_session()));
+    let mut narrow = ToolPolicy::default();
+    narrow.allowed.insert("echo".to_string());
+    narrow.max_arg_bytes = 1024;
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["echo"]).with_tool_policy(narrow),
+        )
+        .expect("mint with explicit policy");
+    let lane = agent.create_lane("p", Budget::default()).expect("lane");
+    let err = match agent.call(
+        lane,
+        &cap,
+        "echo",
+        vec![Arg::Value(Value::Text("x".repeat(2_048)))],
+    ) {
+        Err(err) => err,
+        Ok(promise) => {
+            agent.run();
+            promise
+                .value()
+                .expect_err("a 2 KiB argument past a 1 KiB policy must be refused")
+        }
+    };
+    assert_eq!(err.code(), "rpc/tool-policy", "{err}");
+
+    // Wider: an explicit 1 MiB policy admits the 200 KiB argument.
+    let agent = Agent::with_secret([0x41; 32]);
+    let provider = agent.register(Box::new(rpc41_echo_session()));
+    let mut wide = ToolPolicy::default();
+    wide.allowed.insert("echo".to_string());
+    wide.max_arg_bytes = 1 << 20;
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]).with_tool_policy(wide))
+        .expect("mint with explicit policy");
+    let lane = agent.create_lane("p", Budget::default()).expect("lane");
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::Value(Value::Text("x".repeat(200_000)))],
+        )
+        .expect("a 200 KiB argument under a 1 MiB policy is admitted");
+    agent.run();
+    let response = promise.value().expect("the wide-policy call succeeds");
+    assert!(matches!(response, Value::Map(_)));
+}
+
+/// Guard: once mint attaches the policy, attenuation cannot drop it.
+/// `CapAttrs::attenuate` refuses a child without a policy under a parent
+/// with one, so the gate cannot be laundered out through a delegation;
+/// a child carrying the same policy attenuates fine.
+#[test]
+fn an_attenuated_child_cannot_drop_the_attached_policy() {
+    let session = rpc41_echo_session();
+    let policy = session.policy();
+    let agent = Agent::with_secret([0x41; 32]);
+    let provider = agent.register(Box::new(session));
+    let parent = agent
+        .mint(provider, 0, CapAttrs::new(&["echo"]))
+        .expect("mint without policy");
+    let err = agent
+        .attenuate(&parent, CapAttrs::new(&["echo"]))
+        .expect_err("dropping the attached policy must be refused");
+    assert_eq!(err.code(), "rpc/attenuation-escalation", "{err}");
+    let child = agent
+        .attenuate(&parent, CapAttrs::new(&["echo"]).with_tool_policy(policy))
+        .expect("a child carrying the same policy attenuates");
+    let attrs = agent.cap_attrs(&child).expect("child attrs");
+    assert!(attrs.tool_policy.is_some(), "the child keeps the policy");
+}
+
+/// Edge: the attached policy is validated like a minter-supplied one. A
+/// session advertising 65 tools attaches a 65-name policy, and mint
+/// refuses it -- the same ceiling that bounds every name set a grant
+/// carries (RPC-07). The minter's remedy is an explicit policy naming
+/// only the tools the capability may use.
+#[test]
+fn a_session_with_more_than_64_tools_refuses_a_policy_less_mint() {
+    let names: Vec<String> = (0..65).map(|index| format!("tool{index:02}")).collect();
+    let tools: Vec<String> = names
+        .iter()
+        .map(|name| format!(r#"{{"name":"{name}","description":"t"}}"#))
+        .collect();
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#;
+    let list = tool_list_response(&format!("[{}]", tools.join(",")));
+    let session =
+        McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
+    assert_eq!(session.tools().len(), 65);
+    let agent = Agent::with_secret([0x41; 32]);
+    let provider = agent.register(Box::new(session));
+    let err = agent
+        .mint(provider, 0, CapAttrs::new(&["tool00"]))
+        .expect_err("a 65-tool attached policy must refuse the mint");
+    assert_eq!(err.code(), "rpc/invalid-argument", "{err}");
+    // The remedy: an explicit one-tool policy mints.
+    let cap = agent
+        .mint(
+            provider,
+            0,
+            CapAttrs::new(&["tool00"]).with_tool_policy(ToolPolicy::allow(&["tool00"])),
+        )
+        .expect("an explicit one-tool policy mints");
+    let attrs = agent.cap_attrs(&cap).expect("minted cap attrs");
+    assert_eq!(
+        attrs
+            .tool_policy
+            .as_ref()
+            .map(|policy| policy.allowed.len()),
+        Some(1)
+    );
 }

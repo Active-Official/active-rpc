@@ -41,6 +41,20 @@ program identity rather than trusting the environment:
   still applies to arguments admitted only through it. Construction prints a
   warning to stderr whenever a bare `"*"` rule is present, so the change is
   visible at startup rather than at the first refused call.
+- Minting a capability over an MCP, HTTP or process tool now attaches the
+  provider's tool policy by default (RPC-41). A mint without an explicit
+  policy used to skip the method/arg-byte gate entirely -- only the method
+  set and the budget applied -- so a 200 KiB argument to an MCP tool sailed
+  through. The minted capability now carries the provider's policy
+  (`McpSession::policy`, `HttpTool::policy`, `LocalProcess::policy`):
+  an oversized argument is refused with `rpc/tool-policy`, and a process
+  tool minted without a policy can now spawn (its policy grants process
+  execution), where before every call was refused for want of the grant.
+  An explicit policy supplied at mint still wins, narrower or wider. One
+  edge: an MCP server advertising more than 64 tools refuses a
+  policy-less mint (`rpc/invalid-argument`, "a capability grants too many
+  tools") -- mint with an explicit policy naming only the tools the
+  capability may use.
 - A Unix timeout now signals the child's whole process group, and a Windows
   timeout still uses `taskkill /T`, so descendants do not outlive the call.
 

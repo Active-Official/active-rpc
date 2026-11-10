@@ -204,7 +204,9 @@ pub struct CapAttrs {
     /// spoofable by a lane that was granted a method on some other provider.
     /// Publishing is now an explicit grant, and attenuation can only drop it.
     pub publish: bool,
-    /// Tool policy, when the capability targets a tool.
+    /// Tool policy, when the capability targets a tool. Mint attaches
+    /// the provider's policy when none is supplied (RPC-41); an explicit
+    /// policy wins.
     pub tool_policy: Option<ToolPolicy>,
     /// Whether the capability is ephemeral or eligible for durable restore.
     pub persistence: CapPersistence,
@@ -286,6 +288,9 @@ impl CapAttrs {
     }
 
     /// Attach a tool policy.
+    ///
+    /// An explicit policy wins over the provider's: mint attaches the
+    /// provider's policy only when none is supplied (RPC-41).
     pub fn with_tool_policy(mut self, policy: ToolPolicy) -> Self {
         self.tool_policy = Some(policy);
         self

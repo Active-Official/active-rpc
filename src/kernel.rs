@@ -209,6 +209,25 @@ pub trait Provider {
     fn module_content_hash(&mut self, _object: u64) -> Result<ModuleIdentity> {
         Ok(ModuleIdentity::NotAModuleProvider)
     }
+
+    /// The tool policy a minted capability over this provider carries unless
+    /// the minter supplies one (RPC-41).
+    ///
+    /// The default is `None`: most providers carry no tool-level gate, and
+    /// mint leaves their capabilities exactly as minted. A tool provider
+    /// overrides this to return the policy its own `policy()` method builds
+    /// -- the method allowlist and the per-call argument ceiling the adapter
+    /// enforces -- so `Agent::mint` attaches it when the minter did not
+    /// supply one. Without the attach, the kernel's tool-policy gate
+    /// (`rpc/tool-policy`) never ran for such a capability: only the method
+    /// set and the budget applied, and an oversized tool argument sailed
+    /// through. The attach is a default, not a ceiling: an explicit policy
+    /// the minter supplies wins, and attenuation may only narrow what the
+    /// parent carries. Captured once, at registration, like `methods` and
+    /// `mutating`.
+    fn tool_policy(&self) -> Option<ToolPolicy> {
+        None
+    }
 }
 
 /// What a provider can say about the module at an object (R2-BND-03).
@@ -799,6 +818,12 @@ struct ProviderFacts {
     name: String,
     methods: BTreeSet<String>,
     mutating: BTreeSet<String>,
+    /// The tool policy `Agent::mint` attaches when the minter supplies none
+    /// (RPC-41). `None` means the provider carries no tool-level gate.
+    /// Captured as returned, not truncated: a policy naming more than 64
+    /// tools is refused at mint by `check_method_names`, never silently
+    /// narrowed here.
+    tool_policy: Option<ToolPolicy>,
     /// The provider's surface passed the introduction bound, so `methods` is a
     /// prefix and the provider is undescribable (R-17 round 10, R10-4).
     over_bound: bool,
@@ -829,6 +854,7 @@ impl ProviderFacts {
             name: provider.name().to_string(),
             methods,
             mutating,
+            tool_policy: provider.tool_policy(),
             over_bound,
         }
     }
@@ -1464,9 +1490,9 @@ impl Agent {
     /// Register a provider and return its id.
     ///
     /// The provider's surface is captured here, before the kernel is borrowed:
-    /// `name`, `methods` and `mutating` run with no borrow held, so a provider
-    /// that consults the agent while it describes itself is safe (R-17 round 3,
-    /// M-2).
+    /// `name`, `methods`, `mutating` and the tool policy run with no borrow held,
+    /// so a provider that consults the agent while it describes itself is safe
+    /// (R-17 round 3, M-2).
     pub fn register(&self, provider: Box<dyn Provider>) -> ProviderId {
         let facts = ProviderFacts::capture(provider.as_ref());
         let mut kernel = self.cell.borrow_mut();
@@ -2232,7 +2258,17 @@ impl Agent {
     }
 
     /// Mint a first-generation capability.
-    pub fn mint(&self, provider: ProviderId, object: u64, attrs: CapAttrs) -> Result<CapHandle> {
+    ///
+    /// When the attributes carry no tool policy, the provider's policy is
+    /// attached instead (RPC-41): a capability over an MCP, HTTP or process
+    /// tool always carries the gate its adapter declares, unless the minter
+    /// supplied an explicit policy, which wins.
+    pub fn mint(
+        &self,
+        provider: ProviderId,
+        object: u64,
+        mut attrs: CapAttrs,
+    ) -> Result<CapHandle> {
         if attrs.persistence == crate::cap::CapPersistence::Durable
             && !self.cell.borrow().allow_durable
         {
@@ -2245,12 +2281,34 @@ impl Agent {
         if attrs.methods.is_empty() {
             return Err(Error::InvalidArgument("capability grants no methods"));
         }
-        check_method_names(&attrs)?;
         let mut kernel = self.cell.borrow_mut();
         // `facts` is the registry, as in `Agent::mint` (R-17 round 4, #7).
         if !kernel.facts.contains_key(&provider) {
             return Err(Error::InvalidArgument("unknown provider"));
         }
+        // RPC-41: a tool provider's policy is the default, not an opt-in.
+        // Minting a capability over an MCP, HTTP or process tool without
+        // attaching the provider's policy left the kernel's tool-policy gate
+        // with nothing to enforce -- only the method set and the budget
+        // applied -- so an oversized tool argument sailed through. The
+        // policy is captured at registration, and mint attaches it here
+        // when the minter did not supply one; an explicit policy wins.
+        // The name validation runs after the attach, so a hostile
+        // provider's tool names get the same refusal as a minter-supplied
+        // policy's: a policy naming more than 64 tools, or a name the wire
+        // cannot carry, refuses the mint. Refusal precedence changes by one
+        // step: an unknown provider is now reported before an invalid
+        // method name.
+        if attrs.tool_policy.is_none() {
+            if let Some(policy) = kernel
+                .facts
+                .get(&provider)
+                .and_then(|facts| facts.tool_policy.clone())
+            {
+                attrs.tool_policy = Some(policy);
+            }
+        }
+        check_method_names(&attrs)?;
         if kernel.caps.len() >= MAX_CAPS {
             return Err(Error::BudgetExceeded("caps"));
         }
@@ -8354,6 +8412,23 @@ mod fail_closed_tests {
         assert_eq!(
             error.to_string(),
             "durable capability refused: the capability has no meter"
+        );
+    }
+
+    /// RPC-41 guard: the attach is for tool providers only. A plain provider
+    /// (no `tool_policy` override, so the trait default `None`) mints exactly
+    /// as before -- no policy appears on the capability.
+    #[test]
+    fn a_plain_provider_mint_carries_no_tool_policy() {
+        let agent = Agent::with_secret([0x5a; 32]);
+        let provider = agent.register(Box::new(Ping));
+        let cap = agent
+            .mint(provider, 0, CapAttrs::new(&["ping"]))
+            .expect("mint");
+        let attrs = agent.cap_attrs(&cap).expect("minted cap attrs");
+        assert!(
+            attrs.tool_policy.is_none(),
+            "a plain provider must not gain a policy at mint"
         );
     }
 

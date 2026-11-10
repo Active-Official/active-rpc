@@ -6,9 +6,10 @@
 
 use std::net::TcpListener;
 
+use active_rpc::cap::CapAttrs;
 use active_rpc::tool::{HttpTool, LocalProcess};
 use active_rpc::value::Response;
-use active_rpc::{Arg, Call, Provider, Value};
+use active_rpc::{Agent, Arg, Budget, Call, Provider, Value};
 
 // ---------------------------------------------------------------------------
 // Program identity
@@ -3506,4 +3507,152 @@ fn the_http_adapter_checks_the_method_before_the_argument_shape() {
         .invoke(0, &call)
         .expect_err("the method is not granted");
     assert_eq!(error.code(), "rpc/method-not-granted", "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// RPC-41: mint attaches the provider's tool policy by default.
+// ---------------------------------------------------------------------------
+
+/// The HTTP leg of RPC-41: a capability minted over an `HttpTool` without
+/// an explicit policy carries the tool's policy, so an argument past the
+/// tool's request ceiling is refused `rpc/tool-policy` at queue time. A
+/// small POST still succeeds through the attached policy.
+#[test]
+fn an_http_mint_without_a_policy_is_gated_by_the_tool_policy() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = record_one_request(listener);
+
+    let agent = Agent::with_secret([0x41; 32]);
+    let tool = HttpTool::new(format!("http://{address}"), &[("POST", "/submit")]);
+    let provider = agent.register(Box::new(tool));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["post"]))
+        .expect("mint without policy");
+    let attrs = agent.cap_attrs(&cap).expect("minted cap attrs");
+    let attached = attrs
+        .tool_policy
+        .expect("mint attaches the provider policy");
+    assert!(attached.allowed.contains("post"), "policy allows post");
+    assert_eq!(
+        attached.max_arg_bytes,
+        (1 << 20) / 6 - 256,
+        "the attached ceiling is the tool's own"
+    );
+    let lane = agent.create_lane("p", Budget::default()).expect("lane");
+    // A small POST succeeds through the attached policy.
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("k".to_string(), Value::text("v"));
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "post",
+            vec![
+                Arg::Value(Value::path("/submit")),
+                Arg::Value(Value::Map(entries)),
+            ],
+        )
+        .expect("a small POST is admitted");
+    agent.run();
+    let response = promise.value().expect("a small POST succeeds");
+    assert_eq!(response, Value::Text("ok".to_string()));
+    let (head, body) = server.join().expect("server thread");
+    assert!(
+        head.to_ascii_lowercase().contains("content-length: 9"),
+        "a POST declares its body: {head}"
+    );
+    assert_eq!(body, 9, "the POST body follows the head: {head}");
+    // The W2 shape on the HTTP leg: a 200 KiB argument past the ceiling.
+    let mut big_entries = std::collections::BTreeMap::new();
+    big_entries.insert("k".to_string(), Value::Text("x".repeat(200_000)));
+    let err = match agent.call(
+        lane,
+        &cap,
+        "post",
+        vec![
+            Arg::Value(Value::path("/submit")),
+            Arg::Value(Value::Map(big_entries)),
+        ],
+    ) {
+        Err(err) => err,
+        Ok(promise) => {
+            agent.run();
+            promise
+                .value()
+                .expect_err("a 200 KiB argument past the tool policy must be refused")
+        }
+    };
+    assert_eq!(err.code(), "rpc/tool-policy", "{err}");
+}
+
+/// The process leg of RPC-41: a capability minted over a `LocalProcess`
+/// without an explicit policy carries the tool's policy -- which grants
+/// process execution, so a small `run` now succeeds where a policy-less
+/// mint could never spawn (the adapter refused a call without the
+/// process grant) -- and an argument past the 64 KiB ceiling is refused
+/// `rpc/tool-policy` at queue time.
+#[test]
+fn a_process_mint_without_a_policy_is_gated_by_the_tool_policy() {
+    #[cfg(windows)]
+    let (program, flag) = ("C:\\Windows\\System32\\cmd.exe", "/C");
+    #[cfg(not(windows))]
+    let (program, flag) = ("/bin/sh", "-c");
+    let agent = Agent::with_secret([0x41; 32]);
+    let tool = LocalProcess::new(program, &[flag, "echo hello"]).expect("an absolute program");
+    let provider = agent.register(Box::new(tool));
+    let cap = agent
+        .mint(provider, 0, CapAttrs::new(&["run"]))
+        .expect("mint without policy");
+    let attrs = agent.cap_attrs(&cap).expect("minted cap attrs");
+    let attached = attrs
+        .tool_policy
+        .expect("mint attaches the provider policy");
+    assert!(attached.allowed.contains("run"), "policy allows run");
+    assert_eq!(
+        attached.max_arg_bytes,
+        64 << 10,
+        "the attached ceiling is 64 KiB"
+    );
+    assert!(
+        attached.allow_process,
+        "the attached policy grants process execution"
+    );
+    let lane = agent.create_lane("p", Budget::default()).expect("lane");
+    // A small run succeeds: the attached policy grants process execution.
+    let promise = agent
+        .call(
+            lane,
+            &cap,
+            "run",
+            vec![Arg::text(flag), Arg::text("echo hello")],
+        )
+        .expect("a small run is admitted");
+    agent.run();
+    let response = promise.value().expect("a small run succeeds");
+    let Value::Map(entries) = response else {
+        panic!("a run returns a map: {response:?}");
+    };
+    let stdout = match entries.get("stdout") {
+        Some(Value::Text(text)) => text,
+        other => panic!("unexpected stdout {other:?}"),
+    };
+    assert!(stdout.contains("hello"), "stdout: {stdout:?}");
+    // The W2 shape on the process leg: a 200 KiB argument past 64 KiB.
+    let big = "x".repeat(200_000);
+    let err = match agent.call(
+        lane,
+        &cap,
+        "run",
+        vec![Arg::text(flag), Arg::Value(Value::Text(big))],
+    ) {
+        Err(err) => err,
+        Ok(promise) => {
+            agent.run();
+            promise
+                .value()
+                .expect_err("a 200 KiB argument past the tool policy must be refused")
+        }
+    };
+    assert_eq!(err.code(), "rpc/tool-policy", "{err}");
 }

@@ -37,6 +37,7 @@
 | [0033](0033-receipt-log-path-validation.md) | Receipt-log paths are validated at creation, uniformly on all platforms |
 | [0034](0034-directory-sync-and-signalled-child-on-windows.md) | Parent-directory sync and the signalled-child guard on Windows |
 | [0035](0035-bare-star-argument-rule-opt-in.md) | A bare `*` argument rule needs an explicit opt-in |
+| [0036](0036-mint-attaches-the-provider-tool-policy.md) | Mint attaches the provider's tool policy by default |
 
 ## Reading order and supersessions
 
