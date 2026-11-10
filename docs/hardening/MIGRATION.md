@@ -28,7 +28,13 @@ program identity rather than trusting the environment:
   `PATH`, so anything that can write an earlier entry would choose the binary
   the capability runs. The canonical path is pinned at construction, and
   `with_current_dir` pins the working directory (it also returns `Result` and
-  refuses a relative directory).
+  refuses a relative directory). The pin is the content, not just the path
+  (RPC-43): construction also records a BLAKE3 digest of the program's
+  bytes, and every invoke re-hashes before spawning -- a binary replaced
+  in place after construction is refused with `rpc/provider`
+  (`process/program-changed`, `mcp/program-changed` for an MCP server),
+  never silently re-pinned. A program that cannot be read is refused at
+  construction.
 - `StdioTransport::spawn` refuses a non-absolute `program` for the same reason.
 - A bare `"*"` argument rule in `LocalProcess::new(program, args)` no longer
   admits any argument: it is a prefix of `""`, so it used to admit every
@@ -66,8 +72,14 @@ program identity rather than trusting the environment:
   plane and answer as if real; every answer from the embedded plane now
   carries `"degraded": true` inside the answer text, so offline `--mcp`
   use still works but is visible as degraded.
-- A Unix timeout now signals the child's whole process group, and a Windows
-  timeout still uses `taskkill /T`, so descendants do not outlive the call.
+- A Unix timeout now signals the child's whole process group through the
+  `killpg` syscall, and only when the group is still provably the child's
+  own (RPC-43): a leader that exited long ago may have had its pid reused
+  as a new process-group leader, and a bare `-<pid>` signal would take an
+  unrelated group down with it. A Windows timeout terminates the job
+  object holding the whole tree (XPL-RPC-04), not `taskkill /T` -- the
+  job has been the mechanism since XPL-RPC-04, and this bullet previously
+  said otherwise. Descendants do not outlive the call on either platform.
 
 Promises are retained while a `PromiseHandle` is alive. Dropping the handle makes
 the settled record eligible for trimming after the next drain; a handle never

@@ -33,6 +33,15 @@
 //! nothing and [`prepare_command`] is a no-op. The caller keeps one code
 //! path on every platform instead of a `cfg` at each of the thirteen kill
 //! sites.
+//!
+//! The Unix half of the same primitive lives here too
+//! ([`kill_process_group`], [`kill_pid`], RPC-43): the group kill used
+//! to shell out to an external `/bin/kill` with a bare `-<pid>`, so a
+//! leader that had exited and whose pid had been reused as a new
+//! process-group leader took an unrelated group down with it. The
+//! signal is now the `killpg`/`kill` syscall, and the caller only
+//! signals a group it has proven still to be its own — the check lives
+//! in `active-rpc` (it needs `/proc`), the signal lives here.
 
 #![deny(missing_docs)]
 
@@ -57,6 +66,79 @@ pub fn prepare_command(command: &mut std::process::Command) {
     {
         let _ = command;
     }
+}
+
+/// SIGKILL one process group through the `killpg` syscall (RPC-43, Unix).
+///
+/// `pgid` is the group the caller created at spawn (the leader's pid).
+/// Returns true when the signal was delivered to at least one member.
+/// A zero pgid is refused outright: `killpg(0, …)` signals the caller's
+/// own group, which is never what a tree kill means — and a pgid that
+/// does not fit `pid_t` cannot name a group, so it is refused the same
+/// way instead of truncated.
+///
+/// Outside Unix there is no process group to signal, so this returns
+/// false and does nothing: the Windows job object is the mechanism
+/// there, and the caller never calls this on that platform.
+///
+/// # Safety boundary
+///
+/// The `unsafe` is one syscall taking two integers — no pointer, no
+/// buffer, no handle. The only effect is the signal itself.
+#[cfg(unix)]
+pub fn kill_process_group(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return false;
+    };
+    // SAFETY: `killpg` takes a process-group id and a signal number,
+    // both plain integers; `SIGKILL` is a valid signal, and the call
+    // touches no memory through any pointer.
+    unsafe { libc::killpg(pgid, libc::SIGKILL) == 0 }
+}
+
+/// SIGKILL one pid through the `kill` syscall (RPC-43, Unix).
+///
+/// Returns true when the signal was delivered. A zero pid is refused
+/// outright: `kill(0, …)` signals the caller's own process group. A
+/// pid that does not fit `pid_t` cannot name a process, so it is
+/// refused the same way instead of truncated.
+///
+/// Outside Unix this returns false and does nothing, as in
+/// [`kill_process_group`].
+///
+/// # Safety boundary
+///
+/// As in [`kill_process_group`]: one syscall taking two integers, no
+/// pointer, no buffer. The only effect is the signal itself.
+#[cfg(unix)]
+pub fn kill_pid(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: as in [`kill_process_group`]: `kill` takes a pid and a
+    // signal number, both plain integers, and touches no memory
+    // through any pointer.
+    unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
+}
+
+/// See the Unix implementation: outside Unix there is no process group
+/// to signal, so this returns false and does nothing.
+#[cfg(not(unix))]
+pub fn kill_process_group(_pgid: u32) -> bool {
+    false
+}
+
+/// See the Unix implementation: outside Unix there is no pid to signal
+/// through this API, so this returns false and does nothing.
+#[cfg(not(unix))]
+pub fn kill_pid(_pid: u32) -> bool {
+    false
 }
 
 /// A job object holding one tool child and every descendant it starts.
@@ -273,6 +355,110 @@ mod tests {
         job.terminate();
         let status = child.wait().expect("reap the child");
         assert!(status.success(), "a stubbed child still runs to completion");
+    }
+
+    /// `kill_pid` delivers SIGKILL to one process: the sleeper dies by
+    /// signal (no exit code), and the call reports the delivery.
+    /// The wait is bounded, so a missed signal fails the test instead
+    /// of hanging it; the signal is re-sent defensively on the way out.
+    #[cfg(unix)]
+    #[test]
+    fn kill_pid_kills_one_process() {
+        use super::kill_pid;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a sleeper");
+        assert!(kill_pid(child.id()), "the signal must be delivered");
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait().expect("poll the child") {
+                Some(status) => {
+                    assert!(status.code().is_none(), "a SIGKILL leaves no exit code");
+                    break;
+                }
+                None => {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(5),
+                        "a missed signal would wait forever"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// `kill_process_group` delivers SIGKILL to the whole group, not
+    /// just the leader: the leader runs `sleep` in its own group, the
+    /// signal takes the group, and the leader dies by signal.
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_group_kills_the_group() {
+        use super::kill_process_group;
+        use std::os::unix::process::CommandExt;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn a grouped sleeper");
+        assert!(
+            kill_process_group(child.id()),
+            "the group signal must be delivered"
+        );
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait().expect("poll the child") {
+                Some(status) => {
+                    assert!(status.code().is_none(), "a SIGKILL leaves no exit code");
+                    break;
+                }
+                None => {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(5),
+                        "a missed signal would wait forever"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// A signal to a group or pid that does not exist reports false
+    /// instead of signalling anything — and a zero id never signals
+    /// the caller's own group (`killpg(0, …)` / `kill(0, …)` would).
+    /// A pid that cannot fit `pid_t` is refused the same way instead
+    /// of truncated into a live one.
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_dead_group_or_pid_reports_false() {
+        use super::{kill_pid, kill_process_group};
+
+        let dead = i32::MAX as u32;
+        assert!(!kill_process_group(dead), "no such group exists");
+        assert!(!kill_pid(dead), "no such process exists");
+        assert!(!kill_process_group(0), "a zero pgid must never signal");
+        assert!(!kill_pid(0), "a zero pid must never signal");
+        assert!(
+            !kill_process_group(u32::MAX),
+            "a pgid past pid_t must be refused, not truncated"
+        );
+        assert!(
+            !kill_pid(u32::MAX),
+            "a pid past pid_t must be refused, not truncated"
+        );
+    }
+
+    /// Outside Unix the signal functions are stubs that report false
+    /// and do nothing: the job object is the mechanism there.
+    #[cfg(not(unix))]
+    #[test]
+    fn the_signal_stubs_report_false() {
+        use super::{kill_pid, kill_process_group};
+
+        assert!(!kill_process_group(1), "no group signal outside Unix");
+        assert!(!kill_pid(1), "no pid signal outside Unix");
     }
 
     /// A child spawned suspended does not run until it is assigned and

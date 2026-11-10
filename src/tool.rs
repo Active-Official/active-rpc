@@ -20,6 +20,8 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+#[cfg(unix)]
+use active_rpc_process_tree::{kill_pid, kill_process_group};
 use active_rpc_process_tree::{prepare_command, Job};
 use serde_json::{json, Value as Json};
 
@@ -1176,7 +1178,7 @@ impl StdioTransport {
                 "an MCP program or argument contains a NUL byte",
             ));
         }
-        let program = pin_program(program, "an MCP server")?;
+        let (program, pinned_hash) = pin_program(program, "an MCP server")?;
         let workdir = std::env::current_dir()
             .and_then(std::fs::canonicalize)
             .map_err(|_| Error::Provider {
@@ -1211,6 +1213,24 @@ impl StdioTransport {
                 ));
             }
             command.env(key, value);
+        }
+        // RPC-43: the pin is the content, not just the path. The hash
+        // is re-verified immediately before the exec, so a binary
+        // swapped in after the pin — in the gap the working-directory
+        // canonicalisation and the environment validation open — is
+        // refused rather than run. A mismatch is never re-pinned.
+        match program_hash(&program) {
+            Ok(hash) if hash == pinned_hash => {}
+            Ok(_) => {
+                return Err(Error::Provider {
+                    code: "mcp/program-changed".to_string(),
+                });
+            }
+            Err(_) => {
+                return Err(Error::Provider {
+                    code: "mcp/program-unreadable".to_string(),
+                });
+            }
         }
         let mut child = command.spawn().map_err(|error| Error::Provider {
             code: format!("mcp/spawn:{error}"),
@@ -4103,24 +4123,15 @@ fn pipe_inode(fd: std::os::unix::io::RawFd) -> Option<u64> {
     pipe_inode_of_link(&link)
 }
 
-/// SIGKILL one pid through the `kill` binary (R2-R08B-01). The crate
-/// forbids `unsafe`, so there is no `libc::kill` to call; the group kill
-/// below uses the same mechanism.
+/// SIGKILL one pid through the `kill` syscall (R2-R08B-01, RPC-43).
+/// The crate forbids `unsafe`, so the syscall lives in the
+/// `active-rpc-process-tree` helper crate behind a safe API — and no
+/// external `kill` binary is spawned: a bare pid through a spawned
+/// binary is the same shape as the group kill RPC-43 replaces, and the
+/// binary itself was a dependency on `/bin/kill` existing.
 #[cfg(target_os = "linux")]
 fn kill_one(pid: u32) {
-    let pid = pid.to_string();
-    for candidate in ["/bin/kill", "/usr/bin/kill"] {
-        let killed = Command::new(candidate)
-            .args(["-KILL", "--", pid.as_str()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if killed {
-            break;
-        }
-    }
+    let _ = kill_pid(pid);
 }
 
 /// Inodes of the pipes a just-spawned child writes to (its stdout/stderr),
@@ -4232,17 +4243,163 @@ fn kill_pipe_holders(pipes: &[u64]) {
             break;
         }
         for pid in holders {
-            kill_one(pid);
+            // Re-verify immediately before the signal: a holder that
+            // exited between the scan and this kill may have had its
+            // pid reused, and a bare pid is the same race as the group
+            // kill (RPC-43). Only a process still holding a target pipe
+            // write end is signalled.
+            if pid_holds_pipe_write_end(pid, pipes) {
+                kill_one(pid);
+            }
         }
     }
+}
+
+/// True when `pid` still holds the write end of one of `pipes`
+/// (RPC-43, Linux only): the re-verification `kill_pipe_holders`
+/// runs immediately before signalling a holder it scanned a moment
+/// earlier.
+#[cfg(target_os = "linux")]
+fn pid_holds_pipe_write_end(pid: u32, pipes: &[u64]) -> bool {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for fd in fds.flatten() {
+        let Ok(link) = std::fs::read_link(fd.path()) else {
+            continue;
+        };
+        let Some(ino) = pipe_inode_of_link(&link) else {
+            continue;
+        };
+        if pipes.contains(&ino) && fd_is_write_end(pid, &fd.file_name()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether signalling `child`'s process group can only reach the child's
+/// own tree (RPC-43).
+///
+/// The group kill targets the pgid the spawn created, which is the
+/// leader's pid — and a pid is only unique while its owner lives. A
+/// leader that exited long before this kill may have had its pid reused
+/// as a new process-group leader; signalling `-<pid>` then kills an
+/// unrelated group. Two observations close the realistic race:
+///
+/// * A leader that is still alive cannot have been reused: `try_wait`
+///   saying `None` proves the pid is still our child, so the group is
+///   ours and the signal is safe. This is the common path — a timeout
+///   kill fires while the leader is alive.
+/// * A leader that is dead leaves its group behind only while a member
+///   lives: on Linux `/proc` names every member (see
+///   [`process_group_still_ours_linux`]), and a pgid cannot be reused
+///   while a member carries it.
+///
+/// On non-Linux Unix there is no `/proc` to verify against, so a dead
+/// leader's group is signalled as before — the reuse race survives
+/// there in its narrow form (the whole group dead and the pgid reused
+/// before this kill), and closing it needs a process enumeration the
+/// macOS `sysctl` path would provide; that enumeration is untestable
+/// from this host, so it is recorded, not attempted (RPC-43).
+#[cfg(unix)]
+fn process_group_still_ours(child: &mut Child) -> bool {
+    match child.try_wait() {
+        // The leader is alive: its pid is still our child, so the group
+        // is the one the spawn created.
+        Ok(None) => true,
+        // The leader is dead: on Linux `/proc` decides; elsewhere the
+        // group is signalled as before (see the doc above).
+        Ok(Some(_)) => {
+            #[cfg(target_os = "linux")]
+            {
+                process_group_still_ours_linux(child.id())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                true
+            }
+        }
+        // `try_wait` fails only on a `waitpid` error, which cannot
+        // happen for an unreaped child of ours; keep the old behaviour
+        // rather than inventing a refusal for an impossible path.
+        Err(_) => true,
+    }
+}
+
+/// Linux half of [`process_group_still_ours`] (RPC-43): `/proc` is the
+/// only place that can tell our group from a reused pgid.
+///
+/// The caller already knows the leader is dead, so if `/proc/<pid>`
+/// exists at all the pid was reused. A reused pid that is itself a
+/// group leader (`pgid == pid`) owns this pgid now: our group is dead
+/// and the signal must not fire. A reused pid in another group cannot
+/// own this pgid, so any member found by the scan below is ours — a
+/// pgid cannot be reused while a member carries it — and no member at
+/// all means the group is gone and there is nothing to kill.
+/// Signalling in that last case would be exactly the race this check
+/// exists for, so the signal is skipped.
+///
+/// The scan skips the leader's own pid: between the check above and
+/// the scan, the pid could be reused again as a new group leader, and
+/// its own pgid would then read as a member of our group. Everything
+/// else the scan finds is a genuine member.
+#[cfg(target_os = "linux")]
+fn process_group_still_ours_linux(pgid: u32) -> bool {
+    if let Some(leader_pgid) = process_pgid(pgid) {
+        if leader_pgid == pgid {
+            return false;
+        }
+    }
+    process_group_has_member(pgid)
+}
+
+/// The process group of `pid` from `/proc/<pid>/stat`, or `None` when
+/// the process does not exist (or its stat cannot be read).
+///
+/// `stat` puts the command name in parentheses — and the name can
+/// contain spaces and parentheses — so the fields are read after the
+/// LAST `)`: state is the first field after it, the process group the
+/// third.
+#[cfg(target_os = "linux")]
+fn process_pgid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// True when some process other than `pgid` itself still carries
+/// `pgid` as its process group (RPC-43, Linux only).
+#[cfg(target_os = "linux")]
+fn process_group_has_member(pgid: u32) -> bool {
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in proc.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == pgid {
+            continue;
+        }
+        if process_pgid(pid) == Some(pgid) {
+            return true;
+        }
+    }
+    false
 }
 
 /// End a child's process tree and reap the leader.
 ///
 /// On Unix the caller puts the child in its own process group, so one signal
-/// reaches every descendant it started. `/bin/kill` and `/usr/bin/kill` are
-/// tried because this crate forbids `unsafe` and std has no signal API; a
-/// platform with neither still loses the leader.
+/// reaches every descendant it started. The signal is the `killpg`
+/// syscall, and it fires only when the group is still provably ours
+/// ([`process_group_still_ours`], RPC-43): a bare `-<pid>` through an
+/// external `/bin/kill` would take down an unrelated group if the
+/// leader had exited and its pid had been reused as a new
+/// process-group leader. The syscall lives in the
+/// `active-rpc-process-tree` helper crate, since this crate forbids
+/// `unsafe`; no helper executable is ever launched.
 ///
 /// On Windows the child runs in a job object (XPL-RPC-04), so terminating
 /// the job ends the leader and every descendant it started, atomically. The
@@ -4272,21 +4429,17 @@ fn kill_process_tree(child: &mut Child, pipes: &[u64], job: Option<&Job>) {
     }
     #[cfg(unix)]
     {
-        // The negative pid is the process group the callers create. The leader
-        // may have exited already; the group stays allocated while any member
-        // is alive, which is exactly the case this has to handle.
-        let group = format!("-{}", child.id());
-        for candidate in ["/bin/kill", "/usr/bin/kill"] {
-            let killed = Command::new(candidate)
-                .args(["-KILL", "--", group.as_str()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
-            if killed {
-                break;
-            }
+        // The group is signalled only when it is still provably ours
+        // (RPC-43): a leader that exited long ago may have had its pid
+        // reused as a new process-group leader, and a bare `-<pid>`
+        // signal would take that unrelated group down with it. A live
+        // leader cannot have been reused; a dead leader's group is
+        // proven by a member still carrying the pgid in /proc on Linux.
+        // The signal itself is the `killpg` syscall, not an external
+        // `/bin/kill` — no spawned binary stands between the check and
+        // the signal.
+        if process_group_still_ours(child) {
+            let _ = kill_process_group(child.id());
         }
         // A descendant that called `setsid` left the group, so the signal
         // above never reaches it -- but it still holds the pipes, and on
@@ -4305,7 +4458,22 @@ fn kill_process_tree(child: &mut Child, pipes: &[u64], job: Option<&Job>) {
 // Local process
 // ---------------------------------------------------------------------------
 
-/// Resolve and pin a program path for an adapter.
+/// BLAKE3 digest of a program file's contents, streamed so the size of
+/// the binary does not bound the memory (RPC-43).
+///
+/// The digest is the program's identity, not its path: `pin_program`
+/// records it at pin time, and every spawn re-reads the file and
+/// compares. A file replaced in place — same path, same inode, same
+/// mode — still changes its bytes, so only a content check sees it.
+fn program_hash(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Resolve and pin a program path for an adapter, and record its content
+/// hash (RPC-43).
 ///
 /// A bare or relative name would be resolved from the parent's `PATH` or its
 /// working directory, which is ambient authority: anything that can write an
@@ -4313,7 +4481,16 @@ fn kill_process_tree(child: &mut Child, pipes: &[u64], job: Option<&Job>) {
 /// is pinned so a symlink swapped in before the first spawn cannot redirect the
 /// exec, so the program must resolve now: a path that does not exist is
 /// refused rather than carried to a later spawn (round 17, F-3).
-fn pin_program(program: &str, refusal: &'static str) -> Result<PathBuf> {
+///
+/// The path alone is not the pin: a file replaced in place after pinning —
+/// same path, same inode, same mode — runs at the next spawn unless its
+/// contents are checked too (RPC-43). The returned hash is the BLAKE3
+/// digest of the canonical file's bytes at pin time; every spawn
+/// re-hashes and refuses on mismatch, never re-pins — a re-pin would
+/// bless whatever replaced the program. The residual window is the
+/// re-hash-to-exec gap (one file read to the exec); it cannot close
+/// without executing an open file descriptor, which std does not offer.
+fn pin_program(program: &str, refusal: &'static str) -> Result<(PathBuf, [u8; 32])> {
     // A NUL never reaches an exec, and `canonicalize` would fail into a raw
     // path and a spawn-time provider fault (round 9, F-7).
     if program.contains('\0') {
@@ -4322,8 +4499,15 @@ fn pin_program(program: &str, refusal: &'static str) -> Result<PathBuf> {
     if !Path::new(program).is_absolute() {
         return Err(Error::InvalidArgument(refusal));
     }
-    std::fs::canonicalize(program)
-        .map_err(|_| Error::InvalidArgument("the program path does not resolve"))
+    let canonical = std::fs::canonicalize(program)
+        .map_err(|_| Error::InvalidArgument("the program path does not resolve"))?;
+    // Readable now, or refused now: a program that canonicalises but
+    // cannot be read cannot be hashed, and an unhashed program cannot
+    // be pinned (RPC-43). A directory canonicalises and fails here —
+    // it used to pass construction and fail at spawn.
+    let hash = program_hash(&canonical)
+        .map_err(|_| Error::InvalidArgument("the program cannot be read"))?;
+    Ok((canonical, hash))
 }
 
 /// Whether an encoded path carries an interior NUL.
@@ -4396,6 +4580,12 @@ pub struct LocalProcess {
     pub calls: u64,
     /// Canonical program path pinned at construction.
     resolved: PathBuf,
+    /// BLAKE3 digest of the canonical program's bytes at construction
+    /// (RPC-43). `invoke` re-hashes before every spawn and refuses on
+    /// mismatch: the pin is the content, not just the path. Not shown
+    /// by `Debug`, like `resolved`: a digest is configuration, and a
+    /// log line has no use for 32 bytes of it.
+    program_hash: [u8; 32],
 }
 
 impl std::fmt::Debug for LocalProcess {
@@ -4440,7 +4630,10 @@ impl LocalProcess {
     /// The program must be an absolute path: a bare name is resolved from the
     /// parent's `PATH`, so anything that can write an earlier `PATH` entry
     /// would choose the binary the capability runs. The canonical path is
-    /// pinned here, and the working directory is pinned to this process's
+    /// pinned here, together with a BLAKE3 digest of the program's bytes
+    /// (RPC-43): `invoke` re-hashes before every spawn and refuses when
+    /// the file changed, so a binary replaced in place after construction
+    /// never runs. The working directory is pinned to this process's
     /// current directory (see [`LocalProcess::with_current_dir`]).
     ///
     /// A bare `"*"` rule in `allow_args` is inert unless the tool is built
@@ -4450,7 +4643,8 @@ impl LocalProcess {
     /// notices the change at startup instead of at the first refused call.
     pub fn new(program: impl Into<String>, allow_args: &[&str]) -> Result<Self> {
         let program = program.into();
-        let resolved = pin_program(&program, "a local process program must be an absolute path")?;
+        let (resolved, pinned_hash) =
+            pin_program(&program, "a local process program must be an absolute path")?;
         let workdir = std::env::current_dir().map_err(|_| Error::Provider {
             code: "process/cwd".to_string(),
         })?;
@@ -4479,6 +4673,7 @@ impl LocalProcess {
             timeout_ms: 10_000,
             calls: 0,
             resolved,
+            program_hash: pinned_hash,
         })
     }
 
@@ -4734,6 +4929,28 @@ impl Provider for LocalProcess {
             return Err(Error::InvalidArgument(
                 "a process working directory contains a NUL byte",
             ));
+        }
+        // RPC-43: the pin is the content, not just the path. The
+        // canonical file is re-hashed before every spawn and compared
+        // with the digest recorded at construction; a mismatch refuses
+        // the call before anything executes, and is never re-pinned —
+        // re-pinning would bless whatever replaced the program. An
+        // unreadable file refuses the same way: a program that vanished
+        // after construction must not reach the spawn as a raw OS error.
+        // The check sits before `calls` is counted, so a refused call
+        // is not an admitted one (round 31, F7).
+        match program_hash(&self.resolved) {
+            Ok(hash) if hash == self.program_hash => {}
+            Ok(_) => {
+                return Err(Error::Provider {
+                    code: "process/program-changed".to_string(),
+                });
+            }
+            Err(_) => {
+                return Err(Error::Provider {
+                    code: "process/program-unreadable".to_string(),
+                });
+            }
         }
         let mut command = Command::new(&self.resolved);
         command
@@ -5604,5 +5821,220 @@ mod http_tls_tests {
     fn https_bases_are_refused_without_the_tls_feature() {
         assert!(HttpTool::try_new("https://127.0.0.1:8443", &[("GET", "/health")]).is_err());
         assert!(HttpTool::try_new("http://127.0.0.1:80", &[("GET", "/health")]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod rpc43_tests {
+    use super::{pin_program, program_hash};
+
+    /// A scratch directory that removes itself when the test ends, even
+    /// on a mid-test panic: the hash fixtures live here, and a failed
+    /// test must not leave them behind.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("active-rpc-rpc43-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The digest is content, not path or time: the same bytes hash
+    /// the same under a rewrite, different bytes hash differently, and
+    /// a missing file has no digest. The pin test in
+    /// `tests/tool_rpc43_tests.rs` drives the behaviour; this pins the
+    /// helper it stands on.
+    #[test]
+    fn program_hash_is_content_not_path_or_time() {
+        let directory = ScratchDir::new("hash");
+        let file = directory.0.join("program");
+        std::fs::write(&file, b"PIN-VERSION-1").expect("write version 1");
+        let first = program_hash(&file).expect("hash version 1");
+        std::fs::write(&file, b"PIN-VERSION-1").expect("rewrite the same bytes");
+        assert_eq!(
+            program_hash(&file).expect("hash the rewrite"),
+            first,
+            "a byte-identical rewrite is the same program"
+        );
+        std::fs::write(&file, b"PIN-VERSION-2").expect("write version 2");
+        assert_ne!(
+            program_hash(&file).expect("hash version 2"),
+            first,
+            "different bytes are a different program"
+        );
+    }
+
+    /// A missing program has no digest, so `pin_program` cannot pin it.
+    #[test]
+    fn a_missing_program_has_no_hash() {
+        let missing =
+            std::env::temp_dir().join(format!("active-rpc-rpc43-nope-{}", std::process::id()));
+        assert!(
+            program_hash(&missing).is_err(),
+            "a missing program has no digest"
+        );
+    }
+
+    /// `pin_program` records the digest of the bytes it pins: pinning
+    /// twice across a rewrite records two different digests, and the
+    /// recorded digest matches a fresh hash of the same bytes.
+    #[test]
+    fn pin_program_records_the_content_hash() {
+        let directory = ScratchDir::new("pin");
+        let file = directory.0.join("program");
+        std::fs::write(&file, b"PIN-VERSION-1").expect("write version 1");
+        let (path, first) = pin_program(
+            file.to_str().expect("a UTF-8 scratch path"),
+            "an absolute program",
+        )
+        .expect("pin version 1");
+        assert_eq!(
+            program_hash(&path).expect("hash the pinned path"),
+            first,
+            "the recorded digest is the file's digest"
+        );
+        std::fs::write(&file, b"PIN-VERSION-2").expect("write version 2");
+        let (_, second) = pin_program(
+            file.to_str().expect("a UTF-8 scratch path"),
+            "an absolute program",
+        )
+        .expect("pin version 2");
+        assert_ne!(second, first, "a rewrite pins a new digest");
+    }
+
+    /// Linux-only: the process-group ownership guard
+    /// (`process_group_still_ours` and its `/proc` helpers).
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::super::{
+            kill_process_group, process_group_has_member, process_group_still_ours, process_pgid,
+        };
+
+        /// Spawn a child in its own process group, so its pid is the
+        /// pgid the guard reasons about.
+        fn grouped(program: &str, args: &[&str]) -> std::process::Child {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new(program)
+                .args(args)
+                .process_group(0)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn a grouped child")
+        }
+
+        /// Poll `condition` until it holds or the deadline passes.
+        fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+            let started = std::time::Instant::now();
+            while !condition() {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "{what} did not happen within 5 s"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        /// A live leader owns its group: `try_wait` says `None`, so the
+        /// pid cannot have been reused and the signal is safe.
+        #[test]
+        fn a_live_leader_owns_its_group() {
+            let mut child = grouped("/bin/sleep", &["30"]);
+            let ours = process_group_still_ours(&mut child);
+            let _ = kill_process_group(child.id());
+            let _ = child.wait();
+            assert!(ours, "a live leader's group is ours");
+        }
+
+        /// The dead-leader path the guard exists to protect: the leader
+        /// exits at once, a descendant sleeps on in the group, and the
+        /// group is still ours — the signal must fire. Without the
+        /// guard's member scan this case would read as "group gone".
+        #[test]
+        fn a_dead_leader_with_a_living_descendant_still_owns_its_group() {
+            let mut child = grouped("/bin/sh", &["-c", "sleep 30 & exit 0"]);
+            wait_until(
+                || matches!(child.try_wait(), Ok(Some(_))),
+                "the leader exits at once",
+            );
+            let ours = process_group_still_ours(&mut child);
+            let pgid = child.id();
+            let _ = kill_process_group(pgid);
+            let _ = child.wait();
+            wait_until(
+                || !process_group_has_member(pgid),
+                "the group kill ends the descendant",
+            );
+            assert!(ours, "a dead leader's living group is still ours");
+        }
+
+        /// The drained case the guard exists to refuse: the leader is
+        /// dead and no member carries the pgid, so there is nothing to
+        /// kill — signalling anyway would be the reuse race.
+        #[test]
+        fn a_dead_leader_with_a_drained_group_owns_nothing() {
+            let mut child = grouped("/bin/sh", &["-c", "exit 0"]);
+            wait_until(
+                || matches!(child.try_wait(), Ok(Some(_))),
+                "the leader exits at once",
+            );
+            let ours = process_group_still_ours(&mut child);
+            let _ = child.wait();
+            assert!(!ours, "a drained group must not be signalled");
+        }
+
+        /// `/proc/<pid>/stat` names a group leader's own pgid — the
+        /// branch the guard uses to recognise a reused pid. This calls
+        /// the Linux helper directly on a live leader, where it reads
+        /// "reused": the wrapper never calls it in that state
+        /// (`try_wait` short-circuits a live leader), and the test pins
+        /// that the helper alone cannot tell "our live leader" from "a
+        /// reused pid that is a group leader" — only the wrapper's
+        /// ordering makes the distinction.
+        #[test]
+        fn process_pgid_names_a_group_leader() {
+            let mut child = grouped("/bin/sleep", &["30"]);
+            let pgid = process_pgid(child.id());
+            let _ = kill_process_group(child.id());
+            let _ = child.wait();
+            assert_eq!(pgid, Some(child.id()), "a group leader names its own pgid");
+        }
+
+        /// Membership tracks the group's life: a sleeping descendant
+        /// reads present, and once the group kill lands it reads absent.
+        /// The member the scan finds is the descendant, not the leader:
+        /// the leader's own pid is skipped by design (see
+        /// `process_group_still_ours_linux` — a reused leader's own pgid
+        /// must never read as membership), so a leader-only group reads
+        /// empty to this helper, and the wrapper never calls it in that
+        /// state (`try_wait` short-circuits a live leader).
+        #[test]
+        fn process_group_has_member_tracks_membership() {
+            let mut child = grouped("/bin/sh", &["-c", "sleep 30 & wait"]);
+            let pgid = child.id();
+            wait_until(
+                || process_group_has_member(pgid),
+                "a sleeping descendant joins the group",
+            );
+            assert!(
+                process_group_has_member(pgid),
+                "a sleeping descendant is a member"
+            );
+            let _ = kill_process_group(pgid);
+            let _ = child.wait();
+            wait_until(
+                || !process_group_has_member(pgid),
+                "the group empties after the kill",
+            );
+        }
     }
 }

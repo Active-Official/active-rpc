@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.88"
 authors = ["Active Language Team"]
 license = "MIT OR Apache-2.0"
-description = "One OS primitive for Active RPC: a Windows job object holding a tool child and every descendant it starts, so a timeout kill ends the whole tree (XPL-RPC-04)"
+description = "One OS primitive for Active RPC: a Windows job object holding a tool child and every descendant it starts, so a timeout kill ends the whole tree (XPL-RPC-04), and the Unix process-group signals that kill the same tree there (RPC-43)"
 repository = "https://github.com/Active-Official/active-rpc"
 homepage = "https://github.com/Active-Official/active-rpc"
 publish = false
@@ -13,6 +13,15 @@ publish = false
 [lib]
 name = "active_rpc_process_tree"
 path = "src/lib.rs"
+
+[target.'cfg(unix)'.dependencies]
+# The tree kill on Unix is a direct `killpg`/`kill` syscall (RPC-43):
+# `active-rpc` forbids `unsafe`, so the signals live here behind a safe
+# API instead of a carve-out there — and no external `/bin/kill` binary
+# is spawned on any kill path. Already in the root lockfile (a direct
+# unix dependency of `active-rpc` itself): no new registry crate enters
+# the graph.
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # Already in the root lockfile (transitive via tokio/mio): no new registry

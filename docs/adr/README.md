@@ -39,6 +39,7 @@
 | [0035](0035-bare-star-argument-rule-opt-in.md) | A bare `*` argument rule needs an explicit opt-in |
 | [0036](0036-mint-attaches-the-provider-tool-policy.md) | Mint attaches the provider's tool policy by default |
 | [0037](0037-control-plane-mcp-response-ceiling-and-degraded.md) | Control-plane MCP: plane responses are capped and embedded-plane answers are marked degraded |
+| [0038](0038-process-pin-is-content-and-the-unix-group-kill-is-a-guarded-killpg.md) | Process pinning is content, not just path; the Unix group kill is a guarded `killpg` |
 
 ## Reading order and supersessions
 
