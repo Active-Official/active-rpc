@@ -21,9 +21,12 @@ exclude = [
 ]
 
 [features]
-default = ["quic"]
+default = ["quic", "http-tls"]
 # Real QUIC transport over loopback (quinn + rustls).
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio"]
+# TLS for the HTTP tool provider: `https://` bases with operator-pinned
+# roots, via the same rustls stack the QUIC transport already uses (RPC-38).
+http-tls = ["dep:rustls"]
 # Native HTTP/2 transport carrying raw ARP1 envelopes.
 http2 = ["dep:h2", "dep:http", "dep:bytes", "dep:tokio"]
 # Fuel-metered WebAssembly guest tools under capability control.
@@ -93,6 +96,11 @@ prost = "0.13"
 # The wasm tests assemble their WAT fixtures into binary modules: the sandbox
 # refuses text by default, and a peer only ever sends binary.
 wat = "1"
+# The TLS tests mint a test CA and leaf at runtime, so no test-only private
+# key is committed (RPC-38). `rcgen` is already an optional dependency
+# (behind `quic`); the dev-dependency makes it available to the tests
+# whatever features are enabled.
+rcgen = "0.13"
 
 [[bin]]
 name = "active-rpc-peer"

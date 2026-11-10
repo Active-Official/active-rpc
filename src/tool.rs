@@ -825,6 +825,17 @@ pub const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 /// Largest number of HTTP header fields accepted.
 pub const MAX_HTTP_HEADER_FIELDS: usize = 128;
 
+/// Longest operator-configured extra header name (RPC-38): a name is a
+/// token, and a token past this length is a configuration mistake, not a
+/// header.
+const MAX_HTTP_HEADER_NAME_BYTES: usize = 128;
+
+/// Longest operator-configured extra header value (RPC-38): a bearer token
+/// or API key is far shorter, and the head is charged to the call's byte
+/// grant besides, so a value past this length is a configuration mistake,
+/// not a credential.
+const MAX_HTTP_HEADER_VALUE_BYTES: usize = 8 * 1024;
+
 /// Whether a request method is defined to carry content.
 ///
 /// Only these get a body and a `content-length` header. A request that carries
@@ -881,6 +892,37 @@ fn withhold_after_send(error: Error, mutating: bool) -> Error {
     }
 }
 
+/// A socket `perform` can read, write and arm timeouts on: plain TCP, or a
+/// TLS stream over TCP (RPC-38). The timeout methods are the ones that bound
+/// the exchange — `DeadlineReader::arm` and `write_within` re-arm from the
+/// time the deadline leaves on every chunk — so a peer that drips bytes
+/// cannot stretch the call past the deadline, on either transport.
+trait HttpSocket: std::io::Read + std::io::Write {
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
+}
+
+impl HttpSocket for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        // Method resolution prefers the inherent method over this trait
+        // method, so this is the socket's own setter, not a recursion.
+        self.set_read_timeout(timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.set_write_timeout(timeout)
+    }
+}
+
+#[cfg(feature = "http-tls")]
+impl HttpSocket for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.get_ref().set_read_timeout(timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.get_ref().set_write_timeout(timeout)
+    }
+}
+
 /// A response reader whose every read is bounded by one wall deadline.
 ///
 /// `set_read_timeout` bounds a single `read` syscall, not the call: a server
@@ -889,12 +931,12 @@ fn withhold_after_send(error: Error, mutating: bool) -> Error {
 /// left, and the deadline is re-checked afterwards, so the ceiling is a
 /// ceiling.
 struct DeadlineReader {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<Box<dyn HttpSocket>>,
     deadline: std::time::Instant,
 }
 
 impl DeadlineReader {
-    fn new(stream: TcpStream, deadline: std::time::Instant) -> Self {
+    fn new(stream: Box<dyn HttpSocket>, deadline: std::time::Instant) -> Self {
         Self {
             reader: BufReader::new(stream),
             deadline,
@@ -1004,7 +1046,7 @@ impl DeadlineReader {
 /// iteration with a fresh timeout: a peer that accepts a byte at a time cannot
 /// stretch the phase past the ceiling.
 fn write_within(
-    stream: &mut std::net::TcpStream,
+    stream: &mut dyn HttpSocket,
     bytes: &[u8],
     deadline: std::time::Instant,
 ) -> (usize, Result<()>) {
@@ -1066,6 +1108,26 @@ fn map_http_io(error: std::io::Error, direction: &'static str) -> Error {
     } else {
         Error::Provider {
             code: format!("http/{direction}:{error}"),
+        }
+    }
+}
+
+/// A TLS failure, named for the phase (RPC-38): a handshake that hit its
+/// timeout is the call's ceiling, and any other failure — a certificate
+/// the pins do not cover, a protocol fault — is `http/tls`. The code is
+/// distinct from `http/connect` (the TCP dial) and `http/read` /
+/// `http/write` (the exchange), because the peer's certificate is neither
+/// a dial fault nor a framing fault.
+#[cfg(feature = "http-tls")]
+fn map_tls_io(error: std::io::Error) -> Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        Error::Timeout
+    } else {
+        Error::Provider {
+            code: format!("http/tls:{error}"),
         }
     }
 }
@@ -2297,6 +2359,20 @@ impl<T: McpTransport> Provider for McpSession<T> {
 /// resolved address is refused with `rpc/tool-policy`. An operator that
 /// points the tool at an internal service opts in explicitly with
 /// [`HttpTool::with_allow_non_public`].
+///
+/// The transport is `https://` as well as `http://` (RPC-38): an `https://`
+/// base is wrapped in rustls — the same TLS stack the QUIC transport already
+/// uses — and verified against roots the operator pins with
+/// [`HttpTool::pin_tls_roots`]. There is no implicit trust store: no system
+/// roots, no Mozilla roots, so an `https://` call with no pinned root is
+/// refused before any socket is opened. Operator-configured headers (an
+/// `Authorization` bearer token, an API key) are set with
+/// [`HttpTool::allow_header`]: a call argument can never add one, so a
+/// credential reaches the wire only when the operator put it here at
+/// construction — never in the URL or the body. Headers travel over TLS to
+/// any address, and over plain HTTP only to loopback: a credential that
+/// would cross the wire in cleartext to a non-loopback address refuses the
+/// call with `rpc/tool-policy` before any socket is opened.
 pub struct HttpTool {
     /// Base URL, e.g. `http://127.0.0.1:8080`.
     /// The endpoint this tool can reach. Private: a caller that assigned a
@@ -2331,6 +2407,22 @@ pub struct HttpTool {
     /// saying "this endpoint is internal", not "this one range is fine"
     /// (RPC-32).
     allow_non_public: bool,
+    /// Operator-configured extra request headers, in insertion order
+    /// (RPC-38).
+    ///
+    /// These are the tool's only extra headers: a call argument can never
+    /// add one, so a credential reaches the wire only when the operator put
+    /// it here at construction. Values are secrets — `Debug` prints only
+    /// their lengths — and the transport-managed names (`host`,
+    /// `content-length`, `connection`, `transfer-encoding`) cannot be set
+    /// here at all.
+    headers: Vec<(String, String)>,
+    /// DER trust anchors pinned by the operator for `https://` bases
+    /// (RPC-38). Empty means an `https://` call is refused: the adapter
+    /// trusts no root it was not explicitly given, so there is no implicit
+    /// system or Mozilla root set to fall back on.
+    #[cfg(feature = "http-tls")]
+    tls_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     /// Calls served.
     pub calls: u64,
     /// Whether the last exchange put bytes on the wire. A refusal after that
@@ -2375,6 +2467,16 @@ fn redacted_base(base: &str) -> String {
     }
 }
 
+/// A header list with values replaced by their lengths: a header value is
+/// the natural home of a credential (RPC-38), so it is redacted exactly
+/// like an allowlisted path — the name is safe to print, the value never is.
+fn redacted_headers(headers: &[(String, String)]) -> Vec<String> {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}: <{} bytes>", value.len()))
+        .collect()
+}
+
 impl std::fmt::Debug for HttpTool {
     /// Names and shapes, never an allowlisted path: an exact entry is the
     /// natural home of a fixed credential (a signed URL, a hook token), the
@@ -2385,16 +2487,21 @@ impl std::fmt::Debug for HttpTool {
             .iter()
             .map(|(method, path)| format!("{method} <{} bytes>", path.len()))
             .collect();
-        formatter
-            .debug_struct("HttpTool")
+        let mut debug = formatter.debug_struct("HttpTool");
+        debug
             .field("base", &redacted_base(&self.base))
             .field("allow", &allow)
             .field("max_body", &self.max_body)
             .field("max_request", &self.max_request)
             .field("allow_loopback", &self.allow_loopback)
             .field("allow_non_public", &self.allow_non_public)
-            .field("calls", &self.calls)
-            .finish()
+            // Header values are redacted to lengths; a pinned root is a
+            // public certificate, but its PEM is kilobytes of log noise, so
+            // only the count is printed (RPC-38).
+            .field("headers", &redacted_headers(&self.headers));
+        #[cfg(feature = "http-tls")]
+        debug.field("tls_roots", &self.tls_roots.len());
+        debug.field("calls", &self.calls).finish()
     }
 }
 
@@ -2454,6 +2561,86 @@ impl HttpTool {
         self
     }
 
+    /// Allow one extra request header, with the same gate `try_new` applies
+    /// to the allowlist (RPC-38).
+    ///
+    /// This is the tool's only way to authenticate to a protected endpoint:
+    /// a call argument can never add a header, so a credential reaches the
+    /// wire only when the operator put it here at construction — never in
+    /// the URL or the body, which is the hole this finding closes. A second
+    /// header with the same name replaces the first: two `Authorization`
+    /// values would leave the peer to pick one, and the operator to guess
+    /// which one it picked. The header is sent on every call of this tool,
+    /// over TLS to any address and over plain HTTP only to loopback (see
+    /// `perform`: a credential that would cross the wire in cleartext to a
+    /// non-loopback address refuses the call instead).
+    pub fn allow_header(&mut self, name: &str, value: &str) -> Result<()> {
+        if name.is_empty()
+            || name.len() > MAX_HTTP_HEADER_NAME_BYTES
+            || !name.bytes().all(is_http_token)
+        {
+            return Err(Error::ToolPolicy(
+                "an extra header name must be a non-empty HTTP token",
+            ));
+        }
+        if value.len() > MAX_HTTP_HEADER_VALUE_BYTES
+            || !value
+                .bytes()
+                .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte))
+        {
+            return Err(Error::ToolPolicy(
+                "an extra header value must be printable ASCII without a line break",
+            ));
+        }
+        // The adapter owns the framing: a caller-supplied `host` would
+        // desync the request from the base, a `content-length` from the
+        // body, a `connection` from the close discipline, and a
+        // `transfer-encoding` from the refusal of chunked bodies.
+        if ["host", "content-length", "connection", "transfer-encoding"]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        {
+            return Err(Error::ToolPolicy(
+                "an extra header cannot override a header the adapter owns",
+            ));
+        }
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_string(), value.to_string()));
+        Ok(())
+    }
+
+    /// Pin one PEM bundle of trust anchors for `https://` bases (RPC-38).
+    ///
+    /// Every call appends to the pin set; a bundle that holds no
+    /// certificate, or one that fails to parse, is refused whole. The pins
+    /// are the only trust the adapter has — no system store, no Mozilla
+    /// roots — so an `https://` call with no pinned root is refused before
+    /// any socket is opened, and a server whose chain the pins do not cover
+    /// fails the handshake with `http/tls`. Pin the CA that issued the
+    /// endpoint's certificate. A self-signed leaf can also be pinned as
+    /// its own root — the verifier accepts it (measured: a scratch probe
+    /// connects fine with a self-signed leaf as the pin) — but a CA that
+    /// issues the leaf is the production shape, and the tests pin a CA
+    /// for that reason.
+    #[cfg(feature = "http-tls")]
+    pub fn pin_tls_roots(&mut self, pem: &str) -> Result<()> {
+        use rustls::pki_types::pem::PemObject;
+        let roots: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    Error::ToolPolicy("the pinned TLS roots are not valid PEM certificates")
+                })?;
+        if roots.is_empty() {
+            return Err(Error::ToolPolicy(
+                "the pinned TLS roots hold no certificate",
+            ));
+        }
+        self.tls_roots.extend(roots);
+        Ok(())
+    }
+
     /// Allow one `(method, path)` pair, with the same gate `try_new` applies.
     ///
     /// The allowlist is the tool's whole authority, so a later addition cannot
@@ -2491,6 +2678,21 @@ impl HttpTool {
                 .split('/')
                 .any(|segment| segment == ".." || segment == ".")
             || path.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+    }
+
+    /// Whether `scheme` is one this build can speak: `http` always, and
+    /// `https` only when the `http-tls` feature compiled the TLS stack in
+    /// (RPC-38). A build without the feature refuses an `https://` base at
+    /// construction, exactly as it did before TLS existed.
+    fn scheme_supported(scheme: &str) -> bool {
+        if scheme.eq_ignore_ascii_case("http") {
+            return true;
+        }
+        #[cfg(feature = "http-tls")]
+        if scheme.eq_ignore_ascii_case("https") {
+            return true;
+        }
+        false
     }
 
     /// Whether `name` is a host `ToSocketAddrs` can parse: a DNS name, an IPv4
@@ -2564,12 +2766,13 @@ impl HttpTool {
         // byte is refused for the same reason it is at dispatch.
         let printable = base.bytes().all(|byte| (0x21..=0x7e).contains(&byte));
         let (authority, base_invalid) = match base.split_once("://").filter(|_| printable) {
-            // `perform` speaks plain HTTP and resolves the authority with
+            // `perform` speaks plain HTTP — and, with the `http-tls` feature,
+            // HTTPS via rustls (RPC-38) — and resolves the authority with
             // `ToSocketAddrs`, which needs `host:port`. A scheme it cannot
             // speak, userinfo, a missing port or a port outside `u16` used to be
             // admitted here and then surface at dispatch as the retryable
             // `http/resolve` class (round 54, M-1).
-            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => {
+            Some((scheme, rest)) if Self::scheme_supported(scheme) => {
                 let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
                 let has_tail = end != rest.len();
                 let host = &rest[..end];
@@ -2590,9 +2793,10 @@ impl HttpTool {
                 // An unusable base is never kept: a path tail would retarget a
                 // request if the dispatch refusal were ever bypassed, and a
                 // control character would reach `Debug` (round 52, F-1/F-5).
-                // The scheme is normalised to the form `perform` strips.
+                // The scheme is normalised to the form `perform` strips, so
+                // `HTTPS://` and `https://` are the same base (RPC-38).
                 let authority = if usable {
-                    format!("http://{host}")
+                    format!("{}://{host}", scheme.to_ascii_lowercase())
                 } else {
                     String::new()
                 };
@@ -2614,6 +2818,9 @@ impl HttpTool {
             max_request: 1 << 20,
             allow_loopback: true,
             allow_non_public: false,
+            headers: Vec::new(),
+            #[cfg(feature = "http-tls")]
+            tls_roots: Vec::new(),
             calls: 0,
             after_send: false,
             base_invalid,
@@ -2621,7 +2828,8 @@ impl HttpTool {
     }
 
     /// [`HttpTool::new`] that refuses an ambiguous allowlist entry or a base
-    /// that is not a plain scheme and authority.
+    /// that is not a scheme and an authority this build can speak
+    /// (`https://` needs the `http-tls` feature, RPC-38).
     pub fn try_new(base: impl Into<String>, allow: &[(&str, &str)]) -> Result<Self> {
         if allow.iter().any(|(_, path)| Self::ambiguous_path(path)) {
             return Err(Error::ToolPolicy(
@@ -2651,6 +2859,23 @@ impl HttpTool {
         }
     }
 
+    /// Whether `ip` is loopback, spelling included: `::1` is decided on the
+    /// address as given, because `to_ipv4` maps it to `0.0.0.1`, which is
+    /// neither loopback nor public (RPC-32). The same normalisation the dial
+    /// policy uses decides the plaintext-header rule (RPC-38), so a mapped
+    /// loopback literal is loopback for both.
+    fn ip_is_loopback(ip: std::net::IpAddr) -> bool {
+        if ip.is_loopback() {
+            return true;
+        }
+        match ip {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4()
+                .is_some_and(|v4| std::net::IpAddr::V4(v4).is_loopback()),
+            std::net::IpAddr::V4(_) => false,
+        }
+    }
+
     /// Whether `ip` may be dialled under this tool's dial policy (RPC-32).
     ///
     /// Loopback is governed by `allow_loopback` alone; a globally routable
@@ -2666,7 +2891,7 @@ impl HttpTool {
         // nor public — so loopback is decided on the address as given,
         // before the mapping is consulted. (The unit test caught this:
         // `::1` was refused until this check moved first.)
-        if ip.is_loopback() {
+        if Self::ip_is_loopback(ip) {
             return allow_loopback;
         }
         // An IPv4-mapped (`::ffff:10.0.0.1`) or IPv4-compatible
@@ -2682,13 +2907,35 @@ impl HttpTool {
             },
             v4 => v4,
         };
-        if ip.is_loopback() {
-            return allow_loopback;
-        }
         if Self::ip_is_public(ip) {
             return true;
         }
         allow_non_public
+    }
+
+    /// Whether operator-configured headers may be sent over plain HTTP to
+    /// these resolved addresses (RPC-38): only when every address is
+    /// loopback. Loopback bytes never leave the host, so a credential there
+    /// is not a cleartext leak; any other address would carry it across the
+    /// wire unencrypted, and the call is refused instead. TLS carries
+    /// headers to any address, so this gate only ever runs for `http://`.
+    fn plaintext_headers_allowed(addresses: &[std::net::SocketAddr]) -> bool {
+        addresses
+            .iter()
+            .all(|address| Self::ip_is_loopback(address.ip()))
+    }
+
+    /// The host part of an authority `host:port`, without brackets: the
+    /// server name TLS verifies against (RPC-38). `new` already validated
+    /// the shape, so the split cannot fail — a base without a port is
+    /// refused at construction, and the bracket trim only ever sees a
+    /// bracketed IPv6 literal. TLS-only, like the wrap that calls it.
+    #[cfg(feature = "http-tls")]
+    fn base_host(authority: &str) -> &str {
+        let host = authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host);
+        host.trim_start_matches('[').trim_end_matches(']')
     }
 
     /// Whether `ip` is a globally routable unicast address (RPC-32).
@@ -2814,6 +3061,86 @@ impl HttpTool {
         }
     }
 
+    /// The TLS server name for `host`: an IP literal verifies against the
+    /// certificate's IP SANs, a DNS name against its DNS SANs (RPC-38).
+    /// `host` is the authority's host without port or brackets — `new`
+    /// already validated its shape, so a failure here is defence in depth
+    /// for a name rustls will not speak (an empty or malformed one). Note
+    /// rustls accepts underscore labels, which `usable_host` also admits,
+    /// so an underscore host is not a refusal: it reaches the handshake and
+    /// must match a SAN in the pinned certificate like any other name.
+    #[cfg(feature = "http-tls")]
+    fn tls_server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>> {
+        rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| Error::ToolPolicy("the https:// base host is not a valid TLS server name"))
+    }
+
+    /// Wrap a connected socket in TLS for an `https://` base (RPC-38).
+    ///
+    /// The roots are the operator's pins only: `ClientConfig` is built
+    /// per call from `tls_roots`, so a pin added after construction is
+    /// honoured by the next call and no configuration is cached past a
+    /// mutation. TLS 1.2 is the floor — rustls's default versions are TLS
+    /// 1.3 and 1.2 only, so no version below 1.2 is ever negotiated — and
+    /// no ALPN is offered: the adapter speaks HTTP/1.1 over the tunnel.
+    /// There is no revocation checking: the pin is the trust anchor, and a
+    /// revoked certificate from a pinned CA still verifies until the
+    /// operator removes the pin. A certificate failure is
+    /// `http/tls:<rustls error>`, distinct from `http/connect` (the TCP
+    /// dial) and from `http/read` / `http/write` (the exchange): the peer's
+    /// certificate is neither a dial fault nor a framing fault. No
+    /// application byte is written before the handshake completes, so a TLS
+    /// refusal never leaves `after_send` set.
+    #[cfg(feature = "http-tls")]
+    fn tls_wrap(
+        &self,
+        stream: TcpStream,
+        host: &str,
+        deadline: std::time::Instant,
+    ) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+        let mut store = rustls::RootCertStore::empty();
+        for root in &self.tls_roots {
+            store.add(root.clone()).map_err(|error| Error::Provider {
+                code: format!("http/tls:root:{error}"),
+            })?;
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(store)
+            .with_no_client_auth();
+        let server_name = Self::tls_server_name(host)?;
+        let connection = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+            .map_err(|error| Error::Provider {
+                code: format!("http/tls:{error}"),
+            })?;
+        let mut tls = rustls::StreamOwned::new(connection, stream);
+        // `complete_io` does the handshake in one call, blocking on the
+        // socket; each round is bounded by the time the deadline leaves,
+        // and the deadline is re-checked after it, so a peer that never
+        // answers ServerHello is `rpc/timeout`, not a hung dispatch thread
+        // (the same discipline as `write_within` and
+        // `DeadlineReader::arm`). A round that makes no progress while the
+        // handshake is still open means the peer went quiet or closed the
+        // connection: spinning here would burn the whole ceiling at 100%
+        // CPU, so the handshake fails instead.
+        while tls.conn.is_handshaking() {
+            let left = remaining_until(deadline)?;
+            tls.sock
+                .set_read_timeout(Some(left))
+                .map_err(|_| Error::Timeout)?;
+            tls.sock
+                .set_write_timeout(Some(left))
+                .map_err(|_| Error::Timeout)?;
+            let (read, written) = tls.conn.complete_io(&mut tls.sock).map_err(map_tls_io)?;
+            if read == 0 && written == 0 {
+                return Err(Error::Provider {
+                    code: "http/tls: the peer made no progress during the handshake".to_string(),
+                });
+            }
+            remaining_until(deadline)?;
+        }
+        Ok(tls)
+    }
+
     // One exchange needs the method, the path, the body, the wall ceiling and
     // three byte limits; grouping the limits would add an allocation-free struct
     // for a private helper.
@@ -2839,10 +3166,21 @@ impl HttpTool {
                 }
             }
         };
-        let base = self
-            .base
-            .strip_prefix("http://")
-            .ok_or(Error::ToolPolicy("only http:// endpoints are supported"))?;
+        // `new` normalises the scheme to lower case, so the split sees
+        // exactly `http`, or `https` when the `http-tls` feature compiled
+        // the TLS stack in. Anything else is a base `new` never admitted
+        // (`invoke` already refused `base_invalid`), so this is defence in
+        // depth, not a path a well-constructed tool reaches.
+        #[cfg(feature = "http-tls")]
+        let only_supported = "only http:// and https:// endpoints are supported";
+        #[cfg(not(feature = "http-tls"))]
+        let only_supported = "only http:// endpoints are supported";
+        let (tls, base) = match self.base.split_once("://") {
+            Some(("http", rest)) => (false, rest),
+            #[cfg(feature = "http-tls")]
+            Some(("https", rest)) => (true, rest),
+            _ => return Err(Error::ToolPolicy(only_supported)),
+        };
         // The request head is part of what the capability pays for: an
         // unbounded `base` or an allowlisted long path could otherwise write
         // megabytes before any response check (round 26, #2). A GET carries no
@@ -2850,6 +3188,14 @@ impl HttpTool {
         let head = {
             let mut head =
                 format!("{method} {path} HTTP/1.1\r\nhost: {base}\r\nconnection: close\r\n");
+            // Operator-configured headers only (RPC-38): a call argument
+            // can never add one, so the values here are the operator's,
+            // validated at configuration (no line break, no
+            // transport-managed name) and charged to the grant below like
+            // the rest of the head.
+            for (name, value) in &self.headers {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
             if let Some(body) = body {
                 head.push_str(&format!("content-length: {}\r\n", body.len()));
             }
@@ -2919,6 +3265,27 @@ impl HttpTool {
                 "the base URL resolves to an address this tool is not allowed to dial",
             ));
         }
+        // An `https://` call with no pinned root is refused before any
+        // socket is opened (RPC-38): the adapter trusts no root it was not
+        // explicitly given, so a missing pin is a configuration fault, not
+        // a dial to attempt and fail at the handshake.
+        #[cfg(feature = "http-tls")]
+        if tls && self.tls_roots.is_empty() {
+            return Err(Error::ToolPolicy(
+                "an https:// base needs pinned TLS roots: call pin_tls_roots with the CA certificate(s) that issued the endpoint's certificate",
+            ));
+        }
+        // Credentials must not cross the wire in cleartext (RPC-38): a call
+        // that would send operator-configured headers over plain HTTP to a
+        // non-loopback address is refused before any socket is opened.
+        // Loopback is the carve-out — the bytes never leave the host, the
+        // same reason RPC-32 lets loopback dial by default — and TLS
+        // carries headers to any address.
+        if !tls && !self.headers.is_empty() && !Self::plaintext_headers_allowed(&addresses) {
+            return Err(Error::ToolPolicy(
+                "headers configured on this tool require TLS except on loopback",
+            ));
+        }
         let mut connected = None;
         let mut last = None;
         for address in addresses {
@@ -2933,7 +3300,7 @@ impl HttpTool {
                 Err(error) => last = Some(error),
             }
         }
-        let mut stream = match connected {
+        let stream = match connected {
             Some(stream) => stream,
             // A connect that timed out is the ceiling (a blackhole burns the
             // whole grant); anything else is a transport fault
@@ -2954,6 +3321,19 @@ impl HttpTool {
                 });
             }
         };
+        // TLS (RPC-38): the TCP dial is the same for both schemes; for
+        // `https://` the socket is wrapped in rustls and the handshake runs
+        // under the same deadline before any HTTP byte is written. After
+        // this point the exchange is transport-agnostic: `perform` reads
+        // and writes through the boxed socket, plain or TLS alike.
+        #[cfg(feature = "http-tls")]
+        let mut stream: Box<dyn HttpSocket> = if tls {
+            Box::new(self.tls_wrap(stream, Self::base_host(base), deadline)?)
+        } else {
+            Box::new(stream)
+        };
+        #[cfg(not(feature = "http-tls"))]
+        let mut stream: Box<dyn HttpSocket> = Box::new(stream);
         stream
             .set_write_timeout(Some(remaining_until(deadline)?))
             .map_err(|_| Error::Timeout)?;
@@ -2967,13 +3347,13 @@ impl HttpTool {
         // A head written in chunks can fail after its first chunk: any byte on
         // the wire means the peer may act, even though the line is incomplete
         // (round 47, L-4).
-        let (head_written, head_result) = write_within(&mut stream, head.as_bytes(), deadline);
+        let (head_written, head_result) = write_within(&mut *stream, head.as_bytes(), deadline);
         if head_written > 0 {
             self.after_send = true;
         }
         head_result?;
         if let Some(body) = body {
-            let (_, body_result) = write_within(&mut stream, body, deadline);
+            let (_, body_result) = write_within(&mut *stream, body, deadline);
             body_result?;
         }
         stream.flush().map_err(map_http_write)?;
@@ -4852,5 +5232,280 @@ mod http_dial_policy_tests {
             !called.load(std::sync::atomic::Ordering::SeqCst),
             "the resolver must never run past its deadline"
         );
+    }
+}
+
+#[cfg(test)]
+mod http_header_tests {
+    use super::HttpTool;
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    /// A header name must be a non-empty token, and a value printable ASCII
+    /// without a line break: anything else is request splitting, so the
+    /// refusal is at configuration, not at the first call.
+    #[test]
+    fn extra_header_names_and_values_are_validated() {
+        let mut tool = HttpTool::new("http://127.0.0.1:80", &[("GET", "/health")]);
+        assert!(
+            tool.allow_header("Authorization", "Bearer probe-token")
+                .is_ok(),
+            "a bearer token is a valid header"
+        );
+        assert!(
+            tool.allow_header("", "x").is_err(),
+            "an empty name is refused"
+        );
+        assert!(
+            tool.allow_header("Bad Name", "x").is_err(),
+            "a space is not a token"
+        );
+        assert!(
+            tool.allow_header("X-Ok", "a\rb").is_err(),
+            "a CR splits the head"
+        );
+        assert!(
+            tool.allow_header("X-Ok", "a\nb").is_err(),
+            "an LF splits the head"
+        );
+        assert!(
+            tool.allow_header("X-Ok", "a\u{7f}b").is_err(),
+            "DEL is not printable"
+        );
+        let long = "x".repeat(8 * 1024 + 1);
+        assert!(
+            tool.allow_header("X-Ok", &long).is_err(),
+            "a value past 8 KiB is refused"
+        );
+        let long_name = "x".repeat(129);
+        assert!(
+            tool.allow_header(&long_name, "x").is_err(),
+            "a name past 128 bytes is refused"
+        );
+    }
+
+    /// The adapter owns the framing: a caller-supplied `host` would desync
+    /// the request from the base, a `content-length` from the body, a
+    /// `connection` from the close discipline, and a `transfer-encoding`
+    /// from the refusal of chunked bodies. The match is case-insensitive,
+    /// because the peer's match is.
+    #[test]
+    fn transport_managed_headers_cannot_be_set() {
+        let mut tool = HttpTool::new("http://127.0.0.1:80", &[("GET", "/health")]);
+        for name in [
+            "host",
+            "HOST",
+            "Content-Length",
+            "connection",
+            "Transfer-Encoding",
+        ] {
+            assert!(
+                tool.allow_header(name, "x").is_err(),
+                "{name} is transport-managed"
+            );
+        }
+        // The refusal is per name, not per tool: a good header still works
+        // after five refusals.
+        assert!(tool.allow_header("X-Api-Key", "k").is_ok());
+    }
+
+    /// One value per name: a second `Authorization` replaces the first, so
+    /// the peer never has two credentials to pick between. The stored name
+    /// keeps the second call's spelling — header names are
+    /// case-insensitive, so the spelling is the caller's, not the adapter's.
+    #[test]
+    fn a_second_header_with_the_same_name_replaces_the_first() {
+        let mut tool = HttpTool::new("http://127.0.0.1:80", &[("GET", "/health")]);
+        tool.allow_header("Authorization", "Bearer first")
+            .expect("first");
+        tool.allow_header("authorization", "Bearer second")
+            .expect("second");
+        let debug = format!("{tool:?}");
+        assert!(debug.contains("authorization: <13 bytes>"), "{debug}");
+        assert!(
+            !debug.contains("Authorization:"),
+            "one entry only, under the second spelling: {debug}"
+        );
+        assert!(
+            !debug.contains("first"),
+            "the replaced value must not linger: {debug}"
+        );
+        assert!(!debug.contains("second"), "values are redacted: {debug}");
+    }
+
+    /// `Debug` names the header and its length, never the value: a bearer
+    /// token in a log line is the leak this finding closes.
+    #[test]
+    fn debug_redacts_header_values() {
+        let mut tool = HttpTool::new("http://127.0.0.1:80", &[("GET", "/health")]);
+        tool.allow_header("Authorization", "Bearer probe-token")
+            .expect("header");
+        let debug = format!("{tool:?}");
+        assert!(debug.contains("Authorization: <18 bytes>"), "{debug}");
+        assert!(
+            !debug.contains("probe-token"),
+            "the value must never print: {debug}"
+        );
+    }
+
+    /// Loopback is decided through the IPv4 mapping: `::1` on the address
+    /// as given (because `to_ipv4` maps it to `0.0.0.1`), and a mapped or
+    /// compatible literal by the IPv4 it spells.
+    #[test]
+    fn loopback_is_decided_through_the_ipv4_mapping() {
+        let cases: &[(&str, bool)] = &[
+            ("127.0.0.1", true),
+            ("127.255.255.255", true),
+            ("::1", true),
+            ("::ffff:127.0.0.1", true),
+            ("::127.0.0.1", true),
+            ("10.0.0.1", false),
+            ("8.8.8.8", false),
+            ("::ffff:10.0.0.1", false),
+            ("fe80::1", false),
+            ("::", false),
+        ];
+        for (text, loopback) in cases {
+            let ip = IpAddr::from_str(text).unwrap_or_else(|_| panic!("{text} parses"));
+            assert_eq!(HttpTool::ip_is_loopback(ip), *loopback, "{text}");
+        }
+    }
+
+    /// The plaintext rule needs EVERY resolved address to be loopback: one
+    /// non-loopback record in the answer refuses the headers, and an empty
+    /// answer (which never dials) does not trip the gate.
+    #[test]
+    fn plaintext_headers_need_every_address_to_be_loopback() {
+        let addrs = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|text| text.parse().expect("addr"))
+                .collect::<Vec<std::net::SocketAddr>>()
+        };
+        assert!(HttpTool::plaintext_headers_allowed(&addrs(&[
+            "127.0.0.1:80"
+        ])));
+        assert!(HttpTool::plaintext_headers_allowed(&addrs(&["[::1]:80"])));
+        assert!(HttpTool::plaintext_headers_allowed(&addrs(&[
+            "[::ffff:127.0.0.1]:80"
+        ])));
+        assert!(
+            HttpTool::plaintext_headers_allowed(&[]),
+            "an empty answer never dials"
+        );
+        assert!(!HttpTool::plaintext_headers_allowed(&addrs(&[
+            "10.0.0.1:80"
+        ])));
+        assert!(!HttpTool::plaintext_headers_allowed(&addrs(&[
+            "8.8.8.8:80"
+        ])));
+        assert!(!HttpTool::plaintext_headers_allowed(&addrs(&[
+            "127.0.0.1:80",
+            "10.0.0.1:80"
+        ])));
+    }
+}
+
+/// TLS unit tests: scheme gate, server-name parsing and root pinning. The
+/// end-to-end legs (handshake, verification, auth over TLS) live in
+/// `tests/http_tls_tests.rs`, where a real rustls server stub runs.
+#[cfg(test)]
+#[cfg(feature = "http-tls")]
+mod http_tls_tests {
+    use super::HttpTool;
+    use rustls::pki_types::ServerName;
+
+    /// An `https://` base constructs when the feature is on — the finding's
+    /// leg (a) flips here: `try_new` used to refuse it with
+    /// `rpc/tool-policy`.
+    #[test]
+    fn https_bases_are_admitted_when_tls_is_compiled_in() {
+        assert!(HttpTool::try_new("https://127.0.0.1:8443", &[("GET", "/health")]).is_ok());
+        assert!(HttpTool::try_new("https://localhost:8443", &[("GET", "/health")]).is_ok());
+        assert!(HttpTool::try_new("http://127.0.0.1:80", &[("GET", "/health")]).is_ok());
+        // Userinfo is still refused for https, exactly as for http: a
+        // credential in the URL is the hole this finding closes.
+        assert!(
+            HttpTool::try_new("https://user:pass@127.0.0.1:8443", &[("GET", "/health")]).is_err()
+        );
+        // A scheme this build cannot speak is still refused.
+        assert!(HttpTool::try_new("ftp://127.0.0.1:21", &[("GET", "/health")]).is_err());
+    }
+
+    /// The server name is a DNS name for a DNS host and an IP address for
+    /// a literal: the verifier checks the matching SAN class, so the two
+    /// must not be confused. The error arm is defence in depth for a name
+    /// `new` never admits (empty, malformed): rustls accepts underscore
+    /// labels, which `usable_host` also admits, so `bad_host` parses as a
+    /// DNS name and reaches the handshake, where it must match a SAN in
+    /// the pinned certificate like any other name — the test caught this
+    /// assumption before it shipped.
+    #[test]
+    fn tls_server_names_come_from_the_host() {
+        assert!(matches!(
+            HttpTool::tls_server_name("localhost").expect("localhost"),
+            ServerName::DnsName(_)
+        ));
+        assert!(matches!(
+            HttpTool::tls_server_name("127.0.0.1").expect("127.0.0.1"),
+            ServerName::IpAddress(_)
+        ));
+        assert!(matches!(
+            HttpTool::tls_server_name("::1").expect("::1"),
+            ServerName::IpAddress(_)
+        ));
+        assert!(matches!(
+            HttpTool::tls_server_name("bad_host").expect("rustls speaks underscore labels"),
+            ServerName::DnsName(_)
+        ));
+        assert!(HttpTool::tls_server_name("").is_err());
+        assert!(HttpTool::tls_server_name("a..b").is_err());
+    }
+
+    /// The host for SNI is the authority without port or brackets.
+    #[test]
+    fn the_tls_server_name_host_is_the_authority_without_port_or_brackets() {
+        assert_eq!(HttpTool::base_host("localhost:8443"), "localhost");
+        assert_eq!(HttpTool::base_host("127.0.0.1:8443"), "127.0.0.1");
+        assert_eq!(HttpTool::base_host("[::1]:8443"), "::1");
+    }
+
+    /// Pinning needs a certificate: garbage is refused, an empty bundle is
+    /// refused, and a real PEM bundle pins — `Debug` then counts the roots
+    /// without printing them.
+    #[test]
+    fn pinning_roots_needs_a_certificate() {
+        let mut tool =
+            HttpTool::try_new("https://127.0.0.1:8443", &[("GET", "/health")]).expect("https");
+        assert!(tool.pin_tls_roots("not a pem bundle").is_err());
+        assert!(tool.pin_tls_roots("").is_err());
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("a test certificate");
+        let pem = certified.cert.pem();
+        tool.pin_tls_roots(&pem).expect("a real PEM bundle pins");
+        let debug = format!("{tool:?}");
+        assert!(debug.contains("tls_roots: 1"), "{debug}");
+        assert!(
+            !debug.contains("BEGIN CERTIFICATE"),
+            "roots print as a count: {debug}"
+        );
+        // A second bundle appends, it does not replace the first pin.
+        tool.pin_tls_roots(&pem).expect("a second bundle appends");
+        assert!(format!("{tool:?}").contains("tls_roots: 2"));
+    }
+}
+
+/// Without the feature there is no TLS stack to speak with, so an
+/// `https://` base is still refused at construction — the pre-fix
+/// behaviour, pinned so a future edit cannot silently admit it.
+#[cfg(test)]
+#[cfg(not(feature = "http-tls"))]
+mod http_tls_tests {
+    use super::HttpTool;
+
+    #[test]
+    fn https_bases_are_refused_without_the_tls_feature() {
+        assert!(HttpTool::try_new("https://127.0.0.1:8443", &[("GET", "/health")]).is_err());
+        assert!(HttpTool::try_new("http://127.0.0.1:80", &[("GET", "/health")]).is_ok());
     }
 }

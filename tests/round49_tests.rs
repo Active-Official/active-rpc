@@ -286,7 +286,6 @@ fn try_new_refuses_a_base_it_could_not_render_safely() {
         "http://-:80",
         "http://host:+80",
         "http://:80",
-        "https://host:443",
         "ftp://host:21",
     ] {
         let error = active_rpc::tool::HttpTool::try_new(base, &[("GET", "/x")])
@@ -296,6 +295,18 @@ fn try_new_refuses_a_base_it_could_not_render_safely() {
     }
     active_rpc::tool::HttpTool::try_new("http://127.0.0.1:9", &[("GET", "/x")])
         .expect("a plain base is admitted");
+    // `https://` bases are admitted too (RPC-38): the adapter speaks TLS
+    // with operator-pinned roots, so `https://host:443` left the unusable
+    // list above — and the scheme is normalised the same way. Only when
+    // the feature compiled the TLS stack in: without it an `https://` base
+    // is still refused at construction, exactly as before TLS existed
+    // (pinned by the no-feature lib test).
+    #[cfg(feature = "http-tls")]
+    {
+        let secure = active_rpc::tool::HttpTool::try_new("HTTPS://127.0.0.1:443", &[("GET", "/x")])
+            .expect("an upper-case https scheme is admitted");
+        assert_eq!(secure.base(), "https://127.0.0.1:443");
+    }
     // The scheme is matched case-insensitively and stored in the form `perform`
     // strips, so an upper-case operator value is not a dead endpoint.
     let upper = active_rpc::tool::HttpTool::try_new("HTTP://127.0.0.1:9", &[("GET", "/x")])
@@ -315,7 +326,6 @@ fn an_unusable_base_is_a_policy_fault_and_never_a_resolve_fault() {
     for base in [
         "http://example.com",
         "http://user:pw@host:80",
-        "https://host:443",
         "http://host:extra:80",
         "http://[::1:8080",
     ] {

@@ -30,7 +30,6 @@ const UNUSABLE: &[&str] = &[
     "http://-:80",
     "http://host:+80",
     "http://:80",
-    "https://host:443",
     "ftp://host:21",
     "http://0x7f.0.0.1:8080",
     "http://0x7f000001:8080",
@@ -57,11 +56,20 @@ fn every_unusable_base_is_refused_at_both_ends() {
         assert_eq!(error.code(), "rpc/tool-policy", "{base:?}: {error}");
     }
     // A real numeric literal and a DNS name are still admitted.
+    // `https://` bases are admitted too (RPC-38): the adapter speaks TLS
+    // with operator-pinned roots, so `https://host:443` left the
+    // unusable list above. Only when the feature compiled the TLS stack
+    // in: without it an `https://` base is still refused at construction,
+    // exactly as before TLS existed (pinned by the no-feature lib test).
     for base in [
         "http://127.0.0.1:9",
         "http://[::1]:9",
         "http://api.internal:8080",
     ] {
+        HttpTool::try_new(base, &[("GET", "/x")]).unwrap_or_else(|error| panic!("{base}: {error}"));
+    }
+    #[cfg(feature = "http-tls")]
+    for base in ["https://127.0.0.1:443", "https://api.internal:8443"] {
         HttpTool::try_new(base, &[("GET", "/x")]).unwrap_or_else(|error| panic!("{base}: {error}"));
     }
 }

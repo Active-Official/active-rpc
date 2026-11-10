@@ -322,12 +322,16 @@ Reported as `rpc/provider` with one of these inner codes:
 | `http/transfer-encoding` | a transfer coding other than `identity` |
 | `http/write:<err>`, `http/read:<err>` | socket I/O failed in that direction |
 | `http/read:truncated`, `http/read:truncated-body` | the peer closed before a full line or body arrived |
+| `http/tls` | the TLS handshake failed (a server whose chain the pinned roots do not cover, a hostname the certificate does not cover, or a handshake that errored for any other reason) — TLS 1.2 is the floor, and the handshake is bounded by the call's deadline, so one that outlives it is `rpc/timeout` instead |
 | `http/<status>` | the endpoint answered a status outside 2xx (3xx included: the adapter does not follow redirects) |
-| `rpc/tool-policy` | the base is not `http://host:port` with a printable scheme and authority (a scheme other than `http`, a path, query or fragment, a control character, userinfo, no authority, no port, a port outside `1..=65535`, or a host that is not a DNS name or an IP literal); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; a resolved address is not diallable under the tool's dial policy (private, link-local, shared, unspecified, multicast, reserved, documentation, benchmarking, or an IPv6 translation or tunnel prefix, unless the operator opted in); or the call carries a secret or a path scope the adapter cannot enforce |
+| `rpc/tool-policy` | the base is not `http://host:port` or `https://host:port` with a printable scheme and authority (a scheme other than `http` or `https`, a path, query or fragment, a control character, userinfo, no authority, no port, a port outside `1..=65535`, or a host that is not a DNS name or an IP literal); an `https://` base with no pinned roots, or with headers configured over plain HTTP to a non-loopback address (RPC-38); a path or allowlist entry is ambiguous (dot segment, `;` matrix parameter, percent escape, query, fragment, backslash, double slash or non-printable byte); the request body is past `max_request`; a resolved address is not diallable under the tool's dial policy (private, link-local, shared, unspecified, multicast, reserved, documentation, benchmarking, or an IPv6 translation or tunnel prefix, unless the operator opted in); or the call carries a secret or a path scope the adapter cannot enforce |
 
 The request is `METHOD path HTTP/1.1` with `host`, `connection: close`, and a
 `content-length` only for a method defined to carry content (`POST`, `PUT`,
-`PATCH`). The request body shares the capability's byte grant: a body past the
+`PATCH`), followed by any headers the operator configured on the tool
+(`HttpTool::allow_header`, RPC-38) — transport-managed names are refused
+at configuration, and the configured head is charged against the byte
+grant like the rest of the request. The request body shares the capability's byte grant: a body past the
 grant is `rpc/budget-exceeded` before the connection, and one past the adapter's
 `max_request` is `rpc/tool-policy`. A GET sends no body: the request is complete at the empty line, and
 extra bytes make simple servers and intermediaries reset the connection instead
@@ -355,13 +359,33 @@ IPv4-compatible IPv6 literal is classified by the IPv4 it spells.
 `HttpTool::with_allow_non_public(true)` opts a deliberately internal
 endpoint into every non-public class at once, and
 `HttpTool::with_allow_loopback(false)` forbids even loopback; the two flags
-are independent. A base must be `http://host:port` and nothing else: a path,
+are independent. The adapter speaks `https://` as well as `http://`
+(RPC-38): an `https://` base wraps the socket in TLS (rustls, the same
+stack the QUIC transport already uses — no new dependency) and verifies
+the server against roots the operator pinned with
+`HttpTool::pin_tls_roots`; there is no system store and no Mozilla root
+set, so an `https://` base with no pinned roots is refused with
+`rpc/tool-policy` before any socket is opened, and a server whose chain
+the pins do not cover fails the handshake with `http/tls`. The handshake
+is bounded by the call's deadline (one handshake round per remaining
+slice, so a server that drips handshake bytes cannot stretch the
+ceiling), and TLS 1.2 is the floor. A self-signed leaf can be pinned as
+its own root — the verifier accepts it (measured) — but a CA that issues
+the leaf is the production shape. Known limits: no ALPN, and no
+revocation checking, so a revoked certificate the pins still cover is
+accepted until the pins are rotated. Headers the operator configured are
+sent over TLS to any address; over plain HTTP they are sent only to
+loopback, and a call that would send one to a non-loopback address over
+plain HTTP is refused with `rpc/tool-policy` before dialling — a
+credential configured on the tool never crosses the wire in cleartext to
+a non-loopback peer. Credentials are configured on the tool, never in a
+call argument and never in the URL: a base with userinfo is refused at
+construction. A base must be `http://host:port` or `https://host:port` and nothing else: a path,
 query or fragment would either be dropped (retargeting the request at another
 resource on the same authority) or concatenated with every request path, a
 control character would forge a request head or a log line, and any other shape
 is an endpoint this adapter cannot reach. That includes a scheme other than
-`http` (matched case-insensitively and stored lowercase: the adapter speaks
-plain HTTP, with no TLS), userinfo, a missing port, a port outside `1..=65535`,
+`http` or `https` (matched case-insensitively and stored lowercase), userinfo, a missing port, a port outside `1..=65535`,
 an empty authority, an `http://host/` trailing slash and any byte outside
 `0x21..=0x7e`. The reason is the same in every case: `perform` resolves the
 authority with `ToSocketAddrs`, which needs `host:port`, so a shape it cannot
