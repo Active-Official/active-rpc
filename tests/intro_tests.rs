@@ -49,8 +49,8 @@ impl Provider for Files {
 
 fn agent() -> Agent {
     let agent = Agent::with_secret([0x2f; 32]);
-    agent.register(Box::new(Echo));
-    agent.register(Box::new(Files));
+    agent.register(Box::new(Echo)).expect("register provider");
+    agent.register(Box::new(Files)).expect("register provider");
     agent
 }
 
@@ -87,7 +87,7 @@ fn the_introduction_is_deterministic() {
 #[test]
 fn the_introduction_carries_no_capability_authority() {
     let agent = Agent::with_secret([0x30; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");

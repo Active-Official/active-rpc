@@ -32,7 +32,9 @@ fn setup() -> (
         .install(active_rpc::domain::module_from_source(SOURCE, "rt").unwrap())
         .expect("install");
     let agent = Agent::with_secret([51u8; 32]);
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider_id,
@@ -91,7 +93,7 @@ fn threat_confused_deputy() {
     // A capability for provider A must not reach provider B, even when method
     // names overlap.
     let (agent, _provider, module_cap, lane) = setup();
-    let echo_provider = agent.register(Box::new(Echo));
+    let echo_provider = agent.register(Box::new(Echo)).expect("register provider");
     let echo_cap = agent
         .mint(echo_provider, 0, CapAttrs::new(&["echo"]))
         .unwrap();
@@ -211,7 +213,7 @@ fn threat_budget_bypass_attempts() {
 
     // 3. A tool policy cannot be exceeded.
     let agent = Agent::with_secret([52u8; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let policy = ToolPolicy {
         allowed: ["echo".to_string()].into_iter().collect(),
         max_arg_bytes: 4,
@@ -321,7 +323,9 @@ fn threat_revocation_and_lifetime_edges() {
         .install(active_rpc::domain::module_from_source(SOURCE, "rt").unwrap())
         .expect("install");
     let agent = Agent::with_secret([53u8; 32]);
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider_id,
@@ -402,7 +406,7 @@ fn threat_argument_bombs_in_memory_budget() {
     // that is not a valid image, must both be refused by the layer that owns
     // the check.
     let agent = Agent::with_secret([53u8; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let policy = ToolPolicy {
         allowed: ["echo".to_string()].into_iter().collect(),
         max_arg_bytes: 8,
@@ -493,7 +497,9 @@ fn counting_agent() -> (
         calls: Arc::clone(&calls),
         agent: Rc::clone(&holder),
     };
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(provider_id, 0, CapAttrs::new(&["ping"]))
         .unwrap();
@@ -675,8 +681,16 @@ fn review_zero_ceilings_are_refused_in_every_budget_field() {
 fn review_agent_secrets_are_random() {
     let first = Agent::new();
     let second = Agent::new();
-    let one = first.mint(first.register(Box::new(Echo)), 0, CapAttrs::new(&["echo"]));
-    let two = second.mint(second.register(Box::new(Echo)), 0, CapAttrs::new(&["echo"]));
+    let one = first.mint(
+        first.register(Box::new(Echo)).expect("register provider"),
+        0,
+        CapAttrs::new(&["echo"]),
+    );
+    let two = second.mint(
+        second.register(Box::new(Echo)).expect("register provider"),
+        0,
+        CapAttrs::new(&["echo"]),
+    );
     assert_ne!(
         one.unwrap().id(),
         two.unwrap().id(),
@@ -785,7 +799,9 @@ fn review_module_payloads_redact_a_secret_copy() {
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([52u8; 32]);
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider_id,

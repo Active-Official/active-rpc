@@ -62,7 +62,12 @@ struct Attach {
 }
 
 impl Attach {
-    fn new(base: String, read_only: bool) -> Self {
+    /// Build the attach client, falling back to an embedded plane when the
+    /// live plane is unreachable. Building the embedded core can fail (its
+    /// bundled fixtures are built in `PlaneCore::new`); that failure is
+    /// returned instead of panicking, so the MCP server fails to start with
+    /// a clear message (RPC-51h).
+    fn new(base: String, read_only: bool) -> io::Result<Self> {
         let http = ureq::AgentBuilder::new().redirects(0).build();
         let reachable = http
             .get(&format!("{base}/health"))
@@ -74,19 +79,23 @@ impl Attach {
                 "active-control-plane MCP: {base} is not reachable; using an embedded plane (answers are marked degraded)"
             );
         }
-        let local = (!reachable).then(|| {
-            let mut core = PlaneCore::new();
+        let local = if reachable {
+            None
+        } else {
+            let mut core = PlaneCore::new().map_err(|error| {
+                io::Error::other(format!("could not build the embedded plane: {error}"))
+            })?;
             if read_only {
                 core.set_mode("read-only");
             }
-            Mutex::new(core)
-        });
-        Self {
+            Some(Mutex::new(core))
+        };
+        Ok(Self {
             base,
             http,
             local,
             read_only,
-        }
+        })
     }
 
     fn get(&self, path: &str) -> Result<Json, String> {
@@ -409,13 +418,35 @@ fn call(attach: &Attach, params: &Json) -> Result<Json, ToolFailure> {
     // from the embedded plane carries `degraded`, whichever tool produced
     // it, and a live-plane answer never does.
     let value = attach.mark_degraded(value);
+    // Serializing the tool answer can fail in principle (a value that is
+    // not JSON-able); the old code answered empty text with `isError:
+    // false` (RPC-51h), so the caller saw a successful empty answer. A
+    // failed serialization is an error, and it says so.
+    let (text, is_error) = match serde_json::to_string_pretty(&value) {
+        Ok(text) => (text, false),
+        Err(error) => (
+            format!("could not serialize the tool result: {error}"),
+            true,
+        ),
+    };
     Ok(json!({
-        "content": [{"type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default()}],
-        "isError": false
+        "content": [{"type": "text", "text": text}],
+        "isError": is_error
     }))
 }
 
 fn respond(request: &Json, attach: &Attach) -> Option<Json> {
+    // A request that is not an object has no id to answer to, so it is
+    // answered with id `null` and Invalid Request (-32600) instead of being
+    // silently dropped (RPC-51h): JSON-RPC requires a response to an invalid
+    // Request object. An object without an id is still a notification
+    // (initialized, cancelled, ...) and gets no response.
+    if !request.is_object() {
+        return Some(json!({
+            "jsonrpc": "2.0", "id": null,
+            "error": {"code": -32600, "message": "request must be a JSON-RPC object"}
+        }));
+    }
     // A request without an id is a notification (initialized, cancelled, ...).
     let id = request.get("id")?.clone();
     let method = request.get("method").and_then(Json::as_str).unwrap_or("");
@@ -512,7 +543,7 @@ pub fn run(attach_url: Option<String>, read_only: bool) -> io::Result<()> {
             format!("--attach must name a loopback origin, got {base}"),
         ));
     }
-    let attach = Attach::new(base, read_only);
+    let attach = Attach::new(base, read_only)?;
     let mut stdin = io::BufReader::new(io::stdin());
     let mut stdout = io::stdout();
     loop {
@@ -801,7 +832,8 @@ mod tests {
     #[test]
     fn embedded_plane_answers_are_marked_degraded() {
         let port = closed_loopback_port();
-        let embedded = super::Attach::new(format!("http://127.0.0.1:{port}"), true);
+        let embedded =
+            super::Attach::new(format!("http://127.0.0.1:{port}"), true).expect("embedded plane");
         assert!(embedded.is_degraded(), "unreachable target is degraded");
 
         for tool in ["cp_metrics", "cp_engines"] {
@@ -824,5 +856,29 @@ mod tests {
             "a live-plane answer must not be marked degraded: {answer}"
         );
         assert_eq!(answer["pad"].as_str().expect("pad").len(), 53);
+    }
+
+    /// A request that is not a JSON object is answered with Invalid Request
+    /// (-32600) and id null, not silently dropped (RPC-51h). An object
+    /// without an id is still a notification and gets no response -- that
+    /// is correct per JSON-RPC, and a request with an id is still answered.
+    #[test]
+    fn a_non_object_request_gets_an_invalid_request_error() {
+        let attach = attach_to("http://127.0.0.1:1".to_string(), true);
+        for request in [json!(5), json!("hello"), json!([1, 2]), json!(null)] {
+            let response =
+                super::respond(&request, &attach).expect("a non-object request gets a response");
+            assert_eq!(response["jsonrpc"], json!("2.0"));
+            assert!(response["id"].is_null(), "id must be null: {response}");
+            assert_eq!(response["error"]["code"], json!(-32600));
+        }
+        let notification = json!({"jsonrpc": "2.0", "method": "ping"});
+        assert!(
+            super::respond(&notification, &attach).is_none(),
+            "a notification gets no response"
+        );
+        let ping = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let response = super::respond(&ping, &attach).expect("ping gets a response");
+        assert_eq!(response["id"], json!(1));
     }
 }

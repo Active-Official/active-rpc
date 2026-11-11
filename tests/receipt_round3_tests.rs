@@ -55,7 +55,7 @@ fn receipt(sequence: u64, at_ms: u64) -> Receipt {
 
 /// A kernel with one registered provider, ready to queue work.
 fn ready(agent: &Agent) -> (active_rpc::CapHandle, active_rpc::LaneId) {
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -345,11 +345,13 @@ fn an_in_flight_out_of_band_resolve_seals_one_admission() {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let own: std::rc::Rc<std::cell::RefCell<Option<active_rpc::PromiseHandle>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
-    let provider = agent.register(Box::new(Resolving {
-        agent: std::rc::Rc::clone(&slot),
-        own: std::rc::Rc::clone(&own),
-        toggle: false,
-    }));
+    let provider = agent
+        .register(Box::new(Resolving {
+            agent: std::rc::Rc::clone(&slot),
+            own: std::rc::Rc::clone(&own),
+            toggle: false,
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))
@@ -380,11 +382,13 @@ fn an_in_flight_resolve_while_receipts_were_disabled_still_yields_one_receipt() 
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let own: std::rc::Rc<std::cell::RefCell<Option<active_rpc::PromiseHandle>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
-    let provider = agent.register(Box::new(Resolving {
-        agent: std::rc::Rc::clone(&slot),
-        own: std::rc::Rc::clone(&own),
-        toggle: true,
-    }));
+    let provider = agent
+        .register(Box::new(Resolving {
+            agent: std::rc::Rc::clone(&slot),
+            own: std::rc::Rc::clone(&own),
+            toggle: true,
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))
@@ -443,11 +447,13 @@ fn a_cancel_while_receipts_were_disabled_still_yields_one_receipt() {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let own: std::rc::Rc<std::cell::RefCell<Option<active_rpc::PromiseHandle>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
-    let provider = agent.register(Box::new(Cancelling {
-        agent: std::rc::Rc::clone(&slot),
-        own: std::rc::Rc::clone(&own),
-        toggle: true,
-    }));
+    let provider = agent
+        .register(Box::new(Cancelling {
+            agent: std::rc::Rc::clone(&slot),
+            own: std::rc::Rc::clone(&own),
+            toggle: true,
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))

@@ -30,7 +30,7 @@ impl Provider for Echo {
 
 fn agent() -> (Agent, ProviderId, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x5a; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent
         .create_lane("kernel", Budget::default())
         .expect("lane");
@@ -129,7 +129,7 @@ fn mint_bound_refuses_a_conflicting_binding() {
 fn disabling_durable_refuses_attenuation_and_export() {
     let agent = Agent::with_secret([0x5b; 32]);
     agent.set_durable_capabilities(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
     let durable = agent.mint(provider, 0, attrs).expect("durable");

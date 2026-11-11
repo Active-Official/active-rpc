@@ -37,7 +37,7 @@ fn wall_ms() -> u64 {
 fn the_default_clock_is_virtual_and_advances_by_one_round_trip() {
     let agent = Agent::with_secret([0x61; 32]);
     assert!(!agent.uses_wall_clock());
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -61,7 +61,7 @@ fn a_ttl_that_elapses_between_calls_is_refused_at_the_queue() {
     // refused only at dispatch.
     let agent = Agent::with_secret([0x6d; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("clock", Budget::default()).expect("lane");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]).with_ttl_ms(30))
@@ -97,7 +97,7 @@ fn wall_clock_mode_tracks_the_system_clock() {
 fn a_wall_clock_agent_accepts_a_live_capability_and_refuses_an_expired_one() {
     let agent = Agent::with_secret([0x63; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("clock", Budget::default()).expect("lane");
 
     let live = agent
@@ -119,7 +119,7 @@ fn a_wall_clock_agent_accepts_a_live_capability_and_refuses_an_expired_one() {
 #[test]
 fn the_clock_never_moves_backwards_when_the_mode_changes() {
     let agent = Agent::with_secret([0x64; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -154,7 +154,7 @@ fn the_clock_never_moves_backwards_when_the_mode_changes() {
 fn dispatch_re_checks_the_deadline_under_the_wall_clock() {
     let agent = Agent::with_secret([0x65; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("clock", Budget::default()).expect("lane");
     // A one-millisecond deadline is live when queued but can expire before
     // dispatch; either check refuses it, and neither ever lets it run.

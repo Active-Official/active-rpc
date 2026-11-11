@@ -31,7 +31,7 @@ impl Provider for Echo {
 
 fn fixture() -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x6a; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]).allow_publish())
         .expect("mint");
@@ -79,7 +79,7 @@ fn a_lane_that_did_not_subscribe_cannot_read_a_channel() {
 #[test]
 fn publishing_requires_an_explicit_grant() {
     let agent = Agent::with_secret([0x6b; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     // A capability for a provider is not a licence to speak on a channel.
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -97,7 +97,7 @@ fn publishing_requires_an_explicit_grant() {
 #[test]
 fn attenuation_cannot_add_the_publish_grant() {
     let agent = Agent::with_secret([0x6c; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let parent = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -127,7 +127,7 @@ fn a_topic_must_be_bounded_and_printable() {
     }
     // The grant-time check refuses the same names, so a capability cannot be
     // minted for a topic the channel would reject.
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let error = agent
         .mint(
             provider,

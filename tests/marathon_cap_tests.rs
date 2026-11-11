@@ -86,7 +86,7 @@ fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
 
 fn agent() -> (Agent, active_rpc::ProviderId, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x31; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("caps", Budget::default()).expect("lane");
     (agent, provider, lane)
 }
@@ -95,7 +95,7 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     let agent = Agent::with_secret([0x32; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x82; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     (agent, provider)
 }
 
@@ -116,9 +116,11 @@ fn durable_cap(agent: &Agent, provider: active_rpc::ProviderId) -> CapHandle {
 fn a_pipelined_argument_cannot_carry_a_path_outside_the_scope() {
     let calls = Rc::new(Cell::new(0));
     let agent = Agent::with_secret([0x33; 32]);
-    let provider = agent.register(Box::new(Recorder {
-        calls: Rc::clone(&calls),
-    }));
+    let provider = agent
+        .register(Box::new(Recorder {
+            calls: Rc::clone(&calls),
+        }))
+        .expect("register provider");
     let lane = agent.create_lane("pipe", Budget::default()).expect("lane");
     let producer = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
@@ -170,7 +172,7 @@ fn a_pipelined_argument_cannot_carry_a_path_outside_the_scope() {
 #[test]
 fn a_pipelined_argument_is_charged_at_dispatch() {
     let agent = Agent::with_secret([0x34; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("bytes", Budget::default()).expect("lane");
     let producer = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -278,7 +280,7 @@ fn an_edited_or_unsealed_record_is_refused() {
     // A kernel with no key exports nothing at all.
     let keyless = Agent::with_secret([0x35; 32]);
     keyless.set_durable_capabilities(true);
-    let provider = keyless.register(Box::new(Echo));
+    let provider = keyless.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
     let cap = keyless.mint(provider, 0, attrs).expect("cap");
@@ -447,10 +449,12 @@ fn a_drop_inside_a_provider_notification_is_applied() {
     let slot: Rc<RefCell<Option<CapHandle>>> = Rc::new(RefCell::new(None));
     let notifications = Rc::new(RefCell::new(Vec::new()));
     let agent = Agent::with_secret([0x36; 32]);
-    let provider = agent.register(Box::new(Holder {
-        slot: Rc::clone(&slot),
-        notifications: Rc::clone(&notifications),
-    }));
+    let provider = agent
+        .register(Box::new(Holder {
+            slot: Rc::clone(&slot),
+            notifications: Rc::clone(&notifications),
+        }))
+        .expect("register provider");
     let held = agent
         .mint(provider, 7, CapAttrs::new(&["hold"]))
         .expect("held cap");
@@ -538,7 +542,7 @@ fn a_descriptor_is_canonical_or_refused() {
 fn the_registry_and_the_lineage_are_bounded() {
     use active_rpc::kernel::{MAX_CAPS, MAX_LINEAGE_DEPTH};
     let agent = Agent::with_secret([0x37; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut caps = Vec::with_capacity(MAX_CAPS);
     for _ in 0..MAX_CAPS {
         caps.push(

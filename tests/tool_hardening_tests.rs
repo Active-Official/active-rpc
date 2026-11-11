@@ -3618,7 +3618,7 @@ fn an_http_mint_without_a_policy_is_gated_by_the_tool_policy() {
 
     let agent = Agent::with_secret([0x41; 32]);
     let tool = HttpTool::new(format!("http://{address}"), &[("POST", "/submit")]);
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["post"]))
         .expect("mint without policy");
@@ -3693,7 +3693,7 @@ fn a_process_mint_without_a_policy_is_gated_by_the_tool_policy() {
     let (program, flag) = ("/bin/sh", "-c");
     let agent = Agent::with_secret([0x41; 32]);
     let tool = LocalProcess::new(program, &[flag, "echo hello"]).expect("an absolute program");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
         .expect("mint without policy");
@@ -3880,4 +3880,73 @@ fn a_caller_supplied_systemroot_does_not_reach_the_child() {
         rpc45_parent_systemroot(),
         "stdout: {stdout:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RPC-51h: the provider ceiling.
+// ---------------------------------------------------------------------------
+
+/// A minimal provider that answers `echo` with a constant, for the
+/// ceiling test: it carries no tool, no state, so registering it 4,096
+/// times is cheap and the only thing being exercised is the ceiling.
+struct CeilingEcho;
+
+impl Provider for CeilingEcho {
+    fn name(&self) -> &'static str {
+        "ceiling-echo"
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["echo".to_string()]
+    }
+
+    fn mutating(&self, _method: &str) -> bool {
+        false
+    }
+
+    fn invoke(&mut self, _object: u64, _call: &Call) -> active_rpc::Result<Response> {
+        Ok(Response::Value(Value::Text("echo".to_string())))
+    }
+}
+
+/// Registering past `MAX_PROVIDERS` is refused `rpc/budget-exceeded`,
+/// and the refusal leaves the kernel usable: the first provider still
+/// mints and still answers after the refusal (RPC-51h). Before the fix
+/// there was no ceiling at all -- `next_provider` grew without bound,
+/// unlike every other kernel collection.
+#[test]
+fn registering_past_the_provider_ceiling_is_refused() {
+    let agent = Agent::with_secret([0x51; 32]);
+    let first = agent
+        .register(Box::new(CeilingEcho))
+        .expect("register provider");
+    let cap = agent
+        .mint(first, 0, CapAttrs::new(&["echo"]))
+        .expect("mint on the first provider");
+    for _ in 1..active_rpc::kernel::MAX_PROVIDERS {
+        agent
+            .register(Box::new(CeilingEcho))
+            .expect("register provider");
+    }
+    let error = agent
+        .register(Box::new(CeilingEcho))
+        .expect_err("the 4097th provider is refused");
+    assert_eq!(error.code(), "rpc/budget-exceeded", "{error}");
+    assert!(
+        error.to_string().contains("providers"),
+        "the refusal names the collection: {error}"
+    );
+    // The refusal is stable: a second attempt past the ceiling is refused
+    // the same way, and the kernel is still usable afterwards.
+    let again = agent
+        .register(Box::new(CeilingEcho))
+        .expect_err("the ceiling stays shut");
+    assert_eq!(again.code(), "rpc/budget-exceeded", "{again}");
+    let lane = agent.create_lane("p", Budget::default()).expect("lane");
+    let promise = agent
+        .call(lane, &cap, "echo", vec![])
+        .expect("a call through the first provider is admitted");
+    agent.run();
+    let response = promise.value().expect("the first provider still answers");
+    assert_eq!(response, Value::Text("echo".to_string()));
 }

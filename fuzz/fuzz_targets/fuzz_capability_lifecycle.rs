@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
     // every refusal assertion below (R-20 round 5, F7).
     {
         let control = common::agent(&[0x01]);
-        let provider = control.register(Box::new(common::Echo::default()));
+        let provider = control.register(Box::new(common::Echo::default())).expect("register provider");
         let lane = control
             .create_lane("control", Budget::default())
             .expect("the control lane");
@@ -44,7 +44,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let agent = common::agent(data);
-    let provider = agent.register(Box::new(common::Echo::default()));
+    let provider = agent.register(Box::new(common::Echo::default())).expect("register provider");
     let lane = agent
         .create_lane("main", Budget::default())
         .expect("default lane budget");
@@ -120,7 +120,7 @@ fuzz_target!(|data: &[u8]| {
                 let mut other_seed = data.to_vec();
                 other_seed[0] ^= 0xff;
                 let other = common::agent(&other_seed);
-                let other_provider = other.register(Box::new(common::Echo::default()));
+                let other_provider = other.register(Box::new(common::Echo::default())).expect("register provider");
                 let foreign = common::mint(&other, other_provider, &["ping"], Budget::default());
                 let transplanted = agent.import(foreign.id());
                 let error = agent

@@ -240,7 +240,7 @@ fn input_beyond_the_input_window_is_refused() {
 fn a_capability_runs_the_guest_through_the_kernel() {
     let agent = Agent::with_secret([0x2b; 32]);
     let tool = WasmTool::from_bytes(&binary(ECHO), WasmLimits::default()).expect("compile");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
         .expect("mint");
@@ -259,7 +259,7 @@ fn a_capability_runs_the_guest_through_the_kernel() {
 fn the_kernel_refuses_a_method_the_capability_does_not_grant() {
     let agent = Agent::with_secret([0x2c; 32]);
     let tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["other"]))
         .expect("mint");
@@ -281,7 +281,7 @@ fn a_fuel_refusal_reaches_the_caller_through_the_kernel() {
         ..WasmLimits::default()
     };
     let tool = WasmTool::from_bytes(&binary(BURN), limits).expect("compile");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
         .expect("mint");
@@ -301,7 +301,7 @@ fn a_fuel_refusal_reaches_the_caller_through_the_kernel() {
 fn a_tool_without_a_capability_is_unreachable() {
     let agent = Agent::with_secret([0x2e; 32]);
     let tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
-    let _provider = agent.register(Box::new(tool));
+    let _provider = agent.register(Box::new(tool)).expect("register provider");
     let lane = agent.create_lane("wasm", Budget::default()).expect("lane");
     let imported = agent.import(active_rpc::CapId([0; 16]));
     let error = agent
@@ -584,7 +584,7 @@ fn a_guest_reads_the_kernel_clock_through_the_kernel() {
     let tool =
         WasmTool::from_bytes_with_policy(&binary(CLOCK_GUEST), WasmLimits::default(), policy)
             .expect("compile");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
         .expect("mint");

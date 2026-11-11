@@ -32,7 +32,7 @@ fn agent_with_budget(
     budget: Budget,
 ) -> (Agent, ProviderId, active_rpc::CapHandle, active_rpc::LaneId) {
     let agent = Agent::with_secret([7u8; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("perf", budget).expect("lane");
     let mut attrs = CapAttrs::new(&["ping"]);
     attrs.budget = budget;
@@ -88,7 +88,7 @@ fn capability_churn_is_linear() {
     // numbers (`--nocapture`) when refreshing `docs/spec/performance.md`.
     fn churn(count: u64) -> Duration {
         let agent = Agent::with_secret([11u8; 32]);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let start = Instant::now();
         let caps: Vec<_> = (0..count)
             .map(|object| {

@@ -158,7 +158,9 @@ fn an_exhausted_finish_is_a_state_refusal() {
     let transfer = BulkTransfer::new(body(64 << 20, 92), 256 * 1024).expect("transfer");
     let plan = transfer.plan().clone();
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent
         .create_lane(
             "bulk",

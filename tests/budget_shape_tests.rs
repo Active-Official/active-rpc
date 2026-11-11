@@ -69,10 +69,12 @@ fn fixture_with(budget: Budget, reply: Value) -> Fixture {
 fn fixture_parts(cap_budget: Budget, lane_budget: Budget, reply: Value) -> Fixture {
     let agent = Agent::with_secret([0x6b; 32]);
     let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
-    let provider = agent.register(Box::new(Reply {
-        calls: std::rc::Rc::clone(&calls),
-        reply,
-    }));
+    let provider = agent
+        .register(Box::new(Reply {
+            calls: std::rc::Rc::clone(&calls),
+            reply,
+        }))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["ping"]);
     attrs.budget = cap_budget;
     let cap = agent.mint(provider, 0, attrs).expect("mint");
@@ -789,10 +791,12 @@ fn a_bound_capability_needs_its_peer_to_resolve() {
     // Round 9 (F2): `resolve` had no peer, so it settled a call dispatch would
     // have refused for the wrong identity.
     let agent = Agent::with_secret([0x81; 32]);
-    let provider = agent.register(Box::new(Reply {
-        calls: std::rc::Rc::new(std::cell::Cell::new(0)),
-        reply: Value::text("ok"),
-    }));
+    let provider = agent
+        .register(Box::new(Reply {
+            calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+            reply: Value::text("ok"),
+        }))
+        .expect("register provider");
     let owner = active_rpc::identity::IdentityPolicy::default()
         .admit(
             Some(&active_rpc::identity::PeerIdentity::from_certificate(
@@ -823,10 +827,12 @@ fn a_wall_clock_expiry_binds_an_out_of_band_resolve() {
     // Round 9 (F3): resolve compared against a stale clock in wall-clock mode.
     let agent = Agent::with_secret([0x82; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Reply {
-        calls: std::rc::Rc::new(std::cell::Cell::new(0)),
-        reply: Value::text("ok"),
-    }));
+    let provider = agent
+        .register(Box::new(Reply {
+            calls: std::rc::Rc::new(std::cell::Cell::new(0)),
+            reply: Value::text("ok"),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["ping"]).with_ttl_ms(30))
         .expect("cap");
@@ -864,7 +870,9 @@ fn an_idempotent_body_reaches_the_provider() {
     }
 
     let agent = Agent::with_secret([0x83; 32]);
-    let provider = agent.register(Box::new(PayloadLen));
+    let provider = agent
+        .register(Box::new(PayloadLen))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["len"]))
         .expect("cap");
@@ -1028,7 +1036,9 @@ fn a_provider_answer_deeper_than_the_wire_is_a_budget_refusal() {
     }
 
     let agent = Agent::with_secret([0x84; 32]);
-    let provider = agent.register(Box::new(DeepReply));
+    let provider = agent
+        .register(Box::new(DeepReply))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))
         .expect("cap");
@@ -1137,10 +1147,12 @@ fn a_promise_argument_is_measured_when_it_resolves() {
     let agent = Agent::with_secret([0x7c; 32]);
     let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let wide = Value::list((0..100).map(Value::Int));
-    let provider = agent.register(Box::new(Reply {
-        calls: std::rc::Rc::clone(&calls),
-        reply: wide,
-    }));
+    let provider = agent
+        .register(Box::new(Reply {
+            calls: std::rc::Rc::clone(&calls),
+            reply: wide,
+        }))
+        .expect("register provider");
     let mut wide_attrs = CapAttrs::new(&["ping"]);
     wide_attrs.budget = Budget::default();
     let wide_cap = agent.mint(provider, 0, wide_attrs).expect("wide mint");
@@ -1213,10 +1225,12 @@ fn a_send_over_the_lane_shape_ceilings_is_refused() {
 fn a_publish_over_the_capability_shape_ceilings_is_refused() {
     let agent = Agent::with_secret([0x8d; 32]);
     let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
-    let provider = agent.register(Box::new(Reply {
-        calls: std::rc::Rc::clone(&calls),
-        reply: Value::text("ok"),
-    }));
+    let provider = agent
+        .register(Box::new(Reply {
+            calls: std::rc::Rc::clone(&calls),
+            reply: Value::text("ok"),
+        }))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["ping"]).allow_publish();
     attrs.budget = budget();
     let cap = agent.mint(provider, 0, attrs).expect("mint");
@@ -1398,10 +1412,12 @@ fn a_long_method_name_is_charged_to_the_byte_budget() {
     let method = "m".repeat(1_024);
     let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let agent = Agent::with_secret([0x6c; 32]);
-    let provider = agent.register(Box::new(LongMethod {
-        calls: std::rc::Rc::clone(&calls),
-        method: method.clone(),
-    }));
+    let provider = agent
+        .register(Box::new(LongMethod {
+            calls: std::rc::Rc::clone(&calls),
+            method: method.clone(),
+        }))
+        .expect("register provider");
     let envelope = decoded(&Envelope::request(1, method, vec![]));
     let charge = envelope.non_argument_wire_size();
     // One byte under the charge refuses.

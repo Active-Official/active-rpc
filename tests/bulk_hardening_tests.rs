@@ -226,7 +226,9 @@ fn a_bulk_transfer_through_the_kernel_assembles_the_body() {
     let provider = BulkProvider::with_expected_root(root);
 
     let agent = Agent::new();
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
     let cap = agent
         .mint(id, 0, CapAttrs::new(&["plan", "put", "missing", "finish"]))
@@ -302,7 +304,9 @@ fn the_kernel_grant_and_byte_budget_bound_a_bulk_transfer() {
     let transfer = BulkTransfer::new(payload.clone(), 128 * 1024).expect("transfer");
     let root = transfer.plan().root();
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::with_expected_root(root)));
+    let id = agent
+        .register(Box::new(BulkProvider::with_expected_root(root)))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
 
     let read_only = agent
@@ -380,7 +384,7 @@ fn an_idempotent_call_with_a_payload_is_charged_and_fingerprinted() {
     }
 
     let agent = Agent::new();
-    let id = agent.register(Box::new(Echo));
+    let id = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("idem", Budget::default()).expect("lane");
     let cap = agent.mint(id, 0, CapAttrs::new(&["ping"])).expect("cap");
 
@@ -437,7 +441,7 @@ fn egress_payload_bytes_are_charged() {
     }
 
     let agent = Agent::new();
-    let id = agent.register(Box::new(Echo));
+    let id = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent
         .create_lane("egress", Budget::default())
         .expect("lane");

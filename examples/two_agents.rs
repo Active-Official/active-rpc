@@ -25,7 +25,7 @@ impl Provider for Echo {
 
 fn main() -> Result<()> {
     let agent = Agent::with_secret([7u8; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("demo", Budget::default())?;
 
     // The root capability can call once. The attenuated one cannot widen it.

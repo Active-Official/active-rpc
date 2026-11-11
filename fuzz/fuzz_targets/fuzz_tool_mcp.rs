@@ -52,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
     {
         let control = common::agent(&[0x07]);
         let policy = session.policy();
-        let provider = control.register(Box::new(session));
+        let provider = control.register(Box::new(session)).expect("register provider");
         let lane = control
             .create_lane("control", Budget::default())
             .expect("the control lane");
@@ -91,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
 
     let policy = session.policy();
     let agent = common::agent(data);
-    let provider = agent.register(Box::new(session));
+    let provider = agent.register(Box::new(session)).expect("register provider");
     let lane = agent
         .create_lane("tools", Budget::default())
         .expect("default lane budget");

@@ -46,7 +46,7 @@ fn admitted(certificate: &[u8]) -> AdmittedIdentity {
 #[test]
 fn a_queued_call_does_not_survive_a_later_binding() {
     let agent = Agent::with_secret([0x71; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round2");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -72,7 +72,7 @@ fn a_queued_call_does_not_survive_a_later_binding() {
 #[test]
 fn a_queued_call_from_the_bound_peer_still_runs() {
     let agent = Agent::with_secret([0x72; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round2");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -110,7 +110,7 @@ fn an_empty_certificate_is_not_a_bindable_identity() {
     assert!(active_rpc::identity::presented_fingerprint(Some(&empty)).is_none());
 
     let agent = Agent::with_secret([0x73; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let policy = IdentityPolicy::default();
     let admitted_empty = policy
         .admit(Some(&empty), false)
@@ -156,7 +156,7 @@ fn local_policy_labels_a_loopback_peer_as_loopback() {
 #[test]
 fn a_revoked_descendant_does_not_block_introduction() {
     let agent = Agent::with_secret([0x74; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round2");
     let root = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -191,7 +191,7 @@ fn a_child_that_omits_a_binding_inherits_it() {
 #[test]
 fn the_dispatch_helper_admits_before_it_dispatches() {
     let agent = Agent::with_secret([0x75; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -234,7 +234,7 @@ fn the_dispatch_helper_admits_before_it_dispatches() {
 #[test]
 fn an_expired_descendant_does_not_block_introduction() {
     let agent = Agent::with_secret([0x76; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round2");
     let root = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -270,7 +270,7 @@ fn an_expired_descendant_does_not_block_introduction() {
 #[test]
 fn an_idempotency_key_belongs_to_the_peer_that_claimed_it() {
     let agent = Agent::with_secret([0x77; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round2");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))

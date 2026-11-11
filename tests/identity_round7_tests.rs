@@ -50,7 +50,7 @@ const NEW: &[u8] = b"alice-certificate-two";
 #[test]
 fn a_rotated_peer_retries_its_idempotency_key() {
     let agent = Agent::with_secret([0xb1; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -105,7 +105,7 @@ fn a_rotated_peer_retries_its_idempotency_key() {
 #[test]
 fn a_rotation_carries_a_queued_job() {
     let agent = Agent::with_secret([0xb2; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -141,7 +141,7 @@ fn a_rotation_carries_a_queued_job() {
 #[test]
 fn an_out_of_band_answer_after_rotation() {
     let agent = Agent::with_secret([0xb3; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -200,7 +200,7 @@ fn an_out_of_band_answer_after_rotation() {
 #[test]
 fn a_refused_answer_is_counted_and_taped() {
     let agent = Agent::with_secret([0xb4; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -246,7 +246,7 @@ fn a_refused_answer_is_counted_and_taped() {
 #[test]
 fn an_identity_less_peer_cannot_pipeline_the_agents_own_promise() {
     let agent = Agent::with_secret([0xb5; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -300,7 +300,7 @@ fn an_envelope_naming_a_promise_is_a_wire_refusal() {
     use active_rpc::wire::Envelope;
 
     let agent = Agent::with_secret([0xb6; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -327,7 +327,7 @@ fn an_envelope_naming_a_promise_is_a_wire_refusal() {
 #[test]
 fn a_rotation_refuses_a_pipeline_that_spans_two_capabilities() {
     let agent = Agent::with_secret([0xb7; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let first = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("first cap");
@@ -371,7 +371,7 @@ fn a_rotation_refuses_a_pipeline_that_spans_two_capabilities() {
 
     // The documented procedure: rotate both before the next dispatch.
     let agent = Agent::with_secret([0xb8; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let first = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("first cap");
@@ -425,7 +425,7 @@ fn a_rotation_refuses_a_pipeline_that_spans_two_capabilities() {
 #[test]
 fn a_rotation_does_not_carry_a_claim_across_lanes() {
     let agent = Agent::with_secret([0xb9; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -487,7 +487,7 @@ fn a_rotation_does_not_carry_a_claim_across_lanes() {
 #[test]
 fn a_rotation_reports_the_work_it_carries() {
     let agent = Agent::with_secret([0xba; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -533,7 +533,7 @@ fn a_rotation_reports_the_work_it_carries() {
 #[test]
 fn an_over_budget_answer_is_counted_and_taped() {
     let agent = Agent::with_secret([0xbb; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.budget.max_bytes = 256;
     let cap = agent.mint(provider, 0, attrs).expect("cap");
@@ -584,7 +584,7 @@ fn an_over_budget_answer_is_counted_and_taped() {
 #[test]
 fn a_child_rotated_first_does_not_block_the_root() {
     let agent = Agent::with_secret([0xbc; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let root = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("root");
@@ -614,7 +614,7 @@ fn a_child_rotated_first_does_not_block_the_root() {
     // A descendant bound to a third peer is still refused: it is somebody
     // else's authority.
     let agent = Agent::with_secret([0xbd; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let root = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("root");
@@ -643,7 +643,7 @@ fn a_child_rotated_first_does_not_block_the_root() {
 #[test]
 fn an_answer_wider_than_the_grant_is_counted_and_taped() {
     let agent = Agent::with_secret([0xbe; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.budget.max_array_len = 4;
     let cap = agent.mint(provider, 0, attrs).expect("cap");
@@ -682,7 +682,7 @@ fn an_answer_wider_than_the_grant_is_counted_and_taped() {
 #[test]
 fn a_foreign_answer_on_a_revoked_capability_is_an_identity_refusal() {
     let agent = Agent::with_secret([0xbf; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -728,7 +728,7 @@ fn a_foreign_answer_on_a_revoked_capability_is_an_identity_refusal() {
 #[test]
 fn a_settled_promise_answers_only_its_owner() {
     let agent = Agent::with_secret([0xc1; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");

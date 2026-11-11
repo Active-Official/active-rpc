@@ -662,7 +662,7 @@ impl Recorder {
 
     fn with_record_ops(latency_ms: u64, record_ops: bool) -> Result<Self> {
         let agent = Agent::with_secret(DEMO_SECRET);
-        let provider = agent.register(Box::new(Demo));
+        let provider = agent.register(Box::new(Demo))?;
         agent.set_latency(latency_ms);
         let lane = agent.create_lane("replay", Budget::default())?;
         let mut recorder = Recorder {

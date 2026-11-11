@@ -73,7 +73,7 @@ fn measure(mut op: impl FnMut(), iterations: usize) -> (u64, u64, u64) {
 
 fn call_batch(calls: usize) {
     let agent = Agent::with_secret([0x77; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");

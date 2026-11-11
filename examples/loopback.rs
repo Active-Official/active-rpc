@@ -17,7 +17,9 @@ fn main() -> Result<(), active_rpc::Error> {
         "loopback.active",
     )?)?;
     let agent = Agent::new();
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
 
     // One capability, attenuated to the methods this demo needs.
     let cap = agent.mint(provider_id, object, CapAttrs::new(&["stats", "why"]))?;

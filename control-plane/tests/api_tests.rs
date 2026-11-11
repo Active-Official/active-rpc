@@ -4,6 +4,9 @@ use active_control_plane::server::{app, spawn_worker};
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use serde_json::Value as Json;
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 use tower::ServiceExt;
 
 async fn body_json(response: axum::response::Response) -> Json {
@@ -13,7 +16,7 @@ async fn body_json(response: axum::response::Response) -> Json {
 
 #[tokio::test]
 async fn logs_tail_since_activity_and_engines_are_served() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
 
     let response = app
         .clone()
@@ -75,7 +78,7 @@ async fn logs_tail_since_activity_and_engines_are_served() {
 
 #[tokio::test]
 async fn jsonl_export_contains_structured_lines() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     let response = app
         .oneshot(
             Request::builder()
@@ -103,7 +106,7 @@ async fn jsonl_export_contains_structured_lines() {
 
 #[tokio::test]
 async fn read_only_mode_refuses_scenario_posts() {
-    let app = app(spawn_worker(true));
+    let app = app(spawn_worker(true).expect("kernel worker"));
     let response = app
         .clone()
         .oneshot(
@@ -162,7 +165,7 @@ async fn read_only_mode_refuses_scenario_posts() {
 
 #[tokio::test]
 async fn a_scenario_post_returns_the_real_result_envelope() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     let response = app
         .oneshot(
             Request::builder()
@@ -186,7 +189,7 @@ async fn a_scenario_post_returns_the_real_result_envelope() {
 /// the attacker's name.
 #[tokio::test]
 async fn a_foreign_host_is_refused() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     let request = Request::builder()
         .uri("/health")
         .header("host", "evil.example")
@@ -202,7 +205,7 @@ async fn a_foreign_host_is_refused() {
 /// present-but-unparsable Host is refused on its own (R-19 round 3, L4).
 #[tokio::test]
 async fn an_unparsable_host_is_refused() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     let request = Request::builder()
         .method("POST")
         .uri("/demo/scenario/round-trip")
@@ -218,7 +221,7 @@ async fn an_unparsable_host_is_refused() {
 /// allowed.
 #[tokio::test]
 async fn a_cross_origin_post_is_refused() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     let foreign = Request::builder()
         .method("POST")
         .uri("/demo/scenario/round-trip")
@@ -242,7 +245,7 @@ async fn a_cross_origin_post_is_refused() {
 /// been added before it, so `/app.js` used to answer 200 to a rebound name.
 #[tokio::test]
 async fn a_static_asset_with_a_foreign_host_is_refused() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     for uri in ["/", "/app.js", "/style.css"] {
         let request = Request::builder()
             .uri(uri)
@@ -268,7 +271,7 @@ async fn a_static_asset_with_a_foreign_host_is_refused() {
 /// click comes from the framed document, so both headers are the plane's own.
 #[tokio::test]
 async fn every_response_refuses_framing() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     for uri in ["/", "/app.js", "/health", "/metrics"] {
         let request = Request::builder()
             .uri(uri)
@@ -302,7 +305,7 @@ async fn every_response_refuses_framing() {
 /// port is not this dashboard's own origin.
 #[tokio::test]
 async fn a_loopback_origin_on_another_port_is_refused() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     let request = Request::builder()
         .method("POST")
         .uri("/demo/scenario/round-trip")
@@ -327,7 +330,7 @@ async fn a_loopback_origin_on_another_port_is_refused() {
 /// `/health` must not answer `ok` for a snapshot that stopped moving.
 #[tokio::test]
 async fn a_down_kernel_reads_as_unhealthy() {
-    let state = spawn_worker(false);
+    let state = spawn_worker(false).expect("kernel worker");
     state.latest.lock().expect("snapshot").health.kernel = "down".to_string();
     let app = app(state);
     let request = Request::builder()
@@ -344,7 +347,7 @@ async fn a_down_kernel_reads_as_unhealthy() {
 /// `/logs/since` says when the ring dropped the events the caller asked for.
 #[tokio::test]
 async fn logs_since_reports_a_ring_gap() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     // A cursor far in the future is not a gap (nothing has been skipped), while
     // a zero cursor on a full ring is: the envelopes must carry `oldest` so a
     // caller can tell the two apart.
@@ -362,7 +365,7 @@ async fn logs_since_reports_a_ring_gap() {
 /// (R-19 round 3, M1).
 #[tokio::test]
 async fn a_wrapped_ring_reports_a_gap_and_truncation() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     // Each scenario run records a protected result plus progress events; enough
     // runs wrap the 500-event ring.
     for _ in 0..600 {
@@ -412,7 +415,7 @@ async fn a_wrapped_ring_reports_a_gap_and_truncation() {
 async fn a_down_plane_says_so_in_the_status_module() {
     use std::sync::atomic::Ordering;
 
-    let state = spawn_worker(false);
+    let state = spawn_worker(false).expect("kernel worker");
     state.down.store(true, Ordering::SeqCst);
     let app = app(state);
     let response = app
@@ -433,7 +436,7 @@ async fn a_down_plane_says_so_in_the_status_module() {
 /// spent grant without reading `/metrics` (R-19 round 4, F9).
 #[tokio::test]
 async fn health_reports_the_fixture_grant() {
-    let app = app(spawn_worker(false));
+    let app = app(spawn_worker(false).expect("kernel worker"));
     let response = app
         .oneshot(
             Request::builder()
@@ -447,5 +450,208 @@ async fn health_reports_the_fixture_grant() {
     assert!(
         body["fixture_calls_remaining"].as_u64().unwrap_or(0) > 0,
         "{body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RPC-51 process tests: the control-plane binary's own argument and
+// environment handling, driven as a real process over a real socket.
+// ---------------------------------------------------------------------------
+
+fn plane_bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_active-control-plane"))
+}
+
+/// A loopback port nothing listens on: bind an ephemeral port, then close
+/// it, so the test plane gets a free port of its own.
+fn free_loopback_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    port
+}
+
+/// The raw body of a `GET /health` against a plane on `port`, if one
+/// answers. A raw socket keeps the test free of an HTTP client dependency.
+fn health_body(port: u16) -> Option<String> {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body).ok()?;
+    Some(body)
+}
+
+async fn wait_for_health(port: u16) -> Option<String> {
+    for _ in 0..50 {
+        if let Some(body) = health_body(port) {
+            return Some(body);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// A plane process kept alive until the test drops it.
+struct Plane {
+    child: Child,
+}
+
+impl Drop for Plane {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_plane(args: &[&str]) -> Plane {
+    let child = plane_bin()
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn plane");
+    Plane { child }
+}
+
+fn start_plane_with_env(args: &[&str], key: &str, value: &str) -> Plane {
+    let child = plane_bin()
+        .args(args)
+        .env(key, value)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn plane");
+    Plane { child }
+}
+
+/// (e) A `--port` outside 1..=65535 is refused with exit 2, not silently
+/// defaulted to 8787 -- and the refusal names the range. Port 0 is
+/// refused too: it would bind an ephemeral port the operator cannot know.
+#[test]
+fn a_port_out_of_range_is_refused_not_defaulted() {
+    for port in ["99999", "0", "abc"] {
+        let output = plane_bin()
+            .args(["--port", port])
+            .output()
+            .expect("spawn plane");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "--port {port}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("1..=65535"),
+            "--port {port} must name the range: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The same refusal through the $PORT environment variable.
+    let output = plane_bin()
+        .env("PORT", "99999")
+        .output()
+        .expect("spawn plane");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// (e) A port inside the range serves health on exactly that port.
+#[tokio::test]
+async fn a_port_in_range_serves_health() {
+    let port = free_loopback_port();
+    let _plane = start_plane(&["--port", &port.to_string()]);
+    let body = wait_for_health(port)
+        .await
+        .expect("the plane answers health on its port");
+    assert!(body.contains("\"ok\":true"), "health body: {body}");
+    assert!(body.contains("\"read_only\":false"), "health body: {body}");
+}
+
+/// (f) `ACP_READ_ONLY` accepts the truthy and falsy spellings an operator
+/// would write -- `1`/`true`/`yes` and `0`/`false`/`no` -- and health
+/// reports the mode it actually serves in.
+#[tokio::test]
+async fn acp_read_only_accepts_the_common_spellings() {
+    for (value, read_only) in [
+        ("1", true),
+        ("true", true),
+        ("yes", true),
+        ("0", false),
+        ("false", false),
+        ("no", false),
+    ] {
+        let port = free_loopback_port();
+        let _plane = start_plane_with_env(&["--port", &port.to_string()], "ACP_READ_ONLY", value);
+        let body = wait_for_health(port)
+            .await
+            .expect("the plane answers health");
+        let want = format!("\"read_only\":{}", read_only);
+        assert!(
+            body.contains(&want),
+            "ACP_READ_ONLY={value} must serve {want}: {body}"
+        );
+    }
+}
+
+/// (f) An `ACP_READ_ONLY` value outside the accepted set is refused with
+/// exit 2, so a typo cannot silently pick a mode.
+#[test]
+fn acp_read_only_refuses_an_unknown_spelling() {
+    let output = plane_bin()
+        .env("ACP_READ_ONLY", "banana")
+        .output()
+        .expect("spawn plane");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must be one of 1/true/yes/0/false/no"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// (h) `--help` prints the options, including the port range and the
+/// `ACP_READ_ONLY` spellings, and exits 0.
+#[test]
+fn help_lists_the_options() {
+    let output = plane_bin().args(["--help"]).output().expect("spawn plane");
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(text.contains("--port PORT"), "help: {text}");
+    assert!(text.contains("1..=65535"), "help: {text}");
+    assert!(text.contains("ACP_READ_ONLY"), "help: {text}");
+    assert!(text.contains("--read-only"), "help: {text}");
+}
+
+/// (h) An unknown argument is refused with exit 2 instead of being
+/// silently ignored -- a typo such as `--prot 9999` used to leave the
+/// plane on the default port with no complaint.
+#[test]
+fn an_unknown_argument_is_refused() {
+    let output = plane_bin()
+        .args(["--prot", "9999"])
+        .output()
+        .expect("spawn plane");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown argument --prot"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

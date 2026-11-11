@@ -39,7 +39,7 @@ impl Provider for Echo {
 fn an_introduction_does_not_revive_a_cross_domain_child_for_the_new_peer() {
     let agent = Agent::with_secret([0x94; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let bob = admitted(b"bob-round4d");
     let alice = admitted(b"alice-round4d");
     let root = agent
@@ -107,7 +107,7 @@ fn an_introduction_does_not_revive_a_cross_domain_child_for_the_new_peer() {
 #[test]
 fn an_introduction_reports_every_child_it_binds() {
     let agent = Agent::with_secret([0x95; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round4e");
     let root = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -140,7 +140,7 @@ fn an_introduction_reports_every_child_it_binds() {
 #[test]
 fn a_wrong_peer_is_refused_before_the_argument_shape() {
     let agent = Agent::with_secret([0x96; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let bob = admitted(b"bob-round4f");
     let alice = admitted(b"alice-round4f");
     let mut attrs = CapAttrs::new(&["echo"]);
@@ -181,7 +181,7 @@ fn admitted(certificate: &[u8]) -> AdmittedIdentity {
 #[test]
 fn an_introduction_does_not_rebind_a_revoked_child() {
     let agent = Agent::with_secret([0x91; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round4");
     let bob = admitted(b"bob-round4");
     let root = agent
@@ -217,7 +217,7 @@ fn an_introduction_does_not_rebind_a_revoked_child() {
 #[test]
 fn a_live_child_is_rebound_with_the_root() {
     let agent = Agent::with_secret([0x92; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round4b");
     let root = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -237,7 +237,7 @@ fn a_live_child_is_rebound_with_the_root() {
 #[test]
 fn a_rotation_leaves_a_revoked_child_bound_to_the_old_peer() {
     let agent = Agent::with_secret([0x93; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let bob = admitted(b"bob-round4c");
     let alice = admitted(b"alice-round4c");
     let root = agent

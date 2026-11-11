@@ -39,6 +39,17 @@ use crate::value::{Arg, Call, Response, Value};
 /// agent and finite, so a hostile or buggy caller fails closed.
 pub const MAX_LANES: usize = 4_096;
 
+/// Global ceiling on providers registered in one kernel.
+///
+/// A provider is a registry entry (a boxed adapter plus its captured surface
+/// in `facts`), so an unbounded registry is an unbounded allocation a peer
+/// could drive by registering providers. The value matches [`MAX_LANES`] and
+/// [`MAX_CHANNELS`]: the other per-kernel registries of the same weight, and
+/// far above any real deployment (tens of providers). Past the ceiling a new
+/// registration is refused with `BudgetExceeded("providers")` (RPC-51) instead
+/// of growing the registry without bound.
+pub const MAX_PROVIDERS: usize = 4_096;
+
 /// Global ceiling on live capabilities in one kernel.
 ///
 /// A capability is a registry entry, so an unbounded registry is an
@@ -1506,14 +1517,23 @@ impl Agent {
     /// `name`, `methods`, `mutating` and the tool policy run with no borrow held,
     /// so a provider that consults the agent while it describes itself is safe
     /// (R-17 round 3, M-2).
-    pub fn register(&self, provider: Box<dyn Provider>) -> ProviderId {
+    ///
+    /// At most [`MAX_PROVIDERS`] providers may be registered in one kernel: a
+    /// further registration is refused with `BudgetExceeded("providers")`
+    /// (RPC-51), the same fail-closed shape as the lane, channel and capability
+    /// ceilings. The refusal happens before the provider is inserted, so a
+    /// refused registration leaves the registry exactly as it was.
+    pub fn register(&self, provider: Box<dyn Provider>) -> Result<ProviderId> {
         let facts = ProviderFacts::capture(provider.as_ref());
         let mut kernel = self.cell.borrow_mut();
+        if kernel.providers.len() >= MAX_PROVIDERS {
+            return Err(Error::BudgetExceeded("providers"));
+        }
         let id = ProviderId(kernel.next_provider);
         kernel.next_provider += 1;
         kernel.facts.insert(id, facts);
         kernel.providers.insert(id, provider);
-        id
+        Ok(id)
     }
 
     /// Configure the simulated provider latency (milliseconds per batch).
@@ -8613,7 +8633,7 @@ mod fail_closed_tests {
     #[test]
     fn a_capability_without_a_meter_fails_closed() {
         let agent = Agent::with_secret([0x5a; 32]);
-        let provider = agent.register(Box::new(Ping));
+        let provider = agent.register(Box::new(Ping)).expect("register provider");
         let cap = agent
             .mint(provider, 0, CapAttrs::new(&["ping"]))
             .expect("mint");
@@ -8637,7 +8657,7 @@ mod fail_closed_tests {
     #[test]
     fn a_plain_provider_mint_carries_no_tool_policy() {
         let agent = Agent::with_secret([0x5a; 32]);
-        let provider = agent.register(Box::new(Ping));
+        let provider = agent.register(Box::new(Ping)).expect("register provider");
         let cap = agent
             .mint(provider, 0, CapAttrs::new(&["ping"]))
             .expect("mint");
@@ -8653,7 +8673,7 @@ mod fail_closed_tests {
     #[test]
     fn a_publish_from_a_capability_without_a_meter_fails_closed() {
         let agent = Agent::with_secret([0x5b; 32]);
-        let provider = agent.register(Box::new(Ping));
+        let provider = agent.register(Box::new(Ping)).expect("register provider");
         let attrs = CapAttrs::new(&["ping", "publish"]).restrict_topics(&["t"]);
         let cap = agent.mint(provider, 0, attrs).expect("mint");
         let lane = agent
@@ -8680,7 +8700,7 @@ mod fail_closed_tests {
         let agent = Agent::with_secret([0x5c; 32]);
         agent.set_durable_capabilities(true);
         agent.set_record_seal_key([0x92; 32]);
-        let provider = agent.register(Box::new(Ping));
+        let provider = agent.register(Box::new(Ping)).expect("register provider");
         let owner = crate::identity::IdentityPolicy::default()
             .admit(
                 Some(&crate::identity::PeerIdentity::from_certificate(
@@ -8734,7 +8754,7 @@ mod pin_scan_tests {
     #[test]
     fn a_repeated_revoke_does_not_scan_the_pin_table() {
         let agent = Agent::new();
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let root = agent
             .mint(provider, 0, CapAttrs::new(&["echo"]))
             .expect("root");
@@ -8785,7 +8805,7 @@ mod pin_scan_tests {
         let agent = Agent::new();
         agent.set_durable_capabilities(true);
         agent.set_record_seal_key([0x66; 32]);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let victim = agent
             .mint(provider, 0, CapAttrs::new(&["echo"]))
             .expect("victim root");
@@ -8849,7 +8869,7 @@ mod pin_scan_tests {
         let agent = Agent::new();
         agent.set_durable_capabilities(true);
         agent.set_record_seal_key([0x67; 32]);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let victim = agent
             .mint(provider, 0, CapAttrs::new(&["echo"]))
             .expect("victim root");
@@ -8917,7 +8937,7 @@ mod pin_scan_tests {
         let agent = Agent::new();
         agent.set_durable_capabilities(true);
         agent.set_record_seal_key([0x68; 32]);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let old = crate::identity::IdentityPolicy::default()
             .admit(
                 Some(&crate::identity::PeerIdentity::from_certificate(
@@ -9053,7 +9073,7 @@ mod durable_counter_tests {
         let agent = Agent::new();
         agent.set_durable_capabilities(true);
         agent.set_record_seal_key([0x64; 32]);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let owner = IdentityPolicy::default()
             .admit(Some(&PeerIdentity::from_certificate(b"owner")), false)
             .expect("admitted");
@@ -9085,7 +9105,7 @@ mod durable_counter_tests {
         let agent = Agent::new();
         agent.set_durable_capabilities(true);
         agent.set_record_seal_key([0x65; 32]);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let old = IdentityPolicy::default()
             .admit(
                 Some(&PeerIdentity::from_certificate(b"rotating-owner")),
@@ -9116,7 +9136,9 @@ mod durable_counter_tests {
         let restorer = Agent::new();
         restorer.set_durable_capabilities(true);
         restorer.set_record_seal_key([0x65; 32]);
-        restorer.register(Box::new(Echo));
+        restorer
+            .register(Box::new(Echo))
+            .expect("register provider");
         // A refused restore must not mint anything, so the counter stays put.
         let stranger = IdentityPolicy::default()
             .admit(Some(&PeerIdentity::from_certificate(b"stranger")), false)

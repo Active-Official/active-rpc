@@ -99,7 +99,11 @@ fn out_line(text: impl std::fmt::Display) -> CliResult {
     match writeln!(out, "{text}").and_then(|()| out.flush()) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-            Err(CliError::transport("stdout closed"))
+            // Code 1, not 3 (RPC-51a): `main()` converts code 1 +
+            // "stdout closed" to success — a closed pipe is not a failure —
+            // and that conversion can never fire on a code-3 error, which is
+            // why `receipts show | head -c 0` exited 3.
+            Err(CliError::refused("stdout closed"))
         }
         Err(error) => Err(CliError::transport(error.to_string())),
     }
@@ -191,7 +195,9 @@ struct Kernel {
 
 fn kernel(methods: &[String]) -> Result<Kernel, CliError> {
     let agent = Agent::new();
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent
+        .register(Box::new(Echo))
+        .map_err(|error| CliError::refused(error.to_string()))?;
     let methods: Vec<String> = methods.to_vec();
     let attrs = CapAttrs::new(&methods.iter().map(String::as_str).collect::<Vec<_>>());
     let cap = agent
@@ -210,6 +216,19 @@ fn dispatch(kernel: &Agent, lane: LaneId, request: &Envelope) -> Envelope {
         return Envelope::error(
             request.request_id,
             &Error::Wire("a server only serves requests"),
+        );
+    }
+    // One capability per call (RPC-51h): `call_from_envelope` takes
+    // exactly one `CapHandle`, so a second descriptor could never be
+    // exercised — and silently ignoring an authority descriptor lets a
+    // sender believe two authorities were checked when only the first was.
+    // A request carrying more than one is refused, not truncated.
+    if request.caps.len() > 1 {
+        return Envelope::error(
+            request.request_id,
+            &Error::Wire(
+                "a request carries more than one capability; this peer serves one capability per call",
+            ),
         );
     }
     let Some(descriptor) = request.caps.first() else {
@@ -312,14 +331,18 @@ fn request(id: u64, method: &str, args: Vec<Arg>, payload: &[u8], cap: Option<Ca
 /// help warns about. The file is read under the same ceiling and the same
 /// world-readable check as a receipt key.
 fn cap_from_file(path: &str) -> Result<CapId, CliError> {
-    let bytes = read_bounded(path, 65)?;
+    // One open (RPC-51g): the bounded read and the permission check both use
+    // this handle, so a rename between them cannot substitute a different
+    // file. The check still runs after the read, matching `read_receipt_key`:
+    // the bytes in memory are process-private, and the refusal happens
+    // before the cap is used.
+    let file = std::fs::File::open(path)
+        .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
+    let bytes = read_bounded_handle(&file, path, 65, false)?;
     // The cap id is bearer credentials (whoever holds the 16 bytes can
     // call): the file holding it goes through the same world-readable
-    // check as a receipt key, as the doc above promises. The check runs
-    // after the bounded read, matching `read_receipt_key`: the bytes in
-    // memory are process-private, and the refusal happens before the cap
-    // is used.
-    check_bearer_file_private(path)?;
+    // check as a receipt key, as the doc above promises.
+    check_bearer_file_private(&file, path)?;
     let text =
         String::from_utf8(bytes).map_err(|_| CliError::usage(format!("{path} is not UTF-8")))?;
     parse_cap(text.trim())
@@ -349,6 +372,12 @@ fn parse_cap(text: &str) -> Result<CapId, CliError> {
         return Err(CliError::usage(
             "--cap must be 32 hex characters (the peer prints it)",
         ));
+    }
+    // `u8::from_str_radix` accepts an optional `+` sign, so `+f00...`
+    // parsed and the call proceeded to connect (RPC-51b). Reject any byte
+    // outside the hex alphabet first; the slice below is then pure hex.
+    if !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CliError::usage("--cap is not valid hex"));
     }
     let mut id = [0u8; 16];
     for (index, slot) in id.iter_mut().enumerate() {
@@ -419,7 +448,12 @@ fn flag_number(
     }
 }
 
-fn split_args(args: &[String]) -> (Vec<String>, BTreeMap<String, String>) {
+/// Split positional arguments from `--flag value` / `--flag=value` flags.
+///
+/// A flag passed twice is refused instead of letting the last value win
+/// silently (RPC-51h): a repeated flag is a typo or two command lines merged
+/// into one, and the value that ran must be the value the operator sees.
+fn split_args(args: &[String]) -> Result<(Vec<String>, BTreeMap<String, String>), CliError> {
     let mut positional = Vec::new();
     let mut flags = BTreeMap::new();
     let mut index = 0;
@@ -430,25 +464,39 @@ fn split_args(args: &[String]) -> (Vec<String>, BTreeMap<String, String>) {
             // accepting only `--name value` silently dropped it (a transport
             // downgrade or an empty payload with exit 0).
             if let Some((name, value)) = name.split_once('=') {
-                flags.insert(format!("--{name}"), value.to_string());
+                insert_flag(&mut flags, format!("--{name}"), value.to_string())?;
                 index += 1;
                 continue;
             }
             let key = format!("--{name}");
             if let Some(value) = args.get(index + 1) {
                 if !value.starts_with("--") {
-                    flags.insert(key, value.clone());
+                    insert_flag(&mut flags, key, value.clone())?;
                     index += 2;
                     continue;
                 }
             }
-            flags.insert(key, String::new());
+            insert_flag(&mut flags, key, String::new())?;
         } else {
             positional.push(arg.clone());
         }
         index += 1;
     }
-    (positional, flags)
+    Ok((positional, flags))
+}
+
+/// Insert one flag, refusing a duplicate instead of overwriting silently.
+fn insert_flag(
+    flags: &mut BTreeMap<String, String>,
+    key: String,
+    value: String,
+) -> Result<(), CliError> {
+    if flags.insert(key.clone(), value).is_some() {
+        return Err(CliError::usage(format!(
+            "{key} was passed twice; pass it once"
+        )));
+    }
+    Ok(())
 }
 
 /// Flags that are true by presence and take no value.
@@ -594,7 +642,13 @@ fn doctor(_args: &[String]) -> CliResult {
         VERSION
     ))?;
     out_line("transports: tcp, connect, http2, quic, in-process, shared-memory")?;
-    out_line("features: quic http2")?;
+    // The features are read off the linked library's own flags, not
+    // hardcoded (RPC-51h): a build without `quic` or `http2` reports exactly
+    // what it has.
+    out_line(format!(
+        "features: {}",
+        active_rpc::enabled_features().join(" ")
+    ))?;
     let budget = Budget::default();
     out_line(format!(
         "budget defaults: calls={} bytes={} wall_ms={} nodes={} depth={} array={} value={}",
@@ -653,7 +707,7 @@ fn announce(
 }
 
 fn peer(args: &[String]) -> CliResult {
-    let (_, flags) = split_args(&args[1..]);
+    let (_, flags) = split_args(&args[1..])?;
     reject_unknown(
         &flags,
         &[
@@ -665,7 +719,14 @@ fn peer(args: &[String]) -> CliResult {
         ],
     )?;
     let transport = transport_name(&flags)?;
-    let limit = flag_number(&flags, "--limit", 1)?;
+    // `0` means "serve until stopped" on every transport (RPC-51h): the tcp
+    // loop and `QuicServer::start` already define 0 that way, while http2,
+    // connect and bridge silently served exactly one call. Normalizing here,
+    // once, keeps the meaning in one place.
+    let limit = match flag_number(&flags, "--limit", 1)? {
+        0 => usize::MAX,
+        limit => limit,
+    };
     // Printing the raw capability id is a transfer of authority, so it is opt-in.
     let emit_hex = flag_bool(&flags, "--emit-cap-hex")?;
     if transport != "quic" && flags.contains_key("--cert-out") {
@@ -721,7 +782,7 @@ fn peer_tcp(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
     announce("tcp", &address, kernel.cap.id(), None, emit_hex)?;
     let mut served = 0usize;
     let mut accept_failures = 0u32;
-    while limit == 0 || served < limit {
+    while served < limit {
         let (stream, _) = match listener.accept() {
             Ok(accepted) => {
                 accept_failures = 0;
@@ -777,7 +838,7 @@ fn peer_http2(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
     announce("http2", &address, kernel.cap.id(), None, emit_hex)?;
     let (tx, rx) = mpsc::channel::<(Envelope, mpsc::Sender<Envelope>)>();
     let server_thread = std::thread::spawn(move || {
-        server.serve(limit.max(1), move |envelope| {
+        server.serve(limit, move |envelope| {
             let (reply_tx, reply_rx) = mpsc::channel();
             if tx.send((envelope, reply_tx)).is_err() {
                 return Envelope::error(0, &Error::Transport("kernel unavailable".to_string()));
@@ -805,7 +866,7 @@ fn peer_connect(kernel: Kernel, limit: usize, emit_hex: bool) -> CliResult {
     announce("connect", &address, kernel.cap.id(), None, emit_hex)?;
     let (tx, rx) = mpsc::channel::<(Envelope, mpsc::Sender<Envelope>)>();
     let server_thread = std::thread::spawn(move || {
-        server.serve(limit.max(1), move |envelope| {
+        server.serve(limit, move |envelope| {
             let (reply_tx, reply_rx) = mpsc::channel();
             if tx.send((envelope, reply_tx)).is_err() {
                 return Envelope::error(0, &Error::Transport("kernel unavailable".to_string()));
@@ -832,11 +893,6 @@ fn peer_quic(
     flags: &BTreeMap<String, String>,
     emit_hex: bool,
 ) -> CliResult {
-    if limit == 0 {
-        return Err(CliError::usage(
-            "quic needs --limit N (the server stops after N calls)",
-        ));
-    }
     let (tx, rx) = mpsc::channel::<(Envelope, mpsc::Sender<Envelope>)>();
     let server = QuicServer::start(limit, move |envelope| {
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -854,7 +910,25 @@ fn peer_quic(
         .filter(|value| !value.is_empty())
         .cloned()
         .unwrap_or_else(|| "active-rpc.cert".to_string());
-    std::fs::write(&cert_path, &certificate)
+    // `create_new` refuses an existing file instead of truncating it
+    // (RPC-51h): the certificate is the peer's identity, and silently
+    // replacing it would strand every client holding the old one. Pass
+    // `--cert-out` with a fresh path to write elsewhere.
+    let mut cert_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&cert_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                CliError::refused(format!(
+                    "{cert_path} already exists; pass --cert-out with a fresh path to write the certificate elsewhere"
+                ))
+            } else {
+                CliError::transport(format!("cannot write {cert_path}: {error}"))
+            }
+        })?;
+    cert_file
+        .write_all(&certificate)
         .map_err(|error| CliError::transport(format!("cannot write {cert_path}: {error}")))?;
     announce(
         "quic",
@@ -884,7 +958,7 @@ fn peer_quic(
 // ---------------------------------------------------------------------------
 
 fn call(args: &[String]) -> CliResult {
-    let (_, flags) = split_args(&args[1..]);
+    let (_, flags) = split_args(&args[1..])?;
     reject_unknown(
         &flags,
         &[
@@ -989,7 +1063,7 @@ fn call(args: &[String]) -> CliResult {
 // ---------------------------------------------------------------------------
 
 fn pipeline(args: &[String]) -> CliResult {
-    let (_, flags) = split_args(&args[1..]);
+    let (_, flags) = split_args(&args[1..])?;
     reject_unknown(
         &flags,
         &[
@@ -1109,7 +1183,7 @@ fn pipeline(args: &[String]) -> CliResult {
 // ---------------------------------------------------------------------------
 
 fn loadgen(args: &[String]) -> CliResult {
-    let (_, flags) = split_args(&args[1..]);
+    let (_, flags) = split_args(&args[1..])?;
     reject_unknown(
         &flags,
         &[
@@ -1125,14 +1199,21 @@ fn loadgen(args: &[String]) -> CliResult {
         ],
     )?;
     let address = endpoint(&flags)?;
-    let cap = parse_cap(
-        flags
-            .get("--cap")
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| CliError::usage("--cap is required"))?,
-    )?;
+    // `--cap-file` is honoured here, not just accepted (RPC-51d): it used to
+    // parse but then `--cap` was required, so the flag was silently ignored.
+    // The shared `capability()` helper reads the file under the RPC-50 mode
+    // check and refuses `--cap` + `--cap-file` together, exactly as `call`
+    // does.
+    let cap = capability(&flags)?;
     let requests = flag_number(&flags, "--requests", 100)?;
-    let concurrency = flag_number(&flags, "--concurrency", 4)?.max(1);
+    // A concurrency of 0 was silently rewritten to 1 (RPC-51h): refuse it,
+    // the same fail-loud shape as `--calls 0` in `pipeline`.
+    let concurrency = flag_number(&flags, "--concurrency", 4)?;
+    if concurrency == 0 {
+        return Err(CliError::usage(
+            "--concurrency must be at least 1".to_string(),
+        ));
+    }
     let deadline = timeout(&flags)?;
     let method = method(&flags);
     let payload = std::sync::Arc::new(payload(&flags)?);
@@ -1263,9 +1344,13 @@ fn loadgen(args: &[String]) -> CliResult {
 // ---------------------------------------------------------------------------
 
 fn bridge(args: &[String]) -> CliResult {
-    let (_, flags) = split_args(&args[1..]);
+    let (_, flags) = split_args(&args[1..])?;
     reject_unknown(&flags, &["--limit", "--emit-cap-hex"])?;
-    let limit = flag_number(&flags, "--limit", 1)?;
+    // `0` means "serve until stopped", as for `peer` (RPC-51h).
+    let limit = match flag_number(&flags, "--limit", 1)? {
+        0 => usize::MAX,
+        limit => limit,
+    };
     let emit_hex = flag_bool(&flags, "--emit-cap-hex")?;
     let kernel = kernel(&["echo".to_string()])?;
     let server =
@@ -1289,7 +1374,7 @@ fn bridge(args: &[String]) -> CliResult {
         .map_err(|error| CliError::transport(error.to_string()))?;
     let (tx, rx) = mpsc::channel::<(Envelope, mpsc::Sender<Envelope>)>();
     let server_thread = std::thread::spawn(move || {
-        server.serve(limit.max(1), move |envelope| {
+        server.serve(limit, move |envelope| {
             let (reply_tx, reply_rx) = mpsc::channel();
             if tx.send((envelope, reply_tx)).is_err() {
                 return Envelope::error(0, &Error::Transport("kernel unavailable".to_string()));
@@ -1315,7 +1400,7 @@ fn bridge(args: &[String]) -> CliResult {
 // ---------------------------------------------------------------------------
 
 fn events(args: &[String]) -> CliResult {
-    let (_, flags) = split_args(&args[1..]);
+    let (_, flags) = split_args(&args[1..])?;
     reject_unknown(
         &flags,
         &[
@@ -1333,7 +1418,20 @@ fn events(args: &[String]) -> CliResult {
         .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
     let mut after = flag_number(&flags, "--after", 0)?;
     let follow = flag_bool(&flags, "--follow")?;
-    let interval = Duration::from_millis(flag_number(&flags, "--interval-ms", 500)? as u64);
+    // A zero (or near-zero) interval is a busy-spin poll loop against
+    // the plane (RPC-51h): the follow loop sleeps `interval` between polls
+    // with no floor. The floor is 50 ms — 20 polls a second against a
+    // loopback HTTP endpoint is responsive for `--follow`, and below it the
+    // local round-trip dominates the sleep anyway, so the loop would be pure
+    // overhead. Refused, not clamped: a silent rewrite would hide the
+    // operator's intent, the same shape as the `--concurrency 0` fix.
+    let interval_ms = flag_number(&flags, "--interval-ms", 500)?;
+    if interval_ms < 50 {
+        return Err(CliError::usage(
+            "--interval-ms must be at least 50".to_string(),
+        ));
+    }
+    let interval = Duration::from_millis(interval_ms as u64);
     let deadline = timeout(&flags)?;
     let mut last_body = String::new();
     loop {
@@ -1364,6 +1462,15 @@ fn events(args: &[String]) -> CliResult {
 
 /// Minimal HTTP/1.1 GET for the control-plane event endpoint.
 fn http_get(url: &str) -> Result<String, CliError> {
+    // The operator-supplied URL is interpolated into the request line
+    // (RPC-51h): a CR or LF in it would split the request and smuggle
+    // headers into a request the operator thought was one line. Refused
+    // before any byte is written.
+    if url.contains('\r') || url.contains('\n') {
+        return Err(CliError::usage(
+            "--plane must not contain CR or LF".to_string(),
+        ));
+    }
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| CliError::usage("--plane must be an http:// URL"))?;
@@ -1505,7 +1612,7 @@ fn dechunk(body: &[u8]) -> Result<String, CliError> {
 // ---------------------------------------------------------------------------
 
 fn replay(args: &[String]) -> CliResult {
-    let (positional, flags) = split_args(&args[1..]);
+    let (positional, flags) = split_args(&args[1..])?;
     match positional.first().map(String::as_str) {
         Some("dump") => {
             reject_unknown(&flags, &["--output", "--force"])?;
@@ -1549,10 +1656,15 @@ fn replay(args: &[String]) -> CliResult {
             // following it, and it is atomic, so two dumps cannot share a temp.
             // The suffix only keeps the two names apart; correctness rests on
             // `create_new`.
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0);
+            // The stamp only keeps two temp names apart (`create_new`
+            // is what makes the temp unique); a pre-epoch clock used to
+            // collapse it silently to 0 (RPC-51h). On a pre-epoch clock the
+            // stamp is the distance *below* the epoch, in nanoseconds, so
+            // it still varies with the clock instead of being a constant.
+            let stamp = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(elapsed) => elapsed.as_nanos(),
+                Err(error) => error.duration().as_nanos(),
+            };
             let temporary = format!("{path}.tmp-{}-{stamp}", std::process::id());
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
@@ -1654,6 +1766,20 @@ fn read_bounded_artifact(path: &str, ceiling: u64) -> Result<Vec<u8>, CliError> 
 fn read_bounded_class(path: &str, ceiling: u64, artifact: bool) -> Result<Vec<u8>, CliError> {
     let file = std::fs::File::open(path)
         .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
+    read_bounded_handle(&file, path, ceiling, artifact)
+}
+
+/// Read `ceiling + 1` bytes from an already-open handle.
+///
+/// The bearer paths (`cap_from_file`, `read_receipt_key`) open the file once
+/// and read + permission-check that one handle (RPC-51g): opening by path a
+/// second time could stat a different file after a rename in between.
+fn read_bounded_handle(
+    file: &std::fs::File,
+    path: &str,
+    ceiling: u64,
+    artifact: bool,
+) -> Result<Vec<u8>, CliError> {
     let mut bytes = Vec::new();
     file.take(ceiling + 1)
         .read_to_end(&mut bytes)
@@ -1684,7 +1810,7 @@ receipts show <log> [--limit N]\n       \
 receipts repair <log>";
 
 fn receipts(args: &[String]) -> CliResult {
-    let (positional, flags) = split_args(&args[1..]);
+    let (positional, flags) = split_args(&args[1..])?;
     match positional.first().map(String::as_str) {
         Some("dump") => {
             reject_unknown(&flags, &["--output"])?;
@@ -1753,7 +1879,7 @@ fn receipts_dump(flags: &BTreeMap<String, String>) -> CliResult {
         .ok_or_else(|| CliError::usage(RECEIPTS_USAGE.to_string()))?;
     let agent = Agent::with_secret(DEMO_SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(DemoProvider));
+    let provider = agent.register(Box::new(DemoProvider)).map_err(refusal)?;
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo", "sum"]))
         .map_err(refusal)?;
@@ -1940,16 +2066,16 @@ fn receipts_show(path: &str, limit: usize) -> CliResult {
 /// no DACL (FAT/exFAT) is refused: the invariant cannot be established
 /// there.
 ///
-/// The check opens the file and inspects the opened handle, not the path:
-/// a rename between the read and the stat would check a different file.
-fn check_bearer_file_private(path: &str) -> Result<(), CliError> {
+/// The check inspects the opened handle the caller passes, not the path:
+/// the caller opens the file once and reads + checks that one handle, so a
+/// rename between the read and the stat cannot substitute a different file
+/// (RPC-51g).
+fn check_bearer_file_private(file: &std::fs::File, path: &str) -> Result<(), CliError> {
     #[cfg(unix)]
     {
         // The open handle, not the path: a rename between the read and the
         // stat would check a different file.
         use std::os::unix::fs::PermissionsExt;
-        let file = std::fs::File::open(path)
-            .map_err(|error| CliError::usage(format!("cannot open {path:?}: {error}")))?;
         let mode = file
             .metadata()
             .map_err(|error| CliError::usage(format!("cannot stat {path:?}: {error}")))?
@@ -1963,12 +2089,10 @@ fn check_bearer_file_private(path: &str) -> Result<(), CliError> {
     }
     #[cfg(windows)]
     {
-        // Same shape as the unix arm above: open the file and check the
-        // opened handle's ACL, so the check describes the file actually
-        // opened rather than a path re-read afterwards.
-        let file = std::fs::File::open(path)
-            .map_err(|error| CliError::usage(format!("cannot open {path:?}: {error}")))?;
-        active_rpc_key_acl::check_key_file_acl(&file).map_err(|reason| {
+        // Same shape as the unix arm above: check the opened handle's ACL,
+        // so the check describes the file actually opened rather than a
+        // path re-read afterwards.
+        active_rpc_key_acl::check_key_file_acl(file).map_err(|reason| {
             CliError::usage(format!(
                 "{path:?} is readable by other accounts ({reason}); restrict the file's ACL to the owner"
             ))
@@ -1993,7 +2117,13 @@ fn check_bearer_file_private(path: &str) -> Result<(), CliError> {
 fn read_receipt_key(path: &str) -> Result<[u8; 32], CliError> {
     // 64 hex characters plus a line ending: a Windows file is 66 bytes, and the
     // old 65-byte ceiling refused a perfectly normal key file.
-    let text = String::from_utf8(read_bounded(path, 68)?)
+    // One open (RPC-51g): the bounded read and the permission check both use
+    // this handle. The check used to open the file a second time by path, so
+    // a rename between the read and the stat could have checked a different
+    // file than the one read, despite the comment claiming otherwise.
+    let file = std::fs::File::open(path)
+        .map_err(|error| CliError::usage(format!("cannot read {path}: {error}")))?;
+    let text = String::from_utf8(read_bounded_handle(&file, path, 68, false)?)
         .map_err(|_| CliError::usage(format!("{path:?} is not text")))?;
     let text = text.trim_end_matches(['\r', '\n']);
     // Same gate as the cap file: a leaked key lets a stranger forge a
@@ -2002,7 +2132,7 @@ fn read_receipt_key(path: &str) -> Result<[u8; 32], CliError> {
     // the shared `check_bearer_file_private` helper so the two bearer
     // paths cannot drift apart. The check itself is byte-identical to
     // what was here (same mask, same messages, same exit code).
-    check_bearer_file_private(path)?;
+    check_bearer_file_private(&file, path)?;
     parse_hex32(text.trim()).ok_or_else(|| {
         CliError::usage(format!(
             "{path:?} must hold 64 hex characters (the kernel's receipt key)"
@@ -2014,6 +2144,12 @@ fn parse_hex32(text: &str) -> Option<[u8; 32]> {
     // A 64-*byte* non-ASCII string would make the two-byte slice below land
     // inside a character and panic; check the alphabet first.
     if text.len() != 64 || !text.is_ascii() {
+        return None;
+    }
+    // Same `+` hole as `parse_cap` (RPC-51b): `from_str_radix` accepts
+    // an optional sign, so a key starting with `+` parsed. Reject any byte
+    // outside the hex alphabet first.
+    if !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let mut bytes = [0u8; 32];
@@ -2076,8 +2212,9 @@ usage: active-rpc-cli <command> [options]
       transport, addr, cap_correlation (and cert for quic); --emit-cap-hex prints
       the raw caller id instead, which is bearer authority. --limit is
       connections for tcp/http2, requests for connect, calls for quic; 0 serves
-      until Ctrl-C on tcp.
-  call --addr HOST:PORT [--transport ...] [--cap HEX] [--method M]
+      until Ctrl-C on every transport.
+  call --addr HOST:PORT [--transport ...] [--cap HEX | --cap-file FILE]
+       [--method M]
        [--payload FILE | --text TEXT] [--cert FILE] [--timeout-ms N]
       Issue one call and print kind, id, payload length and value.
   pipeline --addr HOST:PORT --cap HEX [--calls N] [--method M] [--payload FILE]
@@ -2086,8 +2223,8 @@ usage: active-rpc-cli <command> [options]
       round-trip count. --timeout-ms bounds the whole run: a peer that
       answers every call just inside the deadline still fails the run at
       the total deadline.
-  loadgen --addr HOST:PORT --cap HEX [--requests N] [--concurrency C]
-          [--method M] [--payload FILE] [--timeout-ms N]
+  loadgen --addr HOST:PORT (--cap HEX | --cap-file FILE) [--requests N]
+          [--concurrency C] [--method M] [--payload FILE] [--timeout-ms N]
       Controlled load over C connections; prints p50/p95/p99 and throughput.
       --timeout-ms bounds the whole run, as for pipeline.
   bridge [--limit N]

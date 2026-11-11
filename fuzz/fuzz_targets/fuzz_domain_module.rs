@@ -87,7 +87,7 @@ fuzz_target!(|data: &[u8]| {
             .install_canonical_image(&fixed_image)
             .expect("the canonical image installs");
         let agent = Agent::with_secret([0x32; 32]);
-        let id = agent.register(Box::new(provider));
+        let id = agent.register(Box::new(provider)).expect("register provider");
         let cap = agent
             .mint(id, 0, CapAttrs::new(&["stats", "evaluate", "patch"]))
             .expect("the fixed capability");
@@ -170,7 +170,7 @@ fuzz_target!(|data: &[u8]| {
     let mut provider = ModuleProvider::new();
     if let Ok(object) = provider.install_canonical_image(data) {
         let agent = Agent::with_secret([0x31; 32]);
-        let id = agent.register(Box::new(provider));
+        let id = agent.register(Box::new(provider)).expect("register provider");
         let cap = agent
             .mint(id, object, CapAttrs::new(active_rpc::MODULE_METHODS))
             .expect("mint over an installed module");
@@ -218,7 +218,7 @@ fuzz_target!(|data: &[u8]| {
         let mut provider = ModuleProvider::new();
         if let Ok(object) = provider.install_canonical_image(data) {
             let agent = Agent::with_secret([0x31; 32]);
-            let id = agent.register(Box::new(provider));
+            let id = agent.register(Box::new(provider)).expect("register provider");
             let cap = agent
                 .mint(
                     id,
@@ -271,7 +271,7 @@ fuzz_target!(|data: &[u8]| {
     let mut provider = ModuleProvider::new();
     if let Ok(object) = provider.install_canonical_image(source.as_bytes()) {
         let agent = Agent::with_secret([0x32; 32]);
-        let id = agent.register(Box::new(provider));
+        let id = agent.register(Box::new(provider)).expect("register provider");
         let cap = agent
             .mint(id, object, CapAttrs::new(&["why"]))
             .expect("mint");
@@ -303,7 +303,7 @@ fuzz_target!(|data: &[u8]| {
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x33; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent.register(Box::new(provider)).expect("register provider");
     let redacted: Vec<&str> = PATH_METHODS
         .iter()
         .chain(VALUE_METHODS.iter())

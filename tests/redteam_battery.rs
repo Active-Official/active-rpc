@@ -202,11 +202,13 @@ fn provider(
     calls: &Arc<AtomicUsize>,
     drops: &Arc<Mutex<Vec<(u64, CapId)>>>,
 ) -> ProviderId {
-    agent.register(Box::new(Counting {
-        calls: Arc::clone(calls),
-        drops: Arc::clone(drops),
-        methods: &["ping", "echo", "fail", "mutate"],
-    }))
+    agent
+        .register(Box::new(Counting {
+            calls: Arc::clone(calls),
+            drops: Arc::clone(drops),
+            methods: &["ping", "echo", "fail", "mutate"],
+        }))
+        .expect("register provider")
 }
 
 fn mint(agent: &Agent, provider: ProviderId, methods: &[&str]) -> active_rpc::CapHandle {
@@ -382,10 +384,12 @@ fn h2_12_tool() -> std::result::Result<(), String> {
         .create_lane("tools", Budget::default())
         .map_err(|e| e.to_string())?;
 
-    let http = agent.register(Box::new(HttpTool::new(
-        "http://127.0.0.1:1",
-        &[("GET", "/safe")],
-    )));
+    let http = agent
+        .register(Box::new(HttpTool::new(
+            "http://127.0.0.1:1",
+            &[("GET", "/safe")],
+        )))
+        .expect("register provider");
     let http_cap = agent
         .mint(
             http,
@@ -412,9 +416,11 @@ fn h2_12_tool() -> std::result::Result<(), String> {
     let program = "C:\\Windows\\System32\\cmd.exe";
     #[cfg(not(windows))]
     let program = "/bin/sh";
-    let process = agent.register(Box::new(
-        LocalProcess::new(program, &["ok"]).expect("an absolute program"),
-    ));
+    let process = agent
+        .register(Box::new(
+            LocalProcess::new(program, &["ok"]).expect("an absolute program"),
+        ))
+        .expect("register provider");
     let process_cap = agent
         .mint(
             process,
@@ -478,7 +484,12 @@ fn secret_module(literal: &str) -> active_infinity::InfinityModule {
 fn module_provider(agent: &Agent, literal: &str) -> (ProviderId, u64) {
     let mut provider = ModuleProvider::new();
     let object = provider.install(secret_module(literal)).expect("install");
-    (agent.register(Box::new(provider)), object)
+    (
+        agent
+            .register(Box::new(provider))
+            .expect("register provider"),
+        object,
+    )
 }
 
 fn h2_18_events() -> std::result::Result<(), String> {
@@ -594,11 +605,13 @@ fn h2_21_registries() -> std::result::Result<(), String> {
 
 fn h2_23_zero() -> std::result::Result<(), String> {
     let agent = agent(23);
-    let provider = agent.register(Box::new(Counting {
-        calls: Arc::new(AtomicUsize::new(0)),
-        drops: Arc::new(Mutex::new(Vec::new())),
-        methods: &["ping"],
-    }));
+    let provider = agent
+        .register(Box::new(Counting {
+            calls: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::new(Mutex::new(Vec::new())),
+            methods: &["ping"],
+        }))
+        .expect("register provider");
     let zeros = [
         Budget {
             max_calls: 0,
@@ -701,11 +714,13 @@ fn h2_29_read_only() -> std::result::Result<(), String> {
 
 fn h2_32_errors() -> std::result::Result<(), String> {
     let agent = agent(32);
-    let provider = agent.register(Box::new(Counting {
-        calls: Arc::new(AtomicUsize::new(0)),
-        drops: Arc::new(Mutex::new(Vec::new())),
-        methods: &["fail"],
-    }));
+    let provider = agent
+        .register(Box::new(Counting {
+            calls: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::new(Mutex::new(Vec::new())),
+            methods: &["fail"],
+        }))
+        .expect("register provider");
     let lane = agent
         .create_lane("main", Budget::default())
         .map_err(|e| e.to_string())?;
@@ -871,10 +886,12 @@ fn h2_46_path() -> std::result::Result<(), String> {
     let lane = agent
         .create_lane("http", Budget::default())
         .map_err(|e| e.to_string())?;
-    let http = agent.register(Box::new(HttpTool::new(
-        "http://127.0.0.1:1",
-        &[("GET", "/safe")],
-    )));
+    let http = agent
+        .register(Box::new(HttpTool::new(
+            "http://127.0.0.1:1",
+            &[("GET", "/safe")],
+        )))
+        .expect("register provider");
     let cap = agent
         .mint(
             http,

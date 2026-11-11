@@ -47,7 +47,9 @@ fn fixture(methods: &[&str], scope: Option<&str>) -> (Fixture, CapHandle, LaneId
     let agent = Agent::with_secret([0x77; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(hostile_module()).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(methods);
     attrs.path_scope = scope.map(str::to_string);
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -144,7 +146,9 @@ fn subgraph_and_content_hash_respect_the_node_budget() {
     let agent = Agent::with_secret([0x79; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(hostile_module()).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut tight_attrs = CapAttrs::new(&["subgraph", "content_hash"]);
     tight_attrs.budget = Budget {
         max_nodes: 1,
@@ -187,7 +191,9 @@ fn an_alias_cannot_bypass_ai_immutable() {
     let agent = Agent::with_secret([0x78; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(id, object, CapAttrs::new(&["patch", "evaluate"]))
         .expect("cap");
@@ -246,7 +252,9 @@ fn a_scoped_answer_cannot_reach_a_constraint_expression_outside_the_scope() {
     let agent = Agent::with_secret([0x7a; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["evaluate", "subgraph"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -282,7 +290,9 @@ fn a_scoped_evaluate_refuses_a_host_environment_read() {
     let agent = Agent::with_secret([0x7b; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["evaluate"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -318,7 +328,9 @@ fn an_ancestor_patch_cannot_delete_an_immutable_subtree() {
     let agent = Agent::with_secret([0x7c; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(id, object, CapAttrs::new(&["patch", "evaluate"]))
         .expect("cap");
@@ -364,7 +376,9 @@ fn a_scoped_subgraph_carries_no_provenance() {
     let agent = Agent::with_secret([0x7d; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["subgraph"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -393,7 +407,9 @@ fn evaluate_respects_the_node_budget() {
     let agent = Agent::with_secret([0x7e; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(hostile_module()).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["evaluate"]);
     attrs.budget = Budget {
         max_nodes: 1,
@@ -436,7 +452,9 @@ fn a_scoped_answer_cannot_reach_a_pathless_expression() {
     let agent = Agent::with_secret([0x81; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["evaluate", "subgraph"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -500,7 +518,9 @@ fn a_deep_constraint_chain_is_followed() {
     let agent = Agent::with_secret([0x82; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["subgraph"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -532,7 +552,9 @@ fn a_scoped_cone_reply_carries_no_annotation_text() {
     let agent = Agent::with_secret([0x83; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["subgraph"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -599,7 +621,9 @@ fn a_scoped_patch_reply_carries_no_provenance() {
     let agent = Agent::with_secret([0x84; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["patch"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -651,7 +675,9 @@ fn a_binding_cannot_launder_an_outside_node_into_the_scope() {
     let agent = Agent::with_secret([0x85; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["evaluate", "why", "subgraph"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -696,7 +722,9 @@ fn a_scoped_impact_cannot_answer_through_a_reference_alias() {
     let agent = Agent::with_secret([0x86; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["impact"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -732,7 +760,9 @@ fn a_scoped_cone_keeps_the_immutability_guard() {
     let agent = Agent::with_secret([0x87; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["subgraph"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -806,7 +836,9 @@ fn a_reverse_order_constraint_chain_is_followed_to_its_end() {
     let agent = Agent::with_secret([0x83; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["subgraph", "patch"]);
     attrs.path_scope = Some("app".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -1042,7 +1074,9 @@ fn install_copying(attrs: CapAttrs) -> (Agent, CapHandle, LaneId, u64) {
     let agent = Agent::with_secret([0x62; 32]);
     let mut provider = ModuleProvider::new();
     let object = provider.install(copying_module()).expect("install");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent.mint(id, object, attrs).expect("cap");
     let lane = agent
         .create_lane("round9", Budget::default())

@@ -51,7 +51,7 @@ fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
 
 fn agent() -> (Agent, active_rpc::ProviderId, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x41; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent
         .create_lane("round2", Budget::default())
         .expect("lane");
@@ -62,7 +62,7 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     let agent = Agent::with_secret([0x42; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x84; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     (agent, provider)
 }
 
@@ -123,7 +123,9 @@ fn a_tombstone_replayed_at_startup_refuses_the_record() {
     let restarted = Agent::with_secret([0x42; 32]);
     restarted.set_durable_capabilities(true);
     restarted.set_record_seal_key([0x84; 32]);
-    restarted.register(Box::new(Echo));
+    restarted
+        .register(Box::new(Echo))
+        .expect("register provider");
     let accepted = restarted
         .restore_capability_in_process_only(&record, &owner)
         .expect("without the tombstone the record restores");
@@ -236,7 +238,9 @@ fn a_record_keeps_the_clock_mode_its_deadline_was_taken_in() {
     let virtual_kernel = Agent::with_secret([0x43; 32]);
     virtual_kernel.set_durable_capabilities(true);
     virtual_kernel.set_record_seal_key([0x84; 32]);
-    virtual_kernel.register(Box::new(Echo));
+    virtual_kernel
+        .register(Box::new(Echo))
+        .expect("register provider");
     let error = virtual_kernel
         .restore_capability_in_process_only(&record, &owner)
         .expect_err("a wall-clock deadline cannot be read in virtual time");
@@ -303,10 +307,12 @@ fn a_provider_may_use_the_agent_inside_on_drop() {
     let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
     let agent = Agent::with_secret([0x44; 32]);
     *slot.borrow_mut() = Some(agent.clone());
-    let provider = agent.register(Box::new(Callback {
-        agent: Rc::clone(&slot),
-        pins: Rc::clone(&pins),
-    }));
+    let provider = agent
+        .register(Box::new(Callback {
+            agent: Rc::clone(&slot),
+            pins: Rc::clone(&pins),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["hold"]))
         .expect("cap");
@@ -354,7 +360,7 @@ fn a_provider_awaiting_its_own_call_is_refused() {
     }
 
     let agent = Agent::with_secret([0x45; 32]);
-    let inner_provider = agent.register(Box::new(Echo));
+    let inner_provider = agent.register(Box::new(Echo)).expect("register provider");
     let inner = agent
         .mint(inner_provider, 0, CapAttrs::new(&["echo"]))
         .expect("inner cap");
@@ -365,12 +371,14 @@ fn a_provider_awaiting_its_own_call_is_refused() {
     let inner_slot: Rc<RefCell<Option<CapHandle>>> = Rc::new(RefCell::new(Some(inner)));
     let lane_slot: Rc<RefCell<Option<active_rpc::LaneId>>> =
         Rc::new(RefCell::new(Some(inner_lane)));
-    let provider = agent.register(Box::new(Awaiter {
-        agent: Rc::clone(&slot),
-        inner: Rc::clone(&inner_slot),
-        lane: Rc::clone(&lane_slot),
-        outcome: Rc::clone(&outcome),
-    }));
+    let provider = agent
+        .register(Box::new(Awaiter {
+            agent: Rc::clone(&slot),
+            inner: Rc::clone(&inner_slot),
+            lane: Rc::clone(&lane_slot),
+            outcome: Rc::clone(&outcome),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["wait"]))
         .expect("cap");
@@ -420,9 +428,11 @@ fn a_panicking_provider_does_not_wedge_the_kernel() {
 
     let calls = Rc::new(Cell::new(0));
     let agent = Agent::with_secret([0x46; 32]);
-    let provider = agent.register(Box::new(BreakOnce {
-        calls: Rc::clone(&calls),
-    }));
+    let provider = agent
+        .register(Box::new(BreakOnce {
+            calls: Rc::clone(&calls),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["once"]))
         .expect("cap");
@@ -481,9 +491,11 @@ fn a_panicking_on_drop_keeps_the_provider() {
 
     let armed = Rc::new(Cell::new(1));
     let agent = Agent::with_secret([0x48; 32]);
-    let provider = agent.register(Box::new(PanicOnce {
-        armed: Rc::clone(&armed),
-    }));
+    let provider = agent
+        .register(Box::new(PanicOnce {
+            armed: Rc::clone(&armed),
+        }))
+        .expect("register provider");
     let doomed = agent
         .mint(provider, 1, CapAttrs::new(&["hold"]))
         .expect("doomed");
@@ -592,10 +604,12 @@ fn a_drop_raised_inside_on_drop_is_delivered_once() {
     let slot: Rc<RefCell<Option<CapHandle>>> = Rc::new(RefCell::new(None));
     let seen = Rc::new(RefCell::new(Vec::new()));
     let agent = Agent::with_secret([0x47; 32]);
-    let provider = agent.register(Box::new(Nested {
-        slot: Rc::clone(&slot),
-        seen: Rc::clone(&seen),
-    }));
+    let provider = agent
+        .register(Box::new(Nested {
+            slot: Rc::clone(&slot),
+            seen: Rc::clone(&seen),
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(
         agent
             .mint(provider, 7, CapAttrs::new(&["hold"]))

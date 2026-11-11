@@ -97,7 +97,7 @@ fn a_process_control_runs_the_child() {
     };
     let tool = LocalProcess::new("/bin/echo", &["ok"]).expect("an absolute program");
     let agent = active_rpc::Agent::new();
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let lane = agent
         .create_lane("control", Budget::default())
         .expect("lane");
@@ -156,7 +156,7 @@ fn an_http_control_reaches_the_endpoint() {
     let tool = HttpTool::new(format!("http://{address}"), &[("GET", "/safe")]);
     let policy = tool.policy();
     let agent = active_rpc::Agent::new();
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let lane = agent
         .create_lane("control", Budget::default())
         .expect("lane");

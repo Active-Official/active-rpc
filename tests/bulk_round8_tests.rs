@@ -30,7 +30,9 @@ fn the_wall_bound_is_named() {
     assert!(plan.required_wall_ms() > 0);
 
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
     let mut attrs = CapAttrs::new(&["plan", "put", "missing", "finish"]);
     attrs.budget.max_bytes = plan.required_grant();
@@ -107,7 +109,9 @@ fn the_lane_bound_is_named() {
 
 fn run_lane(transfer: &BulkTransfer, lane_bytes: u64) -> Result<(), Error> {
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent
         .create_lane(
             "bulk",

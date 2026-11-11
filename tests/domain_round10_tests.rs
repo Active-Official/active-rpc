@@ -20,7 +20,9 @@ fn install(
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x71; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(methods);
     attrs.path_scope = scope.map(str::to_string);
     attrs.redact = redact;
@@ -188,7 +190,9 @@ fn a_patch_cannot_declassify_an_install_time_secret() {
     let mut provider = ModuleProvider::new();
     let object = provider.install(module.clone()).expect("install");
     let agent = Agent::with_secret([0x74; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["patch", "subgraph", "evaluate", "content_hash"]);
     attrs.redact = true;
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -540,7 +544,9 @@ fn the_last_drop_reclaims_the_module() {
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x72; 32]);
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(provider_id, object, CapAttrs::new(&["evaluate"]))
         .expect("cap");
@@ -875,7 +881,9 @@ fn an_annotation_flood_is_refused_by_the_node_ceiling() {
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x72; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(id, object, CapAttrs::new(&["why"]))
         .expect("cap");
@@ -942,7 +950,9 @@ fn a_scoped_walk_over_many_constraints_stays_within_the_wall_ceiling() {
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x73; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["why", "patch"]);
     attrs.path_scope = Some("app.a".to_string());
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -1452,7 +1462,9 @@ fn a_mutating_patch_refused_on_egress_reports_the_write() {
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x72; 32]);
     agent.enable_receipts(true);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["patch", "content_hash"]);
     // Enough for the arguments and a hash reply, not enough for the patch
     // reply that carries the new cone.
@@ -1510,7 +1522,9 @@ fn a_patch_reply_does_not_reveal_the_installed_secret() {
         let mut provider = ModuleProvider::new();
         let object = provider.install(module).expect("install");
         let agent = Agent::with_secret([0x74; 32]);
-        let id = agent.register(Box::new(provider));
+        let id = agent
+            .register(Box::new(provider))
+            .expect("register provider");
         let mut attrs = CapAttrs::new(&["patch"]);
         attrs.redact = redact;
         let cap = agent.mint(id, object, attrs).expect("cap");
@@ -1574,7 +1588,9 @@ fn a_mutating_reply_with_a_structural_secret_is_a_withheld_reply() {
 
     let agent = Agent::with_secret([0x75; 32]);
     agent.enable_receipts(true);
-    let id = agent.register(Box::new(SecretWriter { image }));
+    let id = agent
+        .register(Box::new(SecretWriter { image }))
+        .expect("register provider");
     let cap = agent.mint(id, 0, CapAttrs::new(&["write"])).expect("cap");
     let lane = agent
         .create_lane("r10-withheld", Budget::default())
@@ -1635,10 +1651,12 @@ fn a_withheld_reply_is_not_re_executed_by_its_key() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let agent = Agent::with_secret([0x76; 32]);
-    let id = agent.register(Box::new(SecretWriter {
-        image,
-        calls: Arc::clone(&calls),
-    }));
+    let id = agent
+        .register(Box::new(SecretWriter {
+            image,
+            calls: Arc::clone(&calls),
+        }))
+        .expect("register provider");
     let cap = agent.mint(id, 0, CapAttrs::new(&["write"])).expect("cap");
     let lane = agent
         .create_lane("r10-withheld-key", Budget::default())
@@ -1678,7 +1696,9 @@ fn a_binding_heavy_module_is_refused_against_the_node_ceiling() {
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x77; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["stats"]);
     attrs.budget.max_nodes = 32;
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -1711,7 +1731,9 @@ fn a_wide_table_is_refused_against_the_node_ceiling_before_the_walk() {
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x78; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["stats", "why"]);
     attrs.budget.max_nodes = 4;
     attrs.budget.max_wall_ms = 5;
@@ -1753,7 +1775,9 @@ fn a_sibling_revoke_does_not_release_an_export_pin() {
     let agent = Agent::with_secret([0x79; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x95; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["stats"]);
     attrs.persistence = active_rpc::CapPersistence::Durable;
     let owner = active_rpc::IdentityPolicy::default()

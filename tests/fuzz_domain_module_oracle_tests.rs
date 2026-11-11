@@ -122,7 +122,9 @@ fn fixed_module_evaluate_and_patch_roundtrip() {
         .install_canonical_image(&fixed_image)
         .expect("the canonical image installs");
     let agent = Agent::with_secret([0x32; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(id, 0, CapAttrs::new(&["stats", "evaluate", "patch"]))
         .expect("the fixed capability");

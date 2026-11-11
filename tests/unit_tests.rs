@@ -57,7 +57,9 @@ fn agent_with_module() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle)
         .install(active_rpc::domain::module_from_source(SOURCE, "unit.active").expect("module"))
         .expect("install");
     let agent = Agent::with_secret([7u8; 32]);
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider_id,
@@ -112,7 +114,9 @@ fn capability_ids_are_unforgeable() {
         .install(active_rpc::domain::module_from_source(SOURCE, "other.active").unwrap())
         .expect("install");
     let other_agent = Agent::new();
-    let other_provider = other_agent.register(Box::new(provider));
+    let other_provider = other_agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let other_cap = other_agent
         .mint(
             other_provider,
@@ -371,7 +375,7 @@ fn revocation_kills_the_capability_and_its_children() {
 #[test]
 fn pipelining_costs_one_round_trip_and_sequential_costs_two() {
     let agent = Agent::with_secret([3u8; 32]);
-    let provider_id = agent.register(Box::new(Echo));
+    let provider_id = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider_id, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -408,7 +412,7 @@ fn pipelining_costs_one_round_trip_and_sequential_costs_two() {
 #[test]
 fn promise_argument_values_are_resolved_before_the_provider_runs() {
     let agent = Agent::with_secret([4u8; 32]);
-    let provider_id = agent.register(Box::new(Echo));
+    let provider_id = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider_id, 0, CapAttrs::new(&["echo"]))
         .unwrap();
@@ -425,7 +429,7 @@ fn promise_argument_values_are_resolved_before_the_provider_runs() {
 #[test]
 fn promise_can_be_cancelled_or_resolved_once() {
     let agent = Agent::with_secret([5u8; 32]);
-    let provider_id = agent.register(Box::new(Echo));
+    let provider_id = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider_id, 0, CapAttrs::new(&["echo"]))
         .unwrap();
@@ -644,7 +648,7 @@ fn response_and_error_envelopes_carry_no_payload() {
 #[test]
 fn tool_policy_is_enforced_on_tool_calls() {
     let agent = Agent::with_secret([11u8; 32]);
-    let provider_id = agent.register(Box::new(Echo));
+    let provider_id = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("main", Budget::default()).unwrap();
     let mut policy = ToolPolicy::allow(&["echo"]);
     // Wire size of Arg::text("ok") is 7 bytes (tag + length + text).
@@ -903,9 +907,11 @@ fn capability_lifecycle_matches_the_bounded_model() {
         }
         let drops = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let agent = Agent::with_secret([3u8; 32]);
-        let provider = agent.register(Box::new(DropSpy {
-            drops: std::rc::Rc::clone(&drops),
-        }));
+        let provider = agent
+            .register(Box::new(DropSpy {
+                drops: std::rc::Rc::clone(&drops),
+            }))
+            .expect("register provider");
         let lane = agent.create_lane("life", Budget::default()).expect("lane");
         let root = agent
             .mint(provider, 0, CapAttrs::new(&["ping"]))
@@ -1284,7 +1290,9 @@ fn settled_value_bytes_are_bounded_after_a_drain() {
     use active_rpc::kernel::MAX_SETTLED_BYTES;
 
     let agent = Agent::with_secret([19u8; 32]);
-    let provider = agent.register(Box::new(BigValue));
+    let provider = agent
+        .register(Box::new(BigValue))
+        .expect("register provider");
     // The byte grant covers 100 one-MiB responses (egress is charged too); the
     // retention ceiling is what this test is about.
     let wide = Budget {

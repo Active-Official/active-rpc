@@ -42,7 +42,7 @@ impl Provider for Echo {
 
 fn agent() -> (Agent, active_rpc::ProviderId) {
     let agent = Agent::with_secret([0x61; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     (agent, provider)
 }
 
@@ -333,11 +333,13 @@ fn destroying_a_lane_mid_batch_settles_its_running_call_once() {
     let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
     let victim = Rc::new(Cell::new(None));
     let work = Rc::new(Cell::new(0usize));
-    let provider = agent.register(Box::new(Killer {
-        agent: Rc::clone(&slot),
-        victim: Rc::clone(&victim),
-        work: Rc::clone(&work),
-    }));
+    let provider = agent
+        .register(Box::new(Killer {
+            agent: Rc::clone(&slot),
+            victim: Rc::clone(&victim),
+            work: Rc::clone(&work),
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["kill", "work"]))
@@ -423,12 +425,14 @@ fn destroying_a_lane_does_not_release_a_running_jobs_dependency() {
     let victim = Rc::new(Cell::new(None));
     let dependency: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
     let observed = Rc::new(Cell::new(None));
-    let provider = agent.register(Box::new(ChainKiller {
-        agent: Rc::clone(&slot),
-        victim: Rc::clone(&victim),
-        dependency: Rc::clone(&dependency),
-        observed: Rc::clone(&observed),
-    }));
+    let provider = agent
+        .register(Box::new(ChainKiller {
+            agent: Rc::clone(&slot),
+            victim: Rc::clone(&victim),
+            dependency: Rc::clone(&dependency),
+            observed: Rc::clone(&observed),
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["zero", "first"]))
@@ -613,7 +617,7 @@ fn destroying_a_full_lane_does_not_flood_the_tape() {
         .create_channel("flood", Direction::Both)
         .expect("channel");
     agent.subscribe(lane, channel).expect("subscribe");
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");

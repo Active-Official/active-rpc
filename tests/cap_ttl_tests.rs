@@ -28,7 +28,7 @@ impl Provider for Echo {
 
 fn agent() -> (Agent, active_rpc::ProviderId, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x7c; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("ttl", Budget::default()).expect("lane");
     (agent, provider, lane)
 }
@@ -90,7 +90,9 @@ fn a_call_that_expires_while_queued_never_reaches_the_provider() {
     // round trip that dispatches it. Dispatch must re-check the deadline, so
     // the provider is never invoked.
     let agent = Agent::with_secret([0x7d; 32]);
-    let provider = agent.register(Box::new(NeverRun));
+    let provider = agent
+        .register(Box::new(NeverRun))
+        .expect("register provider");
     let lane = agent.create_lane("ttl", Budget::default()).expect("lane");
     agent.set_latency(100);
     let cap = agent

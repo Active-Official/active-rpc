@@ -41,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
         // would have passed the old check (R-20 round 6, finding 5).
         let tool = LocalProcess::new("/bin/echo", &["ok"]).expect("an absolute program");
         let control = common::agent(&[0x05]);
-        let provider = control.register(Box::new(tool));
+        let provider = control.register(Box::new(tool)).expect("register provider");
         let lane = control
             .create_lane("control", Budget::default())
             .expect("the control lane");
@@ -79,7 +79,7 @@ fuzz_target!(|data: &[u8]| {
     assert!(policy().is_attenuation_of(&tool.policy()));
 
     let agent = common::agent(data);
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let lane = agent
         .create_lane("process", Budget::default())
         .expect("default lane budget");

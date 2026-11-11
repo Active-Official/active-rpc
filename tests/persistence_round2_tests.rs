@@ -43,7 +43,7 @@ fn durable_agent() -> (Agent, ProviderId) {
     let agent = Agent::with_secret([0x77; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key(SEAL);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     (agent, provider)
 }
 

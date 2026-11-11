@@ -43,7 +43,7 @@ fn receipt_key() -> [u8; 32] {
 fn session() -> (Agent, Vec<Receipt>) {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");

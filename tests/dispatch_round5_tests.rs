@@ -77,12 +77,14 @@ fn worker_agent() -> (Agent, active_rpc::CapHandle, Rc<Cell<usize>>) {
     let victim: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
     let self_handle: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
     let runs = Rc::new(Cell::new(0usize));
-    let provider = agent.register(Box::new(Worker {
-        agent: Rc::clone(&slot),
-        victim: Rc::clone(&victim),
-        self_handle: Rc::clone(&self_handle),
-        runs: Rc::clone(&runs),
-    }));
+    let provider = agent
+        .register(Box::new(Worker {
+            agent: Rc::clone(&slot),
+            victim: Rc::clone(&victim),
+            self_handle: Rc::clone(&self_handle),
+            runs: Rc::clone(&runs),
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
         .mint(
@@ -218,7 +220,7 @@ fn a_dispatch_time_path_refusal_is_counted() {
     }
 
     let agent = Agent::with_secret([0x92; 32]);
-    let provider = agent.register(Box::new(Leaker));
+    let provider = agent.register(Box::new(Leaker)).expect("register provider");
     let cap = agent
         .mint(
             provider,
@@ -284,10 +286,12 @@ fn a_cancelled_running_job_seals_one_receipt_even_when_it_fails() {
     agent.enable_receipts(true);
     let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
     let own: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
-    let provider = agent.register(Box::new(Failing {
-        agent: Rc::clone(&slot),
-        own: Rc::clone(&own),
-    }));
+    let provider = agent
+        .register(Box::new(Failing {
+            agent: Rc::clone(&slot),
+            own: Rc::clone(&own),
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))
@@ -344,7 +348,7 @@ fn a_dispatch_budget_refusal_is_a_refused_call() {
     }
 
     let agent = Agent::with_secret([0x94; 32]);
-    let provider = agent.register(Box::new(Big));
+    let provider = agent.register(Box::new(Big)).expect("register provider");
     let cap = agent
         .mint(
             provider,
@@ -409,11 +413,13 @@ fn cancelling_a_running_tree_is_on_the_tape() {
     let slot: Rc<RefCell<Option<Agent>>> = Rc::new(RefCell::new(None));
     let own: Rc<RefCell<Option<PromiseHandle>>> = Rc::new(RefCell::new(None));
     let runs = Rc::new(Cell::new(0usize));
-    let provider = agent.register(Box::new(TreeCanceller {
-        agent: Rc::clone(&slot),
-        own: Rc::clone(&own),
-        runs: Rc::clone(&runs),
-    }));
+    let provider = agent
+        .register(Box::new(TreeCanceller {
+            agent: Rc::clone(&slot),
+            own: Rc::clone(&own),
+            runs: Rc::clone(&runs),
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))

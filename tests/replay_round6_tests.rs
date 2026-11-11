@@ -33,7 +33,7 @@ fn durable() -> CapAttrs {
 #[test]
 fn repeated_revokes_of_a_revoked_subtree_are_linear() {
     let agent = Agent::new();
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent
         .create_lane("replay", Budget::default())
         .expect("lane");
@@ -76,7 +76,7 @@ fn repeated_revokes_with_a_surviving_pin_table_stay_linear() {
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x63; 32]);
     let owner = admitted(b"owner");
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut root_attrs = durable();
     root_attrs.budget.max_calls = u64::from(PINS as u32) + 1;
     root_attrs.budget.max_bytes = 1 << 20;

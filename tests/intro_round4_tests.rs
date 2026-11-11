@@ -100,10 +100,12 @@ fn a_drain_leaves_the_providers_queued_work_alone() {
     let agent = Agent::new();
     let slot: AgentSlot = Rc::new(RefCell::new(None));
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let id = agent.register(Box::new(RunFromDrain {
-        agent: Rc::clone(&slot),
-        seen,
-    }));
+    let id = agent
+        .register(Box::new(RunFromDrain {
+            agent: Rc::clone(&slot),
+            seen,
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     let lane = agent.create_lane("drain", Budget::default()).expect("lane");
     let cap = agent.mint(id, 0, CapAttrs::new(&["noop"])).expect("cap");
@@ -123,10 +125,12 @@ fn a_drop_raised_during_a_drain_is_delivered_on_the_next_drain() {
     let agent = Agent::new();
     let held: Rc<RefCell<Option<CapHandle>>> = Rc::new(RefCell::new(None));
     let seen = Rc::new(RefCell::new(Vec::new()));
-    let id = agent.register(Box::new(DropInDrain {
-        held: Rc::clone(&held),
-        seen: Rc::clone(&seen),
-    }));
+    let id = agent
+        .register(Box::new(DropInDrain {
+            held: Rc::clone(&held),
+            seen: Rc::clone(&seen),
+        }))
+        .expect("register provider");
     let cap = agent.mint(id, 7, CapAttrs::new(&["noop"])).expect("cap");
     let cap_id = cap.id();
     *held.borrow_mut() = Some(cap);
@@ -167,7 +171,9 @@ impl Provider for PanickingDrain {
 #[test]
 fn a_panicking_drain_restores_the_provider_and_is_on_the_tape() {
     let agent = Agent::new();
-    let id = agent.register(Box::new(PanickingDrain));
+    let id = agent
+        .register(Box::new(PanickingDrain))
+        .expect("register provider");
     assert!(
         agent.take_drops(id).is_empty(),
         "a panicking drain answers empty"
@@ -233,12 +239,14 @@ fn a_drop_that_keeps_a_borrow_parks_the_provider_instead_of_losing_it() {
     let armed = Rc::new(Cell::new(false));
     let delivered = Rc::new(Cell::new(0));
     let dropped = Rc::new(Cell::new(0));
-    let id = agent.register(Box::new(LeakyDrop {
-        agent: Rc::clone(&slot),
-        armed: Rc::clone(&armed),
-        delivered: Rc::clone(&delivered),
-        dropped: Rc::clone(&dropped),
-    }));
+    let id = agent
+        .register(Box::new(LeakyDrop {
+            agent: Rc::clone(&slot),
+            armed: Rc::clone(&armed),
+            delivered: Rc::clone(&delivered),
+            dropped: Rc::clone(&dropped),
+        }))
+        .expect("register provider");
     let cap = agent.mint(id, 0, CapAttrs::new(&["noop"])).expect("cap");
     armed.set(true);
     // Releasing the last handle delivers the callback; the leak makes the
@@ -255,14 +263,18 @@ fn a_drop_that_keeps_a_borrow_parks_the_provider_instead_of_losing_it() {
 #[test]
 fn two_instances_of_one_adapter_describe_one_surface() {
     let agent = Agent::new();
-    agent.register(Box::new(Adapter {
-        name: "bulk",
-        methods: vec!["plan".to_string()],
-    }));
-    agent.register(Box::new(Adapter {
-        name: "bulk",
-        methods: vec!["put".to_string()],
-    }));
+    agent
+        .register(Box::new(Adapter {
+            name: "bulk",
+            methods: vec!["plan".to_string()],
+        }))
+        .expect("register provider");
+    agent
+        .register(Box::new(Adapter {
+            name: "bulk",
+            methods: vec!["put".to_string()],
+        }))
+        .expect("register provider");
     let bytes = agent
         .intro()
         .expect("two instances of one adapter are a documented configuration");
@@ -308,11 +320,13 @@ fn a_provider_may_mint_for_itself_while_it_is_dispatching() {
     let slot: AgentSlot = Rc::new(RefCell::new(Some(agent.clone())));
     let id_slot = Rc::new(Cell::new(None));
     let minted = Rc::new(RefCell::new(None));
-    let id = agent.register(Box::new(SelfMinting {
-        agent: Rc::clone(&slot),
-        id: Rc::clone(&id_slot),
-        minted: Rc::clone(&minted),
-    }));
+    let id = agent
+        .register(Box::new(SelfMinting {
+            agent: Rc::clone(&slot),
+            id: Rc::clone(&id_slot),
+            minted: Rc::clone(&minted),
+        }))
+        .expect("register provider");
     id_slot.set(Some(id));
     let lane = agent.create_lane("self", Budget::default()).expect("lane");
     let cap = agent.mint(id, 0, CapAttrs::new(&["noop"])).expect("cap");
@@ -338,10 +352,12 @@ fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
     let agent = Agent::with_secret([0x55; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x98; 32]);
-    let provider = agent.register(Box::new(Adapter {
-        name,
-        methods: vec!["noop".to_string()],
-    }));
+    let provider = agent
+        .register(Box::new(Adapter {
+            name,
+            methods: vec!["noop".to_string()],
+        }))
+        .expect("register provider");
     let owner = IdentityPolicy::default()
         .admit(
             Some(&PeerIdentity::from_certificate(b"long-name-owner")),
@@ -376,14 +392,18 @@ fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
 #[test]
 fn a_provider_the_introduction_cannot_name_is_skipped_not_fatal() {
     let agent = Agent::new();
-    agent.register(Box::new(Adapter {
-        name: "bad\u{200B}name",
-        methods: vec!["x".to_string()],
-    }));
-    agent.register(Box::new(Adapter {
-        name: "good",
-        methods: vec!["y".to_string()],
-    }));
+    agent
+        .register(Box::new(Adapter {
+            name: "bad\u{200B}name",
+            methods: vec!["x".to_string()],
+        }))
+        .expect("register provider");
+    agent
+        .register(Box::new(Adapter {
+            name: "good",
+            methods: vec!["y".to_string()],
+        }))
+        .expect("register provider");
     let bytes = agent
         .intro()
         .expect("one bad surface does not deny the description");
@@ -406,16 +426,20 @@ fn a_provider_the_introduction_cannot_name_is_skipped_not_fatal() {
 #[test]
 fn a_provider_with_too_many_methods_is_skipped_and_taped_once() {
     let agent = Agent::new();
-    agent.register(Box::new(Adapter {
-        name: "huge",
-        methods: (0..=active_rpc::intro::MAX_METHODS_PER_PROVIDER)
-            .map(|index| format!("m{index}"))
-            .collect(),
-    }));
-    agent.register(Box::new(Adapter {
-        name: "good",
-        methods: vec!["y".to_string()],
-    }));
+    agent
+        .register(Box::new(Adapter {
+            name: "huge",
+            methods: (0..=active_rpc::intro::MAX_METHODS_PER_PROVIDER)
+                .map(|index| format!("m{index}"))
+                .collect(),
+        }))
+        .expect("register provider");
+    agent
+        .register(Box::new(Adapter {
+            name: "good",
+            methods: vec!["y".to_string()],
+        }))
+        .expect("register provider");
     let bytes = agent
         .intro()
         .expect("one huge surface does not deny the rest");
@@ -463,14 +487,18 @@ fn an_ambiguous_record_is_refused_before_the_grant_is_spent() {
     let agent = Agent::with_secret([0x53; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x95; 32]);
-    let first = agent.register(Box::new(Adapter {
-        name: "bulk",
-        methods: vec!["plan".to_string()],
-    }));
-    agent.register(Box::new(Adapter {
-        name: "bulk",
-        methods: vec!["put".to_string()],
-    }));
+    let first = agent
+        .register(Box::new(Adapter {
+            name: "bulk",
+            methods: vec!["plan".to_string()],
+        }))
+        .expect("register provider");
+    agent
+        .register(Box::new(Adapter {
+            name: "bulk",
+            methods: vec!["put".to_string()],
+        }))
+        .expect("register provider");
     let owner = IdentityPolicy::default()
         .admit(
             Some(&PeerIdentity::from_certificate(b"ambiguous-owner")),
@@ -540,9 +568,11 @@ fn a_capture_stops_at_the_introduction_bound() {
 
     let asked = Arc::new(AtomicUsize::new(0));
     let agent = Agent::new();
-    agent.register(Box::new(Counting {
-        asked: Arc::clone(&asked),
-    }));
+    agent
+        .register(Box::new(Counting {
+            asked: Arc::clone(&asked),
+        }))
+        .expect("register provider");
     let bytes = agent.intro().expect("an undescribable provider is skipped");
     let module = active_infinity::decode(&bytes).expect("a valid module");
     let json = active_infinity::interop::to_redacted_json(&module).expect("json");
@@ -567,10 +597,12 @@ fn a_capture_stops_at_the_introduction_bound() {
 fn a_provider_past_the_method_ceiling_is_skipped_but_its_captured_prefix_still_calls() {
     let agent = Agent::new();
     let methods: Vec<String> = (0..100).map(|index| format!("m{index:03}")).collect();
-    let provider = agent.register(Box::new(Adapter {
-        name: "huge",
-        methods: methods.clone(),
-    }));
+    let provider = agent
+        .register(Box::new(Adapter {
+            name: "huge",
+            methods: methods.clone(),
+        }))
+        .expect("register provider");
     let bytes = agent
         .intro()
         .expect("one huge surface does not deny the rest");

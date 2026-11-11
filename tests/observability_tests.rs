@@ -195,7 +195,7 @@ fn the_projection_carries_correlation_ids_and_never_raw_authority() {
 #[test]
 fn a_kernel_trace_has_monotonic_sequences_and_no_raw_ids() {
     let agent = Agent::with_secret([0x61; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = IdentityPolicy::default()
         .admit(
             Some(&PeerIdentity::from_certificate(b"observability-peer")),
@@ -255,7 +255,7 @@ fn a_kernel_trace_has_monotonic_sequences_and_no_raw_ids() {
 #[test]
 fn metrics_json_matches_the_kernel_counters() {
     let agent = Agent::with_secret([0x62; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -282,7 +282,7 @@ fn metrics_json_matches_the_kernel_counters() {
 #[test]
 fn identity_refusals_are_counted_and_visible() {
     let agent = Agent::with_secret([0x63; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = IdentityPolicy::default()
         .admit(
             Some(&PeerIdentity::from_certificate(b"alice-observability")),
@@ -307,7 +307,7 @@ fn identity_refusals_are_counted_and_visible() {
 #[test]
 fn sequences_stay_monotonic_across_a_tape_wrap() {
     let agent = Agent::with_secret([0x64; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -357,7 +357,7 @@ fn loopback_policy_and_identity_kind_stay_out_of_trace_records() {
 #[test]
 fn counters_agree_with_the_tape() {
     let agent = Agent::with_secret([0x5c; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -478,7 +478,7 @@ fn a_label_escapes_every_invisible_character() {
 #[test]
 fn a_trace_names_the_method_on_queued_refused_and_completed() {
     let agent = Agent::with_secret([0x70; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -540,7 +540,7 @@ fn a_trace_names_the_method_on_queued_refused_and_completed() {
 #[test]
 fn an_over_long_refused_method_is_labelled_not_omitted() {
     let agent = Agent::with_secret([0x71; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -658,7 +658,7 @@ fn the_projection_carries_method_and_args_bytes() {
 #[test]
 fn a_refusal_with_no_call_carries_no_method() {
     let agent = Agent::with_secret([0x72; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let _cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");

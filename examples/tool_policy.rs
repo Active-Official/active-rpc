@@ -36,7 +36,9 @@ fn main() {
     println!("discovered tools: {:?}", policy.allowed);
 
     let agent = Agent::with_secret([11u8; 32]);
-    let provider = agent.register(Box::new(session));
+    let provider = agent
+        .register(Box::new(session))
+        .expect("register provider");
     let lane = agent.create_lane("tools", Budget::default()).expect("lane");
 
     // Method grant is necessary, not sufficient: the tool policy must also

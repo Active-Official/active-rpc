@@ -27,7 +27,9 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     let root = module.push(active_infinity::Inode::Str("app".to_string()));
     module.set_root(Some(root));
     provider.install(module).expect("install");
-    let provider = agent.register(Box::new(provider));
+    let provider = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     (agent, provider)
 }
 

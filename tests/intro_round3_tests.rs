@@ -173,9 +173,11 @@ impl Provider for DropConsulting {
 fn a_drop_drain_does_not_reborrow_the_kernel() {
     let agent = Agent::new();
     let slot: AgentSlot = Rc::new(RefCell::new(Some(agent.clone())));
-    let id = agent.register(Box::new(DropConsulting {
-        agent: Rc::clone(&slot),
-    }));
+    let id = agent
+        .register(Box::new(DropConsulting {
+            agent: Rc::clone(&slot),
+        }))
+        .expect("register provider");
     assert!(agent.take_drops(id).is_empty());
     // The provider is back in the registry.
     agent
@@ -189,11 +191,13 @@ fn an_intro_runs_no_provider_code_and_keeps_queued_work() {
     let slot: AgentSlot = Rc::new(RefCell::new(None));
     let calls = Rc::new(Cell::new(0));
     let armed = Rc::new(Cell::new(false));
-    let id = agent.register(Box::new(Counting {
-        agent: Rc::clone(&slot),
-        calls: Rc::clone(&calls),
-        armed: Rc::clone(&armed),
-    }));
+    let id = agent
+        .register(Box::new(Counting {
+            agent: Rc::clone(&slot),
+            calls: Rc::clone(&calls),
+            armed: Rc::clone(&armed),
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
     assert_eq!(calls.get(), 1, "the surface is described once, at register");
 
@@ -225,10 +229,12 @@ fn a_call_does_not_panic_when_the_provider_methods_consults_the_agent() {
     let agent = Agent::new();
     let slot: AgentSlot = Rc::new(RefCell::new(Some(agent.clone())));
     let calls = Rc::new(Cell::new(0));
-    let id = agent.register(Box::new(Reentrant {
-        agent: Rc::clone(&slot),
-        calls: Rc::clone(&calls),
-    }));
+    let id = agent
+        .register(Box::new(Reentrant {
+            agent: Rc::clone(&slot),
+            calls: Rc::clone(&calls),
+        }))
+        .expect("register provider");
     let lane = agent.create_lane("call", Budget::default()).expect("lane");
     let cap = agent.mint(id, 0, CapAttrs::new(&["ping"])).expect("cap");
     let promise = agent
@@ -247,10 +253,12 @@ fn a_call_does_not_panic_when_the_provider_methods_consults_the_agent() {
 fn the_declared_surface_is_the_one_enforced() {
     let agent = Agent::new();
     let grow = Rc::new(Cell::new(false));
-    let id = agent.register(Box::new(Shifting {
-        grow: Rc::clone(&grow),
-        a_mutates: Rc::new(Cell::new(false)),
-    }));
+    let id = agent
+        .register(Box::new(Shifting {
+            grow: Rc::clone(&grow),
+            a_mutates: Rc::new(Cell::new(false)),
+        }))
+        .expect("register provider");
     let lane = agent
         .create_lane("surface", Budget::default())
         .expect("lane");
@@ -282,10 +290,12 @@ fn the_mutating_facts_are_the_ones_enforced() {
     // Registered as non-mutating, then flipped: a read-only capability still
     // admits the call, because the surface was captured at registration.
     let flip = Rc::new(Cell::new(false));
-    let first = agent.register(Box::new(Shifting {
-        grow: Rc::new(Cell::new(false)),
-        a_mutates: Rc::clone(&flip),
-    }));
+    let first = agent
+        .register(Box::new(Shifting {
+            grow: Rc::new(Cell::new(false)),
+            a_mutates: Rc::clone(&flip),
+        }))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["a"]);
     attrs.read_only = true;
     let read_only = agent.mint(first, 0, attrs).expect("read-only cap");
@@ -298,10 +308,12 @@ fn the_mutating_facts_are_the_ones_enforced() {
 
     // The mirror: registered as mutating, then flipped back.
     let flip = Rc::new(Cell::new(true));
-    let second = agent.register(Box::new(Shifting {
-        grow: Rc::new(Cell::new(false)),
-        a_mutates: Rc::clone(&flip),
-    }));
+    let second = agent
+        .register(Box::new(Shifting {
+            grow: Rc::new(Cell::new(false)),
+            a_mutates: Rc::clone(&flip),
+        }))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["a"]);
     attrs.read_only = true;
     let read_only = agent.mint(second, 0, attrs).expect("read-only cap");
@@ -320,12 +332,14 @@ fn an_intro_from_a_provider_lists_the_whole_surface() {
     let agent = Agent::new();
     let slot: AgentSlot = Rc::new(RefCell::new(None));
     let seen = Rc::new(RefCell::new(None));
-    let id = agent.register(Box::new(Introspecting {
-        agent: Rc::clone(&slot),
-        seen: Rc::clone(&seen),
-    }));
+    let id = agent
+        .register(Box::new(Introspecting {
+            agent: Rc::clone(&slot),
+            seen: Rc::clone(&seen),
+        }))
+        .expect("register provider");
     *slot.borrow_mut() = Some(agent.clone());
-    agent.register(Box::new(Echo));
+    agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("facts", Budget::default()).expect("lane");
     let cap = agent
         .mint(id, 0, CapAttrs::new(&["snapshot"]))

@@ -37,7 +37,7 @@ impl Provider for Echo {
 
 fn tenant(secret: u8) -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
     let agent = Agent::with_secret([secret; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -77,7 +77,7 @@ fn a_capability_from_one_agent_is_unknown_to_another() {
 #[test]
 fn budgets_are_charged_per_capability() {
     let agent = Agent::with_secret([0x33; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut tight = CapAttrs::new(&["echo"]);
     tight.budget.max_calls = 2;
     let tight_cap = agent.mint(provider, 0, tight).expect("tight cap");
@@ -103,7 +103,7 @@ fn budgets_are_charged_per_capability() {
 #[test]
 fn interleaved_lanes_keep_their_own_results() {
     let agent = Agent::with_secret([0x44; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");

@@ -53,7 +53,9 @@ fn module_agent() -> (Agent, active_rpc::CapHandle) {
         .install(active_rpc::domain::module_from_source(SOURCE, "c.active").unwrap())
         .expect("install");
     let agent = Agent::with_secret([31u8; 32]);
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider_id,
@@ -153,13 +155,15 @@ fn channels_do_not_cross_talk() {
 #[test]
 fn concurrent_tool_calls_across_providers() {
     let agent = Agent::with_secret([33u8; 32]);
-    let echo_one = agent.register(Box::new(Echo));
-    let echo_two = agent.register(Box::new(Echo));
+    let echo_one = agent.register(Box::new(Echo)).expect("register provider");
+    let echo_two = agent.register(Box::new(Echo)).expect("register provider");
     let mut provider = ModuleProvider::new();
     let object = provider
         .install(active_rpc::domain::module_from_source(SOURCE, "d").unwrap())
         .expect("install");
-    let modules = agent.register(Box::new(provider));
+    let modules = agent
+        .register(Box::new(provider))
+        .expect("register provider");
 
     let cap_a = agent.mint(echo_one, 0, CapAttrs::new(&["echo"])).unwrap();
     let cap_b = agent.mint(echo_two, 0, CapAttrs::new(&["echo"])).unwrap();
@@ -221,7 +225,7 @@ fn two_agents_over_tcp_do_not_cross_talk() {
         let address = address.clone();
         clients.push(std::thread::spawn(move || {
             let agent = Agent::with_secret([40 + index as u8; 32]);
-            let provider_id = agent.register(Box::new(Echo));
+            let provider_id = agent.register(Box::new(Echo)).expect("register provider");
             let cap = agent
                 .mint(provider_id, 0, CapAttrs::new(&["echo"]))
                 .unwrap();

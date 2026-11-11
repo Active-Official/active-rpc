@@ -110,8 +110,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let module_object = module_provider.install(module)?;
 
     let agent = Agent::new();
-    let module_provider_id = agent.register(Box::new(module_provider));
-    let echo_provider_id = agent.register(Box::new(EchoProvider));
+    let module_provider_id = agent.register(Box::new(module_provider))?;
+    let echo_provider_id = agent.register(Box::new(EchoProvider))?;
     let module_cap = agent.mint(
         module_provider_id,
         module_object,

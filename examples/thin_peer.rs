@@ -69,7 +69,7 @@ fn dispatch(agent: &Agent, lane: active_rpc::LaneId, envelope: &Envelope) -> Res
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::with_secret([0x5a; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent.mint(provider, 0, CapAttrs::new(&["echo"]))?;
     let lane = agent.create_lane("thin", Budget::default())?;
 

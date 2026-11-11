@@ -74,7 +74,7 @@ fn a_signed_or_uppercase_fingerprint_is_refused() {
     let agent = Agent::with_secret([0x54; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x97; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let owner = IdentityPolicy::default()
         .admit(Some(&PeerIdentity::from_certificate(b"hex-owner")), true)
         .expect("admit");

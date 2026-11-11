@@ -34,7 +34,7 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let agent = Agent::with_secret([0x7e; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent
         .create_lane("topics", Budget::default())
         .expect("lane");
@@ -274,7 +274,7 @@ fn a_capability_from_another_kernel_cannot_publish() {
     let fixture = fixture();
     let channel = channel(&fixture, "news");
     let other = Agent::with_secret([0x7f; 32]);
-    let provider = other.register(Box::new(Echo));
+    let provider = other.register(Box::new(Echo)).expect("register provider");
     let foreign = other
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");

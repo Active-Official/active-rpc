@@ -80,7 +80,7 @@ fuzz_target!(|data: &[u8]| {
 
     // 3 and 4. Kernel channels and capability transfer.
     let agent = common::agent(data);
-    let provider = agent.register(Box::new(common::Echo::default()));
+    let provider = agent.register(Box::new(common::Echo::default())).expect("register provider");
     let lane = agent
         .create_lane("main", Budget::default())
         .expect("default lane budget");

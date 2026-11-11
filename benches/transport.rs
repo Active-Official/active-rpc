@@ -89,7 +89,9 @@ fn benches(criterion: &mut Criterion) {
             .install(active_rpc::domain::module_from_source(SOURCE, "bench").unwrap())
             .expect("install");
         let agent = Agent::new();
-        let provider_id = agent.register(Box::new(provider));
+        let provider_id = agent
+            .register(Box::new(provider))
+            .expect("register provider");
         // A benchmark spends millions of calls; give the capability and the lane
         // room so the measurement is of dispatch, not of budget exhaustion.
         let wide = Budget {
@@ -144,7 +146,9 @@ fn kernel_fixture() -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
         .install(active_rpc::domain::module_from_source(SOURCE, "bench").unwrap())
         .expect("install");
     let agent = Agent::new();
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let wide = Budget {
         max_calls: u64::MAX,
         ..Budget::default()

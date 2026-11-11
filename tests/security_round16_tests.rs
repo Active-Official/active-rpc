@@ -35,7 +35,9 @@ fn install(module: InfinityModule, methods: &[&str], redact: bool) -> (Agent, Ca
     let mut provider = ModuleProvider::new();
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x7b; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(methods);
     attrs.redact = redact;
     let cap = agent.mint(id, object, attrs).expect("cap");

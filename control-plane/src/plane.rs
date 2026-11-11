@@ -763,32 +763,43 @@ fn fixture_lane_budget() -> Budget {
 }
 
 impl PlaneCore {
-    pub fn new() -> Self {
+    /// Build a plane core with its bundled fixture providers and caps.
+    ///
+    /// Every step is fallible and returns its failure instead of panicking
+    /// (RPC-51h): the fixtures are constants, so a failure means the binary's
+    /// own setup is broken, and the caller decides what that means — the
+    /// kernel worker reports it and the plane fails to start, instead of a
+    /// panic latching the plane down until restart.
+    pub fn new() -> Result<Self, String> {
         // A fresh secret per process: a constant one made every deployment
         // derive the same capability ids and correlation ids, which are then
         // linkable across processes and predictable from the source.
         let agent = Agent::new();
-        let echo_provider = agent.register(Box::new(Echo));
+        let echo_provider = agent
+            .register(Box::new(Echo))
+            .map_err(|error| format!("the echo provider could not be registered: {error}"))?;
         let mut module_provider = ModuleProvider::new();
         let object = module_provider
             .install(fixture_module())
-            .expect("the fixture module installs");
-        let module_provider = agent.register(Box::new(module_provider));
+            .map_err(|error| format!("the fixture module does not install: {error}"))?;
+        let module_provider = agent
+            .register(Box::new(module_provider))
+            .map_err(|error| format!("the module provider could not be registered: {error}"))?;
 
         let lane = agent
             .create_lane("lane-0", fixture_lane_budget())
-            .expect("lane");
+            .map_err(|error| format!("a fixture lane could not be created: {error}"))?;
         let lanes = vec![
             lane,
             agent
                 .create_lane("lane-1", fixture_lane_budget())
-                .expect("lane"),
+                .map_err(|error| format!("a fixture lane could not be created: {error}"))?,
             agent
                 .create_lane("lane-2", fixture_lane_budget())
-                .expect("lane"),
+                .map_err(|error| format!("a fixture lane could not be created: {error}"))?,
             agent
                 .create_lane("lane-3", fixture_lane_budget())
-                .expect("lane"),
+                .map_err(|error| format!("a fixture lane could not be created: {error}"))?,
         ];
 
         let echo_cap = agent
@@ -797,25 +808,29 @@ impl PlaneCore {
                 0,
                 CapAttrs::new(&["echo", "ping"]).with_budget(fixture_budget()),
             )
-            .expect("cap");
+            .map_err(|error| format!("a fixture capability could not be minted: {error}"))?;
         let module_cap = agent
             .mint(
                 module_provider,
                 object,
                 CapAttrs::new(active_rpc::MODULE_METHODS).with_budget(fixture_budget()),
             )
-            .expect("cap");
+            .map_err(|error| format!("a fixture capability could not be minted: {error}"))?;
         let mut audit_attrs = CapAttrs::new(&["stats", "evaluate"]).with_budget(fixture_budget());
         audit_attrs.read_only = true;
         let audit_cap = agent
             .mint(module_provider, object, audit_attrs)
-            .expect("cap");
+            .map_err(|error| format!("a fixture capability could not be minted: {error}"))?;
         let worker_cap = agent
             .attenuate(&echo_cap, CapAttrs::new(&["echo"]))
-            .expect("attenuated cap");
-        let session =
-            McpSession::handshake(MemoryTransport::new(mcp_responses())).expect("mcp handshake");
-        let tool_provider = agent.register(Box::new(session));
+            .map_err(|error| {
+                format!("the attenuated fixture capability could not be minted: {error}")
+            })?;
+        let session = McpSession::handshake(MemoryTransport::new(mcp_responses()))
+            .map_err(|error| format!("the fixture MCP handshake failed: {error}"))?;
+        let tool_provider = agent.register(Box::new(session)).map_err(|error| {
+            format!("the MCP session provider could not be registered: {error}")
+        })?;
         let mcp_cap = agent
             .mint(
                 tool_provider,
@@ -824,7 +839,7 @@ impl PlaneCore {
                     .with_budget(fixture_budget())
                     .with_tool_policy(ToolPolicy::allow(&["echo"])),
             )
-            .expect("cap");
+            .map_err(|error| format!("a fixture capability could not be minted: {error}"))?;
         let mcp_restricted = agent
             .mint(
                 tool_provider,
@@ -833,7 +848,9 @@ impl PlaneCore {
                     .with_budget(fixture_budget())
                     .with_tool_policy(ToolPolicy::allow(&["other"])),
             )
-            .expect("restricted cap");
+            .map_err(|error| {
+                format!("the restricted fixture capability could not be minted: {error}")
+            })?;
         let mut ceiling_policy = ToolPolicy::allow(&["echo"]);
         ceiling_policy.max_arg_bytes = 16;
         let mcp_ceiling = agent
@@ -844,12 +861,18 @@ impl PlaneCore {
                     .with_budget(fixture_budget())
                     .with_tool_policy(ceiling_policy),
             )
-            .expect("ceiling cap");
+            .map_err(|error| {
+                format!("the ceiling fixture capability could not be minted: {error}")
+            })?;
 
         // One persistent loopback endpoint for the HTTP tool scenario. The
         // tool provider is registered once; each run mints only a capability.
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("http stub bind");
-        let http_address = listener.local_addr().expect("http stub addr").to_string();
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|error| format!("the fixture HTTP stub could not bind loopback: {error}"))?;
+        let http_address = listener
+            .local_addr()
+            .map_err(|error| format!("the fixture HTTP stub has no address: {error}"))?
+            .to_string();
         // The loop ends when the core is dropped: the flag is checked after each
         // accept, and `Drop` connects once to wake a blocking accept. Without
         // this, every core built for a test (and every worker) left a listener
@@ -901,10 +924,12 @@ impl PlaneCore {
                     }
                 }
             })
-            .expect("http stub thread");
+            .map_err(|error| format!("the fixture HTTP stub thread could not start: {error}"))?;
         let http_tool = HttpTool::new(format!("http://{http_address}"), &[("GET", "/health")]);
         let http_policy = http_tool.policy();
-        let http_provider = agent.register(Box::new(http_tool));
+        let http_provider = agent
+            .register(Box::new(http_tool))
+            .map_err(|error| format!("the HTTP tool provider could not be registered: {error}"))?;
         let http_cap = agent
             .mint(
                 http_provider,
@@ -916,7 +941,7 @@ impl PlaneCore {
                     .with_budget(fixture_budget())
                     .with_tool_policy(http_policy),
             )
-            .expect("http cap");
+            .map_err(|error| format!("the HTTP fixture capability could not be minted: {error}"))?;
 
         // An absolute program path: a bare name would be resolved from the
         // control plane's own `PATH`, which is ambient authority.
@@ -929,11 +954,13 @@ impl PlaneCore {
         // `echo`, and the adapter's metacharacter refusal is a second line of
         // defence, not the control.
         let process = LocalProcess::new(program, &[flag, "echo active"])
-            .expect("an absolute program")
+            .map_err(|error| format!("the fixture process program is not absolute: {error}"))?
             .with_timeout(3_000);
         let process_program = program.to_string();
         let process_policy = process.policy();
-        let process_provider = agent.register(Box::new(process));
+        let process_provider = agent
+            .register(Box::new(process))
+            .map_err(|error| format!("the process provider could not be registered: {error}"))?;
         let process_allowed = agent
             .mint(
                 process_provider,
@@ -942,7 +969,9 @@ impl PlaneCore {
                     .with_budget(fixture_budget())
                     .with_tool_policy(process_policy),
             )
-            .expect("process cap");
+            .map_err(|error| {
+                format!("the process fixture capability could not be minted: {error}")
+            })?;
         let process_denied = agent
             .mint(
                 process_provider,
@@ -955,7 +984,9 @@ impl PlaneCore {
                         allow_process: false,
                     }),
             )
-            .expect("denied process cap");
+            .map_err(|error| {
+                format!("the denied fixture capability could not be minted: {error}")
+            })?;
 
         let caps = vec![
             CapInfo {
@@ -1049,8 +1080,10 @@ impl PlaneCore {
         for name in ["work-queue", "audit"] {
             let channel = agent
                 .create_channel(name, active_rpc::Direction::Both)
-                .expect("channel");
-            agent.subscribe(lane, channel).expect("subscribe");
+                .map_err(|error| format!("a fixture channel could not be created: {error}"))?;
+            agent
+                .subscribe(lane, channel)
+                .map_err(|error| format!("a fixture lane could not subscribe: {error}"))?;
             channel_messages.insert(name.to_string(), 0);
             channels.push(channel);
         }
@@ -1122,7 +1155,7 @@ impl PlaneCore {
             None,
             None,
         );
-        core
+        Ok(core)
     }
 
     pub fn agent(&self) -> &Agent {
@@ -3275,12 +3308,6 @@ fn mcp_responses() -> BTreeMap<String, String> {
     responses
 }
 
-impl Default for PlaneCore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub fn now_millis() -> u64 {
     now_ms()
 }
@@ -3294,7 +3321,7 @@ mod ring_tests {
     /// compares a cursor against (R-19 round 3, M1).
     #[test]
     fn an_eviction_behind_a_protected_front_is_a_gap() {
-        let mut core = PlaneCore::new();
+        let mut core = PlaneCore::new().expect("plane core");
         // Start from an empty ring so the protected event is the front, which
         // is the shape the production ring reaches: `new()` already recorded
         // its own status events.
@@ -3324,7 +3351,7 @@ mod ring_tests {
     /// (R-19 round 3, M3).
     #[test]
     fn the_fixture_refreshes_before_its_grant_runs_out() {
-        let mut core = PlaneCore::new();
+        let mut core = PlaneCore::new().expect("plane core");
         let fresh = core.echo_cap.id();
         let module = core.module_cap.id();
         assert_eq!(core.fixture_calls_remaining(), FIXTURE_CALLS);
@@ -3358,7 +3385,7 @@ mod ring_tests {
     /// `.expect("bench value")` sites turn a budget refusal into a panic.
     #[test]
     fn one_ladder_and_benchmark_fit_in_the_fixture_grant() {
-        let mut core = PlaneCore::new();
+        let mut core = PlaneCore::new().expect("plane core");
         let before = core.fixture_calls_remaining();
         for result in core.run_level(6, true) {
             assert!(result.ok, "{}: {}", result.code, result.detail);
@@ -3376,7 +3403,7 @@ mod ring_tests {
     /// healthy grant (R-19 round 4, F1).
     #[test]
     fn a_spent_fixture_grant_is_a_report_not_a_panic() {
-        let mut core = PlaneCore::new();
+        let mut core = PlaneCore::new().expect("plane core");
         // Disable the re-mint so the refusal is reachable in one call.
         core.fixture_headroom = 0;
         let provider = core.echo_provider;

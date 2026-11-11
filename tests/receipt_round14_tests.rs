@@ -153,8 +153,12 @@ fn a_provider_cannot_occupy_the_kernel_code_namespace() {
     agent.enable_receipts(true);
     let lane = agent.create_lane("codes", Budget::default()).expect("lane");
     for provider in [
-        agent.register(Box::new(KernelLooking)),
-        agent.register(Box::new(Unrepresentable)),
+        agent
+            .register(Box::new(KernelLooking))
+            .expect("register provider"),
+        agent
+            .register(Box::new(Unrepresentable))
+            .expect("register provider"),
     ] {
         let cap = agent
             .mint(provider, 0, CapAttrs::new(&["trap"]))
@@ -184,7 +188,7 @@ fn a_provider_cannot_occupy_the_kernel_code_namespace() {
 fn a_receipt_records_the_providers_own_code() {
     let agent = Agent::new();
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Trap));
+    let provider = agent.register(Box::new(Trap)).expect("register provider");
     let cap = agent
         .mint(
             provider,

@@ -1,6 +1,9 @@
 //! End-to-end CLI tests: every command drives the shipped binary and a real
 //! kernel peer over a real transport.
 
+use active_rpc::transport::{TcpTransport, Transport};
+use active_rpc::wire::{CapDescriptor, Envelope, Kind};
+use active_rpc::{Budget, CapId};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
@@ -927,5 +930,447 @@ fn a_world_readable_cap_file_is_refused() {
         stderr(&world_readable).contains("S-1-5-32-545"),
         "the refusal names the account that can read the cap: {}",
         stderr(&world_readable)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RPC-51 regression tests.
+// ---------------------------------------------------------------------------
+
+/// (a) A closed stdout is success, not a transport error.
+///
+/// `receipts show` piped to a reader that has already gone away must exit
+/// 0: the operator closed the pipe on purpose (`| head -c 0`), so there is
+/// nothing to refuse. The reader is dropped the moment the child is
+/// spawned, so even the first line hits the closed pipe -- the same shape
+/// the Docker probe proved with `head -c 0` (exit 3 before the fix).
+#[test]
+fn a_closed_pipe_is_success_not_a_transport_error() {
+    let dir = sandbox("epipe");
+    let log = dir.join("demo.arrl");
+    let dumped = run(&["receipts", "dump", "--output", log.to_str().unwrap()]);
+    assert!(dumped.status.success(), "dump: {}", stderr(&dumped));
+    let mut child = cli()
+        .args(["receipts", "show", log.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cli");
+    drop(child.stdout.take());
+    let output = child.wait_with_output().expect("wait");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// (b) `parse_cap` refuses a leading `+`: `u8::from_str_radix` accepts an
+/// optional sign, so `+f00...` used to parse and the call then tried to
+/// connect (exit 3). Now it is a usage error before any connection.
+#[test]
+fn parse_cap_refuses_a_plus_sign() {
+    let output = run(&[
+        "call",
+        "--addr",
+        "127.0.0.1:1",
+        "--cap",
+        "+f000000000000000000000000000000",
+        "--method",
+        "echo",
+        "--text",
+        "hi",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not valid hex"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+/// (d) `loadgen --cap-file` is honoured, not silently ignored (unix): the
+/// load generator reads the capability from the file -- with the RPC-50
+/// owner-only mode check -- and completes its requests.
+#[cfg(unix)]
+#[test]
+fn loadgen_reads_the_cap_from_a_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let peer = start_peer(&["peer", "--limit", "4"]);
+    let dir = sandbox("loadgen-capfile");
+    let cap_path = dir.join("cap.hex");
+    std::fs::write(&cap_path, format!("{}\n", peer.cap)).expect("write cap");
+    std::fs::set_permissions(&cap_path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    let cap_arg = cap_path.to_str().expect("cap path");
+    let output = run(&[
+        "loadgen",
+        "--addr",
+        &peer.address,
+        "--cap-file",
+        cap_arg,
+        "--requests",
+        "2",
+        "--concurrency",
+        "1",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("requests=2"),
+        "stdout: {}",
+        stdout(&output)
+    );
+}
+
+/// (d) The same `--cap-file` honouring on Windows: the cap file is
+/// restricted to its owner first, mirroring the RPC-50 test.
+#[cfg(windows)]
+#[test]
+fn loadgen_reads_the_cap_from_a_file() {
+    let peer = start_peer(&["peer", "--limit", "4"]);
+    let dir = sandbox("loadgen-capfile");
+    let cap_path = dir.join("cap.hex");
+    std::fs::write(&cap_path, format!("{}\n", peer.cap)).expect("write cap");
+    restrict_key_to_owner(&cap_path);
+    let cap_arg = cap_path.to_str().expect("cap path");
+    let output = run(&[
+        "loadgen",
+        "--addr",
+        &peer.address,
+        "--cap-file",
+        cap_arg,
+        "--requests",
+        "2",
+        "--concurrency",
+        "1",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("requests=2"),
+        "stdout: {}",
+        stdout(&output)
+    );
+}
+
+/// (d) `--cap` and `--cap-file` together are refused: one capability per
+/// invocation, and the refusal names both flags.
+#[test]
+fn loadgen_refuses_both_cap_and_cap_file() {
+    let output = run(&[
+        "loadgen",
+        "--addr",
+        "127.0.0.1:1",
+        "--cap",
+        "00112233445566778899aabbccddeeff",
+        "--cap-file",
+        "cap.hex",
+        "--requests",
+        "1",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not both"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+/// (h) `--limit 0` means "serve until stopped" on tcp: two calls both
+/// complete, so the peer served more than one connection.
+#[test]
+fn peer_limit_zero_serves_until_stopped_on_tcp() {
+    let peer = start_peer(&["peer", "--transport", "tcp", "--limit", "0"]);
+    for _ in 0..2 {
+        let output = run(&[
+            "call",
+            "--addr",
+            &peer.address,
+            "--cap",
+            &peer.cap,
+            "--method",
+            "echo",
+            "--text",
+            "hi",
+        ]);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        assert!(
+            stdout(&output).contains("kind=response"),
+            "stdout: {}",
+            stdout(&output)
+        );
+    }
+}
+
+/// (h) `--limit 0` means "serve until stopped" on http2 too: before the
+/// fix `serve(0)` served exactly one connection, so the second call hit a
+/// closed listener. The calls carry a short timeout so the fail-before
+/// shape fails fast instead of hanging on the dead listener.
+#[test]
+fn peer_limit_zero_serves_until_stopped_on_http2() {
+    let peer = start_peer(&["peer", "--transport", "http2", "--limit", "0"]);
+    for _ in 0..2 {
+        let output = run(&[
+            "call",
+            "--addr",
+            &peer.address,
+            "--transport",
+            "http2",
+            "--cap",
+            &peer.cap,
+            "--method",
+            "echo",
+            "--text",
+            "hi",
+            "--timeout-ms",
+            "2000",
+        ]);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        assert!(
+            stdout(&output).contains("kind=response"),
+            "stdout: {}",
+            stdout(&output)
+        );
+    }
+}
+
+/// (h) `--limit 0` means "serve until stopped" on quic too: before the
+/// fix `peer_quic` refused 0 outright, so the peer never started.
+#[test]
+fn peer_limit_zero_serves_until_stopped_on_quic() {
+    let dir = sandbox("quic-limit-zero");
+    let cert_path = dir.join("peer.cert");
+    let cert_arg = cert_path.to_str().expect("cert path");
+    let peer = start_peer(&[
+        "peer",
+        "--transport",
+        "quic",
+        "--limit",
+        "0",
+        "--cert-out",
+        cert_arg,
+    ]);
+    for _ in 0..2 {
+        let output = run(&[
+            "call",
+            "--addr",
+            &peer.address,
+            "--transport",
+            "quic",
+            "--cert",
+            cert_arg,
+            "--cap",
+            &peer.cap,
+            "--method",
+            "echo",
+            "--text",
+            "hi",
+            "--timeout-ms",
+            "5000",
+        ]);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        assert!(
+            stdout(&output).contains("kind=response"),
+            "stdout: {}",
+            stdout(&output)
+        );
+    }
+}
+
+/// (h) `peer_quic` refuses to overwrite an existing cert file: the first
+/// peer creates it, and the second peer with the same `--cert-out` is
+/// refused with exit 1 before it starts serving.
+#[test]
+fn quic_cert_out_refuses_an_existing_file() {
+    let dir = sandbox("quic-cert-exists");
+    let cert_path = dir.join("peer.cert");
+    let cert_arg = cert_path.to_str().expect("cert path");
+    let peer = start_peer(&[
+        "peer",
+        "--transport",
+        "quic",
+        "--limit",
+        "1",
+        "--cert-out",
+        cert_arg,
+    ]);
+    assert!(cert_path.exists(), "the first peer writes the cert");
+    let output = run(&[
+        "peer",
+        "--transport",
+        "quic",
+        "--limit",
+        "1",
+        "--cert-out",
+        cert_arg,
+    ]);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("already exists"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    drop(peer);
+}
+
+/// A 16-byte capability id parsed from the 32 hex digits a peer prints.
+fn cap_id(hex: &str) -> CapId {
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("cap hex");
+    }
+    CapId(bytes)
+}
+
+/// (h) `dispatch` refuses an envelope carrying two capabilities: the
+/// kernel serves one capability per call, so extra authority descriptors
+/// are a refusal (`rpc/wire`), not silently ignored. The control arm
+/// sends the same envelope with one capability and gets a response.
+#[test]
+fn dispatch_refuses_an_envelope_with_two_caps() {
+    let peer = start_peer(&["peer", "--limit", "4"]);
+    let descriptor = CapDescriptor {
+        id: cap_id(&peer.cap),
+        methods: ["echo".to_string()].into_iter().collect(),
+        budget: Budget::default(),
+        read_only: false,
+        redact: false,
+        path_scope: None,
+    };
+    let mut envelope = Envelope::request(1, "echo", vec![]);
+    // The second descriptor must carry a DIFFERENT id: the wire codec
+    // refuses an envelope with two descriptors for the same id at encode
+    // time ("duplicate capability id"), so the send itself would fail
+    // before the peer's dispatch ever saw the envelope. Dispatch refuses
+    // on the count before it looks at any id, so any second id exercises
+    // the refusal.
+    let other = CapDescriptor {
+        id: CapId([0x11; 16]),
+        methods: ["echo".to_string()].into_iter().collect(),
+        budget: Budget::default(),
+        read_only: false,
+        redact: false,
+        path_scope: None,
+    };
+    envelope.caps = vec![descriptor.clone(), other];
+    let mut transport = TcpTransport::connect(&peer.address).expect("connect");
+    transport.send(&envelope).expect("send");
+    let response = transport.recv().expect("recv").expect("a reply arrives");
+    assert_eq!(
+        response.kind,
+        Kind::Error,
+        "a two-cap envelope must be refused"
+    );
+    assert_eq!(
+        response.method, "rpc/wire",
+        "the refusal code: {response:?}"
+    );
+    // Control arm: the same envelope with one capability is answered.
+    let mut single = Envelope::request(1, "echo", vec![]);
+    single.caps = vec![descriptor];
+    let mut transport = TcpTransport::connect(&peer.address).expect("connect");
+    transport.send(&single).expect("send");
+    let response = transport.recv().expect("recv").expect("a reply arrives");
+    assert_eq!(
+        response.kind,
+        Kind::Response,
+        "a one-cap envelope is answered: {response:?}"
+    );
+}
+
+/// (h) `split_args` refuses a flag passed twice: the last one used to win
+/// silently, so a typo could change which capability a call used without
+/// any warning.
+#[test]
+fn split_args_refuses_a_duplicate_flag() {
+    let output = run(&[
+        "call",
+        "--addr",
+        "127.0.0.1:1",
+        "--cap",
+        "00112233445566778899aabbccddeeff",
+        "--cap",
+        "ffeeddccbbaa99887766554433221100",
+        "--method",
+        "echo",
+        "--text",
+        "hi",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("was passed twice"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+/// (h) `loadgen --concurrency 0` is refused: it used to be silently
+/// rewritten to 1, so a typo changed the shape of the load without any
+/// warning.
+#[test]
+fn loadgen_refuses_zero_concurrency() {
+    let output = run(&[
+        "loadgen",
+        "--addr",
+        "127.0.0.1:1",
+        "--cap",
+        "00112233445566778899aabbccddeeff",
+        "--concurrency",
+        "0",
+        "--requests",
+        "1",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("must be at least 1"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+/// (h) `events --interval-ms` below the 50 ms floor is refused: below it
+/// the follow loop would busy-spin, polling faster than a loopback round
+/// trip can answer.
+#[test]
+fn events_refuses_an_interval_below_the_floor() {
+    for interval in ["0", "10"] {
+        let output = run(&["events", "--interval-ms", interval]);
+        assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("must be at least 50"),
+            "stderr: {}",
+            stderr(&output)
+        );
+    }
+}
+
+/// (h) `http_get` refuses a plane URL carrying CR or LF: the URL is
+/// interpolated into the request line, so a line break in it would let
+/// the operator smuggle a second request line.
+#[test]
+fn events_refuses_a_url_with_crlf() {
+    let output = run(&[
+        "events",
+        "--plane",
+        "http://127.0.0.1:8787/activity\r\nInjected: x",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("must not contain CR or LF"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+/// (h) `doctor` prints the features the binary was compiled with, not a
+/// hardcoded list: the line is built from the lib's `enabled_features()`,
+/// so a build without quic says so.
+#[test]
+fn doctor_reports_the_compiled_in_features() {
+    let output = run(&["doctor"]);
+    assert!(output.status.success());
+    assert!(
+        stdout(&output).contains("features: quic http2"),
+        "stdout: {}",
+        stdout(&output)
     );
 }

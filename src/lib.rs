@@ -34,7 +34,7 @@
 //!     "demo.active",
 //! )?)?;
 //! let agent = Agent::new();
-//! let provider_id = agent.register(Box::new(provider));
+//! let provider_id = agent.register(Box::new(provider))?;
 //! let cap = agent.mint(provider_id, object, CapAttrs::new(&["stats"]))?;
 //! let lane = agent.create_lane("main", Budget::default())?;
 //!
@@ -91,6 +91,25 @@ pub use wire::{CapDescriptor, Envelope, Kind, WireLimits};
 
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Features compiled into this build, for diagnostics (`doctor`).
+///
+/// The list is derived from the crate's own feature flags, not hardcoded
+/// (RPC-51): a build without `quic` or `http2` reports exactly what it has,
+/// so the diagnostic can never claim a transport the binary does not carry.
+pub fn enabled_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if cfg!(feature = "quic") {
+        features.push("quic");
+    }
+    if cfg!(feature = "http2") {
+        features.push("http2");
+    }
+    if cfg!(feature = "wasm-tools") {
+        features.push("wasm-tools");
+    }
+    features
+}
 
 /// Protocol version carried in every envelope.
 pub const PROTOCOL_VERSION: u8 = wire::VERSION;

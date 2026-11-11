@@ -45,7 +45,7 @@ fn durable_agent() -> (Agent, active_rpc::CapHandle) {
     let agent = Agent::with_secret([0x31; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x41; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]).with_budget(Budget::calls(10_000));
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"durable-owner");

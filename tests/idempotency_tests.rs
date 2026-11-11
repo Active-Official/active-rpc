@@ -59,11 +59,13 @@ fn setup() -> (
     let calls = Rc::new(Cell::new(0));
     let fail_next = Rc::new(Cell::new(false));
     let fail_withheld = Rc::new(Cell::new(false));
-    let provider = agent.register(Box::new(Counting {
-        calls: calls.clone(),
-        fail_next: fail_next.clone(),
-        fail_withheld: fail_withheld.clone(),
-    }));
+    let provider = agent
+        .register(Box::new(Counting {
+            calls: calls.clone(),
+            fail_next: fail_next.clone(),
+            fail_withheld: fail_withheld.clone(),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["mutate"]))
         .expect("cap");

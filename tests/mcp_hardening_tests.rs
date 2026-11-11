@@ -935,7 +935,9 @@ fn a_read_only_capability_can_call_a_read_only_hint_tool() {
     .expect("handshake");
     let policy = session.policy();
     let agent = Agent::with_secret([0x36; 32]);
-    let provider = agent.register(Box::new(session));
+    let provider = agent
+        .register(Box::new(session))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider,
@@ -974,7 +976,9 @@ fn a_read_only_capability_is_still_refused_a_tool_without_annotations() {
     .expect("handshake");
     let policy = session.policy();
     let agent = Agent::with_secret([0x36; 32]);
-    let provider = agent.register(Box::new(session));
+    let provider = agent
+        .register(Box::new(session))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider,
@@ -1130,7 +1134,9 @@ fn rpc41_echo_session() -> McpSession<Scripted> {
 #[test]
 fn a_mint_without_a_policy_is_gated_by_the_session_policy() {
     let agent = Agent::with_secret([0x41; 32]);
-    let provider = agent.register(Box::new(rpc41_echo_session()));
+    let provider = agent
+        .register(Box::new(rpc41_echo_session()))
+        .expect("register provider");
     // No explicit policy: the mint attaches the session's.
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -1181,7 +1187,9 @@ fn a_mint_without_a_policy_is_gated_by_the_session_policy() {
 fn an_explicit_policy_wins_over_the_attached_default() {
     // Narrower: an explicit 1 KiB policy refuses a 2 KiB argument.
     let agent = Agent::with_secret([0x41; 32]);
-    let provider = agent.register(Box::new(rpc41_echo_session()));
+    let provider = agent
+        .register(Box::new(rpc41_echo_session()))
+        .expect("register provider");
     let mut narrow = ToolPolicy::default();
     narrow.allowed.insert("echo".to_string());
     narrow.max_arg_bytes = 1024;
@@ -1211,7 +1219,9 @@ fn an_explicit_policy_wins_over_the_attached_default() {
 
     // Wider: an explicit 1 MiB policy admits the 200 KiB argument.
     let agent = Agent::with_secret([0x41; 32]);
-    let provider = agent.register(Box::new(rpc41_echo_session()));
+    let provider = agent
+        .register(Box::new(rpc41_echo_session()))
+        .expect("register provider");
     let mut wide = ToolPolicy::default();
     wide.allowed.insert("echo".to_string());
     wide.max_arg_bytes = 1 << 20;
@@ -1241,7 +1251,9 @@ fn an_attenuated_child_cannot_drop_the_attached_policy() {
     let session = rpc41_echo_session();
     let policy = session.policy();
     let agent = Agent::with_secret([0x41; 32]);
-    let provider = agent.register(Box::new(session));
+    let provider = agent
+        .register(Box::new(session))
+        .expect("register provider");
     let parent = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint without policy");
@@ -1274,7 +1286,9 @@ fn a_session_with_more_than_64_tools_refuses_a_policy_less_mint() {
         McpSession::handshake(Scripted::new(&[initialize, list.as_str()])).expect("handshake");
     assert_eq!(session.tools().len(), 65);
     let agent = Agent::with_secret([0x41; 32]);
-    let provider = agent.register(Box::new(session));
+    let provider = agent
+        .register(Box::new(session))
+        .expect("register provider");
     let err = agent
         .mint(provider, 0, CapAttrs::new(&["tool00"]))
         .expect_err("a 65-tool attached policy must refuse the mint");

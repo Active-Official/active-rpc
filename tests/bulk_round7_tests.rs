@@ -86,7 +86,9 @@ fn the_resumed_grant_covers_two_passes() {
 
 fn run_kernel(transfer: &BulkTransfer, grant: u64) -> Result<(), Error> {
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
     let mut attrs = CapAttrs::new(&["plan", "put", "missing", "finish"]);
     attrs.budget.max_bytes = grant;

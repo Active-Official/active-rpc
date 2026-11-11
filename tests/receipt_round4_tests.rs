@@ -58,7 +58,7 @@ impl Provider for Echo {
 fn an_egress_refusal_is_receipted_as_an_egress_refusal() {
     let agent = Agent::with_secret([0x52; 32]);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.budget.max_bytes = 256;
     let cap = agent.mint(provider, 0, attrs).expect("mint");
@@ -215,7 +215,7 @@ fn a_reader_does_not_call_an_in_progress_append_damage() {
 fn the_sequence_setter_refuses_a_rewind_and_an_impossible_start() {
     let agent = Agent::with_secret([0x53; 32]);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");

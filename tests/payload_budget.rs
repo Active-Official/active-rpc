@@ -31,7 +31,7 @@ impl Provider for Echo {
 
 fn agent_with_bytes(max_bytes: u64) -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x9a; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.budget.max_bytes = max_bytes;
     let cap = agent.mint(provider, 0, attrs).expect("mint");
@@ -90,7 +90,7 @@ fn a_response_larger_than_the_remaining_grant_is_refused() {
     }
 
     let agent = Agent::with_secret([0x9b; 32]);
-    let provider = agent.register(Box::new(Big));
+    let provider = agent.register(Box::new(Big)).expect("register provider");
     let cap = agent
         .mint(
             provider,

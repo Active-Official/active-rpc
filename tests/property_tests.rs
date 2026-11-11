@@ -188,7 +188,7 @@ proptest! {
         payload in "[a-zA-Z0-9 _.-]{0,48}",
     ) {
         let agent = Agent::with_secret(seed);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let cap = agent
             .mint(provider, 0, CapAttrs::new(&["echo"]))
             .expect("mint");
@@ -371,7 +371,7 @@ proptest! {
     #[test]
     fn a_refused_dependency_stops_the_pipeline(payload in "[a-z]{0,24}") {
         let agent = Agent::with_secret([0x5a; 32]);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let cap = agent
             .mint(provider, 0, CapAttrs::new(&["echo"]))
             .expect("mint");

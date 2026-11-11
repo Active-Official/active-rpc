@@ -51,7 +51,7 @@ fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
 
 fn agent() -> (Agent, active_rpc::ProviderId, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x51; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent
         .create_lane("promises", Budget::default())
         .expect("lane");
@@ -62,7 +62,7 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     let agent = Agent::with_secret([0x52; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x86; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     (agent, provider)
 }
 
@@ -252,9 +252,11 @@ fn cancelling_inside_dispatch_counts_once() {
     let agent = Agent::with_secret([0x53; 32]);
     let slot: Rc<std::cell::RefCell<Option<(Agent, CapHandle)>>> =
         Rc::new(std::cell::RefCell::new(None));
-    let provider = agent.register(Box::new(SelfCancel {
-        slot: Rc::clone(&slot),
-    }));
+    let provider = agent
+        .register(Box::new(SelfCancel {
+            slot: Rc::clone(&slot),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))
         .expect("cap");
@@ -299,9 +301,11 @@ fn resolving_a_queued_promise_prevents_the_provider_call() {
     }
 
     let agent = Agent::with_secret([0x54; 32]);
-    let provider = agent.register(Box::new(Counter {
-        runs: Rc::clone(&runs),
-    }));
+    let provider = agent
+        .register(Box::new(Counter {
+            runs: Rc::clone(&runs),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["count"]))
         .expect("cap");
@@ -390,9 +394,11 @@ fn run_from_on_drop_does_not_kill_queued_jobs() {
     let agent = Agent::with_secret([0x55; 32]);
     let slot: Rc<std::cell::RefCell<Option<(Agent, CapHandle, active_rpc::LaneId)>>> =
         Rc::new(std::cell::RefCell::new(None));
-    let provider = agent.register(Box::new(Withdrawer {
-        slot: Rc::clone(&slot),
-    }));
+    let provider = agent
+        .register(Box::new(Withdrawer {
+            slot: Rc::clone(&slot),
+        }))
+        .expect("register provider");
     let doomed = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))
         .expect("doomed");
@@ -493,7 +499,9 @@ fn a_virtual_deadline_does_not_inflate_across_a_restart() {
     restarted.set_durable_capabilities(true);
     restarted.set_record_seal_key([0x86; 32]);
     restarted.set_latency(100);
-    restarted.register(Box::new(Echo));
+    restarted
+        .register(Box::new(Echo))
+        .expect("register provider");
     let owner = admitted(b"owner");
     let restored = restarted
         .restore_capability_in_process_only(&record, &owner)
@@ -617,10 +625,12 @@ fn awaiting_from_on_drop_returns_instead_of_spinning() {
     let seen = Rc::new(std::cell::Cell::new(0));
     let slot: Rc<std::cell::RefCell<Option<Slot>>> = Rc::new(std::cell::RefCell::new(None));
     let agent = Agent::with_secret([0x56; 32]);
-    let provider = agent.register(Box::new(AwaitsInDrop {
-        slot: Rc::clone(&slot),
-        seen: Rc::clone(&seen),
-    }));
+    let provider = agent
+        .register(Box::new(AwaitsInDrop {
+            slot: Rc::clone(&slot),
+            seen: Rc::clone(&seen),
+        }))
+        .expect("register provider");
     // One capability is released (its drop runs the handler); the other carries
     // a queued call the handler awaits while the provider is being notified.
     let doomed = agent
@@ -717,7 +727,7 @@ fn a_provider_value_deeper_than_the_wire_limit_is_refused() {
     }
 
     let agent = Agent::with_secret([0x57; 32]);
-    let provider = agent.register(Box::new(Deep));
+    let provider = agent.register(Box::new(Deep)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["deep"]))
         .expect("cap");
@@ -847,7 +857,9 @@ fn a_tombstone_revokes_the_live_capability_it_names() {
     let restarted = Agent::with_secret([0x52; 32]);
     restarted.set_durable_capabilities(true);
     restarted.set_record_seal_key([0x86; 32]);
-    restarted.register(Box::new(Echo));
+    restarted
+        .register(Box::new(Echo))
+        .expect("register provider");
     let restored = restarted
         .restore_capability_in_process_only(&record, &admitted(b"owner"))
         .expect("restore");
@@ -897,7 +909,9 @@ fn the_record_id_sets_are_bounded() {
     restarted.set_durable_capabilities(true);
     restarted.set_record_seal_key([0x86; 32]);
     restarted.set_record_id_ceiling(1).expect("ceiling");
-    restarted.register(Box::new(Echo));
+    restarted
+        .register(Box::new(Echo))
+        .expect("register provider");
     let first = restarted
         .restore_capability_in_process_only(&records[0], &admitted(b"owner"))
         .expect("first restore");
@@ -921,7 +935,9 @@ fn a_record_that_disables_a_ceiling_is_a_durable_refusal() {
     let restarted = Agent::with_secret([0x52; 32]);
     restarted.set_durable_capabilities(true);
     restarted.set_record_seal_key([0x86; 32]);
-    restarted.register(Box::new(Echo));
+    restarted
+        .register(Box::new(Echo))
+        .expect("register provider");
     let error = restarted
         .restore_capability_in_process_only(&record, &admitted(b"owner"))
         .expect_err("a zero ceiling is refused");
@@ -963,9 +979,11 @@ fn cancelling_a_running_call_is_not_a_double_settlement() {
 
     let agent = Agent::with_secret([0x7d; 32]);
     let slot: Rc<RefCell<Option<active_rpc::PromiseHandle>>> = Rc::new(RefCell::new(None));
-    let provider = agent.register(Box::new(Canceller {
-        slot: Rc::clone(&slot),
-    }));
+    let provider = agent
+        .register(Box::new(Canceller {
+            slot: Rc::clone(&slot),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))
         .expect("cap");

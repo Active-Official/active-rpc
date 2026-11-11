@@ -188,7 +188,7 @@ fn the_kernel_counter_closes_on_send_recv_and_destroy() {
 
     // The publish path charges the topic with the record, and destroy releases
     // the backlog.
-    let provider = agent.register(Box::new(Sink));
+    let provider = agent.register(Box::new(Sink)).expect("register provider");
     let cap = agent
         .mint(
             provider,
@@ -253,7 +253,7 @@ fn the_host_sees_a_channel_a_lane_may_not_read() {
 #[test]
 fn a_send_charges_the_transferred_cap_s_meter() {
     let agent = Agent::with_secret([0x51u8; 32]);
-    let provider = agent.register(Box::new(Sink));
+    let provider = agent.register(Box::new(Sink)).expect("register provider");
     let lane = agent
         .create_lane(
             "wide",
@@ -313,7 +313,7 @@ fn a_send_charges_the_transferred_cap_s_meter() {
 #[test]
 fn a_refused_send_spends_nothing() {
     let agent = Agent::with_secret([0x52u8; 32]);
-    let provider = agent.register(Box::new(Sink));
+    let provider = agent.register(Box::new(Sink)).expect("register provider");
     let lane = agent
         .create_lane(
             "wide",
@@ -391,7 +391,7 @@ fn a_refused_send_spends_nothing() {
 #[test]
 fn a_send_charges_the_ancestors_of_a_transferred_cap() {
     let agent = Agent::with_secret([0x53u8; 32]);
-    let provider = agent.register(Box::new(Sink));
+    let provider = agent.register(Box::new(Sink)).expect("register provider");
     let lane = agent
         .create_lane(
             "wide",
@@ -470,7 +470,7 @@ fn plain_module() -> InfinityModule {
 #[test]
 fn a_send_refuses_a_secret_bearing_module() {
     let agent = Agent::with_secret([0x53u8; 32]);
-    let provider = agent.register(Box::new(Sink));
+    let provider = agent.register(Box::new(Sink)).expect("register provider");
     let lane_a = agent.create_lane("a", Budget::default()).expect("lane a");
     let lane_b = agent.create_lane("b", Budget::default()).expect("lane b");
     let channel = agent
@@ -535,7 +535,7 @@ fn a_send_refuses_a_secret_bearing_module() {
 #[test]
 fn a_publish_refuses_a_secret_bearing_module() {
     let agent = Agent::with_secret([0x54u8; 32]);
-    let provider = agent.register(Box::new(Sink));
+    let provider = agent.register(Box::new(Sink)).expect("register provider");
     let lane = agent.create_lane("pub", Budget::default()).expect("lane");
     let lane_b = agent
         .create_lane("recv", Budget::default())

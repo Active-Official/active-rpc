@@ -43,7 +43,9 @@ fn a_withheld_reply_is_receipted_as_admitted_and_not_replayed() {
     let calls = Arc::new(AtomicUsize::new(0));
     let agent = Agent::with_secret([0x6d; 32]);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Withheld(Arc::clone(&calls))));
+    let provider = agent
+        .register(Box::new(Withheld(Arc::clone(&calls))))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider,
@@ -122,7 +124,9 @@ fn a_read_only_call_never_becomes_an_admitted_receipt() {
     let calls = Arc::new(AtomicUsize::new(0));
     let agent = Agent::with_secret([0x6e; 32]);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(ReadOnly(Arc::clone(&calls))));
+    let provider = agent
+        .register(Box::new(ReadOnly(Arc::clone(&calls))))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider,

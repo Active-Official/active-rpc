@@ -58,7 +58,7 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let agent = Agent::with_secret([0x5b; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let peer = PeerIdentity::from_certificate(b"transport-matrix-peer");
     let admitted = IdentityPolicy::default()
         .admit(Some(&peer), true)

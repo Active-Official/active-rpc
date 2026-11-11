@@ -117,7 +117,7 @@ where
 #[test]
 fn a_bridge_call_runs_through_the_real_kernel() {
     let agent = Agent::with_secret([0x4a; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -138,7 +138,7 @@ fn a_bridge_call_runs_through_the_real_kernel() {
 #[test]
 fn a_refusal_crosses_the_bridge_unchanged() {
     let agent = Agent::with_secret([0x4b; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -159,7 +159,7 @@ fn a_refusal_crosses_the_bridge_unchanged() {
 #[test]
 fn a_descriptor_cannot_widen_the_registry() {
     let agent = Agent::with_secret([0x4c; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     // The capability grants only `echo`.
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -187,7 +187,7 @@ fn a_descriptor_cannot_widen_the_registry() {
 #[test]
 fn a_bound_capability_is_refused_over_the_bridge() {
     let agent = Agent::with_secret([0x4d; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let peer = PeerIdentity::from_certificate(b"bridge-peer");
     let admitted = IdentityPolicy::default()
         .admit(Some(&peer), true)
@@ -212,7 +212,7 @@ fn a_bound_capability_is_refused_over_the_bridge() {
 #[test]
 fn a_revoked_capability_is_refused_over_the_bridge() {
     let agent = Agent::with_secret([0x4e; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -689,7 +689,7 @@ fn a_truncated_body_gets_a_400_and_the_bridge_keeps_serving() {
     use std::io::{Read, Write};
 
     let agent = Agent::with_secret([0x4f; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");

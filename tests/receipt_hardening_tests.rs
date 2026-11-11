@@ -80,7 +80,7 @@ fn sandbox(name: &str) -> std::path::PathBuf {
 fn session(count: usize) -> (Agent, Vec<Receipt>) {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -105,7 +105,7 @@ fn session_wall_clock(count: usize) -> (Agent, Vec<Receipt>) {
     let agent = Agent::with_secret(SECRET);
     agent.use_wall_clock(true);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -188,7 +188,7 @@ fn a_kernel_ring_that_wrapped_exports_cleanly() {
     let path = dir.join("receipts.arrl");
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -342,7 +342,7 @@ fn append_verified_refuses_a_forged_receipt() {
 fn a_dispatch_refusal_is_recorded_as_a_refusal() {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -386,7 +386,7 @@ fn a_dispatch_refusal_is_recorded_as_a_refusal() {
 fn evictions_are_counted_and_reported_once() {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -500,7 +500,7 @@ fn an_oversized_log_is_refused_promptly() {
 #[test]
 fn a_granted_method_the_log_cannot_hold_is_refused_at_mint() {
     let agent = Agent::with_secret(SECRET);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let long = "m".repeat(MAX_METHOD_BYTES + 1);
     let error = agent
         .mint(provider, 0, CapAttrs::new(&[long.as_str()]))
@@ -617,7 +617,7 @@ fn a_refusal_round_trips_through_the_log() {
     let path = dir.join("receipts.arrl");
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -651,9 +651,11 @@ fn a_long_granted_method_is_recorded_exactly() {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
     let method = "n".repeat(MAX_METHOD_BYTES);
-    let provider = agent.register(Box::new(LongEcho {
-        method: method.clone(),
-    }));
+    let provider = agent
+        .register(Box::new(LongEcho {
+            method: method.clone(),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&[method.as_str()]))
         .expect("a method exactly at the ceiling");
@@ -681,7 +683,7 @@ fn a_long_granted_method_is_recorded_exactly() {
 fn an_ungranted_method_leaves_no_receipt() {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent
         .create_lane("ungranted", Budget::default())
         .expect("lane");

@@ -37,7 +37,9 @@ impl Provider for Echo {
 fn echo_agent() -> (Agent, CapHandle, LaneId, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let agent = Agent::with_secret([0x7b; 32]);
-    let provider = agent.register(Box::new(Echo(Arc::clone(&calls))));
+    let provider = agent
+        .register(Box::new(Echo(Arc::clone(&calls))))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.budget = Budget {
         max_bytes: 1 << 20,
@@ -148,7 +150,9 @@ fn dropping_an_exported_capability_reports_the_orphan() {
     let agent = Agent::with_secret([0x7d; 32]);
     agent.set_record_seal_key([0x7e; 32]);
     agent.set_durable_capabilities(true);
-    let provider = agent.register(Box::new(Echo(Arc::new(AtomicUsize::new(0)))));
+    let provider = agent
+        .register(Box::new(Echo(Arc::new(AtomicUsize::new(0)))))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"owner");
@@ -172,7 +176,9 @@ fn dropping_an_exported_capability_reports_the_orphan() {
 fn a_rotated_certificate_can_rebind_a_capability() {
     let agent = Agent::with_secret([0x7f; 32]);
     let calls = Arc::new(AtomicUsize::new(0));
-    let provider = agent.register(Box::new(Echo(Arc::clone(&calls))));
+    let provider = agent
+        .register(Box::new(Echo(Arc::clone(&calls))))
+        .expect("register provider");
     let owner = admitted(b"old-owner");
     let cap = agent
         .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]))

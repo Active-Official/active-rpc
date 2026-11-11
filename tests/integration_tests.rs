@@ -45,7 +45,9 @@ fn setup() -> (
     let mut provider = ModuleProvider::new();
     let object = provider.install(module()).expect("install");
     let agent = Agent::with_secret([21u8; 32]);
-    let provider_id = agent.register(Box::new(provider));
+    let provider_id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = agent
         .mint(
             provider_id,

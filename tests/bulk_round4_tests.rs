@@ -55,7 +55,9 @@ fn map_of(value: Value) -> BTreeMap<String, Value> {
 /// meter, which is what the documented grant has to cover (round 4, M-2).
 fn run_through_kernel(transfer: &BulkTransfer, grant: u64) -> Result<(), Error> {
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
     let mut attrs = CapAttrs::new(&["plan", "put", "missing", "finish"]);
     attrs.budget.max_bytes = grant;
@@ -179,7 +181,9 @@ fn the_required_grant_carries_the_whole_transfer() {
 fn a_delegated_capability_on_the_same_object_shares_the_transfer() {
     let transfer = BulkTransfer::new(body(40_000, 21), 10_000).expect("transfer");
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
     let parent = agent
         .mint(id, 0, CapAttrs::new(&["plan", "put", "missing"]))

@@ -12,7 +12,7 @@ fn scenario(core: &mut PlaneCore, id: &str) -> serde_json::Value {
 
 #[test]
 fn round_trip_observes_real_codec_work() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let before = core.snapshot();
     let result = scenario(&mut core, "round-trip");
     let after = core.snapshot();
@@ -34,7 +34,7 @@ fn round_trip_observes_real_codec_work() {
 
 #[test]
 fn pipelining_uses_fewer_round_trips_and_is_repeatable() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let first = scenario(&mut core, "pipeline");
     let second = scenario(&mut core, "pipeline");
     for result in [first, second] {
@@ -56,7 +56,7 @@ fn pipelining_uses_fewer_round_trips_and_is_repeatable() {
 
 #[test]
 fn a_widening_attempt_is_refused_by_the_kernel() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let result = scenario(&mut core, "attenuation");
     assert_eq!(result["ok"], true);
     assert_eq!(result["data"]["code"], "rpc/attenuation-escalation");
@@ -64,7 +64,7 @@ fn a_widening_attempt_is_refused_by_the_kernel() {
 
 #[test]
 fn a_real_budget_is_exhausted() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let before = core.snapshot().metrics.budget_exhaustions;
     let result = scenario(&mut core, "budget");
     let after = core.snapshot().metrics.budget_exhaustions;
@@ -75,7 +75,7 @@ fn a_real_budget_is_exhausted() {
 
 #[test]
 fn a_real_tool_policy_refuses_work() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let result = scenario(&mut core, "tool-policy");
     assert_eq!(result["ok"], true);
     assert_eq!(result["data"]["code"], "rpc/tool-policy");
@@ -83,7 +83,7 @@ fn a_real_tool_policy_refuses_work() {
 
 #[test]
 fn streaming_reassembles_the_canonical_image() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let result = scenario(&mut core, "streaming");
     assert_eq!(result["ok"], true);
     assert_eq!(result["data"]["stable"], true);
@@ -95,7 +95,7 @@ fn streaming_reassembles_the_canonical_image() {
 
 #[test]
 fn lanes_are_served_in_one_provider_batch() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let result = scenario(&mut core, "lanes");
     assert_eq!(result["ok"], true);
     assert_eq!(result["data"]["round_trips"], 1);
@@ -108,7 +108,7 @@ fn lanes_are_served_in_one_provider_batch() {
 
 #[test]
 fn channel_share_transfers_a_capability_id_by_reference() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let result = scenario(&mut core, "channel-share");
     assert_eq!(result["ok"], true);
     assert_eq!(result["data"]["shared"], true);
@@ -117,7 +117,7 @@ fn channel_share_transfers_a_capability_id_by_reference() {
 
 #[test]
 fn revoke_before_dispatch_never_reaches_the_provider() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let result = scenario(&mut core, "revoke");
     assert_eq!(result["ok"], true);
     assert_eq!(result["data"]["code"], "rpc/revoked");
@@ -125,7 +125,7 @@ fn revoke_before_dispatch_never_reaches_the_provider() {
 
 #[test]
 fn the_snapshot_never_contains_the_secret_canary() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     scenario(&mut core, "redaction");
     let snapshot = serde_json::to_string(&core.snapshot()).expect("json");
     assert!(!snapshot.contains(active_control_plane::plane::SECRET_CANARY));
@@ -137,7 +137,7 @@ fn the_snapshot_never_contains_the_secret_canary() {
 
 #[test]
 fn metrics_change_by_the_real_call_count() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let before = core.snapshot().metrics.calls_queued;
     scenario(&mut core, "pipeline");
     let after = core.snapshot().metrics.calls_queued;
@@ -147,7 +147,7 @@ fn metrics_change_by_the_real_call_count() {
 
 #[test]
 fn benchmark_exports_the_samples_it_measured() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let report = core.run_benchmark(20).expect("benchmark");
     assert_eq!(report.encode.n, 20);
     assert_eq!(report.validate.n, 20);
@@ -163,7 +163,7 @@ fn benchmark_exports_the_samples_it_measured() {
 #[test]
 fn status_module_is_valid_ainf_with_a_matching_hash() {
     use base64::Engine;
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let value = core.status_module_json().expect("status module");
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(value["bytes_base64"].as_str().expect("base64"))
@@ -191,7 +191,7 @@ fn status_module_is_valid_ainf_with_a_matching_hash() {
 /// red stage that said only "Scenario panic".
 #[test]
 fn every_ladder_step_passes_twice() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     for round in 0..2 {
         for def in SCENARIOS {
             let result = core.run_scenario(def.id).expect("scenario");
@@ -214,7 +214,7 @@ fn every_ladder_step_passes_twice() {
 /// reported with a message, so an operator can tell the two apart.
 #[test]
 fn a_scenario_reports_the_code_it_refused_with() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     // `mcp-memory` is the step whose second run used to desynchronise.
     let first = core.run_scenario("mcp-memory").expect("scenario");
     assert!(first.ok, "{}", first.detail);
@@ -225,7 +225,7 @@ fn a_scenario_reports_the_code_it_refused_with() {
 
 #[test]
 fn every_ladder_step_runs_real_code_and_passes() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     for def in SCENARIOS {
         let result = core.run_scenario(def.id).expect("scenario");
         assert!(result.ok, "{} failed: {}", def.id, result.detail);
@@ -261,7 +261,7 @@ fn the_ladder_covers_every_level_from_zero_to_six() {
 
 #[test]
 fn run_level_returns_the_steps_at_or_below_the_cut() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let smoke = core.run_level(0, false);
     assert_eq!(smoke.len(), 3);
     let up_to_one = core.run_level(1, true);
@@ -282,7 +282,7 @@ fn run_level_returns_the_steps_at_or_below_the_cut() {
 
 #[test]
 fn idle_rates_are_zero_and_gauges_record_real_samples() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let first = core.snapshot();
     assert_eq!(first.metrics.calls_per_second, 0.0);
     assert_eq!(first.metrics.settled_per_s, 0.0);
@@ -303,7 +303,7 @@ fn idle_rates_are_zero_and_gauges_record_real_samples() {
 
 #[test]
 fn events_carry_structured_fields_and_a_working_cursor() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     core.run_scenario("pipeline").expect("scenario");
     let all = core.events_after(0);
     assert!(all.len() >= 3);
@@ -323,7 +323,7 @@ fn events_carry_structured_fields_and_a_working_cursor() {
 
 #[test]
 fn engines_replace_the_old_topology_with_real_registries() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let snapshot = core.snapshot();
     assert_eq!(snapshot.engines.lanes.len(), 4);
     assert_eq!(snapshot.engines.channels.len(), 2);
@@ -341,7 +341,7 @@ fn engines_replace_the_old_topology_with_real_registries() {
 
 #[test]
 fn health_and_scenario_allow_list_are_stable() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     let snapshot = core.snapshot();
     let first = snapshot.scenario_ids;
     let second = core.snapshot().scenario_ids;
@@ -355,7 +355,7 @@ fn health_and_scenario_allow_list_are_stable() {
 
 #[test]
 fn every_refusal_facet_is_recorded() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     core.run_scenario("tool-policy").expect("tool policy");
     core.run_scenario("budget").expect("budget");
     core.run_scenario("revoke").expect("revoke");
@@ -380,7 +380,7 @@ fn every_refusal_facet_is_recorded() {
 
 #[test]
 fn repeated_refusals_are_each_recorded() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     core.run_scenario("call-storm").expect("call storm");
     let snapshot = core.snapshot();
     let budget_refusals = snapshot
@@ -401,7 +401,7 @@ fn kernel_event_capture_survives_tape_wrap() {
     // The kernel tape holds 16,384 events. Drive it past the wrap, then prove
     // one more scenario still contributes its real kernel events, not just the
     // scenario note. This is the regression the old length cursor missed.
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     while core.agent().total_events() < 16_500 {
         core.run_scenario("pipeline-stress").expect("stress fill");
     }
@@ -429,7 +429,7 @@ fn kernel_event_capture_survives_tape_wrap() {
 
 #[test]
 fn http_and_process_tools_survive_repeated_runs() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     for round in 0..10 {
         let result = core.run_scenario("http-tool").expect("http scenario");
         assert!(result.ok, "http round {round}: {}", result.detail);
@@ -445,7 +445,7 @@ fn http_and_process_tools_survive_repeated_runs() {
 
 #[test]
 fn read_only_mode_is_labeled_without_changing_observations() {
-    let mut core = PlaneCore::new();
+    let mut core = PlaneCore::new().expect("plane core");
     core.set_mode("read-only");
     let snapshot = core.snapshot();
     assert_eq!(snapshot.health.mode, "read-only");
@@ -457,7 +457,7 @@ fn read_only_mode_is_labeled_without_changing_observations() {
 /// MCP fallback) leaked a listener and a thread.
 #[test]
 fn dropping_a_core_closes_the_http_stub() {
-    let core = PlaneCore::new();
+    let core = PlaneCore::new().expect("plane core");
     let address = core.http_address().to_string();
     assert!(
         std::net::TcpStream::connect(&address).is_ok(),

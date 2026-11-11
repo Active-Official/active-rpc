@@ -200,7 +200,9 @@ fn a_one_chunk_image_with_an_early_missing_page_fits_required_grant() {
 
 fn run_kernel_flow(transfer: &BulkTransfer, grant: u64, calls: u64) -> Result<(), Error> {
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
     let mut attrs = CapAttrs::new(&["plan", "put", "missing", "finish"]);
     attrs.budget.max_bytes = grant;
@@ -282,7 +284,9 @@ fn a_narrow_array_budget_can_still_page_the_missing_indexes() {
     let transfer = BulkTransfer::new(body(64 * 1024, 0x27), 1_024).expect("transfer");
     assert!(transfer.plan().chunk_count() > 10);
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
     let mut attrs = CapAttrs::new(&["plan", "missing"]);
     attrs.budget.max_array_len = 10;

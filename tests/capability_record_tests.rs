@@ -58,7 +58,7 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle) {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x91; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"durable-owner");
@@ -166,7 +166,7 @@ fn a_durable_capability_round_trips_through_a_record() {
 #[test]
 fn an_ephemeral_capability_cannot_be_exported() {
     let agent = Agent::with_secret([0x72; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -181,7 +181,7 @@ fn restore_requires_the_durable_policy() {
     let (agent, _provider, cap) = durable_agent();
     let record = agent.export_capability(&cap).expect("export");
     let other = Agent::with_secret([0x73; 32]);
-    other.register(Box::new(Echo));
+    other.register(Box::new(Echo)).expect("register provider");
     let error = other
         .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect_err("durable restore must be opt-in");
@@ -194,7 +194,7 @@ fn restore_refuses_a_passed_deadline() {
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x92; 32]);
     agent.set_latency(100);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]).with_ttl_ms(100);
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"durable-owner");
@@ -222,7 +222,7 @@ fn restore_refuses_a_record_bound_to_another_peer() {
     let agent = Agent::with_secret([0x75; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x93; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let owner = admitted(b"owner-a");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
@@ -285,7 +285,7 @@ fn a_restored_capability_keeps_the_original_deadline() {
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x94; 32]);
     agent.set_latency(100);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]).with_ttl_ms(1_000);
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"durable-owner");
@@ -387,7 +387,7 @@ fn an_expired_export_is_an_expiry_event() {
     let agent = Agent::with_secret([0x73; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x93; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let attrs = CapAttrs::new(&["echo"]).durable().with_ttl_ms(0);
     let cap = agent
         .mint_bound(&admitted(b"durable-owner"), provider, 0, attrs)
@@ -420,7 +420,9 @@ fn an_exported_record_keeps_its_object_alive() {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x93; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["stats"]);
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"durable-owner");
@@ -499,7 +501,9 @@ fn a_revoked_exported_record_releases_its_object() {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x94; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["stats"]);
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"durable-owner");
@@ -531,7 +535,9 @@ fn a_tombstone_after_the_handle_is_dropped_releases_the_pin() {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x96; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["stats"]);
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"durable-owner");
@@ -578,7 +584,7 @@ fn a_restart_after_a_tombstone_mints_a_fresh_record_id() {
     second
         .tombstone_record(record.record_id)
         .expect("replay the tombstone");
-    let provider = second.register(Box::new(Echo));
+    let provider = second.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
     let owner = admitted(b"durable-owner");
@@ -621,7 +627,7 @@ fn a_record_with_a_deadline_but_no_lease_is_refused_by_the_parser() {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x97; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
     attrs.ttl_ms = Some(60_000);
@@ -915,7 +921,7 @@ fn a_record_with_a_nested_extra_or_a_reordered_allow_list_is_refused() {
         let agent = Agent::with_secret([0x71; 32]);
         agent.set_durable_capabilities(true);
         agent.set_record_seal_key([0x91; 32]);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let mut attrs = CapAttrs::new(&["echo"]);
         attrs.persistence = CapPersistence::Durable;
         attrs.tool_policy = Some(active_rpc::cap::ToolPolicy {
@@ -989,7 +995,7 @@ fn a_restored_capability_cannot_be_exported_again() {
     let target = Agent::with_secret(secret);
     target.set_durable_capabilities(true);
     target.set_record_seal_key([0x91; 32]);
-    target.register(Box::new(Echo));
+    target.register(Box::new(Echo)).expect("register provider");
     let restored = target
         .restore_capability_in_process_only(&record, &admitted(b"durable-owner"))
         .expect("restore");
@@ -1006,7 +1012,7 @@ fn a_restored_capability_cannot_be_exported_again() {
 fn a_wall_clock_deadline_does_not_survive_a_switch_to_virtual() {
     let agent = Agent::with_secret([0x5b; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.ttl_ms = Some(60_000);
     let cap = agent.mint(provider, 0, attrs).expect("mint");
@@ -1122,7 +1128,7 @@ fn an_export_after_a_clock_switch_is_refused() {
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x91; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
     attrs.ttl_ms = Some(60_000);
@@ -1686,7 +1692,7 @@ fn revoked_ancestor_setup() -> (Agent, active_rpc::CapabilityRecord, [u8; 32]) {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
     agent.set_record_seal_key([0x91; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let owner = admitted(b"durable-owner");
     let root = agent
         .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]).durable())
@@ -1766,7 +1772,7 @@ fn restore_under_a_tombstoned_ancestor_is_refused_cross_kernel_after_kill_list_r
     let agent_b = Agent::with_secret([0x71; 32]);
     agent_b.set_durable_capabilities(true);
     agent_b.set_record_seal_key([0x91; 32]);
-    agent_b.register(Box::new(Echo));
+    agent_b.register(Box::new(Echo)).expect("register provider");
     agent_b
         .tombstone_record(root_record_id)
         .expect("replay the kill list");
@@ -1782,7 +1788,7 @@ fn restore_without_kill_list_replay_succeeds_cross_kernel() {
     let agent_b = Agent::with_secret([0x71; 32]);
     agent_b.set_durable_capabilities(true);
     agent_b.set_record_seal_key([0x91; 32]);
-    agent_b.register(Box::new(Echo));
+    agent_b.register(Box::new(Echo)).expect("register provider");
     agent_b
         .restore_capability_in_process_only(&child_record, &admitted(b"durable-owner"))
         .expect("no replayed tombstone, so the restore succeeds");
@@ -1863,7 +1869,7 @@ fn a_restart_with_a_replayed_kill_list_never_reissues_a_tombstoned_record_id() {
         let agent = Agent::with_secret(secret);
         agent.set_record_seal_key(seal_key);
         agent.set_durable_capabilities(true);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let owner = admitted(b"owner-public-certificate-bytes");
         let mut attrs = CapAttrs::new(&["echo"]);
         attrs.persistence = CapPersistence::Durable;
@@ -1884,7 +1890,7 @@ fn a_restart_with_a_replayed_kill_list_never_reissues_a_tombstoned_record_id() {
         .tombstone_record(tombstoned)
         .expect("replay the kill list");
     assert!(agent.record_is_tombstoned(&tombstoned));
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let owner = admitted(b"owner-public-certificate-bytes");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
@@ -1950,7 +1956,7 @@ fn an_attenuated_child_after_a_replayed_kill_list_skips_a_tombstoned_serial() {
         let agent = Agent::with_secret(secret);
         agent.set_record_seal_key(seal_key);
         agent.set_durable_capabilities(true);
-        let provider = agent.register(Box::new(Echo));
+        let provider = agent.register(Box::new(Echo)).expect("register provider");
         let owner = admitted(b"owner-public-certificate-bytes");
         let mut attrs = CapAttrs::new(&["echo"]);
         attrs.persistence = CapPersistence::Durable;
@@ -1966,7 +1972,7 @@ fn an_attenuated_child_after_a_replayed_kill_list_skips_a_tombstoned_serial() {
     agent
         .tombstone_record(tombstoned)
         .expect("replay the kill list");
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let owner = admitted(b"owner-public-certificate-bytes");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
@@ -2085,7 +2091,9 @@ fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
         .install(plain_module("module-A"))
         .expect("install A");
     assert_eq!(object_a, 0);
-    let id_a = agent_a.register(Box::new(provider_a));
+    let id_a = agent_a
+        .register(Box::new(provider_a))
+        .expect("register provider");
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");
     assert!(
@@ -2100,7 +2108,9 @@ fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
         .install(plain_module("module-B"))
         .expect("install B");
     assert_eq!(object_b, 0);
-    let _id_b = agent_b.register(Box::new(provider_b));
+    let _id_b = agent_b
+        .register(Box::new(provider_b))
+        .expect("register provider");
     let error = agent_b
         .restore_capability_in_process_only(&record, &owner)
         .expect_err("a different module at the same id is a rebind, not a restore");
@@ -2121,13 +2131,17 @@ fn a_restore_refuses_a_module_cap_when_the_object_does_not_exist() {
     let object_a = provider_a
         .install(plain_module("module-A"))
         .expect("install A");
-    let id_a = agent_a.register(Box::new(provider_a));
+    let id_a = agent_a
+        .register(Box::new(provider_a))
+        .expect("register provider");
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");
     drop(cap_a);
 
     let (agent_c, _) = module_agent();
-    let _id_c = agent_c.register(Box::new(ModuleProvider::new()));
+    let _id_c = agent_c
+        .register(Box::new(ModuleProvider::new()))
+        .expect("register provider");
     let error = agent_c
         .restore_capability_in_process_only(&record, &owner)
         .expect_err("no module lives at the object on this kernel");
@@ -2147,7 +2161,9 @@ fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
     let object_a = provider_a
         .install(plain_module("module-A"))
         .expect("install A");
-    let id_a = agent_a.register(Box::new(provider_a));
+    let id_a = agent_a
+        .register(Box::new(provider_a))
+        .expect("register provider");
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");
     drop(cap_a);
@@ -2158,7 +2174,9 @@ fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
         .install(plain_module("module-A"))
         .expect("install A");
     assert_eq!(object_b, 0);
-    let _id_b = agent_b.register(Box::new(provider_b));
+    let _id_b = agent_b
+        .register(Box::new(provider_b))
+        .expect("register provider");
     let lane_b = agent_b.create_lane("b", Budget::default()).expect("lane");
     let restored = agent_b
         .restore_capability_in_process_only(&record, &owner)
@@ -2185,7 +2203,9 @@ fn a_restore_refuses_a_record_exported_before_a_patch() {
     let object = provider
         .install(plain_module("module-A"))
         .expect("install A");
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let cap = mint_module_cap(
         &agent,
         id,
@@ -2251,7 +2271,9 @@ fn a_sealed_record_carries_the_redacted_hash_for_a_secret_module() {
     let (agent_a, owner) = module_agent();
     let mut provider_a = ModuleProvider::new();
     let object_a = provider_a.install(module).expect("install secret module");
-    let id_a = agent_a.register(Box::new(provider_a));
+    let id_a = agent_a
+        .register(Box::new(provider_a))
+        .expect("register provider");
     let cap_a = mint_module_cap(
         &agent_a,
         id_a,
@@ -2294,7 +2316,9 @@ fn a_sealed_record_carries_the_redacted_hash_for_a_secret_module() {
         .install(secret_module("s3cr3t-value"))
         .expect("install same secret module");
     assert_eq!(object_b, 0);
-    let _id_b = agent_b.register(Box::new(provider_b));
+    let _id_b = agent_b
+        .register(Box::new(provider_b))
+        .expect("register provider");
     agent_b
         .restore_capability_in_process_only(&record, &owner)
         .expect("the same secret module restores");
@@ -2330,7 +2354,9 @@ fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
     let object_a = provider_a
         .install(plain_module("module-A"))
         .expect("install A");
-    let id_a = agent_a.register(Box::new(provider_a));
+    let id_a = agent_a
+        .register(Box::new(provider_a))
+        .expect("register provider");
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");
     assert!(record.content_hash.is_some(), "the export seals a hash");
@@ -2349,7 +2375,9 @@ fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
         .install(plain_module("module-B"))
         .expect("install B");
     assert_eq!(object_b, 0);
-    let _id_b = agent_b.register(Box::new(provider_b));
+    let _id_b = agent_b
+        .register(Box::new(provider_b))
+        .expect("register provider");
     let lane_b = agent_b.create_lane("b", Budget::default()).expect("lane");
     let restored = agent_b
         .restore_capability_in_process_only(&legacy, &owner)
@@ -2373,7 +2401,9 @@ fn a_legacy_record_without_a_hash_refuses_when_the_object_does_not_exist() {
     let object_a = provider_a
         .install(plain_module("module-A"))
         .expect("install A");
-    let id_a = agent_a.register(Box::new(provider_a));
+    let id_a = agent_a
+        .register(Box::new(provider_a))
+        .expect("register provider");
     let cap_a = mint_module_cap(&agent_a, id_a, object_a, &owner, &["evaluate"], true);
     let record = agent_a.export_capability(&cap_a).expect("export");
     drop(cap_a);
@@ -2382,7 +2412,9 @@ fn a_legacy_record_without_a_hash_refuses_when_the_object_does_not_exist() {
     legacy.seal_with(&[0x91; 32]);
 
     let (agent_c, _) = module_agent();
-    let _id_c = agent_c.register(Box::new(ModuleProvider::new()));
+    let _id_c = agent_c
+        .register(Box::new(ModuleProvider::new()))
+        .expect("register provider");
     let error = agent_c
         .restore_capability_in_process_only(&legacy, &owner)
         .expect_err("a legacy record still refuses a missing object");
@@ -2414,7 +2446,7 @@ fn a_restore_without_a_store_is_refused_on_a_second_kernel() {
     let second = Agent::with_secret([0x71; 32]);
     second.set_durable_capabilities(true);
     second.set_record_seal_key([0x91; 32]);
-    second.register(Box::new(Echo));
+    second.register(Box::new(Echo)).expect("register provider");
     let error = second
         .restore_capability(&record, &owner)
         .expect_err("a no-store restore must be refused");
@@ -2459,7 +2491,7 @@ fn an_in_process_only_restore_still_restores_once_per_kernel() {
     let second = Agent::with_secret([0x71; 32]);
     second.set_durable_capabilities(true);
     second.set_record_seal_key([0x91; 32]);
-    second.register(Box::new(Echo));
+    second.register(Box::new(Echo)).expect("register provider");
     let restored = second
         .restore_capability_in_process_only(&record, &owner)
         .expect("the explicit single-process path still restores");

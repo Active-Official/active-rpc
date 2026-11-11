@@ -77,7 +77,7 @@ struct Fixture {
 
 fn fixture(ttl_ms: Option<u64>) -> Fixture {
     let agent = Agent::with_secret([0x51; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let attrs = match ttl_ms {
         Some(ttl) => CapAttrs::new(&["echo", "mutate"]).with_ttl_ms(ttl),
         None => CapAttrs::new(&["echo", "mutate"]),
@@ -146,7 +146,10 @@ fn call_refuses_an_expired_capability_at_queue_time() {
     fixture.agent.set_latency(100);
     // A long-lived second capability advances the clock past the first one's
     // deadline without touching it.
-    let provider = fixture.agent.register(Box::new(Echo));
+    let provider = fixture
+        .agent
+        .register(Box::new(Echo))
+        .expect("register provider");
     let clock = fixture
         .agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -163,7 +166,9 @@ fn call_refuses_an_expired_capability_at_queue_time() {
 #[test]
 fn call_that_expires_between_queue_and_dispatch_never_reaches_the_provider() {
     let agent = Agent::with_secret([0x52; 32]);
-    let provider = agent.register(Box::new(NeverRun));
+    let provider = agent
+        .register(Box::new(NeverRun))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]).with_ttl_ms(100))
         .expect("mint");
@@ -177,7 +182,7 @@ fn call_that_expires_between_queue_and_dispatch_never_reaches_the_provider() {
 #[test]
 fn call_as_refuses_a_bound_capability_for_the_wrong_or_missing_peer() {
     let agent = Agent::with_secret([0x53; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let owner = admitted(b"dispatch-owner");
     let owner_peer = peer(b"dispatch-owner");
     let stranger = peer(b"dispatch-stranger");
@@ -250,7 +255,10 @@ fn publish_refuses_a_revoked_capability() {
 fn publish_refuses_an_expired_capability() {
     let fixture = fixture(Some(100));
     fixture.agent.set_latency(100);
-    let provider = fixture.agent.register(Box::new(Echo));
+    let provider = fixture
+        .agent
+        .register(Box::new(Echo))
+        .expect("register provider");
     let clock = fixture
         .agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -271,7 +279,7 @@ fn publish_refuses_an_expired_capability() {
 #[test]
 fn publish_as_enforces_the_identity_binding() {
     let agent = Agent::with_secret([0x54; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let owner = admitted(b"publish-owner");
     let owner_peer = peer(b"publish-owner");
     let stranger = peer(b"publish-stranger");
@@ -325,7 +333,10 @@ fn send_refuses_a_revoked_capability() {
     let second = fixture
         .agent
         .mint(
-            fixture.agent.register(Box::new(Echo)),
+            fixture
+                .agent
+                .register(Box::new(Echo))
+                .expect("register provider"),
             0,
             CapAttrs::new(&["echo"]),
         )
@@ -351,7 +362,7 @@ fn send_refuses_a_revoked_capability() {
 #[test]
 fn send_as_refuses_revoked_expired_and_bound_capabilities() {
     let agent = Agent::with_secret([0x55; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent.create_lane("send", Budget::default()).expect("lane");
     let channel = agent
         .create_channel("send", Direction::Both)
@@ -418,7 +429,10 @@ fn attenuate_refuses_a_revoked_or_expired_parent() {
     drop(child);
     let expired_fixture = fixture(Some(100));
     expired_fixture.agent.set_latency(100);
-    let provider = expired_fixture.agent.register(Box::new(Echo));
+    let provider = expired_fixture
+        .agent
+        .register(Box::new(Echo))
+        .expect("register provider");
     let clock = expired_fixture
         .agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -448,7 +462,10 @@ fn introduce_to_refuses_a_revoked_or_expired_capability() {
 
     let expired_fixture = fixture(Some(100));
     expired_fixture.agent.set_latency(100);
-    let provider = expired_fixture.agent.register(Box::new(Echo));
+    let provider = expired_fixture
+        .agent
+        .register(Box::new(Echo))
+        .expect("register provider");
     let clock = expired_fixture
         .agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -525,7 +542,7 @@ fn revoking_a_parent_kills_its_descendants_at_every_entry_point() {
 #[test]
 fn a_revoked_read_only_grant_still_refuses_its_methods() {
     let agent = Agent::with_secret([0x56; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["mutate"]);
     attrs.read_only = true;
     let cap = agent.mint(provider, 0, attrs).expect("read-only cap");

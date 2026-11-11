@@ -93,7 +93,7 @@ fn check_invariants(receipts: &[Receipt], start: u64) {
 fn structured(data: &[u8]) {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = match agent.mint(provider, 0, CapAttrs::new(&["echo"])) {
         Ok(cap) => cap,
         Err(_) => return,

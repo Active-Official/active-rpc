@@ -70,7 +70,9 @@ fn the_call_grant_counts_the_resume_pages() {
     let transfer = BulkTransfer::new(body(4_000, 62), 1_000).expect("transfer");
     let calls = transfer.plan().required_calls();
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent.create_lane("bulk", Budget::default()).expect("lane");
     let mut attrs = CapAttrs::new(&["plan", "put", "missing", "finish"]);
     attrs.budget.max_calls = calls;

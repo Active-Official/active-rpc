@@ -22,21 +22,49 @@ use active_rpc::transport::{bind_loopback, serve_connection, TcpTransport, Trans
 use active_rpc::wire::Envelope;
 use active_rpc::Value;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let calls: usize = args
-        .next()
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or(10_000);
-    let payload_bytes: usize = args
-        .next()
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or(256);
+/// Largest payload the bench will allocate (matches the CLI's payload
+/// ceiling): `vec![0x41; payload_bytes]` with no ceiling overflowed on a
+/// huge argument (RPC-51c).
+const MAX_PAYLOAD_BYTES: usize = 64 << 20;
+/// Most calls one bench run will issue: the samples vector is sized by
+/// `calls`, so an unbounded count is the same overflow shape (RPC-51c).
+const MAX_CALLS: usize = 1_000_000;
+
+/// One numeric argument, refusing a non-UTF-8 argument instead of panicking
+/// on it (`std::env::args()` panics, exit 101 — RPC-51c).
+fn arg_usize(value: std::ffi::OsString) -> Result<usize, Box<dyn std::error::Error>> {
+    let text = value
+        .into_string()
+        .map_err(|_| "an argument is not valid UTF-8")?;
+    Ok(text.parse()?)
+}
+
+/// Parse `[calls] [payload-bytes]` with the ceilings applied (RPC-51c):
+/// a huge payload or call count is refused before anything is allocated
+/// -- `vec![0x41; payload_bytes]` with no ceiling overflowed on a huge
+/// argument, and the samples vector is sized by `calls`, the same shape.
+/// Zero calls is refused too. Extracted from `main` so the refusals are
+/// unit-testable (`cargo test --example tcp_bench`).
+fn parse_bench_args(
+    args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let mut args = args;
+    let calls: usize = args.next().map(arg_usize).transpose()?.unwrap_or(10_000);
+    let payload_bytes: usize = args.next().map(arg_usize).transpose()?.unwrap_or(256);
     if calls == 0 {
         return Err("calls must be greater than zero".into());
     }
+    if calls > MAX_CALLS {
+        return Err(format!("calls is capped at {MAX_CALLS}").into());
+    }
+    if payload_bytes > MAX_PAYLOAD_BYTES {
+        return Err(format!("payload-bytes is capped at {MAX_PAYLOAD_BYTES}").into());
+    }
+    Ok((calls, payload_bytes))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (calls, payload_bytes) = parse_bench_args(std::env::args_os().skip(1))?;
     let payload = vec![0x41u8; payload_bytes];
 
     let (listener, address) = bind_loopback()?;
@@ -98,4 +126,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         elapsed
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn defaults_apply_without_arguments() {
+        assert_eq!(
+            parse_bench_args(args(&[]).into_iter()).unwrap(),
+            (10_000, 256)
+        );
+    }
+
+    #[test]
+    fn explicit_arguments_pass_through() {
+        assert_eq!(
+            parse_bench_args(args(&["10", "128"]).into_iter()).unwrap(),
+            (10, 128)
+        );
+    }
+
+    #[test]
+    fn a_huge_payload_is_refused_not_allocated() {
+        // The pre-fix shape: `vec![0x41; 18446744073709551615]` panicked
+        // with `capacity overflow` (exit 101).
+        let error = parse_bench_args(args(&["10", "18446744073709551615"]).into_iter())
+            .expect_err("a payload past the ceiling must be refused");
+        assert!(error.to_string().contains("capped at"), "{error}");
+    }
+
+    #[test]
+    fn a_huge_call_count_is_refused() {
+        let error = parse_bench_args(args(&["1000001"]).into_iter())
+            .expect_err("calls past the ceiling must be refused");
+        assert!(error.to_string().contains("capped at"), "{error}");
+    }
+
+    #[test]
+    fn zero_calls_is_refused() {
+        assert!(parse_bench_args(args(&["0"]).into_iter()).is_err());
+    }
+
+    #[test]
+    fn a_non_numeric_argument_is_refused() {
+        assert!(parse_bench_args(args(&["abc"]).into_iter()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_argument_is_refused_not_a_panic() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![0xff]);
+        assert!(parse_bench_args(vec![bad].into_iter()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_non_utf8_argument_is_refused_not_a_panic() {
+        use std::os::windows::ffi::OsStringExt;
+        let bad = OsString::from_wide(&[0xD800]);
+        assert!(parse_bench_args(vec![bad].into_iter()).is_err());
+    }
 }

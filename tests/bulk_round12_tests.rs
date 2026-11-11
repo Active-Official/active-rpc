@@ -265,7 +265,9 @@ fn repeating_a_refused_grant_does_not_get_a_free_pass() {
 fn a_sibling_capability_on_a_shared_object_can_abort() {
     let transfer = BulkTransfer::new(body(4_000, 0x19), 1_000).expect("transfer");
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent
         .create_lane("shared", Budget::default())
         .expect("lane");
@@ -347,7 +349,9 @@ fn a_zero_grant_attempt_never_counts_against_the_budget() {
 fn an_abort_only_capability_cannot_read_the_objects_state() {
     let transfer = BulkTransfer::new(body(4_000, 0x1b), 1_000).expect("transfer");
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent
         .create_lane("abort-only", Budget::default())
         .expect("lane");
@@ -408,7 +412,9 @@ fn an_abort_only_capability_cannot_read_the_objects_state() {
 fn a_redacting_finish_omits_the_raw_digest() {
     let transfer = BulkTransfer::new(body(4_000, 0x1c), 1_000).expect("transfer");
     let agent = Agent::new();
-    let id = agent.register(Box::new(BulkProvider::new()));
+    let id = agent
+        .register(Box::new(BulkProvider::new()))
+        .expect("register provider");
     let lane = agent
         .create_lane("redact", Budget::default())
         .expect("lane");

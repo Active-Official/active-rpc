@@ -29,7 +29,7 @@ impl Provider for Echo {
 
 fn fixture() -> (Agent, active_rpc::CapHandle, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x3d; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");

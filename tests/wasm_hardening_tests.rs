@@ -214,7 +214,7 @@ fn a_memory_grow_is_capped_by_the_fuel_grant() {
 fn a_wall_budget_bounds_the_fuel_a_guest_may_burn() {
     let agent = Agent::with_secret([0x44; 32]);
     let tool = WasmTool::from_bytes(&binary(BURN), WasmLimits::default()).expect("compile");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let lane = agent
         .create_lane("wasm-budget", Budget::default())
         .expect("lane");
@@ -273,7 +273,7 @@ fn a_wall_budget_bounds_the_fuel_a_guest_may_burn() {
 fn a_read_only_capability_refuses_the_guest() {
     let agent = Agent::with_secret([0x45; 32]);
     let tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]).read_only())
         .expect("mint");
@@ -335,7 +335,7 @@ fn a_start_function_out_of_fuel_is_a_fuel_refusal() {
 fn a_call_must_carry_exactly_one_text_or_module_argument() {
     let agent = Agent::with_secret([0x46; 32]);
     let tool = WasmTool::from_bytes(&binary(CONSTANT), WasmLimits::default()).expect("compile");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
         .expect("mint");
@@ -397,7 +397,7 @@ fn a_refused_call_leaves_no_log_from_an_earlier_one() {
 fn binary_output_travels_as_a_module_value() {
     let agent = Agent::with_secret([0x47; 32]);
     let tool = WasmTool::from_bytes(&binary(BINARY_OUT), WasmLimits::default()).expect("compile");
-    let provider = agent.register(Box::new(tool));
+    let provider = agent.register(Box::new(tool)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["run"]))
         .expect("mint");

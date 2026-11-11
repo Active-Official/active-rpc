@@ -31,7 +31,9 @@ impl Provider for Wide {
 
 fn agent_with(reply: Value, budget: Budget) -> (Agent, ProviderId) {
     let agent = Agent::with_secret([0x5c; 32]);
-    let provider = agent.register(Box::new(Wide { reply }));
+    let provider = agent
+        .register(Box::new(Wide { reply }))
+        .expect("register provider");
     let _ = budget;
     (agent, provider)
 }
@@ -239,7 +241,9 @@ fn two_long_method_names_with_a_shared_prefix_stay_distinct() {
     }
 
     let agent = Agent::with_secret([0x5c; 32]);
-    let provider = agent.register(Box::new(LongMethods));
+    let provider = agent
+        .register(Box::new(LongMethods))
+        .expect("register provider");
     let granted = names();
     let refs: Vec<&str> = granted.iter().map(String::as_str).collect();
     let cap = agent.mint(provider, 0, CapAttrs::new(&refs)).expect("mint");
@@ -297,7 +301,9 @@ fn a_provider_budget_dimension_reaches_the_tape() {
 
     for dimension in ["keys", "value"] {
         let agent = Agent::with_secret([0x5d; 32]);
-        let provider = agent.register(Box::new(Dimension(dimension)));
+        let provider = agent
+            .register(Box::new(Dimension(dimension)))
+            .expect("register provider");
         let cap = agent
             .mint(provider, 0, CapAttrs::new(&["ping"]))
             .expect("mint");

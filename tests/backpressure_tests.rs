@@ -33,7 +33,7 @@ impl Provider for Echo {
 #[test]
 fn a_full_queue_refuses_the_next_call_and_counts_it() {
     let agent = Agent::with_secret([0x44; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");

@@ -52,7 +52,9 @@ fn install(
 ) -> (Agent, CapHandle, LaneId) {
     let object = provider.install(module).expect("install");
     let agent = Agent::with_secret([0x73; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(methods);
     attrs.redact = redact;
     let cap = agent.mint(id, object, attrs).expect("cap");
@@ -199,7 +201,9 @@ fn a_streamed_secret_free_image_keeps_its_address() {
         .install_canonical_image(&streamed)
         .expect("install");
     let agent = Agent::with_secret([0x74; 32]);
-    let id = agent.register(Box::new(provider));
+    let id = agent
+        .register(Box::new(provider))
+        .expect("register provider");
     let mut attrs = CapAttrs::new(&["content_hash"]);
     attrs.redact = true;
     let cap = agent.mint(id, object, attrs).expect("cap");

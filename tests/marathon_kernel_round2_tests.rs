@@ -53,7 +53,7 @@ impl Provider for Other {
 
 fn agent() -> (Agent, ProviderId, active_rpc::LaneId) {
     let agent = Agent::with_secret([0x6a; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let lane = agent
         .create_lane("kernel", Budget::default())
         .expect("lane");
@@ -72,8 +72,8 @@ fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
 #[test]
 fn a_cross_provider_pipeline_settles() {
     let agent = Agent::with_secret([0x6b; 32]);
-    let first = agent.register(Box::new(Echo));
-    let second = agent.register(Box::new(Other));
+    let first = agent.register(Box::new(Echo)).expect("register provider");
+    let second = agent.register(Box::new(Other)).expect("register provider");
     let lane = agent.create_lane("pipe", Budget::default()).expect("lane");
     let cap_first = agent.mint(first, 0, CapAttrs::new(&["echo"])).expect("cap");
     let cap_second = agent
@@ -102,7 +102,7 @@ fn a_wall_clock_record_does_not_restore_unbounded_in_virtual_mode() {
     source.set_durable_capabilities(true);
     source.set_record_seal_key([0x9c; 32]);
     source.use_wall_clock(true);
-    let provider = source.register(Box::new(Echo));
+    let provider = source.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]).durable();
     attrs.ttl_ms = Some(60_000);
     let owner = admitted(b"peer");
@@ -114,7 +114,7 @@ fn a_wall_clock_record_does_not_restore_unbounded_in_virtual_mode() {
     let target = Agent::with_secret([0x6d; 32]);
     target.set_durable_capabilities(true);
     target.set_record_seal_key([0x9c; 32]);
-    target.register(Box::new(Echo));
+    target.register(Box::new(Echo)).expect("register provider");
     let peer = admitted(b"peer");
     let error = target
         .restore_capability_in_process_only(&record, &peer)
@@ -235,10 +235,12 @@ fn on_drop_is_delivered_when_a_provider_releases_during_its_own_call() {
     let slot: Rc<RefCell<Option<CapHandle>>> = Rc::new(RefCell::new(None));
     let agent = Agent::with_secret([0x6f; 32]);
     let lane = agent.create_lane("drop", Budget::default()).expect("lane");
-    let provider = agent.register(Box::new(SlotProvider {
-        slot: Rc::clone(&slot),
-        notifications: Rc::clone(&notifications),
-    }));
+    let provider = agent
+        .register(Box::new(SlotProvider {
+            slot: Rc::clone(&slot),
+            notifications: Rc::clone(&notifications),
+        }))
+        .expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["go"]))
         .expect("cap");
@@ -261,7 +263,7 @@ fn restore_refuses_an_ambiguous_provider_name() {
     let source = Agent::with_secret([0x70; 32]);
     source.set_durable_capabilities(true);
     source.set_record_seal_key([0x9d; 32]);
-    let provider = source.register(Box::new(Echo));
+    let provider = source.register(Box::new(Echo)).expect("register provider");
     let owner = admitted(b"peer");
     let cap = source
         .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]).durable())
@@ -271,8 +273,8 @@ fn restore_refuses_an_ambiguous_provider_name() {
     let target = Agent::with_secret([0x71; 32]);
     target.set_durable_capabilities(true);
     target.set_record_seal_key([0x9d; 32]);
-    target.register(Box::new(Echo));
-    target.register(Box::new(Echo)); // same name
+    target.register(Box::new(Echo)).expect("register provider");
+    target.register(Box::new(Echo)).expect("register provider"); // same name
     let peer = admitted(b"peer");
     let error = target
         .restore_capability_in_process_only(&record, &peer)
@@ -287,7 +289,7 @@ fn a_record_carries_its_clock_mode() {
     source.set_durable_capabilities(true);
     source.set_record_seal_key([0x9e; 32]);
     source.use_wall_clock(true);
-    let provider = source.register(Box::new(Echo));
+    let provider = source.register(Box::new(Echo)).expect("register provider");
     let owner = admitted(b"peer");
     let cap = source
         .mint_bound(&owner, provider, 0, CapAttrs::new(&["echo"]).durable())

@@ -79,7 +79,7 @@ fn one_kernel_keeps_sixteen_tenants_apart_under_interleaving() {
     const ROUNDS: usize = 32;
 
     let agent = Agent::with_secret([0x9a; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let tenants: Vec<Tenant> = (0..TENANTS)
         .map(|i| mint_tenant(&agent, provider, i))
         .collect();
@@ -161,7 +161,7 @@ fn one_kernel_keeps_sixteen_tenants_apart_under_interleaving() {
 #[test]
 fn a_tenant_budget_never_charges_another_tenant() {
     let agent = Agent::with_secret([0x9b; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut tight = CapAttrs::new(&["echo"]);
     tight.budget.max_calls = 3;
     let tight_cap = agent.mint(provider, 0, tight).expect("tight cap");
@@ -219,7 +219,7 @@ fn concurrent_agents_never_accept_another_agents_capability() {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 let agent = Agent::with_secret([0x30 + index as u8; 32]);
-                let provider = agent.register(Box::new(Echo));
+                let provider = agent.register(Box::new(Echo)).expect("register provider");
                 let cap = agent
                     .mint(provider, 0, CapAttrs::new(&["echo"]))
                     .expect("mint");

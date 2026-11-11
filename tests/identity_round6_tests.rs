@@ -40,7 +40,7 @@ fn an_idempotent_envelope_cannot_carry_authority_arguments() {
     use active_rpc::wire::{Envelope, Kind};
 
     let agent = Agent::with_secret([0xa4; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round7");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -98,7 +98,7 @@ fn an_envelope_still_refuses_authority_arguments() {
     use active_rpc::wire::Envelope;
 
     let agent = Agent::with_secret([0xa5; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round7b");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -126,7 +126,7 @@ fn a_promise_of_another_peer_is_refused_at_dispatch() {
     use active_rpc::PromiseId;
 
     let agent = Agent::with_secret([0xa6; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     // No binding: a peer-identity refusal can only come from the promise.
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -186,7 +186,7 @@ fn a_promise_of_another_peer_is_refused_at_dispatch() {
 #[test]
 fn an_out_of_band_answer_comes_from_the_queueing_peer() {
     let agent = Agent::with_secret([0xaa; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -233,7 +233,7 @@ fn an_out_of_band_answer_comes_from_the_queueing_peer() {
 fn a_foreign_clock_deadline_answers_one_code() {
     let agent = Agent::with_secret([0xab; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.ttl_ms = Some(600_000);
     let cap = agent.mint(provider, 0, attrs).expect("cap");
@@ -268,7 +268,7 @@ fn call_peer_refuses_authority_arguments() {
     use active_rpc::PromiseId;
 
     let agent = Agent::with_secret([0xa7; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round8b");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -289,7 +289,7 @@ fn the_authority_guard_is_counted_and_taped() {
     use active_rpc::{Event, PromiseId};
 
     let agent = Agent::with_secret([0xa8; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round8c");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
@@ -326,7 +326,7 @@ fn a_policy_refusal_is_counted() {
     use active_rpc::wire::Envelope;
 
     let agent = Agent::with_secret([0xa9; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -357,7 +357,7 @@ fn expired_events(agent: &Agent, id: active_rpc::CapId) -> usize {
 #[test]
 fn a_revoked_capability_is_not_reported_as_expired() {
     let agent = Agent::with_secret([0xa1; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(b"alice-round6");
     let bob = admitted(b"bob-round6");
     let cap = agent
@@ -390,7 +390,7 @@ fn a_revoked_capability_is_not_reported_as_expired() {
 fn a_rotation_refuses_a_foreign_clock_descendant() {
     let agent = Agent::with_secret([0xa2; 32]);
     agent.use_wall_clock(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let bob = admitted(b"bob-round6b");
     let alice = admitted(b"alice-round6b");
     let root = agent
@@ -435,7 +435,7 @@ fn a_rotation_refuses_a_foreign_clock_descendant() {
 #[test]
 fn an_idempotent_wrong_peer_is_refused_before_the_shape() {
     let agent = Agent::with_secret([0xa3; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let bob = admitted(b"bob-round6c");
     let alice = admitted(b"alice-round6c");
     let mut attrs = CapAttrs::new(&["echo"]);

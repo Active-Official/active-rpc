@@ -162,7 +162,7 @@ struct LevelQuery {
     up_to: bool,
 }
 
-pub fn spawn_worker(read_only: bool) -> AppState {
+pub fn spawn_worker(read_only: bool) -> std::io::Result<AppState> {
     // Bounded on purpose: a flood of local writes must get backpressure, not
     // an unbounded queue behind the single kernel worker.
     let (tx, rx) = bounded::<Command>(8);
@@ -171,7 +171,7 @@ pub fn spawn_worker(read_only: bool) -> AppState {
     // back the shared cell; this function used to build a second core (a second
     // set of capabilities, a second HTTP stub, a second listener) only to have
     // an initial value.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Arc<Mutex<Snapshot>>>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Arc<Mutex<Snapshot>>, String>>();
     let broadcast_thread = broadcast.clone();
     // One heartbeat, shared with `/health`: the worker used to build its own
     // and the API built a second, so the endpoint never advanced
@@ -184,7 +184,18 @@ pub fn spawn_worker(read_only: bool) -> AppState {
     std::thread::Builder::new()
         .name("active-kernel".into())
         .spawn(move || {
-            let mut core = PlaneCore::new();
+            // Building the core can fail (its bundled fixtures are built in
+            // `PlaneCore::new`); report it instead of dying before the first
+            // snapshot, so the spawner fails fast with a reason (RPC-51h).
+            let mut core = match PlaneCore::new() {
+                Ok(core) => core,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "the kernel worker could not build its core: {error}"
+                    )));
+                    return;
+                }
+            };
             core.set_mode(if read_only { "read-only" } else { "demo" });
             // The first snapshot is worker code like any other: a panic here
             // used to block startup for 30 s and then panic the spawner
@@ -193,9 +204,37 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| core.snapshot())) {
                     Ok(first) => first,
                     Err(_) => {
-                        let mut fallback = PlaneCore::new().snapshot();
-                        fallback.health.kernel = "down".to_string();
-                        fallback
+                        // The fallback core is built the same way the
+                        // primary was; if it cannot be built, or its
+                        // snapshot panics too, there is no first snapshot to
+                        // publish — report it instead of leaving the
+                        // spawner to time out (RPC-51h).
+                        let fallback = match PlaneCore::new() {
+                            Ok(mut fallback_core) => {
+                                match std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| {
+                                        fallback_core.snapshot()
+                                    }),
+                                ) {
+                                    Ok(mut snapshot) => {
+                                        snapshot.health.kernel = "down".to_string();
+                                        Some(snapshot)
+                                    }
+                                    Err(_) => None,
+                                }
+                            }
+                            Err(_) => None,
+                        };
+                        match fallback {
+                            Some(snapshot) => snapshot,
+                            None => {
+                                let _ = ready_tx.send(Err(
+                                    "the kernel worker's first snapshot panicked and no fallback snapshot could be built"
+                                        .to_string(),
+                                ));
+                                return;
+                            }
+                        }
                     }
                 };
             let latest: Arc<Mutex<Snapshot>> = Arc::new(Mutex::new(first.clone()));
@@ -204,7 +243,7 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                 beat.observe(first.uptime_ms);
             }
             let _ = broadcast_thread.send(first);
-            if ready_tx.send(Arc::clone(&latest)).is_err() {
+            if ready_tx.send(Ok(Arc::clone(&latest))).is_err() {
                 // The caller went away before the first snapshot; nothing to
                 // serve.
                 return;
@@ -350,13 +389,36 @@ pub fn spawn_worker(read_only: bool) -> AppState {
                 }
             }
         })
-        .expect("kernel worker thread");
-    let latest = ready_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the worker's first snapshot");
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "could not start the kernel worker thread: {error}"
+            ))
+        })?;
+    // The worker reports a build failure over the channel, so a timeout here
+    // means it died before it could report anything, and a disconnect means
+    // it died even earlier — both are startup failures, not panics (RPC-51h).
+    // The 30 s grace itself stays: a slow first snapshot on a loaded machine
+    // is not a failure.
+    let latest = match ready_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(Ok(latest)) => latest,
+        Ok(Err(error)) => {
+            return Err(std::io::Error::other(error));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the kernel worker did not publish its first snapshot within 30 seconds",
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(std::io::Error::other(
+                "the kernel worker died before publishing its first snapshot",
+            ));
+        }
+    };
     // Seed the heartbeat from the first snapshot so a fresh process does not
     // read as stale before the first tick.
-    AppState {
+    Ok(AppState {
         tx,
         latest,
         broadcast,
@@ -364,7 +426,7 @@ pub fn spawn_worker(read_only: bool) -> AppState {
         heartbeat,
         down,
         observers,
-    }
+    })
 }
 
 pub fn public_dir() -> PathBuf {
@@ -1010,7 +1072,7 @@ fn mark_worker_down(latest: &Arc<Mutex<Snapshot>>) -> Snapshot {
 }
 
 pub async fn serve(port: u16, read_only: bool) -> std::io::Result<()> {
-    let state = spawn_worker(read_only);
+    let state = spawn_worker(read_only)?;
     let router = app(state);
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -1231,7 +1293,7 @@ mod worker_panic_tests {
     /// contained, and the down flag must survive later ticks (R-19 round 3, M2).
     #[test]
     fn a_panicking_snapshot_sticks_the_kernel_down() {
-        let mut core = PlaneCore::new();
+        let mut core = PlaneCore::new().expect("plane core");
         let (latest, broadcast, heartbeat, down) = cell(&mut core);
         core.panic_next_snapshot();
         let outcome = publish_snapshot(&mut core, &latest, &broadcast, &heartbeat, &down);
@@ -1255,7 +1317,7 @@ mod worker_panic_tests {
     /// older than the panic.
     #[test]
     fn a_reader_sees_down_after_the_flag_is_set() {
-        let mut core = PlaneCore::new();
+        let mut core = PlaneCore::new().expect("plane core");
         let (latest, broadcast, heartbeat, down) = cell(&mut core);
         let (tx, _rx) = crossbeam_channel::bounded::<Command>(1);
         let state = AppState {

@@ -32,7 +32,7 @@ impl Provider for Echo {
 #[test]
 fn durable_caps_are_refused_until_policy_allows_them() {
     let agent = Agent::new();
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     assert!(!agent.durable_capabilities_allowed());
     let error = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]).durable())

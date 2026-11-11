@@ -134,7 +134,7 @@ fn certificate_identities_are_stable_and_subject_sensitive() {
 #[test]
 fn a_capability_bound_to_one_peer_is_refused_for_every_other_peer() {
     let agent = Agent::with_secret([0x51; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice_id = identity(b"alice-cert");
     let bob_id = identity(b"bob-cert");
     let alice = admitted(&alice_id);
@@ -171,7 +171,7 @@ fn a_capability_bound_to_one_peer_is_refused_for_every_other_peer() {
 #[test]
 fn an_unbound_capability_keeps_working_without_an_identity() {
     let agent = Agent::with_secret([0x52; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -186,7 +186,7 @@ fn an_unbound_capability_keeps_working_without_an_identity() {
 #[test]
 fn introduction_binds_once_and_cannot_move_between_peers() {
     let agent = Agent::with_secret([0x53; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(&identity(b"alice-cert"));
     let bob = admitted(&identity(b"bob-cert"));
     let cap = agent
@@ -212,7 +212,7 @@ fn introduction_binds_once_and_cannot_move_between_peers() {
 #[test]
 fn attenuation_keeps_the_binding_and_refuses_a_rebind() {
     let agent = Agent::with_secret([0x54; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(&identity(b"alice-cert"));
     let bob = admitted(&identity(b"bob-cert"));
     let cap = agent
@@ -249,7 +249,7 @@ fn attenuation_keeps_the_binding_and_refuses_a_rebind() {
 #[test]
 fn an_anonymous_peer_cannot_receive_an_introduction() {
     let agent = Agent::with_secret([0x55; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
@@ -270,7 +270,7 @@ fn an_anonymous_peer_cannot_receive_an_introduction() {
 #[test]
 fn a_bound_capability_cannot_be_transferred_over_a_channel() {
     let agent = Agent::with_secret([0x56; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(&identity(b"alice-cert"));
     let cap = agent
         .mint_bound(&alice, provider, 0, CapAttrs::new(&["echo"]))
@@ -416,7 +416,7 @@ fn quic_dispatches_a_bound_capability_only_for_the_bound_peer() {
     );
 
     let agent = Agent::with_secret([0x57; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let admitted = admitted(&owner_peer);
     let cap: CapHandle = agent
         .mint_bound(&admitted, provider, 0, CapAttrs::new(&["echo"]))
@@ -511,7 +511,7 @@ fn quic_dispatches_a_bound_capability_only_for_the_bound_peer() {
 #[test]
 fn a_zero_fingerprint_binding_is_refused() {
     let agent = Agent::with_secret([0x61; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let error = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]).bound_to([0u8; 32]))
         .expect_err("an anonymous binding is a wildcard");
@@ -536,7 +536,7 @@ fn a_zero_fingerprint_binding_is_refused() {
 #[test]
 fn a_loopback_peer_cannot_hold_a_binding() {
     let agent = Agent::with_secret([0x62; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let loopback = IdentityPolicy::default()
         .admit(None, true)
         .expect("loopback admitted");
@@ -559,7 +559,7 @@ fn a_loopback_peer_cannot_hold_a_binding() {
 #[test]
 fn introduction_binds_the_existing_subtree() {
     let agent = Agent::with_secret([0x63; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice_id = identity(b"alice-subtree");
     let alice = admitted(&alice_id);
     let root = agent
@@ -611,7 +611,7 @@ fn introduction_binds_the_existing_subtree() {
 #[test]
 fn call_peer_uses_the_admitted_identity() {
     let agent = Agent::with_secret([0x65; 32]);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = admitted(&identity(b"alice-call-peer"));
     let bob = admitted(&identity(b"bob-call-peer"));
     let cap = agent

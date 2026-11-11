@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
     // every assertion below (R-20 round 5, F7).
     {
         let control = common::agent(&[0x06]);
-        let provider = control.register(Box::new(common::Echo::default()));
+        let provider = control.register(Box::new(common::Echo::default())).expect("register provider");
         let lane = control
             .create_lane("control", Budget::default())
             .expect("the control lane");
@@ -80,7 +80,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let agent = common::agent(data);
-    let provider = agent.register(Box::new(common::Echo::default()));
+    let provider = agent.register(Box::new(common::Echo::default())).expect("register provider");
     let lane = agent
         .create_lane("topics", Budget::default())
         .expect("the default lane budget is valid");

@@ -56,7 +56,7 @@ fn receipt(sequence: u64, at_ms: u64) -> Receipt {
 }
 
 fn session(agent: &Agent, count: usize) {
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -103,7 +103,7 @@ fn a_receipt_is_sealed_with_a_derived_key_not_the_kernel_secret() {
 fn a_refusal_before_dispatch_is_recorded() {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");
@@ -137,7 +137,7 @@ fn a_refusal_before_dispatch_is_recorded() {
 fn a_destroyed_lane_records_the_calls_it_drops() {
     let agent = Agent::with_secret(SECRET);
     agent.enable_receipts(true);
-    let provider = agent.register(Box::new(Echo));
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("mint");

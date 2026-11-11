@@ -100,7 +100,7 @@ fn a_publish_does_not_copy_the_payload() {
     // Round 2 (#1): `publish` still went through `send_topic`, which clones the
     // message it queued. The kernel needs the sequence only.
     let agent = Agent::with_secret([0x7e; 32]);
-    let provider = agent.register(Box::new(Sink));
+    let provider = agent.register(Box::new(Sink)).expect("register provider");
     let cap = agent
         .mint(
             provider,
@@ -148,7 +148,7 @@ fn a_multi_capability_send_does_not_blame_the_first_capability() {
     use active_rpc::Event;
 
     let agent = Agent::with_secret([0x7f; 32]);
-    let provider = agent.register(Box::new(Sink));
+    let provider = agent.register(Box::new(Sink)).expect("register provider");
     let allowed = agent
         .mint(provider, 0, CapAttrs::new(&["noop"]))
         .expect("cap");
