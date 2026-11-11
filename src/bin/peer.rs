@@ -164,6 +164,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Ok(transport) => transport,
             Err(_) => continue,
         };
+        // Serial by contract (RPC-57, R09-3): one handler at a time, no
+        // deadline on handler time — a slow provider call stalls every later
+        // peer. This is the local/dev server; deployments that need
+        // concurrency use QUIC or HTTP/2.
         let handled = serve_connection(transport, |envelope| {
             handle(
                 &agent,

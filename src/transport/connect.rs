@@ -1,10 +1,18 @@
 //! gRPC / Connect bridge.
 //!
-//! The bridge lets an ordinary HTTP client — a gRPC toolchain, a Connect client,
-//! or `curl` — exchange Active RPC envelopes without knowing the kernel. It
-//! speaks the unary Connect protocol over HTTP/1.1 and carries messages in the
-//! gRPC length-prefixed framing, so the same codec sits behind an HTTP/2 gRPC
-//! server without changes:
+//! The bridge lets this crate's own Connect-style client — and `curl` with a
+//! hand-written request — exchange Active RPC envelopes without knowing the
+//! kernel. It speaks this crate's Connect-style dialect over HTTP/1.1 and
+//! carries messages in the gRPC length-prefixed framing, so the same codec
+//! sits behind an HTTP/2 gRPC server without changes:
+//!
+//! It does NOT interoperate with stock gRPC or Connect clients (RPC-57,
+//! R09-2): the bridge is HTTP/1.1-only, it accepts only the custom
+//! `+active-infinity` media types (a stock client sends `application/grpc`
+//! and is refused with 415, and expects a `grpc-status` trailer on success
+//! that is never sent), and the payload is an ARP1 envelope, not a protobuf
+//! message — so even accepting the stock media type would not let a stock
+//! client work. Stock gRPC interop is a feature, not a fix for this bridge.
 //!
 //! ```text
 //! POST /active.rpc.v1.Agent/Call HTTP/1.1
@@ -229,6 +237,15 @@ impl BridgeServer {
     }
 
     /// Serve `requests` connections, then return the number of calls served.
+    ///
+    /// Serial and single-tenant by design: one connection at a time, one
+    /// handler at a time, and no deadline on handler time — a slow provider
+    /// call stalls every later peer (RPC-57, R09-3). The handler closure
+    /// borrows the `Agent`, which is `!Send`, so a handler deadline would
+    /// need a thread that cannot run the production handlers. Deployments
+    /// that need concurrency use the QUIC or HTTP/2 transports; this bridge
+    /// is for local and development use. `CONNECTION_WAIT` bounds only the
+    /// head and body, not the handler.
     pub fn serve<H>(&self, requests: usize, mut handler: H) -> Result<u64>
     where
         H: FnMut(Envelope) -> Envelope,
@@ -275,7 +292,9 @@ impl BridgeServer {
     ///
     /// Every failure here belongs to this connection, never to the server: a
     /// truncated head, a stalled peer, a bad frame or a dead socket answers a
-    /// `4xx` when it can and returns. `serve` keeps accepting.
+    /// `4xx` when it can and returns. `serve` keeps accepting. The handler
+    /// runs inline with no deadline of its own; see `serve` for the serial
+    /// contract (RPC-57, R09-3).
     fn handle<H>(&self, mut stream: TcpStream, handler: &mut H) -> u64
     where
         H: FnMut(Envelope) -> Envelope,
@@ -860,6 +879,12 @@ impl ConnectClient {
         // when it could not read the frame (round 14, F-5).
         if !answer.answers(envelope.request_id) {
             return Err(Error::Wire("the bridge answered a different request"));
+        }
+        // A frame-level refusal is an `Err`, not an answer: the peer refused
+        // the frame itself, and the caller must not mistake it for a handler
+        // error (RPC-57, R09-4). Every other error answer stays `Ok`.
+        if let Some(error) = crate::transport::frame_refusal(&answer) {
+            return Err(error);
         }
         Ok(answer)
     }

@@ -3590,6 +3590,12 @@ one byte of traffic per byte buffered. The QUIC idle timeout remains
 peer-resettable, the bridge answers 4xx with unread body bytes, and the shm
 straddle/truncated branches remain fuzzer-only.
 
+> **Annotation (2026-11-11, RPC-57):** the 2 GiB figure above is the pre-fix
+> ceiling. RPC-54 (`f604ddd`) lowered `CONNECTION_RECEIVE_WINDOW` from 8 MiB
+> to 1 MiB, so the real QUIC ceiling is now `MAX_CONNECTIONS` 256 × 1 MiB =
+> 256 MiB = `MAX_INFLIGHT_BODY`. The paragraph is left as written — it is a
+> dated round log — and this annotation is the correction.
+
 ### R-09 transports - 2026-11-02 (round 3, fix verification)
 
 Reviewer: DeepSeek V4.1 Flash through the Copilot CLI, `xhigh`, at `4b18153`.

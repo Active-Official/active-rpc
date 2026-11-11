@@ -3463,6 +3463,11 @@ impl Agent {
     /// A refusal is recorded here, not only in [`Agent::send`]: a transport
     /// calls this variant directly, and its refusals used to produce no metric
     /// and no event.
+    ///
+    /// Like [`Agent::call_as`], this takes a raw [`PeerIdentity`] and never
+    /// calls [`crate::identity::IdentityPolicy::admit`] (RPC-57, R11-4):
+    /// transport-side dispatch must admit first and pass the admitted
+    /// identity. See [`Agent::call_as`] for the deprecation for peer traffic.
     pub fn send_as(
         &self,
         peer: Option<&PeerIdentity>,
@@ -3712,6 +3717,11 @@ impl Agent {
     /// [`Agent::publish`] on behalf of the peer the transport authenticated.
     ///
     /// A refusal is recorded here, not only in [`Agent::publish`].
+    ///
+    /// Like [`Agent::call_as`], this takes a raw [`PeerIdentity`] and never
+    /// calls [`crate::identity::IdentityPolicy::admit`] (RPC-57, R11-4):
+    /// transport-side dispatch must admit first and pass the admitted
+    /// identity. See [`Agent::call_as`] for the deprecation for peer traffic.
     pub fn publish_as(
         &self,
         peer: Option<&PeerIdentity>,
@@ -4041,6 +4051,16 @@ impl Agent {
     /// [`Agent::introduce_to`] is refused unless the presented fingerprint
     /// matches, which is how a capability handed to one peer stays useless to
     /// every other one.
+    ///
+    /// # Deprecated for peer traffic (RPC-57, R11-4)
+    ///
+    /// This takes a raw [`PeerIdentity`] and never calls
+    /// [`crate::identity::IdentityPolicy::admit`]: a fabricated peer that
+    /// presents a copied certificate's bytes runs as that peer. Transport-side
+    /// dispatch must go through [`Agent::call_peer`] (admit first, then call
+    /// with the admitted identity) or [`Agent::dispatch_envelope`]; use this
+    /// only for in-process calls where the caller already holds an admitted
+    /// identity, as `src/bin/peer.rs` does.
     pub fn call_as(
         &self,
         peer: Option<&PeerIdentity>,
@@ -4053,6 +4073,9 @@ impl Agent {
     }
 
     /// [`Agent::call_as`] with an envelope payload charged against the budget.
+    ///
+    /// See [`Agent::call_as`] for the deprecation for peer traffic (RPC-57,
+    /// R11-4): this takes the same raw peer and also skips `admit`.
     pub fn call_as_with_payload(
         &self,
         peer: Option<&PeerIdentity>,
@@ -4994,6 +5017,13 @@ impl Agent {
     /// which admits the peer first; calling this directly with a raw
     /// [`PeerIdentity`] skips [`crate::identity::IdentityPolicy::admit`]
     /// entirely (RPC-55).
+    ///
+    /// # Deprecated for peer traffic (RPC-57, R11-4)
+    ///
+    /// A fabricated peer that presents a copied certificate's bytes runs as
+    /// the peer it claims to be. The one legitimate direct use is in-process
+    /// or local dispatch after `admit`: `src/bin/peer.rs` admits the peer,
+    /// then calls this with the admitted identity.
     pub fn call_from_envelope(
         &self,
         peer: Option<&PeerIdentity>,
@@ -5056,6 +5086,16 @@ impl Agent {
     /// capability is live and, when it is bound, that the caller is the bound
     /// peer. Caching the promise must not turn a revoked or rebound capability
     /// back on.
+    ///
+    /// # Deprecated for peer traffic (RPC-57, R11-4)
+    ///
+    /// This takes a raw [`PeerIdentity`] and never calls
+    /// [`crate::identity::IdentityPolicy::admit`]: a fabricated peer that
+    /// presents a copied certificate's bytes runs as that peer. Transport-side
+    /// dispatch must go through [`Agent::call_peer`] (admit first, then call
+    /// with the admitted identity) or [`Agent::dispatch_envelope`]; use this
+    /// only for in-process calls where the caller already holds an admitted
+    /// identity, as `src/bin/peer.rs` does.
     pub fn call_idempotent_as(
         &self,
         peer: Option<&PeerIdentity>,
@@ -5076,6 +5116,10 @@ impl Agent {
     /// [`crate::identity::IdentityPolicy::admit`] returned, so a dispatcher that
     /// has one has already run the policy and cannot silently drop the trust
     /// level.
+    ///
+    /// This is a transport-facing entry point (RPC-57, R11-4): together with
+    /// [`Agent::dispatch_envelope`], it is the only entry point a
+    /// transport-side dispatcher should use.
     pub fn call_peer(
         &self,
         lane: LaneId,
@@ -5097,6 +5141,10 @@ impl Agent {
     /// kernel checks a binding against. Calling [`Agent::call_from_envelope`]
     /// directly with a raw `PeerIdentity` skips [`crate::identity::IdentityPolicy::admit`]
     /// entirely.
+    ///
+    /// This is a transport-facing entry point (RPC-57, R11-4): together with
+    /// [`Agent::call_peer`], it is the only entry point a transport-side
+    /// dispatcher should use.
     ///
     /// `loopback` must come from the connection's own addresses (see
     /// [`crate::identity::IdentityPolicy::admit`]); it is never a header or a caller flag.
@@ -5140,6 +5188,9 @@ impl Agent {
     /// are the same call to it. A caller that holds the body uses
     /// [`Agent::call_idempotent_as_with_body`], which fingerprints its content.
     /// The bytes are charged exactly as a non-idempotent call would charge them.
+    ///
+    /// See [`Agent::call_idempotent_as`] for the deprecation for peer traffic
+    /// (RPC-57, R11-4): this takes the same raw peer and also skips `admit`.
     #[allow(clippy::too_many_arguments)]
     pub fn call_idempotent_as_with_payload(
         &self,
@@ -5169,6 +5220,9 @@ impl Agent {
     /// The body's content is part of the fingerprint, so two same-length
     /// payloads are different calls and a replay with an edited body is
     /// refused.
+    ///
+    /// See [`Agent::call_idempotent_as`] for the deprecation for peer traffic
+    /// (RPC-57, R11-4): this takes the same raw peer and also skips `admit`.
     #[allow(clippy::too_many_arguments)]
     pub fn call_idempotent_as_with_body(
         &self,
@@ -5199,6 +5253,15 @@ impl Agent {
     /// authority-argument guard as [`Agent::call_from_envelope`], so an envelope
     /// can never carry `Arg::Promise` or `Arg::Cap` into a provider through a
     /// retry (round 7, M-1).
+    ///
+    /// # Deprecated for peer traffic (RPC-57, R11-4)
+    ///
+    /// This takes a raw [`PeerIdentity`] and never calls
+    /// [`crate::identity::IdentityPolicy::admit`]: a fabricated peer that
+    /// presents a copied certificate's bytes runs as that peer. Transport-side
+    /// dispatch must go through [`Agent::dispatch_envelope`], which admits
+    /// the peer first; use this only for in-process calls where the caller
+    /// already holds an admitted identity.
     pub fn call_idempotent_from_envelope(
         &self,
         peer: Option<&PeerIdentity>,

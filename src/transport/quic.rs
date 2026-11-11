@@ -657,7 +657,7 @@ async fn serve_stream<H>(
     };
     if let Some(error) = prefix_fault {
         let response = Envelope::error(0, &error);
-        reply(&mut send, &response).await;
+        reply(&mut send, &response, wire).await;
         return;
     }
     let len = u32::from_le_bytes(header) as usize;
@@ -665,7 +665,7 @@ async fn serve_stream<H>(
     if len > ceiling {
         let error = Error::Wire("frame exceeds the size ceiling");
         let response = Envelope::error(0, &error);
-        reply(&mut send, &response).await;
+        reply(&mut send, &response, wire).await;
         return;
     }
     // The aggregate budget tracks bytes the server is actually holding. It is
@@ -675,24 +675,44 @@ async fn serve_stream<H>(
     let body = match read_frame_body(&mut recv, len, &mut budget).await {
         Ok(body) => body,
         Err(error) => {
-            reply(&mut send, &Envelope::error(0, &error)).await;
+            reply(&mut send, &Envelope::error(0, &error), wire).await;
             return;
         }
     };
     let envelope = match Envelope::decode_with(&body, wire) {
         Ok(envelope) => envelope,
         Err(error) => {
-            reply(&mut send, &Envelope::error(0, &error)).await;
+            reply(&mut send, &Envelope::error(0, &error), wire).await;
             let _ =
                 tokio::time::timeout(std::time::Duration::from_millis(250), send.stopped()).await;
             return;
         }
     };
+    // Certificate expiry is re-checked per stream, against wall time: a
+    // binding outlives the certificate that created it on a long-lived
+    // connection unless the transport re-checks it (RPC-57, R11-5). The
+    // handshake verified expiry once; a busy connection can live indefinitely
+    // (the idle timeout resets on activity), so each new stream re-checks the
+    // peer the handshake admitted. The connection stays open — a later stream
+    // is refused the same way, and the client reconnects and re-handshakes.
+    if peer
+        .as_ref()
+        .is_some_and(|peer| peer.is_expired_at(wall_now_unix()))
+    {
+        let error = Error::Identity("peer certificate expired");
+        reply(
+            &mut send,
+            &Envelope::error(envelope.request_id, &error),
+            wire,
+        )
+        .await;
+        return;
+    }
     // A response or error envelope is not a call.
     if envelope.kind != crate::wire::Kind::Request {
         let error = Error::Wire("a server only serves requests");
         let response = Envelope::error(envelope.request_id, &error);
-        reply(&mut send, &response).await;
+        reply(&mut send, &response, wire).await;
         return;
     }
     // One stream is one frame. A frame followed by more bytes would be a second
@@ -704,7 +724,12 @@ async fn serve_stream<H>(
     match tokio::time::timeout(STREAM_TAIL_WAIT, recv.read_chunk(1, true)).await {
         Ok(Ok(Some(chunk))) if !chunk.bytes.is_empty() => {
             let error = Error::Wire("trailing bytes after the QUIC frame");
-            reply(&mut send, &Envelope::error(envelope.request_id, &error)).await;
+            reply(
+                &mut send,
+                &Envelope::error(envelope.request_id, &error),
+                wire,
+            )
+            .await;
             return;
         }
         _ => {}
@@ -721,7 +746,12 @@ async fn serve_stream<H>(
         loop {
             if current >= max_calls {
                 let error = Error::Transport("the server has served its calls".to_string());
-                reply(&mut send, &Envelope::error(envelope.request_id, &error)).await;
+                reply(
+                    &mut send,
+                    &Envelope::error(envelope.request_id, &error),
+                    wire,
+                )
+                .await;
                 // No close here: an admitted call may still be running, and the
                 // last one to finish closes the endpoint (round 47). This
                 // stream is not admitted, but it was counted, so its decrement
@@ -787,7 +817,7 @@ async fn serve_stream<H>(
             // does: it is not charged and must not be held for STREAM_WAIT
             // (round 21, finding 1).
             drop(bytes);
-            reply(&mut send, &Envelope::error(request_id, &error)).await;
+            reply(&mut send, &Envelope::error(request_id, &error), wire).await;
             finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
             return;
         }
@@ -796,7 +826,7 @@ async fn serve_stream<H>(
             let error = Error::Provider {
                 code: "provider/reply-withheld".to_string(),
             };
-            reply(&mut send, &Envelope::error(request_id, &error)).await;
+            reply(&mut send, &Envelope::error(request_id, &error), wire).await;
             finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
             return;
         }
@@ -814,13 +844,13 @@ async fn serve_stream<H>(
         // that was refused is the one held longest, outside every budget
         // (round 20, A).
         drop(bytes);
-        reply(&mut send, &Envelope::error(request_id, &error)).await;
+        reply(&mut send, &Envelope::error(request_id, &error), wire).await;
         finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
         return;
     };
     // Send the bytes encoded under this server's profile: encoding again inside
     // `reply` used the default profile (round 18, R16-6).
-    reply_encoded(&mut send, &bytes).await;
+    reply_encoded(&mut send, &bytes, wire).await;
     finish_call(&mut call, &served, max_calls, &mut send, endpoint).await;
 }
 
@@ -853,6 +883,17 @@ pub fn peer_identity(connection: &quinn::Connection) -> Option<PeerIdentity> {
     let chain = any.downcast::<Vec<CertificateDer<'static>>>().ok()?;
     let leaf = chain.first()?;
     Some(PeerIdentity::from_verified_certificate(leaf.as_ref()))
+}
+
+/// Wall-clock unix seconds now, or 0 when the clock is unavailable.
+///
+/// Expiry is a wall-clock fact, so the per-stream re-check takes its time from
+/// the transport, not the kernel's logical clock (RPC-57, R11-5).
+fn wall_now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 /// Most body bytes one read step reserves.
@@ -980,10 +1021,13 @@ impl Drop for CallGuard {
 ///
 /// Every reply path uses this: a peer that advertises a one-byte receive window
 /// and never reads parks `write_all` after the first byte, so an unbounded early
-/// error reply held the task (and its connection permit) forever.
-async fn reply(send: &mut quinn::SendStream, response: &Envelope) {
+/// error reply held the task (and its connection permit) forever. The response
+/// is encoded under the server's profile (`limits`): the success path already
+/// encodes under it, and an early error reply encoded under the default profile
+/// could exceed a strict server's own ceiling (RPC-57, R09-6).
+async fn reply(send: &mut quinn::SendStream, response: &Envelope, limits: WireLimits) {
     let written = tokio::time::timeout(STREAM_WAIT, async {
-        if send_envelope(send, response).await.is_err() {
+        if send_envelope(send, response, limits).await.is_err() {
             return;
         }
         let _ = send.finish();
@@ -1046,13 +1090,13 @@ impl Drop for ReplyBudget {
 /// The success path encodes once (so the bytes on the wire obey `wire`) and
 /// sends those bytes: re-encoding inside `reply` used the default profile
 /// (round 18, R16-6).
-async fn reply_encoded(send: &mut quinn::SendStream, bytes: &[u8]) {
+async fn reply_encoded(send: &mut quinn::SendStream, bytes: &[u8], limits: WireLimits) {
     let written = tokio::time::timeout(STREAM_WAIT, async {
         let Ok(prefix) = frame(bytes.len()) else {
             // A length the framing cannot express is a refusal, not an empty
             // answer (round 21, finding 9).
             let error = Error::Wire("response exceeds the size ceiling");
-            let _ = send_envelope(send, &Envelope::error(0, &error)).await;
+            let _ = send_envelope(send, &Envelope::error(0, &error), limits).await;
             let _ = send.finish();
             return;
         };
@@ -1072,8 +1116,21 @@ async fn reply_encoded(send: &mut quinn::SendStream, bytes: &[u8]) {
     }
 }
 
-async fn send_envelope(send: &mut quinn::SendStream, envelope: &Envelope) -> Result<()> {
-    let bytes = envelope.encode()?;
+/// Encode one envelope and write it with its length prefix.
+///
+/// The envelope is encoded under `limits`, the server's profile (RPC-57,
+/// R09-6). A profile that cannot carry even a tiny error envelope — a
+/// `max_method` below the refusal method's length, say — must still deliver
+/// its refusal, not go silent, so the encode falls back to the default
+/// profile on failure.
+async fn send_envelope(
+    send: &mut quinn::SendStream,
+    envelope: &Envelope,
+    limits: WireLimits,
+) -> Result<()> {
+    let bytes = envelope
+        .encode_with_limits(limits)
+        .or_else(|_| envelope.encode())?;
     let mut payload = Vec::with_capacity(bytes.len() + 4);
     payload.extend_from_slice(&frame(bytes.len())?);
     payload.extend_from_slice(&bytes);
@@ -1254,6 +1311,12 @@ impl QuicClient {
         // that id is legal for an error and only there.
         if !answer.answers(envelope.request_id) {
             return Err(Error::Wire("the QUIC answer belongs to another request"));
+        }
+        // A frame-level refusal is an `Err`, not an answer: the peer refused
+        // the frame itself, and the caller must not mistake it for a handler
+        // error (RPC-57, R09-4). Every other error answer stays `Ok`.
+        if let Some(error) = crate::transport::frame_refusal(&answer) {
+            return Err(error);
         }
         Ok(answer)
     }

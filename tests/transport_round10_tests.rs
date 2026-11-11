@@ -242,7 +242,10 @@ fn the_last_admitted_call_closes_the_server_not_the_first_to_finish() {
 
 /// An error may carry id 0, the id a peer writes when the frame was refused
 /// before its id could be read. An error for another call and a response with
-/// id 0 are not answers to this call (round 13, R-09 #6).
+/// id 0 are not answers to this call (round 13, R-09 #6). The id-0 case here
+/// uses a provider error: a *wire* error with id 0 now surfaces as `Err`
+/// (RPC-57, R09-4), and `rpc57_tests` pins that surface; this test keeps
+/// pinning the id-0 acceptance itself.
 #[cfg(feature = "quic")]
 #[test]
 fn a_quic_error_id_zero_is_accepted_and_another_id_is_not() {
@@ -251,7 +254,12 @@ fn a_quic_error_id_zero_is_accepted_and_another_id_is_not() {
     use active_rpc::Error as RpcError;
 
     let unreadable = QuicServer::start(1, |_envelope| {
-        Envelope::error(0, &RpcError::Wire("the frame could not be read"))
+        Envelope::error(
+            0,
+            &RpcError::Provider {
+                code: "rpc/provider".to_string(),
+            },
+        )
     })
     .expect("server");
     let client =
@@ -260,6 +268,7 @@ fn a_quic_error_id_zero_is_accepted_and_another_id_is_not() {
         .call(&Envelope::request(7, "ping", Vec::new()))
         .expect("id 0 is legal for an error");
     assert_eq!(answer.kind, Kind::Error);
+    assert_eq!(answer.method, "rpc/provider");
     drop(client);
     unreadable.shutdown();
 

@@ -37,12 +37,33 @@ use crate::value::{Arg, Value};
 /// rejected, after the call had been charged (round 40, R-07-3).
 fn check_value_limits(value: &Value, limits: &WireLimits, remaining: &mut u64) -> Result<()> {
     let widest = u64::from(limits.max_array_len);
+    // One value may not be larger than `max_value`: the decoder refuses such
+    // a value, so the encoder must too, or the writer emits frames its own
+    // reader rejects (RPC-57, R01-5). The kernel already refuses a value past
+    // its `Budget::max_value_size` at dispatch, for arguments and results, so
+    // no conforming flow loses anything by this refusal at the wire.
+    let value_ceiling = u64::from(limits.max_value);
     let mut stack: Vec<&Value> = vec![value];
     while let Some(value) = stack.pop() {
         *remaining = remaining
             .checked_sub(1)
             .ok_or(Error::Wire("value count exceeds the ceiling"))?;
         match value {
+            Value::Text(text) => {
+                if text.len() as u64 > value_ceiling {
+                    return Err(Error::Wire("text value exceeds the ceiling"));
+                }
+            }
+            Value::Path(path) => {
+                if path.len() as u64 > value_ceiling {
+                    return Err(Error::Wire("path value exceeds the ceiling"));
+                }
+            }
+            Value::Module(bytes) => {
+                if bytes.len() as u64 > value_ceiling {
+                    return Err(Error::Wire("module value exceeds the ceiling"));
+                }
+            }
             Value::List(items) => {
                 if items.len() as u64 > widest {
                     return Err(Error::Wire("list is wider than the ceiling"));
@@ -53,8 +74,12 @@ fn check_value_limits(value: &Value, limits: &WireLimits, remaining: &mut u64) -
                 if entries.len() as u64 > widest {
                     return Err(Error::Wire("map is wider than the ceiling"));
                 }
-                for item in entries.values() {
-                    // A key is a value on the wire; the reader charges it.
+                for (key, item) in entries.iter() {
+                    // A key is a value on the wire; the reader charges it, and
+                    // the reader bounds it by `max_value` too.
+                    if key.len() as u64 > value_ceiling {
+                        return Err(Error::Wire("map key exceeds the ceiling"));
+                    }
                     *remaining = remaining
                         .checked_sub(1)
                         .ok_or(Error::Wire("value count exceeds the ceiling"))?;
@@ -429,6 +454,15 @@ pub struct WireLimits {
     pub max_array_len: u32,
     /// Maximum path-scope bytes in a capability descriptor.
     pub max_path: u32,
+    /// Maximum bytes in one value: a `Text`, `Path` or `Module` value, or a
+    /// map key.
+    ///
+    /// Without this, one value may be the whole frame: the decoder bounds a
+    /// string only by the frame length, so an 11 MB `Text` decodes and
+    /// materialises and is only refused later, at dispatch, by the kernel's
+    /// `Budget::max_value_size` (RPC-57, R01-5). The default is taken from
+    /// that budget, not repeated, so the two cannot drift.
+    pub max_value: u32,
 }
 
 impl Default for WireLimits {
@@ -447,6 +481,11 @@ impl Default for WireLimits {
             max_values: 1 << 20,
             max_array_len: 1 << 20,
             max_path: 1_024,
+            // The kernel refuses a value past `Budget::default().max_value_size`
+            // at dispatch, so a frame may not carry one the kernel would refuse
+            // anyway; the number is taken from the budget, not repeated, so the
+            // two cannot drift (RPC-57, R01-5).
+            max_value: u32::try_from(Budget::default().max_value_size).unwrap_or(u32::MAX),
         }
     }
 }
@@ -464,6 +503,8 @@ impl WireLimits {
             max_values: 1 << 16,
             max_array_len: 1 << 12,
             max_path: 128,
+            // Mirrors `Budget::strict().max_value_size` (RPC-57, R01-5).
+            max_value: 1 << 20,
         }
     }
 }
@@ -771,6 +812,26 @@ impl Envelope {
             {
                 return Err(Error::CapabilityTable("delta exceeds the ceiling"));
             }
+            // A delta that removes the same id twice, or removes and adds the
+            // same id, encodes but never applies: `apply_to` refuses both, so
+            // the writer must too, or a table order would decide what a delta
+            // means (RPC-57, R01-4). A removed id that names a capability in
+            // the base table is the normal case and is not refused here.
+            let mut removed_ids = std::collections::BTreeSet::new();
+            for id in &delta.removed {
+                if !removed_ids.insert(id.0) {
+                    return Err(Error::CapabilityTable("delta removes a capability twice"));
+                }
+            }
+            let added_ids: std::collections::BTreeSet<[u8; 16]> =
+                delta.added.iter().map(|cap| cap.id.0).collect();
+            for id in &delta.removed {
+                if added_ids.contains(&id.0) {
+                    return Err(Error::CapabilityTable(
+                        "delta removes and adds the same capability",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -803,7 +864,11 @@ impl Envelope {
         if arg_count > limits.max_args {
             return Err(Error::Wire("argument count exceeds the ceiling"));
         }
-        let mut args = Vec::with_capacity(arg_count as usize);
+        // Never preallocate from an untrusted count: an extreme embedder
+        // limit lets `arg_count` ask for terabytes and abort the process
+        // (RPC-57, R01-6). The loop grows the vector and stops when the input
+        // runs out, like the list reader below.
+        let mut args = Vec::with_capacity((arg_count as usize).min(1024));
         let mut remaining_values = limits.max_values;
         for _ in 0..arg_count {
             args.push(read_arg(
@@ -811,6 +876,7 @@ impl Envelope {
                 &mut cursor,
                 &mut remaining_values,
                 limits.max_array_len,
+                limits.max_value,
             )?);
         }
         let payload_len = read_u32(bytes, &mut cursor)?;
@@ -830,7 +896,8 @@ impl Envelope {
         if cap_count > limits.max_caps {
             return Err(Error::CapabilityTable("too many descriptors"));
         }
-        let mut caps = Vec::with_capacity(cap_count as usize);
+        // Never preallocate from an untrusted count (RPC-57, R01-6).
+        let mut caps = Vec::with_capacity((cap_count as usize).min(64));
         let mut seen: BTreeSet<[u8; 16]> = BTreeSet::new();
         for _ in 0..cap_count {
             let descriptor = read_cap(bytes, &mut cursor, &limits)?;
@@ -854,7 +921,9 @@ impl Envelope {
             if removed_count > limits.max_caps {
                 return Err(Error::CapabilityTable("too many delta removals"));
             }
-            let mut removed = Vec::with_capacity(removed_count as usize);
+            // Never preallocate from an untrusted count (RPC-57, R01-6).
+            let mut removed = Vec::with_capacity((removed_count as usize).min(64));
+            let mut removed_ids = BTreeSet::new();
             for _ in 0..removed_count {
                 if cursor + 16 > bytes.len() {
                     return Err(Error::CapabilityTable("truncated delta id"));
@@ -862,6 +931,12 @@ impl Envelope {
                 let mut id = [0u8; 16];
                 id.copy_from_slice(&bytes[cursor..cursor + 16]);
                 cursor += 16;
+                // A delta that removes the same id twice encodes but never
+                // applies (`apply_to` refuses it), so the reader must too
+                // (RPC-57, R01-4).
+                if !removed_ids.insert(id) {
+                    return Err(Error::CapabilityTable("delta removes a capability twice"));
+                }
                 removed.push(CapId(id));
             }
             let added_count = read_u32(bytes, &mut cursor)
@@ -869,7 +944,8 @@ impl Envelope {
             if added_count > limits.max_caps {
                 return Err(Error::CapabilityTable("too many delta additions"));
             }
-            let mut added = Vec::with_capacity(added_count as usize);
+            // Never preallocate from an untrusted count (RPC-57, R01-6).
+            let mut added = Vec::with_capacity((added_count as usize).min(64));
             for _ in 0..added_count {
                 added.push(read_cap(bytes, &mut cursor, &limits)?);
             }
@@ -880,6 +956,14 @@ impl Envelope {
                 // (round 40, residual R-6).
                 if !seen.insert(descriptor.id.0) {
                     return Err(Error::CapabilityTable("duplicate capability id"));
+                }
+                // A delta that removes and adds the same id encodes but never
+                // applies (`apply_to` refuses it), so the reader must too
+                // (RPC-57, R01-4).
+                if removed_ids.contains(&descriptor.id.0) {
+                    return Err(Error::CapabilityTable(
+                        "delta removes and adds the same capability",
+                    ));
                 }
             }
             Some(CapTableDelta {
@@ -1140,6 +1224,7 @@ fn read_arg(
     cursor: &mut usize,
     remaining_values: &mut u32,
     max_array_len: u32,
+    max_value: u32,
 ) -> Result<Arg> {
     let tag = read_u8(bytes, cursor)?;
     match tag {
@@ -1148,6 +1233,7 @@ fn read_arg(
             cursor,
             remaining_values,
             max_array_len,
+            max_value,
         )?)),
         1 => {
             let id = read_u64(bytes, cursor)?;
@@ -1174,6 +1260,7 @@ fn read_value(
     cursor: &mut usize,
     remaining_values: &mut u32,
     max_array_len: u32,
+    max_value: u32,
 ) -> Result<Value> {
     read_value_at(
         bytes,
@@ -1182,6 +1269,7 @@ fn read_value(
         bytes.len(),
         remaining_values,
         max_array_len,
+        max_value,
     )
 }
 
@@ -1192,6 +1280,7 @@ fn read_value_at(
     budget: usize,
     remaining_values: &mut u32,
     max_array_len: u32,
+    max_value: u32,
 ) -> Result<Value> {
     if depth > MAX_VALUE_DEPTH {
         return Err(Error::Wire("value nesting exceeds the ceiling"));
@@ -1213,10 +1302,13 @@ fn read_value_at(
         },
         2 => Value::Int(read_u64(bytes, cursor)? as i64),
         3 => Value::Float(f64::from_bits(read_u64(bytes, cursor)?)),
+        // One value may not be the whole frame: a `Text` is bounded by
+        // `max_value` as well as by the frame length, or it decodes and
+        // materialises and is only refused later, at dispatch (RPC-57, R01-5).
         4 => Value::Text(read_str(
             bytes,
             cursor,
-            budget.min(u32::MAX as usize) as u32,
+            budget.min(max_value as usize) as u32,
         )?),
         5 => {
             let count = read_u32(bytes, cursor)?;
@@ -1238,6 +1330,7 @@ fn read_value_at(
                     budget,
                     remaining_values,
                     max_array_len,
+                    max_value,
                 )?);
             }
             Value::List(items)
@@ -1257,7 +1350,9 @@ fn read_value_at(
                 *remaining_values = remaining_values
                     .checked_sub(1)
                     .ok_or(Error::Wire("value count exceeds the ceiling"))?;
-                let key = read_str(bytes, cursor, budget.min(u32::MAX as usize) as u32)?;
+                // A map key is a value: it is bounded by `max_value` like
+                // any other string (RPC-57, R01-5).
+                let key = read_str(bytes, cursor, budget.min(max_value as usize) as u32)?;
                 let value = read_value_at(
                     bytes,
                     cursor,
@@ -1265,6 +1360,7 @@ fn read_value_at(
                     budget,
                     remaining_values,
                     max_array_len,
+                    max_value,
                 )?;
                 // Keys are strictly increasing. A duplicate decodes to one
                 // entry, and an out-of-order map re-encodes sorted: either way
@@ -1288,6 +1384,11 @@ fn read_value_at(
             if len as usize > budget {
                 return Err(Error::Wire("module payload exceeds the ceiling"));
             }
+            // A `Module` is a value like any other: it may not exceed
+            // `max_value`, or one module is the whole frame (RPC-57, R01-5).
+            if len > max_value {
+                return Err(Error::Wire("module value exceeds the ceiling"));
+            }
             let end = cursor
                 .checked_add(len as usize)
                 .ok_or(Error::Wire("length overflow"))?;
@@ -1298,10 +1399,11 @@ fn read_value_at(
             *cursor = end;
             Value::Module(module)
         }
+        // A `Path` is bounded by `max_value` like a `Text` (RPC-57, R01-5).
         9 => Value::Path(read_str(
             bytes,
             cursor,
-            budget.min(u32::MAX as usize) as u32,
+            budget.min(max_value as usize) as u32,
         )?),
         _ => return Err(Error::Wire("unknown value tag")),
     };

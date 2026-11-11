@@ -852,6 +852,12 @@ impl Http2Client {
         if !answer.answers(envelope.request_id) {
             return Err(Error::Wire("the peer answered a different request"));
         }
+        // A frame-level refusal is an `Err`, not an answer: the peer refused
+        // the frame itself, and the caller must not mistake it for a handler
+        // error (RPC-57, R09-4). Every other error answer stays `Ok`.
+        if let Some(error) = crate::transport::frame_refusal(&answer) {
+            return Err(error);
+        }
         Ok(answer)
     }
 
@@ -859,6 +865,9 @@ impl Http2Client {
     ///
     /// HTTP/2 stream multiplexing is the reason this transport exists; the
     /// results are returned in request order regardless of completion order.
+    /// A frame-level refusal is returned as that request's element, not as
+    /// the batch's `Err`: `call_many` returns one envelope per request, and
+    /// a refusal belongs to one request, not to the batch (RPC-57, R09-4).
     pub fn call_many(&mut self, envelopes: &[Envelope]) -> Result<Vec<Envelope>> {
         let mut payloads = Vec::with_capacity(envelopes.len());
         for envelope in envelopes {

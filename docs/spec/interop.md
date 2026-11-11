@@ -10,10 +10,15 @@ Active RPC has one native protocol and several adapters.
 | Shared memory, in-process | Native, local |
 | Connect / gRPC bridge (`application/connect+active-infinity`, `application/grpc+active-infinity`) | **Interop only** |
 
-The bridge exists so a gateway written for Connect or gRPC can reach an Active
-RPC peer without reimplementing the envelope. It is never the default in
-examples, quick starts or deployment docs, and it must not become the system of
-record.
+The bridge exists so this crate's own Connect-style client — and `curl`
+with a hand-written request — can reach an Active RPC peer without
+reimplementing the envelope. It does NOT interoperate with stock gRPC or
+Connect clients (RPC-57, R09-2): the bridge is HTTP/1.1-only, it accepts only
+the custom `+active-infinity` media types, and the payload is an ARP1 envelope,
+not a protobuf message. A stock gRPC client sends `application/grpc` and is
+refused with 415. Full stock gRPC interop is a feature, not a property of this
+bridge. It is never the default in examples, quick starts or deployment docs,
+and it must not become the system of record.
 
 ## Wire
 
@@ -77,8 +82,9 @@ prefix (`400`), a wrong content type (`415`) and a request without
 
 - New deployments start on ARP1 over TCP (or QUIC/HTTP2 when the network needs
   them).
-- A bridge is added when an existing Connect/gRPC client must be reached. Keep
-  it at the edge; do not re-export it as the native API.
+- A bridge is added when this crate's own Connect-style client must be reached
+  from plain HTTP. It does not let a stock Connect/gRPC client reach a peer
+  (see above). Keep it at the edge; do not re-export it as the native API.
 - Bridge-level authentication (for example mTLS terminating at a gateway) is the
   gateway's job. The kernel still requires an authenticated identity before it
   honours a bound capability; the bridge alone never provides one.

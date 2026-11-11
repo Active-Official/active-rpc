@@ -140,9 +140,12 @@ added       : u32 count | capability*
 
 A receiver applies the delta only when `cap_table_hash(current) == base`.
 Unknown base, unknown removal, duplicate addition or malformed descriptor is
-`rpc/capability-table`. A delta never widens authority: added descriptors still
-pass the normal attenuation/import checks. Full tables remain the default and
-remain valid when the flag is clear.
+`rpc/capability-table`. A delta that removes the same capability twice, or
+removes and adds the same capability, is refused the same way (RPC-57, R01-4):
+it encodes but never applies, so the writer and the reader refuse it rather
+than let a table order decide what it means. A delta never widens authority:
+added descriptors still pass the normal attenuation/import checks. Full tables
+remain the default and remain valid when the flag is clear.
 
 The load path is exercised, not just the arithmetic: `tests/cap_delta_load_tests.rs`
 runs four concurrent negotiators over TCP for 120 chained deltas each, asserts
@@ -163,9 +166,13 @@ with the lane's budget before dispatch.
 
 `WireLimits` bounds total bytes, arguments, method length, payload, descriptors,
 methods per descriptor, the cumulative value count and the width of one value.
-Defaults accept real modules (64 MiB envelopes) and `WireLimits::strict()` is the
-profile for adversarial surfaces. Exceeding a limit is `rpc/wire` (or
-`rpc/capability-table` for the table).
+One value — a `Text`, `Path` or `Module` value, or a map key — is at most
+`WireLimits::max_value`: 10,000,000 bytes by default, the same number as the
+kernel's `Budget::default().max_value_size`, and 1 MiB under `strict()`.
+Without it one value could be the whole frame and only be refused later, at
+dispatch (RPC-57, R01-5). Defaults accept real modules (64 MiB envelopes) and
+`WireLimits::strict()` is the profile for adversarial surfaces. Exceeding a
+limit is `rpc/wire` (or `rpc/capability-table` for the table).
 
 The default method ceiling is 1024 bytes, the same number
 `kernel::MAX_GRANTED_METHOD_BYTES` and `receipts::MAX_METHOD_BYTES` use: a name a

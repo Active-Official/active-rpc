@@ -96,14 +96,13 @@ fn an_anonymous_peer_is_refused_when_identity_is_required() {
         .expect_err("anonymous off-host is refused");
     assert_eq!(error.code(), "rpc/identity");
 
-    let admitted = IdentityPolicy::local()
+    // `local()` relaxes the identity requirement, but only on loopback: an
+    // anonymous peer off loopback is refused under every policy (RPC-57,
+    // R11-3).
+    let error = IdentityPolicy::local()
         .admit(Some(&anonymous), false)
-        .expect("local policy admits anonymous");
-    assert_eq!(admitted.trust(), TrustLevel::Unauthenticated);
-    assert!(
-        !admitted.can_bind(),
-        "an unauthenticated peer cannot be bound"
-    );
+        .expect_err("local policy refuses anonymous off loopback");
+    assert_eq!(error.code(), "rpc/identity");
 }
 
 #[test]
@@ -253,16 +252,20 @@ fn attenuation_keeps_the_binding_and_refuses_a_rebind() {
 }
 
 #[test]
-fn an_anonymous_peer_cannot_receive_an_introduction() {
+fn a_peer_that_cannot_bind_cannot_receive_an_introduction() {
     let agent = Agent::with_secret([0x55; 32]);
     let provider = agent.register(Box::new(Echo)).expect("register provider");
     let cap = agent
         .mint(provider, 0, CapAttrs::new(&["echo"]))
         .expect("cap");
 
-    let anonymous = IdentityPolicy::local()
-        .admit(Some(&PeerIdentity::anonymous()), false)
-        .expect("anonymous admitted");
+    // `local()` no longer admits an anonymous peer off loopback (RPC-57,
+    // R11-3), so the test uses the loopback identity: admitted, but shared by
+    // every local process and unable to hold a binding — the property the test
+    // pins is that a peer that cannot bind cannot receive one.
+    let anonymous = IdentityPolicy::default()
+        .admit(None, true)
+        .expect("loopback admitted");
     let error = agent
         .introduce_to(&cap, &anonymous)
         .expect_err("anonymous refused");

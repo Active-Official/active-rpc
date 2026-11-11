@@ -108,6 +108,10 @@ wat = "1"
 # (behind `quic`); the dev-dependency makes it available to the tests
 # whatever features are enabled.
 rcgen = "0.13"
+# The RPC-57 expiry test mints short-lived certificates (`not_after` a few
+# seconds out), so it needs `OffsetDateTime` directly. `time` is already in
+# the lockfile (0.3.55) via `rcgen`, so this only adds the dev-dependency edge.
+time = "0.3"
 
 [[bin]]
 name = "active-rpc-peer"

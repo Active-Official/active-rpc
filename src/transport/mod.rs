@@ -232,6 +232,30 @@ const TCP_READ_BUFFER: usize = 8 << 10;
 /// forever (round 10, R-09 #2).
 pub const DEFAULT_FRAME_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A frame-level refusal carried as an error answer, if that is what `answer`
+/// is (RPC-57, R09-4).
+///
+/// The transports disagreed about what a refusal is: HTTP/2 and the bridge
+/// refuse a malformed frame with a 400 and surface it to the caller as `Err`,
+/// while TCP and QUIC answer the same refusal as an `Ok(Error envelope)` and
+/// the caller cannot tell a refusal from a handler error. A handler error
+/// envelope stays `Ok` on every transport; only a refusal — an error whose
+/// method names the frame itself, `rpc/wire` or `rpc/capability-table` —
+/// surfaces as `Err`, with the same value `refusal()` already maps the
+/// HTTP-layer refusal to. A handler that returns a bare `Wire` or
+/// `CapabilityTable` error is classified the same way on all four transports,
+/// which matches what `refusal()` already does for HTTP bodies.
+pub(crate) fn frame_refusal(answer: &Envelope) -> Option<Error> {
+    if answer.kind != Kind::Error {
+        return None;
+    }
+    match answer.method.as_str() {
+        "rpc/wire" => Some(Error::Wire("the peer rejected the frame")),
+        "rpc/capability-table" => Some(Error::CapabilityTable("the peer rejected the frame")),
+        _ => None,
+    }
+}
+
 impl TcpTransport {
     /// Wrap an established stream.
     pub fn new(stream: TcpStream) -> Result<Self> {
@@ -305,14 +329,22 @@ impl TcpTransport {
         if !answer.answers(envelope.request_id) {
             return Err(Error::Wire("the answer belongs to another request"));
         }
+        // A frame-level refusal is an `Err`, not an answer: the peer refused
+        // the frame itself, and the caller must not mistake it for a handler
+        // error (RPC-57, R09-4). Every other error answer stays `Ok`.
+        if let Some(error) = frame_refusal(&answer) {
+            return Err(error);
+        }
         Ok(answer)
     }
 
     /// Connect to a peer.
+    ///
+    /// Delegates to [`TcpTransport::connect_with_timeout`] with the default
+    /// frame wait: a bare `TcpStream::connect` has no deadline, so a
+    /// black-holed SYN parked the caller forever (RPC-57, R09-5).
     pub fn connect(address: &str) -> Result<Self> {
-        let stream = TcpStream::connect(address)
-            .map_err(|error| Error::Transport(format!("connect: {error}")))?;
-        Self::new(stream)
+        Self::connect_with_timeout(address, DEFAULT_FRAME_WAIT)
     }
 
     /// Connect with a read and write deadline.
@@ -531,6 +563,17 @@ pub const DEFAULT_CONNECTION_LIFETIME: std::time::Duration =
 
 /// Serve one connection: read envelopes and answer each with `handler`.
 ///
+/// This server is serial and single-tenant by design: one handler runs at a
+/// time on the serving thread, and there is no deadline on handler time — a
+/// slow provider call stalls every later peer on this connection (and, while
+/// the accept loop waits, every later connection). That is the contract, not
+/// a bug to work around here: the handler closure borrows the `Agent`, which
+/// is `!Send`, so a handler deadline would need a thread that cannot run the
+/// production handlers (RPC-57, R09-3). Deployments that need concurrency use
+/// the QUIC or HTTP/2 transports; this transport is for local and development
+/// use. Bounds that do apply: one frame gets the per-frame deadline, and the
+/// whole connection gets `DEFAULT_CONNECTION_LIFETIME`.
+///
 /// A frame error or a broken socket ends *this* connection, not the server: the
 /// reply carries the stable code and the call returns the count served so far.
 /// A caller that is serving many connections keeps accepting.
@@ -547,6 +590,8 @@ where
 /// [`serve_connection`] with an explicit connection deadline.
 ///
 /// `None` removes the total bound; the per-frame deadline still applies.
+/// The handler runs inline on the serving thread with no deadline of its own;
+/// see [`serve_connection`] for the serial contract (RPC-57, R09-3).
 pub fn serve_connection_within<H>(
     mut transport: TcpTransport,
     mut handler: H,

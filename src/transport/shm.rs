@@ -50,8 +50,13 @@ pub struct SharedSegment {
 
 impl SharedSegment {
     /// Allocate a segment with at least `payload_bytes` of frame space.
+    ///
+    /// The capacity is capped at `MAX_FRAME_BYTES`: no transport accepts a
+    /// frame larger than that, so a larger segment can never carry a frame,
+    /// and an unbounded request used to allocate until the process aborted
+    /// (RPC-57, R09-5). The floor stays 1024 bytes.
     pub fn new(payload_bytes: usize) -> Arc<SharedSegment> {
-        let capacity = payload_bytes.max(1024);
+        let capacity = payload_bytes.clamp(1024, crate::transport::MAX_FRAME_BYTES);
         Arc::new(SharedSegment {
             state: Mutex::new(SegmentState {
                 data: vec![0u8; capacity],

@@ -339,6 +339,8 @@ mod quic {
 
     /// The server applies `WireLimits::strict()`: a method longer than the
     /// strict ceiling is refused instead of accepted under the default limits.
+    /// The refusal is a frame-level refusal (`rpc/wire`), so the call surfaces
+    /// it as `Err` (RPC-57, R09-4) rather than as an `Ok` error envelope.
     #[test]
     fn quic_applies_the_server_wire_limits() {
         let server = QuicServer::start(1, echo)
@@ -346,11 +348,10 @@ mod quic {
             .with_limits(WireLimits::strict());
         let client = QuicClient::connect(server.address(), server.certificate()).expect("client");
         let long = "m".repeat(WireLimits::strict().max_method as usize + 1);
-        let response = client
+        let error = client
             .call(&Envelope::request(1, long, vec![]))
-            .expect("the server answers with an error envelope");
-        assert_eq!(response.kind, Kind::Error, "{response:?}");
-        assert_eq!(response.method, "rpc/wire");
+            .expect_err("the server refuses the over-long method");
+        assert_eq!(error.code(), "rpc/wire", "{error}");
     }
 }
 

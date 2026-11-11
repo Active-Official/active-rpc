@@ -849,7 +849,11 @@ fn a_truncated_bridge_response_is_a_wire_fault() {
 
 /// An error may carry id 0 when the bridge could not read the frame far enough
 /// to learn the id; the bridge client accepts it, as QUIC, TCP and shared
-/// memory do (round 14, F-5).
+/// memory do (round 14, F-5). The error here is a provider error: a *wire*
+/// error with id 0 now surfaces as `Err` instead (RPC-57, R09-4 — a
+/// frame-level refusal is an error of the call, not an answer), and
+/// `rpc57_tests` pins that surface; this test keeps pinning the id-0
+/// acceptance itself.
 #[test]
 fn a_bridge_error_with_id_zero_is_this_calls_answer() {
     use active_rpc::transport::connect::{grpc_frame, CONNECT_TYPE};
@@ -861,7 +865,12 @@ fn a_bridge_error_with_id_zero_is_this_calls_answer() {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut scratch = [0u8; 4096];
         let _ = stream.read(&mut scratch);
-        let error = Envelope::error(0, &Error::Wire("the frame could not be read"));
+        let error = Envelope::error(
+            0,
+            &Error::Provider {
+                code: "rpc/provider".to_string(),
+            },
+        );
         let body = grpc_frame(&error.encode().expect("encode")).expect("frame");
         let mut head = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: {CONNECT_TYPE}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -879,6 +888,6 @@ fn a_bridge_error_with_id_zero_is_this_calls_answer() {
         .call(&request(31, "echo", Vec::new()))
         .expect("id 0 is legal for an error");
     assert_eq!(answer.kind, Kind::Error);
-    assert_eq!(answer.method, "rpc/wire");
+    assert_eq!(answer.method, "rpc/provider");
     server.join().expect("server");
 }

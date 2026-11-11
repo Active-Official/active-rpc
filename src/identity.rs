@@ -79,8 +79,8 @@ impl IdentityKind {
 ///
 /// Provenance is part of the value (RPC-55): a verified identity and an
 /// unverified claim for the same certificate are distinct values (equality
-/// includes `verified`), though they share a fingerprint, which is exactly the
-/// binding key.
+/// includes `verified` and `not_after`), though they share a fingerprint,
+/// which is exactly the binding key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerIdentity {
     kind: IdentityKind,
@@ -91,6 +91,16 @@ pub struct PeerIdentity {
     /// test constructor built it. The field is private, so no caller outside
     /// this module can set it (RPC-55).
     verified: bool,
+    /// Unix seconds after which the verified certificate that created this
+    /// identity is no longer valid, or `None` when the identity carries no
+    /// certificate expiry (RPC-57, R11-5). Set only for verified identities,
+    /// parsed from the leaf certificate's `notAfter` at construction; an
+    /// unverified claim must not assert an expiry, and a loopback or
+    /// anonymous identity has no certificate to expire. A transport re-checks
+    /// it against wall time for the life of the connection
+    /// (`PeerIdentity::is_expired_at`); the kernel never sees it, because the
+    /// kernel clock is logical and expiry is a wall-clock fact.
+    not_after: Option<u64>,
 }
 
 impl PeerIdentity {
@@ -128,8 +138,11 @@ impl PeerIdentity {
     /// TLS stack verified for this connection (`transport::quic::peer_identity`).
     /// The returned identity is [`PeerIdentity::is_verified`] and
     /// [`IdentityPolicy::admit`] accepts it as [`TrustLevel::Authenticated`]
-    /// (RPC-55). An empty buffer is treated as no identity at all, exactly as
-    /// in [`PeerIdentity::from_certificate`].
+    /// (RPC-55). The leaf's `notAfter` is recorded on the identity
+    /// ([`PeerIdentity::not_after`]) so a transport can re-check it against
+    /// wall time for the life of the connection (RPC-57, R11-5). An empty
+    /// buffer is treated as no identity at all, exactly as in
+    /// [`PeerIdentity::from_certificate`].
     ///
     /// No production caller exists in a build without the `quic` transport
     /// (the only in-crate caller is `transport::quic::peer_identity`); the
@@ -168,11 +181,22 @@ impl PeerIdentity {
         }
         let fingerprint = fingerprint_for("", certificate);
         let subject = format!("cert:{}", hex_prefix(&fingerprint, 16));
+        // Expiry is a verified fact, not a claim: only a transport-verified
+        // identity (or the test constructor) records a `notAfter`, parsed
+        // from the leaf certificate. An unverified claim must not assert an
+        // expiry it never proved (RPC-57, R11-5). A certificate whose validity
+        // cannot be parsed records no expiry.
+        let not_after = if verified {
+            certificate_not_after(certificate)
+        } else {
+            None
+        };
         Self {
             kind: IdentityKind::MutualTls,
             subject,
             fingerprint,
             verified,
+            not_after,
         }
     }
 
@@ -207,6 +231,7 @@ impl PeerIdentity {
             subject: "loopback".to_string(),
             fingerprint: loopback_fingerprint(),
             verified: false,
+            not_after: None,
         }
     }
 
@@ -217,6 +242,7 @@ impl PeerIdentity {
             subject: "anonymous".to_string(),
             fingerprint: [0u8; FINGERPRINT_LEN],
             verified: false,
+            not_after: None,
         }
     }
 
@@ -232,6 +258,27 @@ impl PeerIdentity {
     /// identity is never verified.
     pub fn is_verified(&self) -> bool {
         self.verified
+    }
+
+    /// Unix seconds after which the verified certificate that created this
+    /// identity is no longer valid, or `None` when the identity carries no
+    /// certificate expiry (RPC-57, R11-5). `None` means "unknown", not
+    /// "never expires": a transport that enforces expiry must treat an
+    /// unknown expiry as a reason to refuse, not as a licence to keep
+    /// serving.
+    pub fn not_after(&self) -> Option<u64> {
+        self.not_after
+    }
+
+    /// True when the certificate that created this identity is expired at
+    /// `now_unix` (unix seconds, wall time). An identity with no recorded
+    /// expiry is never expired by this predicate: the caller decides what an
+    /// unknown expiry means. Expiry is inclusive at `notAfter`: a certificate
+    /// MUST NOT be used on or after that second (RFC 5280), so `now_unix`
+    /// equal to `notAfter` is already expired.
+    pub fn is_expired_at(&self, now_unix: u64) -> bool {
+        self.not_after
+            .is_some_and(|not_after| now_unix >= not_after)
     }
 
     /// Verified principal name.
@@ -257,6 +304,193 @@ impl PeerIdentity {
     pub fn is_anonymous(&self) -> bool {
         self.kind == IdentityKind::Anonymous
     }
+}
+
+/// Unix seconds of the `notAfter` in a DER certificate, or `None` when the
+/// validity period cannot be read (RPC-57, R11-5).
+///
+/// A minimal strict DER reader for the certificate's validity period only: it
+/// walks Certificate -> tbsCertificate -> optional `[0]` version -> serial ->
+/// signature -> issuer -> validity, and reads `notAfter` as UTCTime or
+/// GeneralizedTime. No new dependency, no unsafe code. Anything malformed,
+/// truncated, non-UTC or pre-epoch yields `None`: an identity whose expiry
+/// cannot be read carries no expiry, and a transport that enforces expiry
+/// must refuse a `None` for a verified identity rather than assume it lives
+/// forever. The reader stops at the validity period, so the rest of the
+/// certificate is never parsed.
+fn certificate_not_after(der: &[u8]) -> Option<u64> {
+    let mut reader = DerReader { bytes: der, pos: 0 };
+    let certificate = reader.read_tlv(0x30)?;
+    // The outer content is the tbsCertificate TLV itself, not its fields:
+    // read the inner SEQUENCE before walking the fields.
+    let mut cert_reader = DerReader {
+        bytes: certificate,
+        pos: 0,
+    };
+    let tbs = cert_reader.read_tlv(0x30)?;
+    let mut tbs = DerReader { bytes: tbs, pos: 0 };
+    // Optional `[0]` EXPLICIT version.
+    if tbs.peek_tag() == Some(0xA0) {
+        let _version = tbs.read_tlv(0xA0)?;
+    }
+    let _serial = tbs.read_tlv(0x02)?;
+    let _signature = tbs.read_tlv(0x30)?;
+    let _issuer = tbs.read_tlv(0x30)?;
+    let validity = tbs.read_tlv(0x30)?;
+    let mut validity_reader = DerReader {
+        bytes: validity,
+        pos: 0,
+    };
+    let _not_before = validity_reader.read_tlv_any()?;
+    let not_after = validity_reader.read_tlv_any()?;
+    parse_x509_time(not_after)
+}
+
+/// One TLV at a time over a byte slice. Definite lengths only: the indefinite
+/// form is refused, and a length that runs past the slice is truncated.
+struct DerReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DerReader<'a> {
+    fn peek_tag(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    /// Read one TLV with the expected tag; return its content bytes.
+    fn read_tlv(&mut self, expected: u8) -> Option<&'a [u8]> {
+        let (tag, content) = self.read_tlv_any()?;
+        if tag != expected {
+            return None;
+        }
+        Some(content)
+    }
+
+    /// Read one TLV of any tag; return the tag and its content bytes.
+    fn read_tlv_any(&mut self) -> Option<(u8, &'a [u8])> {
+        let tag = *self.bytes.get(self.pos)?;
+        let mut pos = self.pos + 1;
+        let first_len = *self.bytes.get(pos)?;
+        pos += 1;
+        let len = if first_len < 0x80 {
+            first_len as usize
+        } else {
+            // Long form: 1-4 length bytes. The indefinite form (0x80) and a
+            // length longer than 4 bytes are refused.
+            let count = (first_len & 0x7F) as usize;
+            if count == 0 || count > 4 {
+                return None;
+            }
+            let mut len = 0usize;
+            for _ in 0..count {
+                len = len
+                    .checked_mul(256)?
+                    .checked_add(*self.bytes.get(pos)? as usize)?;
+                pos += 1;
+            }
+            len
+        };
+        let end = pos.checked_add(len)?;
+        let content = self.bytes.get(pos..end)?;
+        self.pos = end;
+        Some((tag, content))
+    }
+}
+
+/// Unix seconds for an X.509 time value: UTCTime `YYMMDDHHMMSSZ` or
+/// GeneralizedTime `YYYYMMDDHHMMSSZ`, Zulu only. A two-digit year below 50 is
+/// 20xx, 50 and above is 19xx (RFC 5280). Anything else yields `None`.
+fn parse_x509_time((tag, content): (u8, &[u8])) -> Option<u64> {
+    let (year, month, day, hour, minute, second) = match tag {
+        0x17 => {
+            if content.len() != 13 || content[12] != b'Z' {
+                return None;
+            }
+            let year = two_digits(content, 0)?;
+            let year = if year < 50 { 2000 + year } else { 1900 + year };
+            (
+                year,
+                two_digits(content, 2)?,
+                two_digits(content, 4)?,
+                two_digits(content, 6)?,
+                two_digits(content, 8)?,
+                two_digits(content, 10)?,
+            )
+        }
+        0x18 => {
+            if content.len() != 15 || content[14] != b'Z' {
+                return None;
+            }
+            let year = four_digits(content, 0)?;
+            (
+                year,
+                two_digits(content, 4)?,
+                two_digits(content, 6)?,
+                two_digits(content, 8)?,
+                two_digits(content, 10)?,
+                two_digits(content, 12)?,
+            )
+        }
+        _ => return None,
+    };
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if day == 0 || day > max_day {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    days.checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)
+}
+
+/// Two decimal digits at `at`, or `None` when they are not digits.
+fn two_digits(bytes: &[u8], at: usize) -> Option<u64> {
+    let hi = *bytes.get(at)?;
+    let lo = *bytes.get(at + 1)?;
+    if !hi.is_ascii_digit() || !lo.is_ascii_digit() {
+        return None;
+    }
+    Some(u64::from(hi - b'0') * 10 + u64::from(lo - b'0'))
+}
+
+/// Four decimal digits at `at`, or `None` when they are not digits.
+fn four_digits(bytes: &[u8], at: usize) -> Option<u64> {
+    let hi = two_digits(bytes, at)?;
+    let lo = two_digits(bytes, at + 2)?;
+    Some(hi * 100 + lo)
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+/// `None` for a pre-epoch date, which unix seconds cannot represent.
+fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
+    let year = year as i64;
+    let month = month as i64;
+    let day = day as i64;
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days).ok()
 }
 
 /// Bounded, log-safe form of a principal label.
@@ -464,8 +698,14 @@ impl IdentityPolicy {
         }
     }
 
-    /// Development policy: no certificate required anywhere. Never use it for a
-    /// listener that is reachable off-host.
+    /// Development policy: no certificate required on loopback. Never use it
+    /// for a listener that is reachable off-host.
+    ///
+    /// The relaxation is loopback-scoped in code, not only in this comment:
+    /// `admit` refuses an anonymous peer off loopback under this policy too
+    /// (RPC-57, R11-3). The policy exists so a local development listener does
+    /// not need certificates; it is not a licence to serve unauthenticated
+    /// traffic off-host.
     pub const fn local() -> Self {
         Self {
             require_identity: false,
@@ -476,7 +716,11 @@ impl IdentityPolicy {
     /// Admit a peer, or refuse with `rpc/identity`.
     ///
     /// `loopback` must be computed from the connection's local and remote
-    /// addresses, never from a header or a caller-supplied flag.
+    /// addresses, never from a header or a caller-supplied flag. Admission
+    /// does not re-check certificate expiry: a binding outlives the
+    /// certificate that created it unless the transport re-checks
+    /// `PeerIdentity::is_expired_at` against wall time (RPC-57, R11-5; the
+    /// QUIC transport does so per stream).
     pub fn admit(&self, peer: Option<&PeerIdentity>, loopback: bool) -> Result<AdmittedIdentity> {
         // An explicitly anonymous identity says exactly what presenting none
         // says. Normalising first keeps one label per connection: otherwise
@@ -526,7 +770,12 @@ impl IdentityPolicy {
                         identity: PeerIdentity::loopback(),
                         trust: TrustLevel::LoopbackRelaxed,
                     })
-                } else if !self.require_identity {
+                } else if !self.require_identity && loopback {
+                    // `local()` relaxes the identity requirement, but only on
+                    // loopback: an anonymous peer off loopback is refused
+                    // under every policy, because "never for a reachable
+                    // listener" is a property of the connection, not of the
+                    // policy object (RPC-57, R11-3).
                     Ok(AdmittedIdentity {
                         identity: PeerIdentity::anonymous(),
                         trust: TrustLevel::Unauthenticated,
@@ -536,5 +785,148 @@ impl IdentityPolicy {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DER length encoding: short form below 128, long form above.
+    fn der_len(len: usize) -> Vec<u8> {
+        if len < 0x80 {
+            vec![len as u8]
+        } else if len < 0x100 {
+            vec![0x81, len as u8]
+        } else {
+            vec![0x82, (len >> 8) as u8, len as u8]
+        }
+    }
+
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&der_len(content.len()));
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// A minimal certificate that ends after the validity period: the parser
+    /// stops there, so the rest of the certificate is not needed. `version`
+    /// selects the optional `[0]` EXPLICIT version wrapper.
+    fn cert_with_validity(not_before: &[u8], not_after: &[u8], version: bool) -> Vec<u8> {
+        let validity = der_tlv(
+            0x30,
+            &[der_tlv(0x17, not_before), der_tlv(0x17, not_after)].concat(),
+        );
+        let mut tbs = Vec::new();
+        if version {
+            tbs.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x02, &[2])));
+        }
+        tbs.extend_from_slice(&der_tlv(0x02, &[1])); // serial
+        tbs.extend_from_slice(&der_tlv(0x30, &[])); // signature
+        tbs.extend_from_slice(&der_tlv(0x30, &[])); // issuer
+        tbs.extend_from_slice(&validity);
+        der_tlv(0x30, &der_tlv(0x30, &tbs))
+    }
+
+    #[test]
+    fn utctime_future_parses_to_unix_seconds() {
+        // 2049-01-01T00:00:00Z. (UTCTime year 50 would be 1950, not 2050 —
+        // see the boundary test.)
+        let der = cert_with_validity(b"200101000000Z", b"490101000000Z", true);
+        assert_eq!(certificate_not_after(&der), Some(2_493_072_000));
+    }
+
+    #[test]
+    fn utctime_past_parses_to_unix_seconds() {
+        // 2020-01-01T00:00:00Z.
+        let der = cert_with_validity(b"190101000000Z", b"200101000000Z", true);
+        assert_eq!(certificate_not_after(&der), Some(1_577_836_800));
+    }
+
+    #[test]
+    fn generalized_time_parses_to_unix_seconds() {
+        let validity = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x18, b"20200101000000Z"),
+                der_tlv(0x18, b"20500101000000Z"),
+            ]
+            .concat(),
+        );
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&der_tlv(0x02, &[1]));
+        tbs.extend_from_slice(&der_tlv(0x30, &[]));
+        tbs.extend_from_slice(&der_tlv(0x30, &[]));
+        tbs.extend_from_slice(&validity);
+        let der = der_tlv(0x30, &der_tlv(0x30, &tbs));
+        assert_eq!(certificate_not_after(&der), Some(2_524_608_000));
+    }
+
+    #[test]
+    fn utctime_year_boundary_49_is_2049_and_50_is_pre_epoch() {
+        // Year 49 is 2049; year 50 is 1950, which unix seconds cannot
+        // represent, so the parser yields no expiry for it.
+        let der = cert_with_validity(b"480101000000Z", b"490101000000Z", true);
+        assert_eq!(certificate_not_after(&der), Some(2_493_072_000));
+        let der = cert_with_validity(b"490101000000Z", b"500101000000Z", true);
+        assert_eq!(certificate_not_after(&der), None);
+    }
+
+    #[test]
+    fn version_absent_still_parses() {
+        let der = cert_with_validity(b"200101000000Z", b"490101000000Z", false);
+        assert_eq!(certificate_not_after(&der), Some(2_493_072_000));
+    }
+
+    #[test]
+    fn garbage_and_truncated_certificates_yield_no_expiry() {
+        assert_eq!(certificate_not_after(&[]), None);
+        assert_eq!(certificate_not_after(&[0u8; 64]), None);
+        // A real-shaped certificate cut off inside the validity period.
+        let der = cert_with_validity(b"200101000000Z", b"500101000000Z", true);
+        assert_eq!(certificate_not_after(&der[..der.len() - 4]), None);
+        // Indefinite length is refused.
+        let mut indefinite = der.clone();
+        indefinite[1] = 0x80;
+        assert_eq!(certificate_not_after(&indefinite), None);
+        // A non-UTC time tag is refused.
+        let validity = der_tlv(
+            0x30,
+            &[
+                der_tlv(0x17, b"200101000000Z"),
+                der_tlv(0x16, b"500101000000Z"),
+            ]
+            .concat(),
+        );
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&der_tlv(0x02, &[1]));
+        tbs.extend_from_slice(&der_tlv(0x30, &[]));
+        tbs.extend_from_slice(&der_tlv(0x30, &[]));
+        tbs.extend_from_slice(&validity);
+        let der = der_tlv(0x30, &der_tlv(0x30, &tbs));
+        assert_eq!(certificate_not_after(&der), None);
+    }
+
+    #[test]
+    fn unverified_and_non_certificate_identities_have_no_expiry() {
+        // An unverified claim records no expiry, whatever the bytes say.
+        let der = cert_with_validity(b"200101000000Z", b"500101000000Z", true);
+        let claim = PeerIdentity::from_certificate(&der);
+        assert_eq!(claim.not_after(), None);
+        assert!(!claim.is_expired_at(u64::MAX));
+        // Loopback and anonymous identities have no expiry.
+        assert_eq!(PeerIdentity::loopback().not_after(), None);
+        assert_eq!(PeerIdentity::anonymous().not_after(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "test-utils")]
+    fn verified_identity_records_expiry_and_predicate_matches() {
+        let der = cert_with_validity(b"200101000000Z", b"490101000000Z", true);
+        let identity = PeerIdentity::from_certificate_for_test(&der);
+        assert_eq!(identity.not_after(), Some(2_493_072_000)); // 2049-01-01T00:00:00Z
+        assert!(!identity.is_expired_at(2_493_071_999));
+        assert!(identity.is_expired_at(2_493_072_000));
     }
 }

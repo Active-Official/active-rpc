@@ -150,11 +150,13 @@ fn local_policy_labels_a_loopback_peer_as_loopback() {
     assert_eq!(admitted.trust(), TrustLevel::LoopbackRelaxed);
     assert!(!admitted.can_bind());
 
-    // Off-host under `local()` is still nobody in particular.
-    let remote = IdentityPolicy::local()
+    // Off-host under `local()` is refused: the relaxation is loopback-scoped
+    // in code (RPC-57, R11-3), not a licence to serve unauthenticated traffic
+    // off-host.
+    let error = IdentityPolicy::local()
         .admit(None, false)
-        .expect("no identity required");
-    assert_eq!(remote.identity().kind(), IdentityKind::Anonymous);
+        .expect_err("anonymous off loopback is refused under local()");
+    assert_eq!(error.code(), "rpc/identity");
 }
 
 /// A revoked descendant is dead authority; its binding must not block the
