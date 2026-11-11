@@ -18,4 +18,4 @@ default = ["quic"]
 quic = ["active-rpc/quic"]
 
 [dependencies]
-active-rpc = { version = "2.0.0", default-features = false }
+active-rpc = { path = "../..", version = "2.3.0", default-features = false }

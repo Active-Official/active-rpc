@@ -9,7 +9,10 @@ maturity release; the executed record lives in `STATUS.md`.
 1. Every CI job is green on both remotes at the candidate commit.
 2. Versions are bumped in `Cargo.toml` (library and CLI) and the lockfiles are
    refreshed; `CHANGELOG.md` has a dated section; `REGISTRY.md` lists the
-   versions.
+   versions; the five facades' `active-rpc` floors are bumped to the library
+   version (enforced by `tests/doc_gate.rs`
+   `facade_floors_equal_the_parent_version` — a stale floor fails CI before
+   the release, not after it).
 3. `cargo publish --dry-run` succeeds for the library, and for the CLI once the
    library version is resolvable.
 4. `STATUS.md` reflects the candidate state and its residual risks.

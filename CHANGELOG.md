@@ -347,6 +347,18 @@ Hardening from the R-09 (transports), R-10 (bulk), R-11 (identity), R-12
 - The nightly lane has a 120-minute job ceiling and uploads `fuzz/artifacts` and
   the grown corpus on failure.
 
+### Facades (TEST-09)
+
+- **Facade floors track the parent (TEST-09).** All five facades pinned
+  `active-rpc = "2.0.0"` while the parent shipped 2.3.0, so a consumer
+  pinning the floor got a facade over a three-minor-old kernel with
+  known-fixed secret/redaction bugs. The floors are now `2.3.0` and
+  resolve the tree under test (`path = "../.."`, the same shape as the
+  CLI and the control plane), and `tests/doc_gate.rs`
+  `facade_floors_equal_the_parent_version` fails CI when a floor drifts
+  from the parent version again. The release runbook (precondition 2)
+  now lists the floor bump as a release step.
+
 ## CLI 0.3.1 - 2026-10-31
 
 - `version` (also `--version`, `-V`) prints the CLI and kernel versions, and

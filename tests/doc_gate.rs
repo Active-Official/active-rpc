@@ -568,3 +568,119 @@ fn changelog_has_exactly_one_unreleased_section() {
         headings[0]
     );
 }
+
+/// Every facade's `active-rpc` floor must equal the parent version.
+///
+/// TEST-09: all five facades pinned `active-rpc = "2.0.0"` while the
+/// parent shipped 2.3.0, so a consumer pinning the floor got a facade
+/// over a three-minor-old kernel with known-fixed secret/redaction
+/// bugs. The floor is the parent version, exactly — not a range, not
+/// "at least": a floor below the parent re-admits the old kernel, and
+/// a floor above the parent cannot resolve.
+///
+/// The dependency also carries `path = "../.."`, the same shape as
+/// the CLI (`cli/active-rpc-cli/Cargo.toml`) and the control plane
+/// (`control-plane/Cargo.toml`): the facades are part of this repo,
+/// so they resolve the tree under test. Without the path, the bumped
+/// floor could not resolve at all until 2.3.0 is published on
+/// crates.io (latest published is 2.2.0), and the CI facades job —
+/// `cargo test --manifest-path facades/<crate>/Cargo.toml` — would
+/// go red on main. With the path, `cargo publish` still strips it
+/// and keeps the version requirement, so the published facade
+/// requires the published kernel (release order: kernel first, as
+/// the runbook already requires for the CLI).
+///
+/// Three precision points, all load-bearing:
+/// * The floor is read from the `active-rpc = { ... }` line inside
+///   the facade's `[dependencies]` section, not file-wide: the
+///   transport facade also mentions `active-rpc/quic` in `[features]`,
+///   and a plain `contains` check would pass vacuously (the TEST-03
+///   lesson).
+/// * A facade with no `active-rpc` dependency line fails outright:
+///   a missing floor must not read as a matching floor.
+/// * The five known facades must all be present, and no other
+///   directory may appear: a deleted facade must fail the gate, not
+///   silently drop out of it, and a new facade must be added to the
+///   list deliberately.
+#[test]
+fn facade_floors_equal_the_parent_version() {
+    const EXPECTED: &[&str] = &[
+        "active-rpc-kernel",
+        "active-rpc-core",
+        "active-rpc-client",
+        "active-rpc-tools",
+        "active-rpc-transport",
+    ];
+    let parent = env!("CARGO_PKG_VERSION");
+    let facades = repo_path("facades");
+    let mut checked: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&facades).expect("facades/ must exist") {
+        let entry = entry.expect("facade dir entry");
+        let manifest = entry.path().join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let text =
+            fs::read_to_string(&manifest).unwrap_or_else(|_| panic!("read {}", manifest.display()));
+        let line = facade_active_rpc_dep_line(&text).unwrap_or_else(|| {
+            panic!("{name}/Cargo.toml has no active-rpc line in [dependencies]")
+        });
+        let floor = facade_active_rpc_floor(&line).unwrap_or_else(|| {
+            panic!("{name}/Cargo.toml active-rpc line names no version: {line}")
+        });
+        assert_eq!(
+            floor.as_str(),
+            parent,
+            "{name}/Cargo.toml pins active-rpc {floor}, parent is {parent}"
+        );
+        assert!(
+            line.contains("path = \"../..\""),
+            "{name}/Cargo.toml must resolve active-rpc from the tree (path = \"../..\") so the floor resolves before the parent is published"
+        );
+        checked.push(name);
+    }
+    for expected in EXPECTED {
+        assert!(
+            checked.iter().any(|name| name == expected),
+            "facade {expected} is missing from facades/"
+        );
+    }
+    assert_eq!(
+        checked.len(),
+        EXPECTED.len(),
+        "unexpected facade directories in facades/: {checked:?}"
+    );
+}
+
+/// The `active-rpc = ...` line inside a manifest's `[dependencies]`
+/// section, or `None` when the section has no such line. Section
+/// scoped: a mention in `[features]` (the transport facade's
+/// `active-rpc/quic`) is not a dependency line.
+fn facade_active_rpc_dep_line(manifest: &str) -> Option<String> {
+    let mut in_dependencies = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_dependencies = line == "[dependencies]";
+            continue;
+        }
+        if in_dependencies && line.starts_with("active-rpc = ") {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
+/// The version requirement on an `active-rpc = ...` dependency line.
+/// Handles the bare form (`active-rpc = "2.3.0"`) and the table form
+/// (`active-rpc = { path = "../..", version = "2.3.0", ... }`),
+/// in either key order.
+fn facade_active_rpc_floor(dep_line: &str) -> Option<String> {
+    if let Some(version) = dep_line.strip_prefix("active-rpc = \"") {
+        return version.split('"').next().map(str::to_string);
+    }
+    let marker = "version = \"";
+    let start = dep_line.find(marker)? + marker.len();
+    dep_line[start..].split('"').next().map(str::to_string)
+}
