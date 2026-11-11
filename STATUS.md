@@ -7,13 +7,21 @@ has a test or a CI job behind it; residual risks are listed, not hidden.
 
 | Item | Value |
 |------|-------|
-| Library | `active-rpc` 2.2.0 |
+| Library | `active-rpc` 2.3.0 |
 | CLI | `active-rpc-cli` 0.3.1 |
 | ARP1 envelope | unchanged through the maturity program |
 | CI | every job green on both `Active-Official` and `RatioArtificiosa` at the release commit |
-| Tag | signed `v2.2.0`, identical object on both orgs |
+| Tag (latest release) | signed `v2.2.0`, identical object on both orgs |
 | GitHub Release | [Active-Official](https://github.com/Active-Official/active-rpc/releases/tag/v2.2.0) and [RatioArtificiosa](https://github.com/RatioArtificiosa/active-rpc/releases/tag/v2.2.0), marked Latest, with `active-rpc-2.2.0.cdx.json` |
 | Authenticity | `ReceiptLog` (`ARRL`) for durable receipts; `CapabilityRecord` for durable capabilities; WASM ABI v2 host policy |
+
+The `Library` row tracks the version in `Cargo.toml` — the next release
+candidate (`CHANGELOG.md` `Unreleased - 2.3.0`). The `Tag`, `GitHub
+Release` and SBOM rows name the latest release until that version is
+tagged; they must never name a version ahead of the tree, or an operator
+verifying a deployment checks a tag/SBOM that does not exist (TEST-04).
+`tests/doc_gate.rs::status_and_registry_track_the_library_version`
+enforces both halves.
 
 ## Absolute Max program (AMAX-PROP-2026-10-31)
 

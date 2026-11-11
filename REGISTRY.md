@@ -7,7 +7,7 @@ publishes as `active-rpc-cli`.
 
 | Crate | Version | Purpose |
 |---|---|---|
-| [`active-rpc`](https://crates.io/crates/active-rpc) | 2.2.0 | Capability-based, promise-pipelined RPC kernel |
+| [`active-rpc`](https://crates.io/crates/active-rpc) | 2.3.0 | Capability-based, promise-pipelined RPC kernel |
 | [`active-rpc-kernel`](https://crates.io/crates/active-rpc-kernel) | 0.1.1 | Agent, events, metrics, promises and providers |
 | [`active-rpc-core`](https://crates.io/crates/active-rpc-core) | 0.1.1 | Capability, budget, value and wire types |
 | [`active-rpc-client`](https://crates.io/crates/active-rpc-client) | 0.1.1 | Agent, call and promise client surface |

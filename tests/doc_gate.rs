@@ -361,3 +361,158 @@ fn every_yanked_version_has_an_adr() {
         );
     }
 }
+
+fn parse_version_opt(token: &str) -> Option<(u64, u64, u64)> {
+    let token = token.strip_prefix('v').unwrap_or(token);
+    let mut parts = token.split('.');
+    let major: u64 = parts.next()?.parse().ok()?;
+    let minor: u64 = parts.next()?.parse().ok()?;
+    let patch: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn format_version(version: (u64, u64, u64)) -> String {
+    format!("{}.{}.{}", version.0, version.1, version.2)
+}
+
+/// `STATUS.md` and `REGISTRY.md` must track the library version.
+///
+/// TEST-04: both files named `active-rpc` 2.2.0 while `Cargo.toml` said
+/// 2.3.0, so an operator verifying a deployment against them checked the
+/// wrong tag/SBOM. The release runbook (precondition 2) requires
+/// `REGISTRY.md` to list the versions when the version is bumped, and
+/// precondition 4 requires `STATUS.md` to reflect the candidate state, so
+/// both files track the in-tree version — the version the next release
+/// will carry — not the last release.
+///
+/// Two precision points, both load-bearing:
+/// * The `Library` row and the registry row are asserted row-scoped, not
+///   file-wide: a stray "2.3.0" anywhere else in either file must not
+///   satisfy the gate (the TEST-03 lesson — a plain `contains` check
+///   passes vacuously).
+/// * The `Tag` / GitHub Release / SBOM rows describe the *latest
+///   release*, not the candidate: 2.3.0 is unreleased (CHANGELOG
+///   `Unreleased - 2.3.0`, no `v2.3.0` tag), so bumping those rows to
+///   `v2.3.0` would fabricate a release. They must instead agree with
+///   each other on one version, name the SBOM for it, never run ahead of
+///   the library version (equal at release time, older before it), and
+///   name a tag that exists in this repo.
+#[test]
+fn status_and_registry_track_the_library_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    let library_version =
+        parse_version_opt(version).expect("CARGO_PKG_VERSION must be three numeric parts");
+
+    let status = fs::read_to_string(repo_path("STATUS.md")).expect("STATUS.md");
+    let library_rows: Vec<&str> = status
+        .lines()
+        .filter(|line| line.starts_with("| Library |"))
+        .collect();
+    assert_eq!(
+        library_rows.len(),
+        1,
+        "STATUS.md must have exactly one Library row"
+    );
+    assert!(
+        library_rows[0].contains(&format!("`active-rpc` {version}")),
+        "STATUS.md Library row must name the library version {version}: {}",
+        library_rows[0]
+    );
+
+    let registry = fs::read_to_string(repo_path("REGISTRY.md")).expect("REGISTRY.md");
+    let crate_rows: Vec<&str> = registry
+        .lines()
+        .filter(|line| {
+            line.split('|').nth(1).is_some_and(|cell| {
+                cell.trim() == "[`active-rpc`](https://crates.io/crates/active-rpc)"
+            })
+        })
+        .collect();
+    assert_eq!(
+        crate_rows.len(),
+        1,
+        "REGISTRY.md must have exactly one active-rpc row"
+    );
+    let registry_version = crate_rows[0]
+        .split('|')
+        .nth(2)
+        .expect("registry row version cell")
+        .trim();
+    assert_eq!(
+        registry_version, version,
+        "REGISTRY.md active-rpc row must list the library version {version}"
+    );
+
+    // The release rows describe the latest release, not the candidate.
+    let tag_row = status
+        .lines()
+        .find(|line| {
+            line.split('|')
+                .nth(1)
+                .is_some_and(|cell| cell.trim().starts_with("Tag"))
+        })
+        .expect("STATUS.md must have a Tag row");
+    assert!(
+        tag_row.contains("(latest release)"),
+        "STATUS.md Tag row must say it names the latest release, so it is never mistaken for the candidate version: {tag_row}"
+    );
+    let release_row = status
+        .lines()
+        .find(|line| {
+            line.split('|')
+                .nth(1)
+                .is_some_and(|cell| cell.trim() == "GitHub Release")
+        })
+        .expect("STATUS.md must have a GitHub Release row");
+    let mut named: Vec<(u64, u64, u64)> = Vec::new();
+    for row in [tag_row, release_row] {
+        for token in row.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.')) {
+            if let Some(triple) = parse_version_opt(token) {
+                named.push(triple);
+            }
+        }
+    }
+    assert!(
+        !named.is_empty(),
+        "STATUS.md Tag and GitHub Release rows must name a version"
+    );
+    let tag_version = named[0];
+    assert!(
+        named.iter().all(|triple| *triple == tag_version),
+        "STATUS.md Tag and GitHub Release rows must agree on one version: {named:?}"
+    );
+    let tag_version_text = format_version(tag_version);
+    assert!(
+        release_row.contains(&format!("active-rpc-{tag_version_text}.cdx.json")),
+        "STATUS.md GitHub Release row must name the SBOM for the tagged version {tag_version_text}: {release_row}"
+    );
+    assert!(
+        tag_version <= library_version,
+        "STATUS.md Tag row names {tag_version_text}, ahead of the library version {version}: the tag names a release that does not exist yet"
+    );
+
+    // The tag the file names must exist in this repo. A checkout without
+    // git (a published crate tarball) skips this assertion rather than
+    // failing spuriously; CI and the release workflow always run in a
+    // checkout, where the check is load-bearing.
+    let tag = format!("v{tag_version_text}");
+    match std::process::Command::new("git")
+        .args(["tag", "--list", &tag])
+        .current_dir(repo_path(""))
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let listed = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                listed.lines().any(|line| line.trim() == tag),
+                "STATUS.md names tag {tag} but no such tag exists in this repo"
+            );
+        }
+        _ => {
+            eprintln!("note: git unavailable or not a checkout, skipping tag-existence check");
+        }
+    }
+}
