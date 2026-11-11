@@ -71,12 +71,14 @@ fn a_deep_active_value_converts_without_recursing() {
     let envelope = active_rpc::wire::Envelope::request(
         1,
         "value",
-        vec![active_rpc::value::Arg::Value(converted)],
+        vec![active_rpc::value::Arg::Value(converted.clone())],
     );
-    assert!(
-        envelope.encode().is_ok(),
-        "the converted value is within what the wire accepts"
-    );
+    let bytes = envelope
+        .encode()
+        .expect("the converted value is within what the wire accepts");
+    let back = active_rpc::wire::Envelope::decode(&bytes).expect("the encoded envelope decodes");
+    assert_eq!(back.method, "value");
+    assert_eq!(back.first_value(), Some(&converted));
 }
 
 /// A `Response::Module` prints its length, never its bytes (R-16 round 5, #2).

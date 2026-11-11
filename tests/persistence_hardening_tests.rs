@@ -254,13 +254,13 @@ fn a_module_that_carries_a_secret_is_refused_and_redacts() {
     match redact_value(Value::Module(bytes.clone())) {
         Value::Module(redacted) => {
             assert_ne!(redacted, bytes, "the redacted module must differ");
-            assert!(assert_no_secret_material(&Value::Module(redacted)).is_ok());
+            assert_eq!(assert_no_secret_material(&Value::Module(redacted)), Ok(()));
         }
         other => panic!("a decodable module stays a module: {other:?}"),
     }
     // And the shared redactor agrees with the value-level one.
     let redacted = redact_module(&bytes).expect("redact");
-    assert!(assert_no_secret_material(&Value::Module(redacted)).is_ok());
+    assert_eq!(assert_no_secret_material(&Value::Module(redacted)), Ok(()));
 }
 
 #[test]

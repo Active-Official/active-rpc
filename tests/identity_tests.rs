@@ -698,7 +698,11 @@ fn a_subject_is_bounded_and_escaped() {
         .clone()
         .with_subject("\u{00e9}".repeat(active_rpc::identity::MAX_SUBJECT_BYTES));
     assert!(wide.subject().len() <= active_rpc::identity::MAX_SUBJECT_BYTES);
-    assert!(std::str::from_utf8(wide.subject().as_bytes()).is_ok());
+    assert_eq!(
+        wide.subject(),
+        "\u{00e9}".repeat(active_rpc::identity::MAX_SUBJECT_BYTES / 2),
+        "a multibyte character straddling the ceiling is cut, not split"
+    );
 
     // A plain ASCII principal is unchanged.
     let plain = base.with_subject("client.example");

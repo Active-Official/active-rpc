@@ -165,7 +165,11 @@ fn an_imported_handle_cannot_introduce_authority() {
         "rpc/identity"
     );
     // The owner still holds an unbound capability.
-    assert!(agent.introduce_to(&cap, &peer).is_ok());
+    let descriptor = agent
+        .introduce_to(&cap, &peer)
+        .expect("the owner still holds an unbound capability");
+    assert_eq!(descriptor.id, cap.id());
+    assert!(descriptor.methods.contains("ping"));
 }
 
 /// 2.6 - separators, bidi and zero-width characters are refused everywhere a
@@ -315,7 +319,14 @@ fn a_provider_may_call_the_agent_from_methods() {
     assert!(!bytes.is_empty());
     assert_eq!(lanes.get(), 1, "intro reads the captured surface");
     // The provider is still registered.
-    assert!(agent.mint(provider, 0, CapAttrs::new(&["ping"])).is_ok());
+    let minted = agent
+        .mint(provider, 0, CapAttrs::new(&["ping"]))
+        .expect("the provider is still registered");
+    let attrs = agent
+        .cap_attrs(&minted)
+        .expect("the minted capability is recorded");
+    assert_eq!(attrs.methods.len(), 1);
+    assert!(attrs.methods.contains("ping"));
 }
 
 /// 2.10 / 13 - a message is a bounded transfer, and a closed channel is not

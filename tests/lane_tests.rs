@@ -464,7 +464,13 @@ fn lane_and_channel_names_are_validated_text() {
     assert!(agent
         .create_lane("bad\u{2028}name", Budget::default())
         .is_err());
-    assert!(agent.create_lane("fine", Budget::default()).is_ok());
+    let lane = agent
+        .create_lane("fine", Budget::default())
+        .expect("a valid name creates a lane");
+    let state = agent.lane(lane).expect("the created lane is recorded");
+    assert_eq!(state.name, "fine");
+    assert_eq!(state.budget, Budget::default());
+    assert_eq!(state.completed, 0);
     // The refusal names the bound the constant actually enforces.
     let error = agent
         .create_lane("n".repeat(MAX_OBJECT_NAME_BYTES + 1), Budget::default())

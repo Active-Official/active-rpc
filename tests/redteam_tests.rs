@@ -106,7 +106,14 @@ fn threat_confused_deputy() {
         .attenuate(&echo_cap, CapAttrs::new(&["stats"]))
         .expect_err("attenuation cannot borrow methods");
     assert_eq!(error.code(), "rpc/attenuation-escalation");
-    assert!(agent.call(lane, &module_cap, "stats", vec![]).is_ok());
+    let promise = agent
+        .call(lane, &module_cap, "stats", vec![])
+        .expect("stats is admitted on the module capability");
+    let value = promise.value().expect("the stats call settles");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
 }
 
 #[test]
@@ -193,7 +200,11 @@ fn threat_budget_bypass_attempts() {
         )
         .unwrap();
     let promise = agent.call(lane, &narrow, "stats", vec![]).unwrap();
-    assert!(promise.value().is_ok());
+    let value = promise.value().expect("the narrowed stats call completes");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
     assert_eq!(
         agent
             .call(lane, &narrow, "stats", vec![])
@@ -538,7 +549,11 @@ fn review_cancelled_and_destroyed_work_never_runs() {
 fn review_lane_capacity_counts_queued_calls() {
     let (agent, _calls, cap, _lane) = counting_agent();
     let lane = agent.create_lane("tight", Budget::calls(1)).unwrap();
-    assert!(agent.call(lane, &cap, "ping", vec![]).is_ok());
+    let promise = agent
+        .call(lane, &cap, "ping", vec![])
+        .expect("a queued ping counts against the lane budget");
+    let value = promise.value().expect("the queued ping settles");
+    assert_eq!(value, Value::text("pong"));
     let error = agent
         .call(lane, &cap, "ping", vec![])
         .expect_err("a queued call counts against the lane budget");

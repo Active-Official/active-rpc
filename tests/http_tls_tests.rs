@@ -384,7 +384,7 @@ fn header_configuration_is_validated_at_the_public_api() {
             "{name} is transport-managed"
         );
     }
-    assert!(tool.allow_header("X-Api-Key", "k").is_ok());
+    assert_eq!(tool.allow_header("X-Api-Key", "k"), Ok(()));
 }
 
 /// `Debug` names the header and its length, and counts the pinned roots —

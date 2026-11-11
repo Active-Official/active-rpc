@@ -117,13 +117,16 @@ fn a_non_canonical_image_is_refused_by_the_egress() {
         verify_canonical: false,
         ..active_infinity::DecodeOpts::default()
     };
+    let meta = active_infinity::validate_with(&non_canonical, lenient)
+        .expect("the fixture is structurally valid");
+    assert_eq!(meta.nodes, 1);
+    assert_eq!(meta.secrets, 0);
+    let decoded =
+        active_infinity::decode_with(&non_canonical, lenient).expect("the fixture decodes");
+    let root = decoded.root().expect("the decoded module has a root");
     assert!(
-        active_infinity::validate_with(&non_canonical, lenient).is_ok(),
-        "the fixture is structurally valid"
-    );
-    assert!(
-        active_infinity::decode_with(&non_canonical, lenient).is_ok(),
-        "the fixture decodes"
+        matches!(&decoded.nodes()[root.index()], Inode::Str(text) if text.as_str() == "plain"),
+        "the lenient decode recovers the fixture module"
     );
     let error = check_module_payload(&non_canonical).expect_err("canonicity is not proven");
     assert_eq!(error.code(), "rpc/payload");
@@ -157,9 +160,12 @@ fn the_depth_walk_agrees_with_the_conversion() {
     let envelope = active_rpc::wire::Envelope::request(
         1,
         "value",
-        vec![active_rpc::value::Arg::Value(converted)],
+        vec![active_rpc::value::Arg::Value(converted.clone())],
     );
-    assert!(envelope.encode().is_ok(), "the accepted value encodes");
+    let bytes = envelope.encode().expect("the accepted value encodes");
+    let back = active_rpc::wire::Envelope::decode(&bytes).expect("the encoded envelope decodes");
+    assert_eq!(back.method, "value");
+    assert_eq!(back.first_value(), Some(&converted));
 
     // One more container is past the conversion's cap.
     let mut deeper = ActiveValue::Null;

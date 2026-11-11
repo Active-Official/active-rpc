@@ -285,7 +285,10 @@ fn a_non_redacting_call_refuses_a_secret_bearing_module() {
     // A structural secret (the original bytes) is refused...
     assert!(assert_no_structural_secrets(&Value::Module(image.clone())).is_err());
     // ...while the content-free marker is the sanctioned answer.
-    assert!(assert_no_structural_secrets(&Value::Secret).is_ok());
+    assert_eq!(assert_no_structural_secrets(&Value::Secret), Ok(()));
     // Opaque provider bytes (a WASM tool's binary output) are not an image.
-    assert!(assert_no_structural_secrets(&Value::Module(b"\0asm\x01\0\0\0".to_vec())).is_ok());
+    assert_eq!(
+        assert_no_structural_secrets(&Value::Module(b"\0asm\x01\0\0\0".to_vec())),
+        Ok(())
+    );
 }

@@ -135,8 +135,17 @@ fn a_scoped_capability_cannot_read_global_metadata() {
         Some("rpc/path-not-granted"),
         "{subgraph:?}"
     );
-    let leaf = call(&fixture, lane, &cap, "subgraph", vec![path("app.y")]);
-    assert!(leaf.is_ok(), "{leaf:?}");
+    let leaf = call(&fixture, lane, &cap, "subgraph", vec![path("app.y")])
+        .expect("an in-scope leaf answers");
+    let bytes = match leaf {
+        Value::Module(bytes) => bytes,
+        other => panic!("a subgraph is a module image: {other:?}"),
+    };
+    let decoded = active_infinity::decode(&bytes).expect("the subgraph decodes");
+    assert!(
+        matches!(decoded.nodes(), [Inode::Str(text)] if text.as_str() == "in"),
+        "the leaf subgraph holds the app.y value"
+    );
 }
 
 /// `subgraph` and `content_hash` are metadata work like `why`: they honour the

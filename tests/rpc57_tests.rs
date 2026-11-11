@@ -185,7 +185,14 @@ fn a_well_formed_delta_still_round_trips() {
     let delta = back.cap_delta.expect("delta present");
     assert_eq!(delta.removed.len(), 1);
     assert_eq!(delta.added.len(), 1);
-    assert!(delta.apply_to(&base).is_ok(), "a well-formed delta applies");
+    let applied = delta.apply_to(&base).expect("a well-formed delta applies");
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].id, CapId([6u8; 16]));
+    assert_eq!(applied[0].methods, BTreeSet::from(["echo".to_string()]));
+    assert_eq!(applied[0].budget, Budget::default());
+    assert!(!applied[0].read_only);
+    assert!(!applied[0].redact);
+    assert_eq!(applied[0].path_scope, None);
 }
 
 /// R01-5: one `Text` value past the per-value ceiling is refused at decode.

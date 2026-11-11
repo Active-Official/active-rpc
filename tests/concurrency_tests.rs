@@ -108,9 +108,12 @@ fn lane_budgets_do_not_leak_between_lanes() {
     let tight = agent.create_lane("tight", Budget::calls(1)).unwrap();
     let roomy = agent.create_lane("roomy", Budget::default()).unwrap();
     let first = agent.call(tight, &cap, "stats", vec![]).unwrap();
+    let value = first
+        .value()
+        .expect("the tight lane's single call completes");
     assert!(
-        first.value().is_ok(),
-        "the tight lane's single call completes"
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
     );
     let error = agent
         .call(tight, &cap, "stats", vec![])
@@ -119,7 +122,11 @@ fn lane_budgets_do_not_leak_between_lanes() {
     // The roomy lane runs ten calls without touching the tight lane's budget.
     for _ in 0..10 {
         let promise = agent.call(roomy, &cap, "stats", vec![]).unwrap();
-        assert!(promise.value().is_ok());
+        let value = promise.value().expect("the roomy lane call completes");
+        assert!(
+            matches!(value, Value::Map(_)),
+            "stats answers a map: {value:?}"
+        );
     }
     assert_eq!(agent.lane(tight).unwrap().completed, 1);
     assert_eq!(agent.lane(roomy).unwrap().completed, 10);

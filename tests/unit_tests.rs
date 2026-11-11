@@ -129,14 +129,15 @@ fn capability_ids_are_unforgeable() {
         .call(lane, &imported, "stats", vec![])
         .expect_err("foreign capability must be refused");
     assert_eq!(error.code(), "rpc/unknown-capability");
-    assert!(other_agent
-        .call(
-            other_agent.create_lane("main", Budget::default()).unwrap(),
-            &other_cap,
-            "stats",
-            vec![]
-        )
-        .is_ok());
+    let other_lane = other_agent.create_lane("main", Budget::default()).unwrap();
+    let promise = other_agent
+        .call(other_lane, &other_cap, "stats", vec![])
+        .expect("a capability minted by the other agent works there");
+    let value = promise.value().expect("the foreign stats call settles");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
     let _ = provider_id;
 }
 
@@ -231,9 +232,15 @@ fn attenuation_narrows_and_never_widens() {
         .attenuate(&scoped, CapAttrs::new(&["stats"]).with_path("limits"))
         .expect_err("path escalation");
     assert_eq!(error.code(), "rpc/attenuation-escalation");
-    assert!(agent
+    let narrowed = agent
         .attenuate(&scoped, CapAttrs::new(&["stats"]).with_path("app.nested"))
-        .is_ok());
+        .expect("a deeper path narrows");
+    let attrs = agent
+        .cap_attrs(&narrowed)
+        .expect("the narrowed capability is recorded");
+    assert_eq!(attrs.path_scope.as_deref(), Some("app.nested"));
+    assert_eq!(attrs.methods.len(), 1);
+    assert!(attrs.methods.contains("stats"));
 
     // Tool policies cannot gain tools.
     let tool = agent
@@ -272,14 +279,25 @@ fn attenuated_budget_is_enforced_on_the_real_call_path() {
         .unwrap();
     for _ in 0..2 {
         let promise = agent.call(lane, &narrow, "stats", vec![]).unwrap();
-        assert!(promise.value().is_ok());
+        let value = promise.value().expect("the narrowed stats call completes");
+        assert!(
+            matches!(value, Value::Map(_)),
+            "stats answers a map: {value:?}"
+        );
     }
     let error = agent
         .call(lane, &narrow, "stats", vec![])
         .expect_err("budget exhausted");
     assert_eq!(error.code(), "rpc/budget-exceeded");
     // The parent capability still has its own budget.
-    assert!(agent.call(lane, &cap, "stats", vec![]).is_ok());
+    let promise = agent
+        .call(lane, &cap, "stats", vec![])
+        .expect("the parent capability still admits stats");
+    let value = promise.value().expect("the parent stats call settles");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
 }
 
 #[test]
@@ -287,14 +305,27 @@ fn lane_budget_is_independent_and_enforced() {
     let (agent, _provider, cap) = agent_with_module();
     let lane = agent.create_lane("tight", Budget::calls(1)).unwrap();
     let first = agent.call(lane, &cap, "stats", vec![]).unwrap();
-    assert!(first.value().is_ok(), "the first call completes");
+    let value = first.value().expect("the first call completes");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
     let error = agent
         .call(lane, &cap, "stats", vec![])
         .expect_err("lane budget");
     assert_eq!(error.code(), "rpc/budget-exceeded");
     // A second lane is unaffected.
     let other = agent.create_lane("roomy", Budget::default()).unwrap();
-    assert!(agent.call(other, &cap, "stats", vec![]).is_ok());
+    let promise = agent
+        .call(other, &cap, "stats", vec![])
+        .expect("a second lane admits stats");
+    let value = promise
+        .value()
+        .expect("the second lane's stats call settles");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
 }
 
 #[test]
@@ -316,7 +347,14 @@ fn read_only_capability_refuses_mutation() {
         )
         .expect_err("read-only patch");
     assert_eq!(error.code(), "rpc/read-only");
-    assert!(agent.call(lane, &read_only, "stats", vec![]).is_ok());
+    let promise = agent
+        .call(lane, &read_only, "stats", vec![])
+        .expect("a read-only capability still reads stats");
+    let value = promise.value().expect("the read-only stats call settles");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
 }
 
 #[test]
@@ -326,14 +364,20 @@ fn path_scope_is_enforced_before_the_provider() {
     let scoped = agent
         .attenuate(&cap, CapAttrs::new(&["impact"]).with_path("app"))
         .unwrap();
-    assert!(agent
+    let promise = agent
         .call(
             lane,
             &scoped,
             "impact",
-            vec![Arg::Value(Value::Path("app.port".into()))]
+            vec![Arg::Value(Value::Path("app.port".into()))],
         )
-        .is_ok());
+        .expect("an in-scope impact is admitted");
+    let value = promise.value().expect("the impact call settles");
+    assert_eq!(
+        value,
+        Value::List(vec![Value::text("app")]),
+        "changing app.port affects the app table"
+    );
     let error = agent
         .call(
             lane,
@@ -481,7 +525,14 @@ fn channels_carry_messages_and_transfer_capabilities() {
 
     // Channel capability sharing is a borrow within one agent: the sender keeps
     // its handle and the ids travel with the message.
-    assert!(agent.call(lane, &cap, "stats", vec![]).is_ok());
+    let promise = agent
+        .call(lane, &cap, "stats", vec![])
+        .expect("the sender keeps a working capability");
+    let value = promise.value().expect("the stats call settles");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
     assert_eq!(
         message.caps,
         vec![cap.id()],
@@ -504,7 +555,13 @@ fn send_only_and_receive_only_channels_enforce_direction() {
     // refusals below are about direction, not about who may read the channel.
     agent.subscribe(lane, send_only).unwrap();
     agent.subscribe(lane, receive_only).unwrap();
-    assert!(agent.send(lane, send_only, Value::Null, &[]).is_ok());
+    assert_eq!(
+        agent
+            .send(lane, send_only, Value::Null, &[])
+            .expect("a send on a send-only channel is admitted"),
+        0,
+        "the first message on a channel is sequence 0"
+    );
     let error = agent.recv(lane, send_only).unwrap_err();
     assert_eq!(error.code(), "rpc/invalid-argument");
     let error = agent
@@ -517,7 +574,14 @@ fn send_only_and_receive_only_channels_enforce_direction() {
 fn destroyed_lane_refuses_further_calls() {
     let (agent, _provider, cap) = agent_with_module();
     let lane = agent.create_lane("main", Budget::default()).unwrap();
-    assert!(agent.call(lane, &cap, "stats", vec![]).is_ok());
+    let promise = agent
+        .call(lane, &cap, "stats", vec![])
+        .expect("stats is admitted before the lane is destroyed");
+    let value = promise.value().expect("the stats call settles");
+    assert!(
+        matches!(value, Value::Map(_)),
+        "stats answers a map: {value:?}"
+    );
     agent.destroy_lane(lane).unwrap();
     let error = agent
         .call(lane, &cap, "stats", vec![])
@@ -660,9 +724,11 @@ fn tool_policy_is_enforced_on_tool_calls() {
             CapAttrs::new(&["echo", "mutate"]).with_tool_policy(policy),
         )
         .unwrap();
-    assert!(agent
+    let promise = agent
         .call(lane, &cap, "echo", vec![Arg::text("ok")])
-        .is_ok());
+        .expect("a within-policy echo is admitted");
+    let value = promise.value().expect("the echo call settles");
+    assert_eq!(value, Value::text("ok"));
     let error = agent
         .call(lane, &cap, "echo", vec![Arg::text("too long")])
         .expect_err("argument over the policy ceiling");
@@ -1226,9 +1292,12 @@ fn destroyed_lane_keeps_a_settled_promise_readable() {
     let promise = agent.call(lane, &cap, "stats", vec![]).expect("call");
     promise.value().expect("settled before destroy");
     agent.destroy_lane(lane).expect("destroy");
+    let value = promise
+        .value()
+        .expect("a settled result must survive lane destruction");
     assert!(
-        promise.value().is_ok(),
-        "a settled result must survive lane destruction"
+        matches!(value, Value::Map(_)),
+        "the settled stats answer survives intact: {value:?}"
     );
 }
 

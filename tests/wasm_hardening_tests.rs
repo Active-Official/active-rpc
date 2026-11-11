@@ -178,7 +178,11 @@ fn a_memory_reservation_is_charged_before_instantiation() {
         },
     )
     .expect("compile");
-    assert!(small.call(b"").is_ok(), "a two-page module must run");
+    assert_eq!(
+        small.call(b"").expect("a two-page module must run"),
+        Vec::<u8>::new(),
+        "the constant guest writes no output"
+    );
 }
 
 /// `memory.grow` is not charged by wasmi, so the store limiter must stop at

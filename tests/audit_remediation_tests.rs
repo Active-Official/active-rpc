@@ -206,7 +206,8 @@ fn a_rotated_certificate_can_rebind_a_capability() {
         .call_as(Some(renewed.identity()), lane, &cap, "echo", Vec::new())
         .expect("the rotated peer is admitted");
     agent.run();
-    assert!(promise.value().is_ok());
+    let value = promise.value().expect("the rotated peer's echo settles");
+    assert_eq!(value, Value::text("echo"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 

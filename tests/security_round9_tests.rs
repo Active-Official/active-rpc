@@ -90,7 +90,7 @@ fn both_egress_gates_classify_a_module_the_same_way() {
     let corrupt = Value::Module(corrupt_bytes);
 
     for gate in [assert_no_structural_secrets, assert_no_secret_material] {
-        assert!(gate(&opaque).is_ok(), "opaque bytes pass");
+        assert_eq!(gate(&opaque), Ok(()), "opaque bytes pass");
         assert_eq!(
             gate(&secret)
                 .expect_err("a secret image never crosses")
@@ -103,7 +103,7 @@ fn both_egress_gates_classify_a_module_the_same_way() {
                 .code(),
             "rpc/provider"
         );
-        assert!(gate(&plain).is_ok(), "a canonical secret-free image passes");
+        assert_eq!(gate(&plain), Ok(()), "a canonical secret-free image passes");
         assert_eq!(
             gate(&non_canonical)
                 .expect_err("non-canonical bytes are a payload fault")

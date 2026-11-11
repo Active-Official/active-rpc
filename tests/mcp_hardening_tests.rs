@@ -147,11 +147,10 @@ fn the_line_cap_is_inclusive_and_one_byte_over_is_refused() {
     let session = McpSession::handshake(Scripted::new(
         &lines.iter().map(String::as_str).collect::<Vec<_>>(),
     ));
-    assert!(
-        session.is_ok(),
-        "an exact-cap line must be accepted: {:?}",
-        session.err()
-    );
+    let session = session.expect("an exact-cap line must be accepted");
+    assert_eq!(session.calls, 0, "the handshake is not counted as a call");
+    assert_eq!(session.tools().len(), 1, "the handshake discovers one tool");
+    assert_eq!(session.tools()[0].name, "read");
 
     let over = build(fill + 1);
     assert_eq!(over.len(), MAX_MCP_LINE_BYTES + 1);
