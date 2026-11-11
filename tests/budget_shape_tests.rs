@@ -786,6 +786,7 @@ fn a_deep_queued_value_is_refused_before_the_dispatch_clone() {
     assert_eq!(fixture.calls.get(), 0);
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_bound_capability_needs_its_peer_to_resolve() {
     // Round 9 (F2): `resolve` had no peer, so it settled a call dispatch would
@@ -799,9 +800,7 @@ fn a_bound_capability_needs_its_peer_to_resolve() {
         .expect("register provider");
     let owner = active_rpc::identity::IdentityPolicy::default()
         .admit(
-            Some(&active_rpc::identity::PeerIdentity::from_certificate(
-                b"owner",
-            )),
+            Some(&active_rpc::identity::PeerIdentity::from_certificate_for_test(b"owner")),
             true,
         )
         .expect("admit");

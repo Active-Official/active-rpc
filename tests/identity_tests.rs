@@ -5,10 +5,11 @@
 //! certificate is the only thing that produces a bindable identity.
 
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::channel::Direction;
-use active_rpc::identity::{
-    AdmittedIdentity, IdentityKind, IdentityPolicy, PeerIdentity, TrustLevel,
-};
+#[cfg(feature = "test-utils")]
+use active_rpc::identity::AdmittedIdentity;
+use active_rpc::identity::{IdentityKind, IdentityPolicy, PeerIdentity, TrustLevel};
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::{Agent, Budget, Provider};
 
@@ -40,11 +41,13 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn identity(seed: &[u8]) -> PeerIdentity {
-    PeerIdentity::from_certificate(seed)
+    PeerIdentity::from_certificate_for_test(seed)
 }
 
 /// Admit a certificate identity through the production policy.
+#[cfg(feature = "test-utils")]
 fn admitted(peer: &PeerIdentity) -> AdmittedIdentity {
     IdentityPolicy::default()
         .admit(Some(peer), true)
@@ -131,6 +134,7 @@ fn certificate_identities_are_stable_and_subject_sensitive() {
     assert_ne!(renamed, first, "the identity value includes the label");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_capability_bound_to_one_peer_is_refused_for_every_other_peer() {
     let agent = Agent::with_secret([0x51; 32]);
@@ -183,6 +187,7 @@ fn an_unbound_capability_keeps_working_without_an_identity() {
     assert_eq!(promise.value().expect("value"), Value::Int(7));
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn introduction_binds_once_and_cannot_move_between_peers() {
     let agent = Agent::with_secret([0x53; 32]);
@@ -209,6 +214,7 @@ fn introduction_binds_once_and_cannot_move_between_peers() {
         .any(|event| matches!(event, active_rpc::Event::CapIntroduced { .. })));
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn attenuation_keeps_the_binding_and_refuses_a_rebind() {
     let agent = Agent::with_secret([0x54; 32]);
@@ -267,6 +273,7 @@ fn an_anonymous_peer_cannot_receive_an_introduction() {
     assert_eq!(error.code(), "rpc/identity");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_bound_capability_cannot_be_transferred_over_a_channel() {
     let agent = Agent::with_secret([0x56; 32]);
@@ -308,14 +315,21 @@ fn quic_mutual_tls_delivers_distinct_peer_identities_and_refuses_anonymous_clien
 
     use active_rpc::Envelope;
 
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<(String, bool)>();
     let server =
         active_rpc::transport::quic::QuicServer::start_mutual_tls(2, move |envelope, peer| {
             let hex = peer
                 .as_ref()
                 .map(|identity| identity.fingerprint_hex())
                 .unwrap_or_default();
-            let _ = tx.send(hex.clone());
+            // RPC-55: the identity the transport delivers comes from a chain
+            // rustls verified in the handshake, so it is verified - the one
+            // producer of verified identities outside the test seam.
+            let verified = peer
+                .as_ref()
+                .map(|identity| identity.is_verified())
+                .unwrap_or(false);
+            let _ = tx.send((hex.clone(), verified));
             Envelope::response(envelope.request_id, Value::text(hex))
         })
         .expect("start mutual-tls server");
@@ -367,8 +381,12 @@ fn quic_mutual_tls_delivers_distinct_peer_identities_and_refuses_anonymous_clien
         Some(&Value::text(second_expected.clone()))
     );
 
-    let observed: Vec<String> = rx.iter().take(2).collect();
-    assert_eq!(observed, vec![first_expected, second_expected]);
+    let observed: Vec<(String, bool)> = rx.iter().take(2).collect();
+    assert_eq!(
+        observed,
+        vec![(first_expected, true), (second_expected, true)],
+        "the transport delivers verified identities (RPC-55)"
+    );
     server.shutdown();
 }
 
@@ -380,6 +398,7 @@ fn quic_mutual_tls_delivers_distinct_peer_identities_and_refuses_anonymous_clien
 /// presented by a second, validly authenticated client is refused with
 /// `rpc/identity`; a client with no certificate never completes the handshake.
 #[cfg(feature = "quic")]
+#[cfg(feature = "test-utils")]
 #[test]
 fn quic_dispatches_a_bound_capability_only_for_the_bound_peer() {
     use std::sync::mpsc;
@@ -406,7 +425,7 @@ fn quic_dispatches_a_bound_capability_only_for_the_bound_peer() {
     let address = server.address().to_string();
     let ca = server.ca_certificate().cloned().expect("ca");
     let (owner_cert, owner_key) = server.client_credentials().expect("owner credentials");
-    let owner_peer = PeerIdentity::from_certificate(owner_cert.as_ref());
+    let owner_peer = PeerIdentity::from_certificate_for_test(owner_cert.as_ref());
     let (stranger_cert, stranger_key) = server
         .issue_client_credentials("active-rpc quic stranger")
         .expect("stranger credentials");
@@ -556,6 +575,7 @@ fn a_loopback_peer_cannot_hold_a_binding() {
 
 /// A child minted before the introduction must travel with it: otherwise the
 /// unbound child is usable by another peer and transferable over a channel.
+#[cfg(feature = "test-utils")]
 #[test]
 fn introduction_binds_the_existing_subtree() {
     let agent = Agent::with_secret([0x63; 32]);
@@ -608,6 +628,7 @@ fn introduction_binds_the_existing_subtree() {
 
 /// `call_peer` is the typed gate: an admitted identity works, a different one is
 /// refused exactly like `call_as`.
+#[cfg(feature = "test-utils")]
 #[test]
 fn call_peer_uses_the_admitted_identity() {
     let agent = Agent::with_secret([0x65; 32]);
@@ -679,4 +700,85 @@ fn a_subject_is_bounded_and_escaped() {
     // A plain ASCII principal is unchanged.
     let plain = base.with_subject("client.example");
     assert_eq!(plain.subject(), "client.example");
+}
+/// RPC-55 (R11-1): `from_certificate` performs no verification, and the type
+/// can now tell a verified identity from a fabricated one. The audit's probe
+/// (`r11_arbitrary_bytes_are_a_mutual_tls_identity`) asserted that garbage
+/// bytes admit as `Authenticated` with `can_bind() == true`; after the fix the
+/// fabricated identity is refused by `admit()` under every policy.
+#[test]
+fn r11_arbitrary_bytes_are_refused_by_admit() {
+    let peer = PeerIdentity::from_certificate(b"not a certificate at all");
+    // The constructor still builds the fingerprint label (kind and digest are
+    // unchanged), but the value carries no proof: it is not verified.
+    assert_eq!(peer.kind(), IdentityKind::MutualTls);
+    assert!(!peer.is_verified());
+    // The same bytes always name the same principal - the label is stable -
+    // but the label alone is not authority.
+    let again = PeerIdentity::from_certificate(b"not a certificate at all");
+    assert_eq!(again, peer);
+    assert_eq!(again.fingerprint(), peer.fingerprint());
+    let other = PeerIdentity::from_certificate(b"a different fabricated certificate");
+    assert_ne!(other.fingerprint(), peer.fingerprint());
+
+    for policy in [
+        IdentityPolicy::default(),
+        IdentityPolicy::strict(),
+        IdentityPolicy::local(),
+    ] {
+        let error = policy
+            .admit(Some(&peer), false)
+            .expect_err("a fabricated identity is refused off loopback");
+        assert_eq!(error.code(), "rpc/identity");
+        let error = policy
+            .admit(Some(&peer), true)
+            .expect_err("a fabricated identity is refused on loopback too");
+        assert_eq!(error.code(), "rpc/identity");
+    }
+}
+
+/// RPC-55: the `test-utils` seam builds a verified identity, so the kernel's
+/// binding tests can still build admitted peers - and admission still works
+/// for a verified identity. (The constructor only exists with the feature.)
+#[cfg(feature = "test-utils")]
+#[test]
+fn r11_a_verified_test_certificate_is_admitted_and_can_bind() {
+    let peer = PeerIdentity::from_certificate_for_test(b"rpc55-test-cert");
+    assert_eq!(peer.kind(), IdentityKind::MutualTls);
+    assert!(peer.is_verified());
+    // A verified identity and an unverified claim for the same bytes are
+    // distinct values, though they share the binding key.
+    let claim = PeerIdentity::from_certificate(b"rpc55-test-cert");
+    assert_ne!(peer, claim);
+    assert_eq!(peer.fingerprint(), claim.fingerprint());
+    // Renaming preserves provenance: a verified identity stays verified and
+    // a claim stays a claim.
+    assert!(peer.clone().with_subject("renamed").is_verified());
+    assert!(!claim.clone().with_subject("renamed").is_verified());
+
+    let admitted = IdentityPolicy::default()
+        .admit(Some(&peer), false)
+        .expect("a verified identity is admitted");
+    assert_eq!(admitted.trust(), TrustLevel::Authenticated);
+    assert!(admitted.can_bind());
+
+    // The admitted peer can hold a binding, exactly as a transport-verified
+    // peer could.
+    let agent = Agent::with_secret([0x66; 32]);
+    let provider = agent.register(Box::new(Echo)).expect("register provider");
+    let cap = agent
+        .mint_bound(&admitted, provider, 0, CapAttrs::new(&["echo"]))
+        .expect("bound cap");
+    let lane = agent.create_lane("main", Budget::default()).expect("lane");
+    let promise = agent
+        .call_as(
+            Some(admitted.identity()),
+            lane,
+            &cap,
+            "echo",
+            vec![Arg::value(Value::text("ok"))],
+        )
+        .expect("verified peer may call");
+    agent.run();
+    assert_eq!(promise.value().expect("value"), Value::text("ok"));
 }

@@ -4,17 +4,24 @@
 
 use std::time::Instant;
 
-use active_rpc::cap::{CapAttrs, CapPersistence};
+use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
+use active_rpc::cap::CapPersistence;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::replay::ReplayPackage;
-use active_rpc::{AdmittedIdentity, Agent, Budget};
+#[cfg(feature = "test-utils")]
+use active_rpc::AdmittedIdentity;
+use active_rpc::{Agent, Budget};
 
+#[cfg(feature = "test-utils")]
 fn admitted(name: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(name)), false)
+        .admit(Some(&PeerIdentity::from_certificate_for_test(name)), false)
         .expect("admitted")
 }
 
+#[cfg(feature = "test-utils")]
 fn durable() -> CapAttrs {
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
@@ -67,6 +74,7 @@ fn repeated_revokes_of_a_revoked_subtree_are_linear() {
 /// its exporting handle (the record stays restorable until its provider object
 /// is reclaimed), so an unrelated revoke still has to look at the table once;
 /// every later revoke of an already-revoked capability must not (R-12 round 12).
+#[cfg(feature = "test-utils")]
 #[test]
 fn repeated_revokes_with_a_surviving_pin_table_stay_linear() {
     const PINS: usize = 300;

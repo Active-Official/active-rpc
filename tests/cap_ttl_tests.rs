@@ -184,6 +184,7 @@ fn a_child_cannot_outlive_a_parent_that_expires_sooner() {
 /// deadline means the same thing to a call, an attenuation, an introduction
 /// and a channel send; checking it on only one of them lets an expired grant
 /// keep minting or delegating.
+#[cfg(feature = "test-utils")]
 #[test]
 fn every_authority_path_refuses_an_expired_capability() {
     use active_rpc::channel::Direction;
@@ -211,7 +212,7 @@ fn every_authority_path_refuses_an_expired_capability() {
         .expect_err("an expired parent cannot attenuate");
     assert_eq!(error.code(), "rpc/revoked");
 
-    let peer = PeerIdentity::from_certificate(b"ttl-peer");
+    let peer = PeerIdentity::from_certificate_for_test(b"ttl-peer");
     let admitted = IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit");

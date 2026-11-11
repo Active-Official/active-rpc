@@ -31,6 +31,13 @@ http-tls = ["dep:rustls"]
 http2 = ["dep:h2", "dep:http", "dep:bytes", "dep:tokio"]
 # Fuel-metered WebAssembly guest tools under capability control.
 wasm-tools = ["dep:wasmi", "dep:wat"]
+# Test-only identities (RPC-55): `PeerIdentity::from_certificate_for_test`
+# builds a verified identity from raw bytes so the kernel's binding tests can
+# build admitted peers without a live transport. NEVER enable in a shipped
+# build: it re-opens RPC-55 by letting any caller mint a bindable identity for
+# any fingerprint. CI covers it through --all-features; the full local suite
+# needs `cargo test --features test-utils`.
+test-utils = []
 
 [dependencies]
 active-infinity = "2.4.0"

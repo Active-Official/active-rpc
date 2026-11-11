@@ -2373,9 +2373,9 @@ impl Agent {
     ///
     /// The binding is recorded on the capability and enforced at dispatch: the
     /// same id presented by another peer, or with no identity, is refused with
-    /// `rpc/identity`. The parameter is an [`AdmittedIdentity`]: an identity the
-    /// transport *reported* and `admit` accepted, which is record-keeping rather
-    /// than proof of the chain (see `PeerIdentity::from_certificate`).
+    /// `rpc/identity`. The parameter is an [`AdmittedIdentity`]: an identity
+    /// `admit` accepted, which for a certificate peer means a transport verified
+    /// the chain - `admit` refuses an unverified certificate identity (RPC-55).
     pub fn mint_bound(
         &self,
         peer: &AdmittedIdentity,
@@ -2661,8 +2661,9 @@ impl Agent {
     /// A fingerprint is the whole DER, so a leaf renewal invalidated every
     /// binding at once (audit AR-04). The caller owns the handle and presents
     /// the binding's fingerprint: this is knowledge of the fingerprint
-    /// (`PeerIdentity::from_certificate` is public), not a proof that the old
-    /// peer agreed. The move is owner-scoped, so a third party gains nothing;
+    /// (`PeerIdentity::from_certificate` builds an unverified claim from raw
+    /// bytes), not a proof that the old peer agreed. The move is owner-scoped,
+    /// so a third party gains nothing;
     /// an operator that needs the stronger guarantee takes the new peer's
     /// consent out of band. The caller names the new admitted peer, and
     /// authority does not change: the same records, budgets, expiry and policy
@@ -4979,6 +4980,11 @@ impl Agent {
     /// and a capability id in an argument is opaque data, not a grant. Both are
     /// refused as `rpc/wire`, and the envelope payload is charged like any
     /// other call.
+    ///
+    /// Transport-side dispatch should go through [`Agent::dispatch_envelope`],
+    /// which admits the peer first; calling this directly with a raw
+    /// [`PeerIdentity`] skips [`crate::identity::IdentityPolicy::admit`]
+    /// entirely (RPC-55).
     pub fn call_from_envelope(
         &self,
         peer: Option<&PeerIdentity>,
@@ -5055,8 +5061,9 @@ impl Agent {
 
     /// Issue a call on behalf of a peer the policy admitted.
     ///
-    /// [`Agent::call_as`] takes a bare [`PeerIdentity`], which a caller can only
-    /// produce through the transport's report; this takes the type
+    /// [`Agent::call_as`] takes a bare [`PeerIdentity`], which carries no proof
+    /// on its own - an unverified certificate claim is a bare identity too, and
+    /// `admit` refuses it (RPC-55); this takes the type
     /// [`crate::identity::IdentityPolicy::admit`] returned, so a dispatcher that
     /// has one has already run the policy and cannot silently drop the trust
     /// level.
@@ -8703,7 +8710,7 @@ mod fail_closed_tests {
         let provider = agent.register(Box::new(Ping)).expect("register provider");
         let owner = crate::identity::IdentityPolicy::default()
             .admit(
-                Some(&crate::identity::PeerIdentity::from_certificate(
+                Some(&crate::identity::PeerIdentity::from_verified_certificate(
                     b"meter-owner",
                 )),
                 true,
@@ -8813,7 +8820,9 @@ mod pin_scan_tests {
         pinned_attrs.persistence = CapPersistence::Durable;
         let owner = crate::identity::IdentityPolicy::default()
             .admit(
-                Some(&crate::identity::PeerIdentity::from_certificate(b"pins")),
+                Some(&crate::identity::PeerIdentity::from_verified_certificate(
+                    b"pins",
+                )),
                 false,
             )
             .expect("admitted");
@@ -8877,7 +8886,9 @@ mod pin_scan_tests {
         pinned_attrs.persistence = CapPersistence::Durable;
         let owner = crate::identity::IdentityPolicy::default()
             .admit(
-                Some(&crate::identity::PeerIdentity::from_certificate(b"pins")),
+                Some(&crate::identity::PeerIdentity::from_verified_certificate(
+                    b"pins",
+                )),
                 false,
             )
             .expect("admitted");
@@ -8940,7 +8951,7 @@ mod pin_scan_tests {
         let provider = agent.register(Box::new(Echo)).expect("register provider");
         let old = crate::identity::IdentityPolicy::default()
             .admit(
-                Some(&crate::identity::PeerIdentity::from_certificate(
+                Some(&crate::identity::PeerIdentity::from_verified_certificate(
                     b"old-pins",
                 )),
                 false,
@@ -8948,7 +8959,7 @@ mod pin_scan_tests {
             .expect("admitted");
         let new = crate::identity::IdentityPolicy::default()
             .admit(
-                Some(&crate::identity::PeerIdentity::from_certificate(
+                Some(&crate::identity::PeerIdentity::from_verified_certificate(
                     b"new-pins",
                 )),
                 false,
@@ -9075,7 +9086,10 @@ mod durable_counter_tests {
         agent.set_record_seal_key([0x64; 32]);
         let provider = agent.register(Box::new(Echo)).expect("register provider");
         let owner = IdentityPolicy::default()
-            .admit(Some(&PeerIdentity::from_certificate(b"owner")), false)
+            .admit(
+                Some(&PeerIdentity::from_verified_certificate(b"owner")),
+                false,
+            )
             .expect("admitted");
         let root = agent
             .mint_bound(&owner, provider, 0, durable())
@@ -9108,13 +9122,13 @@ mod durable_counter_tests {
         let provider = agent.register(Box::new(Echo)).expect("register provider");
         let old = IdentityPolicy::default()
             .admit(
-                Some(&PeerIdentity::from_certificate(b"rotating-owner")),
+                Some(&PeerIdentity::from_verified_certificate(b"rotating-owner")),
                 false,
             )
             .expect("admitted");
         let new = IdentityPolicy::default()
             .admit(
-                Some(&PeerIdentity::from_certificate(b"rotated-owner")),
+                Some(&PeerIdentity::from_verified_certificate(b"rotated-owner")),
                 false,
             )
             .expect("admitted");
@@ -9141,7 +9155,10 @@ mod durable_counter_tests {
             .expect("register provider");
         // A refused restore must not mint anything, so the counter stays put.
         let stranger = IdentityPolicy::default()
-            .admit(Some(&PeerIdentity::from_certificate(b"stranger")), false)
+            .admit(
+                Some(&PeerIdentity::from_verified_certificate(b"stranger")),
+                false,
+            )
             .expect("admitted");
         let error = restorer
             .restore_capability_in_process_only(&record, &stranger)

@@ -703,7 +703,7 @@ fn valid_tool_name(name: &str) -> bool {
 /// The longest tool description a session keeps, in bytes.
 ///
 /// The ceiling bounds the stored description, marker included: the body is
-/// capped at this minus the marker length (see [`marked_description`]).
+/// capped at this minus the marker length (see `marked_description`).
 pub const MAX_MCP_DESCRIPTION_BYTES: usize = 4 << 10;
 
 /// Prefix marking a tool description as unverified text from the MCP server.

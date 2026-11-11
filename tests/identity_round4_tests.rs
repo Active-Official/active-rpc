@@ -1,13 +1,19 @@
 //! R-11 round 4: an introduction rebinds only live records, and a binding needs
 //! a bindable fingerprint.
 
+#[cfg(feature = "test-utils")]
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{AdmittedIdentity, IdentityPolicy, PeerIdentity};
+#[cfg(feature = "test-utils")]
 use active_rpc::value::{Arg, Call, Response};
+#[cfg(feature = "test-utils")]
 use active_rpc::{Agent, Budget, Provider};
 
+#[cfg(feature = "test-utils")]
 struct Echo;
 
+#[cfg(feature = "test-utils")]
 impl Provider for Echo {
     fn name(&self) -> &'static str {
         "echo"
@@ -35,6 +41,7 @@ impl Provider for Echo {
 /// the kernel was switched to the virtual clock. Pre-fix, introducing the root
 /// rebound that child, and switching back made Alice's capability live — a peer
 /// that never received it could call it (round 4, F1, exploit B).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_introduction_does_not_revive_a_cross_domain_child_for_the_new_peer() {
     let agent = Agent::with_secret([0x94; 32]);
@@ -104,6 +111,7 @@ fn an_introduction_does_not_revive_a_cross_domain_child_for_the_new_peer() {
 
 /// The tape explains every binding the introduction performed, not only the root
 /// (round 5, F3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_introduction_reports_every_child_it_binds() {
     let agent = Agent::with_secret([0x95; 32]);
@@ -137,6 +145,7 @@ fn an_introduction_reports_every_child_it_binds() {
 /// Identity is answered before any authority is measured: a wrong peer gets
 /// rpc/identity even when the arguments would also fail the budget shape
 /// (round 5, F4).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_wrong_peer_is_refused_before_the_argument_shape() {
     let agent = Agent::with_secret([0x96; 32]);
@@ -169,15 +178,20 @@ fn a_wrong_peer_is_refused_before_the_argument_shape() {
     assert_eq!(error.code(), "rpc/identity", "{error}");
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(certificate)), false)
+        .admit(
+            Some(&PeerIdentity::from_certificate_for_test(certificate)),
+            false,
+        )
         .expect("admitted")
 }
 
 /// A revoked child keeps the binding it died with: an introduction must not
 /// rewrite a dead record's history, because a clock-domain mismatch can make
 /// that record readable again under the new peer (round 4, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_introduction_does_not_rebind_a_revoked_child() {
     let agent = Agent::with_secret([0x91; 32]);
@@ -214,6 +228,7 @@ fn an_introduction_does_not_rebind_a_revoked_child() {
 
 /// The live part of the subtree is still bound: the fix narrows the mutation to
 /// live records, it does not disable the feature (round 4, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_live_child_is_rebound_with_the_root() {
     let agent = Agent::with_secret([0x92; 32]);
@@ -234,6 +249,7 @@ fn a_live_child_is_rebound_with_the_root() {
 
 /// A rotation moves the live subtree and leaves a dead child's binding alone
 /// (round 4, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_leaves_a_revoked_child_bound_to_the_old_peer() {
     let agent = Agent::with_secret([0x93; 32]);

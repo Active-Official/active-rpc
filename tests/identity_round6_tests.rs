@@ -3,6 +3,7 @@
 //! shape on the idempotent path too.
 
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{AdmittedIdentity, IdentityPolicy, PeerIdentity};
 use active_rpc::value::{Arg, Call, Response};
 use active_rpc::{Agent, Budget, Event, Provider};
@@ -35,6 +36,7 @@ impl Provider for Echo {
 /// A keyed dispatch from a peer's envelope applies the authority-argument guard,
 /// so an envelope cannot smuggle a promise or a capability into a provider
 /// through a retry (round 7, M-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_idempotent_envelope_cannot_carry_authority_arguments() {
     use active_rpc::wire::{Envelope, Kind};
@@ -93,6 +95,7 @@ fn an_idempotent_envelope_cannot_carry_authority_arguments() {
 
 /// The same arguments through the peer-facing envelope guard are refused there
 /// too, so the idempotent entry point is not the only line of defence.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_envelope_still_refuses_authority_arguments() {
     use active_rpc::wire::Envelope;
@@ -112,15 +115,20 @@ fn an_envelope_still_refuses_authority_arguments() {
     assert_eq!(error.code(), "rpc/wire", "{error}");
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(certificate)), false)
+        .admit(
+            Some(&PeerIdentity::from_certificate_for_test(certificate)),
+            false,
+        )
         .expect("admitted")
 }
 
 /// A pipelined argument may only name a promise the same peer queued, and the
 /// capability is unbound so the promise owner is the only possible refusal
 /// (round 8, F1; round 9, F4).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_promise_of_another_peer_is_refused_at_dispatch() {
     use active_rpc::PromiseId;
@@ -183,6 +191,7 @@ fn a_promise_of_another_peer_is_refused_at_dispatch() {
 
 /// An out-of-band answer comes from the peer that queued the call
 /// (round 9, F3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_out_of_band_answer_comes_from_the_queueing_peer() {
     let agent = Agent::with_secret([0xaa; 32]);
@@ -263,6 +272,7 @@ fn a_foreign_clock_deadline_answers_one_code() {
 
 /// The typed peer gate applies the authority-argument guard too
 /// (round 8, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn call_peer_refuses_authority_arguments() {
     use active_rpc::PromiseId;
@@ -283,6 +293,7 @@ fn call_peer_refuses_authority_arguments() {
 
 /// The guard is counted and taped like every other refusal
 /// (round 8, F2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn the_authority_guard_is_counted_and_taped() {
     use active_rpc::wire::Envelope;
@@ -354,6 +365,7 @@ fn expired_events(agent: &Agent, id: active_rpc::CapId) -> usize {
 
 /// A revoked capability is reported as revoked, and the tape does not claim a
 /// lease expired when the operator revoked it (round 6, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_revoked_capability_is_not_reported_as_expired() {
     let agent = Agent::with_secret([0xa1; 32]);
@@ -386,6 +398,7 @@ fn a_revoked_capability_is_not_reported_as_expired() {
 /// A rotation refuses the whole subtree when a descendant's deadline belongs to
 /// the other clock domain, and neither record is reported as expired
 /// (round 6, F3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_refuses_a_foreign_clock_descendant() {
     let agent = Agent::with_secret([0xa2; 32]);
@@ -432,6 +445,7 @@ fn a_rotation_refuses_a_foreign_clock_descendant() {
 
 /// The idempotent path answers identity before measuring the budget shape
 /// (round 6, F2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_idempotent_wrong_peer_is_refused_before_the_shape() {
     let agent = Agent::with_secret([0xa3; 32]);

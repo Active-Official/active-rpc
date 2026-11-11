@@ -2,15 +2,22 @@
 //! once and documented, and a fingerprint parser is strict about hex.
 
 use active_infinity::{encode, InfinityModule, Inode};
+#[cfg(feature = "test-utils")]
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
+#[cfg(feature = "test-utils")]
 use active_rpc::kernel::Provider;
 use active_rpc::security::{module_carries_a_secret, SECRET_MARKER};
+#[cfg(feature = "test-utils")]
 use active_rpc::value::{Call, Response, Value};
+#[cfg(feature = "test-utils")]
 use active_rpc::{Agent, CapPersistence, CapabilityRecord};
 
+#[cfg(feature = "test-utils")]
 struct Echo;
 
+#[cfg(feature = "test-utils")]
 impl Provider for Echo {
     fn name(&self) -> &'static str {
         "echo"
@@ -69,6 +76,7 @@ fn a_corrupt_image_claims_a_secret_and_a_plain_image_does_not() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_signed_or_uppercase_fingerprint_is_refused() {
     let agent = Agent::with_secret([0x54; 32]);
@@ -76,7 +84,10 @@ fn a_signed_or_uppercase_fingerprint_is_refused() {
     agent.set_record_seal_key([0x97; 32]);
     let provider = agent.register(Box::new(Echo)).expect("register provider");
     let owner = IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(b"hex-owner")), true)
+        .admit(
+            Some(&PeerIdentity::from_certificate_for_test(b"hex-owner")),
+            true,
+        )
         .expect("admit");
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;

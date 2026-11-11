@@ -8,11 +8,14 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::kernel::Provider;
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::wire::Envelope;
-use active_rpc::{Agent, Budget, CapHandle, CapPersistence, CapabilityRecord};
+use active_rpc::{Agent, Budget, CapHandle};
+#[cfg(feature = "test-utils")]
+use active_rpc::{CapPersistence, CapabilityRecord};
 
 struct Echo;
 
@@ -42,8 +45,9 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
-    let peer = PeerIdentity::from_certificate(certificate);
+    let peer = PeerIdentity::from_certificate_for_test(certificate);
     IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit")
@@ -58,6 +62,7 @@ fn agent() -> (Agent, active_rpc::ProviderId, active_rpc::LaneId) {
     (agent, provider, lane)
 }
 
+#[cfg(feature = "test-utils")]
 fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     let agent = Agent::with_secret([0x52; 32]);
     agent.set_durable_capabilities(true);
@@ -66,6 +71,7 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     (agent, provider)
 }
 
+#[cfg(feature = "test-utils")]
 fn bound_durable(agent: &Agent, provider: active_rpc::ProviderId, ttl: Option<u64>) -> CapHandle {
     let owner = admitted(b"owner");
     let mut attrs = CapAttrs::new(&["echo"]);
@@ -452,6 +458,7 @@ fn peek_on_a_pending_promise_is_not_unresolvable() {
 
 /// A child minted after a clock switch carries the kernel's clock mode, so its
 /// deadline is read in the domain that produced it.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_child_after_a_clock_switch_is_stamped_with_the_new_domain() {
     let (agent, provider) = durable_agent();
@@ -472,6 +479,7 @@ fn a_child_after_a_clock_switch_is_stamped_with_the_new_domain() {
 
 /// A virtual deadline does not inflate when a restarted kernel reads it: the
 /// sealed remaining lease is the ceiling.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_virtual_deadline_does_not_inflate_across_a_restart() {
     let (source, provider) = durable_agent();
@@ -530,6 +538,7 @@ fn a_virtual_deadline_does_not_inflate_across_a_restart() {
 }
 
 /// A restored credential cannot refill a spent grant.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restored_copy_cannot_refill_a_spent_grant() {
     let (agent, provider) = durable_agent();
@@ -571,6 +580,7 @@ fn a_restored_copy_cannot_refill_a_spent_grant() {
 }
 
 /// A record that names no peer is refused by restore, not silently bound.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_unbound_record_is_refused_by_restore() {
     let (agent, provider) = durable_agent();
@@ -742,6 +752,7 @@ fn a_provider_value_deeper_than_the_wire_limit_is_refused() {
 
 /// A record is restored once per kernel: the budgets inside it were reserved at
 /// export, so a second restore would mint a second copy of one grant.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_restores_once_per_kernel() {
     let (agent, provider) = durable_agent();
@@ -760,6 +771,7 @@ fn a_record_restores_once_per_kernel() {
 }
 
 /// An exported record is consumed: the same capability cannot export twice.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_exported_record_is_consumed() {
     let (agent, provider) = durable_agent();
@@ -773,6 +785,7 @@ fn an_exported_record_is_consumed() {
 
 /// A restored child cannot outspend the ancestor it was derived from: the
 /// export reserves the lineage, not only the capability.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restored_child_cannot_outspend_its_parent() {
     let (agent, provider) = durable_agent();
@@ -811,6 +824,7 @@ fn a_restored_child_cannot_outspend_its_parent() {
 /// An export refused before it hands out a record must cost nothing: the grant
 /// stays with the capability and the record id is not burned, or a deployment
 /// that presents one malformed field loses both.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_empty_path_scope_is_refused_at_the_mint() {
     let (agent, provider) = durable_agent();
@@ -848,6 +862,7 @@ fn an_empty_path_scope_is_refused_at_the_mint() {
 
 /// A tombstone is a kill switch: a capability restored from the record before
 /// the kill list was replayed must be revoked, not left alive for its lease.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_tombstone_revokes_the_live_capability_it_names() {
     let (source, provider) = durable_agent();
@@ -885,6 +900,7 @@ fn a_tombstone_revokes_the_live_capability_it_names() {
 
 /// The record-id sets are bounded: a kernel that keeps exporting refuses the
 /// export that would grow the set past its ceiling.
+#[cfg(feature = "test-utils")]
 #[test]
 fn the_record_id_sets_are_bounded() {
     let (agent, provider) = durable_agent();
@@ -925,6 +941,7 @@ fn the_record_id_sets_are_bounded() {
 
 /// A sealed record whose budget disables a ceiling is a durable refusal, not a
 /// caller argument error.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_that_disables_a_ceiling_is_a_durable_refusal() {
     let (source, provider) = durable_agent();

@@ -304,12 +304,13 @@ fn plain_send_and_recv_still_carry_no_topic() {
     let _ = Budget::default();
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_capability_bound_to_a_peer_publishes_only_through_that_peer() {
     use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 
     let fixture = fixture();
-    let owner = PeerIdentity::from_certificate(b"topic-owner");
+    let owner = PeerIdentity::from_certificate_for_test(b"topic-owner");
     let stranger = PeerIdentity::from_certificate(b"topic-stranger");
     let admitted = IdentityPolicy::default()
         .admit(Some(&owner), true)

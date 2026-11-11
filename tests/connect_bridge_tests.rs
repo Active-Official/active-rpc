@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::kernel::Provider;
 use active_rpc::transport::connect::{BridgeServer, ConnectClient};
@@ -184,11 +185,12 @@ fn a_descriptor_cannot_widen_the_registry() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_bound_capability_is_refused_over_the_bridge() {
     let agent = Agent::with_secret([0x4d; 32]);
     let provider = agent.register(Box::new(Echo)).expect("register provider");
-    let peer = PeerIdentity::from_certificate(b"bridge-peer");
+    let peer = PeerIdentity::from_certificate_for_test(b"bridge-peer");
     let admitted = IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit");

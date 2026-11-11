@@ -852,7 +852,7 @@ pub fn peer_identity(connection: &quinn::Connection) -> Option<PeerIdentity> {
     let any = connection.peer_identity()?;
     let chain = any.downcast::<Vec<CertificateDer<'static>>>().ok()?;
     let leaf = chain.first()?;
-    Some(PeerIdentity::from_certificate(leaf.as_ref()))
+    Some(PeerIdentity::from_verified_certificate(leaf.as_ref()))
 }
 
 /// Most body bytes one read step reserves.
@@ -1124,7 +1124,7 @@ impl QuicClient {
     /// Connect with mutual TLS: trust `ca`, present `certificate` and `key`.
     ///
     /// This is the client half of [`QuicServer::start_mutual_tls`]. The server
-    /// sees [`PeerIdentity::from_certificate`] for this certificate, which is
+    /// sees `PeerIdentity::from_verified_certificate` for this certificate, which is
     /// what a bound capability compares against.
     pub fn connect_mutual_tls(
         address: &str,

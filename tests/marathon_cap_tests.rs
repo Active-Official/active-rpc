@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use active_rpc::budget::{Budget, BudgetMeter};
 use active_rpc::cap::{CapAttrs, CapId, ToolPolicy};
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::intro::MAX_METHODS_PER_PROVIDER;
 use active_rpc::kernel::{Provider, MAX_METHODS_PER_GRANT};
@@ -15,7 +16,9 @@ use active_rpc::replay::MAX_METHODS;
 use active_rpc::tool::HttpTool;
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::wire::{decode_capability_table, CapDescriptor, WireLimits};
-use active_rpc::{Agent, CapHandle, CapPersistence, CapabilityRecord};
+#[cfg(feature = "test-utils")]
+use active_rpc::CapPersistence;
+use active_rpc::{Agent, CapHandle, CapabilityRecord};
 
 struct Echo;
 
@@ -77,8 +80,9 @@ impl Provider for Recorder {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
-    let peer = PeerIdentity::from_certificate(certificate);
+    let peer = PeerIdentity::from_certificate_for_test(certificate);
     IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit")
@@ -91,6 +95,7 @@ fn agent() -> (Agent, active_rpc::ProviderId, active_rpc::LaneId) {
     (agent, provider, lane)
 }
 
+#[cfg(feature = "test-utils")]
 fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     let agent = Agent::with_secret([0x32; 32]);
     agent.set_durable_capabilities(true);
@@ -101,6 +106,7 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
 
 /// A durable capability bound to the peer that restores it: a record must
 /// name its peer, so an unbound one cannot be exported.
+#[cfg(feature = "test-utils")]
 fn durable_cap(agent: &Agent, provider: active_rpc::ProviderId) -> CapHandle {
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
@@ -232,6 +238,7 @@ fn attenuation_cannot_add_process_execution() {
 
 /// Revocation reaches a durable record: the exported authority cannot be
 /// restored after the live capability is revoked.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_revoked_durable_capability_cannot_be_restored() {
     let (agent, provider) = durable_agent();
@@ -248,6 +255,7 @@ fn a_revoked_durable_capability_cannot_be_restored() {
 
 /// A record is a credential: without a seal from this deployment it is not
 /// accepted, and an edit breaks the seal.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_edited_or_unsealed_record_is_refused() {
     let (agent, provider) = durable_agent();
@@ -473,6 +481,7 @@ fn a_drop_inside_a_provider_notification_is_applied() {
 
 /// An imported (id-only) handle has no reference of its own and cannot export
 /// authority.
+#[cfg(feature = "test-utils")]
 #[test]
 fn export_from_an_imported_handle_is_refused() {
     let (agent, provider) = durable_agent();
@@ -578,6 +587,7 @@ fn the_registry_and_the_lineage_are_bounded() {
 /// by `restore_capability_with`, not by the parser). The audited path is the restore
 /// itself, so this test drives that and compares the restored capability with
 /// the record.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_preserves_the_binding() {
     let (agent, provider) = durable_agent();
@@ -602,6 +612,7 @@ fn a_restore_preserves_the_binding() {
 
 /// A capability record keeps its id across a round trip, and the record id is
 /// what a revocation tombstones.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_keeps_its_identity_across_the_round_trip() {
     let (agent, provider) = durable_agent();
@@ -718,6 +729,7 @@ fn an_attenuation_past_the_method_ceiling_is_refused() {
 /// covers the method set, so the tampered record has to be re-sealed with the
 /// deployment key first: the restore must judge the count, not the seal
 /// (RPC-07).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_of_a_grant_over_the_ceiling_is_refused() {
     let (agent, provider) = durable_agent();

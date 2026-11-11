@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::channel::Direction;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::kernel::Provider;
 use active_rpc::value::{Arg, Call, Response, Value};
@@ -42,8 +43,9 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
-    let peer = PeerIdentity::from_certificate(certificate);
+    let peer = PeerIdentity::from_certificate_for_test(certificate);
     IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit")
@@ -105,6 +107,7 @@ fn dropping_the_parent_handle_keeps_the_subtree_bound() {
 }
 
 /// A tombstone is authority metadata a deployment can replay after a restart.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_tombstone_replayed_at_startup_refuses_the_record() {
     let (source, provider) = durable_agent();
@@ -142,6 +145,7 @@ fn a_tombstone_replayed_at_startup_refuses_the_record() {
 
 /// One credential is one live grant: a second restore must be refused, or a
 /// revocation could not reach every copy.
+#[cfg(feature = "test-utils")]
 #[test]
 fn restoring_the_same_record_twice_is_refused() {
     let (agent, provider) = durable_agent();
@@ -169,6 +173,7 @@ fn restoring_the_same_record_twice_is_refused() {
 
 /// Tombstones only track durable records: an ephemeral mint/revoke cycle must
 /// not grow the set forever.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_revocation_tombstones_only_durable_records() {
     let (agent, provider) = durable_agent();
@@ -209,6 +214,7 @@ fn an_unbound_durable_capability_cannot_be_exported() {
 
 /// A deadline belongs to the clock it was minted in, not to the clock the
 /// export happens to run under.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_keeps_the_clock_mode_its_deadline_was_taken_in() {
     let (source, provider) = durable_agent();

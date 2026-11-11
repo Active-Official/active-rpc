@@ -5,15 +5,17 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use active_rpc::cap::{CapAttrs, CapPersistence};
+use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
+use active_rpc::cap::CapPersistence;
 use active_rpc::kernel::Provider;
 use active_rpc::persistence::MemoryRecordStore;
 #[cfg(windows)]
 use active_rpc::value::Arg;
 use active_rpc::value::{Call, Response, Value};
-use active_rpc::{
-    AdmittedIdentity, Agent, Budget, CapHandle, Error, IdentityPolicy, LaneId, PeerIdentity,
-};
+#[cfg(feature = "test-utils")]
+use active_rpc::{AdmittedIdentity, IdentityPolicy, PeerIdentity};
+use active_rpc::{Agent, Budget, CapHandle, Error, LaneId};
 
 /// A provider that counts calls and echoes.
 struct Echo(Arc<AtomicUsize>);
@@ -58,9 +60,10 @@ fn echo_agent() -> (Agent, CapHandle, LaneId, Arc<AtomicUsize>) {
     (agent, cap, lane, calls)
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(name: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(name)), false)
+        .admit(Some(&PeerIdentity::from_certificate_for_test(name)), false)
         .expect("admitted")
 }
 
@@ -145,6 +148,7 @@ fn resolve_as_after_cancel_does_not_charge() {
 
 /// AR-03: dropping the last handle of an exported durable capability is
 /// observable, because the sealed record is still restorable.
+#[cfg(feature = "test-utils")]
 #[test]
 fn dropping_an_exported_capability_reports_the_orphan() {
     let agent = Agent::with_secret([0x7d; 32]);
@@ -172,6 +176,7 @@ fn dropping_an_exported_capability_reports_the_orphan() {
 
 /// AR-04: a leaf renewal moves a bound capability to the new fingerprint
 /// without changing its authority.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotated_certificate_can_rebind_a_capability() {
     let agent = Agent::with_secret([0x7f; 32]);

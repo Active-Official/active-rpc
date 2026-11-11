@@ -5,7 +5,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use active_rpc::cap::{CapAttrs, CapId, CapPersistence};
+#[cfg(feature = "test-utils")]
+use active_rpc::cap::CapPersistence;
+use active_rpc::cap::{CapAttrs, CapId};
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::kernel::{Provider, MAX_METHODS_PER_GRANT};
 use active_rpc::value::{Call, Response, Value};
@@ -343,6 +346,7 @@ fn a_provider_may_mint_for_itself_while_it_is_dispatching() {
 /// The provider-name bound the introduction applies is the one the sealed-record
 /// parser accepts, so a name a kernel can describe is one it can persist
 /// (R-17 round 5, L-5).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
     let name: &'static str = Box::leak(
@@ -360,7 +364,7 @@ fn a_provider_name_at_the_introduction_bound_round_trips_a_record() {
         .expect("register provider");
     let owner = IdentityPolicy::default()
         .admit(
-            Some(&PeerIdentity::from_certificate(b"long-name-owner")),
+            Some(&PeerIdentity::from_certificate_for_test(b"long-name-owner")),
             true,
         )
         .expect("admit");
@@ -482,6 +486,7 @@ fn a_refused_receive_is_recorded() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_ambiguous_record_is_refused_before_the_grant_is_spent() {
     let agent = Agent::with_secret([0x53; 32]);
@@ -501,7 +506,7 @@ fn an_ambiguous_record_is_refused_before_the_grant_is_spent() {
         .expect("register provider");
     let owner = IdentityPolicy::default()
         .admit(
-            Some(&PeerIdentity::from_certificate(b"ambiguous-owner")),
+            Some(&PeerIdentity::from_certificate_for_test(b"ambiguous-owner")),
             true,
         )
         .expect("admit");

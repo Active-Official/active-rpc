@@ -3,9 +3,13 @@
 //! agent's own promise, and a refused answer is visible on the tape.
 
 use active_rpc::cap::CapAttrs;
-use active_rpc::identity::{AdmittedIdentity, IdentityPolicy, PeerIdentity};
+use active_rpc::identity::PeerIdentity;
+#[cfg(feature = "test-utils")]
+use active_rpc::identity::{AdmittedIdentity, IdentityPolicy};
 use active_rpc::value::{Arg, Call, Response};
-use active_rpc::{Agent, Budget, Event, Provider};
+#[cfg(feature = "test-utils")]
+use active_rpc::Event;
+use active_rpc::{Agent, Budget, Provider};
 
 struct Echo;
 
@@ -32,14 +36,19 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(certificate)), false)
+        .admit(
+            Some(&PeerIdentity::from_certificate_for_test(certificate)),
+            false,
+        )
         .expect("admitted")
 }
 
 /// The old and the successor certificate of one peer.
 const OLD: &[u8] = b"alice-certificate-one";
+#[cfg(feature = "test-utils")]
 const NEW: &[u8] = b"alice-certificate-two";
 
 /// A rotation is the documented recovery for a renewed leaf certificate, so the
@@ -47,6 +56,7 @@ const NEW: &[u8] = b"alice-certificate-two";
 /// applied mutating call answers `rpc/identity` forever and it cannot learn
 /// whether the write landed, while a fresh key would apply it twice
 /// (R-11 round 11, #1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotated_peer_retries_its_idempotency_key() {
     let agent = Agent::with_secret([0xb1; 32]);
@@ -102,6 +112,7 @@ fn a_rotated_peer_retries_its_idempotency_key() {
 /// it. A dispatch that compared the queued fingerprint with the new binding
 /// would answer `rpc/identity` for a call the operator had already authorized
 /// (R-11 round 11, #1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_carries_a_queued_job() {
     let agent = Agent::with_secret([0xb2; 32]);
@@ -138,6 +149,7 @@ fn a_rotation_carries_a_queued_job() {
 /// rotation moves that owner too: before it the successor cannot answer, after
 /// it the successor can and the old certificate cannot
 /// (R-11 round 11, #1 and #5).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_out_of_band_answer_after_rotation() {
     let agent = Agent::with_secret([0xb3; 32]);
@@ -197,6 +209,7 @@ fn an_out_of_band_answer_after_rotation() {
 /// A refused answer is an operator-visible event, not a silent `Err`: the one
 /// signal that says a peer tried to answer somebody else's call
 /// (R-11 round 11, #5).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_refused_answer_is_counted_and_taped() {
     let agent = Agent::with_secret([0xb4; 32]);
@@ -324,6 +337,7 @@ fn an_envelope_naming_a_promise_is_a_wire_refusal() {
 /// refused at dispatch, with the rotation's own code and no partial side effect.
 /// The operator rotates every capability in a pipeline before the next dispatch
 /// (R-11 round 12, F1; `docs/deployment/identity.md` rule 3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_refuses_a_pipeline_that_spans_two_capabilities() {
     let agent = Agent::with_secret([0xb7; 32]);
@@ -422,6 +436,7 @@ fn a_rotation_refuses_a_pipeline_that_spans_two_capabilities() {
 /// cannot move a lane: a retry on the same lane replays the promise, a retry on
 /// a new one is a new call. The deployment doc says so, and this pins it so the
 /// code and the doc cannot drift (R-11 round 12, F3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_does_not_carry_a_claim_across_lanes() {
     let agent = Agent::with_secret([0xb9; 32]);
@@ -484,6 +499,7 @@ fn a_rotation_does_not_carry_a_claim_across_lanes() {
 /// A rotation says on the tape what it carried, so an auditor can tell a
 /// rotation that moved a peer's answers from one that moved none
 /// (R-11 round 12, F5).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_reports_the_work_it_carries() {
     let agent = Agent::with_secret([0xba; 32]);
@@ -530,6 +546,7 @@ fn a_rotation_reports_the_work_it_carries() {
 /// An out-of-band answer past the grant is refused, counted and taped like the
 /// same refusal on a call: a peer must not be able to probe the reply ceiling
 /// without a trace (R-11 round 12, F2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_over_budget_answer_is_counted_and_taped() {
     let agent = Agent::with_secret([0xbb; 32]);
@@ -581,6 +598,7 @@ fn an_over_budget_answer_is_counted_and_taped() {
 /// Rotating a tree child-first is the natural order, and it must not leave the
 /// root unrotatable: a descendant already bound to the successor is not "another
 /// peer" (R-11 round 13, M-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_child_rotated_first_does_not_block_the_root() {
     let agent = Agent::with_secret([0xbc; 32]);
@@ -640,6 +658,7 @@ fn a_child_rotated_first_does_not_block_the_root() {
 
 /// An answer whose shape the grant refuses is counted and taped on the
 /// out-of-band path too (R-11 round 12, F2; round 13, L-2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_answer_wider_than_the_grant_is_counted_and_taped() {
     let agent = Agent::with_secret([0xbe; 32]);
@@ -679,6 +698,7 @@ fn an_answer_wider_than_the_grant_is_counted_and_taped() {
 /// Ownership is answered before the capability's own state: a peer that does not
 /// own the promise must not learn whether the capability is revoked
 /// (R-11 round 13, L-4).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_foreign_answer_on_a_revoked_capability_is_an_identity_refusal() {
     let agent = Agent::with_secret([0xbf; 32]);
@@ -725,6 +745,7 @@ fn a_foreign_answer_on_a_revoked_capability_is_an_identity_refusal() {
 /// Ownership is a property of the promise, not of its producing job: a promise
 /// that has settled still answers only its owner, so a guessed id does not even
 /// tell a stranger whether it exists (R-11 round 14, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_settled_promise_answers_only_its_owner() {
     let agent = Agent::with_secret([0xc1; 32]);

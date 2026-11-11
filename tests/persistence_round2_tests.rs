@@ -3,19 +3,28 @@
 //! Each test names the finding it pins. The records are real sealed records and
 //! the modules are real canonical images.
 
+#[cfg(feature = "test-utils")]
 use active_rpc::cap::{CapAttrs, CapPersistence};
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{AdmittedIdentity, IdentityPolicy, PeerIdentity};
+#[cfg(feature = "test-utils")]
 use active_rpc::kernel::Provider;
+#[cfg(feature = "test-utils")]
 use active_rpc::persistence::CapabilityRecord;
 use active_rpc::security::{
     assert_no_structural_secrets, is_invisible_or_reordering, redact_module, redact_value,
     valid_text,
 };
-use active_rpc::value::{Call, Response, Value};
+use active_rpc::value::Value;
+#[cfg(feature = "test-utils")]
+use active_rpc::value::{Call, Response};
+#[cfg(feature = "test-utils")]
 use active_rpc::{Agent, ProviderId};
 
+#[cfg(feature = "test-utils")]
 struct Echo;
 
+#[cfg(feature = "test-utils")]
 impl Provider for Echo {
     fn name(&self) -> &'static str {
         "echo"
@@ -31,14 +40,20 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 const SEAL: [u8; 32] = [0x6d; 32];
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::strict()
-        .admit(Some(&PeerIdentity::from_certificate(certificate)), false)
+        .admit(
+            Some(&PeerIdentity::from_certificate_for_test(certificate)),
+            false,
+        )
         .expect("admitted")
 }
 
+#[cfg(feature = "test-utils")]
 fn durable_agent() -> (Agent, ProviderId) {
     let agent = Agent::with_secret([0x77; 32]);
     agent.set_durable_capabilities(true);
@@ -47,6 +62,7 @@ fn durable_agent() -> (Agent, ProviderId) {
     (agent, provider)
 }
 
+#[cfg(feature = "test-utils")]
 fn durable_cap(agent: &Agent, provider: ProviderId) -> active_rpc::CapHandle {
     let mut attrs = CapAttrs::new(&["echo"]);
     attrs.persistence = CapPersistence::Durable;
@@ -60,6 +76,7 @@ fn durable_cap(agent: &Agent, provider: ProviderId) -> active_rpc::CapHandle {
 /// Since R-03 round 4 the mint applies the record format's path-scope rule, so
 /// the capability that could never be exported is never created; the export
 /// gap this test was written for can no longer be reached.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_unexportable_record_costs_no_authority() {
     let (agent, provider) = durable_agent();
@@ -83,6 +100,7 @@ fn an_unexportable_record_costs_no_authority() {
 }
 
 /// F4: a lease without a deadline would restore as unbounded.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_lease_without_a_deadline_is_refused() {
     let (agent, provider) = durable_agent();
@@ -97,6 +115,7 @@ fn a_lease_without_a_deadline_is_refused() {
 }
 
 /// F7: every text field the parser accepts is validated there.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_with_a_malformed_method_or_topic_is_a_persistence_refusal() {
     let (agent, provider) = durable_agent();
@@ -132,6 +151,7 @@ fn a_record_with_a_malformed_method_or_topic_is_a_persistence_refusal() {
 }
 
 /// F9: the record text has one meaning.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_duplicate_key_or_unknown_field_is_refused() {
     let (agent, provider) = durable_agent();
@@ -165,6 +185,7 @@ fn a_duplicate_key_or_unknown_field_is_refused() {
 }
 
 /// F10: the seal is purpose-separated.
+#[cfg(feature = "test-utils")]
 #[test]
 fn the_seal_is_not_a_bare_keyed_hash() {
     let (agent, provider) = durable_agent();

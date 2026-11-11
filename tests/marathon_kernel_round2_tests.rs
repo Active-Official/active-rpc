@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::channel::Direction;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::kernel::Provider;
 use active_rpc::value::{Arg, Call, Response, Value};
@@ -60,8 +61,9 @@ fn agent() -> (Agent, ProviderId, active_rpc::LaneId) {
     (agent, provider, lane)
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
-    let peer = PeerIdentity::from_certificate(certificate);
+    let peer = PeerIdentity::from_certificate_for_test(certificate);
     IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit")
@@ -96,6 +98,7 @@ fn a_cross_provider_pipeline_settles() {
 
 /// A bounded record exported from a wall-clock kernel is refused by a virtual
 /// kernel: its deadline is in another clock domain.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_wall_clock_record_does_not_restore_unbounded_in_virtual_mode() {
     let source = Agent::with_secret([0x6c; 32]);
@@ -258,6 +261,7 @@ fn on_drop_is_delivered_when_a_provider_releases_during_its_own_call() {
 }
 
 /// A provider name shared by two registrations is ambiguous for a restore.
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_refuses_an_ambiguous_provider_name() {
     let source = Agent::with_secret([0x70; 32]);
@@ -283,6 +287,7 @@ fn restore_refuses_an_ambiguous_provider_name() {
 }
 
 /// A durable capability record round-trips through JSON with its clock mode.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_carries_its_clock_mode() {
     let source = Agent::with_secret([0x72; 32]);

@@ -860,7 +860,7 @@ fn scrub_secrets(text: &str) -> std::borrow::Cow<'_, str> {
 /// one of them, and a trace is text that a collector may write into a line log
 /// or a terminal. Escaping and truncating here is the fail-closed boundary,
 /// independent of what each producer does. Secret-looking shapes are
-/// scrubbed first, by [`scrub_secrets`]: the fast path below returns short
+/// scrubbed first, by `scrub_secrets`: the fast path below returns short
 /// clean text unchanged, and a secret must not take it (RPC-48).
 ///
 /// The result is at most [`MAX_LABEL_BYTES`] bytes and contains no control

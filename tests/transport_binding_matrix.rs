@@ -5,24 +5,37 @@
 //! keep working over each transport. QUIC mutual TLS lives in
 //! `identity_tests.rs`; this file covers TCP, Connect and HTTP/2.
 
+#[cfg(feature = "test-utils")]
 use std::thread;
 
 #[cfg(feature = "http2")]
 use std::sync::mpsc;
 
+#[cfg(feature = "test-utils")]
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
+#[cfg(feature = "test-utils")]
 use active_rpc::kernel::Provider;
+#[cfg(feature = "test-utils")]
 use active_rpc::transport::connect::{BridgeServer, ConnectClient};
 #[cfg(feature = "http2")]
 use active_rpc::transport::http2::{Http2Client, Http2Server};
-use active_rpc::transport::{bind_loopback, serve_connection, TcpTransport, Transport};
+#[cfg(feature = "test-utils")]
+use active_rpc::transport::Transport;
+#[cfg(feature = "test-utils")]
+use active_rpc::transport::{bind_loopback, serve_connection, TcpTransport};
+#[cfg(feature = "test-utils")]
 use active_rpc::value::{Arg, Call, Response, Value};
+#[cfg(feature = "test-utils")]
 use active_rpc::wire::{CapDescriptor, Envelope, Kind};
+#[cfg(feature = "test-utils")]
 use active_rpc::{Agent, Budget, CapHandle, CapId};
 
+#[cfg(feature = "test-utils")]
 struct Echo;
 
+#[cfg(feature = "test-utils")]
 impl Provider for Echo {
     fn name(&self) -> &'static str {
         "echo"
@@ -49,6 +62,7 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 struct Fixture {
     agent: Agent,
     lane: active_rpc::LaneId,
@@ -56,10 +70,11 @@ struct Fixture {
     unbound: CapHandle,
 }
 
+#[cfg(feature = "test-utils")]
 fn fixture() -> Fixture {
     let agent = Agent::with_secret([0x5b; 32]);
     let provider = agent.register(Box::new(Echo)).expect("register provider");
-    let peer = PeerIdentity::from_certificate(b"transport-matrix-peer");
+    let peer = PeerIdentity::from_certificate_for_test(b"transport-matrix-peer");
     let admitted = IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit");
@@ -80,6 +95,7 @@ fn fixture() -> Fixture {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn descriptor(id: CapId) -> CapDescriptor {
     CapDescriptor {
         id,
@@ -91,6 +107,7 @@ fn descriptor(id: CapId) -> CapDescriptor {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn request(id: CapId) -> Envelope {
     let mut envelope = Envelope::request(7, "echo", vec![Arg::text("payload")]);
     envelope.caps = vec![descriptor(id)];
@@ -98,6 +115,7 @@ fn request(id: CapId) -> Envelope {
 }
 
 /// Dispatch as an unauthenticated transport would: no peer identity.
+#[cfg(feature = "test-utils")]
 fn dispatch_unauthenticated(
     agent: &Agent,
     lane: active_rpc::LaneId,
@@ -122,16 +140,19 @@ fn dispatch_unauthenticated(
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn assert_refused(response: &Envelope, code: &str) {
     assert_eq!(response.kind, Kind::Error, "expected a refusal");
     assert_eq!(response.method, code, "{}", response.method);
 }
 
+#[cfg(feature = "test-utils")]
 fn assert_response(response: &Envelope) {
     assert_eq!(response.kind, Kind::Response, "method={}", response.method);
 }
 
 /// Dispatch with an authenticated peer, as a transport that verified one would.
+#[cfg(feature = "test-utils")]
 fn dispatch_authenticated(
     agent: &Agent,
     lane: active_rpc::LaneId,
@@ -163,10 +184,12 @@ fn dispatch_authenticated(
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn peer(certificate: &[u8]) -> PeerIdentity {
     PeerIdentity::from_certificate(certificate)
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn tcp_accepts_a_bound_capability_only_for_the_bound_identity() {
     let fixture = fixture();
@@ -199,6 +222,7 @@ fn tcp_accepts_a_bound_capability_only_for_the_bound_identity() {
     assert_refused(&second, "rpc/identity");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn connect_accepts_a_bound_capability_only_for_the_bound_identity() {
     let fixture = fixture();
@@ -229,6 +253,7 @@ fn connect_accepts_a_bound_capability_only_for_the_bound_identity() {
     assert_refused(&second, "rpc/identity");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_wire_descriptor_cannot_move_a_capability_to_another_provider() {
     // The registry is the authority: the descriptor may *name* a capability, but
@@ -255,6 +280,7 @@ fn a_wire_descriptor_cannot_move_a_capability_to_another_provider() {
     assert_refused(&response, "rpc/method-not-granted");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn tcp_refuses_a_bound_capability_and_accepts_an_unbound_one() {
     let fixture = fixture();
@@ -281,6 +307,7 @@ fn tcp_refuses_a_bound_capability_and_accepts_an_unbound_one() {
     assert_response(&unbound);
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn connect_refuses_a_bound_capability_and_accepts_an_unbound_one() {
     let fixture = fixture();
@@ -305,6 +332,7 @@ fn connect_refuses_a_bound_capability_and_accepts_an_unbound_one() {
 }
 
 #[cfg(feature = "http2")]
+#[cfg(feature = "test-utils")]
 #[test]
 fn http2_refuses_a_bound_capability_and_accepts_an_unbound_one() {
     let fixture = fixture();

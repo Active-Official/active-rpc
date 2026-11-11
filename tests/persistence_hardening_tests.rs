@@ -3,18 +3,24 @@
 //! the security helpers inspect module bytes, and the parser speaks the durable
 //! error vocabulary.
 
+#[cfg(feature = "test-utils")]
 use active_rpc::cap::{CapAttrs, CapPersistence};
-use active_rpc::persistence::{CapabilityRecord, MemoryRecordStore, RecordStore};
+use active_rpc::persistence::CapabilityRecord;
+#[cfg(feature = "test-utils")]
+use active_rpc::persistence::{MemoryRecordStore, RecordStore};
 use active_rpc::security::{assert_no_secret_material, redact_module, redact_value, SECRET_MARKER};
 use active_rpc::value::Value;
+#[cfg(feature = "test-utils")]
 use active_rpc::{Agent, Error, PeerIdentity};
 
+#[cfg(feature = "test-utils")]
 fn admitted(name: &[u8]) -> active_rpc::AdmittedIdentity {
     active_rpc::IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(name)), false)
+        .admit(Some(&PeerIdentity::from_certificate_for_test(name)), false)
         .expect("admitted")
 }
 
+#[cfg(feature = "test-utils")]
 fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     let agent = Agent::with_secret([0x61; 32]);
     agent.set_record_seal_key([0x62; 32]);
@@ -33,6 +39,7 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId) {
     (agent, provider)
 }
 
+#[cfg(feature = "test-utils")]
 fn durable_cap(agent: &Agent, provider: active_rpc::ProviderId) -> active_rpc::CapHandle {
     let mut attrs = CapAttrs::new(&["metadata"]);
     attrs.persistence = CapPersistence::Durable;
@@ -46,6 +53,7 @@ fn durable_cap(agent: &Agent, provider: active_rpc::ProviderId) -> active_rpc::C
 // A2: one record, one restore, even across kernels
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_restores_once_across_kernels_sharing_a_store() {
     let (first, provider) = durable_agent();
@@ -70,6 +78,7 @@ fn a_record_restores_once_across_kernels_sharing_a_store() {
     assert_eq!(store.len(), 1);
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_store_that_cannot_remember_refuses_and_revokes_the_grant() {
     struct Broken;
@@ -111,6 +120,7 @@ fn a_store_that_cannot_remember_refuses_and_revokes_the_grant() {
 
 /// A store that detects the conflict (rather than a write error) also leaves
 /// exactly one grant.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_store_that_detects_a_conflict_leaves_one_grant() {
     struct Conflict(bool);
@@ -151,6 +161,7 @@ fn a_store_that_detects_a_conflict_leaves_one_grant() {
 // A1: the parser does not authenticate, and restore is the only bridge
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_unsealed_record_parses_but_never_restores() {
     let (agent, provider) = durable_agent();
@@ -172,6 +183,7 @@ fn an_unsealed_record_parses_but_never_restores() {
 // A4: an unparsable record is never exported
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_unreadable_path_scope_is_refused_at_mint() {
     let (agent, provider) = durable_agent();

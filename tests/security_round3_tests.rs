@@ -2,15 +2,24 @@
 //! the record store defaults fail closed, the seal parser mirrors the verifier,
 //! and `Debug` never prints module bytes.
 
+#[cfg(feature = "test-utils")]
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
+#[cfg(feature = "test-utils")]
 use active_rpc::kernel::Provider;
+#[cfg(feature = "test-utils")]
 use active_rpc::persistence::{CapabilityRecord, MemoryRecordStore, RecordStore};
-use active_rpc::value::{Call, Response, Value};
+use active_rpc::value::Value;
+#[cfg(feature = "test-utils")]
+use active_rpc::value::{Call, Response};
+#[cfg(feature = "test-utils")]
 use active_rpc::{Agent, Budget, CapPersistence, Error};
 
+#[cfg(feature = "test-utils")]
 struct Echo;
 
+#[cfg(feature = "test-utils")]
 impl Provider for Echo {
     fn name(&self) -> &'static str {
         "echo"
@@ -34,13 +43,15 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
-    let peer = PeerIdentity::from_certificate(certificate);
+    let peer = PeerIdentity::from_certificate_for_test(certificate);
     IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit")
 }
 
+#[cfg(feature = "test-utils")]
 fn durable_agent() -> (Agent, active_rpc::CapHandle) {
     let agent = Agent::with_secret([0x31; 32]);
     agent.set_durable_capabilities(true);
@@ -56,10 +67,12 @@ fn durable_agent() -> (Agent, active_rpc::CapHandle) {
 /// A store that implements `claim` by delegating to `mark_restored` and forgets
 /// to override it: the default must refuse rather than accept silently, or one
 /// record becomes two grants (round 3, F-3).
+#[cfg(feature = "test-utils")]
 struct ForgetsMarkRestored {
     ids: std::collections::BTreeSet<[u8; 32]>,
 }
 
+#[cfg(feature = "test-utils")]
 impl RecordStore for ForgetsMarkRestored {
     fn is_restored(&self, record_id: &[u8; 32]) -> bool {
         self.ids.contains(record_id)
@@ -71,6 +84,7 @@ impl RecordStore for ForgetsMarkRestored {
     }
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_store_that_forgets_mark_restored_fails_closed() {
     let (agent, cap) = durable_agent();
@@ -101,6 +115,7 @@ fn a_store_that_forgets_mark_restored_fails_closed() {
 /// The seal parser must accept exactly what the verifier accepts: lowercase hex
 /// of the right length. An uppercase or non-hex seal parses today and every
 /// restore then fails (round 3, F-4).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_with_a_seal_the_verifier_can_never_accept_is_refused() {
     let (agent, cap) = durable_agent();
@@ -138,6 +153,7 @@ fn a_value_debug_does_not_print_module_bytes() {
 /// pinned elsewhere, and this pins the whole material (nested `budget` and
 /// `tool_policy` order included), so a reorder that would invalidate every
 /// record at rest fails here instead of silently in the field (round 3, F-6).
+#[cfg(feature = "test-utils")]
 #[test]
 fn the_seal_material_is_pinned_to_a_golden_vector() {
     let (agent, cap) = durable_agent();

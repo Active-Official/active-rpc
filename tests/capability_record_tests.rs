@@ -5,13 +5,22 @@
 //! changes; the authority, the absolute deadline and the binding are what
 //! survive.
 
+#[cfg(feature = "test-utils")]
 use active_infinity::{InfinityModule, Inode, SecretBytes};
 use active_rpc::cap::CapAttrs;
+#[cfg(feature = "test-utils")]
 use active_rpc::domain::ModuleProvider;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
-use active_rpc::kernel::{Provider, MAX_LINEAGE_DEPTH};
-use active_rpc::value::{Arg, Call, Response, Value};
-use active_rpc::{Agent, Budget, CapHandle, CapPersistence, CapabilityRecord, Error, LaneId};
+use active_rpc::kernel::Provider;
+#[cfg(feature = "test-utils")]
+use active_rpc::kernel::MAX_LINEAGE_DEPTH;
+#[cfg(feature = "test-utils")]
+use active_rpc::value::Arg;
+use active_rpc::value::{Call, Response, Value};
+use active_rpc::{Agent, Budget, CapabilityRecord};
+#[cfg(feature = "test-utils")]
+use active_rpc::{CapHandle, CapPersistence, Error, LaneId};
 
 struct Echo;
 
@@ -41,19 +50,22 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
-    let peer = PeerIdentity::from_certificate(certificate);
+    let peer = PeerIdentity::from_certificate_for_test(certificate);
     IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit")
 }
 
+#[cfg(feature = "test-utils")]
 fn peer(certificate: &[u8]) -> PeerIdentity {
     PeerIdentity::from_certificate(certificate)
 }
 
 /// A durable capability bound to `durable-owner`: a record must name the
 /// peer it was issued to, so an unbound one cannot be exported at all.
+#[cfg(feature = "test-utils")]
 fn durable_agent() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle) {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
@@ -68,6 +80,7 @@ fn durable_agent() -> (Agent, active_rpc::ProviderId, active_rpc::CapHandle) {
     (agent, provider, cap)
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn export_and_restore_are_on_the_trace() {
     // R-06: an export spends a grant and a restore mints authority from a
@@ -108,6 +121,7 @@ fn export_and_restore_are_on_the_trace() {
     assert_eq!(trace[exported].event(), "cap.exported");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_durable_capability_round_trips_through_a_record() {
     let (agent, _provider, cap) = durable_agent();
@@ -176,6 +190,7 @@ fn an_ephemeral_capability_cannot_be_exported() {
     assert_eq!(error.code(), "rpc/persistence");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_requires_the_durable_policy() {
     let (agent, _provider, cap) = durable_agent();
@@ -188,6 +203,7 @@ fn restore_requires_the_durable_policy() {
     assert_eq!(error.code(), "rpc/persistence");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_refuses_a_passed_deadline() {
     let agent = Agent::with_secret([0x74; 32]);
@@ -217,6 +233,7 @@ fn restore_refuses_a_passed_deadline() {
     assert_eq!(error.code(), "rpc/persistence");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_refuses_a_record_bound_to_another_peer() {
     let agent = Agent::with_secret([0x75; 32]);
@@ -246,6 +263,7 @@ fn restore_refuses_a_record_bound_to_another_peer() {
     assert_ne!(restored.id(), original);
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_refuses_an_unknown_provider() {
     let (agent, _provider, cap) = durable_agent();
@@ -279,6 +297,7 @@ fn a_malformed_or_oversized_record_is_refused() {
     assert_eq!(error.code(), "rpc/persistence");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restored_capability_keeps_the_original_deadline() {
     let agent = Agent::with_secret([0x76; 32]);
@@ -340,6 +359,7 @@ fn a_restored_capability_keeps_the_original_deadline() {
 /// A borrowed handle names a capability this kernel minted for someone else.
 /// It must not attenuate (a grant laundered out of a borrow, with the owner's
 /// record pinned alive) or revoke (any receiver killing the sender).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_borrowed_handle_neither_attenuates_nor_revokes() {
     let (agent, _provider, cap) = durable_agent();
@@ -365,6 +385,7 @@ fn a_borrowed_handle_neither_attenuates_nor_revokes() {
 
 /// The binding is reported before the tombstone: a wrong peer learns nothing
 /// about which record ids were revoked.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_tombstoned_record_reports_the_binding_first() {
     let (agent, _provider, cap) = durable_agent();
@@ -382,6 +403,7 @@ fn a_tombstoned_record_reports_the_binding_first() {
 
 /// An export of an expired capability says so on the tape, like every other
 /// expiry path.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_expired_export_is_an_expiry_event() {
     let agent = Agent::with_secret([0x73; 32]);
@@ -406,6 +428,7 @@ fn an_expired_export_is_an_expiry_event() {
 /// An exported record pins its object: dropping the last handle must not let
 /// the provider reclaim the module the record names, or a later restore would
 /// mint authority over a dead object (round 32, #3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_exported_record_keeps_its_object_alive() {
     use active_infinity::{InfinityModule, Inode};
@@ -454,6 +477,7 @@ fn an_exported_record_keeps_its_object_alive() {
 
 /// A restored capability carries the same record id, but its record is spent:
 /// dropping it must not report a restorable orphan (round 33, F4).
+#[cfg(feature = "test-utils")]
 #[test]
 fn dropping_a_restored_capability_is_not_an_orphan() {
     use active_rpc::kernel::Event;
@@ -488,6 +512,7 @@ fn dropping_a_restored_capability_is_not_an_orphan() {
 /// A tombstoned record can never be restored, so its object pin must be
 /// released by the revocation: otherwise the provider never reclaims the
 /// module and one module per record is retained (round 36, L-3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_revoked_exported_record_releases_its_object() {
     use active_infinity::{InfinityModule, Inode};
@@ -522,6 +547,7 @@ fn a_revoked_exported_record_releases_its_object() {
 
 /// Tombstoning an exported record after its handle was dropped still releases
 /// the export pin: the provider must reclaim the module (round 38, F3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_tombstone_after_the_handle_is_dropped_releases_the_pin() {
     use active_infinity::{InfinityModule, Inode};
@@ -567,6 +593,7 @@ fn a_tombstone_after_the_handle_is_dropped_releases_the_pin() {
 /// The export-side tombstone check itself is unchanged: a capability that
 /// did carry a tombstoned id is still refused there, before anything is
 /// reserved.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restart_after_a_tombstone_mints_a_fresh_record_id() {
     let (agent, _provider, cap) = durable_agent();
@@ -604,6 +631,7 @@ fn a_restart_after_a_tombstone_mints_a_fresh_record_id() {
 /// Rotating a capability's peer invalidates any exported record for the old
 /// peer: the credential was bound to the identity the rotation removes
 /// (round 39, M-2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_tombstones_the_records_of_the_old_peer() {
     let (agent, _provider, cap) = durable_agent();
@@ -622,6 +650,7 @@ fn a_rotation_tombstones_the_records_of_the_old_peer() {
 /// The parser refuses a record with a deadline but no lease, the shape restore
 /// always refuses: it must not advertise a record it can never serve
 /// (round 39, L-5).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_with_a_deadline_but_no_lease_is_refused_by_the_parser() {
     let agent = Agent::with_secret([0x71; 32]);
@@ -652,6 +681,7 @@ fn a_record_with_a_deadline_but_no_lease_is_refused_by_the_parser() {
 // ---------------------------------------------------------------------------
 
 /// Spend every tombstone slot the kernel has, so the next one is refused.
+#[cfg(feature = "test-utils")]
 fn fill_tombstones(agent: &Agent) {
     for index in 0..active_rpc::kernel::MAX_TOMBSTONES {
         let mut id = [0u8; 32];
@@ -669,6 +699,7 @@ fn fill_tombstones(agent: &Agent) {
 
 /// A rotation that cannot record its tombstones must not be half applied: the
 /// subtree stays bound to the peer it was bound to (round 40, R-07-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_refused_rotation_leaves_the_binding_alone() {
     let (agent, _provider, ancestor) = durable_agent();
@@ -705,6 +736,7 @@ fn a_refused_rotation_leaves_the_binding_alone() {
 /// A rotation withdraws the record of a peer even when the exporting handle is
 /// gone: the documented orphan workflow leaves no capability record to match
 /// (round 40, R-07-2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_tombstones_the_record_of_a_dropped_exporter() {
     let (agent, _provider, ancestor) = durable_agent();
@@ -734,6 +766,7 @@ fn a_rotation_tombstones_the_record_of_a_dropped_exporter() {
 
 /// A restore is a durable mint, so it obeys the tombstone budget the mint
 /// obeys; without that the set grew past its ceiling (round 40, residual R-3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_is_refused_when_the_tombstone_budget_is_spent() {
     let (agent, _provider, cap) = durable_agent();
@@ -754,6 +787,7 @@ fn a_restore_is_refused_when_the_tombstone_budget_is_spent() {
 
 /// Two records can name one provider object; restoring one must not drop the
 /// object the other still pins (round 40, residual R-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn two_records_on_one_object_hold_two_pins() {
     let (agent, provider, first) = durable_agent();
@@ -794,6 +828,7 @@ fn two_records_on_one_object_hold_two_pins() {
 
 /// A rotation retires the records of the rotated subtree, not every record the
 /// retired peer holds: a sibling capability stays usable (round 41, F2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_leaves_a_siblings_record_restorable() {
     let (agent, provider, first) = durable_agent();
@@ -834,6 +869,7 @@ fn a_rotation_leaves_a_siblings_record_restorable() {
 
 /// A registry at its ceiling refuses a restore *before* the claim, so the
 /// record stays usable once capacity frees (round 41, F7).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_refused_by_a_full_registry_does_not_spend_the_record() {
     use active_rpc::kernel::MAX_CAPS;
@@ -877,6 +913,7 @@ fn a_restore_refused_by_a_full_registry_does_not_spend_the_record() {
 /// A record's present fields must have the type the format defines, and its
 /// arrays must be canonical: two texts with one meaning shared one seal
 /// (round 41, F4).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_with_a_coerced_field_or_an_unsorted_list_is_refused() {
     let (agent, _provider, cap) = durable_agent();
@@ -913,6 +950,7 @@ fn a_record_with_a_coerced_field_or_an_unsorted_list_is_refused() {
 /// A record's nested objects are part of its format: an extra key and a
 /// reordered allow-list are texts no writer produces, and both used to parse
 /// under a valid seal (round 42, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_with_a_nested_extra_or_a_reordered_allow_list_is_refused() {
     // Mint a capability with a tool policy so the record carries one.
@@ -959,6 +997,7 @@ fn a_record_with_a_nested_extra_or_a_reordered_allow_list_is_refused() {
 /// A rotation to the peer that already holds the binding changes nothing, so
 /// it must tombstone nothing: the subtree's own records stay restorable
 /// (round 42, F3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_to_the_same_peer_tombstones_nothing() {
     let (agent, _provider, cap) = durable_agent();
@@ -982,6 +1021,7 @@ fn a_rotation_to_the_same_peer_tombstones_nothing() {
 /// A restored capability carries the record id it came from: exporting it
 /// again would mint a second artifact under one credential id
 /// (round 42, F5).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restored_capability_cannot_be_exported_again() {
     // The duplicate appears across kernels: the restorer never exported the
@@ -1046,6 +1086,7 @@ fn a_wall_clock_deadline_does_not_survive_a_switch_to_virtual() {
 /// A revocation reaches a record exported from a descendant whose handle was
 /// dropped: the orphan workflow must not defeat the kill switch
 /// (round 43, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_revocation_tombstones_an_orphaned_descendant_record() {
     use active_rpc::kernel::Event;
@@ -1085,6 +1126,7 @@ fn a_revocation_tombstones_an_orphaned_descendant_record() {
 
 /// A reordered record text is not the text this crate writes, so it is
 /// refused even though the parsed value is the same (round 43, F2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_with_a_reordered_key_is_refused() {
     let (agent, _provider, cap) = durable_agent();
@@ -1103,6 +1145,7 @@ fn a_record_with_a_reordered_key_is_refused() {
 }
 
 /// A no-op rotation is not reported as a rebind (round 43, F4).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_to_the_same_peer_is_not_on_the_tape() {
     use active_rpc::kernel::Event;
@@ -1122,6 +1165,7 @@ fn a_rotation_to_the_same_peer_is_not_on_the_tape() {
 
 /// Export obeys the clock-domain rule: a deadline minted in the wall clock
 /// cannot leave from a virtual-clock kernel (round 43, F5).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_export_after_a_clock_switch_is_refused() {
     let agent = Agent::with_secret([0x71; 32]);
@@ -1158,6 +1202,7 @@ fn an_export_after_a_clock_switch_is_refused() {
 /// A restored copy of a descendant is part of the authority tree: revoking the
 /// ancestor reaches it, and so does a capability attenuated from it
 /// (round 44, F-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_revocation_reaches_a_restored_copy_of_a_descendant() {
     let secret = [0x71; 32];
@@ -1201,6 +1246,7 @@ fn a_revocation_reaches_a_restored_copy_of_a_descendant() {
 
 /// A rotation moves the restored copy too: the peer it was bound to cannot use
 /// it afterwards, and the successor can (round 44, F-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_reaches_a_restored_copy() {
     let (agent, _provider, parent) = durable_agent();
@@ -1246,6 +1292,7 @@ fn a_rotation_reaches_a_restored_copy() {
 
 /// Introducing a capability to the peer that already holds it is not a second
 /// introduction (round 44, F-5).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_repeated_introduction_is_not_a_second_introduction() {
     use active_rpc::kernel::Event;
@@ -1271,6 +1318,7 @@ fn a_repeated_introduction_is_not_a_second_introduction() {
 /// compares its input with this rendering, so a dependency that changed
 /// `serde_json`'s ordering would rewrite every record at rest
 /// (round 44, F-3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_text_has_a_fixed_key_order() {
     let (agent, _provider, cap) = durable_agent();
@@ -1322,6 +1370,7 @@ fn a_record_text_has_a_fixed_key_order() {
 /// The restored copy is a real tree edge: dropping it unlinks from its
 /// ancestors, so a later revoke does not report a capability that is already
 /// gone (round 45, F-3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn dropping_a_restored_copy_does_not_leave_a_stale_child() {
     use active_rpc::kernel::Event;
@@ -1364,6 +1413,7 @@ fn dropping_a_restored_copy_does_not_leave_a_stale_child() {
 
 /// A live restored copy keeps its ancestor's record (and meter) alive
 /// (round 45, F-3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_live_restored_copy_keeps_its_ancestor_alive() {
     use active_rpc::kernel::Event;
@@ -1406,6 +1456,7 @@ fn a_live_restored_copy_keeps_its_ancestor_alive() {
 /// already refuses to mint a record this kernel could never restore, so a
 /// deterministic refusal never spends the credential (round 45, F-2; round 47,
 /// F1-F2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_chain_too_deep_to_restore_is_refused_at_export() {
     use active_rpc::kernel::MAX_LINEAGE_DEPTH;
@@ -1437,6 +1488,7 @@ fn a_chain_too_deep_to_restore_is_refused_at_export() {
 }
 /// Revoking a wide tree is linear: the record-id expansion is one registry
 /// index, not a scan per reached capability (round 45, F-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_wide_revocation_is_linear() {
     let (agent, _provider, root) = durable_agent();
@@ -1464,6 +1516,7 @@ fn a_wide_revocation_is_linear() {
 
 /// The rotation selector uses the same ancestry: a retired peer's record behind
 /// a restored copy is tombstoned (round 46, F-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_rotation_reaches_a_record_behind_a_restored_copy() {
     let (agent, _provider, root) = durable_agent();
@@ -1497,6 +1550,7 @@ fn a_rotation_reaches_a_record_behind_a_restored_copy() {
 /// whole tree: the restore's ancestors are tree edges, and the pin of a later
 /// export must name them or a revocation of the original root misses the
 /// record (round 46, F-1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_record_exported_through_a_restored_copy_is_revoked_with_the_root() {
     let (agent, _provider, root) = durable_agent();
@@ -1537,6 +1591,7 @@ fn a_record_exported_through_a_restored_copy_is_revoked_with_the_root() {
 /// pin of `MAX - 1` already reaches the ceiling. An export there would mint a
 /// credential this kernel refuses to restore after spending the grant, so it is
 /// refused before the reserve and the record id stays unspent (round 47, F1-F2).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_export_past_the_restore_ceiling_is_refused_and_spends_nothing() {
     let (agent, _provider, root) = durable_agent();
@@ -1594,6 +1649,7 @@ fn an_export_past_the_restore_ceiling_is_refused_and_spends_nothing() {
 /// A revocation tombstones the record, so dropping the handle afterwards is
 /// not an orphan: the event promises a restorable record and an operator tool
 /// keys off it (round 47, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_revoked_record_is_not_an_orphan_when_the_handle_drops() {
     use active_rpc::kernel::Event;
@@ -1617,6 +1673,7 @@ fn a_revoked_record_is_not_an_orphan_when_the_handle_drops() {
 
 /// A narrow revoke is not O(registry): the record-id index is maintained, not
 /// rebuilt per call, so N sequential leaf revokes stay linear (round 47, F3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn sequential_narrow_revocations_are_linear() {
     let (agent, provider, root) = durable_agent();
@@ -1645,6 +1702,7 @@ fn sequential_narrow_revocations_are_linear() {
 /// from the record-id index, and pruning the dropped copy's entry left the
 /// descendant record restorable after `tombstone_record` claimed to kill it
 /// (R-12 round 13, F1).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_tombstone_reaches_a_record_exported_through_a_dropped_restored_copy() {
     let (agent, _provider, root) = durable_agent();
@@ -1688,6 +1746,7 @@ fn a_tombstone_reaches_a_record_exported_through_a_dropped_restored_copy() {
 /// every ancestor), both exported, both handles dropped, then the root's
 /// record is tombstoned. The child is live nowhere, so no live-cap check
 /// can see the revoked ancestor — only the sealed ancestor list can.
+#[cfg(feature = "test-utils")]
 fn revoked_ancestor_setup() -> (Agent, active_rpc::CapabilityRecord, [u8; 32]) {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
@@ -1712,6 +1771,7 @@ fn revoked_ancestor_setup() -> (Agent, active_rpc::CapabilityRecord, [u8; 32]) {
     (agent, child_record, root_record.record_id)
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn export_seals_the_ancestors_record_ids() {
     let (agent, child_record, root_record_id) = revoked_ancestor_setup();
@@ -1732,6 +1792,7 @@ fn export_seals_the_ancestors_record_ids() {
     drop(owner);
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_under_a_tombstoned_ancestor_is_refused() {
     let (agent, child_record, root_record_id) = revoked_ancestor_setup();
@@ -1744,6 +1805,7 @@ fn restore_under_a_tombstoned_ancestor_is_refused() {
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_under_a_live_ancestor_succeeds_and_calls() {
     let (agent, child_record, _root_record_id) = revoked_ancestor_setup();
@@ -1761,6 +1823,7 @@ fn restore_under_a_live_ancestor_succeeds_and_calls() {
     promise.value().expect("the restored grant answers");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_under_a_tombstoned_ancestor_is_refused_cross_kernel_after_kill_list_replay() {
     let (_agent, child_record, root_record_id) = revoked_ancestor_setup();
@@ -1782,6 +1845,7 @@ fn restore_under_a_tombstoned_ancestor_is_refused_cross_kernel_after_kill_list_r
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn restore_without_kill_list_replay_succeeds_cross_kernel() {
     let (_agent, child_record, _root_record_id) = revoked_ancestor_setup();
@@ -1794,6 +1858,7 @@ fn restore_without_kill_list_replay_succeeds_cross_kernel() {
         .expect("no replayed tombstone, so the restore succeeds");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_descendant_of_a_restored_capability_re_exports_its_ancestors() {
     let (agent, child_record, root_record_id) = revoked_ancestor_setup();
@@ -1832,6 +1897,7 @@ fn a_descendant_of_a_restored_capability_re_exports_its_ancestors() {
     assert_eq!(error.code(), "rpc/revoked", "{error}");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_legacy_record_without_an_ancestor_list_restores_under_the_old_rule() {
     // Records sealed before the ancestor field existed carry an empty
@@ -1860,6 +1926,7 @@ fn a_legacy_record_without_an_ancestor_list_restores_under_the_old_rule() {
 /// asserting the FIXED behaviour: the fresh mint skips the tombstoned
 /// serial, so the new capability carries a new record id, calls, and
 /// exports — while the tombstoned id stays dead.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restart_with_a_replayed_kill_list_never_reissues_a_tombstoned_record_id() {
     let secret = [0x42u8; 32];
@@ -1922,6 +1989,7 @@ fn a_restart_with_a_replayed_kill_list_never_reissues_a_tombstoned_record_id() {
 /// the replay and the mint. The refusal travels through the tombstone
 /// revoke in practice; the dispatch-side tombstone arm is the second gate
 /// for any copy that revoke cannot see.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_call_queued_before_the_kill_list_replay_is_refused_at_dispatch() {
     let (agent, _provider, cap) = durable_agent();
@@ -1946,6 +2014,7 @@ fn a_call_queued_before_the_kill_list_replay_is_refused_at_dispatch() {
 
 /// RPC-02 (attenuate arm): a child minted after a kill-list replay skips
 /// a tombstoned (serial, parent) pair just like a first-generation mint.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_attenuated_child_after_a_replayed_kill_list_skips_a_tombstoned_serial() {
     let secret = [0x42u8; 32];
@@ -2006,6 +2075,7 @@ fn an_attenuated_child_after_a_replayed_kill_list_skips_a_tombstoned_serial() {
 // ---------------------------------------------------------------------------
 
 /// A plain module whose root table holds one string value (for evaluate).
+#[cfg(feature = "test-utils")]
 fn plain_module(value: &str) -> InfinityModule {
     let mut module = InfinityModule::new();
     let node = module.push(Inode::Str(value.to_string()));
@@ -2017,6 +2087,7 @@ fn plain_module(value: &str) -> InfinityModule {
 }
 
 /// A module whose root table holds one structural secret.
+#[cfg(feature = "test-utils")]
 fn secret_module(secret: &str) -> InfinityModule {
     let mut module = InfinityModule::new();
     let secret_node = module.push(Inode::Secret(SecretBytes::new(secret)));
@@ -2030,6 +2101,7 @@ fn secret_module(secret: &str) -> InfinityModule {
 /// A durable-capable agent with the deployment's secret and seal key, and the
 /// owner the records are bound to. Two agents built this way are the same
 /// deployment, as in the W15 probes.
+#[cfg(feature = "test-utils")]
 fn module_agent() -> (Agent, active_rpc::AdmittedIdentity) {
     let agent = Agent::with_secret([0x71; 32]);
     agent.set_durable_capabilities(true);
@@ -2037,6 +2109,7 @@ fn module_agent() -> (Agent, active_rpc::AdmittedIdentity) {
     (agent, admitted(b"durable-owner"))
 }
 
+#[cfg(feature = "test-utils")]
 fn mint_module_cap(
     agent: &Agent,
     provider: active_rpc::ProviderId,
@@ -2055,6 +2128,7 @@ fn mint_module_cap(
 }
 
 /// Call a method as the owner peer and return the value.
+#[cfg(feature = "test-utils")]
 fn call_as_owner(
     agent: &Agent,
     lane: LaneId,
@@ -2069,6 +2143,7 @@ fn call_as_owner(
 
 /// The domain `content_hash` answer for a module capability, without the
 /// `blake3:` prefix.
+#[cfg(feature = "test-utils")]
 fn content_hash_via(agent: &Agent, lane: LaneId, cap: &CapHandle) -> String {
     match call_as_owner(agent, lane, cap, "content_hash", Vec::new()).expect("content_hash") {
         Value::Text(text) => text.strip_prefix("blake3:").expect("prefix").to_string(),
@@ -2076,6 +2151,7 @@ fn content_hash_via(agent: &Agent, lane: LaneId, cap: &CapHandle) -> String {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -2083,6 +2159,7 @@ fn hex(bytes: &[u8]) -> String {
 /// R2-BND-03: a record exported for module A restores onto a kernel that
 /// installed module B at the same object id — the restore is refused, not
 /// rebound.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
     let (agent_a, owner) = module_agent();
@@ -2124,6 +2201,7 @@ fn a_restore_refuses_a_module_cap_bound_for_a_different_module() {
 /// R2-BND-03: a record exported for module A restores onto a kernel whose
 /// module provider holds nothing — the restore is refused at the restore,
 /// not at the first call.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_refuses_a_module_cap_when_the_object_does_not_exist() {
     let (agent_a, owner) = module_agent();
@@ -2154,6 +2232,7 @@ fn a_restore_refuses_a_module_cap_when_the_object_does_not_exist() {
 
 /// R2-BND-03: the same module on another kernel restores, and evaluates to
 /// the module it was minted for.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
     let (agent_a, owner) = module_agent();
@@ -2196,6 +2275,7 @@ fn a_restore_succeeds_for_the_same_module_on_another_kernel() {
 /// R2-BND-03 (design step 5): a record exported before a patch must not
 /// silently rebind to the patched module. The sealed address is the hash at
 /// export, and the patch changes it.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_refuses_a_record_exported_before_a_patch() {
     let (agent, owner) = module_agent();
@@ -2263,6 +2343,7 @@ fn a_restore_refuses_a_record_exported_before_a_patch() {
 /// R2-BND-03: the sealed address for a secret-bearing module is the redacted
 /// projection's hash — never the raw hash of the secret image, or the record
 /// itself would carry an offline equality oracle over the secret.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_sealed_record_carries_the_redacted_hash_for_a_secret_module() {
     let module = secret_module("s3cr3t-value");
@@ -2326,6 +2407,7 @@ fn a_sealed_record_carries_the_redacted_hash_for_a_secret_module() {
 
 /// R2-BND-03: an export for a provider that serves no modules seals no hash,
 /// and restores exactly as before.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_export_for_a_provider_that_serves_no_modules_seals_no_hash() {
     let (agent, _provider, cap) = durable_agent();
@@ -2347,6 +2429,7 @@ fn an_export_for_a_provider_that_serves_no_modules_seals_no_hash() {
 /// still rebind to a different module at the same id. That is the documented
 /// migration bridge, not the fix: a deployment that needs the binding
 /// re-exports the record. It refuses when the object does not exist.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
     let (agent_a, owner) = module_agent();
@@ -2394,6 +2477,7 @@ fn a_legacy_record_without_a_hash_restores_when_the_object_exists() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_legacy_record_without_a_hash_refuses_when_the_object_does_not_exist() {
     let (agent_a, owner) = module_agent();
@@ -2432,6 +2516,7 @@ fn a_legacy_record_without_a_hash_refuses_when_the_object_does_not_exist() {
 /// `restore_capability` refuses without a store: the "already restored" set
 /// is in-process only, so a no-store restore on a second kernel used to mint
 /// a second live grant for the full recorded budget (RPC-04, SEC-F3).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_restore_without_a_store_is_refused_on_a_second_kernel() {
     use active_rpc::persistence::MemoryRecordStore;
@@ -2481,6 +2566,7 @@ fn a_restore_without_a_store_is_refused_on_a_second_kernel() {
 /// The explicit opt-in keeps the old behaviour under its own name: a
 /// single-process deployment restores once per kernel, and a repeat restore
 /// in the same kernel is still refused (RPC-04).
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_in_process_only_restore_still_restores_once_per_kernel() {
     let (agent, _provider, cap) = durable_agent();

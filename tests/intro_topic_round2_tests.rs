@@ -9,7 +9,8 @@ use std::rc::Rc;
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::channel::{Channel, ChannelStats, Direction};
-use active_rpc::identity::{AdmittedIdentity, IdentityPolicy, PeerIdentity};
+#[cfg(feature = "test-utils")]
+use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::kernel::Provider;
 use active_rpc::value::{Call, Response, Value};
 use active_rpc::{Agent, Budget, ProviderId};
@@ -38,6 +39,7 @@ fn agent() -> (Agent, ProviderId) {
 }
 
 /// 2.1 - a wall clock has to be read before a deadline is compared.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_expired_capability_cannot_publish_send_attenuate_or_be_introduced() {
     let (agent, provider) = agent();
@@ -48,7 +50,10 @@ fn an_expired_capability_cannot_publish_send_attenuate_or_be_introduced() {
     let lane = agent.create_lane("clock", Budget::default()).expect("lane");
     agent.subscribe(lane, channel).expect("subscribe");
     let peer = IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(b"peer-a")), false)
+        .admit(
+            Some(&PeerIdentity::from_certificate_for_test(b"peer-a")),
+            false,
+        )
         .expect("admitted");
 
     let expiring = |agent: &Agent| {
@@ -138,6 +143,7 @@ fn a_channel_view_carries_no_messages() {
 }
 
 /// 2.4 - an imported handle is not ownership.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_imported_handle_cannot_introduce_authority() {
     let (agent, provider) = agent();
@@ -146,7 +152,10 @@ fn an_imported_handle_cannot_introduce_authority() {
         .expect("mint");
     let borrowed = agent.import(cap.id());
     let peer = IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(b"peer-b")), false)
+        .admit(
+            Some(&PeerIdentity::from_certificate_for_test(b"peer-b")),
+            false,
+        )
         .expect("admitted");
     assert_eq!(
         agent
@@ -359,13 +368,4 @@ fn a_message_carries_a_bounded_number_of_capabilities() {
             .code(),
         "rpc/invalid-argument"
     );
-}
-
-/// The identity type is public so a test can build one; this keeps the import
-/// used when the peer is admitted from a policy.
-#[allow(dead_code)]
-fn admitted(certificate: &[u8]) -> AdmittedIdentity {
-    IdentityPolicy::strict()
-        .admit(Some(&PeerIdentity::from_certificate(certificate)), false)
-        .expect("admitted")
 }

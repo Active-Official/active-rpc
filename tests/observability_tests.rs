@@ -5,9 +5,10 @@ use active_rpc::observability::{
     label, project, EVENT_NAMES, MAX_LABEL_BYTES, METRICS_SCHEMA, SCHEMA,
 };
 use active_rpc::value::{Arg, Call, Response, Value};
+#[cfg(feature = "test-utils")]
+use active_rpc::PeerIdentity;
 use active_rpc::{
-    Agent, Budget, CapId, ChannelId, Event, IdentityPolicy, LaneId, PeerIdentity, PromiseId,
-    Provider, ProviderId,
+    Agent, Budget, CapId, ChannelId, Event, IdentityPolicy, LaneId, PromiseId, Provider, ProviderId,
 };
 
 struct Echo;
@@ -192,13 +193,16 @@ fn the_projection_carries_correlation_ids_and_never_raw_authority() {
     }
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_kernel_trace_has_monotonic_sequences_and_no_raw_ids() {
     let agent = Agent::with_secret([0x61; 32]);
     let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = IdentityPolicy::default()
         .admit(
-            Some(&PeerIdentity::from_certificate(b"observability-peer")),
+            Some(&PeerIdentity::from_certificate_for_test(
+                b"observability-peer",
+            )),
             true,
         )
         .expect("admitted");
@@ -279,13 +283,16 @@ fn metrics_json_matches_the_kernel_counters() {
     assert_eq!(json["gauges"]["jobs"], agent.job_count());
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn identity_refusals_are_counted_and_visible() {
     let agent = Agent::with_secret([0x63; 32]);
     let provider = agent.register(Box::new(Echo)).expect("register provider");
     let alice = IdentityPolicy::default()
         .admit(
-            Some(&PeerIdentity::from_certificate(b"alice-observability")),
+            Some(&PeerIdentity::from_certificate_for_test(
+                b"alice-observability",
+            )),
             true,
         )
         .expect("admitted");

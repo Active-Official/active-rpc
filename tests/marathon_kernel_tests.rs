@@ -108,11 +108,12 @@ fn an_idempotent_replay_is_refused_after_revoke() {
 
 /// A caller-supplied binding that disagrees with the admitted peer is refused
 /// instead of silently overwritten.
+#[cfg(feature = "test-utils")]
 #[test]
 fn mint_bound_refuses_a_conflicting_binding() {
     use active_rpc::identity::{IdentityPolicy, PeerIdentity};
     let (agent, provider, _lane) = agent();
-    let peer = PeerIdentity::from_certificate(b"peer-a");
+    let peer = PeerIdentity::from_certificate_for_test(b"peer-a");
     let admitted = IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit");

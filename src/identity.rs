@@ -14,6 +14,15 @@
 //! The fingerprint is a domain-separated Blake3 digest of the peer certificate,
 //! not the X.509 SHA-256 thumbprint. It is a public label: it identifies a peer,
 //! it never authorises one. Authority stays in the capability registry.
+//!
+//! Provenance is part of the identity (RPC-55): a `MutualTls` identity is only
+//! *verified* when a transport built it from a certificate chain the TLS stack
+//! verified for this connection (`PeerIdentity::is_verified`). The public
+//! `PeerIdentity::from_certificate` builds an unverified claim from raw bytes
+//! (a fingerprint label, never authority), and [`IdentityPolicy::admit`]
+//! refuses it. The only other verified producer is the `test-utils` feature's
+//! `PeerIdentity::from_certificate_for_test`, test scaffolding that must never
+//! be enabled in a shipped build.
 
 use crate::error::{Error, Result};
 
@@ -33,7 +42,10 @@ const FINGERPRINT_DOMAIN: &[u8] = b"active-rpc/peer-identity/v1\0";
 /// How a peer proved who it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum IdentityKind {
-    /// Mutual TLS (QUIC or TLS) with a verified client certificate.
+    /// Mutual TLS (QUIC or TLS) with a client certificate. The kind names the
+    /// mechanism, not the proof: whether the chain was verified is
+    /// [`PeerIdentity::is_verified`], and [`IdentityPolicy::admit`] only accepts
+    /// a verified certificate identity (RPC-55).
     MutualTls,
     /// Loopback peer admitted by policy rather than by a certificate.
     Loopback,
@@ -57,34 +69,93 @@ impl IdentityKind {
 /// Build one only from evidence the transport actually verified: a certificate
 /// chain, a TLS exporter, or an explicit loopback decision. A caller-supplied
 /// string is not an identity.
+///
+/// Provenance is part of the value (RPC-55): a verified identity and an
+/// unverified claim for the same certificate are distinct values (equality
+/// includes `verified`), though they share a fingerprint, which is exactly the
+/// binding key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerIdentity {
     kind: IdentityKind,
     subject: String,
     fingerprint: [u8; FINGERPRINT_LEN],
+    /// True only when a transport built this identity from a certificate chain
+    /// the TLS stack verified for this connection - or when the `test-utils`
+    /// test constructor built it. The field is private, so no caller outside
+    /// this module can set it (RPC-55).
+    verified: bool,
 }
 
 impl PeerIdentity {
-    /// Identity from a certificate a transport verified.
+    /// Identity from a certificate's bytes - an unverified CLAIM, not proof.
     ///
-    /// `certificate` is the DER encoding the transport authenticated; only its
-    /// digest is retained, so the identity is safe to log and compare. The
-    /// default subject is a short certificate label; use
+    /// `certificate` is the DER encoding the caller *claims* is a certificate;
+    /// only its digest is retained, so the identity is safe to log and compare.
+    /// The default subject is a short certificate label; use
     /// [`PeerIdentity::with_subject`] to attach the principal a deployment
     /// extracted from the certificate's SAN.
     ///
-    /// This is record-keeping, not proof: it cannot tell whether the chain was
-    /// verified. Only a transport that verified it may call this, and the kernel
-    /// treats the value as the caller's claim about its own connection. Pass the
-    /// authenticated certificate's DER, never a placeholder, a proxy header or a
-    /// configuration string: every caller that passes the same bytes is the same
-    /// principal and can exercise the others' bound capabilities. An empty
+    /// This performs no verification of any kind (RPC-55): it does not parse
+    /// X.509, check a chain, an expiry, a revocation, or a SAN, and it cannot
+    /// tell whether the caller holds the certificate's key - a certificate is
+    /// public, so the same bytes from any caller name the same principal.
+    /// [`IdentityPolicy::admit`] therefore refuses a `MutualTls` identity built
+    /// here: authority needs a transport that verified the chain, which builds
+    /// the identity through `PeerIdentity::from_verified_certificate` (in-crate;
+    /// see `transport::quic::peer_identity`). Use this constructor only for a
+    /// fingerprint label - comparing against a binding, or presenting a peer to
+    /// a raw entry point in a test - and use
+    /// `PeerIdentity::from_certificate_for_test` (feature `test-utils`) when a
+    /// test needs an admitted peer. Pass the authenticated certificate's DER,
+    /// never a placeholder, a proxy header or a configuration string: every
+    /// caller that passes the same bytes is the same principal and can exercise
+    /// the others' bound capabilities through the raw entry points. An empty
     /// buffer is treated as no identity at all.
     pub fn from_certificate(certificate: &[u8]) -> Self {
-        // An empty buffer is not evidence of anything. Returning a `MutualTls`
-        // identity for it would give every caller that passed an empty exporter,
-        // proxy header or config string *one shared* bindable fingerprint — the
-        // same wildcard class as the all-zero binding, wearing a cert label.
+        Self::from_cert_bytes(certificate, false)
+    }
+
+    /// Identity from a certificate the transport verified (in-crate only).
+    ///
+    /// Only a transport may call this, and only with the leaf of a chain the
+    /// TLS stack verified for this connection (`transport::quic::peer_identity`).
+    /// The returned identity is [`PeerIdentity::is_verified`] and
+    /// [`IdentityPolicy::admit`] accepts it as [`TrustLevel::Authenticated`]
+    /// (RPC-55). An empty buffer is treated as no identity at all, exactly as
+    /// in [`PeerIdentity::from_certificate`].
+    ///
+    /// No production caller exists in a build without the `quic` transport
+    /// (the only in-crate caller is `transport::quic::peer_identity`); the
+    /// kernel's unit tests still call it in every build, so the lint is
+    /// silenced only where no production caller can exist.
+    #[cfg_attr(not(feature = "quic"), allow(dead_code))]
+    pub(crate) fn from_verified_certificate(certificate: &[u8]) -> Self {
+        Self::from_cert_bytes(certificate, true)
+    }
+
+    /// Identity from a certificate for tests only (feature `test-utils`).
+    ///
+    /// Test scaffolding, not a transport: it builds a *verified* identity from
+    /// raw bytes so the kernel's binding tests can build admitted peers without
+    /// a live transport. NEVER enable `test-utils` in a shipped build - it
+    /// re-opens RPC-55 exactly as `from_certificate` used to, by letting any
+    /// caller mint a bindable identity for any fingerprint. An empty buffer is
+    /// treated as no identity at all, exactly as in
+    /// [`PeerIdentity::from_certificate`].
+    #[cfg(feature = "test-utils")]
+    pub fn from_certificate_for_test(certificate: &[u8]) -> Self {
+        Self::from_cert_bytes(certificate, true)
+    }
+
+    /// Shared construction for the three certificate constructors: the
+    /// fingerprint is the digest of the bytes, the subject is a short label,
+    /// and only `verified` differs. An empty buffer is not evidence of
+    /// anything - returning a `MutualTls` identity for it would give every
+    /// caller that passed an empty exporter, proxy header or config string
+    /// *one shared* bindable fingerprint, the same wildcard class as the
+    /// all-zero binding, wearing a cert label - so it is an anonymous
+    /// identity, which is never verified whatever the caller asked for.
+    fn from_cert_bytes(certificate: &[u8], verified: bool) -> Self {
         if certificate.is_empty() {
             return Self::anonymous();
         }
@@ -94,6 +165,7 @@ impl PeerIdentity {
             kind: IdentityKind::MutualTls,
             subject,
             fingerprint,
+            verified,
         }
     }
 
@@ -104,7 +176,9 @@ impl PeerIdentity {
     /// Recomputing it here would break every binding made before the name was
     /// attached. Two identities for the same certificate with different subjects
     /// are distinct values (equality includes the subject) but share a
-    /// fingerprint, which is exactly the binding key.
+    /// fingerprint, which is exactly the binding key. Provenance is preserved:
+    /// renaming a verified identity keeps it verified, and renaming a claim
+    /// keeps it a claim.
     ///
     /// The label is bounded to [`MAX_SUBJECT_BYTES`] and any control, line
     /// separator or bidi character is escaped, because the same string is
@@ -125,6 +199,7 @@ impl PeerIdentity {
             kind: IdentityKind::Loopback,
             subject: "loopback".to_string(),
             fingerprint: loopback_fingerprint(),
+            verified: false,
         }
     }
 
@@ -134,12 +209,22 @@ impl PeerIdentity {
             kind: IdentityKind::Anonymous,
             subject: "anonymous".to_string(),
             fingerprint: [0u8; FINGERPRINT_LEN],
+            verified: false,
         }
     }
 
     /// How the identity was established.
     pub fn kind(&self) -> IdentityKind {
         self.kind
+    }
+
+    /// True only when a transport built this identity from a certificate chain
+    /// the TLS stack verified for this connection - or when the `test-utils`
+    /// test constructor built it (RPC-55). [`IdentityPolicy::admit`] accepts a
+    /// `MutualTls` identity only when this is true; a loopback or anonymous
+    /// identity is never verified.
+    pub fn is_verified(&self) -> bool {
+        self.verified
     }
 
     /// Verified principal name.
@@ -316,7 +401,8 @@ impl AdmittedIdentity {
 
     /// True when a capability may be bound to this peer.
     ///
-    /// Only a **certificate** peer can hold a binding. A loopback peer is shared
+    /// Only a **verified certificate** peer can hold a binding: `admit` refuses
+    /// an unverified certificate identity (RPC-55). A loopback peer is shared
     /// by every local process and an unauthenticated peer is nobody in
     /// particular, so a capability bound to either would be usable by a peer
     /// that never proved anything. An unbound capability works for both.
@@ -373,10 +459,23 @@ impl IdentityPolicy {
         // `None` and `Unauthenticated` when it passed `anonymous()`.
         let peer = peer.filter(|identity| !identity.is_anonymous());
         match peer {
-            Some(identity) if identity.kind() == IdentityKind::MutualTls => Ok(AdmittedIdentity {
-                identity: identity.clone(),
-                trust: TrustLevel::Authenticated,
-            }),
+            Some(identity) if identity.kind() == IdentityKind::MutualTls => {
+                // RPC-55: the kind names the mechanism, not the proof. A
+                // certificate is public, so any caller can present the bytes of
+                // a certificate it does not hold; only an identity a transport
+                // built from a chain the TLS stack verified (or the test-utils
+                // test constructor built) may be authenticated.
+                if identity.is_verified() {
+                    Ok(AdmittedIdentity {
+                        identity: identity.clone(),
+                        trust: TrustLevel::Authenticated,
+                    })
+                } else {
+                    Err(Error::Identity(
+                        "certificate identity was not verified by a transport",
+                    ))
+                }
+            }
             Some(identity) if identity.kind() == IdentityKind::Loopback => {
                 if loopback && self.trust_loopback {
                     Ok(AdmittedIdentity {

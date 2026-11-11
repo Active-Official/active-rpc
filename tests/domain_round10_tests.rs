@@ -1764,6 +1764,7 @@ fn a_wide_table_is_refused_against_the_node_ceiling_before_the_walk() {
 /// Revoking a sibling durable capability must not release the export pin of a
 /// restorable record on the same object: the provided object must stay alive
 /// for the restore (round 37, A).
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_sibling_revoke_does_not_release_an_export_pin() {
     let mut module = InfinityModule::new();
@@ -1782,7 +1783,9 @@ fn a_sibling_revoke_does_not_release_an_export_pin() {
     attrs.persistence = active_rpc::CapPersistence::Durable;
     let owner = active_rpc::IdentityPolicy::default()
         .admit(
-            Some(&active_rpc::PeerIdentity::from_certificate(b"pin-owner")),
+            Some(&active_rpc::PeerIdentity::from_certificate_for_test(
+                b"pin-owner",
+            )),
             true,
         )
         .expect("admitted");

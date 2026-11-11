@@ -11,6 +11,7 @@
 
 use active_rpc::cap::CapAttrs;
 use active_rpc::channel::Direction;
+#[cfg(feature = "test-utils")]
 use active_rpc::identity::{IdentityPolicy, PeerIdentity};
 use active_rpc::kernel::Provider;
 use active_rpc::value::{Call, Response, Value};
@@ -100,13 +101,15 @@ fn fixture(ttl_ms: Option<u64>) -> Fixture {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> active_rpc::AdmittedIdentity {
-    let peer = PeerIdentity::from_certificate(certificate);
+    let peer = PeerIdentity::from_certificate_for_test(certificate);
     IdentityPolicy::default()
         .admit(Some(&peer), true)
         .expect("admit")
 }
 
+#[cfg(feature = "test-utils")]
 fn peer(certificate: &[u8]) -> PeerIdentity {
     PeerIdentity::from_certificate(certificate)
 }
@@ -179,6 +182,7 @@ fn call_that_expires_between_queue_and_dispatch_never_reaches_the_provider() {
     assert_code(promise.value(), "rpc/revoked");
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn call_as_refuses_a_bound_capability_for_the_wrong_or_missing_peer() {
     let agent = Agent::with_secret([0x53; 32]);
@@ -276,6 +280,7 @@ fn publish_refuses_an_expired_capability() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn publish_as_enforces_the_identity_binding() {
     let agent = Agent::with_secret([0x54; 32]);
@@ -359,6 +364,7 @@ fn send_refuses_a_revoked_capability() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn send_as_refuses_revoked_expired_and_bound_capabilities() {
     let agent = Agent::with_secret([0x55; 32]);
@@ -452,6 +458,7 @@ fn attenuate_refuses_a_revoked_or_expired_parent() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[test]
 fn introduce_to_refuses_a_revoked_or_expired_capability() {
     let live = fixture(None);

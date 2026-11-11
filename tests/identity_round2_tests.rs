@@ -2,9 +2,9 @@
 //! certificate is not an identity, and the policy is a path a transport can use.
 
 use active_rpc::cap::CapAttrs;
-use active_rpc::identity::{
-    AdmittedIdentity, IdentityKind, IdentityPolicy, PeerIdentity, TrustLevel,
-};
+#[cfg(feature = "test-utils")]
+use active_rpc::identity::AdmittedIdentity;
+use active_rpc::identity::{IdentityKind, IdentityPolicy, PeerIdentity, TrustLevel};
 use active_rpc::value::{Arg, Call, Response, Value};
 use active_rpc::wire::{Envelope, Kind};
 use active_rpc::{Agent, Budget, Provider};
@@ -34,15 +34,20 @@ impl Provider for Echo {
     }
 }
 
+#[cfg(feature = "test-utils")]
 fn admitted(certificate: &[u8]) -> AdmittedIdentity {
     IdentityPolicy::default()
-        .admit(Some(&PeerIdentity::from_certificate(certificate)), false)
+        .admit(
+            Some(&PeerIdentity::from_certificate_for_test(certificate)),
+            false,
+        )
         .expect("admitted")
 }
 
 /// A call queued before the capability was bound must not run after it: the
 /// binding is authority withdrawn from the queued caller, and dispatch is where
 /// revocation and expiry are enforced.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_queued_call_does_not_survive_a_later_binding() {
     let agent = Agent::with_secret([0x71; 32]);
@@ -69,6 +74,7 @@ fn a_queued_call_does_not_survive_a_later_binding() {
 }
 
 /// The same call, queued by the peer it was bound to, still runs.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_queued_call_from_the_bound_peer_still_runs() {
     let agent = Agent::with_secret([0x72; 32]);
@@ -153,6 +159,7 @@ fn local_policy_labels_a_loopback_peer_as_loopback() {
 
 /// A revoked descendant is dead authority; its binding must not block the
 /// introduction of a live parent forever.
+#[cfg(feature = "test-utils")]
 #[test]
 fn a_revoked_descendant_does_not_block_introduction() {
     let agent = Agent::with_secret([0x74; 32]);
@@ -231,6 +238,7 @@ fn the_dispatch_helper_admits_before_it_dispatches() {
 
 /// Expiry is monotonic, so an expired-and-bound descendant would block the
 /// introduction of a live parent forever if it were not skipped.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_expired_descendant_does_not_block_introduction() {
     let agent = Agent::with_secret([0x76; 32]);
@@ -267,6 +275,7 @@ fn an_expired_descendant_does_not_block_introduction() {
 /// An idempotency key names the principal that claimed it: a replay from another
 /// peer must be a clean `rpc/identity`, not a cached promise whose job was
 /// stamped for the first caller.
+#[cfg(feature = "test-utils")]
 #[test]
 fn an_idempotency_key_belongs_to_the_peer_that_claimed_it() {
     let agent = Agent::with_secret([0x77; 32]);
