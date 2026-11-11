@@ -82,6 +82,7 @@ dependencies = [
  "active-rpc",
  "blake3",
  "libfuzzer-sys",
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -96,6 +97,7 @@ dependencies = [
 name = "active-rpc-process-tree"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "windows-sys 0.61.2",
 ]
 

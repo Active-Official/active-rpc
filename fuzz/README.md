@@ -1,8 +1,9 @@
 # Fuzzing
 
-Sixteen targets cover framing, authorization, promises, budgets, tools, channels,
+Nineteen targets cover framing, authorization, promises, budgets, tools, channels,
 bulk transfer, replay packages, topics, receipts, the WASM sandbox, the module
-provider, the durable record parser and transports. Every target drives the real
+provider, the durable record parser, transports, the QUIC handshake, TCP
+framing and identity binding. Every target drives the real
 kernel or adapter and asserts an invariant, not only "did not crash".
 
 | Target | Surface | Invariant |
@@ -23,6 +24,9 @@ kernel or adapter and asserts an invariant, not only "did not crash".
 | `fuzz_wasm_module` | module bytes, fuel, imports | construction is total; the sandbox refuses a huge table; a run is bounded (the clock is embedder-seeded, so a failure reproduces from the input; entropy is disabled) |
 | `fuzz_domain_module` | `ModuleProvider` install and path lookup | the image parser is total; a fuzzed path answers or refuses, never panics; `evaluate` / `patch` run time-boxed on small images (RPC-26), and the redaction oracle inspects answer bytes for secrets instead of formatting them |
 | `fuzz_persistence_record` | `CapabilityRecord` JSON and seal | the parser is total and canonical; a seal never verifies under a key it did not use; an edited record breaks it |
+| `fuzz_quic_handshake` | QUIC handshake, mutual TLS, identity binding | a mutated trust root or client credential is refused; two peers get distinct verified identities; a mutated payload gets one well-formed frame or a catalogued refusal |
+| `fuzz_tcp_framing` | TCP length-prefix framing over `TcpTransport` | framing is total and a fixed point; a hostile frame is answered or the peer closes, and the listener still serves; an answer for another request is refused |
+| `fuzz_identity_binding` | identity, fingerprint binding, introduction | a claim never verifies; admission is exactly the policy matrix; fingerprints never confuse two peers; an introduction is canonical |
 
 The transplant invariant holds across kernels with **different** secrets. Two
 kernels sharing a secret are one authority domain and derive the same ids by
@@ -75,7 +79,10 @@ Seeds are committed under `fuzz/corpus/<target>/`:
 - a real `ARRL` log with header-only and truncated variants, plus the input that
   found the writer/reader disagreement, for the receipt target;
 - empty, memory-only, trapping and truncated WebAssembly modules;
-- a small shared-memory frame and a length-prefixed gRPC frame.
+- a small shared-memory frame and a length-prefixed gRPC frame;
+- a mode-selecting byte stream for the QUIC handshake target, a
+  length-prefixed frame for the TCP framing target, and a 32-byte
+  admit-matrix input for the identity binding target.
 
 Every fixed bug adds a minimized seed named after the checklist item. Seeds are
 deterministic and treated as hostile input. `c10-transplant-distinct-secret.bin`

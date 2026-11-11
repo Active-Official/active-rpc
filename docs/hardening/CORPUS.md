@@ -25,7 +25,7 @@ shape as committed seeds so libFuzzer starts from valid structure.
 
 ## Fuzz targets
 
-Sixteen structure-aware targets. `fuzz/README.md` is the primary table; this one
+Nineteen structure-aware targets. `fuzz/README.md` is the primary table; this one
 records the corpus each target starts from. `tests/fuzz_manifest_tests.rs`
 fails if a lane (a workflow, the fuzz README, this file or the runner script)
 omits a target the manifest declares.
@@ -48,6 +48,9 @@ omits a target the manifest declares.
 | `fuzz_wasm_module` | `fuzz_targets/fuzz_wasm_module.rs` | four module classes | construction total, oversize module and huge table refused, bounded run with an embedder-seeded clock and entropy disabled |
 | `fuzz_domain_module` | `fuzz_targets/fuzz_domain_module.rs` | module images and paths | the image parser is total; every domain method answers or refuses (`evaluate` / `patch` time-boxed on small images, RPC-26) |
 | `fuzz_persistence_record` | `fuzz_targets/fuzz_persistence_record.rs` | sealed and edited records | parser total and canonical, seal only under its own key |
+| `fuzz_quic_handshake` | `fuzz_targets/fuzz_quic_handshake.rs` | mode-selecting byte stream | mutated trust root or client credential refused, two peers distinct and verified, mutated payload one frame or a catalogued refusal |
+| `fuzz_tcp_framing` | `fuzz_targets/fuzz_tcp_framing.rs` | length-prefixed frame | framing total and a fixed point, hostile frame answered or peer closes with the listener still serving, wrong-id answer refused |
+| `fuzz_identity_binding` | `fuzz_targets/fuzz_identity_binding.rs` | 32-byte admit-matrix input | a claim never verifies, admission exactly the policy matrix, fingerprints never confuse two peers, introduction canonical |
 
 `common.rs` holds the deterministic `Echo` provider and budget helpers; it is
 not a target. `fuzz/Cargo.toml` declares each binary.

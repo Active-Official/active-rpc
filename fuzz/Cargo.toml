@@ -21,6 +21,9 @@ active-rpc = { path = "..", version = "2.3.0", default-features = false, feature
 # replay body in its checksum so mutations reach the body parser.
 active-infinity = "2.4.0"
 blake3 = "1.5"
+# The QUIC handshake target forges certificates and keys from mutated bytes,
+# so it names the DER types directly instead of borrowing them through quinn.
+rustls-pki-types = "1"
 
 [[bin]]
 name = "fuzz_arp1_frame"
@@ -130,6 +133,27 @@ bench = false
 [[bin]]
 name = "fuzz_persistence_record"
 path = "fuzz_targets/fuzz_persistence_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_quic_handshake"
+path = "fuzz_targets/fuzz_quic_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tcp_framing"
+path = "fuzz_targets/fuzz_tcp_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_identity_binding"
+path = "fuzz_targets/fuzz_identity_binding.rs"
 test = false
 doc = false
 bench = false

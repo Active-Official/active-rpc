@@ -58,7 +58,19 @@ impl Provider for Echo {
 /// be sure the secret differs: `data` and `data` with byte 0 flipped can never
 /// produce the same secret, while an unrelated seed may (a seed of all `0x06`
 /// expands to exactly the same 32 bytes as a one-byte seed of `0x06`).
+///
+/// An empty seed falls back to `EMPTY_SEED` instead of the all-zero secret:
+/// cycling an empty slice yielded nothing, so every slot stayed 0 and any
+/// target that called `agent(data)` on empty input built a zero-secret
+/// kernel (TEST-06, F-R20-3). Every target guards empty input first, so the
+/// bug was latent, not live — but a helper that cannot produce a zero secret
+/// removes the hazard class instead of relying on every caller remembering
+/// the guard. The fallback is deterministic and documented, so the empty
+/// seed reproduces exactly like any other seed.
+pub const EMPTY_SEED: &[u8] = b"fuzz-empty-seed";
+
 pub fn secret(seed: &[u8]) -> [u8; 32] {
+    let seed = if seed.is_empty() { EMPTY_SEED } else { seed };
     let mut secret = [0u8; 32];
     for (slot, byte) in secret.iter_mut().zip(seed.iter().cycle()) {
         *slot = *byte;
