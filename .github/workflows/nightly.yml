@@ -108,3 +108,44 @@ jobs:
           cargo llvm-cov report --json --output-path coverage.json
           python3 scripts/coverage_gate.py coverage.json
           exit ${test_exit:-0}
+
+  coverage-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
+      - name: Install cargo-llvm-cov
+        # Pinned for the same reason as cargo-fuzz.
+        run: cargo install cargo-llvm-cov --version 0.6.19 --locked
+      - name: Coverage floor (Windows)
+        # Same split as the Linux `coverage` job above (TEST-01): the test
+        # and report phases are split, because one failing binary used to
+        # stop the run before any report existed, so the gate never ran at
+        # all. --no-fail-fast runs every binary; the report is then built
+        # from the collected profraw data regardless of test outcomes; the
+        # test exit code is kept and re-raised at the end, so a test
+        # failure still fails this job (TEST-01).
+        #
+        # PowerShell form: windows-latest runs `run:` blocks in pwsh, so
+        # the Linux job's bash `|| test_exit=$?` / `exit ${test_exit:-0}`
+        # idiom does not apply. $LASTEXITCODE is captured after each
+        # native command; a report or gate failure exits immediately, and
+        # the test exit code is re-raised last. A gate failure is never
+        # masked by a passing test run, and a test failure is never masked
+        # by a passing gate.
+        #
+        # The gate runs against the WINDOWS baseline
+        # (docs/hardening/coverage-baseline-windows.json), not the Linux
+        # one: the uncovered-function lists are platform-specific, and the
+        # Linux baseline flags legitimately Windows-uncovered spans
+        # (receipts.rs:1103, :661) on a Windows report (TEST-02). Each
+        # platform's report is gated against its own platform's baseline.
+        run: |
+          $testExit = 0
+          cargo llvm-cov --locked --all-features --no-fail-fast --no-report
+          if ($LASTEXITCODE -ne 0) { $testExit = $LASTEXITCODE }
+          cargo llvm-cov report --json --output-path coverage.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python3 scripts/coverage_gate.py --baseline docs/hardening/coverage-baseline-windows.json coverage.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          exit $testExit

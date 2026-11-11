@@ -5,6 +5,8 @@ Usage:
     cargo llvm-cov --locked --all-features --json --output-path coverage.json
     python scripts/coverage_gate.py coverage.json
 
+    python scripts/coverage_gate.py --baseline docs/hardening/coverage-baseline-windows.json coverage.json
+
     python scripts/coverage_gate.py --update-baseline coverage.json
 
 Checks, in order:
@@ -54,14 +56,23 @@ coverage, and review the diff before committing it. A coverage drop that
 is real (not toolchain noise) must be fixed by adding tests, not by
 re-baselining.
 
-The baseline is generated from the CI platform's report (Linux, in
-``nightly.yml``), and the gate is a single-platform gate: the floors
-apply on any platform, but the uncovered-function lists are
-platform-specific. A function covered on Linux through platform-gated
-code (a Unix file-lock path, for instance) is legitimately uncovered on
-Windows, and the gate will flag it there. That is a platform gap to
-record, not a regression: run the gate on the CI platform to judge a
-change, and compare the other platform's numbers against the floors.
+Two baselines exist, one per platform the coverage is measured on
+(TEST-02): ``docs/hardening/coverage-baseline.json`` (Linux, the
+``coverage`` job in ``nightly.yml``) and
+``docs/hardening/coverage-baseline-windows.json`` (Windows, the
+``coverage-windows`` job in ``nightly.yml``). Pass ``--baseline`` to
+select one; the default is the Linux baseline. The floors apply on any
+platform, but the uncovered-function lists are platform-specific, so
+each platform's report is gated against its own platform's baseline. A
+function covered on Linux through platform-gated code (a Unix file-lock
+path, for instance) is legitimately uncovered on Windows, and the Linux
+baseline flags it there (receipts.rs:1103 and :661 on a Windows
+report): that is a platform gap to record, not a regression.
+``--update-baseline`` regenerates whichever baseline ``--baseline``
+names. A macOS baseline does not exist yet: no macOS host is available
+to measure one, so macOS coverage is not gated (the macOS gate in
+ci.yml compiles and tests; it does not measure coverage). That is a
+TEST-02 follow-up, not a gap in this gate.
 """
 
 from __future__ import annotations
