@@ -18,7 +18,7 @@
         "src/cap.rs:255-255",
         "src/cap.rs:256-256",
         "src/cap.rs:336-336",
-        "src/cap.rs:515-515"
+        "src/cap.rs:522-522"
       ]
     },
     "src/identity.rs": {
@@ -89,7 +89,8 @@
         "src/receipts.rs:2813-2813",
         "src/receipts.rs:3506-3506",
         "src/receipts.rs:661-661",
-        "src/receipts.rs:726-726"
+        "src/receipts.rs:726-726",
+        "src/receipts.rs:908-908"
       ]
     },
     "src/replay.rs": {

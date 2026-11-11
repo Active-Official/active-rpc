@@ -367,6 +367,13 @@ impl CapAttrs {
     /// - A parent without a tool policy is compared through
     ///   [`CapAttrs::effective_tool_policy`], so a "narrowing" policy can never
     ///   add process execution or widen the parent's byte ceiling.
+    ///
+    /// This relation is not transitive: a parent bound to one peer, an
+    /// unbound middle, and a child bound to another peer are pairwise
+    /// monotone, but the child is not an attenuation of the parent. Do not
+    /// validate a delegation chain link by link with this predicate; use
+    /// [`CapAttrs::attenuate`], which composes (a property test pins the
+    /// composition law, TEST-07 / F1-NF-09).
     pub fn is_attenuation_of(&self, parent: &CapAttrs) -> bool {
         let methods_ok = self.methods.is_subset(&parent.methods) && !self.methods.is_empty();
         let persistence_ok = self.persistence != CapPersistence::Durable

@@ -3600,6 +3600,41 @@ mod lock_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A lock file that is not a lock at all is still steal-attempted, not
+    /// wedged: `take_stale` records the moved nonce as "missing" when the
+    /// quarantined file has no readable nonce, and the file is restored when
+    /// the judgement does not match (TEST-07 coverage gate: this pins the
+    /// `unwrap_or_else(|| "missing")` branch in `take_stale`; an empty file
+    /// does NOT reach it -- `read_lock` still parses an empty file as
+    /// `Some(("", None))` -- so the body must be non-empty and
+    /// non-lock-shaped).
+    #[test]
+    fn the_steal_of_a_lock_without_a_nonce_reports_missing() {
+        let path = scratch("no-nonce");
+        let lock_path = lock_of(&path);
+        std::fs::write(&lock_path, b"not a lock at all").expect("foreign lock");
+
+        assert!(
+            !super::take_stale(&lock_path, "judged-1", None),
+            "a lock with no nonce is not the judged one"
+        );
+        // Restored, not deleted and not orphaned: the move was undone.
+        assert!(lock_path.exists(), "the unjudged lock is restored");
+        assert_eq!(
+            std::fs::read(&lock_path).expect("restored lock"),
+            b"not a lock at all",
+            "the restored lock is byte-identical"
+        );
+        let quarantine = lock_path.with_file_name(format!(
+            "{}.stale-judged-1",
+            lock_path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!quarantine.exists(), "no quarantine file is left behind");
+
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The write path checks ownership itself, not only the acquire path: a
     /// writer displaced during the state walk must not append a second chain
     /// (R-13 round 10, A). The check lives in `write_all`, so this drives the
@@ -4095,6 +4130,20 @@ mod round11_tests {
         let error = open_log_read(&link).expect_err("refused");
         assert_eq!(error.code(), "rpc/receipt");
         assert_eq!(std::fs::read(&target).expect("victim"), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing log is a refusal, not a panic: `open_log_read` maps the
+    /// failed open to `rpc/receipt` (TEST-07 coverage gate: this pins the
+    /// `map_err` branch in `open_log_read`, which the reparse-point test
+    /// does not reach -- there the open succeeds and the attribute check
+    /// refuses instead).
+    #[test]
+    fn the_read_open_refuses_a_missing_log() {
+        let dir = scratch_dir("missing-read");
+        let missing = dir.join("no-such-log.arrl");
+        let error = open_log_read(&missing).expect_err("a missing log is refused");
+        assert_eq!(error.code(), "rpc/receipt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
