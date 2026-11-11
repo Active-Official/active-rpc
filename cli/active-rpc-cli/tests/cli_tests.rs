@@ -1374,3 +1374,53 @@ fn doctor_reports_the_compiled_in_features() {
         stdout(&output)
     );
 }
+
+/// RPC-56: `receipts show` prints the caller's 128-bit prefix for a peer
+/// call, and nothing for a local or anonymous one.
+#[test]
+fn receipts_show_names_the_caller() {
+    use active_rpc::receipts::{Decision, Receipt, ReceiptLog};
+    let dir = sandbox("rpc56-caller");
+    let path = dir.join("caller.arrl");
+    let log = ReceiptLog::create(&path).expect("create");
+    log.append(
+        &Receipt {
+            sequence: 1,
+            cap: "0011223344556677".to_string(),
+            method: "echo".to_string(),
+            at_ms: 1,
+            decision: Decision::Admitted,
+            mac: [0u8; 32],
+            caller: Some([0xabu8; 16]),
+        },
+    )
+    .expect("append peer receipt");
+    log.append(
+        &Receipt {
+            sequence: 2,
+            cap: "0011223344556677".to_string(),
+            method: "echo".to_string(),
+            at_ms: 2,
+            decision: Decision::Admitted,
+            mac: [0u8; 32],
+            caller: None,
+        },
+    )
+    .expect("append local receipt");
+    drop(log);
+    let show = run(&["receipts", "show", path.to_str().expect("log path")]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let shown = stdout(&show);
+    let lines: Vec<&str> = shown.lines().collect();
+    assert_eq!(lines.len(), 3, "{shown}");
+    assert!(
+        lines[1].contains(&format!("caller={}", "ab".repeat(16))),
+        "the peer receipt names its caller: {}",
+        lines[1]
+    );
+    assert!(
+        !lines[2].contains("caller="),
+        "the local receipt names no caller: {}",
+        lines[2]
+    );
+}

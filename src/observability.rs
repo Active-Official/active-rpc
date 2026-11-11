@@ -8,7 +8,7 @@
 //!
 //! Two documents are versioned here:
 //!
-//! - [`SCHEMA`] `active-rpc/observability/2`: one JSON object per kernel event.
+//! - [`SCHEMA`] `active-rpc/observability/3`: one JSON object per kernel event.
 //! - [`METRICS_SCHEMA`] `active-rpc/metrics/1`: a point-in-time counter snapshot.
 //!
 //! The event names are part of the schema. [`EVENT_NAMES`] is the closed set, and
@@ -21,12 +21,15 @@ use crate::kernel::{Event, Metrics};
 
 /// Observability event schema version.
 ///
-/// v2 (RPC-46) adds the call-lifecycle `method` label and the queued
-/// `args_bytes` count. No field was renamed or removed: a v1 reader ignores
-/// the fields it does not know, but the version moves because consumers that
-/// assert exact field sets (the control plane's event match, the projection
-/// tests) must be updated with the shape, not silently left behind.
-pub const SCHEMA: &str = "active-rpc/observability/2";
+/// v3 (RPC-56) adds the caller identity prefix on `call.queued`: the first
+/// 128 bits of the presented fingerprint, as `identity`, when the call
+/// arrived from an authenticated peer. v2 (RPC-46) added the call-lifecycle
+/// `method` label and the queued `args_bytes` count. No field was renamed or
+/// removed: a v1 reader ignores the fields it does not know, but the version
+/// moves because consumers that assert exact field sets (the control plane's
+/// event match, the projection tests) must be updated with the shape, not
+/// silently left behind.
+pub const SCHEMA: &str = "active-rpc/observability/3";
 /// Metrics snapshot schema version.
 pub const METRICS_SCHEMA: &str = "active-rpc/metrics/1";
 
@@ -127,6 +130,13 @@ impl TraceEvent {
     /// Argument bytes the queued call was charged for, if any.
     pub fn args_bytes(&self) -> Option<u64> {
         self.args_bytes
+    }
+
+    /// Caller of the queued call, when it arrived from an authenticated peer:
+    /// the first 128 bits of the presented fingerprint as 32 lowercase hex
+    /// characters (RPC-56). Absent for a local call and for an anonymous peer.
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
     }
 
     /// JSON object for this event.
@@ -292,6 +302,7 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             cap,
             method,
             args_bytes,
+            caller,
         } => {
             trace.event = "call.queued";
             trace.job = Some(*job);
@@ -302,6 +313,11 @@ pub fn project(event: &Event, sequence: u64) -> TraceEvent {
             // refused and completed labels for the same call (RPC-46).
             trace.method = Some(method.clone());
             trace.args_bytes = Some(*args_bytes);
+            // The caller is the first 128 bits of the presented fingerprint,
+            // as 32 lowercase hex characters (RPC-56): the same public label
+            // the receipt seals and the replay trace carries. Absent for a
+            // local call and for an anonymous peer.
+            trace.identity = caller.as_ref().map(crate::identity::fingerprint_prefix_hex);
         }
         Event::CallRefused {
             lane,

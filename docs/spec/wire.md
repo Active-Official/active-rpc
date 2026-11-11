@@ -861,7 +861,9 @@ A record carries the decision the kernel took at dispatch
 (`admitted` or `refused` plus an `rpc/...` code), because a call that was queued
 and then refused is evidence of a refusal. Records carry correlation ids, method
 names, times and decisions; they never carry arguments, values, capability ids
-or secret material.
+or secret material. A record for a call from an authenticated peer also carries
+the first 128 bits of the caller's fingerprint, as an optional trailing field
+(RPC-56); a local or anonymous call carries none.
 
 ### Replay package (`ARRP`)
 
@@ -876,7 +878,12 @@ op_count u32   ops...       trace_count u32  traces...   checksum blake3[32]
 An operation is `SetLatency`, `Mint`, `Attenuate`, `Call` or `Revoke`; a call
 records the method and the size of the text value replay synthesizes, never
 the argument. The kernel's charged wire size is a different number and is in
-the `call.queued` trace entry. The trace is
+the `call.queued` trace entry, which also names the caller (the first 128 bits
+of the presented fingerprint) when the call arrived from an authenticated peer.
+Replay is identity-blind by design: the recorder has no introduction operation
+and replays every call as anonymous, so `replay()` refuses a package whose
+recorded trace contains a `cap.introduced` entry rather than replaying it
+approximately (RPC-56). The trace is
 the decision stream plus one `op.*` input entry per operation, so an edit to a
 grant, a TTL, a latency or a refused call's method does not match a replayed
 trace. The recorder, the encoder and the decoder share one set of limits

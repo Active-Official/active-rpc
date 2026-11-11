@@ -451,6 +451,11 @@ impl ReplayPackage {
     /// refusal), so they do not abort the replay; a mismatch aborts with the
     /// first differing entry.
     ///
+    /// Replay is identity-blind by design (RPC-56): a package whose recorded
+    /// trace contains a `cap.introduced` entry is refused here, before any
+    /// operation runs, because the recorder has no introduction operation
+    /// and replays every call as anonymous.
+    ///
     /// The trace pins the inputs: every operation appends an `op.*` entry
     /// derived from its own fields, so a package edited without re-running the
     /// replay no longer matches its own trace. Comparing the replayed operation
@@ -510,6 +515,22 @@ impl ReplayPackage {
         if self.ops.first() != Some(&Op::SetLatency(self.latency_ms)) {
             return Err(Error::Replay(
                 "the package does not begin with its header latency".into(),
+            ));
+        }
+        // Replay is identity-blind by design (RPC-56): the recorder has no
+        // Introduce operation and replays every call as anonymous, so a
+        // package whose recorded trace names an introduced peer cannot be
+        // replayed faithfully. Refuse it outright with the reason named,
+        // rather than letting the trace comparison fail later with a bare
+        // length mismatch that hides why. A recorder-produced package can
+        // never carry one: no recording path introduces a capability.
+        if self
+            .trace
+            .iter()
+            .any(|entry| entry.event.starts_with("cap.introduced:"))
+        {
+            return Err(Error::Replay(
+                "the package records a capability introduced to a peer; replay is identity-blind and cannot reproduce it".into(),
             ));
         }
         // The ceilings `decode` enforces, over the fields replay consumes:
@@ -1230,12 +1251,22 @@ fn trace_of(event: &Event, ordinals: &mut BTreeMap<CapId, u32>) -> Trace {
             cap,
             method,
             args_bytes,
+            caller,
             ..
         } => Trace {
             // The method and the charged size are what a queued call asked for;
             // without them a package could be edited from one granted method to
-            // another and still compare equal.
-            event: format!("call.queued:{method}:{args_bytes}"),
+            // another and still compare equal. The caller prefix (RPC-56) is
+            // the same: two calls for the same method by different peers must
+            // not compare equal, and a replay runs anonymous, so a recorded
+            // peer call can never replay equal -- fail-closed, not silent.
+            event: match caller {
+                Some(prefix) => format!(
+                    "call.queued:{method}:{args_bytes}:caller={}",
+                    crate::identity::fingerprint_prefix_hex(prefix)
+                ),
+                None => format!("call.queued:{method}:{args_bytes}"),
+            },
             cap: ordinal(*cap),
         },
         Event::BatchDispatched { .. } => Trace {
@@ -1626,6 +1657,40 @@ mod tests {
         assert!(left.event.starts_with("cap.introduced:"));
         // 32 hex characters, plus the prefix and the colon.
         assert_eq!(left.event.len(), "cap.introduced:".len() + 32);
+    }
+
+    /// RPC-56: the queued-call trace names the caller, so two calls for
+    /// the same method by different peers do not compare equal -- and the
+    /// same prefix is the same caller, because the prefix is the whole label.
+    #[test]
+    fn two_calls_by_different_peers_are_distinct_in_the_trace() {
+        let mut ordinals = BTreeMap::new();
+        let queued = |caller: Option<[u8; 16]>, ordinals: &mut BTreeMap<CapId, u32>| {
+            trace_of(
+                &Event::CallQueued {
+                    job: 0,
+                    lane: LaneId(0),
+                    cap: CapId([1u8; 16]),
+                    method: "echo".to_string(),
+                    args_bytes: 5,
+                    caller,
+                },
+                ordinals,
+            )
+        };
+        let anonymous = queued(None, &mut ordinals);
+        assert_eq!(anonymous.event, "call.queued:echo:5");
+        let first = queued(Some([0x11u8; 16]), &mut ordinals);
+        assert_eq!(
+            first.event,
+            "call.queued:echo:5:caller=11111111111111111111111111111111"
+        );
+        let mut second_prefix = [0x11u8; 16];
+        second_prefix[15] ^= 0x01;
+        let second = queued(Some(second_prefix), &mut ordinals);
+        assert_ne!(first.event, second.event, "{first:?} and {second:?}");
+        // The same prefix is the same caller: the prefix is the whole label.
+        assert_eq!(first.event, queued(Some([0x11u8; 16]), &mut ordinals).event);
     }
 }
 

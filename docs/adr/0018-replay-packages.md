@@ -184,6 +184,22 @@ write, and an interrupted write leaves the previous artifact intact.
   - `Recorder::trace()` after poisoning returns the partial decision log.
     `poisoned()` (and `package()`'s refusal) is the signal that it is partial.
 
+## Amendment (RPC-56, 2026-11-10)
+
+Replay is identity-blind by design, and the package format now says so in
+code. The recorder has no introduction operation and replays every call as
+anonymous, so a session that depended on a binding cannot be replayed
+faithfully: the re-executed call runs as anonymous. `replay()` (and
+`replay_trace()`, which funnels through the same path) refuses a package
+whose recorded trace contains a `cap.introduced` entry, before any operation
+runs, rather than letting the trace comparison fail later with a bare length
+mismatch that hides why. A recorder-produced package can never carry one: no
+recording path introduces a capability, so the refusal only fires on
+hand-built or edited packages. The `call.queued` trace entry also names the
+caller when present (`call.queued:<method>:<bytes>:caller=<32 hex>`), so two
+calls for the same method by different peers no longer compare equal; an
+anonymous call keeps the exact old string.
+
 ## Consequences
 
 - `active_rpc::replay` exposes `Recorder`, `ReplayPackage`, `Op` and `Trace`.

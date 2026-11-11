@@ -39,6 +39,7 @@ fn a_well_formed_receipt_log_reads_back() {
         at_ms: 1,
         decision: Decision::Admitted,
         mac: [0u8; 32],
+        caller: None,
     };
     let second = Receipt {
         sequence: 2,
@@ -47,6 +48,7 @@ fn a_well_formed_receipt_log_reads_back() {
         at_ms: 2,
         decision: Decision::Refused("rpc/unknown-capability".to_string()),
         mac: [1u8; 32],
+        caller: None,
     };
     log.append(&first).expect("append the first receipt");
     log.append(&second).expect("append the second receipt");

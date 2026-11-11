@@ -2038,9 +2038,17 @@ fn receipts_show(path: &str, limit: usize) -> CliResult {
     ))?;
     for receipt in snapshot.receipts().iter().take(limit) {
         // The method is quoted: it is stored text, and a raw newline would turn
-        // one record into two lines of "evidence".
+        // one record into two lines of "evidence". The caller is the 128-bit
+        // prefix of the presented fingerprint (RPC-56); an anonymous or local
+        // call prints nothing there, so its line is byte-identical to before.
+        let caller = receipt
+            .caller
+            .map(|prefix| {
+                format!(" caller={}", active_rpc::identity::fingerprint_prefix_hex(&prefix))
+            })
+            .unwrap_or_default();
         out_line(format!(
-            "{} {} {} {} {:?} {}",
+            "{} {} {} {} {:?} {}{}",
             receipt.sequence,
             receipt.at_ms,
             receipt.cap,
@@ -2049,7 +2057,8 @@ fn receipts_show(path: &str, limit: usize) -> CliResult {
             match &receipt.decision {
                 active_rpc::receipts::Decision::Refused(code) => code.as_str(),
                 active_rpc::receipts::Decision::Admitted => "",
-            }
+            },
+            caller
         ))?;
     }
     Ok(())

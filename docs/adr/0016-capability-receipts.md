@@ -16,7 +16,7 @@ A kernel can enable receipts (`Agent::enable_receipts`). Every call that reaches
 dispatch appends a `Receipt` to a bounded ring (`MAX_RECEIPTS = 1024`):
 
 ```text
-sequence u64 | cap correlation id | method | at_ms u64 | decision | mac [32]
+sequence u64 | cap correlation id | method | at_ms u64 | decision | caller? [u8; 16] | mac [32]
 ```
 
 - The mac is `blake3::keyed_hash(derive_receipt_key(kernel_secret), domain || fields)`. It proves
@@ -24,7 +24,7 @@ sequence u64 | cap correlation id | method | at_ms u64 | decision | mac [32]
   signature and is not intended to convince a third party that never shared the
   secret.
 - The capability appears as its correlation id, never its authority id.
-- Arguments, values, payloads and secrets never enter a receipt.
+- Arguments, values, payloads and secrets never enter a receipt. A call from an authenticated peer records the first 128 bits of the caller's fingerprint (RPC-56); a local or anonymous call records none.
 - Both outcomes are recorded. `Decision::Admitted` and
   `Decision::Refused(code)` carry the decision the kernel took at dispatch, so a
   call that was queued and then refused (revocation, expiry, identity, budget,

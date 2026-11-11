@@ -72,6 +72,11 @@ pub struct Receipt {
     pub at_ms: u64,
     /// What the kernel decided.
     pub decision: Decision,
+    /// Caller of the call this receipt records, when the call arrived from
+    /// an authenticated peer: the first 128 bits of the presented
+    /// fingerprint (RPC-56). `None` for a local call and for an anonymous
+    /// peer. A receipt that predates this field decodes with `None`.
+    pub caller: Option<[u8; crate::identity::FINGERPRINT_PREFIX_LEN]>,
     /// Keyed hash over the fields above.
     pub mac: [u8; 32],
 }
@@ -100,6 +105,7 @@ impl Receipt {
         method: &str,
         at_ms: u64,
         decision: Decision,
+        caller: Option<[u8; crate::identity::FINGERPRINT_PREFIX_LEN]>,
     ) -> Receipt {
         let mut receipt = Receipt {
             sequence,
@@ -107,6 +113,7 @@ impl Receipt {
             method: method.to_string(),
             at_ms,
             decision,
+            caller,
             mac: [0u8; 32],
         };
         receipt.mac = receipt.compute(key);
@@ -129,6 +136,8 @@ impl Receipt {
     ///
     /// A receipt that fails this could be sealed by the kernel and then refused
     /// by its own log, which would leave an audit trail that cannot be written.
+    /// The caller prefix is sixteen fixed bytes, so it is always representable
+    /// and needs no check here.
     pub fn fields_are_representable(&self) -> bool {
         valid_correlation_id(&self.cap)
             && valid_method(&self.method)
@@ -149,6 +158,14 @@ impl Receipt {
         hasher.update(&self.at_ms.to_le_bytes());
         hasher.update(&[self.decision.flag()]);
         hasher.update(self.decision.code().as_bytes());
+        // The caller seals with the receipt: a receipt that names a peer
+        // cannot be edited to name another (or none) without breaking the
+        // MAC. `None` contributes nothing, so a receipt sealed before this
+        // field existed verifies exactly as it did (RPC-56).
+        if let Some(caller) = &self.caller {
+            hasher.update(&[1]);
+            hasher.update(caller);
+        }
         *hasher.finalize().as_bytes()
     }
 }
@@ -2650,7 +2667,12 @@ fn read_stable(path: &std::path::Path) -> Result<(Vec<u8>, Vec<Receipt>, LogStat
 
 /// Encode one record: `len u32 | sequence u64 | at_ms u64 | decision u8 |
 /// code_len u16 | code | cap_len u16 | cap | method_len u16 | method | mac [32]
-/// | prev [32] | record_hash [32]`.
+/// | prev [32] | caller? [1 + 16] | record_hash [32]`.
+///
+/// The caller field is optional and trailing (RPC-56): a record without it
+/// is a receipt sealed before the field existed, or one for a local or
+/// anonymous call. Appending it last keeps every earlier byte where it was,
+/// so an old record still decodes and still verifies under the same MAC.
 fn encode_record(receipt: &Receipt, previous: &[u8; 32]) -> Result<Vec<u8>> {
     // The writer applies the reader's rules, and it applies *all* of them: a
     // record this accepts and the reader rejects would make the whole log
@@ -2676,6 +2698,13 @@ fn encode_record(receipt: &Receipt, previous: &[u8; 32]) -> Result<Vec<u8>> {
     body.extend_from_slice(receipt.method.as_bytes());
     body.extend_from_slice(&receipt.mac);
     body.extend_from_slice(previous);
+    // The caller prefix is an optional trailing field (RPC-56): a record
+    // without it is a receipt sealed before the field existed (or for a
+    // local/anonymous call), and the reader decodes it with `caller: None`.
+    if let Some(caller) = &receipt.caller {
+        body.push(1);
+        body.extend_from_slice(caller);
+    }
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(LOG_DOMAIN);
@@ -2772,6 +2801,28 @@ fn decode_record(bytes: &[u8], cursor: usize) -> Result<(Receipt, [u8; 32], [u8;
         .try_into()
         .expect("32 bytes");
     cursor += 32;
+    // Optional trailing caller prefix (RPC-56): absent on every record a
+    // writer sealed before the field existed, and on every receipt for a
+    // local or anonymous call. A present field is one flag byte (1) plus 16
+    // prefix bytes; any other shape is malformed, not a legacy record.
+    let caller = if cursor == body.len() {
+        None
+    } else {
+        let flag = *body
+            .get(cursor)
+            .ok_or_else(|| Error::receipt("truncated caller flag"))?;
+        cursor += 1;
+        if flag != 1 {
+            return Err(Error::receipt("malformed caller flag"));
+        }
+        let prefix: [u8; crate::identity::FINGERPRINT_PREFIX_LEN] = body
+            .get(cursor..cursor + crate::identity::FINGERPRINT_PREFIX_LEN)
+            .ok_or_else(|| Error::receipt("truncated caller prefix"))?
+            .try_into()
+            .expect("16 bytes");
+        cursor += crate::identity::FINGERPRINT_PREFIX_LEN;
+        Some(prefix)
+    };
     if cursor != body.len() {
         return Err(Error::receipt("trailing bytes in a record"));
     }
@@ -2818,6 +2869,7 @@ fn decode_record(bytes: &[u8], cursor: usize) -> Result<(Receipt, [u8; 32], [u8;
             method,
             at_ms,
             decision,
+            caller,
             mac,
         },
         previous,
@@ -3014,6 +3066,7 @@ mod walk_tests {
                 at_ms: index,
                 decision: Decision::Admitted,
                 mac: [0u8; 32],
+                caller: None,
             };
             let encoded = encode_record(&receipt, &previous).expect("record");
             previous = encoded[encoded.len() - 32..]
@@ -3828,6 +3881,7 @@ mod future_tests {
             at_ms,
             decision: Decision::Admitted,
             mac: [0u8; 32],
+            caller: None,
         }
     }
 
@@ -3921,6 +3975,7 @@ mod path_validation_tests {
             at_ms,
             decision: Decision::Admitted,
             mac: [0u8; 32],
+            caller: None,
         }
     }
 

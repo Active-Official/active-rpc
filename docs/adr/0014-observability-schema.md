@@ -44,6 +44,17 @@ where it went and where it came from. `cap.exported` (the sealed record left) an
 left no trace of its own, and a restore read as a plain mint. Both carry only the
 correlation id, like every other capability event.
 
+## Addendum (2026-11-10): the caller prefix on `call.queued`
+
+The observability schema moves to `active-rpc/observability/3` (RPC-56).
+`call.queued` carries the `identity` field -- already in the schema for
+`cap.introduced` and `cap.rebound` -- with the first 128 bits of the caller's
+fingerprint (32 lowercase hex characters) when the call arrived from an
+authenticated peer, and omits it for a local or anonymous call. No field was
+renamed or removed; the version moves because a consumer that asserts exact
+field sets for `call.queued` must be updated with the shape, the same rule
+that moved v2 for the `method` label.
+
 ## Consequences
 
 - A support bundle, a CI log and a dashboard are safe to share by default. That

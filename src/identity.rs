@@ -29,6 +29,13 @@ use crate::error::{Error, Result};
 /// Length of a peer fingerprint in bytes.
 pub const FINGERPRINT_LEN: usize = 32;
 
+/// Length of the caller prefix recorded for a call (RPC-56): the first 128
+/// bits of a peer's fingerprint. A 128-bit prefix is the same representation
+/// the replay trace keeps for an introduced peer, and a targeted second
+/// preimage on 128 bits is 2^128 work, so the prefix identifies the caller
+/// for forensics without carrying the full fingerprint into telemetry.
+pub const FINGERPRINT_PREFIX_LEN: usize = 16;
+
 /// Longest subject label an identity keeps, in bytes.
 ///
 /// The subject reaches logs, JSON and the control plane; an unbounded principal
@@ -329,6 +336,24 @@ pub fn bindable(fingerprint: [u8; FINGERPRINT_LEN]) -> bool {
 pub fn presented_fingerprint(peer: Option<&PeerIdentity>) -> Option<[u8; FINGERPRINT_LEN]> {
     peer.filter(|identity| !identity.is_anonymous())
         .map(PeerIdentity::fingerprint)
+}
+
+/// The first 128 bits of a fingerprint: the caller label events, receipts
+/// and traces record (RPC-56). The full fingerprint stays in the kernel's
+/// binding checks; only the prefix leaves the kernel.
+pub fn fingerprint_prefix(fingerprint: [u8; FINGERPRINT_LEN]) -> [u8; FINGERPRINT_PREFIX_LEN] {
+    let mut prefix = [0u8; FINGERPRINT_PREFIX_LEN];
+    prefix.copy_from_slice(&fingerprint[..FINGERPRINT_PREFIX_LEN]);
+    prefix
+}
+
+/// Hex form of a caller prefix: 32 lowercase hex characters.
+pub fn fingerprint_prefix_hex(prefix: &[u8; FINGERPRINT_PREFIX_LEN]) -> String {
+    let mut out = String::with_capacity(FINGERPRINT_PREFIX_LEN * 2);
+    for byte in prefix {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// Compare a presented fingerprint with a bound one without a short circuit.

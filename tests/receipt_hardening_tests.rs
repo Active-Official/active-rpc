@@ -129,6 +129,7 @@ fn receipt(sequence: u64, at_ms: u64) -> Receipt {
         at_ms,
         decision: Decision::Admitted,
         mac: [0u8; 32],
+        caller: None,
     }
 }
 

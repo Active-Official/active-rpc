@@ -96,6 +96,7 @@ fn an_exported_log_round_trips_and_verifies() {
         at_ms: receipts[2].at_ms + 1,
         decision: active_rpc::receipts::Decision::Admitted,
         mac: receipts[0].mac,
+        caller: None,
     };
     log.append(&extra).expect("append one");
     assert_eq!(log.records().expect("records").len(), 4);
@@ -205,6 +206,7 @@ fn an_invalid_receipt_is_refused_at_append() {
         at_ms: 0,
         decision: active_rpc::receipts::Decision::Admitted,
         mac: [0u8; 32],
+        caller: None,
     };
     let error = log.append(&receipt).expect_err("bad correlation id");
     assert_eq!(error.code(), "rpc/receipt");

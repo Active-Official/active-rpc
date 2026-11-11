@@ -37,6 +37,7 @@ fn receipt(sequence: u64, method: &str) -> Receipt {
         at_ms: sequence,
         decision: Decision::Admitted,
         mac: [0u8; 32],
+        caller: None,
     }
 }
 

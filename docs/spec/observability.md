@@ -5,7 +5,7 @@ authority.
 
 | Schema | Emitted by | Shape |
 |--------|-----------|-------|
-| `active-rpc/observability/2` | `Agent::trace()`, `Agent::trace_json()` | one object per kernel event |
+| `active-rpc/observability/3` | `Agent::trace()`, `Agent::trace_json()` | one object per kernel event |
 | `active-rpc/metrics/1` | `Agent::metrics_json()` | counters and gauges |
 
 ## Hard rules
@@ -31,13 +31,13 @@ authority.
    the schema version still moves when the shape changes, so a consumer that
    asserts exact field sets is told to update instead of silently reading the
    old shape. v2 added the optional `method` label on the call-lifecycle
-   events and `args_bytes` on `call.queued` (RPC-46). Renaming a field is a
+   events and `args_bytes` on `call.queued` (RPC-46). v3 adds the optional `identity` caller prefix on `call.queued` (RPC-56). Renaming a field is a
    schema version bump.
 
 ## Event record
 
 ```json
-{"schema":"active-rpc/observability/2","sequence":42,"event":"call.refused",
+{"schema":"active-rpc/observability/3","sequence":42,"event":"call.refused",
  "lane":0,"cap":"9f1c0e2d4b6a8c31","method":"nope","code":"rpc/method-not-granted"}
 ```
 
@@ -67,7 +67,7 @@ represent is labelled, never dropped silently and never refused.
 | `method` | string | a call-lifecycle event (`call.queued`, `call.refused`, `job.completed`): the method the call named, as the bounded label the kernel records; absent on a refusal that names no call |
 | `args_bytes` | u64 | `call.queued`: the argument bytes the call was charged for (a refused call was never charged, so a refusal carries none; a completed job's bytes are on its queued record) |
 | `dimension` | string | a budget exhaustion or ceiling: `call`, `byte`, `lane call`, `lane byte`, `promises`, `jobs`, `caps`, `caps per message`, `lanes`, `channels`, `subscriptions`, `records`, `tombstones`, `nodes`, `keys`, `value`, `wall`, `depth`, `array_len`, `value_size`, `channel queue`, `args`, or `other` for a ceiling added without a label |
-| `identity` | string | a capability's peer: one fingerprint (a public label) for `cap.introduced`, or `from->to` for `cap.rebound`, which carries the same field twice |
+| `identity` | string | a capability's peer: one fingerprint (a public label) for `cap.introduced`, `from->to` for `cap.rebound`, which carries the same field twice, or the first 128 bits of the caller's fingerprint (32 lowercase hex characters) for `call.queued` |
 | `detail` | string | a short, value-free explanation (`"3 jobs in 2 lanes"`) |
 
 ## Event names
@@ -89,7 +89,7 @@ represent is labelled, never dropped silently and never refused.
 | `cap.transferred` | `cap`, `channel` | a capability travelled on a channel |
 | `lane.created` | `lane` | a lane was created |
 | `lane.destroyed` | `lane`, `detail` | a lane was destroyed; `detail` is the number of queued jobs dropped with it (their per-job events are coalesced into this one, receipts still record each refusal) |
-| `call.queued` | `job`, `lane`, `cap`, `method`, `args_bytes` | a call entered the queue |
+| `call.queued` | `job`, `lane`, `cap`, `method`, `args_bytes`, `identity` | a call entered the queue; `identity` is present when the call arrived from an authenticated peer |
 | `call.refused` | `lane`, `cap`, `method`, `code` | a call was refused before a provider saw it; `method` is absent when the refusal names no call |
 | `batch.dispatched` | `provider`, `detail` | one provider round-trip carrying a batch |
 | `job.completed` | `job`, `lane`, `method` | a dispatched job finished; `method` is the same label `call.queued` carried for the job, so the two records join on (`job`, `method`) |

@@ -83,6 +83,7 @@ fn every_event(cap: CapId) -> Vec<Event> {
             cap,
             method: "echo".to_string(),
             args_bytes: 4,
+            caller: None,
         },
         Event::CallRefused {
             lane,
@@ -606,6 +607,7 @@ fn the_projection_carries_method_and_args_bytes() {
             cap,
             method: "echo".to_string(),
             args_bytes: 4,
+            caller: None,
         },
         0,
     );

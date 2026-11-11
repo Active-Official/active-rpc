@@ -218,6 +218,7 @@ fn writer(data: &[u8]) {
         at_ms: u64::from(field(6, 0)),
         decision,
         mac: [field(7, 0); 32],
+        caller: None,
     };
     match log.append(&candidate) {
         Ok(()) => {
@@ -257,6 +258,7 @@ fuzz_target!(|data: &[u8]| {
             at_ms: 1,
             decision: Decision::Admitted,
             mac: [0u8; 32],
+            caller: None,
         };
         log.append(&receipt).expect("append");
         let bytes = std::fs::read(&path).expect("read");

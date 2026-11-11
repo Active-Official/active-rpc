@@ -399,6 +399,13 @@ pub enum Event {
         method: String,
         /// Argument bytes the call was charged for.
         args_bytes: u64,
+        /// Caller of the queued call, when the call arrived from an
+        /// authenticated peer: the first 128 bits of the presented
+        /// fingerprint (RPC-56). `None` for a local call and for an anonymous
+        /// peer, so an absent caller is absence, never a zero fingerprint.
+        /// The receipt for this job seals the same prefix, and the trace
+        /// carries it as `call.queued:<method>:<bytes>:caller=<hex>`.
+        caller: Option<[u8; crate::identity::FINGERPRINT_PREFIX_LEN]>,
     },
     /// A batch of jobs was dispatched to a provider (one round-trip).
     BatchDispatched {
@@ -4459,6 +4466,8 @@ impl Agent {
             cap: cap_id,
             method: method_event_label(method),
             args_bytes,
+            caller: crate::identity::presented_fingerprint(peer)
+                .map(crate::identity::fingerprint_prefix),
         });
         kernel.metrics.calls_queued = kernel.metrics.calls_queued.saturating_add(1);
         // Budgets are charged here, before the call is queued. Dispatch
@@ -7567,6 +7576,7 @@ impl Kernel {
             &receipt_method(&job.call.method),
             self.now_ms,
             decision,
+            job.identity.map(crate::identity::fingerprint_prefix),
         );
         self.receipts.push_back(receipt);
         if self.receipts.len() > crate::receipts::MAX_RECEIPTS {

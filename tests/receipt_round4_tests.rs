@@ -31,6 +31,7 @@ fn receipt(sequence: u64, method: &str) -> Receipt {
         at_ms: sequence,
         decision: Decision::Admitted,
         mac: [0u8; 32],
+        caller: None,
     }
 }
 
@@ -286,6 +287,7 @@ fn a_future_dated_receipt_is_refused_at_append() {
         at_ms,
         decision: Decision::Admitted,
         mac: [0u8; 32],
+        caller: None,
     };
     log.append(&at(1, 100)).expect("append seq 1");
     let err = log

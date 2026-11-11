@@ -29,6 +29,7 @@ record: len u32 LE | sequence u64 | at_ms u64
       | method_len u16 | method (UTF-8, 1..=1024 bytes)
       | mac [32]
       | previous [32]
+      | caller? [1 + 16] (RPC-56: flag 1 + first 128 bits of the caller's fingerprint; absent on older records and on local/anonymous calls)
       | record_hash [32]
 ```
 
@@ -117,9 +118,26 @@ After round 2: the writer cannot produce a record its reader rejects, a refusal
 always leaves a receipt, the key that proves a log is not the key that mints
 authority, and a crash costs at most one record.
 
+## Amendment (RPC-56, 2026-11-10)
+
+A receipt that cannot answer "which peer made this call" is an audit gap: the
+binding exists to make that question answerable. The record gains an optional
+trailing caller field -- one flag byte (`1`) plus the first 128 bits of the
+presented fingerprint -- written only when the call arrived from an
+authenticated peer. The log version stays 2: the field is appended last, so a
+record without it is exactly a v2 record, the reader decodes it with
+`caller: None`, and its MAC verifies exactly as it did. The receipt MAC seals
+the caller when present (`flag 1 || prefix` after the decision code) and
+contributes nothing when absent, so stripping or adding a caller breaks the
+MAC. A writer that produces a record its reader rejects is still impossible:
+`encode_record` applies the reader's rules, and the caller prefix is
+fixed-size bytes. `receipts show` prints `caller=<32 hex>` when present and
+nothing when absent, so an anonymous receipt's line is byte-identical to
+before.
+
 ## Consequences
 
-- The log holds correlation ids, method names, times and the decision. It never
+- The log holds correlation ids, method names, times and the decision, and, for a peer call, the caller's 128-bit fingerprint prefix. It never
   holds arguments, values, capability ids or secrets; `receipts.rs` refuses to
   encode a record whose correlation id is not 16 lowercase hex characters, whose
   method is empty or over 1 KiB or carries a control character, or whose refusal
