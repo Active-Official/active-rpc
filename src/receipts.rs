@@ -3088,6 +3088,278 @@ mod walk_tests {
         }
         assert_eq!(records, MAX_LOG_RECORDS, "the ceiling is the stop");
     }
+
+    /// One receipt, sealed with a refusal code and a caller prefix, as a
+    /// whole log: the shared fixture for the truncation and corruption tests
+    /// below (TEST-01).
+    fn one_record_log() -> Vec<u8> {
+        let receipt = Receipt {
+            sequence: 1,
+            cap: "0011223344556677".to_string(),
+            method: "echo".to_string(),
+            at_ms: 7,
+            decision: Decision::Refused("rpc/unknown-capability".to_string()),
+            mac: [0u8; 32],
+            caller: Some([0xabu8; 16]),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LOG_MAGIC);
+        bytes.push(LOG_VERSION);
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        assert_eq!(bytes.len(), LOG_HEADER_LEN);
+        let encoded = encode_record(&receipt, &[0u8; 32]).expect("record");
+        bytes.extend_from_slice(&encoded);
+        bytes
+    }
+
+    /// Every cut of a one-record log is refused, except the two cuts that are
+    /// whole logs (header-only and complete): a truncation inside any field
+    /// must fail the walk, never misparse and never panic (TEST-01). A cut
+    /// can only ever trip the record-length closures (`truncated record
+    /// length`, `truncated record`): the slice ends before any field is
+    /// read, so the per-field closures need a lying length prefix instead
+    /// -- see `shortened_record_lengths_are_refused_field_by_field`.
+    #[test]
+    fn every_truncation_of_a_record_is_refused() {
+        let bytes = one_record_log();
+        let total = bytes.len();
+        for cut in 0..=total {
+            let result = walk_log(&bytes[..cut]);
+            if cut == total || cut == LOG_HEADER_LEN {
+                assert!(result.is_ok(), "cut {cut} is a whole log and must walk");
+            } else {
+                assert!(result.is_err(), "cut {cut} truncates a field and must fail");
+            }
+        }
+        // The full log walks to exactly the one receipt, caller included.
+        let (receipts, _) = walk_log(&bytes).expect("whole log");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].decision,
+            Decision::Refused("rpc/unknown-capability".to_string())
+        );
+        assert_eq!(receipts[0].caller, Some([0xabu8; 16]));
+    }
+
+    /// Corrupt bytes in each text field are refused with the field's own
+    /// error, never misparsed and never panicking (TEST-01: the `map_err`
+    /// closures in `decode_record` were uncovered -- each mutation below
+    /// executes a different one). A record length outside the floor/ceiling
+    /// is refused the same way.
+    #[test]
+    fn corrupt_fields_are_refused_not_misparsed() {
+        let base = one_record_log();
+        // Field offsets are found, not assumed: the record is
+        // `length | sequence | at_ms | flag | code_len | code | cap_len |
+        // cap | method_len | method | mac | previous | caller? | hash`, and
+        // each text field holds a unique literal.
+        let code_at = base
+            .windows(b"rpc/unknown-capability".len())
+            .position(|window| window == b"rpc/unknown-capability")
+            .expect("code field");
+        let cap_at = base
+            .windows(b"0011223344556677".len())
+            .position(|window| window == b"0011223344556677")
+            .expect("cap field");
+        let method_at = base
+            .windows(b"echo".len())
+            .position(|window| window == b"echo")
+            .expect("method field");
+
+        // 1. A decision code that is not UTF-8.
+        let mut bad = base.clone();
+        bad[code_at] = 0xFF;
+        assert!(
+            walk_log(&bad).is_err(),
+            "a non-UTF-8 decision code must be refused"
+        );
+        // 2. A correlation id that is not UTF-8.
+        let mut bad = base.clone();
+        bad[cap_at] = 0xFF;
+        assert!(
+            walk_log(&bad).is_err(),
+            "a non-UTF-8 correlation id must be refused"
+        );
+        // 3. A method that is not UTF-8.
+        let mut bad = base.clone();
+        bad[method_at] = 0xFF;
+        assert!(
+            walk_log(&bad).is_err(),
+            "a non-UTF-8 method must be refused"
+        );
+        // 4. A record length below the floor.
+        let mut bad = base.clone();
+        bad[LOG_HEADER_LEN..LOG_HEADER_LEN + 4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(walk_log(&bad).is_err(), "a 3-byte record must be refused");
+        // 5. A record length above the ceiling.
+        let mut bad = base.clone();
+        bad[LOG_HEADER_LEN..LOG_HEADER_LEN + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(walk_log(&bad).is_err(), "a huge record must be refused");
+    }
+
+    /// Two records under a header that starts at `u64::MAX` overflow the
+    /// expected sequence on the second record (TEST-01: the `ok_or_else`
+    /// closure in `walk_log` was uncovered -- no writer can produce this
+    /// log, only a crafted header can).
+    #[test]
+    fn a_log_starting_at_the_sequence_ceiling_overflows_on_its_second_record() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LOG_MAGIC);
+        bytes.push(LOG_VERSION);
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut previous = [0u8; 32];
+        for _ in 0..2 {
+            let receipt = Receipt {
+                sequence: u64::MAX,
+                cap: "0011223344556677".to_string(),
+                method: "echo".to_string(),
+                at_ms: 0,
+                decision: Decision::Admitted,
+                mac: [0u8; 32],
+                caller: None,
+            };
+            let encoded = encode_record(&receipt, &previous).expect("record");
+            previous = encoded[encoded.len() - 32..]
+                .try_into()
+                .expect("32-byte hash");
+            bytes.extend_from_slice(&encoded);
+        }
+        let error = walk_log(&bytes).expect_err("the sequence must overflow");
+        assert_eq!(error.code(), "rpc/receipt");
+    }
+
+    /// A record whose declared length is shorter than the record the writer
+    /// sealed is refused field by field: the length prefix is rewritten to
+    /// land the body end inside each field in turn, and each rewrite must
+    /// fail with that field's own error, never a misparse and never a panic
+    /// (TEST-01: the per-field `ok_or_else` closures in `decode_record`
+    /// were uncovered -- a cut file can only ever trip the record-length
+    /// closures, because the slice ends before any field is read; only a
+    /// lying length prefix puts the slice end inside a field. The code is
+    /// 60 bytes long so the fields spread across the reachable body: the
+    /// first 55 body bytes are always present in any in-range record
+    /// (`MIN_LOG_RECORD` is 87), which is why the sequence, time, decision
+    /// and decision-length closures cannot fire at all and are not covered
+    /// here -- see the record for the proof).
+    #[test]
+    fn shortened_record_lengths_are_refused_field_by_field() {
+        let code = format!("rpc/unknown-capability-{}", "x".repeat(37));
+        assert_eq!(code.len(), 60, "the fixture code must be 60 bytes");
+        let receipt = Receipt {
+            sequence: 1,
+            cap: "0011223344556677".to_string(),
+            method: "echo".to_string(),
+            at_ms: 7,
+            decision: Decision::Refused(code),
+            mac: [0u8; 32],
+            caller: Some([0xabu8; 16]),
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LOG_MAGIC);
+        bytes.push(LOG_VERSION);
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let encoded = encode_record(&receipt, &[0u8; 32]).expect("record");
+        bytes.extend_from_slice(&encoded);
+        // Body layout with a 60-byte code: sequence 0..8, time 8..16, flag
+        // 16, code_len 17..19, code 19..79, cap_len 79..81, cap 81..97,
+        // method_len 97..99, method 99..103, mac 103..135, previous
+        // 135..167, caller flag 167, prefix 168..184. The record length is
+        // the body plus the 32-byte hash, so each length below puts the body
+        // end inside the named field.
+        for (length, message) in [
+            (92u32, "truncated decision code"),
+            (111, "truncated cap length"),
+            (129, "truncated method length"),
+            (131, "truncated method"),
+            (135, "truncated mac"),
+            (167, "truncated chain link"),
+            (200, "truncated caller prefix"),
+        ] {
+            let mut bad = bytes.clone();
+            bad[LOG_HEADER_LEN..LOG_HEADER_LEN + 4].copy_from_slice(&length.to_le_bytes());
+            let error = walk_log(&bad).expect_err("a shortened record must be refused");
+            assert!(
+                error.to_string().contains(message),
+                "length {length} must fail in the field that is cut short, not elsewhere: {error}"
+            );
+        }
+        // A record that ends exactly where the caller flag would start is a
+        // legacy record without a caller prefix, not a truncated one: the
+        // `cursor == body.len()` branch takes it, so the caller-flag closure
+        // cannot fire. It is still refused -- as a legacy record whose hash
+        // does not match -- and the hash is what must catch it.
+        let mut bad = bytes.clone();
+        bad[LOG_HEADER_LEN..LOG_HEADER_LEN + 4].copy_from_slice(&199u32.to_le_bytes());
+        let error = walk_log(&bad).expect_err("a shortened record must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("record hash does not match its contents"),
+            "length 199 parses as a legacy record and must fail on its hash: {error}"
+        );
+    }
+
+    /// Remove a file (and its `.lock` sibling) when the test ends, even on
+    /// panic, so a failing append test cannot leave a log behind.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            if let Some(name) = self.0.file_name() {
+                let lock = self
+                    .0
+                    .with_file_name(format!("{}.lock", name.to_string_lossy()));
+                let _ = std::fs::remove_file(lock);
+            }
+        }
+    }
+
+    /// Appending past the sequence ceiling is refused before anything is
+    /// written: a log whose header starts at `u64::MAX` cannot take even
+    /// one more receipt, and the second receipt of a batch trips the
+    /// `checked_add` in the append path (TEST-01: the `ok_or_else`
+    /// closure in `append_inner` was uncovered -- `create_starting_at`
+    /// refuses a start that close to the ceiling, so only a crafted
+    /// header can produce this log).
+    #[test]
+    fn appending_past_the_sequence_ceiling_is_refused() {
+        let path = std::env::temp_dir().join(format!(
+            "active-rpc-test01-ceiling-{}.arrl",
+            std::process::id()
+        ));
+        let _guard = RemoveOnDrop(path.clone());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(LOG_MAGIC);
+        bytes.push(LOG_VERSION);
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).expect("header-only log");
+        let log = ReceiptLog::open(&path).expect("a header-only log opens");
+        let receipt = Receipt {
+            sequence: u64::MAX,
+            cap: "0011223344556677".to_string(),
+            method: "echo".to_string(),
+            at_ms: 7,
+            decision: Decision::Admitted,
+            mac: [0u8; 32],
+            caller: None,
+        };
+        let error = log
+            .append_all(&[receipt.clone(), receipt])
+            .expect_err("an append past the ceiling must be refused");
+        assert!(
+            error.to_string().contains("receipt sequence overflows"),
+            "the append must fail on the sequence ceiling: {error}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).expect("log still exists").len() as usize,
+            LOG_HEADER_LEN,
+            "a refused batch must not write anything"
+        );
+    }
 }
 
 #[cfg(test)]

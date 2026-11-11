@@ -1,5 +1,130 @@
 {
-  "lines": 68.52,
-  "regions": 67.53,
-  "functions": 58.62
+  "lines": 88.2,
+  "regions": 88.72,
+  "functions": 84.84,
+  "files": {
+    "src/budget.rs": {
+      "lines": 93.98,
+      "functions": 89.47,
+      "uncovered_functions": [
+        "src/budget.rs:161-161",
+        "src/budget.rs:202-202"
+      ]
+    },
+    "src/cap.rs": {
+      "lines": 94.81,
+      "functions": 90.91,
+      "uncovered_functions": [
+        "src/cap.rs:255-255",
+        "src/cap.rs:256-256",
+        "src/cap.rs:336-336",
+        "src/cap.rs:515-515"
+      ]
+    },
+    "src/identity.rs": {
+      "lines": 92.31,
+      "functions": 96.49,
+      "uncovered_functions": [
+        "src/identity.rs:629-629",
+        "src/identity.rs:65-65"
+      ]
+    },
+    "src/kernel.rs": {
+      "lines": 89.39,
+      "functions": 94.44,
+      "uncovered_functions": [
+        "src/kernel.rs:1256-1256",
+        "src/kernel.rs:1681-1681",
+        "src/kernel.rs:1758-1758",
+        "src/kernel.rs:1814-1814",
+        "src/kernel.rs:182-182",
+        "src/kernel.rs:183-183",
+        "src/kernel.rs:1888-1888",
+        "src/kernel.rs:1986-1986",
+        "src/kernel.rs:2075-2075",
+        "src/kernel.rs:3604-3604",
+        "src/kernel.rs:3854-3854",
+        "src/kernel.rs:4857-4857",
+        "src/kernel.rs:6947-6947",
+        "src/kernel.rs:8635-8635",
+        "src/kernel.rs:8644-8644",
+        "src/kernel.rs:8705-8705",
+        "src/kernel.rs:8825-8825",
+        "src/kernel.rs:911-916",
+        "src/kernel.rs:9117-9117"
+      ]
+    },
+    "src/receipts.rs": {
+      "lines": 92.0,
+      "functions": 85.47,
+      "uncovered_functions": [
+        "src/receipts.rs:1106-1106",
+        "src/receipts.rs:1148-1148",
+        "src/receipts.rs:1222-1222",
+        "src/receipts.rs:1373-1373",
+        "src/receipts.rs:1439-1439",
+        "src/receipts.rs:1440-1440",
+        "src/receipts.rs:1749-1749",
+        "src/receipts.rs:1900-1900",
+        "src/receipts.rs:1907-1907",
+        "src/receipts.rs:2017-2017",
+        "src/receipts.rs:2027-2027",
+        "src/receipts.rs:2085-2085",
+        "src/receipts.rs:2095-2095",
+        "src/receipts.rs:2194-2194",
+        "src/receipts.rs:2237-2237",
+        "src/receipts.rs:2239-2239",
+        "src/receipts.rs:2273-2273",
+        "src/receipts.rs:2275-2275",
+        "src/receipts.rs:2366-2366",
+        "src/receipts.rs:2575-2575",
+        "src/receipts.rs:2688-2688",
+        "src/receipts.rs:2716-2716",
+        "src/receipts.rs:2734-2734",
+        "src/receipts.rs:2743-2743",
+        "src/receipts.rs:2750-2750",
+        "src/receipts.rs:2757-2757",
+        "src/receipts.rs:2761-2761",
+        "src/receipts.rs:2813-2813",
+        "src/receipts.rs:3506-3506",
+        "src/receipts.rs:652-652",
+        "src/receipts.rs:726-726",
+        "src/receipts.rs:864-864",
+        "src/receipts.rs:908-908"
+      ]
+    },
+    "src/replay.rs": {
+      "lines": 84.31,
+      "functions": 87.1,
+      "uncovered_functions": [
+        "src/replay.rs:1006-1006",
+        "src/replay.rs:1393-1393",
+        "src/replay.rs:1427-1427",
+        "src/replay.rs:1514-1514",
+        "src/replay.rs:1525-1525",
+        "src/replay.rs:1530-1530",
+        "src/replay.rs:1575-1575",
+        "src/replay.rs:1611-1611",
+        "src/replay.rs:1620-1620",
+        "src/replay.rs:569-569",
+        "src/replay.rs:727-727",
+        "src/replay.rs:779-779"
+      ]
+    },
+    "src/security.rs": {
+      "lines": 94.25,
+      "functions": 94.2,
+      "uncovered_functions": [
+        "src/security.rs:302-302",
+        "src/security.rs:310-310",
+        "src/security.rs:320-320",
+        "src/security.rs:416-416"
+      ]
+    },
+    "src/wire.rs": {
+      "lines": 97.06,
+      "functions": 100.0,
+      "uncovered_functions": []
+    }
+  }
 }

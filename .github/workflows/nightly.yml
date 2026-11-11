@@ -94,6 +94,17 @@ jobs:
         # Pinned for the same reason as cargo-fuzz.
         run: cargo install cargo-llvm-cov --version 0.6.19 --locked
       - name: Coverage floor
+        # Full JSON, not --summary-only: the per-file floors and the
+        # no-new-uncovered-function check in scripts/coverage_gate.py need
+        # the `files` and `functions` sections. The test and report phases
+        # are split: one failing binary used to stop the run before any
+        # report existed, so the gate never ran at all. --no-fail-fast runs
+        # every binary; the report is then built from the collected
+        # profraw data regardless of test outcomes; the test exit code is
+        # kept and re-raised at the end, so a test failure still fails
+        # this job (TEST-01).
         run: |
-          cargo llvm-cov --locked --all-features --json --summary-only --output-path coverage.json
+          cargo llvm-cov --locked --all-features --no-fail-fast --no-report || test_exit=$?
+          cargo llvm-cov report --json --output-path coverage.json
           python3 scripts/coverage_gate.py coverage.json
+          exit ${test_exit:-0}
