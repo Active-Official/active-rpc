@@ -516,3 +516,55 @@ fn status_and_registry_track_the_library_version() {
         }
     }
 }
+
+/// `CHANGELOG.md` must have exactly one `## Unreleased` section, at the top.
+///
+/// TEST-05: Infinity's changelog carried two `## Unreleased` sections; the
+/// second one — after `## 2.4.2` — hid hash-affecting canonical-form changes
+/// ("enum members … are sorted before interning", "node numbering orders
+/// bindings by name", "re-encode them to migrate"), so a changelog parser
+/// (or a human) reading top-down stopped at the first `Unreleased` and
+/// missed them. The Infinity half was already fixed by the INF-03 fix
+/// (aa2ba55), which merged the second block into the top one and marked its
+/// entries `### Changed (hash-affecting — re-encode required)`; this repo
+/// never grew a second block (its single heading is
+/// `## Unreleased - 2.3.0`), so there is no content to merge here — the
+/// gate is the fix on this side, so the same drift can never land
+/// unnoticed in this repo.
+///
+/// Two precision points, both load-bearing:
+/// * The count is over `## ` headings whose text starts with
+///   "Unreleased", not a file-wide `contains` — a stray "Unreleased"
+///   mention in prose must not satisfy the gate, and a second heading
+///   must fail it (the TEST-03 lesson — a plain `contains` check passes
+///   vacuously).
+/// * The single heading must be the FIRST `## ` heading in the file: a
+///   second block is exactly an `Unreleased` heading that is not first,
+///   so position is asserted, not just count.
+#[test]
+fn changelog_has_exactly_one_unreleased_section() {
+    let changelog = fs::read_to_string(repo_path("CHANGELOG.md")).expect("CHANGELOG.md");
+    let headings: Vec<&str> = changelog
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .collect();
+    assert!(
+        !headings.is_empty(),
+        "CHANGELOG.md must have at least one `## ` section heading"
+    );
+    let unreleased: Vec<&&str> = headings
+        .iter()
+        .filter(|heading| heading.starts_with("Unreleased"))
+        .collect();
+    assert_eq!(
+        unreleased.len(),
+        1,
+        "CHANGELOG.md must have exactly one `## Unreleased` section, found {}: {unreleased:?}",
+        unreleased.len()
+    );
+    assert!(
+        headings[0].starts_with("Unreleased"),
+        "the `## Unreleased` section must be the first section in CHANGELOG.md, found first heading: {}",
+        headings[0]
+    );
+}
