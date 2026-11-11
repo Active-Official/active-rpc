@@ -72,6 +72,11 @@ fn check_value_limits(value: &Value, limits: &WireLimits, remaining: &mut u64) -
 /// Shared by the envelope writer and the standalone table encoder so the two
 /// cannot drift: a descriptor method longer than the table's ceiling used to
 /// encode here and be refused by every reader (round 41, F3).
+///
+/// A method name must also satisfy [`crate::receipts::valid_method`], the
+/// same predicate `mint` enforces: the wire and the registry agree on what
+/// a valid descriptor is, so a decoded descriptor is always mintable
+/// (RPC-53, R01-2).
 fn check_descriptor(cap: &CapDescriptor, limits: &WireLimits) -> Result<()> {
     if cap.id.0 == [0u8; 16] {
         return Err(Error::CapabilityTable("zero capability id"));
@@ -91,6 +96,15 @@ fn check_descriptor(cap: &CapDescriptor, limits: &WireLimits) -> Result<()> {
         .any(|method| method.len() > limits.max_method as usize)
     {
         return Err(Error::CapabilityTable("method name exceeds the ceiling"));
+    }
+    if cap
+        .methods
+        .iter()
+        .any(|method| !crate::receipts::valid_method(method))
+    {
+        return Err(Error::CapabilityTable(
+            "method name is not a valid method name",
+        ));
     }
     if cap
         .path_scope
@@ -327,6 +341,12 @@ pub fn cap_table_hash(caps: &[CapDescriptor]) -> Result<[u8; 32]> {
 /// provider may hand back a large blob) and a derived formatter would dump it
 /// into every log line. Formatting shows sizes and a bounded method label
 /// (F-02).
+///
+/// Fields by kind (spec §1.1; RPC-53): a Request is a call and carries
+/// anything; a Response carries exactly one result value in `args` and no
+/// method, table or delta (its payload is the echo channel); an Error
+/// carries only its provider code in `method`; a Hello carries the
+/// capability table it announces and nothing else.
 #[derive(Clone, PartialEq)]
 pub struct Envelope {
     /// Envelope kind.
@@ -634,8 +654,74 @@ impl Envelope {
         Ok(out)
     }
 
+    /// Refuse an envelope whose kind cannot carry the fields it carries.
+    ///
+    /// The wire grammar by kind (RPC-53, R01-3; spec §1.1): a Request is the
+    /// only call, so it is the only kind that carries arguments, a payload,
+    /// a capability table and a delta freely. A Response carries exactly the
+    /// one result value — `response()` builds exactly one `Arg::Value` — and
+    /// no method, table or delta; its payload is the echo channel
+    /// (`thin_peer` returns the request payload in the response, and the
+    /// HTTP/2 test asserts the client receives it), so a payload on a
+    /// Response is legitimate. An Error carries only its provider code in
+    /// `method`. A Hello carries the capability table it announces and
+    /// nothing else: a delta applies to an already-negotiated table, and
+    /// Hello *is* the negotiation.
+    ///
+    /// Called from both `check_limits` (encode) and `decode_with` (decode):
+    /// encoding is the inverse of decoding, so a frame this crate would
+    /// refuse must be refused locally, not by the peer (round 39, L-7).
+    fn check_kind_fields(&self) -> Result<()> {
+        match self.kind {
+            Kind::Request => Ok(()),
+            Kind::Response => {
+                if !self.method.is_empty() {
+                    return Err(Error::Wire("a response carries no method name"));
+                }
+                if self.args.len() != 1 || !matches!(self.args.first(), Some(Arg::Value(_))) {
+                    return Err(Error::Wire("a response carries exactly one result value"));
+                }
+                if !self.caps.is_empty() {
+                    return Err(Error::Wire("a response carries no capability table"));
+                }
+                if self.cap_delta.is_some() {
+                    return Err(Error::Wire("a response carries no capability-table delta"));
+                }
+                Ok(())
+            }
+            Kind::Error => {
+                if !self.args.is_empty() {
+                    return Err(Error::Wire("an error carries no arguments"));
+                }
+                if !self.payload.is_empty() {
+                    return Err(Error::Wire("an error carries no payload"));
+                }
+                if !self.caps.is_empty() {
+                    return Err(Error::Wire("an error carries no capability table"));
+                }
+                if self.cap_delta.is_some() {
+                    return Err(Error::Wire("an error carries no capability-table delta"));
+                }
+                Ok(())
+            }
+            Kind::Hello => {
+                if !self.args.is_empty() {
+                    return Err(Error::Wire("a hello carries no arguments"));
+                }
+                if !self.payload.is_empty() {
+                    return Err(Error::Wire("a hello carries no payload"));
+                }
+                if self.cap_delta.is_some() {
+                    return Err(Error::Wire("a hello carries no capability-table delta"));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Refuse an envelope this crate's own decoder would refuse.
     fn check_limits(&self, limits: &WireLimits) -> Result<()> {
+        self.check_kind_fields()?;
         if self.method.len() > limits.max_method as usize {
             return Err(Error::Wire("method name exceeds the ceiling"));
         }
@@ -807,7 +893,7 @@ impl Envelope {
         if cursor != bytes.len() {
             return Err(Error::Wire("trailing bytes"));
         }
-        Ok(Envelope {
+        let envelope = Envelope {
             kind,
             request_id,
             method,
@@ -817,7 +903,9 @@ impl Envelope {
             redact: flags & FLAG_REDACT != 0,
             read_only: flags & FLAG_READ_ONLY != 0,
             cap_delta,
-        })
+        };
+        envelope.check_kind_fields()?;
+        Ok(envelope)
     }
 
     /// The first value argument, when present.
@@ -1282,6 +1370,15 @@ fn read_cap_inner(bytes: &[u8], cursor: &mut usize, limits: &WireLimits) -> Resu
                     "method names are not in canonical order",
                 ));
             }
+        }
+        // A name the mint refuses is not a descriptor method: the wire and
+        // the registry must agree, or a decoded descriptor is one no peer
+        // could have minted (RPC-53, R01-2). The check is the receipt
+        // predicate itself, not a second copy of its character rule.
+        if !crate::receipts::valid_method(&method) {
+            return Err(Error::CapabilityTable(
+                "method name is not a valid method name",
+            ));
         }
         methods.insert(method);
     }

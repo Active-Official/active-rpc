@@ -41,6 +41,16 @@ All integers are little-endian.
 | 3 | `Error` | a failure (method field carries the error code) |
 | 4 | `Hello` | capability handshake |
 
+Fields by kind: a `Request` is the only call, so it is the only kind that
+carries arguments, a payload, a capability table and a delta freely. A
+`Response` carries exactly one argument — the result value, its first
+argument — and no method name, capability table or delta; its payload is
+the echo channel (a peer may return the request payload in the response).
+An `Error` carries only its provider code in the method field. A `Hello`
+carries the capability table it announces and nothing else — no arguments,
+no payload, no delta. A frame that violates its kind's grammar is refused
+with `rpc/wire` (RPC-53).
+
 ### 1.2 Flags
 
 | Bit | Name | Meaning |
