@@ -1,6 +1,6 @@
 # ADR-0006 - Versioning and publishing
 
-**Status:** accepted (2026-10-27). Point 4 (MSRV) is superseded by [ADR-0007](0007-msrv.md), which is the source of truth for the minimum supported Rust version.
+**Status:** accepted (2026-10-27). Point 4 (MSRV) is superseded by [ADR-0007](0007-msrv.md), which is the source of truth for the minimum supported Rust version. Point 5 (yank rule) is amended by [ADR-0040](0040-yank-rule-retrospective.md), which is the retrospective ADR for the yank recorded in CHANGELOG.md 1.1.9 and the source of truth for the yank rule.
 
 ## Context
 

@@ -293,3 +293,71 @@ fn the_security_policy_lists_the_shipped_minor() {
         "SECURITY.md must say which version is supported"
     );
 }
+
+/// Every version the changelog names as yanked must have its ADR.
+///
+/// TEST-03: ADR-0006 required an ADR for any yank, and
+/// active-infinity 2.0.0 was yanked (CHANGELOG.md, 1.1.9) with no ADR at
+/// all. The gate reads every `yank` line in CHANGELOG.md, extracts the
+/// version(s) it names, and requires one numbered ADR to mention the
+/// version *in a yank context* — the version string and the word "yank"
+/// in the same file. The same-file requirement is load-bearing: ADR-0019
+/// mentions "2.0.0" only as wasmi's version, so a plain "some ADR
+/// mentions the version" check would have passed vacuously before this
+/// fix. The index (docs/adr/README.md) is not an ADR, so it is excluded
+/// from the scan: only files named `NNNN-*.md` count. A yank line that
+/// names no version fails outright, so a future yank cannot dodge the
+/// gate by omitting the version.
+#[test]
+fn every_yanked_version_has_an_adr() {
+    let changelog = fs::read_to_string(repo_path("CHANGELOG.md")).expect("CHANGELOG.md");
+    let adr_dir = repo_path("docs/adr");
+    let mut adrs: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&adr_dir).expect("docs/adr").flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let numbered = name.len() > 5
+            && name[..4].chars().all(|c| c.is_ascii_digit())
+            && name.as_bytes()[4] == b'-';
+        if numbered && path.extension().is_some_and(|extension| extension == "md") {
+            adrs.push(
+                fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {}", path.display())),
+            );
+        }
+    }
+    assert!(!adrs.is_empty(), "docs/adr must contain numbered ADR files");
+    let mut yanked: Vec<String> = Vec::new();
+    for line in changelog.lines() {
+        if !line.to_lowercase().contains("yank") {
+            continue;
+        }
+        let mut found = false;
+        for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.')) {
+            let parts: Vec<&str> = token.split('.').collect();
+            if parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+            {
+                yanked.push(token.to_string());
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "CHANGELOG yank line names no version, so no ADR can cover it: {line}"
+        );
+    }
+    assert!(
+        !yanked.is_empty(),
+        "expected CHANGELOG.md to record at least one yank (active-infinity 2.0.0)"
+    );
+    for version in yanked {
+        assert!(
+            adrs.iter().any(|adr| adr.contains(&version)
+                && adr.to_lowercase().contains("yank")),
+            "no ADR records the yank of version {version}; see ADR-0006 point 5 as amended by ADR-0040"
+        );
+    }
+}

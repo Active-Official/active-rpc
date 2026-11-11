@@ -41,6 +41,7 @@
 | [0037](0037-control-plane-mcp-response-ceiling-and-degraded.md) | Control-plane MCP: plane responses are capped and embedded-plane answers are marked degraded |
 | [0038](0038-process-pin-is-content-and-the-unix-group-kill-is-a-guarded-killpg.md) | Process pinning is content, not just path; the Unix group kill is a guarded `killpg` |
 | [0039](0039-wire-grammar-by-kind-and-descriptor-method-validity.md) | Wire grammar by kind and descriptor method validity |
+| [0040](0040-yank-rule-retrospective.md) | Retrospective: yank of active-infinity 2.0.0; the yank rule |
 
 ## Reading order and supersessions
 
@@ -52,6 +53,9 @@
   decision.
 - **MSRV:** 0007 is the source of truth and supersedes point 4 of 0006. A change
   to the minimum supported Rust version is a change to 0007.
+- **Yank rule:** 0006 states the original versioning rules; 0040 amends point 5
+  (the yank rule) and is the retrospective record for the active-infinity
+  2.0.0 yank. A change to the yank rule is a change to 0040.
 - **Receipts:** 0016 defines the in-memory receipt and the decision it records;
   0021 defines the durable log that carries those receipts off the process.
 - Every ADR states one `**Status:**` line naming the date it was accepted. An ADR
