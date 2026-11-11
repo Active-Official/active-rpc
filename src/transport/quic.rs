@@ -467,18 +467,33 @@ pub const STREAM_TAIL_WAIT: std::time::Duration = std::time::Duration::from_mill
 
 /// Body bytes every live stream may hold at once.
 ///
-/// The stream and connection windows bound what a peer can pin *before* we read
-/// it; this bounds what the server itself buffers after reading, across every
-/// connection. 64 MiB per stream times 256 connections would be 16 GiB of
-/// memory an unauthenticated peer could ask for.
+/// This bounds what the server itself buffers *after* reading, across every
+/// connection. What a peer can pin *before* we read it is bounded separately
+/// by the flow-control windows, so the two bounds must be sized together
+/// (RPC-54): `MAX_CONNECTIONS` connections each hold at most
+/// `CONNECTION_RECEIVE_WINDOW` in quinn's own buffers, and 256 x 1 MiB =
+/// 256 MiB, exactly this budget. The server-wide worst case for one QUIC
+/// server is therefore `MAX_CONNECTIONS * CONNECTION_RECEIVE_WINDOW +
+/// MAX_INFLIGHT_BODY + MAX_INFLIGHT_REPLY` = 768 MiB. 64 MiB per stream times
+/// 256 connections would be 16 GiB of memory an unauthenticated peer could
+/// ask for.
 pub const MAX_INFLIGHT_BODY: usize = 256 << 20;
 
 /// Concurrent bidirectional streams (calls) one QUIC connection may carry.
 pub const MAX_CONCURRENT_STREAMS: u32 = 256;
-/// Receive window for one stream: bounded buffering per call.
+/// Receive window for one stream: bounded buffering per call. The connection
+/// window caps the aggregate across a connection's streams.
 pub const STREAM_RECEIVE_WINDOW: u32 = 1 << 20;
 /// Receive window for one connection: the real cap on buffered bytes.
-pub const CONNECTION_RECEIVE_WINDOW: u32 = 8 << 20;
+///
+/// Sized so the windows and the connection count jointly satisfy the body
+/// budget (RPC-54): `MAX_CONNECTIONS` x this window = `MAX_INFLIGHT_BODY`
+/// (256 MiB), so quinn's own pre-read buffers can never hold more than the
+/// application-level budget the operator tunes against. A frame larger than
+/// the window still arrives, drip-fed as the server reads and quinn re-issues
+/// credit, so this costs throughput headroom on single-stream bulk transfers,
+/// not correctness.
+pub const CONNECTION_RECEIVE_WINDOW: u32 = 1 << 20;
 
 async fn serve<H>(
     endpoint: quinn::Endpoint,
@@ -1323,8 +1338,9 @@ impl QuicClient {
 /// The stream and flow-control limits are amplification bounds: ARP1 carries one
 /// call per bidirectional stream, so the number of concurrent streams is the
 /// number of calls a peer can have in flight, and the windows bound how many
-/// bytes it can pin before we read them. Unidirectional streams are refused
-/// because this transport never uses one.
+/// bytes it can pin before we read them. The connection window and the
+/// connection count are sized together against `MAX_INFLIGHT_BODY` (RPC-54).
+/// Unidirectional streams are refused because this transport never uses one.
 fn transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     // No keep-alive: a peer that holds a connection open without traffic keeps a
@@ -1344,7 +1360,10 @@ fn transport_config() -> quinn::TransportConfig {
 }
 #[cfg(test)]
 mod budget_tests {
-    use super::{ReplyBudget, MAX_INFLIGHT_REPLY};
+    use super::{
+        ReplyBudget, CONNECTION_RECEIVE_WINDOW, MAX_CONNECTIONS, MAX_INFLIGHT_BODY,
+        MAX_INFLIGHT_REPLY, STREAM_RECEIVE_WINDOW,
+    };
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
@@ -1366,5 +1385,33 @@ mod budget_tests {
         // A zero-length reservation is always admitted and harmless.
         let empty = ReplyBudget::try_reserve(&counter, 0).expect("zero bytes");
         drop(empty);
+    }
+
+    /// RPC-54: the flow-control windows and the connection count must jointly
+    /// satisfy the body budget. Quinn buffers up to the connection receive
+    /// window per connection *before* the application reads a byte, outside
+    /// `MAX_INFLIGHT_BODY`, so the pre-read worst case is
+    /// `MAX_CONNECTIONS * CONNECTION_RECEIVE_WINDOW`. At the audited head
+    /// that was 256 x 8 MiB = 2 GiB against a 256 MiB budget.
+    #[test]
+    fn the_receive_windows_and_connection_count_fit_the_body_budget() {
+        let pre_read = MAX_CONNECTIONS * CONNECTION_RECEIVE_WINDOW as usize;
+        assert!(
+            pre_read <= MAX_INFLIGHT_BODY,
+            "RPC-54: {MAX_CONNECTIONS} connections x {CONNECTION_RECEIVE_WINDOW} B \
+             receive window = {pre_read} B of pre-read quinn buffering, over the \
+             {MAX_INFLIGHT_BODY} B body budget"
+        );
+        // The connection window must cover a whole stream window, or a single
+        // stream could never use its own share.
+        assert!(
+            STREAM_RECEIVE_WINDOW as usize <= CONNECTION_RECEIVE_WINDOW as usize,
+            "RPC-54: the {STREAM_RECEIVE_WINDOW} B stream window must fit inside \
+             the {CONNECTION_RECEIVE_WINDOW} B connection window"
+        );
+        // The documented server-wide worst case (audit's RPC-54 formula):
+        // quinn's pre-read buffers + post-read bodies + parked replies.
+        let worst_case = pre_read + MAX_INFLIGHT_BODY + MAX_INFLIGHT_REPLY;
+        assert_eq!(worst_case, 768 << 20);
     }
 }
