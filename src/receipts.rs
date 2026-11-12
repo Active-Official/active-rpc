@@ -457,6 +457,20 @@ const LOCK_STALE_MS: u64 = 120_000;
 /// this grace the age rule wins (R-13 round 7, #1).
 const LOCK_LIVE_GRACE_MS: u64 = 10 * LOCK_STALE_MS;
 
+/// Wall-clock budget for one lock acquisition, in milliseconds.
+///
+/// The retry loop below sleeps 5 ms rising to 45 ms over 40 attempts,
+/// which sums to exactly 1 380 ms -- but that sum counts only the
+/// sleeps. On a loaded machine each sleep overshoots and each attempt
+/// costs more, so the loop ran 3.69 s on the CI macOS runner against
+/// a documented 1.38 s budget (CI-FIX-RPC-13). The budget is therefore
+/// enforced against the wall clock, not the attempt count: the loop
+/// refuses once this long has passed, whatever the sleeps did. The sum
+/// and the constant must stay in step: attempts 0..19 sleep 5 + 2 *
+/// attempt ms (480 ms in total) and attempts 20..39 sleep 45 ms
+/// (900 ms).
+const LOCK_ACQUIRE_BUDGET_MS: u64 = 1_380;
+
 /// Bytes written to the log between two refreshes of the lock's mtime.
 ///
 /// A writer that keeps its lock fresh makes "older than the ceiling" mean "no
@@ -603,6 +617,7 @@ impl LogLock {
     fn acquire(log: &std::path::Path) -> Result<Self> {
         let path = lock_path(log);
         sweep_leftovers(&path);
+        let started = std::time::Instant::now();
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -612,6 +627,17 @@ impl LogLock {
                 .unwrap_or(0)
         );
         for attempt in 0..40u32 {
+            if started.elapsed() >= std::time::Duration::from_millis(LOCK_ACQUIRE_BUDGET_MS) {
+                // The budget is wall-clock time, not attempt count: a
+                // loaded machine overshoots the sleeps, and without
+                // this check the wait stretches past the documented
+                // 1.38 s without bound (CI-FIX-RPC-13). The refusal
+                // is the same locked-by-another-writer error the
+                // exhausted loop returns below.
+                return Err(Error::receipt(
+                    "the receipt log is locked by another writer",
+                ));
+            }
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -694,6 +720,10 @@ impl LogLock {
                     // own sleep, so the successful path is shorter (R-13 round 7,
                     // #4). The wait only has to cover one append; a longer one is
                     // a lock a caller should see refused rather than a stall.
+                    // The 1.38 s is wall-clock time, not attempt count: the loop
+                    // top refuses once LOCK_ACQUIRE_BUDGET_MS has passed, so
+                    // sleep overshoot under load cannot stretch the wait the
+                    // way it did on the CI macOS runner (3.69 s, CI-FIX-RPC-13).
                     let step = u64::from(attempt.min(20));
                     std::thread::sleep(std::time::Duration::from_millis(5 + step * 2));
                 }
