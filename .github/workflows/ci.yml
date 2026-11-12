@@ -22,9 +22,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # tests/doc_gate.rs asserts the tag named in STATUS.md exists
-          # via `git tag --list`; the default depth-1 checkout fetches no
-          # tags, so the gate fails in CI while passing locally.
-          fetch-tags: true
+          # via `git tag --list`. A depth-1 checkout fetches only the tag
+          # on the fetched commit: `fetch-tags: true` only omits
+          # `--no-tags`, it does not pass `--tags`, and git auto-follows
+          # tags solely onto the objects the fetch downloads — v2.2.0
+          # points at an ancestor, not at HEAD, so it was never fetched
+          # (CI-FIX-RPC-9). Full history fetches every tag explicitly.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
         with:
           components: rustfmt, clippy
@@ -69,9 +73,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # tests/doc_gate.rs asserts the tag named in STATUS.md exists
-          # via `git tag --list`; the default depth-1 checkout fetches no
-          # tags, so the gate fails in CI while passing locally.
-          fetch-tags: true
+          # via `git tag --list`. A depth-1 checkout fetches only the tag
+          # on the fetched commit: `fetch-tags: true` only omits
+          # `--no-tags`, it does not pass `--tags`, and git auto-follows
+          # tags solely onto the objects the fetch downloads — v2.2.0
+          # points at an ancestor, not at HEAD, so it was never fetched
+          # (CI-FIX-RPC-9). Full history fetches every tag explicitly.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
         with:
           components: rustfmt, clippy
@@ -105,9 +113,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # tests/doc_gate.rs asserts the tag named in STATUS.md exists
-          # via `git tag --list`; the default depth-1 checkout fetches no
-          # tags, so the gate fails in CI while passing locally.
-          fetch-tags: true
+          # via `git tag --list`. A depth-1 checkout fetches only the tag
+          # on the fetched commit: `fetch-tags: true` only omits
+          # `--no-tags`, it does not pass `--tags`, and git auto-follows
+          # tags solely onto the objects the fetch downloads — v2.2.0
+          # points at an ancestor, not at HEAD, so it was never fetched
+          # (CI-FIX-RPC-9). Full history fetches every tag explicitly.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
         with:
           components: rustfmt, clippy
