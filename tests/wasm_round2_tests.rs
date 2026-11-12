@@ -159,10 +159,18 @@ fn declared_memory_is_charged_against_the_grant() {
         text.contains("wasm/limits") || text.contains("wasm/fuel"),
         "unexpected refusal: {error}"
     );
-    // With a grant that can pay for it, the same guest runs.
+    // With a grant that can pay for it, the same guest runs. The grant is
+    // 30 s, not 5 s: instantiating a 256 MiB guest costs ~3.9-4.1 s in a
+    // debug build on Windows (page-fault zeroing of 65 536 pages), so a 5 s
+    // wall left ~1 s of margin and flipped to `rpc/timeout` under any
+    // concurrent load (segment-160 probe: 3 consecutive failures at 5.01 s
+    // while the Infinity worker ran, then 3 passes at 3.9-4.1 s). The size
+    // of an affordable grant is not the property under test -- the refusal
+    // above pins the unaffordable side -- and the fuel is already capped at
+    // the 1 000 000 limit, so a longer wall changes only the wall.
     let mut call = Call::new("run", vec![Arg::text("")]);
     call.budget = Budget {
-        max_wall_ms: 5_000,
+        max_wall_ms: 30_000,
         ..Budget::default()
     };
     call.now_ms = 1;
