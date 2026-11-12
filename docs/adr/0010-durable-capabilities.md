@@ -98,6 +98,13 @@ a **re-mint**, never a resurrection:
   claimed **before** the mint: `claim` is the atomic check-and-mark, so a failed
   mint leaves the claim spent (fail-closed: a retry is refused and the operator
   reconciles) rather than allowing two processes to mint from one record.
+  The claim must also be **durable** before the mint (R2-PERSIST-04):
+  `claim` must not return `Ok` until the claim survives a process crash
+  (flushed + fsynced, or committed in a transactional store), or the claim
+  must be made durable by the `sync` call the kernel makes immediately
+  after `claim` and before the mint — a store that only buffers in `claim`
+  and never flushes in `sync` loses the claim on crash and the record
+  restores twice. A failed `sync` refuses the restore with no grant minted.
   `Agent::restore_capability` refuses a restore with no store at all
   (`rpc/persistence`, RPC-04): without a shared store the "already restored"
   set is in-process only, so a second kernel — or a restart — would restore

@@ -33,14 +33,20 @@ use crate::{Error, Result};
 ///
 /// Both methods are fallible in spirit: `is_restored` answers from the store, and
 /// `mark_restored` must fail closed — a store that cannot write must return an
-/// error, because the restore is then refused and the minted grant revoked.
+/// error, because the restore is then refused before any grant is minted.
+/// A claim is single-use only if it is durable: see [`RecordStore::claim`].
 pub trait RecordStore {
     /// True when this record id was restored by any kernel sharing the store.
     ///
     /// Advisory: the kernel calls [`RecordStore::claim`] only, and the default
-    /// answers `false`. An embedder that keeps its own durable view implements
-    /// this for its own checks (and must answer `true` on a read error: it
-    /// would otherwise treat a restored record as fresh).
+    /// answers `true` (fail closed). An embedder that keeps its own durable
+    /// view implements this for its own checks (and must answer `true` on a
+    /// read error: it would otherwise treat a restored record as fresh).
+    ///
+    /// The answer must come from durable state (R2-PERSIST-04): a userspace
+    /// buffer a crash could lose is not an answer. A store that buffers
+    /// claims must answer from the set its last successful
+    /// [`RecordStore::sync`] made durable, or re-read the store.
     fn is_restored(&self, _record_id: &[u8; 32]) -> bool {
         // Fail closed: a store that cannot answer treats every record as
         // restored, so a forgotten implementation cannot mint a second grant
@@ -53,7 +59,9 @@ pub trait RecordStore {
     /// Advisory for the same reason. A store whose backend accepts duplicates
     /// (an upsert) must detect the conflict in [`RecordStore::claim`] and
     /// return an error there: two restores of one record are two copies of its
-    /// budget, and a revocation reaches only the one it knows.
+    /// budget, and a revocation reaches only the one it knows. A mark is
+    /// durable under the same rule as a claim (below): commit before
+    /// returning `Ok`, or delegate to [`RecordStore::claim`].
     fn mark_restored(&mut self, _record_id: &[u8; 32]) -> Result<()> {
         // Fail closed: the default must not be a silent no-op. A store whose
         // `claim` delegates here (the `MemoryRecordStore` shape) would
@@ -72,7 +80,44 @@ pub trait RecordStore {
     ///
     /// The kernel calls this after the seal and the binding are verified and
     /// before the grant is minted.
+    ///
+    /// Durability (R2-PERSIST-04): a claim is single-use only if it survives
+    /// a crash. `claim` must not return `Ok` for a claim that is still only
+    /// buffered: either `claim` itself commits the claim before returning
+    /// (flushed + fsynced, or committed in a transactional store), or the
+    /// claim is made durable by the [`RecordStore::sync`] call the kernel
+    /// makes immediately after `claim` and before the mint. A store whose
+    /// `claim` only buffers and whose `sync` never flushes satisfies the
+    /// atomicity sentence above and still loses every recent claim to a
+    /// `kill -9`, a power loss, or an OOM-kill — with an 8 KiB buffer, every
+    /// claim until ~125 accumulate — and the next kernel restores the record
+    /// again. The kernel cannot conjure durability for such a store; the
+    /// contract is the guarantee.
+    ///
+    /// A file-backed store flushes and fsyncs the claim (on Windows,
+    /// `File::sync_all`, i.e. `FlushFileBuffers`); a store that creates its
+    /// file must also make the creation itself durable (the receipt log's
+    /// `sync_parent` is the in-crate precedent).
     fn claim(&mut self, record_id: &[u8; 32]) -> Result<()>;
+
+    /// Make every claim accepted since the last successful `sync` durable.
+    ///
+    /// The kernel calls this immediately after [`RecordStore::claim`] and
+    /// before the grant is minted (R2-PERSIST-04), so a store may batch the
+    /// fsync instead of paying it inside every `claim`: buffer in `claim`,
+    /// flush + fsync here. A store whose `claim` already commits durably
+    /// (a transactional store, a file store that syncs on write) implements
+    /// this as a no-op — that is the default, and [`MemoryRecordStore`]
+    /// keeps it, because an in-memory store dies with the process and has
+    /// nothing to flush.
+    ///
+    /// A failed `sync` refuses the restore with no grant minted. The claim
+    /// stays where the store put it: a store that recorded it treats the
+    /// record as spent (fail-closed, the same rule as a failed mint), and
+    /// the operator reconciles (ADR-0010).
+    fn sync(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// An in-memory [`RecordStore`], for tests and single-process deployments.
@@ -123,6 +168,13 @@ impl RecordStore for MemoryRecordStore {
         // single-process by construction; a multi-process deployment must
         // implement `claim` over its own storage.
         self.mark_restored(record_id)
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        // Nothing to flush: the set is the store, and the store dies with
+        // the process. A multi-process deployment must use a durable store
+        // whose `sync` commits the claim (R2-PERSIST-04).
+        Ok(())
     }
 }
 

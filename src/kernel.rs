@@ -1966,7 +1966,10 @@ impl Agent {
     /// The record is claimed atomically before the mint: `claim` is the
     /// check-and-mark step, so a failed mint leaves the claim spent rather than
     /// letting a second process restore the same record (fail-closed, ADR-0010;
-    /// round 39, L-1).
+    /// round 39, L-1). The claim is also made durable before the mint: the
+    /// kernel calls [`crate::persistence::RecordStore::sync`] right after
+    /// `claim`, so a buffered store flushes + fsyncs before the grant exists
+    /// (R2-PERSIST-04); a failed `sync` refuses the restore with no grant minted.
     pub fn restore_capability_with(
         &self,
         record: &crate::persistence::CapabilityRecord,
@@ -2208,13 +2211,27 @@ impl Agent {
         if lineage.len() >= MAX_LINEAGE_DEPTH {
             return Err(Error::Escalation("capability chain is too deep"));
         }
-        // Claim the record *before* minting. `claim` is atomic where the store
-        // can make it so: a check-then-mark pair let two processes restore one
+        // Claim the record *before* minting, and make the claim durable
+        // before the grant exists. `claim` is atomic where the store can
+        // make it so: a check-then-mark pair let two processes restore one
         // record into two grants, and the second grant's budget was a second
         // copy that no revocation reached. A claim left behind by a failed mint
         // is fail-closed: the record is spent, not duplicated.
+        // Durability (R2-PERSIST-04): `claim` alone is not enough. A
+        // buffered file-backed store returns `Ok` with the claim still in
+        // userspace, and a crash loses it, so the next kernel restores the
+        // record again. `sync` runs after `claim` and before the mint, so a
+        // store that buffers must flush + fsync here and a store whose
+        // `claim` already commits answers with a no-op. The sync runs
+        // before the mint (not after it, as the audit's defence-in-depth
+        // note suggests): a failed `sync` then refuses the restore with no
+        // grant to unwind, and a claim that landed is spent, fail-closed.
+        // A store that neither commits in `claim` nor flushes in `sync`
+        // violates the `RecordStore` contract, and the kernel cannot save
+        // it -- the regression test pins that boundary.
         if let Some(store) = store {
             store.claim(&record.record_id)?;
+            store.sync()?;
         }
         let restored = self.mint_restored(
             peer,
