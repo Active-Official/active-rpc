@@ -3804,6 +3804,20 @@ fn a_cleared_env_still_gives_cmd_its_systemroot() {
 /// Loading managed Windows PowerShell failed with error 8007000d`), so the
 /// call answered with empty stdout. With only the injected `SystemRoot`
 /// added, PowerShell starts and answers.
+/// The startup budget is 60 s on both legs of the invoke ceiling, not
+/// the adapter's 10 s default alone: `LocalProcess::invoke` takes the
+/// smaller of the adapter timeout and the call budget's `max_wall_ms`,
+/// and the call budget defaults to 5 s -- so raising only the adapter
+/// timeout changes nothing (CI-FIX-RPC-14: the first version of this
+/// fix did exactly that and left the effective ceiling at 5 s). The CI
+/// Windows gates run failed this test with `provider/reply-withheld`
+/// (the invoke never got its answer inside 5 s under parallel-suite
+/// load), while the sibling MCP test -- the same powershell.exe, the
+/// same cleared env -- passed with a 60 s recv deadline. PowerShell is
+/// a managed runtime whose cold start is the slow leg; the budget is
+/// the only difference between the two tests, so it is the budget that
+/// is fixed. What the test pins is unchanged: PowerShell starts with a
+/// cleared env and prints `SystemRoot`.
 #[cfg(windows)]
 #[test]
 fn a_cleared_env_still_starts_powershell() {
@@ -3811,7 +3825,8 @@ fn a_cleared_env_still_starts_powershell() {
     let program = format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
     let script = "Write-Output $env:SystemRoot";
     let mut tool = LocalProcess::new(&program, &["-NoProfile", "-Command", script])
-        .expect("an absolute program");
+        .expect("an absolute program")
+        .with_timeout(60_000);
     assert!(tool.env.is_empty(), "the test passes no env at all");
     let mut call = Call::new(
         "run",
@@ -3822,6 +3837,9 @@ fn a_cleared_env_still_starts_powershell() {
         ],
     );
     call.tool_allows_process = true;
+    // The second leg of the invoke ceiling: the adapter timeout above
+    // is capped by the call budget, which defaults to 5 s.
+    call.budget.max_wall_ms = 60_000;
     let response = tool.invoke(0, &call).expect("powershell answers");
     let stdout = rpc45_stdout(response);
     assert_eq!(stdout.trim(), root, "stdout: {stdout:?}");
