@@ -2752,14 +2752,12 @@ impl HttpTool {
     /// (RPC-38). A build without the feature refuses an `https://` base at
     /// construction, exactly as it did before TLS existed.
     fn scheme_supported(scheme: &str) -> bool {
-        if scheme.eq_ignore_ascii_case("http") {
-            return true;
-        }
+        let http = scheme.eq_ignore_ascii_case("http");
         #[cfg(feature = "http-tls")]
-        if scheme.eq_ignore_ascii_case("https") {
-            return true;
-        }
-        false
+        let https = scheme.eq_ignore_ascii_case("https");
+        #[cfg(not(feature = "http-tls"))]
+        let https = false;
+        http || https
     }
 
     /// Whether `name` is a host `ToSocketAddrs` can parse: a DNS name, an IPv4

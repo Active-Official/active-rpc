@@ -74,6 +74,20 @@ fn every_unusable_base_is_refused_at_both_ends() {
     }
 }
 
+/// Without http-tls, an https:// base is still refused at construction:
+/// the build cannot speak TLS, exactly as before TLS existed (RPC-38,
+/// CI-FIX-RPC-11: pins the no-feature side of scheme_supported).
+#[test]
+#[cfg(not(feature = "http-tls"))]
+fn https_base_is_refused_without_tls() {
+    for base in ["https://127.0.0.1:443", "https://api.internal:8443"] {
+        let error = HttpTool::try_new(base, &[("GET", "/x")])
+            .err()
+            .unwrap_or_else(|| panic!("{base} was admitted without the http-tls feature"));
+        assert_eq!(error.code(), "rpc/tool-policy", "{base}: {error}");
+    }
+}
+
 /// A long authority is named by its length, not printed whole (round 57, L-5).
 #[test]
 fn a_long_authority_is_not_printed_whole() {
