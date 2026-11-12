@@ -4288,6 +4288,36 @@ mod path_validation_tests {
         dir
     }
 
+    /// Scratch base for the component-boundary fixtures
+    /// (`a_component_of_216_bytes_is_refused_by_path_validation_and_215_is_accepted`
+    /// and `a_log_name_too_long_for_the_staging_suffix_is_refused_at_create`):
+    /// the longest fixture component is 216 bytes, and with the one-letter
+    /// `q` subdirectory the longest fixture path is base + "/q/" + 216,
+    /// which must stay under the 260-character total ceiling or the
+    /// total-path rule fires before the component rule is ever exercised.
+    /// `std::env::temp_dir()` is short on Linux (`/tmp`) and on the Windows
+    /// runner, but macOS runners set `TMPDIR` to a `/var/folders/.../T/`
+    /// path of ~46 characters, which already breaks the budget
+    /// (46 + 3 + 216 > 260) — that is why both tests failed on macOS while
+    /// passing on Linux and Windows. There the base falls back to `/tmp`
+    /// (4 characters); the validation measures the path as given, without
+    /// resolving symlinks, so `/tmp` -> `/private/tmp` does not lengthen
+    /// the count.
+    fn boundary_base() -> std::path::PathBuf {
+        let temp = std::env::temp_dir();
+        if temp.to_string_lossy().len() + 3 + (MAX_LOG_NAME_BYTES + 1) < MAX_LOG_PATH_CHARS {
+            return temp;
+        }
+        #[cfg(unix)]
+        {
+            std::path::PathBuf::from("/tmp")
+        }
+        #[cfg(not(unix))]
+        {
+            temp
+        }
+    }
+
     fn receipt(sequence: u64, at_ms: u64) -> Receipt {
         Receipt {
             sequence,
@@ -4453,18 +4483,30 @@ mod path_validation_tests {
     /// No subdirectory: the temp prefix plus the component must stay under
     /// the 260-character total ceiling, or the total-path rule fires first
     /// (a 235-byte component under an 80-character prefix is over both
-    /// ceilings, and the total is reported first). The name carries the pid
-    /// so parallel runs cannot collide in the shared temp directory, and the
-    /// component is 219–221 bytes whatever the pid's length, so the
-    /// component rule — not the pid — decides the outcome.
+    /// ceilings, and the total is reported first). The base comes from
+    /// `boundary_base`, not `temp_dir` directly: the macOS runner's
+    /// `/var/folders/...` temp prefix (~46 characters) already breaks the
+    /// budget for a 216-byte component, so the base falls back to `/tmp`
+    /// there. The name carries the pid so parallel runs cannot collide in
+    /// the shared temp directory, and the component is exactly 216 bytes
+    /// whatever the pid's length — the smallest component the staging rule
+    /// refuses — so the component rule, not the pid, decides the outcome.
     #[test]
     fn a_log_name_too_long_for_the_staging_suffix_is_refused_at_create() {
-        let dir = std::env::temp_dir();
-        let name = format!("{}{}.arrl", "a".repeat(210), std::process::id());
-        assert!(
-            name.len() > 215,
-            "the test name must be over the component ceiling: {}",
-            name.len()
+        let dir = boundary_base();
+        // The component is exactly 216 bytes whatever the pid's length —
+        // the smallest component the staging rule refuses — so the total
+        // stays under the ceiling on every platform.
+        let pid = std::process::id().to_string();
+        let name = format!(
+            "{}{}.arrl",
+            "a".repeat(211usize.saturating_sub(pid.len())),
+            pid
+        );
+        assert_eq!(
+            name.len(),
+            216,
+            "the test name must be exactly 216 bytes: the smallest component over the ceiling"
         );
         let path = dir.join(&name);
         assert!(
@@ -4566,10 +4608,13 @@ mod path_validation_tests {
     /// is asserted short so the total-path ceiling cannot fire first.
     #[test]
     fn a_component_of_216_bytes_is_refused_by_path_validation_and_215_is_accepted() {
-        // A one-letter base keeps the total path short: the temp prefix plus
+        // A one-letter subdirectory keeps the total path short: the base plus
         // a 215-byte component must stay under the 260-character ceiling, or
-        // the total-path rule would fire first.
-        let dir = std::env::temp_dir().join("q");
+        // the total-path rule would fire first. The base comes from
+        // `boundary_base`, not `temp_dir` directly: the macOS runner's
+        // `/var/folders/...` temp prefix (~46 characters) already breaks
+        // the budget for a 216-byte component.
+        let dir = boundary_base().join("q");
         let accepted = dir.join(format!("{}.arrl", "a".repeat(210)));
         assert_eq!(accepted.file_name().unwrap().len(), 215);
         assert!(
