@@ -20,8 +20,14 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+// `kill_pid` is only used by the Linux-only `kill_one` below;
+// `kill_process_group` is the Unix group kill, so it is used on macOS too.
+// One Unix import for both makes macOS clippy fail on the unused `kill_pid`
+// (RPC-43): each name is gated to the platforms that use it.
+#[cfg(target_os = "linux")]
+use active_rpc_process_tree::kill_pid;
 #[cfg(unix)]
-use active_rpc_process_tree::{kill_pid, kill_process_group};
+use active_rpc_process_tree::kill_process_group;
 use active_rpc_process_tree::{prepare_command, Job};
 use serde_json::{json, Value as Json};
 
