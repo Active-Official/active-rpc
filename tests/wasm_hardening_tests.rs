@@ -178,8 +178,18 @@ fn a_memory_reservation_is_charged_before_instantiation() {
         },
     )
     .expect("compile");
+    // The run is pinned with the wall deadline held open: the same guest under
+    // plain `call` stops by the 2 ms fuel-derived deadline on a slow machine
+    // instead (RPC-37), so a bare `call` cannot pin a run for it -- a trivial
+    // call costs 1.9-3.2 ms (median 2.4 ms) of per-call setup alone, already
+    // past the 2 ms a 10 000-fuel grant derives (segment-160 probe).
+    // `call_with_deadline` with a generous deadline isolates the fuel
+    // mechanism (see `fuel_exhaustion_is_refused_with_its_own_code` in
+    // wasm_tool_tests.rs).
     assert_eq!(
-        small.call(b"").expect("a two-page module must run"),
+        small
+            .call_with_deadline(b"", std::time::Duration::from_secs(10))
+            .expect("a two-page module must run"),
         Vec::<u8>::new(),
         "the constant guest writes no output"
     );
@@ -201,8 +211,17 @@ fn a_memory_grow_is_capped_by_the_fuel_grant() {
     )
     .expect("compile");
     // The guest returns -1 when the grow is refused, which the host reports as
-    // a bad output length.
-    assert_eq!(error_code(tool.call(b"")), "wasm/output");
+    // a bad output length. The fuel code is pinned with the wall deadline held
+    // open: the same guest under plain `call` stops by the 2 ms fuel-derived
+    // deadline on a slow machine instead (RPC-37) -- the probe measured a
+    // 10 000-fuel grow call at 1.8-3.2 ms against that 2 ms wall, and 1 of 20
+    // timed out natively. `call_with_deadline` with a generous deadline
+    // isolates the fuel mechanism (see `fuel_exhaustion_is_refused_with_its_own_code`
+    // in wasm_tool_tests.rs).
+    assert_eq!(
+        error_code(tool.call_with_deadline(b"", std::time::Duration::from_secs(10))),
+        "wasm/output"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_millis(500),
         "the grow was materialised: {:?}",
@@ -238,9 +257,26 @@ fn a_wall_budget_bounds_the_fuel_a_guest_may_burn() {
         .expect("queued");
     agent.run();
     let error = promise.value().expect_err("the guest must be stopped");
+    // The guest stops by whichever budget binds first: fuel exhaustion
+    // (`wasm/fuel`) on a machine faster than the documented rate, the wall
+    // deadline (`rpc/timeout`) on a slower one (RPC-37). Both are budget
+    // refusals, and the grant is what stops the burner either way: the
+    // 10 ms grant buys 50 000 fuel, the memory reservation charges part of
+    // it, and the rest must burn inside the 10 ms wall at the measured
+    // ~3 800-4 900 fuel/ms debug rate plus ~2.4 ms of per-call setup --
+    // inside 10 ms on a fast machine, past it on a loaded one (segment-160
+    // probe: 1 in 10 kernel burns timed out natively, and the gate's Docker
+    // leg failed this assertion the same way). No grant size pins
+    // `wasm/fuel` here: a smaller grant cannot pay for the sandbox at all,
+    // and a larger one makes the burn outgrow the wall. The same either/or
+    // is the established shape for a kernel wall grant (see
+    // `a_random_loop_cannot_outlive_its_wall_budget` in
+    // wasm_round2_tests.rs); the second half below already accepts either
+    // of two refusals for the same reason.
     assert!(
-        matches!(&error, Error::Provider { code } if code == "wasm/fuel"),
-        "a one-millisecond grant must stop a burner: {error:?}"
+        matches!(&error, Error::Provider { code } if code == "wasm/fuel")
+            || error.code() == "rpc/timeout",
+        "a ten-millisecond grant must stop a burner: {error:?}"
     );
     // The rate is the documented one: one millisecond buys FUEL_PER_MS fuel.
     assert_eq!(FUEL_PER_MS, 5_000);
@@ -324,8 +360,15 @@ fn a_start_function_out_of_fuel_is_a_fuel_refusal() {
         ..WasmLimits::default()
     };
     let mut tool = WasmTool::from_bytes(&binary(START_LOOP), limits).expect("compile");
+    // The fuel code is pinned with the wall deadline held open: the same guest
+    // under plain `call` stops by the 2 ms fuel-derived deadline on a slow
+    // machine instead (RPC-37) -- the probe measured a 10 000-fuel start-loop
+    // call at 2.1-5.5 ms against that 2 ms wall, and 5 of 20 timed out
+    // natively. `call_with_deadline` with a generous deadline isolates the
+    // fuel mechanism (see `fuel_exhaustion_is_refused_with_its_own_code` in
+    // wasm_tool_tests.rs).
     assert_eq!(
-        error_code(tool.call(b"")),
+        error_code(tool.call_with_deadline(b"", std::time::Duration::from_secs(10))),
         "wasm/fuel",
         "the budget covers the start function, and the refusal says so"
     );
