@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 description = "One OS primitive for Active RPC: a Windows job object holding a tool child and every descendant it starts, so a timeout kill ends the whole tree (XPL-RPC-04), and the Unix process-group signals that kill the same tree there (RPC-43)"
 repository = "https://github.com/Active-Official/active-rpc"
 homepage = "https://github.com/Active-Official/active-rpc"
-publish = false
+publish = true
 
 [lib]
 name = "active_rpc_process_tree"

@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 description = "One OS primitive for Active RPC: the stable identity of an open file on Windows (volume serial + file index), so receipt-lock ownership is the file, not its copyable text"
 repository = "https://github.com/Active-Official/active-rpc"
 homepage = "https://github.com/Active-Official/active-rpc"
-publish = false
+publish = true
 
 [lib]
 name = "active_rpc_file_identity"
