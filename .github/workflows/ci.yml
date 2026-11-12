@@ -20,6 +20,11 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # tests/doc_gate.rs asserts the tag named in STATUS.md exists
+          # via `git tag --list`; the default depth-1 checkout fetches no
+          # tags, so the gate fails in CI while passing locally.
+          fetch-tags: true
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
         with:
           components: rustfmt, clippy
@@ -62,6 +67,11 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # tests/doc_gate.rs asserts the tag named in STATUS.md exists
+          # via `git tag --list`; the default depth-1 checkout fetches no
+          # tags, so the gate fails in CI while passing locally.
+          fetch-tags: true
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
         with:
           components: rustfmt, clippy
@@ -93,6 +103,11 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # tests/doc_gate.rs asserts the tag named in STATUS.md exists
+          # via `git tag --list`; the default depth-1 checkout fetches no
+          # tags, so the gate fails in CI while passing locally.
+          fetch-tags: true
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, pinned 2026-11-07 (R-20 round 5, F11)
         with:
           components: rustfmt, clippy
