@@ -117,12 +117,14 @@ pub const MAX_CAPS_PER_MESSAGE: usize = 1_024;
 /// Global ceiling on live promise and job records in one kernel.
 ///
 /// The ceiling covers a kernel that keeps issuing calls on long-lived lanes and
-/// is a backpressure valve, not a lifetime quota: after each drain the kernel
-/// trims settled promise records to [`MAX_SETTLED_PROMISES`] and
-/// [`MAX_SETTLED_BYTES`], and completed jobs are removed immediately.
+/// is a backpressure valve, not a lifetime quota: after each dispatched batch
+/// the kernel trims settled promise records to [`MAX_SETTLED_PROMISES`] and
+/// [`MAX_SETTLED_BYTES`] (R2-R02-01), and completed jobs are removed
+/// immediately. Only live records count against it: see the check in
+/// `call_inner_payload`.
 pub const MAX_PROMISES: usize = 100_000;
 
-/// Target number of settled promise records retained after a drain.
+/// Target number of settled promise records retained after a batch or a drain.
 ///
 /// Retention is handle-pinned: a record with a live [`PromiseHandle`] is never
 /// evicted, so a caller that holds handles for a large batch can read every
@@ -130,7 +132,7 @@ pub const MAX_PROMISES: usize = 100_000;
 /// never evicted.
 pub const MAX_SETTLED_PROMISES: usize = 1_024;
 
-/// Target bytes of settled values retained per kernel after a drain.
+/// Target bytes of settled values retained per kernel after a batch or a drain.
 ///
 /// Values can be large; this bounds the payload memory an *unreferenced*
 /// completed call chain pins. Handle-pinned records are exempt because the
@@ -4409,7 +4411,16 @@ impl Agent {
         // Registry ceilings are checked before charging: a refused call must
         // not consume budget, and the job/promise maps must stay finite even
         // when the caller never destroys its lane.
-        if kernel.promises.len() >= MAX_PROMISES {
+        //
+        // The promise ceiling counts live records only (R2-R02-01): settled
+        // records awaiting trim are dead weight, and counting them turned the
+        // valve into a wall — a run that never drained filled the ceiling
+        // with completed work and refused every new call. `settled` holds
+        // each settled id exactly once (`record_settled` runs only on the
+        // single settlement transition, and `trim_settled` removes a record
+        // and its settled entry together), so live is exactly
+        // `promises.len() - settled.len()`.
+        if kernel.promises.len().saturating_sub(kernel.settled.len()) >= MAX_PROMISES {
             return Err(Error::BudgetExceeded("promises"));
         }
         if kernel.jobs.len() >= MAX_PROMISES {
@@ -4574,6 +4585,17 @@ impl Agent {
                 }
             };
             self.dispatch(batch);
+            // R2-R02-01: reclaim settled records as they are produced. The
+            // only trim used to run at a full drain, so a run whose queue
+            // never drained filled `MAX_PROMISES` with dead records and then
+            // refused every new call. `trim_settled` evicts only unpinned
+            // records (no live handle, no idempotency key, no queued waiter),
+            // so a queued consumer's producer record survives until the
+            // consumer runs.
+            {
+                let mut kernel = self.cell.borrow_mut();
+                kernel.trim_settled();
+            }
         }
     }
 
@@ -7409,12 +7431,20 @@ impl Kernel {
         }
     }
 
-    /// Trim settled promises after the queue drains.
+    /// Trim settled promises to the retention targets.
     ///
-    /// Only called with no queued job, so no dependency can still need an
-    /// evicted record. A record with a live handle is pinned and never evicted;
-    /// if every record is pinned the limits are a target, not a reason to drop
-    /// a result the caller can still read.
+    /// Called after the queue drains and, since R2-R02-01, after each
+    /// dispatched batch: a run whose queue never drains must not let the
+    /// settled backlog grow to `MAX_PROMISES`. The mid-run call is safe
+    /// because eviction still skips every record a queued job can need: a
+    /// record with a live handle is pinned, a record an idempotency key
+    /// still names is pinned, and a record a queued job waits on
+    /// (`waiters > 0`) is pinned — a pipelined consumer reads its
+    /// producer's record at dispatch (ordering, then argument
+    /// substitution), so evicting it would make the consumer read its
+    /// dependency as unsettled and fail it as a pipelined cycle. If every
+    /// record is pinned the limits are a target, not a reason to drop a
+    /// result the caller can still read.
     fn trim_settled(&mut self) {
         while (self.settled.len() > MAX_SETTLED_PROMISES || self.settled_bytes > MAX_SETTLED_BYTES)
             && self.settled.len() > 1
@@ -7424,7 +7454,11 @@ impl Kernel {
                 let pinned = self
                     .promises
                     .get(id)
-                    .map(|record| record.handles > 0)
+                    // A queued job waits on this promise: its dispatch reads
+                    // the record (R2-R02-01). `waiters` is incremented for
+                    // every dependency when the job is queued and released
+                    // when the job leaves the map, so this pin is exact.
+                    .map(|record| record.handles > 0 || record.waiters > 0)
                     .unwrap_or(false)
                     // An idempotency key that still names this promise must keep
                     // it: replaying the key has to return the original result.
