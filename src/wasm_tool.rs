@@ -90,7 +90,9 @@ pub const MAX_FUEL: u64 = 1_000_000_000;
 /// The interpreter costs roughly 4 000 fuel per millisecond of debug-build work,
 /// so this rate converts a wall budget into a fuel budget (a 100 ms grant buys
 /// 500 000 fuel) without throttling a fast guest, and converts a fuel budget
-/// back into the wall deadline a direct [`WasmTool::call`] enforces. It is a
+/// back into the wall deadline a direct [`WasmTool::call`] enforces, halved
+/// there so the clock binds before the meter on a machine that burns faster
+/// than the calibrated rate (CI-FIX-RPC-12). It is a
 /// conversion rate, not a deadline: on a slow or loaded machine the same fuel
 /// takes far longer than the rate predicts, so the rate alone never bound a
 /// call's wall time (RPC-37). The wall deadline is enforced by a real clock
@@ -508,17 +510,26 @@ impl WasmTool {
     /// Run the guest on `input` and return its output.
     ///
     /// The guest runs on a worker thread under a real wall-clock deadline
-    /// derived from the fuel budget: `fuel / FUEL_PER_MS` milliseconds. Fuel
-    /// alone never bound wall time (RPC-37): on a slow or loaded machine the
-    /// same fuel takes far longer than the rate predicts, so the deadline is
-    /// enforced by a clock around the execution, not by the meter. A call
-    /// that outlives its deadline is refused with [`Error::Timeout`]
-    /// (`rpc/timeout`); the fuel budget still bounds the guest's total work,
-    /// and a guest that exhausts it first is refused with `wasm/fuel` as
-    /// before. Use [`WasmTool::call_with_deadline`] to set the deadline
-    /// explicitly instead of deriving it from fuel.
+    /// derived from the fuel budget: `fuel / FUEL_PER_MS / 2` milliseconds.
+    /// Fuel alone never bound wall time (RPC-37): on a slow or loaded machine
+    /// the same fuel takes far longer than the rate predicts, so the deadline
+    /// is enforced by a clock around the execution, not by the meter. The
+    /// halving is the margin that makes the clock bind first: the interpreter
+    /// burns roughly 4 000 fuel per millisecond on a developer machine, so
+    /// the unhalved rate left only a 1.25x margin, and a faster machine burns
+    /// the same fuel inside the deadline and reports `wasm/fuel` instead of
+    /// the timeout (CI-FIX-RPC-12: measured 232-261 ms to burn the default
+    /// 1M fuel on the fix machine, 251-268 ms in Docker Linux, and under
+    /// 200 ms on the CI Linux runner). At half the rate the deadline assumes
+    /// a 10 000 fuel/ms burn, so it still binds on a machine burning twice
+    /// as fast as the calibrated rate. A call that outlives its deadline is
+    /// refused with [`Error::Timeout`] (`rpc/timeout`); the fuel budget
+    /// still bounds the guest's total work, and a guest that exhausts it
+    /// first is refused with `wasm/fuel` as before. Use
+    /// [`WasmTool::call_with_deadline`] to set the deadline explicitly
+    /// instead of deriving it from fuel.
     pub fn call(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let max_wall = Duration::from_millis((self.limits.fuel / FUEL_PER_MS).max(1));
+        let max_wall = Duration::from_millis((self.limits.fuel / FUEL_PER_MS / 2).max(1));
         self.call_with_deadline(input, max_wall)
     }
 

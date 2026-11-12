@@ -165,8 +165,12 @@ fn a_looping_guest_is_stopped_by_an_explicit_wall_deadline() {
 }
 
 /// The same deadline binds a direct `call`: the deadline is derived from the
-/// fuel budget (`fuel / FUEL_PER_MS`), so a default-limits loop stops at
-/// ~200 ms with `rpc/timeout` instead of running until its fuel exhausts.
+/// fuel budget (`fuel / FUEL_PER_MS / 2`), so a default-limits loop stops at
+/// ~100 ms with `rpc/timeout` instead of running until its fuel exhausts.
+/// The halving is load-bearing: at the unhalved rate the deadline was 200 ms
+/// against a 232-268 ms burn on the fix machine, and a faster CI runner
+/// burned the fuel inside the deadline and reported `wasm/fuel` instead
+/// (CI-FIX-RPC-12).
 #[test]
 fn a_looping_guest_is_stopped_by_the_fuel_derived_wall_deadline() {
     let mut tool = WasmTool::from_bytes(&binary(BURN), WasmLimits::default()).expect("compile");
@@ -175,11 +179,11 @@ fn a_looping_guest_is_stopped_by_the_fuel_derived_wall_deadline() {
     let elapsed = started.elapsed();
     assert!(matches!(error, Error::Timeout), "{error:?}");
     assert!(
-        elapsed >= std::time::Duration::from_millis(200),
+        elapsed >= std::time::Duration::from_millis(100),
         "the call returned before its deadline: {elapsed:?}"
     );
     assert!(
-        elapsed < std::time::Duration::from_millis(200) + std::time::Duration::from_secs(2),
+        elapsed < std::time::Duration::from_millis(100) + std::time::Duration::from_secs(2),
         "the deadline did not bind the call: {elapsed:?}"
     );
 }
@@ -727,8 +731,8 @@ fn an_input_at_the_window_ceiling_still_runs() {
     let mut tool = WasmTool::from_bytes(&binary(ECHO), WasmLimits::default()).expect("compile");
     let input = vec![b'x'; 64 * 1024];
     // This pins the 64 KiB input-window boundary, not the derived wall:
-    // a bare `call` derives its wall from the default 1M fuel as 200 ms
-    // (`fuel / FUEL_PER_MS`), and on a loaded machine the worker thread can
+    // a bare `call` derives its wall from the default 1M fuel as 100 ms
+    // (`fuel / FUEL_PER_MS / 2`), and on a loaded machine the worker thread can
     // starve past it even though the copy itself is milliseconds (round-4
     // probe: loaded call latency median ~35 ms, max ~75 ms running alone,
     // and `run: Timeout` at this line in a loaded full-suite run). The
