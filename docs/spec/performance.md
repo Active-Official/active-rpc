@@ -319,3 +319,13 @@ slower.
 docs/spec/perf-baseline.json` adds an absolute comparison (p50 ≤ 1.6x, p99 ≤
 3.0x) for a release machine. CI runs the ratio gate in the `perf-gate` job; the
 matrix is uploaded as an artifact.
+
+The checked-in baseline was measured on Windows: its host field is
+`"host": {"arch": "x86_64", "os": "windows"}`. CI's `perf-gate` job runs on
+`ubuntu-latest` and does not pass `--baseline`, so the absolute comparison is
+not part of CI — it is a manual, same-host-class check, and the gate script
+never reads the host field at all. Before treating an absolute-comparison
+breach as a regression, re-measure on the machine under test; `--update`
+rewrites the baseline from the measured matrix, host included, so refresh the
+record in the same commit whenever the baseline moves to a new host, per the
+regression policy above.

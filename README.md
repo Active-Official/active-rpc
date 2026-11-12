@@ -170,6 +170,8 @@ let _ = second.value()?;
 | Bulk | `ARBL`/`ARBC` chunked transfer with per-chunk hashes, resume and a capability-granted receiver that charges the budget |
 | Observability | `active-rpc/observability/2` events and `active-rpc/metrics/1` counters, correlation ids only |
 
+HTTP/2 is cleartext loopback-only; use QUIC or a terminating proxy for the network (see ADR-0012).
+
 Specifications: [`docs/spec/wire.md`](docs/spec/wire.md) (ARP1, bulk frames,
 error codes), [`docs/spec/interop.md`](docs/spec/interop.md) (the Connect/gRPC
 bridge) and [`docs/spec/observability.md`](docs/spec/observability.md); the

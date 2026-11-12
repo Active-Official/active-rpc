@@ -131,3 +131,34 @@ fn the_bridge_is_documented_as_interop_only() {
     assert!(deployment.contains("start_with_identity"));
     assert!(deployment.contains("rpc/identity"));
 }
+
+/// TEST-11: the README must state the HTTP/2 transport's loopback-only
+/// limitation next to the transport list. ADR-0012 makes the listener
+/// cleartext (h2c) and loopback-only through `Http2Server::bind_loopback`,
+/// the only constructor; a deployer reading the transports table without
+/// that caveat could reasonably plan a network listener that cannot exist.
+#[test]
+fn readme_states_the_http2_loopback_only_limitation() {
+    let readme = std::fs::read_to_string(root().join("README.md")).expect("README.md");
+    let mention = readme
+        .find("HTTP/2")
+        .expect("README must name the HTTP/2 transport");
+    let window = &readme[mention..];
+    let near = window.get(..600).unwrap_or(window);
+    assert!(
+        near.contains("loopback-only"),
+        "README must state HTTP/2 is loopback-only near the HTTP/2 mention"
+    );
+    assert!(
+        near.contains("cleartext"),
+        "the caveat must say the transport is cleartext (h2c)"
+    );
+    assert!(
+        near.contains("QUIC"),
+        "the caveat must name QUIC as the network alternative"
+    );
+    assert!(
+        near.contains("terminating proxy"),
+        "the caveat must point at a terminating proxy as the network alternative"
+    );
+}

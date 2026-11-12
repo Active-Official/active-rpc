@@ -164,6 +164,28 @@ fn performance_baselines_are_checked_in() {
     );
 }
 
+/// TEST-11: the checked-in perf baseline was measured on Windows while CI
+/// runs on Ubuntu-only, and the gate script never reads the baseline's host
+/// field — so the host record lives here, in `docs/spec/performance.md`,
+/// next to the gate description. If the baseline is re-measured on another
+/// host, this test forces the record to move with it.
+#[test]
+fn perf_baseline_host_is_recorded() {
+    let perf = fs::read_to_string(repo_path("docs/spec/performance.md")).expect("performance");
+    assert!(
+        perf.contains(r#""host": {"arch": "x86_64", "os": "windows"}"#),
+        "performance.md must record the perf-baseline host exactly as the JSON states it"
+    );
+    assert!(
+        perf.contains("ubuntu-latest"),
+        "performance.md must say CI's perf-gate job runs on ubuntu-latest"
+    );
+    assert!(
+        perf.contains("does not pass `--baseline`"),
+        "performance.md must say CI does not run the absolute comparison"
+    );
+}
+
 #[test]
 fn release_and_supply_chain_process_is_operational() {
     let release = fs::read_to_string(repo_path("docs/hardening/RELEASE.md")).expect("release");
