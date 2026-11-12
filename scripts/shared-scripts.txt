@@ -1,0 +1,31 @@
+# Shared scripts (TEST-12) — files that must be byte-identical in
+# active-infinity/scripts/.
+#
+# These four are crate-neutral (no per-crate constant anywhere in them:
+# no crate name, no per-crate threshold) and are byte-identical in both
+# repos today. `scripts/check_shared_scripts.py` enforces this list, and
+# the `shared-scripts` job in `.github/workflows/ci.yml` runs that check
+# against Active-Official/active-infinity on every push and pull request.
+# A fix to one of these files must land in BOTH repos in the same change
+# set, or CI fails loudly here instead of letting the copies drift.
+#
+# Deliberately NOT listed (per-crate by design — see the TEST-12 record):
+#   api_surface.py      per-crate secret/capability blacklists
+#   check_32bit.sh      per-crate default feature set
+#   fuzz_docker.py      per-crate fuzz targets and harness flags
+#   negative_controls.py per-crate invariant control tables
+#   perf_gate.py        per-crate perf shapes and thresholds
+#   sbom.py             usage examples name the crate (cosmetic only)
+#   check_action_pins.py, local_gate.sh, supply_chain.py
+#                       exist in only one repo
+# And the known-divergent case, NOT listed until it converges:
+#   coverage_gate.py    RPC gained the TEST-01/TEST-02 hardening
+#                       (per-file floors, no-new-uncovered-function,
+#                       --update-baseline, Windows baseline) on 2026-11-11;
+#                       Infinity still runs the old global-totals gate.
+#                       Follow-up: port that hardening to Infinity, then
+#                       list coverage_gate.py here.
+check_presentation.py
+hardening_status.py
+recall.py
+verify_tag.sh

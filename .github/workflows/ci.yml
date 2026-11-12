@@ -161,6 +161,29 @@ jobs:
       - name: Validate the hardening matrix
         run: python3 scripts/hardening_status.py --check
 
+  shared-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # TEST-12: the scripts listed in scripts/shared-scripts.txt are
+      # maintained by copy in active-infinity and must stay byte-identical.
+      # A fix in one repo that is not mirrored fails loudly here instead
+      # of silently diverging (as the TEST-01/TEST-02 coverage_gate.py
+      # hardening did). The mirror org is Active-Official, the same org
+      # as this repo's `official` remote; the comparison is against
+      # Infinity's main, so a shared-script change must land in both
+      # repos before either side's CI goes green. The two repos are
+      # double-pushed together at each segment gate, so a shared-script
+      # change staged in one repo and not yet pushed to the other can
+      # make this job red until the mirror push lands — re-run it then.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: Active-Official/active-infinity
+          ref: main
+          path: active-infinity
+      - name: Shared scripts agree with active-infinity
+        run: python3 scripts/check_shared_scripts.py --other-repo active-infinity
+
   negative-controls:
     runs-on: ubuntu-latest
     steps:
