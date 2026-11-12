@@ -283,24 +283,44 @@ fn a_wall_budget_bounds_the_fuel_a_guest_may_burn() {
 
     // A grant that cannot pay for the declared memory is refused before the
     // guest runs, rather than spending host CPU on an allocation it never
-    // charged.
+    // charged. That refusal must come from the synchronous reservation check
+    // in `call_with_deadline`, not from the worker thread: BURN declares 2
+    // pages (256 fuel), so a 1 ms grant (5 000 fuel) can always pay for its
+    // reservation (round 19, M1 charges the declaration, not the ceiling),
+    // and the refusal then depends on a worker that must instantiate and
+    // burn the fuel before the 1 ms wall fires -- a race that loses ~1 call
+    // in 10 natively and every call in Docker (segment-160 probe:
+    // `probe-tiny-native.log`, `probe-tiny-docker.log`; no wall size fixes
+    // it, the burn scales with the wall). This module declares 256 MiB
+    // (524 288 fuel), which dwarfs the 5 000 fuel a 1 ms grant buys, so the
+    // pre-check refuses with `wasm/fuel` synchronously, before any worker
+    // starts -- deterministic on every machine, at any load.
+    let big_limits = WasmLimits {
+        max_memory_bytes: 256 << 20,
+        ..WasmLimits::default()
+    };
+    let big_tool = WasmTool::from_bytes(&binary(BIG_MEMORY), big_limits).expect("compile");
+    let big_provider = agent
+        .register(Box::new(big_tool))
+        .expect("register provider");
     let tiny = Budget {
         max_wall_ms: 1,
         ..Budget::default()
     };
     let cap = agent
-        .mint(provider, 0, CapAttrs::new(&["run"]).with_budget(tiny))
+        .mint(big_provider, 0, CapAttrs::new(&["run"]).with_budget(tiny))
         .expect("mint");
     let promise = agent
         .call(lane, &cap, "run", vec![Arg::text("")])
         .expect("queued");
     agent.run();
     let error = promise.value().expect_err("the sandbox is unaffordable");
-    // `wasm/fuel` when the instantiation itself exhausts the grant (wasmi charges
-    // for it), `wasm/limits` when the explicit memory charge does. Either way the
-    // guest never runs, which is the property under test.
+    // The reservation check runs on the calling thread before the worker
+    // starts, so a grant too small to pay for the guest's own memory is
+    // `wasm/fuel` -- and only `wasm/fuel` -- deterministically. The guest
+    // never runs, which is the property under test.
     assert!(
-        matches!(&error, Error::Provider { code } if code == "wasm/limits" || code == "wasm/fuel"),
+        matches!(&error, Error::Provider { code } if code == "wasm/fuel"),
         "a grant below the sandbox's cost must be refused: {error:?}"
     );
 }
