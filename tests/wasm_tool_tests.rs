@@ -726,6 +726,17 @@ fn an_input_at_the_window_ceiling_still_runs() {
     // returns its length).
     let mut tool = WasmTool::from_bytes(&binary(ECHO), WasmLimits::default()).expect("compile");
     let input = vec![b'x'; 64 * 1024];
-    let output = tool.call(&input).expect("run");
+    // This pins the 64 KiB input-window boundary, not the derived wall:
+    // a bare `call` derives its wall from the default 1M fuel as 200 ms
+    // (`fuel / FUEL_PER_MS`), and on a loaded machine the worker thread can
+    // starve past it even though the copy itself is milliseconds (round-4
+    // probe: loaded call latency median ~35 ms, max ~75 ms running alone,
+    // and `run: Timeout` at this line in a loaded full-suite run). The
+    // generous deadline holds the wall open so the fuel meter -- not the
+    // clock -- decides the outcome, exactly as the fuel-refusal tests do
+    // (CI-FIX-RPC-2); the 1M fuel grant still bounds the guest's work.
+    let output = tool
+        .call_with_deadline(&input, std::time::Duration::from_secs(10))
+        .expect("run");
     assert_eq!(output, input);
 }
