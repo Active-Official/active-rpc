@@ -112,10 +112,28 @@ fn is_transient_accept(error: &std::io::Error) -> bool {
 ///
 /// Returns false when the deadline has already passed, so a caller answers a
 /// timeout instead of blocking.
-fn arm_deadline(stream: &TcpStream, deadline: std::time::Instant) -> bool {
+///
+/// When `rearm` is false the deadline is only checked, never re-armed: the
+/// caller already set the socket timeout and has since shut the socket
+/// down, and on macOS setting any socket option after both halves are shut
+/// down fails with EINVAL — XNU `sosetoptlock` refuses every setsockopt
+/// once `SS_CANTRCVMORE | SS_CANTSENDMORE` are both set ("the socket has
+/// been shutdown, no more sockopt's") — so re-arming there refuses every
+/// honest answer at once (CI-FIX-RPC-10: the macOS gates
+/// `connect_bridge_tests` failures, 12 of 22, all instant "request head
+/// timed out" in a 2.02 s binary that could not have waited out the 4.5 s
+/// client deadline). The timeout set before the shutdown stays in force —
+/// shutdown does not clear socket options — and the deadline check still
+/// bounds the total wait; a single read may run to that already-set
+/// timeout, so the wall bound for a dripping peer after a shutdown is the
+/// deadline plus that timeout, not the deadline alone.
+fn arm_deadline(stream: &TcpStream, deadline: std::time::Instant, rearm: bool) -> bool {
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     if remaining.is_zero() {
         return false;
+    }
+    if !rearm {
+        return true;
     }
     stream.set_read_timeout(Some(remaining)).is_ok()
         && stream.set_write_timeout(Some(remaining)).is_ok()
@@ -131,11 +149,12 @@ fn read_line_before(
     reader: &mut BufReader<TcpStream>,
     max: usize,
     deadline: Option<std::time::Instant>,
+    rearm: bool,
 ) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
         if let Some(deadline) = deadline {
-            if !arm_deadline(reader.get_ref(), deadline) {
+            if !arm_deadline(reader.get_ref(), deadline, rearm) {
                 return Err(Error::Transport("request head timed out".to_string()));
             }
         }
@@ -181,7 +200,7 @@ fn read_body_by_deadline(
     use std::io::Read;
     let mut chunk = [0u8; 16 * 1024];
     while body.len() < length {
-        if !arm_deadline(reader.get_ref(), deadline) {
+        if !arm_deadline(reader.get_ref(), deadline, true) {
             return Err(BodyFault::TimedOut);
         }
         let want = (length - body.len()).min(chunk.len());
@@ -311,12 +330,13 @@ impl BridgeServer {
             return 0;
         };
         let mut reader = BufReader::new(clone);
-        if !arm_deadline(&stream, deadline) || !arm_deadline(reader.get_ref(), deadline) {
+        if !arm_deadline(&stream, deadline, true) || !arm_deadline(reader.get_ref(), deadline, true)
+        {
             let _ = write_http_response(&mut stream, 408, b"rpc/transport", deadline);
             drain_before_close(&mut stream);
             return 0;
         }
-        let head = match read_head(&mut reader, MAX_HEAD, Some(deadline), true) {
+        let head = match read_head(&mut reader, MAX_HEAD, Some(deadline), true, true) {
             Ok(Some(head)) => head,
             Ok(None) => return 0,
             Err(_) => {
@@ -598,20 +618,23 @@ fn read_head(
     max: usize,
     deadline: Option<std::time::Instant>,
     request_side: bool,
+    rearm: bool,
 ) -> Result<Option<Vec<String>>> {
     let mut head = Vec::new();
     let mut total = 0usize;
     loop {
         // The socket timeout is per read; a head that dribbles one byte just
         // inside it would hold the serial accept slot for hours. Re-arm the
-        // connection deadline before every line, on the handle that reads.
+        // connection deadline before every line, on the handle that reads —
+        // unless the caller already shut down (see `arm_deadline`).
         if let Some(deadline) = deadline {
-            if !arm_deadline(reader.get_ref(), deadline) {
+            if !arm_deadline(reader.get_ref(), deadline, rearm) {
                 return Err(Error::Transport("request head timed out".to_string()));
             }
         }
         let remaining = max.saturating_sub(total);
-        let raw: Vec<u8> = read_line_before(reader, remaining + 1, deadline)?.unwrap_or_default();
+        let raw: Vec<u8> =
+            read_line_before(reader, remaining + 1, deadline, rearm)?.unwrap_or_default();
         let read = raw.len();
         if read == 0 {
             if head.is_empty() {
@@ -988,7 +1011,11 @@ impl ConnectClient {
         // never come (the client sends exactly `content-length`).
         let _ = stream.shutdown(std::net::Shutdown::Write);
         let mut reader = BufReader::new(stream);
-        let Some(head) = read_head(&mut reader, MAX_HEAD, Some(deadline), false)? else {
+        // No re-arm: this socket's write half is shut down and the peer
+        // shuts its half down by answering — on macOS re-setting a socket
+        // timeout then fails with EINVAL (see `arm_deadline`). The read
+        // timeout set before the shutdown is still in force.
+        let Some(head) = read_head(&mut reader, MAX_HEAD, Some(deadline), false, false)? else {
             return Err(Error::Transport(
                 "bridge closed without a response".to_string(),
             ));
@@ -1050,13 +1077,18 @@ impl ConnectClient {
         let mut response = Vec::with_capacity(length.min(64 * 1024));
         let mut chunk = [0u8; 8 * 1024];
         while response.len() < length {
-            let left = deadline
+            // The deadline is checked, not re-armed: the read timeout was
+            // set to `wait` before the shutdown, and on macOS re-setting
+            // it after both halves are shut down fails with EINVAL (see
+            // `arm_deadline`), which would refuse the body of every
+            // honest answer. The pre-shutdown timeout still bounds each
+            // read, and this check bounds the total.
+            if deadline
                 .checked_duration_since(std::time::Instant::now())
-                .ok_or_else(|| Error::Transport("response body timed out".to_string()))?;
-            reader
-                .get_ref()
-                .set_read_timeout(Some(left))
-                .map_err(|error| Error::Transport(format!("response: {error}")))?;
+                .is_none()
+            {
+                return Err(Error::Transport("response body timed out".to_string()));
+            }
             let want = (length - response.len()).min(chunk.len());
             let read = std::io::Read::read(&mut reader, &mut chunk[..want])
                 .map_err(|error| Error::Transport(format!("response: {error}")))?;
