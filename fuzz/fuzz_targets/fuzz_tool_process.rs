@@ -9,8 +9,9 @@
 //! 3. A non-existent program is refused at construction, not a panic.
 //! 4. The adapter policy is a valid attenuation of a wider parent.
 //!
-//! The program is a real shell but the allow-list admits only `ok`, so no
-//! argument the target produces can run anything.
+//! The program is a real program -- a shell on Unix, echo on Windows --
+//! but the allow-list admits only `ok`, so no argument the target
+//! produces can run anything.
 //!
 //! Run with `cargo +nightly fuzz run fuzz_tool_process -- -runs=200000`.
 
@@ -21,6 +22,36 @@ use active_rpc::{Arg, Budget, CapAttrs, ToolPolicy, Value};
 
 #[path = "common.rs"]
 mod common;
+
+/// The program the target runs: `/bin/echo` on Unix, Git for Windows'
+/// `echo.exe` on Windows. `/bin/echo` is not an absolute path on
+/// Windows (no drive prefix), so `LocalProcess::new` refuses it and
+/// the control's `.expect` panics on every Windows run. Git's echo
+/// prints its argument plus LF and exits 0, the same contract the
+/// control asserts. The fuzz job runs on Linux, so this branch only
+/// ever runs for local Windows fuzz runs.
+#[cfg(windows)]
+fn echo_program() -> &'static str {
+    "C:\\Program Files\\Git\\usr\\bin\\echo.exe"
+}
+#[cfg(not(windows))]
+fn echo_program() -> &'static str {
+    "/bin/echo"
+}
+
+/// The program the body runs: `/bin/sh` on Unix, Git for Windows'
+/// `echo.exe` on Windows (same absolute-path reason as
+/// `echo_program`). The body only needs the call to be admitted or
+/// refused by the allow-list, so echo's success on `ok` exercises
+/// the same assertions `sh`'s failure did.
+#[cfg(windows)]
+fn shell_program() -> &'static str {
+    "C:\\Program Files\\Git\\usr\\bin\\echo.exe"
+}
+#[cfg(not(windows))]
+fn shell_program() -> &'static str {
+    "/bin/sh"
+}
 
 fn policy() -> ToolPolicy {
     ToolPolicy {
@@ -35,11 +66,11 @@ fuzz_target!(|data: &[u8]| {
     // comes back. A policy that refused every argument used to pass
     // (R-20 round 5, F7).
     {
-        // `/bin/echo` with the allowed argument: the response proves the child
+        // `echo_program()` with the allowed argument: the response proves the child
         // ran and its output came back, not only that the policy accepted the
-        // call. `/bin/sh ok` would have run a file named `ok` and a canned `Ok`
+        // call. A shell (`/bin/sh ok`) would have run a file named `ok` and a canned `Ok`
         // would have passed the old check (R-20 round 6, finding 5).
-        let tool = LocalProcess::new("/bin/echo", &["ok"]).expect("an absolute program");
+        let tool = LocalProcess::new(echo_program(), &["ok"]).expect("an absolute program");
         let control = common::agent(&[0x05]);
         let provider = control.register(Box::new(tool)).expect("register provider");
         let lane = control
@@ -75,7 +106,7 @@ fuzz_target!(|data: &[u8]| {
     }
     // A program that does not resolve is refused at construction (round 17).
     assert!(LocalProcess::new("/nonexistent-active-fuzz-binary", &["ok"]).is_err());
-    let tool = LocalProcess::new("/bin/sh", &["ok"]).expect("an absolute program");
+    let tool = LocalProcess::new(shell_program(), &["ok"]).expect("an absolute program");
     assert!(policy().is_attenuation_of(&tool.policy()));
 
     let agent = common::agent(data);
