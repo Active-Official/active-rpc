@@ -90,6 +90,41 @@ fn many_functions_wat(n: usize) -> String {
     wat
 }
 
+/// A module whose `run` loops through a chain of `n` tiny functions, each
+/// calling the next and the last returning its argument.
+///
+/// Used by the fuel-derived-deadline test (CI-FIX-RPC-22): a call chain burns
+/// fuel far slower in wall time than the bare branch loop, because every call
+/// pays the interpreter's frame setup for only a few fuel. Measured on the
+/// fix machine, the 100-deep chain burns the default 1M fuel in ~522-560 ms
+/// (1,785-1,915 fuel/ms, Windows native and Docker Linux alike), against
+/// ~230-275 ms (3,636-4,347 fuel/ms) for the bare `(loop $l (br $l))` loop.
+/// The derived deadline is 100 ms, so the chain's margin is ~5.2-5.6x: a
+/// runner must burn more than five times faster than the fix machine to
+/// exhaust the fuel inside the deadline. The bare loop's margin was only
+/// ~2.3-2.8x, and a macOS CI runner in round 14 exceeded it and reported
+/// `wasm/fuel` instead of the timeout. The chain is 100 deep, far below the
+/// engine's 1,024-frame recursion ceiling.
+fn call_chain_wat(n: usize) -> String {
+    let mut wat = String::from("(module (memory (export \"memory\") 1)\n");
+    for i in 0..n {
+        if i + 1 < n {
+            wat.push_str(&format!(
+                "  (func $f{i} (param i32) (result i32) (call $f{} (local.get 0)))\n",
+                i + 1
+            ));
+        } else {
+            wat.push_str(&format!(
+                "  (func $f{i} (param i32) (result i32) (local.get 0))\n",
+            ));
+        }
+    }
+    wat.push_str(
+        "  (func (export \"run\") (param i32) (result i32)\n    (local $x i32)\n    (local.set $x (i32.const 1))\n    (loop $l\n      (local.set $x (call $f0 (local.get $x)))\n      (br $l))\n    i32.const 0))\n",
+    );
+    wat
+}
+
 fn error_code(result: active_rpc::Result<impl std::fmt::Debug>) -> String {
     match result {
         Ok(value) => panic!("the guest was accepted: {value:?}"),
@@ -171,9 +206,21 @@ fn a_looping_guest_is_stopped_by_an_explicit_wall_deadline() {
 /// against a 232-268 ms burn on the fix machine, and a faster CI runner
 /// burned the fuel inside the deadline and reported `wasm/fuel` instead
 /// (CI-FIX-RPC-12).
+/// The guest is a 100-deep call chain, not the bare branch loop, because the
+/// deadline only binds while the guest burns its fuel slower than the rate the
+/// derivation assumes (10 000 fuel/ms): the bare loop burns ~3 600-4 350
+/// fuel/ms on the fix machine, a ~2.3-2.8x margin, and a macOS CI runner in
+/// round 14 exceeded it and reported `wasm/fuel` at the `Timeout` assertion
+/// below (CI-FIX-RPC-22). The chain burns ~1 785-1 915 fuel/ms, so its
+/// ~522-560 ms burn leaves a ~5.2-5.6x margin on the same 100 ms deadline.
+/// The production derivation is unchanged; only the test's guest is slower
+/// to burn, which is what makes the timeout outcome deterministic. The bare
+/// loop keeps its own pin in `fuel_exhaustion_is_refused_with_its_own_code`,
+/// where the wall is held open and no race exists.
 #[test]
 fn a_looping_guest_is_stopped_by_the_fuel_derived_wall_deadline() {
-    let mut tool = WasmTool::from_bytes(&binary(BURN), WasmLimits::default()).expect("compile");
+    let mut tool = WasmTool::from_bytes(&binary(&call_chain_wat(100)), WasmLimits::default())
+        .expect("compile");
     let started = std::time::Instant::now();
     let error = tool.call(b"").expect_err("the loop must stop");
     let elapsed = started.elapsed();
