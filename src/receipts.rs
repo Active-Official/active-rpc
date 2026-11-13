@@ -1320,6 +1320,10 @@ fn sync_parent(path: &std::path::Path) {
 /// can make the writer add one per steal (R-13 round 12, F7). Best effort: an
 /// entry that cannot be read or removed is left alone, and a live creator's
 /// staging file is younger than the ceiling.
+/// Bounded (CI-FIX-RPC-15): at most 32 matching entries are considered per
+/// call, whatever their fate, so a pile of fresh leftovers cannot make one
+/// append scan for ever; and only a regular file is ever opened, so a FIFO
+/// or a junction at a leftover name cannot hang the writer.
 fn sweep_leftovers(lock: &std::path::Path) {
     let Some(parent) = lock.parent() else {
         return;
@@ -1340,6 +1344,11 @@ fn sweep_leftovers(lock: &std::path::Path) {
         return;
     };
     let now = std::time::SystemTime::now();
+    // One unit per matching entry considered, whatever its fate: fresh
+    // entries are never removed, so counting only deletions let a planted
+    // pile of fresh leftovers be re-scanned -- and re-opened -- on every
+    // append for ever (CI-FIX-RPC-15: 40,000 fresh files cost one append
+    // 3.9 s against the 1,380 ms acquire budget).
     let mut budget = 32usize;
     for entry in entries.flatten() {
         if budget == 0 {
@@ -1361,10 +1370,18 @@ fn sweep_leftovers(lock: &std::path::Path) {
         {
             continue;
         }
-        // A receipt log is never one of our leftovers, whatever its name: a
-        // sibling log stored under a matching suffix must not be swept
-        // (R-13 round 16, F6).
-        if begins_with_receipt_log(&entry.path()) {
+        budget -= 1;
+        // Only a regular file can be a leftover this build wrote, and the
+        // type is read without following a link, so a FIFO, a device or a
+        // junction at a leftover name is never opened: open blocks on a
+        // FIFO (unix) and on an unreachable share (Windows), and the sweep
+        // used to open before any type or age check. The same guard
+        // `lock_state` gives the lock path (R-13 round 9, F5).
+        // (CI-FIX-RPC-15).
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
             continue;
         }
         // A future mtime is a planted file, the same reading `lock_state`
@@ -1378,9 +1395,17 @@ fn sweep_leftovers(lock: &std::path::Path) {
                 Ok(age) => age.as_millis() as u64 >= LOCK_STALE_MS,
                 Err(_) => true,
             });
-        if aged && std::fs::remove_file(entry.path()).is_ok() {
-            budget -= 1;
+        if !aged {
+            continue;
         }
+        // A receipt log is never one of our leftovers, whatever its name: a
+        // sibling log stored under a matching suffix must not be swept
+        // (R-13 round 16, F6). Checked after the age, so a fresh sibling is
+        // never opened at all (CI-FIX-RPC-15).
+        if begins_with_receipt_log(&entry.path()) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
 }
 

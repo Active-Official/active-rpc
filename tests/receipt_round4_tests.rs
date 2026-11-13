@@ -172,6 +172,95 @@ fn an_empty_lock_is_stolen_and_a_non_regular_lock_is_refused() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// (CI-FIX-RPC-15, review #1): a pile of fresh leftovers cannot stretch
+/// one append past the acquire budget. 40,000 fresh `<stem>.stale-*`
+/// files cost one append 3.9 s before the fix (the reviewer's probe:
+/// 5.7-6.2 s), because the sweep counted only successful removals
+/// against its 32 budget and re-scanned -- and re-opened -- the pile on
+/// every append. The sweep now considers at most 32 matching entries
+/// per call, whatever their fate, so the same append returns in ~245 ms.
+/// The count is the point: a few thousand pass even with the old
+/// counting, so the test plants the review's 40,000. The leftovers live
+/// in their own directory (the sweep enumerates the log's parent), and
+/// the directory is removed before any assertion, so a failure cannot
+/// leave 40,000 files behind.
+#[test]
+fn a_pile_of_fresh_leftovers_cannot_stretch_one_append() {
+    let dir = std::env::temp_dir().join(format!(
+        "active-rpc-receipt-r4-{}-sweep-bound",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("sweep dir");
+    let path = dir.join("receipts.arrl");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let log = ReceiptLog::open(&path).expect("open");
+    let mut planted = 0u32;
+    for i in 0..40_000u32 {
+        if std::fs::File::create(dir.join(format!("receipts.arrl.stale-{i}"))).is_ok() {
+            planted += 1;
+        }
+    }
+    let started = std::time::Instant::now();
+    let appended = log.append(&receipt(1, "echo"));
+    let elapsed = started.elapsed();
+    drop(log);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        planted >= 39_000,
+        "planted only {planted} of 40,000 leftovers"
+    );
+    appended.expect("append succeeds past the leftovers");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "one append took {elapsed:?} past 40,000 fresh leftovers"
+    );
+}
+
+/// (CI-FIX-RPC-15, review #2): a FIFO at a leftover name cannot hang
+/// one append. The sweep used to `File::open` every prefix-matching
+/// entry before any type or age check, and opening a FIFO blocks until
+/// a writer appears, so one planted FIFO hung every append for ever.
+/// Only regular files are ever opened now, so the append returns
+/// inside the budget. Unix-only: Windows has no FIFO, and the junction
+/// half of the finding is not pinned by a test. The append runs on a
+/// thread with a 5 s receive deadline, so a regression fails this test
+/// instead of hanging the suite (the thread is left blocked; the
+/// process still exits).
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_a_leftover_name_cannot_hang_one_append() {
+    let dir = std::env::temp_dir().join(format!(
+        "active-rpc-receipt-r4-{}-sweep-fifo",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("sweep dir");
+    let path = dir.join("receipts.arrl");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let fifo = dir.join("receipts.arrl.stale-fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success(), "mkfifo creates the FIFO: {status}");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let log = ReceiptLog::open(&path).expect("open");
+        let _ = sender.send(log.append(&receipt(1, "echo")));
+    });
+    let started = std::time::Instant::now();
+    let appended = receiver.recv_timeout(std::time::Duration::from_secs(5));
+    let elapsed = started.elapsed();
+    let _ = std::fs::remove_dir_all(&dir);
+    let appended = appended.expect("the append answers within 5 s, not a hang");
+    appended.expect("append succeeds past the FIFO");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "one append took {elapsed:?} past a FIFO leftover"
+    );
+}
+
 /// 5: a reader that lands mid-append waits for the writer instead of calling the
 /// log damaged.
 #[test]
