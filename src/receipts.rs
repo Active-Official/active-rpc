@@ -724,8 +724,20 @@ impl LogLock {
                     // top refuses once LOCK_ACQUIRE_BUDGET_MS has passed, so
                     // sleep overshoot under load cannot stretch the wait the
                     // way it did on the CI macOS runner (3.69 s, CI-FIX-RPC-13).
-                    let step = u64::from(attempt.min(20));
-                    std::thread::sleep(std::time::Duration::from_millis(5 + step * 2));
+                    // The sleep is truncated to the time left in the budget:
+                    // without the truncation the final 45 ms step alone pushed
+                    // the refusal to 1.42 s (the reviewer's measurement). The
+                    // 1.54-1.60 s this machine showed before the fix was not
+                    // sleep granularity: the probe log sat directly in a
+                    // 59,425-entry %TEMP%, and the sweep enumerates the log's
+                    // parent directory before the budget clock starts, which
+                    // cost ~140 ms inside the timed append. Isolated in its
+                    // own directory the refusal lands at 1.3805-1.3808 s,
+                    // the budget to within 1 ms (CI-FIX-RPC-16).
+                    let step = std::time::Duration::from_millis(5 + u64::from(attempt.min(20)) * 2);
+                    let left = std::time::Duration::from_millis(LOCK_ACQUIRE_BUDGET_MS)
+                        .saturating_sub(started.elapsed());
+                    std::thread::sleep(step.min(left));
                 }
                 Err(_) => return Err(Error::receipt("cannot lock the receipt log")),
             }

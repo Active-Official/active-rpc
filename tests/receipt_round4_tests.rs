@@ -172,6 +172,57 @@ fn an_empty_lock_is_stolen_and_a_non_regular_lock_is_refused() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// (CI-FIX-RPC-16, review #4): a live lock held by a regular file refuses
+/// within the wall-clock budget on every platform. The directory case in
+/// the test above takes the non-`AlreadyExists` early return on Windows
+/// and never enters the retry loop, and the 3 s bound passes without the
+/// fix on an idle host -- so without this test the guard is unpinned. A
+/// fresh lock naming the current live pid forces the full 40-attempt loop
+/// on every platform: the refusal must come at the 1.38 s budget, not
+/// before it (the loop ran) and not after it (the budget bound it).
+#[test]
+fn a_live_lock_is_refused_within_the_wall_clock_budget() {
+    let path = scratch("live-lock");
+    drop(ReceiptLog::create(&path).expect("create"));
+    let log = ReceiptLog::open(&path).expect("open");
+    let lock = path.with_file_name(format!(
+        "{}.lock",
+        path.file_name().expect("name").to_string_lossy()
+    ));
+    // A live lock: fresh mtime, the current pid, a valid nonce line. The
+    // magic literal must match LOCK_MAGIC in src/receipts.rs.
+    let pid = std::process::id();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    std::fs::write(
+        &lock,
+        format!("active-rpc-lock v1 {pid}-{nanos} pid {pid} started {now_ms}\n"),
+    )
+    .expect("lock");
+    let started = std::time::Instant::now();
+    let error = log
+        .append(&receipt(1, "echo"))
+        .expect_err("a live lock is refused");
+    let elapsed = started.elapsed();
+    assert_eq!(error.code(), "rpc/receipt");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(1),
+        "the wait was {elapsed:?}: the retry loop did not run"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the wait was {elapsed:?}, not the documented wait"
+    );
+    let _ = std::fs::remove_file(&lock);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// (CI-FIX-RPC-15, review #1): a pile of fresh leftovers cannot stretch
 /// one append past the acquire budget. 40,000 fresh `<stem>.stale-*`
 /// files cost one append 3.9 s before the fix (the reviewer's probe:
