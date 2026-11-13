@@ -204,6 +204,11 @@ fn a_child_killed_by_a_signal_withholds_the_reply() {
 /// because Windows cannot tell a termination code from a code the child
 /// exited with itself. That is the documented residual, pinned here so a
 /// future change to the guard cannot silently reclassify it.
+/// The budget is 60 s on purpose (CI-FIX-RPC-18): the call needs two
+/// sequential process starts (PowerShell, then `taskkill`) plus the 400 ms
+/// sleep, all charged against one absolute wall deadline, and a
+/// CPU-constrained runner needs 4-6 s for that work - the old 5 s budget
+/// fired the wait loop there (run 43350905901) while this PC passes at ~1.2 s.
 #[cfg(windows)]
 #[test]
 fn a_child_terminated_by_another_process_reports_its_exit_code() {
@@ -224,7 +229,10 @@ fn a_child_terminated_by_another_process_reports_its_exit_code() {
         &["-NoProfile", "-Command", script],
     )
     .expect("an absolute program");
-    tool.timeout_ms = 5_000;
+    // 60 s, not 5 s (CI-FIX-RPC-18): see the doc comment above. The budget
+    // is not the pinned behaviour - the exit-code classification is - so it
+    // is sized for the slowest legitimate runner, not for this PC.
+    tool.timeout_ms = 60_000;
     // The adapter spawns with an empty environment (`env_clear`), and
     // Windows PowerShell's managed host cannot load without a user
     // profile (it fails with 8009001d, "keyset does not exist"): the
@@ -261,7 +269,7 @@ fn a_child_terminated_by_another_process_reports_its_exit_code() {
     );
     call.tool_allows_process = true;
     call.budget = Budget {
-        max_wall_ms: 5_000,
+        max_wall_ms: 60_000,
         max_bytes: 1 << 20,
         ..Budget::default()
     };
