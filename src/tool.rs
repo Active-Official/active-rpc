@@ -5375,25 +5375,121 @@ mod write_tests {
     /// The byte count survives a failure: a head written in chunks can fail
     /// after the first one, and the caller needs that count to mark the call as
     /// possibly applied (round 47, L-4; round 49, L-2).
+    ///
+    /// The close is synchronised, not raced (CI-FIX-RPC-24): the server
+    /// reads exactly the head, then closes and signals; the test waits
+    /// for the signal, reads until the FIN is observed, then writes
+    /// single bytes until one fails — a failed write proves the reset
+    /// has been processed — so the bulk write starts with the socket
+    /// already in its error state and its first chunk must fail.
+    /// (`TcpStream::set_linger` is unstable, so the close itself is a
+    /// plain FIN and the RST is elicited by writing to the closed port;
+    /// and on Windows `take_error` never reports the pending reset —
+    /// probe `probe_take_error_after_fin` watched it return `None` for
+    /// a full 5 s while the very next write failed with
+    /// `ConnectionAborted` — so the reset is observed through a failing
+    /// write, not through `SO_ERROR`.) The unsynchronised form flaked
+    /// on CI (Ratio gates-windows, round 16): the client could write
+    /// all 3 MiB into kernel buffers before the server thread closed,
+    /// so `write_within` returned `Ok` — on the fix machine the same
+    /// 3 MiB stops at 2,752,512 bytes against a never-reading peer
+    /// (round-17 probe, `ci-fix17-probec.log`), so the race is
+    /// machine-dependent buffering, not a production regression (round
+    /// 16 touched only `tests/wasm_tool_tests.rs`).
     #[test]
     fn a_partial_write_reports_what_it_sent() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("address");
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let mut buffer = vec![0u8; 4096];
-            let _ = std::io::Read::read(&mut stream, &mut buffer);
-            // Close with the rest unread: the next chunk fails.
+            let mut head = [0u8; 4096];
+            std::io::Read::read_exact(&mut stream, &mut head).expect("the server reads the head");
+            // Close after reading the head: the rest is never read.
             drop(stream);
+            let _ = closed_tx.send(());
         });
         let mut client = std::net::TcpStream::connect(address).expect("connect");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         let payload = vec![b'x'; 3 << 20];
-        let (sent, result) = write_within(&mut client, &payload, deadline);
+        let head_len = 4096;
+        let (head_sent, head_result) = write_within(
+            &mut client,
+            &payload[..head_len],
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        );
+        assert!(head_result.is_ok(), "the head is written before the close");
+        assert_eq!(head_sent, head_len, "the head is fully written");
+        closed_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the server closes after reading the head");
+        // Wait until the FIN is observed: the read returns EOF. The bulk
+        // write below must not start before this.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut probe = [0u8; 1];
+        match std::io::Read::read(&mut client, &mut probe) {
+            Ok(0) => {
+                // FIN observed: the peer is gone.
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionReset
+                    || error.kind() == std::io::ErrorKind::ConnectionAborted =>
+            {
+                // RST observed already: the socket is in its error state.
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                panic!("the peer close was not observed within 5 s: {error}")
+            }
+            Err(error) => panic!("unexpected read error while waiting for the close: {error}"),
+            Ok(n) => panic!("the peer sent {n} unexpected bytes"),
+        }
+        // Write single bytes until one fails: a failed write proves the
+        // reset has been processed, so the bulk write below starts with
+        // the socket already in its error state. The first bytes go out
+        // to the closed port and provoke the reset; the loop exits on the
+        // first failure, typically within a few iterations, and fails
+        // loudly if no reset arrives within 5 s.
+        let reset_wait = std::time::Instant::now();
+        let mut reset_observed = false;
+        let probe_byte = [0u8; 1];
+        while reset_wait.elapsed() < std::time::Duration::from_secs(5) {
+            match std::io::Write::write(&mut client, &probe_byte) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ConnectionReset
+                        || error.kind() == std::io::ErrorKind::ConnectionAborted
+                        || error.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    reset_observed = true;
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // No reset yet and the byte did not go out: keep
+                    // waiting; the reset is already on its way.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("unexpected write error while waiting for the reset: {error}"),
+                Ok(_) => {}
+            }
+        }
+        assert!(reset_observed, "the RST was not observed within 5 s");
+        let _ = client.set_read_timeout(None);
+        let (rest_sent, result) = write_within(
+            &mut client,
+            &payload[head_len..],
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        );
+        let sent = head_sent + rest_sent;
         assert!(result.is_err(), "a closed peer fails a later chunk");
         assert!(sent > 0, "the bytes already written are reported");
         assert!(sent < payload.len(), "the write did not complete");
-        let _ = server.join();
+        server.join().expect("the server thread finishes");
     }
 }
 

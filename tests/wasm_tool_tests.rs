@@ -461,10 +461,10 @@ fn a_wat_module_under_the_text_ceiling_still_compiles() {
 /// A compile that outlives its deadline is refused with `wasm/timeout`
 /// (RPC-39).
 ///
-/// The module below compiles in ~230-310 ms in debug (60,000 empty
-/// functions), so a 1 ms deadline can only be met by the deadline
-/// mechanism, not by a fast compile; a zero deadline is clamped to 1 ms
-/// rather than read as "no deadline".
+/// The module below compiles in ~230-310 ms in debug on the fix machine
+/// (60,000 empty functions), so a 1 ms deadline can only be met by the
+/// deadline mechanism, not by a fast compile; a zero deadline is clamped
+/// to 1 ms rather than read as "no deadline".
 /// The 20,000-function module this test used first compiles in ~80 ms in
 /// debug, a ~80x margin on the 1 ms deadline — and an Official macOS CI
 /// runner in round 15 still finished inside it (CI-FIX-RPC-23): the 1 ms
@@ -473,10 +473,19 @@ fn a_wat_module_under_the_text_ceiling_still_compiles() {
 /// whole scheduling delay as well as the 1 ms, and a fast, loaded runner
 /// can spend it. The 60,000-function module needs more than three times
 /// that delay to flip (worst measured rep 203 ms, worst median 232 ms
-/// across Windows native and Docker Linux). Its binary stays under the
-/// 1 MiB module ceiling (asserted below); the neighbouring large-binary
-/// test keeps its own 20,000-function pin that a legal module compiles
-/// inside the 5 s default.
+/// across Windows native and Docker Linux; round-17 probe: native
+/// 211-260 ms, Docker 212-348 ms, 20 reps each).
+/// The precondition floor below is 50 ms, not the 100 ms round 16 set:
+/// a Ratio Linux CI runner compiled the fixture in 99.377 ms in round 16
+/// (run #381) and tripped the 100 ms guard — the guard was set ~2x below
+/// the worst LOCAL rep (203 ms), but CI Linux is ~2x faster than the fix
+/// machine, so local worst reps do not bound CI. 50 ms sits ~2x below the
+/// fastest CI compile observed (99.377 ms) and 50x above the 1 ms deadline
+/// it must outlive. A larger fixture does not buy more: 70,000 functions
+/// is 91% of the 1 MiB ceiling and would compile in only ~116 ms on that
+/// runner. Its binary stays under the 1 MiB module ceiling (asserted
+/// below); the neighbouring large-binary test keeps its own 20,000-function
+/// pin that a legal module compiles inside the 5 s default.
 #[test]
 fn a_compile_that_outlives_its_deadline_is_refused_with_timeout() {
     let binary = binary(&many_functions_wat(60_000));
@@ -486,14 +495,16 @@ fn a_compile_that_outlives_its_deadline_is_refused_with_timeout() {
         binary.len()
     );
     // Precondition, measured not assumed: the fixture must outlive the
-    // 1 ms deadline by two orders of magnitude on this hardware, or the
-    // refusal below pins nothing. If hardware ever compiles it in under
-    // 100 ms, this fails here with a clear message instead of flaking at
+    // 1 ms deadline by a wide margin on this hardware, or the refusal
+    // below pins nothing. The floor is 50 ms: ~2x below the fastest
+    // compile observed anywhere (99.377 ms, Ratio Linux CI, round 16)
+    // and 50x above the deadline. If hardware ever compiles it in under
+    // 50 ms, this fails here with a clear message instead of flaking at
     // the `expect_err` below — the signal to enlarge the fixture again.
     let precondition = std::time::Instant::now();
     let _ = WasmTool::from_bytes(&binary, WasmLimits::default()).expect("the fixture must compile");
     assert!(
-        precondition.elapsed() >= std::time::Duration::from_millis(100),
+        precondition.elapsed() >= std::time::Duration::from_millis(50),
         "the fixture compiled too fast to pin the deadline: {:?}",
         precondition.elapsed()
     );
