@@ -745,13 +745,23 @@ async fn serve_stream<H>(
         let mut current = served.load(Ordering::SeqCst);
         loop {
             if current >= max_calls {
-                let error = Error::Transport("the server has served its calls".to_string());
-                reply(
-                    &mut send,
-                    &Envelope::error(envelope.request_id, &error),
-                    wire,
-                )
-                .await;
+                // Reset the stream instead of replying with an error
+                // envelope: the endpoint is spent, and a reply races the
+                // close that follows. A peer that reads the reply before
+                // the close lands sees `Ok(Error envelope)` (CI run
+                // 43350901356, Ratio-only: the spent-budget test got
+                // `Ok(Envelope { kind: Error, method: "rpc/transport",
+                // .. })`), while a peer that sees the close first gets a
+                // transport error -- the same call has two outcomes
+                // depending on scheduling. A reset is a transport error
+                // on every interleaving: the caller never mistakes the
+                // refusal for an answer, and the endpoint still closes
+                // below when this was the last running call (round 15,
+                // F-1).
+                // A reset on a stream the peer already closed fails;
+                // there is nothing to do with that -- the endpoint
+                // close below is the signal that matters.
+                let _ = send.reset(0u32.into());
                 // No close here: an admitted call may still be running, and the
                 // last one to finish closes the endpoint (round 47). This
                 // stream is not admitted, but it was counted, so its decrement
