@@ -3813,11 +3813,15 @@ fn a_cleared_env_still_gives_cmd_its_systemroot() {
 /// Windows gates run failed this test with `provider/reply-withheld`
 /// (the invoke never got its answer inside 5 s under parallel-suite
 /// load), while the sibling MCP test -- the same powershell.exe, the
-/// same cleared env -- passed with a 60 s recv deadline. PowerShell is
-/// a managed runtime whose cold start is the slow leg; the budget is
-/// the only difference between the two tests, so it is the budget that
-/// is fixed. What the test pins is unchanged: PowerShell starts with a
-/// cleared env and prints `SystemRoot`.
+/// same cleared env -- passed with a 60 s recv deadline. That 60 s is
+/// the precedent for cold-start tolerance, not the only difference
+/// between the two tests: the MCP test uses its own transport deadline
+/// (`recv_line_within(60 s)`) and bypasses both the adapter timeout and
+/// the call budget, so it never exercises the ceiling this test goes
+/// through. PowerShell is a managed runtime whose cold start is the
+/// slow leg; the budget is what this test fixes, because `invoke` takes
+/// the smaller of the two legs. What the test pins is unchanged:
+/// PowerShell starts with a cleared env and prints `SystemRoot`.
 #[cfg(windows)]
 #[test]
 fn a_cleared_env_still_starts_powershell() {
@@ -3843,6 +3847,50 @@ fn a_cleared_env_still_starts_powershell() {
     let response = tool.invoke(0, &call).expect("powershell answers");
     let stdout = rpc45_stdout(response);
     assert_eq!(stdout.trim(), root, "stdout: {stdout:?}");
+}
+
+/// (CI-FIX-RPC-17, review #5): pin the `min()` in `LocalProcess::invoke`
+/// -- the adapter timeout alone does not bound the wait; the call budget
+/// does. A child that runs ~5 s (`ping -n 6` waits ~5 s) with the adapter
+/// at 60 s and the budget at 2 s must be refused at the budget, not left
+/// to finish: if `invoke` ignored the budget, the child would answer in
+/// ~5 s and the call would return `Ok`. The 2 s budget is the whole
+/// point, so a regression that drops the `min()` fails here, while the
+/// 60 s adapter timeout alone passes the powershell test above. The
+/// refusal looks like the flood test's: `rpc/provider` with
+/// `provider/reply-withheld`.
+#[cfg(windows)]
+#[test]
+fn a_small_budget_refuses_a_slow_child_before_it_finishes() {
+    let root = rpc45_parent_systemroot();
+    // ping.exe directly, by absolute path: the tool's env is empty, so a
+    // `cmd /C ping ...` child cannot find `ping` on PATH and exits at
+    // once (the first version of this test did exactly that).
+    let program = format!("{root}\\System32\\ping.exe");
+    let mut tool = LocalProcess::new(&program, &["-n", "6", "127.0.0.1"])
+        .expect("an absolute program")
+        .with_timeout(60_000);
+    let mut call = Call::new(
+        "run",
+        vec![Arg::text("-n"), Arg::text("6"), Arg::text("127.0.0.1")],
+    );
+    call.tool_allows_process = true;
+    // The budget leg of the ceiling, deliberately smaller than the
+    // adapter leg: the refusal must come at 2 s, not at the child's ~5 s.
+    call.budget.max_wall_ms = 2_000;
+    let started = std::time::Instant::now();
+    let error = tool.invoke(0, &call).expect_err("a slow child is refused");
+    let elapsed = started.elapsed();
+    assert_eq!(error.code(), "rpc/provider");
+    assert_eq!(error.provider_code(), Some("provider/reply-withheld"));
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1_500),
+        "the wait was {elapsed:?}: the budget did not bind"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(3_500),
+        "the wait was {elapsed:?}, not the 2 s budget"
+    );
 }
 
 /// W2's `w2_rpc45_stdio_powershell_server_fails_without_systemroot` (filed
