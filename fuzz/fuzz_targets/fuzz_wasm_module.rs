@@ -21,7 +21,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use active_rpc::wasm_tool::{WasmHostPolicy, WasmLimits, WasmTool, MAX_MODULE_BYTES};
+use active_rpc::wasm_tool::{
+    WasmHostPolicy, WasmLimits, WasmTool, MAX_COMPILE_WALL, MAX_MODULE_BYTES,
+};
 
 /// Small ceilings keep one execution cheap: the point is the parser and the
 /// sandbox, not a long-running guest.
@@ -63,7 +65,19 @@ fuzz_target!(|data: &[u8]| {
             },
         )
         .expect("the fixed wat module compiles");
-        let output = tool.call(&[]).expect("the fixed module runs");
+        // The control proves the sandbox runs a valid module end to end, so
+        // it runs under an explicit generous wall, not `call()`'s
+        // fuel-derived deadline: the 50 000-fuel grant derives 5 ms
+        // (`fuel / FUEL_PER_MS / 2`, CI-FIX-RPC-12), which must cover thread
+        // spawn plus wasmi instantiation, and a loaded CI runner missed it
+        // once (run #378: `the fixed module runs: Timeout`, at this line).
+        // The derived deadline is not what this control tests -- RPC-12's own
+        // tests pin it, including the halving -- so the control takes
+        // `MAX_COMPILE_WALL` (5 s) and can only fail on a real breakage
+        // (CI-FIX-RPC-21).
+        let output = tool
+            .call_with_deadline(&[], MAX_COMPILE_WALL)
+            .expect("the fixed module runs");
         assert_eq!(output, vec![65], "the guest's output did not come back");
     }
 
